@@ -1,5 +1,8 @@
 import AppKit
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptFileSystem
+import RepoPromptShared
 
 /// Centralised helpers for installing the RepoPrompt MCP server
 /// into third-party editors and copying the JSON configuration.
@@ -33,35 +36,10 @@ enum MCPIntegrationHelper {
     }
 
     static let repoPromptMCPServerName = RepoPromptMCPServerConfiguration.defaultServerName
-    static let repoPromptToolNames: Set<String> = [
-        "ask_user",
-        "ask_user_question",
-        "get_file_tree",
-        "file_search",
-        "read_file",
-        "get_code_structure",
-        "apply_edits",
-        "file_actions",
 
-        "manage_selection",
-        "prompt",
-        "workspace_context",
-        "ask_oracle",
-        "oracle_send",
-        "oracle_utils",
-        "oracle_chat_log",
-        "git",
-        "bind_context",
-        "manage_workspaces",
-        "context_builder",
-        "share_thoughts",
-        "wait_for_next_user_instruction",
-        "agent_explore",
-        "agent_run",
-        "agent_manage",
-        "set_status",
-        "app_settings"
-    ]
+    /// Reserved, app-provisioned Computer Use companion MCP server name.
+    static let computerUseMCPServerName = "computer-use"
+    static let repoPromptToolNames: Set<String> = Set(MCPDomainToolCatalog.orderedToolNames).union(["ask_user_question"])
 
     // MARK: - Command Install Mode
 
@@ -139,16 +117,7 @@ enum MCPIntegrationHelper {
     /// JSON snippet shown to users / copied to clipboard.
     static var jsonSnippet: String {
         (try? repoPromptMCPConfiguration.prettyPrintedWrappedSettingsJSON())
-            ?? """
-            {
-            	"mcpServers": {
-            		"\(repoPromptMCPServerName)": {
-            			"command": "\(serverCommand)",
-            			"args": []
-            		}
-            	}
-            }
-            """
+            ?? #"{"mcpServers":{"\#(repoPromptMCPServerName)":{"command":"\#(serverCommand)","args":["--backend","app"]}}}"#
     }
 
     static var isMCPServerInstalled: Bool {
@@ -179,15 +148,17 @@ enum MCPIntegrationHelper {
     }
 
     private static func stripExplicitRepoPromptPrefix(from rawName: String) -> (normalized: String, explicit: Bool) {
-        let server = repoPromptMCPServerName.lowercased()
-        let explicitPrefixes = [
-            "mcp__\(server)__",
-            "mcp_\(server)__",
-            "\(server)__",
-            "\(server)_"
-        ]
-        for prefix in explicitPrefixes where rawName.hasPrefix(prefix) {
-            return (String(rawName.dropFirst(prefix.count)), true)
+        for name in [repoPromptMCPServerName, RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName] {
+            let server = name.lowercased()
+            let explicitPrefixes = [
+                "mcp__\(server)__",
+                "mcp_\(server)__",
+                "\(server)__",
+                "\(server)_"
+            ]
+            for prefix in explicitPrefixes where rawName.hasPrefix(prefix) {
+                return (String(rawName.dropFirst(prefix.count)), true)
+            }
         }
         return (rawName, false)
     }
@@ -255,15 +226,51 @@ enum MCPIntegrationHelper {
         guard let rawValue else { return false }
         let lowered = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lowered.isEmpty else { return false }
-        let repoPromptServer = repoPromptMCPServerName.lowercased()
-        return lowered == repoPromptServer || lowered.contains(repoPromptServer)
+        // Exact match only: a substring check would let look-alike servers such as
+        // `NotRepoPromptCE` borrow RepoPrompt provenance for auto-approval.
+        return repoPromptServerIdentifiers.contains(lowered)
     }
+
+    static func isComputerUseServerIdentifier(_ rawValue: String) -> Bool {
+        rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().replacingOccurrences(of: "_", with: "-") == computerUseMCPServerName
+    }
+
+    /// Reserved app-owned identities must never be populated from user-controlled definitions.
+    static func isReservedMCPServerIdentifier(_ rawValue: String) -> Bool {
+        isRepoPromptServerIdentifier(rawValue) || isComputerUseServerIdentifier(rawValue)
+    }
+
+    private static let repoPromptServerIdentifiers: Set<String> = [
+        repoPromptMCPServerName.lowercased(),
+        RepoPromptMCPServerConfiguration.grokBuildRuntimeServerName.lowercased()
+    ]
 
     static func repoPromptPermissionAutoApprovalMatch(
         requestToolName: String?,
         requestPayload: [String: Any]
     ) -> RepoPromptPermissionAutoApprovalMatch? {
-        if let requestToolName, isRepoPromptToolName(requestToolName) {
+        // Catalog membership identifies RepoPrompt tools but is not permission authority on its
+        // own: fail closed whenever the payload attributes the request to a different MCP server,
+        // even if a bare tool name also happens to match a RepoPrompt tool.
+        let serverCandidates = permissionRequestServerCandidates(input: requestPayload)
+        if serverCandidates.contains(where: { !isRepoPromptServerIdentifier($0) }) {
+            return nil
+        }
+        // The same applies to a tool name qualified with another server (`mcp__OtherServer__x`),
+        // whether it is the actual invocation or nested request metadata.
+        let toolNameCandidates = permissionRequestToolNameCandidates(input: requestPayload)
+        if ([requestToolName].compactMap(\.self) + toolNameCandidates).contains(where: isForeignServerQualifiedToolName) {
+            return nil
+        }
+
+        // Bare names (top-level or nested) only auto-approve when the payload also carries
+        // RepoPrompt provenance (an exact RepoPrompt server identifier). Server-prefixed names
+        // carry their own provenance.
+        let hasRepoPromptServerProvenance = serverCandidates.contains { isRepoPromptServerIdentifier($0) }
+
+        if let requestToolName, isRepoPromptToolName(requestToolName),
+           hasRepoPromptServerProvenance || isRepoPromptToolNameWithServerPrefix(requestToolName)
+        {
             return RepoPromptPermissionAutoApprovalMatch(
                 source: .topLevelToolName,
                 normalizedToolName: normalizedRepoPromptToolName(requestToolName),
@@ -281,8 +288,10 @@ enum MCPIntegrationHelper {
             }
         }
 
-        for toolName in permissionRequestToolNameCandidates(input: requestPayload) {
-            guard isRepoPromptToolName(toolName) else { continue }
+        for toolName in toolNameCandidates {
+            guard isRepoPromptToolName(toolName),
+                  hasRepoPromptServerProvenance || isRepoPromptToolNameWithServerPrefix(toolName)
+            else { continue }
             return RepoPromptPermissionAutoApprovalMatch(
                 source: .nestedToolName,
                 normalizedToolName: normalizedRepoPromptToolName(toolName),
@@ -301,6 +310,41 @@ enum MCPIntegrationHelper {
         return nil
     }
 
+    /// Only the reserved, app-provisioned companion may borrow the armed chat's policy.
+    /// Reuse the same structured provenance extraction and contradictory-origin vetoes as host tools.
+    static func isComputerUseCompanionPermissionRequest(_ payload: [String: Any]) -> Bool {
+        let servers = permissionRequestServerCandidates(input: payload)
+        guard !servers.isEmpty,
+              servers.allSatisfy({ $0.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }) else { return false }
+        return permissionRequestToolNameCandidates(input: payload).allSatisfy { tool in
+            let lower = tool.lowercased()
+            return !lower.hasPrefix("mcp__") || lower.hasPrefix("mcp__\(computerUseMCPServerName)__")
+        }
+    }
+
+    /// Returns the unqualified tool name when `rawName` is qualified with the reserved
+    /// Computer Use companion server (`mcp__computer-use__<tool>`). Transcript-side
+    /// normalization rewrites `-` to `_`, so the `mcp__computer_use__` form is also accepted.
+    static func computerUseCompanionToolName(_ rawName: String?) -> String? {
+        guard let name = trimmedLowercasedToolName(rawName) else { return nil }
+        guard name.hasPrefix("mcp__") else { return nil }
+        let remainder = name.dropFirst("mcp__".count)
+        guard let separator = remainder.range(of: "__"),
+              separator.lowerBound > remainder.startIndex
+        else { return nil }
+        let server = remainder[..<separator.lowerBound]
+        let tool = remainder[separator.upperBound...]
+        let isCompanionServer = isComputerUseServerIdentifier(String(server))
+        guard !tool.isEmpty, isCompanionServer else { return nil }
+        return String(tool)
+    }
+
+    /// True when the tool name is qualified with the reserved Computer Use companion
+    /// server, in either the raw or the `-`→`_`-normalized prefix form.
+    static func isComputerUseCompanionToolName(_ rawName: String?) -> Bool {
+        computerUseCompanionToolName(rawName) != nil
+    }
+
     static func repoPromptPermissionServerIdentifier(in requestPayload: [String: Any]) -> String? {
         for serverName in permissionRequestServerCandidates(input: requestPayload) {
             guard isRepoPromptServerIdentifier(serverName) else { continue }
@@ -315,13 +359,31 @@ enum MCPIntegrationHelper {
         }
     }
 
+    /// True when the name is qualified with an MCP server other than RepoPrompt, e.g.
+    /// `mcp__OtherServer__delete_files`.
+    private static func isForeignServerQualifiedToolName(_ rawName: String) -> Bool {
+        guard let lowered = trimmedLowercasedToolName(rawName) else { return false }
+        let name = stripFunctionsPrefix(from: lowered)
+        guard name.hasPrefix("mcp__") else { return false }
+        let remainder = name.dropFirst("mcp__".count)
+        guard let separator = remainder.range(of: "__") else { return false }
+        let server = String(remainder[..<separator.lowerBound])
+        return !server.isEmpty && !isRepoPromptServerIdentifier(server)
+    }
+
+    /// Display labels are host-rendered text, so they only count as provenance in two anchored
+    /// shapes whose tool part is a RepoPrompt catalog tool:
+    /// `<tool> (RepoPromptCE MCP Server)` and `<RepoPrompt server>[ MCP Server]: <tool>`.
     private static func repoPromptPermissionLabelMatch(_ rawLabel: String?) -> RepoPromptPermissionAutoApprovalMatch? {
         guard let label = trimmedPermissionRequestString(rawLabel) else { return nil }
-        let legacyServerLabel = "(\(repoPromptMCPServerName) MCP Server)"
-        if label.localizedCaseInsensitiveContains(legacyServerLabel) {
+        let legacyServerSuffix = "(\(repoPromptMCPServerName) MCP Server)".lowercased()
+        if label.lowercased().hasSuffix(legacyServerSuffix) {
+            let toolLabel = String(label.dropLast(legacyServerSuffix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard canonicalRepoPromptToolName(toolLabel) != nil else { return nil }
             return RepoPromptPermissionAutoApprovalMatch(
                 source: .serverIdentifier,
-                normalizedToolName: nil,
+                normalizedToolName: normalizedRepoPromptToolName(toolLabel),
                 serverIdentifier: repoPromptMCPServerName
             )
         }
@@ -343,13 +405,13 @@ enum MCPIntegrationHelper {
     private static func isRepoPromptPermissionServerLabel(_ rawLabel: String) -> Bool {
         let lowered = rawLabel.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lowered.isEmpty else { return false }
-        let repoPromptServer = repoPromptMCPServerName.lowercased()
-        return lowered == repoPromptServer
-            || lowered.hasPrefix("\(repoPromptServer)-")
-            || lowered.hasPrefix("\(repoPromptServer) ")
-            || lowered.contains("\(repoPromptServer) mcp server")
+        let mcpServerSuffix = " mcp server"
+        let server = lowered.hasSuffix(mcpServerSuffix) ? String(lowered.dropLast(mcpServerSuffix.count)) : lowered
+        return isRepoPromptServerIdentifier(server)
     }
 
+    /// Candidate paths intentionally exclude `rawInput`: those are model-controlled tool arguments,
+    /// never provider-attested invocation identity, so they must not supply provenance.
     private static func permissionRequestLabelCandidates(input: [String: Any]) -> [String] {
         let values = collectPermissionRequestStrings(
             from: input,
@@ -359,17 +421,10 @@ enum MCPIntegrationHelper {
                 ["tool_title"],
                 ["displayName"],
                 ["display_name"],
-                ["rawInput", "title"],
-                ["rawInput", "toolTitle"],
-                ["rawInput", "tool_title"],
                 ["toolCall", "title"],
                 ["toolCall", "name"],
                 ["toolCall", "displayName"],
                 ["toolCall", "display_name"],
-                ["rawInput", "toolCall", "title"],
-                ["rawInput", "toolCall", "name"],
-                ["rawInput", "toolCall", "displayName"],
-                ["rawInput", "toolCall", "display_name"],
                 ["request", "title"],
                 ["request", "toolTitle"],
                 ["request", "tool_title"],
@@ -377,8 +432,7 @@ enum MCPIntegrationHelper {
                 ["request", "toolCall", "name"],
                 ["request", "toolCall", "displayName"],
                 ["request", "toolCall", "display_name"],
-                ["request", "_meta", "tool_title"],
-                ["request", "_meta", "tool_description"]
+                ["request", "_meta", "tool_title"]
             ]
         )
 
@@ -395,11 +449,8 @@ enum MCPIntegrationHelper {
                 ["server"],
                 ["mcp_server"],
                 ["mcpServer"],
-                ["rawInput", "server_name"],
-                ["rawInput", "serverName"],
-                ["rawInput", "server"],
-                ["rawInput", "mcp_server"],
-                ["rawInput", "mcpServer"],
+                ["mcp_server_name"],
+                ["mcpServerName"],
                 ["serverInfo", "name"],
                 ["tool", "server"],
                 ["tool", "server_name"],
@@ -407,12 +458,11 @@ enum MCPIntegrationHelper {
                 ["toolCall", "server"],
                 ["toolCall", "server_name"],
                 ["toolCall", "serverName"],
-                ["rawInput", "toolCall", "server"],
-                ["rawInput", "toolCall", "server_name"],
-                ["rawInput", "toolCall", "serverName"],
                 ["request", "server"],
                 ["request", "server_name"],
                 ["request", "serverName"],
+                ["request", "mcp_server_name"],
+                ["request", "mcpServerName"],
                 ["request", "tool", "server"],
                 ["request", "tool", "server_name"],
                 ["request", "tool", "serverName"],
@@ -425,15 +475,12 @@ enum MCPIntegrationHelper {
     }
 
     private static func permissionRequestToolNameCandidates(input: [String: Any]) -> [String] {
-        var values = collectPermissionRequestStrings(
+        let values = collectPermissionRequestStrings(
             from: input,
             paths: [
                 ["tool_name"],
                 ["toolName"],
                 ["name"],
-                ["rawInput", "tool_name"],
-                ["rawInput", "toolName"],
-                ["rawInput", "name"],
                 ["tool", "tool_name"],
                 ["tool", "toolName"],
                 ["tool", "name"],
@@ -441,13 +488,6 @@ enum MCPIntegrationHelper {
                 ["toolCall", "toolName"],
                 ["toolCall", "name"],
                 ["toolCall", "title"],
-                ["rawInput", "tool", "tool_name"],
-                ["rawInput", "tool", "toolName"],
-                ["rawInput", "tool", "name"],
-                ["rawInput", "toolCall", "tool_name"],
-                ["rawInput", "toolCall", "toolName"],
-                ["rawInput", "toolCall", "name"],
-                ["rawInput", "toolCall", "title"],
                 ["request", "tool_name"],
                 ["request", "toolName"],
                 ["request", "name"],
@@ -458,22 +498,12 @@ enum MCPIntegrationHelper {
                 ["request", "toolCall", "toolName"],
                 ["request", "toolCall", "name"],
                 ["request", "toolCall", "title"],
-                ["request", "_meta", "tool_title"],
-                ["request", "_meta", "tool_description"],
-                ["request", "_meta", "connector_name"]
+                ["request", "_meta", "tool_title"]
             ]
         )
 
-        if let suggestions = input["permission_suggestions"] as? [[String: Any]] {
-            for suggestion in suggestions {
-                guard let rules = suggestion["rules"] as? [[String: Any]] else { continue }
-                for rule in rules {
-                    if let toolName = trimmedPermissionRequestString(rule["toolName"]) {
-                        values.append(toolName)
-                    }
-                }
-            }
-        }
+        // `permission_suggestions` describe proposed permission updates, not the invocation being
+        // approved, so they are intentionally not tool-name candidates.
 
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
@@ -581,13 +611,15 @@ enum MCPIntegrationHelper {
         CodexIntegrationConfiguration.mcpServerNames()
     }
 
-    /// Installs the RepoPrompt MCP server into Codex CLI (`~/.codex/config.toml`).
+    /// Installs the RepoPrompt MCP server into RepoPrompt's isolated Codex config.
     ///
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
-    static func installInCodex() -> (success: Bool, wasAlreadyPresent: Bool) {
-        let result = CodexIntegrationConfiguration.installPersistentMCPConfig()
+    static func installInCodex(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        let result = CodexIntegrationConfiguration.installPersistentMCPConfig(launchSnapshot: launchSnapshot)
         if result.success {
             // Also install Codex slash commands for MCP tool usage.
             installCodexCommands(useCLIVariant: false)
@@ -600,8 +632,10 @@ enum MCPIntegrationHelper {
     /// `enabled = false` so normal Codex usage stays opt-in, while the agent enables it at runtime via
     /// `-c` overrides.
     @discardableResult
-    static func ensureCodexServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
-        CodexIntegrationConfiguration.ensureServerForDiscovery()
+    static func ensureCodexServerForDiscovery(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        CodexIntegrationConfiguration.ensureServerForDiscovery(launchSnapshot: launchSnapshot)
     }
 
     static func codexConfigContainsRepoPrompt() -> Bool {
@@ -612,9 +646,12 @@ enum MCPIntegrationHelper {
         CodexIntegrationConfiguration.removeInstallEntry()
     }
 
-    /// Ensures existing Codex CLI configs include the RepoPrompt tool timeout override.
+    /// Ensures existing Codex CLI configs include the RepoPrompt V5 MCP policy:
+    /// the preserved 10,000-active-second server timeout and enabled parallel tool calls.
+    /// Codex has no per-tool timeout exemption, so the long timeout protects synchronous
+    /// Oracle and Context Builder operations.
     /// - Parameter force: When true, bypasses the once-per-install guard and rechecks the file.
-    /// - Returns: `true` if the RepoPrompt entry was located (and now has the desired timeout).
+    /// - Returns: `true` if the RepoPrompt entry was located and now has the desired policy.
     @discardableResult
     static func ensureCodexToolTimeout(force: Bool = false) -> Bool {
         CodexIntegrationConfiguration.ensureToolTimeout(force: force)
@@ -949,8 +986,7 @@ enum MCPIntegrationHelper {
 
     /// Returns the URL for the Codex prompts directory.
     private static func codexPromptsDirectoryURL() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex", isDirectory: true)
+        CodexIntegrationConfiguration.configDirectoryURL()
             .appendingPathComponent("prompts", isDirectory: true)
     }
 
@@ -1128,7 +1164,7 @@ enum MCPIntegrationHelper {
             do {
                 try fm.createDirectory(at: promptsDir, withIntermediateDirectories: true, attributes: nil)
             } catch {
-                print("MCPIntegrationHelper – Failed to create ~/.codex/prompts directory: \(error)")
+                print("MCPIntegrationHelper – Failed to create RepoPrompt-owned Codex prompts directory: \(error)")
                 return 0
             }
         }

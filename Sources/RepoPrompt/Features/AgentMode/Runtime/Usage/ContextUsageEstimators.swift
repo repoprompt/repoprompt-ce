@@ -4,6 +4,7 @@ enum ContextUsageSnapshotSource: String, Codable, Equatable {
     case claudeUsageEvent
     case geminiUsageEvent
     case codexNativeUsage
+    case acpUsageEvent
     case turnFinalization
     case persistedTurns
     case compactionSignal
@@ -52,20 +53,20 @@ protocol ContextUsageEstimating: AnyObject {
     @discardableResult
     func enqueueUserTurnEstimate(
         messageForProvider: String,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Int
 
     @discardableResult
     func replaceNextQueuedUserTurnEstimate(
         messageForProvider: String,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Int?
 
-    func dequeueQueuedUserTurnEstimate(session: AgentModeViewModel.TabSession) -> Int?
-    func beginTurn(session: AgentModeViewModel.TabSession, initialMessage: String)
-    func addUserInputTokens(_ tokens: Int, session: AgentModeViewModel.TabSession)
-    func addToolInputPayload(_ payload: String?, session: AgentModeViewModel.TabSession)
-    func addToolOutputPayload(_ payload: String?, session: AgentModeViewModel.TabSession)
+    func dequeueQueuedUserTurnEstimate(session: AgentTabSession) -> Int?
+    func beginTurn(session: AgentTabSession, initialMessage: String)
+    func addUserInputTokens(_ tokens: Int, session: AgentTabSession)
+    func addToolInputPayload(_ payload: String?, session: AgentTabSession)
+    func addToolOutputPayload(_ payload: String?, session: AgentTabSession)
 
     @discardableResult
     func ingestUsageSignal(
@@ -73,41 +74,51 @@ protocol ContextUsageEstimating: AnyObject {
         completionTokens: Int?,
         contextUsedTokens: Int?,
         modelContextWindow: Int?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> ContextUsageSnapshot?
 
     @discardableResult
     func ingestTurnFinalizationSignal(
         contextUsedTokens: Int?,
         modelContextWindow: Int?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> ContextUsageSnapshot?
 
-    func ingestStatusSignal(_ statusText: String?, session: AgentModeViewModel.TabSession)
-    func ingestSystemSignal(_ systemText: String?, session: AgentModeViewModel.TabSession)
+    func ingestStatusSignal(_ statusText: String?, session: AgentTabSession)
+    func ingestSystemSignal(_ systemText: String?, session: AgentTabSession)
 
     @discardableResult
     func finalizeTurn(
         promptTokens: Int?,
         completionTokens: Int?,
         contextUsedTokens: Int?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> Bool
 
     @discardableResult
     func ingestNativeContextUsage(
         _ usage: AgentContextUsage?,
-        session: AgentModeViewModel.TabSession
+        session: AgentTabSession
     ) -> ContextUsageSnapshot?
+
+    /// Whether this turn has already produced a provider-reported occupancy figure — the
+    /// estimator can then prefer that figure over billed prompt-call counts, and the vouch for
+    /// it is allowed to stand across a billed report. `false` for estimators whose reports are
+    /// themselves the occupancy claim.
+    func hasOccupancyReportThisTurn(session: AgentTabSession) -> Bool
 }
 
 extension ContextUsageEstimating {
     @discardableResult
     func ingestNativeContextUsage(
         _ usage: AgentContextUsage?,
-        session _: AgentModeViewModel.TabSession
+        session _: AgentTabSession
     ) -> ContextUsageSnapshot? {
         _ = usage
         return nil
+    }
+
+    func hasOccupancyReportThisTurn(session _: AgentTabSession) -> Bool {
+        false
     }
 }

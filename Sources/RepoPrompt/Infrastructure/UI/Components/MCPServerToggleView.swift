@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptSettingsCore
 import SwiftUI
 
 private struct MCPToolbarVisualState: Equatable {
@@ -96,17 +97,13 @@ struct MCPServerToggleView: View {
 
     var body: some View {
         Button(action: { showPopover.toggle() }) {
-            HStack(spacing: 6) {
-                Image(systemName: "server.rack")
-                    .imageScale(.medium)
-                    .foregroundColor(buttonIconColor)
-                Text("MCP Server")
-            }
+            Label("MCP Server", systemImage: "server.rack")
+                .labelStyle(.iconOnly)
+                .imageScale(.medium)
+                .foregroundColor(buttonIconColor)
         }
-        .buttonStyle(CustomButtonStyle())
-        .padding(.leading, 8)
-        .padding(.trailing, 8)
-        .help(toolbarStateObserver.visualState.helpText)
+        .hoverTooltip(toolbarStateObserver.visualState.helpText, .bottom)
+        .accessibilityHint(toolbarStateObserver.visualState.helpText)
         .popover(isPresented: $showPopover, attachmentAnchor: .rect(.bounds), arrowEdge: .top) {
             popoverContent()
         }
@@ -553,7 +550,8 @@ struct MCPServerPopoverContent: View {
                                 Image(systemName: "info.circle.fill")
                                     .foregroundColor(.orange)
                                     .font(.system(size: 12))
-                                    .help("Setup Wizard hid presets so you can use the model dropdown above directly. Click 'Show presets' to restore them.")
+                                    .hoverTooltip("Setup Wizard hid presets so you can use the model dropdown above directly. Click 'Show presets' to restore them.")
+                                    .accessibilityLabel("Setup Wizard hid presets so you can use the model dropdown above directly. Click Show presets to restore them.")
                                 Text("Presets hidden by Setup Wizard.")
                                     .font(fontPreset.captionFont)
                                     .foregroundColor(.secondary)
@@ -625,7 +623,10 @@ struct MCPServerPopoverContent: View {
 
     private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
         var items = promptViewModel.availableAgentKinds.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .cursor {
+                return StableMenuItem.submenu(agent.displayName, items: promptViewModel.cursorContextBuilderMenuItems(options: promptViewModel.contextBuilderModelOptions(for: agent)))
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: promptViewModel.contextBuilderModelOptions(for: agent),
                 selectedAgent: promptViewModel.contextBuilderAgent,
@@ -633,7 +634,7 @@ struct MCPServerPopoverContent: View {
             ) { selectedAgent, selectedOption in
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
-                // Force commit to GlobalSettingsStore so recommendation engine sees the change
+                // Persist even when the user re-selects the displayed runtime fallback.
                 promptViewModel.commitContextBuilderSettings()
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .recommendationsDidApply, object: nil)
@@ -679,7 +680,7 @@ struct MCPServerPopoverContent: View {
                             if result.success {
                                 showMCPFeedback(result.wasAlreadyPresent ? "Codex already configured" : "Codex configured")
                             } else {
-                                showMCPFeedback("Codex config failed", isError: true)
+                                showMCPFeedback(result.errorMessage ?? "Codex config failed", isError: true)
                             }
                         }
                         Button("OpenCode") {
@@ -861,7 +862,7 @@ struct MCPServerPopoverContent: View {
                     }
 
                     Section {
-                        Text("Codex CLI (~/.codex/prompts)")
+                        Text("RepoPrompt Codex (isolated prompts)")
                             .font(.caption)
                             .foregroundColor(.secondary)
 

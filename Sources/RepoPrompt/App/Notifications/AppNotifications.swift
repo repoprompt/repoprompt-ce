@@ -1,6 +1,11 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension Notification.Name {
+    /// Posted by `GlobalSettingsStore` after the notification preference group changes.
+    static let notificationPreferencesDidChange = Notification.Name("RepoPromptNotificationPreferencesDidChange")
+    /// Posted when the UI should open Settings to the Notifications tab.
+    static let showNotificationSettingsTab = Notification.Name("showNotificationSettingsTab")
     static let showAPISettingsTab = Notification.Name("showAPISettingsTab")
     /// General request to open/focus the dedicated Settings window (Appearance / current tab).
     /// `object` should be the WindowState to target; when omitted, the focused/latest window is used.
@@ -15,6 +20,8 @@ extension Notification.Name {
     static let showCLIProvidersTab = Notification.Name("showCLIProvidersTab")
     /// Posted when the UI should show the Agent Mode settings tab
     static let showAgentModeSettingsTab = Notification.Name("showAgentModeSettingsTab")
+    /// Posted when the UI should open Settings to the Model Router tab.
+    static let showModelRouterSettingsTab = Notification.Name("showModelRouterSettingsTab")
     /// Posted when the UI should open Settings to the Agent Models tab.
     static let showAgentModelsSettingsTab = Notification.Name("showAgentModelsSettingsTab")
     /// Posted when the UI should open Settings to the Agent Permissions tab.
@@ -64,17 +71,36 @@ extension Notification.Name {
     /// userInfo: ["windowID": Int]
     static let showMCPServerPopover = Notification.Name("showMCPServerPopover")
     /// Posted when Agent Mode should open the Oracle pill popover.
-    /// userInfo: ["windowID": Int, "tabID": UUID?, "chatID": String?]
+    /// userInfo: ["windowID": Int, "workspaceID": UUID, "tabID": UUID, "chatID": String]
+    /// Running Oracle tool calls may instead use ["route": "latest"] without chatID to open
+    /// the latest eligible tab/run-scoped Oracle chat.
     static let showAgentOraclePopover = Notification.Name("showAgentOraclePopover")
     /// Posted when Agent Mode should open the Workflow pill popover.
     /// userInfo: ["windowID": Int]
     static let showAgentWorkflowPopover = Notification.Name("showAgentWorkflowPopover")
+
     /// Posted by WorkspaceManagerViewModel when workspace switch overlay visibility changes.
     /// object: WorkspaceManagerViewModel instance (window-scoped)
     /// userInfo: ["isVisible": Bool]
     static let workspaceSwitchOverlayDidChange = Notification.Name("workspaceSwitchOverlayDidChange")
+    /// Posted when a compose tab's persisted display name changes.
+    /// userInfo: ["tabID": UUID, "windowID": Int, "name": String]
+    static let composeTabNameChanged = Notification.Name("composeTabNameChanged")
+    /// Posted when a compose tab is linked to or unlinked from a persistent Agent session.
+    /// userInfo: ["tabID": UUID, "windowID": Int, "previousSessionID": UUID?, "sessionID": UUID?]
+    static let agentSessionBindingDidChange = Notification.Name("agentSessionBindingDidChange")
 
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.
     static let toggleRepoPromptNavigationSidebar = Notification.Name("toggleRepoPromptNavigationSidebar")
+
+    /// Show the Agent navigation HUD for the target window.
+    /// userInfo: ["windowID": Int, "mode": AgentNavigationHUDMode.rawValue]
+    static let showAgentNavigationHUD = Notification.Name("showAgentNavigationHUD")
+
+    /// Select a numbered result in the Agent navigation HUD for the target window.
+    /// `handledRequest` is a synchronous mutable acknowledgement used by global
+    /// ⌘1–⌘9 handlers before they fall through to regular compose-tab switching.
+    /// userInfo: ["windowID": Int, "resultIndex": Int, "handledRequest": AgentNavigationHUDHandledRequest]
+    static let selectAgentNavigationHUDResult = Notification.Name("selectAgentNavigationHUDResult")
 }

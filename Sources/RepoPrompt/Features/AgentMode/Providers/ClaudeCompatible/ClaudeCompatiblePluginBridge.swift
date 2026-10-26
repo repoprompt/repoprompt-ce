@@ -18,7 +18,7 @@ enum ClaudeCompatiblePluginBridge {
             .kimiClaudeCode
         case .customClaudeCompatible:
             .customClaudeCompatible
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
             nil
         }
     }
@@ -114,8 +114,8 @@ enum ClaudeCompatiblePluginBridge {
     static func backendEnvironment(
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String
-    ) -> [String: String] {
-        ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
+    ) throws -> [String: String] {
+        try ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
     }
 
     static func removedBackendEnvironmentKeys(config: ClaudeCodeCompatibleBackendConfig) -> Set<String> {
@@ -208,7 +208,7 @@ enum ClaudeCompatiblePluginBridge {
             "Claude Code is unavailable."
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             "Claude-compatible backend is not configured."
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin:
             "Not a Claude-compatible provider."
         }
     }

@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 struct MetaInstruction {
     let title: String
@@ -40,106 +43,6 @@ enum PromptPackagingService {
         </title>
 
         """
-    }
-
-    private enum GitDiffArtifact {
-        static let rootFolderName = "_git_data"
-
-        static func isDiffArtifactPath(_ fullPath: String) -> Bool {
-            guard fullPath.contains("/\(rootFolderName)/") else { return false }
-            let lower = fullPath.lowercased()
-            guard lower.hasSuffix(".diff") || lower.hasSuffix(".patch") else { return false }
-            return lower.contains("/diff/") || lower.contains("/diffs/")
-        }
-    }
-
-    static func partitionPromptEntriesForGitDiff(
-        _ entries: [PromptFileEntry]
-    ) -> (diffEntries: [PromptFileEntry], codeEntries: [PromptFileEntry]) {
-        guard !entries.isEmpty else { return ([], []) }
-        var diffEntries: [PromptFileEntry] = []
-        var codeEntries: [PromptFileEntry] = []
-        diffEntries.reserveCapacity(entries.count)
-        codeEntries.reserveCapacity(entries.count)
-
-        for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
-                diffEntries.append(entry)
-            } else {
-                codeEntries.append(entry)
-            }
-        }
-        return (diffEntries, codeEntries)
-    }
-
-    static func selectedGitDiffText(
-        fromDiffEntries diffEntries: [PromptFileEntry]
-    ) async -> String? {
-        guard !diffEntries.isEmpty else { return nil }
-        let rawParts = await generateRawFileTexts(diffEntries)
-        return rawParts.isEmpty ? nil : rawParts.joined(separator: "\n\n")
-    }
-
-    static func selectedGitDiffText(
-        from entries: [PromptFileEntry]
-    ) async -> String? {
-        let (diffEntries, _) = partitionPromptEntriesForGitDiff(entries)
-        return await selectedGitDiffText(fromDiffEntries: diffEntries)
-    }
-
-    static func resolveGitDiff(
-        fromDiffEntries diffEntries: [PromptFileEntry],
-        fallback: @Sendable () async -> String?
-    ) async -> String? {
-        if let selected = await selectedGitDiffText(fromDiffEntries: diffEntries) {
-            return selected
-        }
-        return await fallback()
-    }
-
-    static func resolveGitDiff(
-        from entries: [PromptFileEntry],
-        fallback: @Sendable () async -> String?
-    ) async -> String? {
-        if let selected = await selectedGitDiffText(from: entries) {
-            return selected
-        }
-        return await fallback()
-    }
-
-    static func generateRawFileTexts(
-        _ entries: [PromptFileEntry]
-    ) async -> [String] {
-        guard !entries.isEmpty else { return [] }
-        var blocks: [String] = []
-        blocks.reserveCapacity(entries.count)
-
-        for entry in entries {
-            let file = entry.file
-
-            if let ranges = entry.ranges,
-               !ranges.isEmpty,
-               let assembly = await file.assembleContent(for: ranges)
-            {
-                if assembly.isFullFile {
-                    if !assembly.combinedText.isEmpty {
-                        blocks.append(assembly.combinedText)
-                    }
-                } else {
-                    let text = assembly.segments.map(\.text).joined(separator: "\n")
-                    if !text.isEmpty {
-                        blocks.append(text)
-                    }
-                }
-                continue
-            }
-
-            if let content = await file.latestContent, !content.isEmpty {
-                blocks.append(content)
-            }
-        }
-
-        return blocks
     }
 
     /// Build an AIMessage that includes:
@@ -214,7 +117,7 @@ enum PromptPackagingService {
         codeEntries.reserveCapacity(entries.count)
 
         for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
+            if entry.role == .authorizedGitDiffArtifact {
                 diffEntries.append(entry)
             } else {
                 codeEntries.append(entry)
@@ -227,6 +130,7 @@ enum PromptPackagingService {
         fromDiffEntries diffEntries: [ResolvedPromptFileEntry]
     ) -> String? {
         let rawParts = generateRawFileTexts(diffEntries)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         return rawParts.isEmpty ? nil : rawParts.joined(separator: "\n\n")
     }
 
@@ -243,6 +147,19 @@ enum PromptPackagingService {
     ) async -> String? {
         if let selected = selectedGitDiffText(fromDiffEntries: diffEntries) {
             return selected
+        }
+        return await fallback()
+    }
+
+    /// Preserves the selected-artifact-first lazy boundary while retaining structured fallback
+    /// details for diagnostics and tests. The fallback is never evaluated when a readable selected
+    /// patch is present.
+    static func resolveGitDiffResolution(
+        fromDiffEntries diffEntries: [ResolvedPromptFileEntry],
+        fallback: @Sendable () async -> PromptGitDiffResolution
+    ) async -> PromptGitDiffResolution {
+        if let selected = selectedGitDiffText(fromDiffEntries: diffEntries) {
+            return .selectedArtifact(selected)
         }
         return await fallback()
     }
@@ -287,21 +204,32 @@ enum PromptPackagingService {
     static func generateFileContents(
         _ files: [ResolvedPromptFileEntry],
         filePathDisplay: FilePathDisplay = .full,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) -> [String] {
-        let (_, contentBlocks) = generatePartitionedFileBlocks(files, filePathDisplay: filePathDisplay, codemapSnapshots: codemapSnapshots, displayPathResolver: displayPathResolver)
+        let (_, contentBlocks) = generatePartitionedFileBlocks(files, filePathDisplay: filePathDisplay, codemapPresentation: codemapPresentation, displayPathResolver: displayPathResolver)
         return contentBlocks
+    }
+
+    static func combinedFileMapContent(
+        fileTreeContent: String?,
+        codemapBlocks: [String]
+    ) -> String? {
+        let codemapContent = codemapBlocks.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let combined = [fileTreeContent ?? "", codemapContent]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        return combined.isEmpty ? nil : combined
     }
 
     static func generatePartitionedFileBlocks(
         _ files: [ResolvedPromptFileEntry],
         filePathDisplay: FilePathDisplay,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) -> (codemapBlocks: [String], contentBlocks: [String]) {
         let (_, codeEntries) = partitionPromptEntriesForGitDiff(files)
-        let detailed = generateFileBlocksDetailed(files: codeEntries, filePathDisplay: filePathDisplay, codemapSnapshots: codemapSnapshots, displayPathResolver: displayPathResolver)
+        let detailed = generateFileBlocksDetailed(files: codeEntries, filePathDisplay: filePathDisplay, codemapPresentation: codemapPresentation, displayPathResolver: displayPathResolver)
         var codemapBlocks: [String] = []
         var contentBlocks: [String] = []
 
@@ -320,7 +248,7 @@ enum PromptPackagingService {
     static func generateFileBlocksDetailed(
         files: [ResolvedPromptFileEntry],
         filePathDisplay: FilePathDisplay,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) -> [ResolvedPromptFileBlockRecord] {
         var blocks: [ResolvedPromptFileBlockRecord] = []
@@ -334,11 +262,10 @@ enum PromptPackagingService {
                 ?? selectedPath(for: entry, filePathDisplay: filePathDisplay, hasMultipleRoots: hasMultipleRoots)
 
             if entry.isCodemap {
-                if let api = codemapSnapshots[file.id]?.fileAPI {
-                    let description = api.getFullAPIDescription(displayPath: selectedPath)
-                    blocks.append(ResolvedPromptFileBlockRecord(entry: entry, file: file, text: description, isCodemap: true))
-                    continue
+                if let rendered = codemapPresentation.renderedEntriesByFileID[file.id] {
+                    blocks.append(ResolvedPromptFileBlockRecord(entry: entry, file: file, text: rendered.text, isCodemap: true))
                 }
+                continue
             }
 
             guard let content = entry.loadedContent else { continue }
@@ -356,302 +283,6 @@ enum PromptPackagingService {
         return blocks
     }
 
-    /// Produce file contents as an array of strings, each with the file path + raw content
-    static func generateFileContents(
-        _ files: [PromptFileEntry],
-        filePathDisplay: FilePathDisplay = .full
-    ) async -> [String] {
-        let (_, contentBlocks) = await generatePartitionedFileBlocks(files, filePathDisplay: filePathDisplay)
-        return contentBlocks
-    }
-
-    /// Partitions file blocks into codemap blocks and content blocks
-    static func generatePartitionedFileBlocks(
-        _ files: [PromptFileEntry],
-        filePathDisplay: FilePathDisplay
-    ) async -> (codemapBlocks: [String], contentBlocks: [String]) {
-        let (_, codeEntries) = partitionPromptEntriesForGitDiff(files)
-        let detailed = await generateFileBlocksDetailed(files: codeEntries, filePathDisplay: filePathDisplay)
-        var codemapBlocks: [String] = []
-        var contentBlocks: [String] = []
-
-        for (_, text, isCodemap) in detailed {
-            if text.isEmpty { continue }
-            if isCodemap {
-                codemapBlocks.append(text)
-            } else {
-                contentBlocks.append(text)
-            }
-        }
-
-        return (codemapBlocks, contentBlocks)
-    }
-
-    static func generateFileBlocksDetailed(
-        files: [PromptFileEntry],
-        filePathDisplay: FilePathDisplay
-    ) async -> [(file: FileViewModel, text: String, isCodemap: Bool)] {
-        var blocks: [(FileViewModel, String, Bool)] = []
-        guard !files.isEmpty else { return blocks }
-
-        let hasMultipleRoots = Set(files.map(\.file.rootFolderPath)).count > 1
-
-        for entry in files {
-            let file = entry.file
-            let selectedPath: String = if filePathDisplay == .relative {
-                hasMultipleRoots ? file.uniqueRelativePath : file.relativePath
-            } else {
-                file.fullPath
-            }
-
-            if entry.isCodemap {
-                // Fallback: If codemap not available, fall through to full content
-                if let api = file.fileAPI {
-                    let description = api.getFullAPIDescription(displayPath: selectedPath)
-                    blocks.append((file, description, true))
-                    continue
-                }
-                // No codemap available, fall through to treat as full content entry
-            }
-
-            let startFence = codeFenceStart(for: file.name)
-
-            if let ranges = entry.ranges,
-               !ranges.isEmpty,
-               let assembly = await file.assembleContent(for: ranges)
-            {
-                let text = renderFileBlock(selectedPath: selectedPath, startFence: startFence, content: assembly.combinedText, assembly: assembly)
-                blocks.append((file, text, false))
-                continue
-            }
-
-            guard let content = await file.latestContent else { continue }
-            let text = renderFullFileBlock(selectedPath: selectedPath, startFence: startFence, content: content)
-            blocks.append((file, text, false))
-        }
-
-        return blocks
-    }
-
-    static func generatePrompt(
-        systemPrompt: String,
-        metaInstructions: [MetaInstruction],
-        userInstructions: String,
-        files: [PromptFileEntry],
-        filePathDisplay: FilePathDisplay,
-        fileTreeContent: String?, // NEW simplified parameter for the file tree
-        gitDiff: String? = nil,
-        includeDatetimeInUserInstructions: Bool = false,
-        // Add parameters needed by PromptAssemblyBuilder
-        promptSectionsOrder: [PromptSection],
-        disabledPromptSections: Set<PromptSection>,
-        duplicateUserInstructionsAtTop: Bool
-    ) async -> AIMessage {
-        // --- Generate Snippets ---
-        var snippets: [PromptSection: String] = [:]
-
-        let (diffEntries, codeEntries) = partitionPromptEntriesForGitDiff(files)
-        let (codemapBlocks, contentBlocks) = await generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay)
-
-        // File Map Snippet - CRITICAL: Check for codemaps OR tree
-        let codemapJoined = codemapBlocks.joined(separator: "\n\n")
-        let hasTree = fileTreeContent != nil && !fileTreeContent!.isEmpty
-        let hasCodemaps = !codemapJoined.isEmpty
-
-        if hasTree || hasCodemaps {
-            let combinedMap = [fileTreeContent ?? "", codemapJoined]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
-            snippets[.fileMap] = """
-            <file_map>
-            \(combinedMap)
-            </file_map>
-
-            """
-        }
-
-        // File Contents Snippet - only content blocks
-        if !contentBlocks.isEmpty {
-            let snippet = """
-            <file_contents>
-            \(contentBlocks.joined(separator: "\n\n"))
-            </file_contents>
-
-            """
-            snippets[.fileContents] = snippet
-        }
-
-        // Meta Prompts Snippet
-        if let metaSnippet = buildMetaPromptsSnippet(metaInstructions) {
-            snippets[.metaPrompts] = metaSnippet
-        }
-
-        let effectiveGitDiff = await resolveGitDiff(
-            fromDiffEntries: diffEntries
-        ) {
-            gitDiff
-        }
-
-        // Git Diff Snippet
-        if let diff = effectiveGitDiff, !diff.isEmpty {
-            let snippet = """
-            <git_diff>
-            \(diff)
-            </git_diff>
-
-            """
-            snippets[.gitDiff] = snippet
-        }
-
-        // User Instructions Snippet
-        if !userInstructions.isEmpty {
-            var snippet = ""
-            if includeDatetimeInUserInstructions {
-                let dateFormatter = DateFormatter()
-                dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
-                let dateString = dateFormatter.string(from: Date())
-                snippet += """
-                <user_instructions date="\(dateString)">
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            } else {
-                snippet += """
-                <user_instructions>
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            }
-            snippets[.userInstructions] = snippet
-        }
-
-        // --- Build Final User Message ---
-        let userMessage = PromptAssemblyBuilder.build(
-            order: promptSectionsOrder,
-            disabled: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
-            snippets: snippets
-        )
-
-        // --- Return AIMessage ---
-        return AIMessage(
-            systemPrompt: systemPrompt,
-            userMessage: userMessage
-        )
-    }
-
-    static func generateClipboardContent(
-        metaInstructions: [MetaInstruction],
-        userInstructions: String,
-        files: [PromptFileEntry],
-        fileTreeContent: String?, // NEW simplified parameter for the file tree
-        gitDiff: String? = nil,
-        includeSavedPrompts: Bool,
-        includeFiles: Bool,
-        includeUserPrompt: Bool,
-        filePathDisplay: FilePathDisplay,
-        includeDatetimeInUserInstructions: Bool = false,
-        promptSectionsOrder: [PromptSection],
-        disabledPromptSections: Set<PromptSection>,
-        duplicateUserInstructionsAtTop: Bool,
-        tabTitle: String? = nil,
-        displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
-    ) async -> String {
-        // --- Generate Snippets ---
-        var snippets: [PromptSection: String] = [:]
-
-        let (diffEntries, codeEntries) = partitionPromptEntriesForGitDiff(files)
-        let (codemapBlocks, contentBlocks) = await generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay)
-
-        // File Map Snippet - CRITICAL: Check for codemaps OR tree
-        let codemapJoined = codemapBlocks.joined(separator: "\n\n")
-        let hasTree = fileTreeContent != nil && !fileTreeContent!.isEmpty
-        let hasCodemaps = !codemapJoined.isEmpty
-
-        if hasTree || hasCodemaps {
-            let combinedMap = [fileTreeContent ?? "", codemapJoined]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
-            snippets[.fileMap] = """
-            <file_map>
-            \(combinedMap)
-            </file_map>
-
-            """
-        }
-
-        // File Contents Snippet - only content blocks
-        if includeFiles, !contentBlocks.isEmpty {
-            let snippet = """
-            <file_contents>
-            \(contentBlocks.joined(separator: "\n\n"))
-            </file_contents>
-
-            """
-            snippets[.fileContents] = snippet
-        }
-
-        // Meta Prompts Snippet
-        if includeSavedPrompts, let metaSnippet = buildMetaPromptsSnippet(metaInstructions) {
-            snippets[.metaPrompts] = metaSnippet
-        }
-
-        let effectiveGitDiff = await resolveGitDiff(
-            fromDiffEntries: diffEntries
-        ) {
-            gitDiff
-        }
-
-        // Git Diff Snippet
-        if let diff = effectiveGitDiff, !diff.isEmpty {
-            let snippet = """
-            <git_diff>
-            \(diff)
-            </git_diff>
-
-            """
-            snippets[.gitDiff] = snippet
-        }
-
-        // User Instructions Snippet
-        if includeUserPrompt, !userInstructions.isEmpty {
-            var snippet = ""
-            if includeDatetimeInUserInstructions {
-                let dateFormatter = DateFormatter()
-                dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
-                let dateString = dateFormatter.string(from: Date())
-                snippet += """
-                <user_instructions date="\(dateString)">
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            } else {
-                snippet += """
-                <user_instructions>
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            }
-            snippets[.userInstructions] = snippet
-        }
-
-        // --- Build Final String ---
-        let clipboardContent = PromptAssemblyBuilder.build(
-            order: promptSectionsOrder,
-            disabled: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
-            snippets: snippets
-        )
-
-        // NEW: Prepend title block if provided and not generic
-        let prefix = Self.titleSnippet(for: tabTitle) ?? ""
-        return prefix + clipboardContent
-    }
-
     static func generateClipboardContent(
         metaInstructions: [MetaInstruction],
         userInstructions: String,
@@ -662,7 +293,7 @@ enum PromptPackagingService {
         includeFiles: Bool,
         includeUserPrompt: Bool,
         filePathDisplay: FilePathDisplay,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
         includeDatetimeInUserInstructions: Bool = false,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
@@ -673,16 +304,12 @@ enum PromptPackagingService {
         var snippets: [PromptSection: String] = [:]
 
         let (diffEntries, codeEntries) = partitionPromptEntriesForGitDiff(files)
-        let (codemapBlocks, contentBlocks) = generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay, codemapSnapshots: codemapSnapshots, displayPathResolver: displayPathResolver)
+        let (codemapBlocks, contentBlocks) = generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay, codemapPresentation: codemapPresentation, displayPathResolver: displayPathResolver)
 
-        let codemapJoined = codemapBlocks.joined(separator: "\n\n")
-        let hasTree = fileTreeContent != nil && !fileTreeContent!.isEmpty
-        let hasCodemaps = !codemapJoined.isEmpty
-
-        if hasTree || hasCodemaps {
-            let combinedMap = [fileTreeContent ?? "", codemapJoined]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
+        if let combinedMap = combinedFileMapContent(
+            fileTreeContent: fileTreeContent,
+            codemapBlocks: codemapBlocks
+        ) {
             snippets[.fileMap] = """
             <file_map>
             \(combinedMap)

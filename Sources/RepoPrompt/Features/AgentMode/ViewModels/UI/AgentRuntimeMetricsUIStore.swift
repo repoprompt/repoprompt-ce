@@ -1,26 +1,26 @@
 import Foundation
+import RepoPromptInstrumentation
 
 @MainActor
 final class AgentRuntimeMetricsUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     let runtimeVM = AgentRuntimeSidebarViewModel()
     @Published private(set) var revision: Int = 0
-    private var lastLiveSelectedFileCount: Int?
 
     func update(
         transcriptSnapshot: AgentTranscriptAnalyticsSnapshot,
         codexUsage: AgentContextUsage?,
         liveSelectedFileCount: Int?,
+        liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String
     ) {
-        if let liveSelectedFileCount {
-            lastLiveSelectedFileCount = liveSelectedFileCount
-        }
         let previousSnapshot = runtimeVM.snapshot
         runtimeVM.update(
             snapshot: transcriptSnapshot,
             codexUsage: codexUsage,
-            liveSelectedFileCount: lastLiveSelectedFileCount,
+            liveSelectedFileCount: liveSelectedFileCount,
+            liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw
         )
@@ -29,7 +29,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
             revision &+= 1
         }
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 "runtimeMetrics",
                 published: didPublish,
                 details: [
@@ -37,6 +37,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
                     "usedTokens": runtimeVM.snapshot.usedTokens.map(String.init) ?? "nil",
                     "estimatedTranscriptTokens": runtimeVM.snapshot.estimatedTranscriptTokens.map(String.init) ?? "nil",
                     "selectionFileCount": runtimeVM.snapshot.selectionFileCount.map(String.init) ?? "nil",
+                    "selectionSliceRanges": runtimeVM.snapshot.selectionSummary.map { String($0.sliceRangeCount) } ?? "nil",
                     "updatedAtChanged": String(runtimeVM.snapshot.updatedAt != previousSnapshot.updatedAt)
                 ]
             )

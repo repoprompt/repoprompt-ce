@@ -8,6 +8,8 @@ import MCP
 /// Shared utility functions used by `AgentRunMCPToolService` and `AgentManageMCPToolService`.
 /// Extracted to eliminate duplication across the two tool services and the snapshot model.
 enum AgentMCPToolHelpers {
+    static let maximumTimeoutSeconds: TimeInterval = 86400
+
     // MARK: - String parsing
 
     /// Trims whitespace and returns nil for empty strings.
@@ -51,28 +53,45 @@ enum AgentMCPToolHelpers {
         }
     }
 
+    // MARK: - Int parsing
+
+    /// Converts a model-supplied double to an `Int` without trapping.
+    ///
+    /// `Int(someDouble)` is a runtime trap for non-finite values and for magnitudes outside `Int`'s
+    /// representable range. That is reachable from ordinary tool arguments: the MCP `Value` decoder
+    /// falls back to `.double` for any JSON numeral that does not fit `Int` (`1e300`,
+    /// `99999999999999999999`), and no schema validation runs between the transport and these
+    /// services. Saturating at the bounds lets each caller's own clamp or validation handle the
+    /// value instead of crashing the app.
+    static func saturatingInt(fromDouble value: Double) -> Int? {
+        guard value.isFinite else { return nil }
+        let truncated = value.rounded(.towardZero)
+        // `Double(Int.max)` rounds up to 2^63, so `>=` is the correct out-of-range test; `Int.min`
+        // is exactly representable, so `<=` saturates it without excluding the valid value.
+        if truncated >= Double(Int.max) { return Int.max }
+        if truncated <= Double(Int.min) { return Int.min }
+        return Int(truncated)
+    }
+
     // MARK: - Timeout parsing
 
     /// Parses a timeout in seconds from int, double, or string Value representations.
     static func parseTimeoutSeconds(_ value: Value?) throws -> TimeInterval? {
         guard let value else { return nil }
+        let seconds: TimeInterval
         switch value {
         case let .int(intValue):
-            let seconds = TimeInterval(intValue)
-            guard seconds >= 0 else {
-                throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
-            }
-            return seconds
+            seconds = TimeInterval(intValue)
         case let .double(doubleValue):
             guard doubleValue.isFinite, doubleValue >= 0 else {
                 throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
             }
-            return doubleValue
+            seconds = doubleValue
         case let .string(stringValue):
             guard let parsed = Double(stringValue), parsed.isFinite, parsed >= 0 else {
                 throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
             }
-            return parsed
+            seconds = parsed
         case .null:
             return nil
         case .bool, .array, .object:
@@ -80,6 +99,17 @@ enum AgentMCPToolHelpers {
         default:
             throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
         }
+        guard seconds >= 0 else {
+            throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
+        }
+        guard seconds <= maximumTimeoutSeconds else {
+            throw MCPError.invalidParams("timeout must be \(Self.renderTimeout(maximumTimeoutSeconds)) seconds or less.")
+        }
+        return seconds
+    }
+
+    private static func renderTimeout(_ seconds: TimeInterval) -> String {
+        seconds.rounded(.down) == seconds ? String(Int(seconds)) : String(seconds)
     }
 
     // MARK: - Timestamps

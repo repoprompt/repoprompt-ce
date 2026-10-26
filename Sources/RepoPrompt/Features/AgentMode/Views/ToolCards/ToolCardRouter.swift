@@ -1,18 +1,27 @@
 import Foundation
+import RepoPromptShared
 import SwiftUI
 
 func normalizedToolCardName(_ name: String?) -> String? {
-    guard let raw = name?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
-    let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(raw) ?? raw
+    guard let acceptedName = AgentToolNamePolicy.accepted(name) else { return nil }
+    let raw = acceptedName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !raw.isEmpty else { return nil }
+    // Companion calls keep their server prefix in the transcript; cards show the bare action.
+    let canonical = MCPIntegrationHelper.computerUseCompanionToolName(raw)
+        ?? MCPIntegrationHelper.canonicalRepoPromptToolName(raw)
+        ?? raw
     // External tools can be namespaced (for example, "functions.bash").
     // Route by suffix so tool cards stay consistent.
+    if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(canonical.lowercased()) {
+        return webCanonical
+    }
     let suffix = canonical.split(separator: ".").last.map(String.init) ?? canonical
     let lowered = suffix.lowercased()
     if lowered == "local_shell" || lowered == "shell" || lowered == "unified_exec" || lowered == "exec_command" || lowered == "run_shell_command" {
         return "bash"
     }
-    if lowered == "web_search" || lowered == "web_search_request" || lowered == "google_web_search" || lowered == "search_web" {
-        return "search"
+    if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(lowered) {
+        return webCanonical
     }
     if lowered == "filechange" || lowered == "file_change" {
         return "apply_patch"
@@ -33,56 +42,29 @@ func isAutoExpandableEditToolResult(_ item: AgentChatItem) -> Bool {
     return toolName == "apply_edits" || toolName == "apply_patch" || toolName == "edit"
 }
 
-struct AgentOracleOpenContext {
-    let windowID: Int
-    let tabID: UUID?
-    let chatID: String?
-
-    init(windowID: Int, tabID: UUID?, chatID: String? = nil) {
-        self.windowID = windowID
-        self.tabID = tabID
-        self.chatID = chatID
-    }
-}
-
 enum AgentOracleToolRouting {
-    static func stringValue(from json: String?, keys: [String]) -> String? {
-        guard let json else { return nil }
-        let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        guard let data = trimmed.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data, options: [])
-        else {
-            return nil
-        }
-        return stringValue(from: object, keys: keys)
+    static func operationPopoverUserInfo(
+        openContext: AgentOracleOpenContext?,
+        chatID: String?,
+        tabID: UUID? = nil,
+        presentation: AgentOraclePopoverPresentation = .standard
+    ) -> [AnyHashable: Any]? {
+        AgentOraclePopoverRoute(
+            openContext: openContext,
+            chatID: chatID,
+            tabID: tabID,
+            presentation: presentation
+        )?.notificationUserInfo
     }
 
-    private static func stringValue(from value: Any, keys: [String]) -> String? {
-        if let dictionary = value as? [String: Any] {
-            for key in keys {
-                if let string = dictionary[key] as? String {
-                    let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { return trimmed }
-                }
-                if let uuid = dictionary[key] as? UUID {
-                    return uuid.uuidString
-                }
-                if let number = dictionary[key] as? NSNumber {
-                    let text = number.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !text.isEmpty { return text }
-                }
-            }
-            for nested in dictionary.values {
-                if let match = stringValue(from: nested, keys: keys) { return match }
-            }
-        }
-        if let array = value as? [Any] {
-            for element in array {
-                if let match = stringValue(from: element, keys: keys) { return match }
-            }
-        }
-        return nil
+    static func latestPopoverUserInfo(
+        openContext: AgentOracleOpenContext?,
+        tabID: UUID? = nil
+    ) -> [AnyHashable: Any]? {
+        AgentOracleLatestPopoverRoute(
+            openContext: openContext,
+            tabID: tabID
+        )?.notificationUserInfo
     }
 }
 
@@ -124,6 +106,7 @@ enum ToolCardRouter {
         "edit",
         "file_search",
         "search",
+        "web_read",
         "get_file_tree",
         "get_code_structure",
         "file_actions",
@@ -154,11 +137,12 @@ enum ToolCardRouter {
     ) -> AnyView {
         let normalized = normalizedToolCardName(item.toolName)
         let key = normalized?.lowercased()
-        let subtitle = callSubtitle(for: key, argsJSON: item.toolArgsJSON)
+        let presentation = callPresentation(for: item)
+        let subtitle = presentation?.subtitle ?? callSubtitle(for: key, argsJSON: item.toolArgsJSON)
         return AnyView(
             ToolCallCard(
                 item: item,
-                title: toolDisplayName(for: normalized ?? item.toolName),
+                title: presentation?.title ?? toolDisplayName(for: normalized ?? item.toolName),
                 subtitle: subtitle,
                 oracleOpenContext: oracleOpenContext,
                 showRunScopedToolCancel: showRunScopedToolCancel,
@@ -192,7 +176,9 @@ enum ToolCardRouter {
         case "file_search":
             return AnyView(FileSearchResultCard(item: item))
         case "search":
-            return AnyView(WebSearchResultCard(item: item))
+            return AnyView(WebSearchResultCard(item: item, normalizedToolName: "search"))
+        case "web_read":
+            return AnyView(WebSearchResultCard(item: item, normalizedToolName: "web_read"))
         case "get_file_tree":
             return AnyView(FileTreeResultCard(item: item))
         case "get_code_structure":
@@ -242,6 +228,22 @@ enum ToolCardRouter {
             }
             return AnyView(UnknownToolResultCard(item: item, title: toolDisplayName(for: normalized ?? item.toolName)))
         }
+    }
+
+    struct ToolCallPresentation: Equatable {
+        let title: String
+        let subtitle: String?
+    }
+
+    static func callPresentation(for item: AgentChatItem) -> ToolCallPresentation? {
+        let normalized = normalizedToolCardName(item.toolName)?.lowercased()
+        guard let webPresentation = AgentWebToolActionPresentation.classify(
+            rawToolName: item.toolName,
+            normalizedToolName: normalized,
+            argsJSON: item.toolArgsJSON,
+            resultJSON: nil
+        ) else { return nil }
+        return ToolCallPresentation(title: webPresentation.title, subtitle: webPresentation.subtitle)
     }
 
     static func callSubtitle(for toolName: String?, argsJSON: String?) -> String? {
@@ -329,12 +331,16 @@ private enum ToolCardSubtitleBuilder {
             }
         case "get_code_structure":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.CodeStructureArgs.self, from: argsJSON) {
-                if args.scope == "selected" {
-                    return "selected"
+                let target = if let count = args.paths?.count, count > 0 {
+                    "\(count) path\(count == 1 ? "" : "s")"
+                } else {
+                    "selection"
                 }
-                if let count = args.paths?.count, count > 0 {
-                    return "\(count) path\(count == 1 ? "" : "s")"
+                if let expand = args.expand {
+                    let depth = args.depth ?? 1
+                    return "\(target) • \(expand), depth \(depth)"
                 }
+                return target
             }
         case "file_actions":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.FileActionsArgs.self, from: argsJSON),
@@ -454,8 +460,8 @@ private enum ToolCardSubtitleBuilder {
             {
                 return command
             }
-        case "search", "web_search", "web_search_request", "google_web_search", "search_web":
-            if let query = stringArgument(from: argsJSON, keys: ["query", "q", "search_query", "searchQuery", "text", "value"]),
+        case "search":
+            if let query = stringArgument(from: argsJSON, keys: AgentWebToolPayloadKeys.legacySearchQueryKeys),
                !query.isEmpty
             {
                 return "\"\(query)\""
@@ -632,8 +638,10 @@ private enum ToolCardSubtitleBuilder {
         if detach == true {
             return "detach"
         }
-        let resolvedTimeout = timeout ?? AgentRunMCPToolService.defaultWaitTimeoutSeconds
-        return resolvedTimeout <= 0 ? "poll" : "wait ≤\(formatSeconds(resolvedTimeout))"
+        guard let timeout else {
+            return "wait (default)"
+        }
+        return timeout <= 0 ? "poll" : "wait ≤\(formatSeconds(timeout))"
     }
 
     private static func formatSeconds(_ seconds: Double) -> String {
@@ -741,6 +749,34 @@ private enum ToolCardSubtitleBuilder {
     }
 }
 
+func oracleToolCallPopoverUserInfo(
+    item: AgentChatItem,
+    openContext: AgentOracleOpenContext?
+) -> [AnyHashable: Any]? {
+    guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
+          toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send"
+    else { return nil }
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolResultJSON)
+    ) {
+        return exact
+    }
+    guard item.toolResultJSON == nil, item.toolIsError == nil else { return nil }
+
+    if let exact = AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
+    ) {
+        return exact
+    }
+    guard AgentOracleAuthoritativeChatIDPolicy.allowsLatestFallback(fromSerializedJSON: item.toolArgsJSON) else {
+        return nil
+    }
+    return AgentOracleToolRouting.latestPopoverUserInfo(openContext: openContext)
+}
+
 enum ToolCallCardStateResolver {
     static func status(for item: AgentChatItem) -> ToolCardStatus {
         if item.toolResultJSON != nil || item.toolIsError != nil {
@@ -792,19 +828,11 @@ struct ToolCallCard: View {
     }
 
     private var onTap: (() -> Void)? {
-        guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
-              toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send",
-              let oracleOpenContext else { return nil }
+        guard let userInfo = oracleToolCallPopoverUserInfo(
+            item: item,
+            openContext: oracleOpenContext
+        ) else { return nil }
         return {
-            var userInfo: [AnyHashable: Any] = ["windowID": oracleOpenContext.windowID]
-            if let tabID = oracleOpenContext.tabID {
-                userInfo["tabID"] = tabID
-            }
-            if let chatID = AgentOracleToolRouting.stringValue(from: item.toolArgsJSON, keys: ["chat_id", "chatID"])
-                ?? oracleOpenContext.chatID
-            {
-                userInfo["chatID"] = chatID
-            }
             NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
         }
     }

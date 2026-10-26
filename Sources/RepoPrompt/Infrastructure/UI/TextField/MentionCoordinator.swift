@@ -4,183 +4,180 @@ import Foundation
 
 @MainActor
 final class MentionCoordinator: MentionTextViewDelegate {
-    // MARK: – Init & stored refs
+    private struct LevelState {
+        let parent: MentionSuggestion?
+        var suggestions: [MentionSuggestion]
+        var highlightedIndex: Int
+    }
+
+    private struct QueryRequest {
+        let query: String
+        let parent: MentionSuggestion?
+        let preserveIndex: Bool
+        let epoch: UInt64
+    }
+
+    // MARK: - Init & stored refs
 
     private unowned let textView: MentionTextView
     private let suggestionService: MentionSuggestionService
     private let overlay = MentionOverlayController()
+    private var configuration: FileMentionPickerConfiguration
     private let commitHandler: (MentionSuggestion) -> Void
     private let tokenRemovedHandler: (MentionTokenPayload) -> Void
 
     init(
         textView: MentionTextView,
         suggestionService: MentionSuggestionService,
+        configuration: FileMentionPickerConfiguration = .compact,
         commitHandler: @escaping (MentionSuggestion) -> Void,
         tokenRemovedHandler: @escaping (MentionTokenPayload) -> Void
     ) {
         self.textView = textView
         self.suggestionService = suggestionService
+        self.configuration = configuration
         self.commitHandler = commitHandler
         self.tokenRemovedHandler = tokenRemovedHandler
+        applyConfiguration(configuration)
 
-        // ------------------------------------------------------------------
-        // Debounce search queries (80 ms) so the UI remains responsive while
-        // the user is typing fast.  The subscription is stored in
-        // `cancellables`, so it is cancelled automatically on deinit.
-        // ------------------------------------------------------------------
         querySubject
             .debounce(for: .milliseconds(80), scheduler: RunLoop.main)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] q, parent, preserve in
-                self?.runQuery(q, parent: parent, preserveIndex: preserve)
+            .sink { [weak self] request in
+                self?.runQuery(request)
             }
             .store(in: &cancellables)
+
+        overlay.onRowClicked = { [weak self] level, index in
+            self?.selectSuggestion(at: index, inLevel: level)
+        }
     }
 
-    // MARK: – Internal state
+    func updateFileManager(_ manager: WorkspaceFilesViewModel?) {
+        guard suggestionService.updateFileManager(manager) else { return }
+        resetMentionSession(endTextViewSession: true)
+    }
 
-    private var parentStack: [MentionSuggestion?] = [nil]
-    // Mirrors `parentStack` – keeps the highlighted row for every depth
-    private var highlightStack: [Int] = [0]
-    private var suggestions: [MentionSuggestion] = []
-    private var highlighted: Int = 0
+    func updateConfiguration(_ configuration: FileMentionPickerConfiguration) {
+        guard self.configuration != configuration else { return }
+        self.configuration = configuration
+        resetMentionSession(endTextViewSession: true)
+        applyConfiguration(configuration)
+    }
 
-    // Combine-based debounce ------------------------------------------------
-    private let querySubject = PassthroughSubject<(String, MentionSuggestion?, Bool), Never>()
+    private func applyConfiguration(_ configuration: FileMentionPickerConfiguration) {
+        suggestionService.updateConfiguration(configuration)
+        overlay.suggestedWidth = configuration.overlayWidth
+        overlay.visibleRowLimit = configuration.visibleRows
+    }
+
+    // MARK: - Internal state
+
+    private var levels = [LevelState(parent: nil, suggestions: [], highlightedIndex: 0)]
+
+    private var currentParent: MentionSuggestion? {
+        guard let level = levels.last else { return nil }
+        return level.parent
+    }
+
+    private var currentSuggestions: [MentionSuggestion] {
+        levels.last?.suggestions ?? []
+    }
+
+    private var currentHighlightedIndex: Int {
+        levels.last?.highlightedIndex ?? 0
+    }
+
+    private let querySubject = PassthroughSubject<QueryRequest, Never>()
     private var cancellables = Set<AnyCancellable>()
+    private var queryEpoch: UInt64 = 0
+    #if DEBUG
+        private var testPendingDebouncedQuery: QueryRequest?
+    #endif
     private var pendingReanchorTask: Task<Void, Never>?
     private var reanchorGeneration: UInt64 = 0
 
-    // MARK: – Delegate entry-points (will be wired later)
+    // MARK: - MentionTextViewDelegate
 
     func mentionStarted(at caret: NSRect) {
-        parentStack = [nil]
-        highlightStack = [0]
-        highlighted = 0
+        invalidatePendingQueries()
 
-        // Pre-compute the default suggestion list (empty query at repo root)
-        let initialItems = suggestionService.suggestions(for: "", under: nil)
-        suggestions = initialItems
+        let initialSuggestions = suggestionService.suggestions(for: "", under: nil)
+        levels = [LevelState(parent: nil, suggestions: initialSuggestions, highlightedIndex: 0)]
 
         guard !textView.hasMarkedText(), let host = textView.window else {
             overlay.hide()
             return
         }
-        // Pass the real items right away so the table never displays the
-        // "No results found" placeholder.
-        overlay.show(at: caret, owner: host, items: initialItems)
+        overlay.show(at: caret, owner: host, items: initialSuggestions)
         scheduleOverlayReanchor()
     }
 
-    /// ------------------------------------------------------------------
-    /// Overload required by `MentionTextViewDelegate` for protocol conformance
-    /// ------------------------------------------------------------------
-    func mentionQueryChanged(_ q: String, parent: MentionSuggestion?) {
-        mentionQueryChanged(q, parent: parent, preserveIndex: false)
+    func mentionQueryChanged(_ query: String, parent: MentionSuggestion?) {
+        mentionQueryChanged(query, parent: parent, preserveIndex: false)
     }
 
     func mentionQueryChanged(
-        _ q: String,
+        _ query: String,
         parent: MentionSuggestion?,
         preserveIndex: Bool = false
     ) {
-        // Push every change through the Combine pipeline; the subscriber
-        // will receive debounced updates on the main run-loop.
-        querySubject.send((q, parent, preserveIndex))
+        let request = QueryRequest(
+            query: query,
+            parent: parent,
+            preserveIndex: preserveIndex,
+            epoch: queryEpoch
+        )
+        #if DEBUG
+            testPendingDebouncedQuery = request
+        #endif
+        querySubject.send(request)
     }
 
-    // ------------------------------------------------------------------
-    // MARK: – Private helpers
+    func mentionNavigate(_ command: MentionNavigationCommand) {
+        guard let currentLevelIndex = levels.indices.last else { return }
 
-    /// ------------------------------------------------------------------
-    private func runQuery(
-        _ q: String,
-        parent: MentionSuggestion?,
-        preserveIndex: Bool
-    ) {
-        guard !textView.hasMarkedText() else {
-            overlay.hide()
-            return
-        }
-        // Resolve `nil` parent to the current folder context so searches stay
-        // properly scoped after the user has drilled into a sub-folder.
-        let effectiveParent = parent ?? parentStack.last ?? nil
-        let items = suggestionService.suggestions(for: q, under: effectiveParent)
-        suggestions = items
-
-        // Decide which row should be highlighted first
-        let desired = preserveIndex
-            ? (highlightStack.last ?? 0)
-            : 0
-        // Clamp in case the list shrunk; avoid negative when list is empty
-        highlighted = items.isEmpty ? 0 : min(max(desired, 0), items.count - 1)
-
-        // Sync per-level cache
-        if !highlightStack.isEmpty {
-            highlightStack[highlightStack.count - 1] = highlighted
-        }
-
-        overlay.update(items: items, highlighted: highlighted)
-        guard textView.window != nil else {
-            overlay.hide()
-            return
-        }
-        scheduleOverlayReanchor()
-    }
-
-    func mentionNavigate(_ cmd: MentionNavigationCommand) {
-        // Ensure stacks are initialized
-        if highlightStack.isEmpty {
-            highlightStack = [0]
-        }
-        if parentStack.isEmpty {
-            parentStack = [nil]
-        }
-        switch cmd {
+        switch command {
         case .up:
-            highlighted = (highlighted - 1 + suggestions.count) % max(suggestions.count, 1)
+            let count = levels[currentLevelIndex].suggestions.count
+            levels[currentLevelIndex].highlightedIndex =
+                (levels[currentLevelIndex].highlightedIndex - 1 + count) % max(count, 1)
             overlay.moveHighlight(by: -1)
-            if !highlightStack.isEmpty {
-                highlightStack[highlightStack.count - 1] = highlighted
-            }
         case .down:
-            highlighted = (highlighted + 1) % max(suggestions.count, 1)
-            overlay.moveHighlight(by: +1)
-            if !highlightStack.isEmpty {
-                highlightStack[highlightStack.count - 1] = highlighted
-            }
+            let count = levels[currentLevelIndex].suggestions.count
+            levels[currentLevelIndex].highlightedIndex =
+                (levels[currentLevelIndex].highlightedIndex + 1) % max(count, 1)
+            overlay.moveHighlight(by: 1)
         case .left:
-            guard parentStack.count > 1 else { return }
-            parentStack.removeLast()
-            highlightStack.removeLast()
-            highlighted = highlightStack.last ?? 0
-
+            guard levels.count > 1 else { return }
+            levels.removeLast()
             overlay.popLevel()
-            // Refresh suggestions for the new parent folder but keep index
-            mentionQueryChanged("", parent: parentStack.last ?? nil, preserveIndex: true)
+            mentionQueryChanged("", parent: currentParent, preserveIndex: true)
         case .right:
-            guard highlighted >= 0,
-                  highlighted < suggestions.count,
-                  suggestions[highlighted].kind == .folder
-            else { return }
-            parentStack.append(suggestions[highlighted])
-            // Store current selection, start child level at 0
-            highlightStack.append(0)
+            guard currentSuggestions.indices.contains(currentHighlightedIndex) else { return }
+            let selectedSuggestion = currentSuggestions[currentHighlightedIndex]
+            guard selectedSuggestion.kind == .folder else { return }
+
+            levels.append(LevelState(
+                parent: selectedSuggestion,
+                suggestions: [],
+                highlightedIndex: 0
+            ))
             overlay.pushLevel()
-            // clear query for new level
-            mentionQueryChanged("", parent: parentStack.last ?? nil)
+            mentionQueryChanged("", parent: selectedSuggestion)
         }
     }
 
     func mentionAccept() {
-        guard highlighted >= 0, highlighted < suggestions.count else { return }
-        let sugg = suggestions[highlighted]
-        overlay.hide() // Tear down UI first
-        textView.insertMentionToken(sugg) // Then mutate text
-        commitHandler(sugg)
+        guard currentSuggestions.indices.contains(currentHighlightedIndex) else { return }
+        let suggestion = currentSuggestions[currentHighlightedIndex]
+        overlay.hide()
+        textView.insertMentionToken(suggestion)
+        commitHandler(suggestion)
     }
 
     func mentionAbort() {
+        invalidatePendingQueries()
         pendingReanchorTask?.cancel()
         overlay.hide()
     }
@@ -189,16 +186,70 @@ final class MentionCoordinator: MentionTextViewDelegate {
         tokenRemovedHandler(payload)
     }
 
-    /// ------------------------------------------------------------------
-    /// Ensure no suggestion window survives the lifetime of the coordinator
-    /// ------------------------------------------------------------------
     deinit {
         pendingReanchorTask?.cancel()
-        // Capture overlay in a local so we don't rebuild self-access after
-        // the object is partially de-initialised.
-        let overlayRef = self.overlay
+        let overlay = self.overlay
         Task { @MainActor in
-            overlayRef.hide()
+            overlay.hide()
+        }
+    }
+
+    // MARK: - Private helpers
+
+    private func runQuery(_ request: QueryRequest) {
+        guard request.epoch == queryEpoch else { return }
+        guard !textView.hasMarkedText() else {
+            overlay.hide()
+            return
+        }
+
+        let parent = request.parent ?? currentParent
+        let suggestions = suggestionService.suggestions(for: request.query, under: parent)
+        let desiredIndex = request.preserveIndex ? currentHighlightedIndex : 0
+        let highlightedIndex = suggestions.isEmpty
+            ? 0
+            : min(max(desiredIndex, 0), suggestions.count - 1)
+
+        if let currentLevelIndex = levels.indices.last {
+            levels[currentLevelIndex].suggestions = suggestions
+            levels[currentLevelIndex].highlightedIndex = highlightedIndex
+        } else {
+            levels = [LevelState(
+                parent: parent,
+                suggestions: suggestions,
+                highlightedIndex: highlightedIndex
+            )]
+        }
+
+        overlay.update(items: suggestions, highlighted: highlightedIndex)
+        guard textView.window != nil else {
+            overlay.hide()
+            return
+        }
+        scheduleOverlayReanchor()
+    }
+
+    private func selectSuggestion(at index: Int, inLevel level: Int) {
+        guard levels.indices.contains(level),
+              levels[level].suggestions.indices.contains(index)
+        else { return }
+
+        invalidatePendingQueries()
+        levels = Array(levels.prefix(level + 1))
+        levels[level].highlightedIndex = index
+    }
+
+    private func invalidatePendingQueries() {
+        queryEpoch &+= 1
+    }
+
+    private func resetMentionSession(endTextViewSession: Bool) {
+        invalidatePendingQueries()
+        pendingReanchorTask?.cancel()
+        levels = [LevelState(parent: nil, suggestions: [], highlightedIndex: 0)]
+        overlay.hide()
+        if endTextViewSession {
+            textView.endMentionSession()
         }
     }
 
@@ -220,12 +271,47 @@ final class MentionCoordinator: MentionTextViewDelegate {
                 overlay.hide()
                 return
             }
-            let selection = textView.clampSelectionToCurrentString()
+            let displaySelectionRange = textView.clampSelectionToCurrentString()
             let caretRect = textView.firstRect(
-                forCharacterRange: selection,
+                forCharacterRange: displaySelectionRange,
                 actualRange: nil
             )
             overlay.repositionRoot(to: caretRect)
         }
     }
+
+    #if DEBUG
+        var testSuggestions: [MentionSuggestion] {
+            currentSuggestions
+        }
+
+        var testOverlayWindowCount: Int {
+            overlay.testWindowCount
+        }
+
+        func testSuggestions(atLevel level: Int) -> [MentionSuggestion] {
+            guard levels.indices.contains(level) else { return [] }
+            return levels[level].suggestions
+        }
+
+        func testHighlightedIndex(atLevel level: Int) -> Int? {
+            guard levels.indices.contains(level) else { return nil }
+            return levels[level].highlightedIndex
+        }
+
+        @discardableResult
+        func testFlushPendingDebouncedQuery(cancelScheduledEmission: Bool = true) -> Bool {
+            guard let request = testPendingDebouncedQuery else { return false }
+            testPendingDebouncedQuery = nil
+            runQuery(request)
+            if cancelScheduledEmission {
+                invalidatePendingQueries()
+            }
+            return true
+        }
+
+        func testClickOverlayRow(level: Int, index: Int) {
+            overlay.clickRowForTesting(level: level, index: index)
+        }
+    #endif
 }

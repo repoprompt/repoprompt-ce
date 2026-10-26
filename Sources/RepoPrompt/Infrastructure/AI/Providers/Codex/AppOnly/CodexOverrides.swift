@@ -3,17 +3,10 @@ import Foundation
 enum CodexOverrides {
     private static let forcedDisabledConfig: [String: Bool] = [
         "features.apps": false,
-        "features.js_repl": false,
-        "features.js_repl_tools_only": false,
         "features.memories": false,
         "features.goals": false,
         "features.computer_use": false,
         "features.plugins": false,
-        "features.tool_search": false,
-        // Disable MCP elicitation until RepoPrompt supports the mcpServer/elicitation/request
-        // server request and its {action, content, _meta} response contract. Without this,
-        // Codex routes MCP tool approvals through elicitation by default (ToolCallMcpElicitation
-        // is stable + enabled), which RepoPrompt treats as unsupported and fails the run.
         "features.tool_call_mcp_elicitation": false,
         "features.tool_suggest": false,
         "memories.generate_memories": false,
@@ -21,12 +14,7 @@ enum CodexOverrides {
     ]
 
     private static let computerUseEnabledConfig: [String: Bool] = [
-        "features.computer_use": true,
-        "features.plugins": true,
-        "features.tool_search": true,
-        "features.tool_call_mcp_elicitation": true,
-        "features.tool_search_always_defer_mcp_tools": true,
-        "features.tool_suggest": true
+        "features.computer_use": true
     ]
 
     enum ReasoningSummary: String {
@@ -38,14 +26,34 @@ enum CodexOverrides {
 
     struct FeaturePolicy: Equatable {
         var goalsEnabled: Bool
+        var memoriesEnabled: Bool
         var computerUseEnabled: Bool
+        var capabilities: CodexCapabilitySettings
 
-        static let defaultDisabled = FeaturePolicy(goalsEnabled: false, computerUseEnabled: false)
-        static let enabledForGoals = FeaturePolicy(goalsEnabled: true, computerUseEnabled: false)
-        static let enabledForComputerUse = FeaturePolicy(goalsEnabled: false, computerUseEnabled: true)
-
-        static func resolved(goalsEnabled: Bool, computerUseEnabled: Bool) -> FeaturePolicy {
-            FeaturePolicy(goalsEnabled: goalsEnabled, computerUseEnabled: computerUseEnabled)
+        static let defaultDisabled = FeaturePolicy(
+            goalsEnabled: false,
+            memoriesEnabled: false,
+            computerUseEnabled: false,
+            capabilities: .disabled
+        )
+        static let enabledForGoals = FeaturePolicy(
+            goalsEnabled: true,
+            memoriesEnabled: false,
+            computerUseEnabled: false,
+            capabilities: .disabled
+        )
+        static func resolved(
+            goalsEnabled: Bool,
+            memoriesEnabled: Bool,
+            computerUseEnabled: Bool,
+            capabilities: CodexCapabilitySettings = .disabled
+        ) -> FeaturePolicy {
+            FeaturePolicy(
+                goalsEnabled: goalsEnabled,
+                memoriesEnabled: memoriesEnabled,
+                computerUseEnabled: computerUseEnabled,
+                capabilities: capabilities
+            )
         }
     }
 
@@ -53,13 +61,7 @@ enum CodexOverrides {
         var toolOutputTokenLimit: Int
         var shellToolEnabled: Bool?
         var webSearchRequestEnabled: Bool?
-        var viewImageToolEnabled: Bool?
-        /// Best-effort only in the current Codex stack: shipped model metadata can still expose
-        /// built-in patching, and shell/unified-exec can still route patch activity when enabled.
-        var includeApplyPatchTool: Bool?
-        var parallelToolCallsEnabled: Bool?
         var multiAgentEnabled: Bool?
-        var experimentalSteeringEnabled: Bool?
         /// Keep reasoning summaries enabled for newer Codex models that now default them off.
         var modelReasoningSummary: ReasoningSummary? = .auto
     }
@@ -89,22 +91,9 @@ enum CodexOverrides {
         }
         if let webSearchRequestEnabled = toolPolicy.webSearchRequestEnabled {
             args.append(contentsOf: ["-c", "web_search=\(webSearchMode(enabled: webSearchRequestEnabled))"])
-            args.append(contentsOf: ["-c", "features.web_search_request=\(webSearchRequestEnabled)"])
-        }
-        if let viewImageToolEnabled = toolPolicy.viewImageToolEnabled {
-            args.append(contentsOf: ["-c", "features.view_image_tool=\(viewImageToolEnabled)"])
-        }
-        if let includeApplyPatchTool = toolPolicy.includeApplyPatchTool {
-            args.append(contentsOf: ["-c", "features.apply_patch_freeform=\(includeApplyPatchTool)"])
-        }
-        if let parallelToolCallsEnabled = toolPolicy.parallelToolCallsEnabled {
-            args.append(contentsOf: ["-c", "features.parallel_tool_calls=\(parallelToolCallsEnabled)"])
         }
         if let multiAgentEnabled = toolPolicy.multiAgentEnabled {
             args.append(contentsOf: ["-c", "features.multi_agent=\(multiAgentEnabled)"])
-        }
-        if let experimentalSteeringEnabled = toolPolicy.experimentalSteeringEnabled {
-            args.append(contentsOf: ["-c", "features.steer=\(experimentalSteeringEnabled)"])
         }
         if let modelReasoningSummary = toolPolicy.modelReasoningSummary {
             args.append(contentsOf: ["-c", "model_reasoning_summary=\(modelReasoningSummary.rawValue)"])
@@ -128,22 +117,9 @@ enum CodexOverrides {
         }
         if let webSearchRequestEnabled = toolPolicy.webSearchRequestEnabled {
             overrides["web_search"] = webSearchMode(enabled: webSearchRequestEnabled)
-            overrides["features.web_search_request"] = webSearchRequestEnabled
-        }
-        if let viewImageToolEnabled = toolPolicy.viewImageToolEnabled {
-            overrides["features.view_image_tool"] = viewImageToolEnabled
-        }
-        if let includeApplyPatchTool = toolPolicy.includeApplyPatchTool {
-            overrides["features.apply_patch_freeform"] = includeApplyPatchTool
-        }
-        if let parallelToolCallsEnabled = toolPolicy.parallelToolCallsEnabled {
-            overrides["features.parallel_tool_calls"] = parallelToolCallsEnabled
         }
         if let multiAgentEnabled = toolPolicy.multiAgentEnabled {
             overrides["features.multi_agent"] = multiAgentEnabled
-        }
-        if let experimentalSteeringEnabled = toolPolicy.experimentalSteeringEnabled {
-            overrides["features.steer"] = experimentalSteeringEnabled
         }
         if let modelReasoningSummary = toolPolicy.modelReasoningSummary {
             overrides["model_reasoning_summary"] = modelReasoningSummary.rawValue
@@ -198,8 +174,17 @@ enum CodexOverrides {
 
     private static func forcedConfig(featurePolicy: FeaturePolicy) -> [String: Bool] {
         var config = forcedDisabledConfig
+        config["features.apps"] = featurePolicy.capabilities.appsEnabled
+        config["features.plugins"] = featurePolicy.capabilities.pluginsEnabled
+        config["features.tool_call_mcp_elicitation"] = featurePolicy.capabilities.mcpElicitationEnabled
+        config["features.tool_suggest"] = featurePolicy.capabilities.toolSuggestionsEnabled
         if featurePolicy.goalsEnabled {
             config["features.goals"] = true
+        }
+        if featurePolicy.memoriesEnabled {
+            config["features.memories"] = true
+            config["memories.generate_memories"] = true
+            config["memories.use_memories"] = true
         }
         guard featurePolicy.computerUseEnabled else {
             return config

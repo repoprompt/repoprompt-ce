@@ -3,20 +3,22 @@ import Foundation
 extension MCPServerViewModel {
     @MainActor
     func buildTabWorkspaceContext(
-        context: TabScopedContext,
+        context: MCPTabContextSnapshot,
         include: Set<String>,
         display: FilePathDisplay,
         copyPresetOverride: CopyPreset? = nil,
-        activeTabCompatibility: Bool = false
-    ) async -> ToolResultDTOs.PromptContextDTO {
+        presentationActiveContext: Bool = false
+    ) async throws -> ToolResultDTOs.PromptContextDTO {
         let includeSelection = include.contains("selection")
         let requireSelectionData = includeSelection
             || include.contains("files")
             || include.contains("code")
+            || include.contains("tree")
             || include.contains("tokens")
 
         var collections: SelectionReplyAssembler.SelectionCollections? = nil
         var selectionReply: ToolResultDTOs.SelectedFilesReply? = nil
+        var preparedTokenAccounting: MCPPreparedTokenAccounting? = nil
         let lookupContext = await lookupContext(for: context)
         let effectiveSelection = lookupContext.physicalizeSelection(context.selection)
         let emitsFilesystemIdentity = includeSelection
@@ -48,12 +50,27 @@ extension MCPServerViewModel {
                 stored: effectiveSelection,
                 codeMapUsage: effectiveMCPCodeMapUsage(.auto)
             )
-            let formatter = PathFormatter(format: .relative, owner: self, projection: lookupContext.bindingProjection)
+            let formatter = PathFormatter(
+                format: .relative,
+                owner: self,
+                projection: lookupContext.bindingProjection,
+                rootScope: lookupContext.rootScope
+            )
             let tokens = TokenServices(owner: self)
-            let gathered = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
-            let evaluation = await evaluateVirtualPromptEntries(
-                for: effectiveSelection,
-                codeMapUsage: gathered.codeMapUsage
+            let gathered = await SelectionReplyAssembler.collect(
+                from: source,
+                owner: self,
+                rootScope: lookupContext.rootScope,
+                contentPolicy: include.contains("files") ? .loadContent : .cachedOnly,
+                lookupContext: lookupContext
+            )
+            let preparedAccounting = await prepareMCPTokenAccounting(
+                context: context,
+                effectiveSelection: effectiveSelection,
+                collections: gathered,
+                resolvedContext: resolvedCfg,
+                lookupContext: lookupContext,
+                presentationActiveContext: presentationActiveContext
             )
             let reply = await SelectionReplyAssembler.buildSelectedFilesReply(
                 collections: gathered,
@@ -62,13 +79,11 @@ extension MCPServerViewModel {
                 userPresetState: userPresetState,
                 copyUsage: copyUsage != .auto ? copyUsage : nil,
                 projection: projectionConfig,
-                entryResultsByFileID: evaluation.entryResultsByFileID
+                entryResultsByFileID: preparedAccounting.entryResultsByFileID
             )
             collections = gathered
             selectionReply = reply
-        } else if includeSelection {
-            // Always use .auto mode for normalized view
-            selectionReply = await (buildTabSelectedFilesReply(from: context.selection, codeMapUsageOverride: .auto)).0
+            preparedTokenAccounting = preparedAccounting
         }
 
         let selectionDTO = includeSelection ? selectionReply : nil
@@ -88,20 +103,15 @@ extension MCPServerViewModel {
 
         var codeStructDTO: ToolResultDTOs.SelectedCodeStructureDTO? = nil
         if include.contains("code"), !promptVM.codeMapsGloballyDisabled, let coll = collections {
-            let builder = CodeStructureBuilder(owner: self, projection: lookupContext.bindingProjection)
-            let combined = coll.selected.map(\.file) + coll.codemap.map(\.file)
-            codeStructDTO = await builder.build(for: combined)
+            let builder = CodeStructureBuilder(owner: self, lookupContext: lookupContext)
+            codeStructDTO = await builder.build(for: coll)
         }
 
         var fileTreeDTO: ToolResultDTOs.FileTreeDTO? = nil
-        var fileTreeTokens = 0
         if include.contains("tree") {
-            let treeSelection = activeTabCompatibility
-                ? storedSelection(for: context, includeCodemapPathsWhenSelectedUsage: true)
-                : effectiveSelection
-            let rawTreeSnapshot = await promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
-                selection: treeSelection,
-                request: WorkspaceFileTreeSnapshotRequest(
+            let treePresentation = await promptVM.workspaceFileContextStore.makeFileTreePresentation(
+                selection: effectiveSelection,
+                request: WorkspaceFileTreePresentationRequest(
                     mode: .selected,
                     filePathDisplay: promptVM.filePathDisplayOption,
                     onlyIncludeRootsWithSelectedFiles: false,
@@ -109,33 +119,29 @@ extension MCPServerViewModel {
                     showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
                     rootScope: lookupContext.rootScope
                 ),
+                lookupContext: lookupContext,
+                codemapPresentation: collections?.codemapPresentation ?? .empty,
                 profile: .uiAssisted
             )
-            let treeSnapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawTreeSnapshot) ?? rawTreeSnapshot
-            if treeSnapshot.roots.isEmpty {
-                let msg = activeTabCompatibility
+            if treePresentation.rootCount == 0 {
+                let msg = presentationActiveContext
                     ? await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: nil)
                     : await tabWorkspaceContextMessage(forOperation: tabFileTreeToolName, path: nil)
                 fileTreeDTO = .init(
                     rootsCount: 0,
                     usesLegend: false,
                     tree: msg,
-                    note: activeTabCompatibility ? "No workspace loaded" : nil,
+                    note: presentationActiveContext ? "No workspace loaded" : nil,
                     worktreeScope: worktreeScope
                 )
-                fileTreeTokens = TokenCalculationService.estimateTokens(for: msg)
             } else {
-                let tree = await Task.detached(priority: .userInitiated) {
-                    CodeMapExtractor.generateFileTree(using: treeSnapshot)
-                }.value
                 fileTreeDTO = .init(
-                    rootsCount: treeSnapshot.roots.count,
-                    usesLegend: true,
-                    tree: tree,
+                    rootsCount: treePresentation.rootCount,
+                    usesLegend: treePresentation.usesLegend,
+                    tree: treePresentation.content,
                     note: nil,
                     worktreeScope: worktreeScope
                 )
-                fileTreeTokens = TokenCalculationService.estimateTokens(for: tree)
             }
         }
 
@@ -147,68 +153,12 @@ extension MCPServerViewModel {
             let filesContentTokens = (selectionReply?.summary?.fullTokens ?? 0) + (selectionReply?.summary?.sliceTokens ?? 0)
             let codemapsTokens = selectionReply?.summary?.codemapTokens ?? 0
 
-            if activeTabCompatibility {
-                await promptVM.tokenCountingViewModel.forceImmediateRecount()
-                let breakdown = latestTokenBreakdown()
-                let promptTokens = breakdown.prompt
-                var treeTokens = breakdown.fileTree
-                if treeTokens == 0 && fileTreeTokens > 0 {
-                    treeTokens = fileTreeTokens
-                }
-                let metaTokens = breakdown.meta
-                let gitTokens = breakdown.git
-                var totalTokens = breakdown.total
-                let componentSum = promptTokens + fileTokens + treeTokens + metaTokens + gitTokens
-                if totalTokens == 0 || totalTokens < componentSum {
-                    totalTokens = componentSum
-                }
-                let otherTokens = max(totalTokens - componentSum, 0)
-                tokenStatsDTO = .init(
-                    total: totalTokens,
-                    files: fileTokens,
-                    prompt: promptTokens,
-                    fileTree: treeTokens,
-                    meta: metaTokens,
-                    git: gitTokens,
-                    other: otherTokens,
-                    filesContent: filesContentTokens > 0 ? filesContentTokens : nil,
-                    codemaps: codemapsTokens > 0 ? codemapsTokens : nil
-                )
-
-                if let userFileTokens = selectionReply?.userCopyTokens, userFileTokens != fileTokens {
-                    let userContentTokens = selectionReply?.userCopyContentTokens ?? 0
-                    let userCodemapTokens = selectionReply?.userCopyCodemapTokens ?? 0
-                    let userComponentSum = promptTokens + userFileTokens + treeTokens + metaTokens + gitTokens
-                    let userTotalTokens = max(userComponentSum, totalTokens - fileTokens + userFileTokens)
-                    let userOtherTokens = max(userTotalTokens - userComponentSum, 0)
-                    userTokenStatsDTO = .init(
-                        total: userTotalTokens,
-                        files: userFileTokens,
-                        prompt: promptTokens,
-                        fileTree: treeTokens,
-                        meta: metaTokens,
-                        git: gitTokens,
-                        other: userOtherTokens,
-                        filesContent: userContentTokens > 0 ? userContentTokens : nil,
-                        codemaps: userCodemapTokens > 0 ? userCodemapTokens : nil
-                    )
-                    let codemapDelta = fileTokens - userFileTokens
-                    tokenStatsNote = "Difference: \(codemapDelta) codemap tokens (API signatures). Your preset excludes these, so exports use \(userFileTokens) file tokens, not \(fileTokens)."
-                }
-            } else {
-                let selectedFiles = collections?.selected.map(\.file) ?? []
-                let codemapFiles = collections?.codemap.map(\.file) ?? []
-                let breakdown = await buildVirtualTokenBreakdown(
-                    for: context,
-                    resolvedContext: resolvedCfg,
-                    selectedFiles: selectedFiles,
-                    codemapFiles: codemapFiles
-                )
+            if let prepared = preparedTokenAccounting {
                 tokenStatsDTO = Self.makeTokenStats(
                     filesTokens: fileTokens,
                     filesContentTokens: filesContentTokens > 0 ? filesContentTokens : nil,
                     codemapsTokens: codemapsTokens > 0 ? codemapsTokens : nil,
-                    breakdown: breakdown
+                    breakdown: prepared.breakdown
                 )
 
                 if let userFileTokens = selectionReply?.userCopyTokens, userFileTokens != fileTokens {
@@ -218,7 +168,7 @@ extension MCPServerViewModel {
                         filesTokens: userFileTokens,
                         filesContentTokens: userContentTokens > 0 ? userContentTokens : nil,
                         codemapsTokens: userCodemapTokens > 0 ? userCodemapTokens : nil,
-                        breakdown: breakdown
+                        breakdown: prepared.breakdown
                     )
                     let codemapDelta = fileTokens - userFileTokens
                     tokenStatsNote = "Difference: \(codemapDelta) codemap tokens (API signatures). Your preset excludes these, so exports use \(userFileTokens) file tokens, not \(fileTokens)."
@@ -240,69 +190,28 @@ extension MCPServerViewModel {
             tokenStats: tokenStatsDTO,
             userTokenStats: userTokenStatsDTO,
             tokenStatsNote: tokenStatsNote,
+            tokenAccounting: preparedTokenAccounting?.tokenAccounting,
             copyPreset: copyPresetContextDTO,
             copyPresets: nil,
             worktreeScope: worktreeScope
         )
     }
 
-    nonisolated static func gitDiffCandidates(from selection: StoredSelection) -> [String] {
-        var candidates = StoredSelectionPathNormalization.standardizedPaths(selection.selectedPaths)
-        let seen = Set(candidates)
-        var dedupedSeen = seen
-        for (path, ranges) in StoredSelectionPathNormalization.standardizedSlices(selection.slices) where !ranges.isEmpty {
-            guard dedupedSeen.insert(path).inserted else { continue }
-            candidates.append(path)
-        }
-        return candidates
-    }
-
-    nonisolated static func resolveGitDiffPaths(
-        candidates: [String],
-        resolvedMap: [String: String],
-        normalizeUserInput: (String) -> String,
-        fileExists: (String) -> Bool
-    ) -> [String] {
-        var seen = Set<String>()
-        var results: [String] = []
-        results.reserveCapacity(candidates.count)
-
-        for raw in candidates {
-            if let resolved = resolvedMap[raw] {
-                let std = StandardizedPath.absolute(resolved)
-                if seen.insert(std).inserted {
-                    results.append(std)
-                }
-                continue
-            }
-
-            let normalized = normalizeUserInput(raw)
-            guard normalized.hasPrefix("/") else { continue }
-            let std = StandardizedPath.absolute(normalized)
-            if fileExists(std), seen.insert(std).inserted {
-                results.append(std)
-            }
-        }
-
-        return results
-    }
-
     @MainActor
     private func resolvedContextForExportSelectedFiles(
-        _ resolvedContext: ResolvedTabContextSnapshot?
-    ) async throws -> ResolvedTabContextSnapshot? {
+        _ resolvedContext: MCPResolvedTabContextSnapshot?
+    ) async throws -> MCPResolvedTabContextSnapshot? {
         if let resolvedContext { return resolvedContext }
         let metadata = await captureRequestMetadata()
         return try resolveTabContextSnapshot(
             from: metadata,
-            toolName: "export_selected_files",
-            policy: .allowLegacyImplicitRouting
+            toolName: "export_selected_files"
         )
     }
 
     @MainActor
     func buildExportSelectedFileInfos(
-        resolvedContext: ResolvedTabContextSnapshot? = nil,
+        resolvedContext: MCPResolvedTabContextSnapshot? = nil,
         cfg: PromptContextResolved,
         selectionOverride: StoredSelection? = nil,
         display: FilePathDisplay
@@ -317,7 +226,12 @@ extension MCPServerViewModel {
         } else {
             WorkspaceLookupContext.visibleWorkspace
         }
-        let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
+        let formatter = PathFormatter(
+            format: display,
+            owner: self,
+            projection: lookupContext.bindingProjection,
+            rootScope: lookupContext.rootScope
+        )
         let selectionForCollections = selectionOverride ?? resolved?.snapshot.selection
         let collections: SelectionReplyAssembler.SelectionCollections
         if let selectionForCollections {
@@ -325,14 +239,19 @@ extension MCPServerViewModel {
                 stored: lookupContext.physicalizeSelection(selectionForCollections),
                 codeMapUsage: effectiveCodeMapUsage
             )
-            collections = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
+            collections = await SelectionReplyAssembler.collect(
+                from: source,
+                owner: self,
+                rootScope: lookupContext.rootScope,
+                lookupContext: lookupContext
+            )
         } else {
             collections = SelectionReplyAssembler.SelectionCollections.empty(codeMapUsage: effectiveCodeMapUsage)
         }
 
         let evaluationSelection: StoredSelection? = if let selectionOverride {
             lookupContext.physicalizeSelection(selectionOverride)
-        } else if let resolved, !resolved.usesActiveTabCompatibility {
+        } else if let resolved {
             lookupContext.physicalizeSelection(resolved.snapshot.selection)
         } else {
             nil
@@ -340,7 +259,8 @@ extension MCPServerViewModel {
         let entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult]? = if let evaluationSelection {
             await evaluateVirtualPromptEntries(
                 for: evaluationSelection,
-                codeMapUsage: collections.codeMapUsage
+                codeMapUsage: collections.codeMapUsage,
+                rootScope: lookupContext.rootScope
             ).entryResultsByFileID
         } else {
             nil
@@ -357,59 +277,42 @@ extension MCPServerViewModel {
     @MainActor
     func buildTabClipboardContent(
         cfg: PromptContextResolved,
-        context: TabScopedContext
+        context: MCPTabContextSnapshot
     ) async -> String {
         // Use the resolved tab-scoped context directly.
         // Run-bound sessions and explicitly bound tabs should export from their bound tab
         // state, not from whichever compose tab happens to be active in the UI.
         let lookupContext = await lookupContext(for: context)
-        let selection = lookupContext.physicalizeSelection(context.selection)
         let effectivePromptText = context.promptText
-
         let store = promptVM.workspaceFileContextStore
-        let effectiveCodeMapUsage = effectiveMCPCodeMapUsage(cfg.codeMapUsage)
-        let accountingService = PromptContextAccountingService()
-        let resolution = await accountingService.resolveEntries(
-            selection: selection,
-            store: store,
-            rootScope: lookupContext.rootScope,
-            profile: .uiAssisted,
-            codeMapUsage: effectiveCodeMapUsage
+        let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+            workspaceID: context.workspaceID,
+            tabID: context.tabID,
+            sessionID: context.activeAgentSessionID,
+            bindings: context.worktreeBindings
         )
-        let fileEntries = resolution.entries
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-
-        let combinedTreeAndMap: String?
-        if cfg.rendersFileTree {
-            let rawFileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: selection,
-                request: WorkspaceFileTreeSnapshotRequest(
-                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: cfg.effectiveFileTreeMode),
-                    filePathDisplay: promptVM.filePathDisplayOption,
-                    onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
-                    includeLegend: true,
-                    showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
-                    rootScope: lookupContext.rootScope
-                ),
-                profile: .uiAssisted
-            )
-            let fileTreeSnapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawFileTreeSnapshot) ?? rawFileTreeSnapshot
-            let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-            combinedTreeAndMap = tree.isEmpty ? nil : tree
-        } else {
-            combinedTreeAndMap = nil
-        }
-
-        let gitDiff: String?
-        switch cfg.gitInclusion {
-        case .none:
-            gitDiff = nil
-        case .selected:
-            let selectedPaths = await gitDiffPaths(for: selection)
-            gitDiff = await promptVM.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
-        case .complete:
-            gitDiff = await promptVM.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
-        }
+        let coordinator = AutomaticReviewGitDiffCoordinator()
+        var effectiveCfg = cfg
+        effectiveCfg.codeMapUsage = effectiveMCPCodeMapUsage(cfg.codeMapUsage)
+        let preAssemblyRequest = PromptContextPreAssemblyRequest(
+            cfg: effectiveCfg,
+            selection: context.selection,
+            store: store,
+            lookupContext: lookupContext,
+            filePathDisplay: promptVM.filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            selectedGitDiffLookupProfile: .mcpSelection,
+            selectedGitDiffArtifactPolicy: .respectGitInclusion,
+            reviewGitContext: reviewGitContext,
+            selectedGitDiffProvider: { request in
+                await coordinator.resolve(request)
+            },
+            completeGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] in
+                await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
+            }
+        )
 
         let combinedMeta = promptVM.metaInstructions(
             for: cfg,
@@ -417,40 +320,33 @@ extension MCPServerViewModel {
         )
         let includeMetaBlock = !combinedMeta.isEmpty
 
-        let clipboardFilePathDisplay = promptVM.filePathDisplayOption
-        return await PromptPackagingService.generateClipboardContent(
-            metaInstructions: combinedMeta,
-            userInstructions: cfg.includeUserPrompt ? effectivePromptText : "",
-            files: fileEntries,
-            fileTreeContent: combinedTreeAndMap,
-            gitDiff: gitDiff,
-            includeSavedPrompts: includeMetaBlock,
-            includeFiles: cfg.includeFiles,
-            includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: promptVM.filePathDisplayOption,
-            codemapSnapshots: codemapSnapshots,
-            includeDatetimeInUserInstructions: promptVM.includeDatetimeInUserInstructions,
-            promptSectionsOrder: promptVM.promptSectionsOrder,
-            disabledPromptSections: promptVM.disabledPromptSections,
-            duplicateUserInstructionsAtTop: promptVM.duplicateUserInstructionsAtTop,
-            displayPathResolver: { entry in
-                lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: entry.file.standardizedFullPath, display: clipboardFilePathDisplay)
+        do {
+            return try await PromptContextPreAssemblyService.withResolved(
+                preAssemblyRequest
+            ) { preAssembly in
+                await PromptPackagingService.generateClipboardContent(
+                    metaInstructions: combinedMeta,
+                    userInstructions: cfg.includeUserPrompt ? effectivePromptText : "",
+                    files: preAssembly.entries,
+                    fileTreeContent: preAssembly.fileTreeContent,
+                    gitDiff: preAssembly.gitDiff,
+                    includeSavedPrompts: includeMetaBlock,
+                    includeFiles: cfg.includeFiles,
+                    includeUserPrompt: cfg.includeUserPrompt,
+                    filePathDisplay: self.promptVM.filePathDisplayOption,
+                    codemapPresentation: preAssembly.codemapPresentation,
+                    includeDatetimeInUserInstructions: self.promptVM.includeDatetimeInUserInstructions,
+                    promptSectionsOrder: self.promptVM.promptSectionsOrder,
+                    disabledPromptSections: self.promptVM.disabledPromptSections,
+                    duplicateUserInstructionsAtTop: self.promptVM.duplicateUserInstructionsAtTop,
+                    displayPathResolver: { entry in
+                        preAssembly.displayPath(for: entry)
+                    }
+                )
             }
-        )
-    }
-
-    func gitDiffPaths(for selection: StoredSelection) async -> [String] {
-        let candidates = Self.gitDiffCandidates(from: selection)
-        guard !candidates.isEmpty else { return [] }
-
-        let resolvedFiles = await promptVM.workspaceFileContextStore.lookupFiles(atPaths: candidates, profile: .mcpSelection, rootScope: .allLoaded)
-        let resolvedMap = resolvedFiles.mapValues { $0.standardizedFullPath }
-        return Self.resolveGitDiffPaths(
-            candidates: candidates,
-            resolvedMap: resolvedMap,
-            normalizeUserInput: { ($0 as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines) },
-            fileExists: { FileManager.default.fileExists(atPath: $0) }
-        )
+        } catch {
+            return ""
+        }
     }
 }
 

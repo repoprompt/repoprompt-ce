@@ -4,21 +4,57 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 METADATA_ROOT="${REPOPROMPT_APPROVED_SOURCE_ROOT:-$ROOT_DIR}"
+CODEX_MANIFEST="$METADATA_ROOT/Vendor/Codex/manifest.json"
 source "$SCRIPT_DIR/load_release_metadata.sh"
-load_release_metadata "$METADATA_ROOT"
 
-APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
 TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ROLLOUT_TOOL="$SCRIPT_DIR/stable_rollout.py"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
+CODEX_V8_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexV8JIT.entitlements"
+CODEX_AUDIO_INPUT_ENTITLEMENTS="$TRUSTED_ROOT/AppBundle/CodexAudioInput.entitlements"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
-STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
     exit 1
 }
 
+load_release_metadata_with_identity_projection \
+    "$METADATA_ROOT" \
+    "${REPOPROMPT_APPROVED_SOURCE_ROOT:-}" \
+    "$SCRIPT_DIR" \
+    "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" ||
+    fail "Unable to load the reviewed release identity context"
+
+# Stable workflows export this context before staging. Local/focused callers
+# derive the same policy projection here rather than relying on identity literals.
+if [[ -z "${EXPECTED_SIGN_IDENTITY+x}" ]]; then
+    declaration_name="release-rollout.json"
+    [[ "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" == "tip-rollout-v1" ]] && \
+        declaration_name="tip-rollout.json"
+    eval "$(python3 "$ROLLOUT_TOOL" packaging-context \
+        --declaration "$METADATA_ROOT/$declaration_name" \
+        --policy "$SCRIPT_DIR/apple_identity_policy.json" \
+        --version-env "$METADATA_ROOT/version.env")" ||
+        fail "Unable to derive the reviewed release identity context"
+fi
+if [[ "${REPOPROMPT_TIP_ARCHIVE_CONTRACT:-}" != "tip-rollout-v1" ]]; then
+    validate_stable_release_context \
+        "$BUNDLE_ID" \
+        "$SIGNING_TEAM_ID" \
+        "${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}" \
+        "${SIGN_IDENTITY:-}" || fail "Stable release context validation failed"
+fi
+IDENTITY_MIGRATION_TARGET_REQUIREMENT="$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT"
+APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
+STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+CODEX_BUNDLE="$APP_BUNDLE/Contents/Resources/BundledRuntimes/Codex"
+ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+IDENTITY_MIGRATION_ANCHOR_DESTINATION="$APP_BUNDLE/Contents/Resources/IdentityMigration/RepoPromptIdentityAnchor"
+
 [[ -n "${SIGN_IDENTITY:-}" ]] || fail "Missing required environment variable: SIGN_IDENTITY"
+[[ "$SIGN_IDENTITY" == "$EXPECTED_SIGN_IDENTITY" ]] ||
+    fail "Application signing identity mismatch: expected $EXPECTED_SIGN_IDENTITY, got $SIGN_IDENTITY"
 [[ -f "${REPOPROMPT_PROVISIONING_PROFILE:-}" ]] ||
     fail "Missing RepoPrompt CE Developer ID provisioning profile"
 [[ -d "$APP_BUNDLE" ]] || fail "Missing staged app bundle: $APP_BUNDLE"
@@ -26,12 +62,20 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
     "$SCRIPT_DIR/validate_staged_release.sh"
 REPOPROMPT_RELEASE_SOURCE_ROOT="$TRUSTED_ROOT" \
     "$SCRIPT_DIR/verify_sparkle_vendor.sh"
+python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$CODEX_MANIFEST" verify-bundle \
+    --arch all \
+    --bundle "$CODEX_BUNDLE"
 
 rm -rf "$STAGED_SPARKLE_FRAMEWORK"
 mkdir -p "$(dirname "$STAGED_SPARKLE_FRAMEWORK")"
 ditto "$TRUSTED_SPARKLE_FRAMEWORK" "$STAGED_SPARKLE_FRAMEWORK"
 REPOPROMPT_RELEASE_SOURCE_ROOT="$TRUSTED_ROOT" \
     "$SCRIPT_DIR/verify_sparkle_vendor.sh" "$STAGED_SPARKLE_FRAMEWORK"
+"$SCRIPT_DIR/validate_app_architectures.sh" \
+    "$APP_BUNDLE" \
+    "arm64,x86_64" \
+    "Trusted Sparkle replacement pre-sign app"
 
 profile_plist="$(mktemp)"
 app_entitlements="$(mktemp)"
@@ -46,9 +90,11 @@ trap cleanup EXIT
 
 security cms -D -i "$REPOPROMPT_PROVISIONING_PROFILE" -o "$profile_plist"
 profile_app_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null || true)"
-[[ "$profile_app_identifier" == "$SIGNING_TEAM_ID.$BUNDLE_ID" ]] ||
-    fail "Provisioning profile app identifier mismatch: expected $SIGNING_TEAM_ID.$BUNDLE_ID, got ${profile_app_identifier:-<missing>}"
-cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+[[ "$profile_app_identifier" == "$EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER" ]] ||
+    fail "Provisioning profile app identifier mismatch: expected $EXPECTED_PROVISIONING_PROFILE_APPLICATION_IDENTIFIER, got ${profile_app_identifier:-<missing>}"
+python3 "$SCRIPT_DIR/embedded_provisioning_profile.py" install \
+    "$REPOPROMPT_PROVISIONING_PROFILE" \
+    "$APP_BUNDLE/Contents/embedded.provisionprofile"
 python3 - "$ENTITLEMENTS_TEMPLATE" "$app_entitlements" "$BUNDLE_ID" "$SIGNING_TEAM_ID" <<'PYTHON'
 import sys
 from pathlib import Path
@@ -59,8 +105,58 @@ text = text.replace("__BUNDLE_ID__", bundle_id).replace("__SIGNING_TEAM_ID__", t
 Path(output).write_text(text, encoding="utf-8")
 PYTHON
 plutil -lint "$app_entitlements"
+plutil -lint "$CODEX_V8_ENTITLEMENTS"
+plutil -lint "$CODEX_AUDIO_INPUT_ENTITLEMENTS"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
-plutil -replace RepoPromptSigningMode -string developer-id "$APP_BUNDLE/Contents/Info.plist"
+signing_mode_marker="$EXPECTED_SIGNING_MODE"
+plutil -replace RepoPromptSigningMode -string "$signing_mode_marker" "$APP_BUNDLE/Contents/Info.plist"
+
+identity_migration_phase="$(
+    plutil -extract RepoPromptIdentityMigrationPhase raw "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null ||
+        printf 'disabled\n'
+)"
+expected_identity_migration_phase="${REPOPROMPT_IDENTITY_MIGRATION_PHASE:-disabled}"
+[[ "$identity_migration_phase" == "$expected_identity_migration_phase" ]] ||
+    fail "Staged identity migration phase mismatch: expected $expected_identity_migration_phase, got $identity_migration_phase"
+case "$identity_migration_phase" in
+disabled)
+    ;;
+legacy-preparer)
+    [[ -n "$EXPECTED_MIGRATION_ANCHOR_BUNDLE_ID" && \
+       -n "$EXPECTED_MIGRATION_ANCHOR_TEAM_ID" && \
+       -n "$EXPECTED_MIGRATION_ANCHOR_REQUIREMENT" ]] ||
+        fail "Legacy identity preparer requires the complete migration-anchor policy"
+    identity_migration_anchor="${REPOPROMPT_IDENTITY_MIGRATION_ANCHOR:-}"
+    [[ -n "$identity_migration_anchor" ]] ||
+        fail "Legacy identity preparer signing requires REPOPROMPT_IDENTITY_MIGRATION_ANCHOR"
+    [[ -f "$identity_migration_anchor" && ! -L "$identity_migration_anchor" ]] ||
+        fail "Identity migration anchor must be a regular, non-symlink file"
+    codesign --verify --strict --verbose=2 \
+        -R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$identity_migration_anchor"
+    anchor_signature_details="$(codesign -dv --verbose=4 "$identity_migration_anchor" 2>&1)"
+    anchor_identifier="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"
+    anchor_team="$(printf '%s\n' "$anchor_signature_details" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
+    validate_resolved_migration_anchor_identity "$anchor_identifier" "$anchor_team" ||
+        fail "Identity migration anchor does not match the resolved release context"
+    mkdir -p "$(dirname "$IDENTITY_MIGRATION_ANCHOR_DESTINATION")"
+    ditto "$identity_migration_anchor" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
+    chmod 755 "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
+    [[ -f "$IDENTITY_MIGRATION_ANCHOR_DESTINATION" && ! -L "$IDENTITY_MIGRATION_ANCHOR_DESTINATION" ]] ||
+        fail "Embedded identity migration anchor must be a regular, non-symlink file"
+    codesign --verify --strict --verbose=2 \
+        -R="$IDENTITY_MIGRATION_TARGET_REQUIREMENT" "$IDENTITY_MIGRATION_ANCHOR_DESTINATION"
+    ;;
+*)
+    fail "Unsupported RepoPromptIdentityMigrationPhase: $identity_migration_phase"
+    ;;
+esac
+
+# Telemetry is gated on DSN presence: only the official Developer ID publish job receives the
+# protected SENTRY_DSN secret, and only here is it baked into the signed bundle. The value is never
+# echoed or written to the artifact manifest.
+if [[ -n "${SENTRY_DSN:-}" ]]; then
+    plutil -replace RepoPromptSentryDSN -string "$SENTRY_DSN" "$APP_BUNDLE/Contents/Info.plist"
+fi
 
 sign_path() {
     local path="$1"
@@ -78,10 +174,48 @@ sign_sparkle_framework() {
 }
 
 sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"
+# Manifest-driven Codex signing: each Mach-O gets exactly the release entitlement
+# profile pinned in Vendor/Codex/manifest.json. The trusted V8 JIT allowlist is a
+# repository-owned plist; vendor entitlement metadata is never preserved blindly.
+codex_signing_plan="$(python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$CODEX_MANIFEST" list-bundle-signing-plan --arch all)"
+while IFS=$'\t' read -r relative_path entitlement_profile; do
+    [[ -n "$relative_path" ]] || continue
+    case "$entitlement_profile" in
+    v8-jit)
+        sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_V8_ENTITLEMENTS"
+        ;;
+    audio-input)
+        sign_path "$CODEX_BUNDLE/$relative_path" --entitlements "$CODEX_AUDIO_INPUT_ENTITLEMENTS"
+        ;;
+    none)
+        sign_path "$CODEX_BUNDLE/$relative_path"
+        ;;
+    *)
+        fail "Unsupported Codex release entitlement profile for $relative_path: ${entitlement_profile:-<missing>}"
+        ;;
+    esac
+done <<< "$codex_signing_plan"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+python3 "$SCRIPT_DIR/embedded_provisioning_profile.py" validate \
+    "$APP_BUNDLE/Contents/embedded.provisionprofile"
+codesign --verify --strict --verbose=2 -R="$EXPECTED_APP_REQUIREMENT" "$APP_BUNDLE"
+python3 "$SCRIPT_DIR/codex_runtime_artifact.py" \
+    --manifest "$CODEX_MANIFEST" verify-bundle \
+    --arch all \
+    --bundle "$CODEX_BUNDLE" \
+    --signed-team-identifier "$SIGNING_TEAM_ID"
+"$SCRIPT_DIR/validate_app_architectures.sh" \
+    "$APP_BUNDLE" \
+    "arm64,x86_64" \
+    "Developer ID staged app post-sign"
+"$SCRIPT_DIR/write_app_artifact_manifest.py" write \
+    --app "$APP_BUNDLE" \
+    --output "$ARTIFACT_MANIFEST" \
+    --expected-architectures "arm64,x86_64"
 codesign -d --entitlements :- "$APP_BUNDLE" > "$signed_entitlements"
 plutil -convert xml1 -o "$canonical_app_entitlements" "$app_entitlements"
 plutil -convert xml1 -o "$canonical_signed_entitlements" "$signed_entitlements"
@@ -92,9 +226,9 @@ cmp "$canonical_app_entitlements" "$canonical_signed_entitlements" ||
 signature_details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1)"
 identifier="$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"
 team="$(printf '%s\n' "$signature_details" | awk -F= '/^TeamIdentifier=/{print $2; exit}')"
-[[ "$identifier" == "$BUNDLE_ID" ]] ||
-    fail "Signed app identifier mismatch: expected $BUNDLE_ID, got ${identifier:-<missing>}"
-[[ "$team" == "$SIGNING_TEAM_ID" ]] ||
-    fail "Signed app team mismatch: expected $SIGNING_TEAM_ID, got ${team:-<missing>}"
+[[ "$identifier" == "$EXPECTED_APP_BUNDLE_ID" ]] ||
+    fail "Signed app identifier mismatch: expected $EXPECTED_APP_BUNDLE_ID, got ${identifier:-<missing>}"
+[[ "$team" == "$EXPECTED_APP_TEAM_ID" ]] ||
+    fail "Signed app team mismatch: expected $EXPECTED_APP_TEAM_ID, got ${team:-<missing>}"
 
 printf 'OK: staged app signed for Developer ID distribution.\n'

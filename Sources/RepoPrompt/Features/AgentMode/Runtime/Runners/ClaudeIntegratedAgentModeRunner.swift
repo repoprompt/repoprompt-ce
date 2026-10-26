@@ -1,15 +1,28 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptProcess
+import RepoPromptProviderQuota
+import RepoPromptSettingsCore
 
 @MainActor
 final class ClaudeIntegratedAgentModeRunner {
-    private struct ConsumeEventsOutcome {
-        let terminalState: AgentSessionRunState
-        let errorText: String?
-        let shouldShutdownSession: Bool
+    private enum ConsumeEventsOutcome {
+        case completed
+        case cancelled
+        case failed(errorText: String?, shouldShutdownSession: Bool)
     }
+
+    /// Claude's native stream reports terminal cancellation and failure as values,
+    /// while the shared transient execution core accepts those classifications as
+    /// thrown errors. This marker is intentionally runner-local: the coordinator
+    /// and native controller remain the authorities for the underlying terminal
+    /// event and its provider-specific metadata.
+    private struct NativeTerminalFailure: Error {}
 
     private let claudeCoordinator: ClaudeAgentModeCoordinator
     private let hooks: AgentModeRunService.Hooks
+    private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
+    private let quotaService: ClaudeRunRateLimitTelemetryService
 
     #if DEBUG
         private func reasoningDebug(_ message: @autoclosure () -> String) {
@@ -33,28 +46,68 @@ final class ClaudeIntegratedAgentModeRunner {
 
     init(
         claudeCoordinator: ClaudeAgentModeCoordinator,
-        hooks: AgentModeRunService.Hooks
+        hooks: AgentModeRunService.Hooks,
+        terminalCommitBarrier: AgentRunTerminalCommitBarrier,
+        quotaService: ClaudeRunRateLimitTelemetryService = WindowStatesManager.shared.providerQuotaRuntime.claudeTelemetry
     ) {
         self.claudeCoordinator = claudeCoordinator
         self.hooks = hooks
+        self.terminalCommitBarrier = terminalCommitBarrier
+        self.quotaService = quotaService
+    }
+
+    /// Whether cancelling an attempt on `runID` must keep that run's committed MCP route.
+    ///
+    /// True only while the session still owns this exact reused process run: its Claude controller is
+    /// attached and its process run identity is still `runID`. That is the case for an attempt that
+    /// ended before its provider call — for example a retracted Auto-wake — whose provider process and
+    /// MCP connection outlive it. User Stop and provider identity resets detach the controller and
+    /// clear the run identity first (`prepareClaudeCancelSync`), so their cancellation keeps revoking.
+    static func cancellationPreservesRunRoute(session: AgentTabSession, runID: UUID) -> Bool {
+        session.claudeController != nil
+            && AgentModeProcessRunIdentity.existingProcessRunID(for: session) == runID
+    }
+
+    /// Cancels one attempt's bootstrap lease. Every cancellation in this runner goes through here so
+    /// the run-ownership decision is made in exactly one place, at cleanup time.
+    static func cancelAttemptLease(_ lease: MCPBootstrapLease, session: AgentTabSession?, runID: UUID) async {
+        let preservesRoute = session.map { cancellationPreservesRunRoute(session: $0, runID: runID) } ?? false
+        await lease.cancelAndCleanup(preservingCommittedRoute: preservesRoute)
     }
 
     func startRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        makeLease: (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: (_ runID: UUID) -> MCPBootstrapLease,
+        autoEffortSelection: AutoEffortTurnSelection? = nil,
+        providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID? = nil
     ) async {
-        let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
+        let dedicatedNoteID = selfCompactDispatchID.flatMap { $0.stage == .note ? $0 : nil }
+        var handedToRunTask = false
+        defer {
+            if !handedToRunTask { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
+            if let dedicatedNoteID, !handedToRunTask {
+                AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                    hooks.persistence.scheduleSave(session)
+                }
+            }
+        }
+        guard stopFence?.permitsStart(of: session) ?? true else { return }
+        let attachmentReservationID = hooks.attachments.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
            !session.pendingNonCodexUserInputTokenQueue.isEmpty
         {
-            session.pendingNonCodexUserInputTokenQueue[0] = hooks.estimateRuntimeTokens(initialMessageForRun)
+            session.pendingNonCodexUserInputTokenQueue[0] = hooks.usage.estimateRuntimeTokens(initialMessageForRun)
         }
-        hooks.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
+        hooks.usage.startNonCodexTurnAccountingIfNeeded(session, initialMessageForRun)
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
@@ -63,19 +116,67 @@ final class ClaudeIntegratedAgentModeRunner {
             AgentModeProcessRunIdentity.existingProcessRunID(for: session)
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
-        let runAttemptID = UUID()
-        session.activeHeadlessRunAttemptID = runAttemptID
+        guard stopFence?.permitsStart(of: session) ?? true else {
+            Task { await lease.cancelAndCleanup() }
+            return
+        }
+        let ownership = session.beginRunAttempt(source: "claudeNative")
+        session.installRunAttemptTerminalResources(ownership: ownership) { [weak session] terminalState in
+            {
+                switch terminalState {
+                case .failed:
+                    await lease.failAndRelease()
+                case .cancelled:
+                    await Self.cancelAttemptLease(lease, session: session, runID: runID)
+                default:
+                    break
+                }
+            }
+        }
+        let runAttemptID = ownership.attemptID
+        if let dispatchID = providerControlCommand?.selfCompactDispatchID,
+           dispatchID.stage == .compact
+        {
+            guard session.selfCompactDispatchIsCurrent?() != false,
+                  session.selfCompactNativeCompletion?.bindCompact(
+                      dispatchID, runID: runID, runAttemptID: runAttemptID
+                  ) == true
+            else {
+                await finalize(
+                    session: session, runID: runID, ownership: ownership,
+                    attachmentReservationID: attachmentReservationID, terminalState: .failed,
+                    errorText: nil, notifyTurnComplete: false
+                )
+                return
+            }
+        }
+        session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus("Thinking…", source: .transport)
         session.runState = .running
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
         session.claudeExpectedTurnIDs.removeAll()
-        hooks.setAgentRunActive(tabID, true)
-        hooks.updateBindings(session)
+        hooks.presentation.setAgentRunActive(session, true)
+        hooks.bindingObservation.updateBindings(session)
 
-        session.agentTask = Task { [weak self, weak session] in
-            guard let self, let session else { return }
+        let isPeriodic = session.oversight.pendingAutoWake?.isPeriodic == true
+        // Only the producer can identify its newly appended row. An Auto-wake can follow an
+        // unanswered historical user row, so even a trailing-row check cannot establish ownership.
+        let rollbackUserItemID = providerControlCommand == nil && selfCompactDispatchID == nil && !isPeriodic
+            ? initialUserItemID
+            : nil
+        session.agentTask = Task { [weak self, weak session, hooks] in
+            guard let session else { return }
+            defer {
+                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+                if let dedicatedNoteID {
+                    AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                        hooks.persistence.scheduleSave(session)
+                    }
+                }
+            }
+            guard let self else { return }
             await withTaskCancellationHandler {
                 let acquired = await lease.acquire()
                 guard acquired else {
@@ -83,7 +184,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         tabID: tabID,
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID,
+                        ownership: ownership,
                         attachmentReservationID: attachmentReservationID
                     )
                     return
@@ -94,81 +195,199 @@ final class ClaudeIntegratedAgentModeRunner {
                     runID: runID
                 )
 
-                let sent = await self.claudeCoordinator.sendClaudeNativeMessage(
-                    session: session,
-                    text: initialMessageForRun,
-                    attachments: attachments
-                )
-                self.hooks.recordPendingHandoffSendOutcome(session, sent)
-                guard sent else {
-                    await lease.failAndRelease()
+                let providerName = session.selectedAgent.rawValue
+                var didSendToProvider = false
+                var routeRefusalMessage: String?
+                var nativeFailureMetadata: (errorText: String?, shouldShutdownSession: Bool)?
+                let report = await DomainAgentRunExecutionCore.execute(
+                    failureText: { _ in nativeFailureMetadata?.errorText ?? "" }
+                ) {
+                    await lease.providerInitializationStarted(provider: providerName)
+                    let sendOutcome = await self.claudeCoordinator.sendClaudeNativeMessage(
+                        session: session,
+                        text: initialMessageForRun,
+                        attachments: attachments,
+                        intent: .runAttempt(ownership: ownership, runID: runID),
+                        // No event stream is owned until this send succeeds and the runner subscribes
+                        // below, so replacing a route-stale controller is safe at this boundary.
+                        allowsCatalogRouteControllerRecovery: true,
+                        autoEffortSelection: autoEffortSelection,
+                        providerControlCommand: providerControlCommand,
+                        selfCompactDispatchID: selfCompactDispatchID,
+                        // A replacement process's MCP child needs this run's one-shot admission
+                        // policy re-armed; the lease that installed it still owns it here.
+                        reinstallRunRoutingPolicy: { await lease.reinstallPolicyForReplacementProcess() }
+                    )
+                    if sendOutcome == .sent { session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained) }
+                    if let dedicatedNoteID, sendOutcome != .sent {
+                        AgentSelfCompactParkedPrefix.reparkUnattemptedDedicatedNote(dedicatedNoteID, session: session) {
+                            self.hooks.persistence.scheduleSave(session)
+                        }
+                    }
+                    let providerInitializationOutcome = switch sendOutcome {
+                    case .sent:
+                        "ready"
+                    case .failed:
+                        Task.isCancelled ? "cancelled" : "failed"
+                    case .superseded:
+                        "superseded"
+                    }
+                    await lease.providerInitializationCompleted(
+                        provider: providerName,
+                        outcome: providerInitializationOutcome
+                    )
+
+                    switch sendOutcome {
+                    case .sent:
+                        didSendToProvider = true
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, true) }
+                    case let .failed(message):
+                        nativeFailureMetadata = (errorText: nil, shouldShutdownSession: false)
+                        if ClaudeAgentModeCoordinator.isRouteVerificationFailure(message) {
+                            routeRefusalMessage = message
+                        }
+                        throw NativeTerminalFailure()
+                    case .superseded:
+                        return .superseded
+                    }
+
+                    self.hooks.attachments.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
+                    self.hooks.attachments.markAttachmentsConsumed(session, attachmentReservationID)
+                    _ = await lease.releaseWhenRouted()
+
+                    guard let events = await self.claudeCoordinator.events(for: session) else {
+                        nativeFailureMetadata = (
+                            errorText: "Claude native events stream not available.",
+                            shouldShutdownSession: false
+                        )
+                        throw NativeTerminalFailure()
+                    }
+
+                    session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
+                    switch await self.consumeEvents(
+                        events,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID
+                    ) {
+                    case .completed:
+                        return .completed(assistantText: nil)
+                    case .cancelled:
+                        throw CancellationError()
+                    case let .failed(errorText, shouldShutdownSession):
+                        nativeFailureMetadata = (errorText, shouldShutdownSession)
+                        throw NativeTerminalFailure()
+                    }
+                }
+
+                switch report.result {
+                case .superseded:
+                    if self.claudeCoordinator.runAttemptIsCurrent(
+                        ownership,
+                        runID: runID,
+                        for: session
+                    ) {
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+                        let revision = await self.finalize(
+                            session: session,
+                            runID: runID,
+                            ownership: ownership,
+                            attachmentReservationID: attachmentReservationID,
+                            terminalState: .cancelled,
+                            errorText: nil,
+                            notifyTurnComplete: false
+                        )
+                        if revision == nil {
+                            await Self.cancelAttemptLease(lease, session: session, runID: runID)
+                        }
+                    } else {
+                        await Self.cancelAttemptLease(lease, session: session, runID: runID)
+                    }
+                case let .terminal(outcome):
+                    let terminalState: AgentSessionRunState = switch outcome.kind {
+                    case .completed: .completed
+                    case .cancelled: .cancelled
+                    case .failed: .failed
+                    }
+                    if !didSendToProvider {
+                        if !isPeriodic, providerControlCommand == nil, selfCompactDispatchID == nil { self.hooks.providerInput.recordPendingHandoffSendOutcome(session, false) }
+                    }
                     await self.finalize(
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID,
+                        ownership: ownership,
                         attachmentReservationID: attachmentReservationID,
-                        terminalState: .failed,
-                        errorText: nil,
-                        notifyTurnComplete: false
+                        terminalState: terminalState,
+                        errorText: outcome.kind == .failed ? nativeFailureMetadata?.errorText : nil,
+                        notifyTurnComplete: outcome.kind == .completed,
+                        shouldShutdownSession: outcome.kind == .failed
+                            && nativeFailureMetadata?.shouldShutdownSession == true
                     )
-                    return
+                    // Route refusals happen before any provider write, so the user's message was never
+                    // sent. Mirror Codex: withdraw the unsent row and hand the text back for a resend.
+                    if outcome.kind == .failed, !didSendToProvider,
+                       routeRefusalMessage != nil,
+                       let rollbackUserItemID
+                    {
+                        self.hooks.queuedWorkRecovery.restoreRouteRefusedUnsentTurn(
+                            session,
+                            rollbackUserItemID,
+                            "\(session.selectedAgent.displayName) did not send because the RepoPrompt MCP route could not be verified. Your message was restored."
+                        )
+                    }
                 }
-
-                self.hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
-                self.hooks.markAttachmentsConsumed(session, attachmentReservationID)
-                _ = await lease.releaseWhenRouted()
-
-                guard let events = await self.claudeCoordinator.events(for: session) else {
-                    await self.finalize(
-                        session: session,
-                        runID: runID,
-                        runAttemptID: runAttemptID,
-                        attachmentReservationID: attachmentReservationID,
-                        terminalState: .failed,
-                        errorText: "Claude native events stream not available.",
-                        notifyTurnComplete: false
-                    )
-                    return
-                }
-
-                let outcome = await self.consumeEvents(
-                    events,
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID
-                )
-                await self.finalize(
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID,
-                    attachmentReservationID: attachmentReservationID,
-                    terminalState: outcome.terminalState,
-                    errorText: outcome.errorText,
-                    notifyTurnComplete: outcome.terminalState == .completed
-                )
-                if outcome.shouldShutdownSession {
-                    await self.claudeCoordinator.shutdownClaudeSession(session)
-                }
-            } onCancel: {
-                Task { await lease.cancelAndCleanup() }
-            }
+            } onCancel: {}
         }
+        handedToRunTask = true
+    }
+
+    /// The Claude config directory the native `claude` process is launched with: the same
+    /// environment composition as `ClaudeNativeProcessSessionController` (cached shell env
+    /// layered over the app env), so `CLAUDE_CONFIG_DIR` set only in a shell profile counts.
+    private static func claudeRunUsageProfileID() async -> String {
+        let environment = await ProcessEnvironmentBuilder.build(ProcessEnvironmentRequest(purpose: .claudeNative)).environment
+        let filtered = await ProviderEnvironmentFiltering.filter(environment, for: .claudeCode)
+        return ClaudeUsageCredentialProfile.current(environment: filtered).id
     }
 
     private func consumeEvents(
         _ events: AsyncStream<NativeAgentRuntimeEvent>,
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
         runAttemptID: UUID
     ) async -> ConsumeEventsOutcome {
         var exitedDueToAttemptMismatch = false
+        // Only first-party Claude owns this subscription telemetry. No extra request or
+        // process is started; compatible launchers cannot populate Claude account usage.
+        var quotaLease: UUID?
+        if session.selectedAgent == .claudeCode,
+           session.runID == runID, session.activeRunAttemptID == runAttemptID
+        {
+            // Diagnostics toggle OR connected Claude usage display (see
+            // `GlobalSettingsStore.claudeRunTelemetryRecordingEnabled`): the pill stays current
+            // during runs by default, and this per-run sync never switches that off.
+            let recordsTelemetry = GlobalSettingsStore.shared.claudeRunTelemetryRecordingEnabled(
+                profileID: ClaudeUsageCredentialProfile.current().id
+            )
+            await quotaService.setEnabled(recordsTelemetry)
+            // Attribute the run to its Claude config directory so the usage pill only adopts
+            // telemetry from the same profile it reads usage for.
+            let profileID = recordsTelemetry ? await Self.claudeRunUsageProfileID() : nil
+            if session.runID == runID, session.activeRunAttemptID == runAttemptID {
+                quotaLease = await quotaService.beginObservation(credentialProfileID: profileID)
+            }
+        }
 
         eventLoop: for await event in events {
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 exitedDueToAttemptMismatch = true
                 break eventLoop
+            }
+
+            if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+                session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
             }
 
             switch event {
@@ -179,7 +398,11 @@ final class ClaudeIntegratedAgentModeRunner {
                         reasoningDebug("stream reasoning run=\(runID.uuidString) attempt=\(runAttemptID.uuidString) tab=\(session.tabID.uuidString) len=\(text.count) snippet=\(reasoningDebugSnippet(text))")
                     }
                 #endif
-                await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+                await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
+            case let .rateLimit(info):
+                if session.selectedAgent == .claudeCode, let quotaLease {
+                    await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
+                }
             case let .runtimeInit(status):
                 // Persist provider session ID as soon as it becomes available from
                 // runtime init events (initialize response or system/init stream).
@@ -188,22 +411,31 @@ final class ClaudeIntegratedAgentModeRunner {
                    newSessionID != session.providerSessionID
                 {
                     session.providerSessionID = newSessionID
+                    session.providerCleanupHandle = ProviderConversationCleanupHandle.resolved(
+                        provider: session.selectedAgent.rawValue,
+                        explicit: nil,
+                        providerSessionID: newSessionID,
+                        codexConversationID: session.codexConversationID,
+                        codexRolloutPath: session.codexRolloutPath
+                    )
                     session.isDirty = true
-                    hooks.scheduleSave(session.tabID)
+                    hooks.persistence.scheduleSave(session)
                 }
                 if status.isRepoPromptServerFailed {
-                    return ConsumeEventsOutcome(
-                        terminalState: .failed,
+                    return .failed(
                         errorText: "RepoPrompt MCP failed to initialize for Claude (session \(status.sessionID ?? "unknown")).",
                         shouldShutdownSession: true
                     )
                 }
             case let .approvalRequest(request):
+                if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+                    session.recordRunProgress(ownership: ownership, kind: .interaction, stage: .waitingForInteraction)
+                }
                 session.pendingApproval = request
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
                 session.runState = .waitingForApproval
-                hooks.updateBindings(session)
+                hooks.bindingObservation.updateBindings(session)
             case let .approvalCancelled(requestID):
                 if session.pendingApproval?.requestID == .claudeControl(requestID) {
                     session.pendingApproval = nil
@@ -212,7 +444,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         session.setRunningStatus("Thinking…", source: .transport)
                         session.runState = .running
                     }
-                    hooks.updateBindings(session)
+                    hooks.bindingObservation.updateBindings(session)
                 }
             case let .turnCompleted(turnID, turnStatus):
                 guard session.claudeExpectedTurnIDs.contains(turnID) else {
@@ -233,8 +465,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     if !session.runState.isActive {
                         session.runState = .running
                     }
-                    hooks.setAgentRunActive(session.tabID, true)
-                    hooks.updateBindings(session)
+                    hooks.presentation.setAgentRunActive(session, true)
+                    hooks.bindingObservation.updateBindings(session)
                     continue eventLoop
                 }
                 // No superseding turn expected — terminal for this run.
@@ -242,11 +474,11 @@ final class ClaudeIntegratedAgentModeRunner {
                 session.claudeSupersedingProtectedTurnIDs.removeAll()
                 switch turnStatus {
                 case .completed:
-                    return ConsumeEventsOutcome(terminalState: .completed, errorText: nil, shouldShutdownSession: false)
+                    return .completed
                 case .cancelled:
-                    return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil, shouldShutdownSession: false)
+                    return .cancelled
                 case .failed:
-                    return ConsumeEventsOutcome(terminalState: .failed, errorText: nil, shouldShutdownSession: false)
+                    return .failed(errorText: nil, shouldShutdownSession: false)
                 }
             case let .error(message):
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -260,8 +492,8 @@ final class ClaudeIntegratedAgentModeRunner {
                     #endif
                     let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
                     session.appendItem(errorItem)
-                    hooks.updateBindings(session)
-                    hooks.scheduleSave(session.tabID)
+                    hooks.bindingObservation.updateBindings(session)
+                    hooks.persistence.scheduleSave(session)
                 }
             }
         }
@@ -269,110 +501,78 @@ final class ClaudeIntegratedAgentModeRunner {
         // If we exited because the attempt changed (cancel / new attempt)
         // or the task was cancelled, this is expected — not a stream failure.
         if exitedDueToAttemptMismatch || Task.isCancelled {
-            return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil, shouldShutdownSession: false)
+            return .cancelled
         }
 
         // The events stream ended without a terminal turnCompleted event while this
         // attempt was still active.  This means the stream was finished or the Claude
         // process exited unexpectedly.
-        let errorItem = AgentChatItem.error(
-            "Claude events stream ended unexpectedly. The run may need to be restarted.",
-            sequenceIndex: session.nextSequenceIndex
+        return .failed(
+            errorText: "Claude events stream ended unexpectedly. The run may need to be restarted.",
+            shouldShutdownSession: false
         )
-        session.appendItem(errorItem)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
-        return ConsumeEventsOutcome(terminalState: .failed, errorText: nil, shouldShutdownSession: false)
     }
 
     private func handleAcquireFailure(
-        tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        tabID _: UUID,
+        session: AgentTabSession,
         runID: UUID,
-        runAttemptID: UUID,
+        ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
-        guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
-        else {
-            return
-        }
-        session.activeHeadlessRunAttemptID = nil
-        session.agentTask = nil
-        session.runState = .cancelled
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
-        hooks.recordPendingHandoffSendOutcome(session, false)
-        hooks.setAgentRunActive(tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
+        hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
+        await terminalCommitBarrier.commit(.init(
+            binding: hooks.bindTerminalSession(session),
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .cancelled,
+            source: "claudeNative.acquireFailure",
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: false
+        ))
     }
 
+    @discardableResult
     private func finalize(
-        session: AgentModeViewModel.TabSession,
+        session: AgentTabSession,
         runID: UUID,
-        runAttemptID: UUID,
+        ownership: AgentRunOwnership,
         attachmentReservationID: UUID?,
         terminalState: AgentSessionRunState,
         errorText: String?,
-        notifyTurnComplete: Bool
-    ) async {
-        guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
-        else {
-            return
-        }
-
-        hooks.finalizeStreamingItems(session)
-        hooks.finalizePendingToolCalls(session, terminalState)
-        hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-        let queuedInstruction = terminalState == .completed ? session.pendingInstructions.first : nil
-        if queuedInstruction != nil {
-            session.pendingInstructions.removeFirst()
-        }
-        session.activeHeadlessRunAttemptID = nil
-        session.agentTask = nil
-        session.runState = terminalState
-        session.pendingSupersedingTurnCompletions = 0
-        session.claudeSupersedingProtectedTurnIDs.removeAll()
-        session.claudeExpectedTurnIDs.removeAll()
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
-        hooks.cancelPendingQuestion(session)
-        hooks.cancelPendingApproval(session)
-        let pendingReviewCancellationReason = switch terminalState {
-        case .completed:
-            "Run completed before review decision"
-        case .cancelled:
-            "Run cancelled"
-        case .failed:
-            "Run failed"
-        default:
-            "Run finished"
-        }
-        hooks.cancelPendingApplyEditsReview(session, pendingReviewCancellationReason)
-        hooks.cancelPendingWorktreeMergeReview(session, pendingReviewCancellationReason)
-        hooks.setAgentRunActive(session.tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-
-        if let errorText {
-            let trimmed = errorText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
-                session.appendItem(errorItem)
+        notifyTurnComplete: Bool,
+        shouldShutdownSession: Bool = false
+    ) async -> AgentRunTerminalCommitRevision? {
+        await terminalCommitBarrier.commit(.init(
+            binding: hooks.bindTerminalSession(session),
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: terminalState,
+            source: "claudeNative.finalize",
+            errorText: errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: notifyTurnComplete,
+            prepareProviderState: { [claudeCoordinator] in
+                session.pendingSupersedingTurnCompletions = 0
+                session.claudeSupersedingProtectedTurnIDs.removeAll()
+                session.claudeExpectedTurnIDs.removeAll()
+                guard shouldShutdownSession else { return nil }
+                let oldController = claudeCoordinator.prepareClaudeCancelSync(session)
+                return {
+                    claudeCoordinator.beginClaudeResumeTransferIfNeeded(
+                        for: session,
+                        oldController: oldController
+                    )
+                    await claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                }
             }
-        }
-
-        hooks.updateBindings(session)
-        if notifyTurnComplete {
-            hooks.notifyAgentTurnComplete(session)
-        }
-        hooks.scheduleSave(session.tabID)
-
-        if let queuedInstruction {
-            hooks.startFollowUpRun(session.tabID, queuedInstruction)
-        }
+        ))
     }
 
     // MARK: - Error Filtering

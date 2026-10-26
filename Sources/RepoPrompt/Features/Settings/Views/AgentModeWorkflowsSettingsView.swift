@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Settings-native management surface for Agent Mode workflow prompts.
@@ -200,7 +202,8 @@ struct AgentModeWorkflowsSettingsView: View {
                 Image(systemName: "arrow.up")
             }
             .disabled(index == 0)
-            .help("Move earlier")
+            .hoverTooltip("Move earlier")
+            .accessibilityLabel("Move earlier")
 
             Button {
                 workflowStore.moveFeaturedWorkflow(withID: workflow.id, direction: 1)
@@ -208,14 +211,15 @@ struct AgentModeWorkflowsSettingsView: View {
                 Image(systemName: "arrow.down")
             }
             .disabled(index == workflowStore.featuredWorkflows.count - 1)
-            .help("Move later")
+            .hoverTooltip("Move later")
+            .accessibilityLabel("Move later")
 
             Button {
                 workflowStore.removeFeaturedWorkflow(withID: workflow.id)
             } label: {
                 Label("Remove", systemImage: "minus.circle")
             }
-            .help("Remove from featured workflows")
+            .hoverTooltip("Remove from featured workflows")
         }
     }
 
@@ -230,7 +234,7 @@ struct AgentModeWorkflowsSettingsView: View {
             ))
             .toggleStyle(.switch)
             .controlSize(.small)
-            .help(isHidden ? "Show this built-in workflow" : "Hide this built-in workflow")
+            .hoverTooltip(isHidden ? "Show this built-in workflow" : "Hide this built-in workflow")
 
             featureButton(for: definition, isEnabled: !isHidden)
 
@@ -241,7 +245,7 @@ struct AgentModeWorkflowsSettingsView: View {
             } label: {
                 Label("Clone", systemImage: "plus.square.on.square")
             }
-            .help("Clone as a custom markdown workflow")
+            .hoverTooltip("Clone as a custom markdown workflow")
         }
     }
 
@@ -254,14 +258,14 @@ struct AgentModeWorkflowsSettingsView: View {
             } label: {
                 Label("Reveal", systemImage: "doc.text.magnifyingglass")
             }
-            .help("Reveal in Finder")
+            .hoverTooltip("Reveal in Finder")
 
             Button(role: .destructive) {
                 workflowPendingDeletion = workflow
             } label: {
                 Label("Delete", systemImage: "trash")
             }
-            .help("Delete custom workflow")
+            .hoverTooltip("Delete custom workflow")
         }
     }
 
@@ -314,7 +318,8 @@ struct AgentModeWorkflowsSettingsView: View {
             Label("Add Featured Workflow", systemImage: "plus")
         }
         .disabled(workflowStore.featuredWorkflowIDs.count >= AgentWorkflowStore.maxFeaturedWorkflowCount || addableFeaturedWorkflows.isEmpty)
-        .help(addFeaturedHelpText)
+        .hoverTooltip(addFeaturedHelpText)
+        .accessibilityHint(addFeaturedHelpText)
     }
 
     private var customToolbar: some View {
@@ -353,7 +358,8 @@ struct AgentModeWorkflowsSettingsView: View {
             Label(isFeatured ? "Featured" : "Feature", systemImage: isFeatured ? "star.fill" : "star")
         }
         .disabled(!isActionEnabled)
-        .help(featureHelpText(isFeatured: isFeatured, canFeature: canFeature, isEnabled: isEnabled))
+        .hoverTooltip(featureHelpText(isFeatured: isFeatured, canFeature: canFeature, isEnabled: isEnabled))
+        .accessibilityHint(featureHelpText(isFeatured: isFeatured, canFeature: canFeature, isEnabled: isEnabled))
     }
 
     // MARK: - Helpers

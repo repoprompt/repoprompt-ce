@@ -52,13 +52,13 @@ func selectionSignature(for paths: Set<String>) -> SelectionSig {
 actor PathMatchWorker {
     // MARK: - Index Cache (single-entry, keyed by generation)
 
-    private var lastIndexID: UInt64?
+    private var lastIndexIdentity: PathMatchCacheIdentity?
     private var lastIndexes: PathMatchIndexes?
 
     // MARK: - Snapshot Cache (multi-entry for selection churn)
 
     private struct SnapshotKey: Equatable {
-        let staticID: UInt64
+        let staticIdentity: PathMatchCacheIdentity
         let selectionSig: SelectionSig
     }
 
@@ -76,8 +76,8 @@ actor PathMatchWorker {
     /// Builds or retrieves cached indexes for the given static data.
     private func indexes(for staticData: StaticPathMatchData) -> PathMatchIndexes {
         // Fast path: return cached indexes if generation matches
-        if let cachedID = lastIndexID,
-           cachedID == staticData.id,
+        if let cachedIdentity = lastIndexIdentity,
+           cachedIdentity == staticData.cacheIdentity,
            let cached = lastIndexes
         {
             return cached
@@ -91,7 +91,7 @@ actor PathMatchWorker {
         )
 
         // Cache for next call
-        lastIndexID = staticData.id
+        lastIndexIdentity = staticData.cacheIdentity
         lastIndexes = built
 
         // Clear snapshot cache when indexes change (different generation)
@@ -108,7 +108,7 @@ actor PathMatchWorker {
         selectedFileFullPaths: Set<String>,
         selectionSig: SelectionSig
     ) -> PathMatchSnapshot {
-        let key = SnapshotKey(staticID: staticData.id, selectionSig: selectionSig)
+        let key = SnapshotKey(staticIdentity: staticData.cacheIdentity, selectionSig: selectionSig)
 
         // Check cache (linear scan is fine for small cache)
         if let idx = snapshotCache.firstIndex(where: { $0.key == key }) {
@@ -244,10 +244,13 @@ actor PathMatchWorker {
         )
     }
 
-    /// Clears all cached data.
-    func invalidateCache() {
-        lastIndexID = nil
-        lastIndexes = nil
-        snapshotCache.removeAll(keepingCapacity: true)
+    /// Removes only cached data built from stale scope snapshots.
+    func invalidateCache(snapshotIdentities: Set<PathMatchCacheIdentity>) {
+        guard !snapshotIdentities.isEmpty else { return }
+        if let lastIndexIdentity, snapshotIdentities.contains(lastIndexIdentity) {
+            self.lastIndexIdentity = nil
+            lastIndexes = nil
+        }
+        snapshotCache.removeAll { snapshotIdentities.contains($0.key.staticIdentity) }
     }
 }

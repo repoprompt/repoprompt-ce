@@ -19,17 +19,27 @@ enum ClaudeCodeAIModelCatalog {
     }
 
     private static let pickerEffortOrder: [ClaudeCodeEffortLevel] = [
-        .low, .medium, .high, .max, .xhigh
+        .low, .medium, .high, .xhigh, .max
     ]
 
     private static let modelDefinitions: [ModelDefinition] = [
-        ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .max]),
-        ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .max]),
-        ModelDefinition(runtimeModelRaw: "claude-opus-4-7", displayName: "Opus 4.7", supportedEfforts: [.low, .medium, .high, .xhigh]),
-        ModelDefinition(runtimeModelRaw: "claude-opus-4-6", displayName: "Opus 4.6", supportedEfforts: [.low, .medium, .high, .max]),
+        ModelDefinition(runtimeModelRaw: "fable", displayName: "Fable Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-fable-5-1", displayName: "Fable 5.1", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        // Restricted-access tier; listed for entitled accounts but never used as a default.
+        ModelDefinition(runtimeModelRaw: "claude-mythos-5-1", displayName: "Mythos 5.1 (Restricted)", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-5-5", displayName: "Opus 5.5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-5", displayName: "Opus 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-4-8", displayName: "Opus 4.8", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-4-7", displayName: "Opus 4.7", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-4-6", displayName: "Opus 4.6", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-5-20251101", displayName: "Opus 4.5", supportedEfforts: []),
         ModelDefinition(runtimeModelRaw: "sonnet[1m]", displayName: "Sonnet Latest (1M)", supportedEfforts: [.low, .medium, .high]),
         ModelDefinition(runtimeModelRaw: "sonnet", displayName: "Sonnet Latest", supportedEfforts: [.low, .medium, .high]),
+        ModelDefinition(runtimeModelRaw: "claude-sonnet-5-5", displayName: "Sonnet 5.5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
+        ModelDefinition(runtimeModelRaw: "claude-sonnet-5", displayName: "Sonnet 5", supportedEfforts: [.low, .medium, .high, .xhigh, .max]),
         ModelDefinition(runtimeModelRaw: "claude-sonnet-4-6", displayName: "Sonnet 4.6", supportedEfforts: [.low, .medium, .high]),
         ModelDefinition(runtimeModelRaw: "claude-sonnet-4-5-20250929", displayName: "Sonnet 4.5", supportedEfforts: []),
         ModelDefinition(runtimeModelRaw: "haiku", displayName: "Haiku Latest", supportedEfforts: []),
@@ -144,11 +154,17 @@ enum ClaudeCodeAIModelCatalog {
         case .noModel:
             return [.claudeCodeModel(specifier: compatibleBackendSpecifier(backendID: backendID, requestedModelRaw: nil))]
         case .claudeSlotMapping:
-            return [
+            var models: [AIModel] = [
                 .claudeCodeModel(specifier: compatibleBackendSpecifier(backendID: backendID, requestedModelRaw: AgentModel.claudeHaiku.rawValue)),
                 .claudeCodeModel(specifier: compatibleBackendSpecifier(backendID: backendID, requestedModelRaw: AgentModel.claudeSonnet.rawValue)),
                 .claudeCodeModel(specifier: compatibleBackendSpecifier(backendID: backendID, requestedModelRaw: AgentModel.claudeOpus.rawValue))
             ]
+            if backendID == .glmZAI {
+                models.append(contentsOf: ClaudeCompatibleProviderRuntimeBridge.directSelectableGLMModelRawValues.map {
+                    .claudeCodeModel(specifier: compatibleBackendSpecifier(backendID: backendID, requestedModelRaw: $0))
+                })
+            }
+            return models
         }
     }
 
@@ -240,31 +256,50 @@ enum ClaudeCodeAIModelCatalog {
         return AIModel.ClaudeCodePickerMenu(defaultOption: nil, groups: groups + compatibleGroups)
     }
 
-    static func modelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
-        let lhsCompatible = compatibleBackendDescriptor(for: lhs)
-        let rhsCompatible = compatibleBackendDescriptor(for: rhs)
-        if lhsCompatible != nil || rhsCompatible != nil {
-            if lhsCompatible == nil { return true }
-            if rhsCompatible == nil { return false }
+    struct SortKey {
+        let isCompatibleBackend: Bool
+        let baseRank: Int
+        let effortRank: Int
+        let displayName: String
+        let rawValue: String
+    }
+
+    /// Precomputes all values used for sorting so that `baseSortRank`'s linear
+    /// scan through `modelDefinitions` is paid once per model rather than once
+    /// per comparison inside a sort closure.
+    static func sortKey(for model: AIModel) -> SortKey {
+        SortKey(
+            isCompatibleBackend: compatibleBackendDescriptor(for: model) != nil,
+            baseRank: baseSortRank(baseModelRaw(for: model)),
+            effortRank: effortSortRank(explicitEffort(for: model)),
+            displayName: model.displayName,
+            rawValue: model.rawValue
+        )
+    }
+
+    static func precedes(lhsKey: SortKey, lhs: AIModel, rhsKey: SortKey, rhs: AIModel) -> Bool {
+        let lhsCompatible = lhsKey.isCompatibleBackend
+        let rhsCompatible = rhsKey.isCompatibleBackend
+        if lhsCompatible || rhsCompatible {
+            if !lhsCompatible { return true }
+            if !rhsCompatible { return false }
             return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
-        let leftBaseRank = baseSortRank(baseModelRaw(for: lhs))
-        let rightBaseRank = baseSortRank(baseModelRaw(for: rhs))
-        if leftBaseRank != rightBaseRank {
-            return leftBaseRank < rightBaseRank
+        if lhsKey.baseRank != rhsKey.baseRank {
+            return lhsKey.baseRank < rhsKey.baseRank
         }
-
-        let leftEffortRank = effortSortRank(explicitEffort(for: lhs))
-        let rightEffortRank = effortSortRank(explicitEffort(for: rhs))
-        if leftEffortRank != rightEffortRank {
-            return leftEffortRank < rightEffortRank
+        if lhsKey.effortRank != rhsKey.effortRank {
+            return lhsKey.effortRank < rhsKey.effortRank
         }
-
-        let displayComparison = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
+        let displayComparison = lhsKey.displayName.localizedCaseInsensitiveCompare(rhsKey.displayName)
         if displayComparison != .orderedSame {
             return displayComparison == .orderedAscending
         }
-        return lhs.rawValue.localizedCaseInsensitiveCompare(rhs.rawValue) == .orderedAscending
+        return lhsKey.rawValue.localizedCaseInsensitiveCompare(rhsKey.rawValue) == .orderedAscending
+    }
+
+    static func modelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
+        precedes(lhsKey: sortKey(for: lhs), lhs: lhs, rhsKey: sortKey(for: rhs), rhs: rhs)
     }
 
     private static func definition(forBaseModelRaw raw: String?) -> ModelDefinition? {
@@ -324,6 +359,20 @@ enum ClaudeCodeAIModelCatalog {
         case let .claudeSlotMapping(mapping):
             let normalizedMapping = mapping.normalized
             let slot = requestedModelRaw ?? AgentModel.claudeSonnet.rawValue
+            if backendID == .glmZAI,
+               let requestedModelRaw,
+               ClaudeCompatibleProviderRuntimeBridge.isDirectSelectableGLMModel(requestedModelRaw)
+            {
+                let backendDisplayName = displayName(forBackendModelID: requestedModelRaw)
+                let groupName = config.normalizedDisplayName
+                return CompatibleBackendModelDescriptor(
+                    backendID: backendID,
+                    requestedModelRaw: requestedModelRaw,
+                    groupDisplayName: groupName,
+                    optionDisplayName: backendDisplayName,
+                    modelDisplayName: "\(groupName) \(backendDisplayName)"
+                )
+            }
             let optionName: String
             let backendModelID: String
             switch slot {
@@ -345,8 +394,8 @@ enum ClaudeCodeAIModelCatalog {
                 backendID: backendID,
                 requestedModelRaw: slot,
                 groupDisplayName: groupName,
-                optionDisplayName: "\(optionName) - \(backendDisplayName)",
-                modelDisplayName: "\(groupName) \(optionName)"
+                optionDisplayName: "\(backendDisplayName) — \(optionName)",
+                modelDisplayName: "\(groupName) \(backendDisplayName) — \(optionName)"
             )
         }
     }
@@ -361,7 +410,10 @@ enum ClaudeCodeAIModelCatalog {
             guard let first = entries.first else { return nil }
             let options = entries
                 .sorted { lhs, rhs in
-                    compatibleBackendOptionRank(lhs.1.requestedModelRaw) < compatibleBackendOptionRank(rhs.1.requestedModelRaw)
+                    let lhsRank = compatibleBackendOptionRank(lhs.1.requestedModelRaw)
+                    let rhsRank = compatibleBackendOptionRank(rhs.1.requestedModelRaw)
+                    if lhsRank != rhsRank { return lhsRank < rhsRank }
+                    return lhs.1.optionDisplayName.localizedCaseInsensitiveCompare(rhs.1.optionDisplayName) == .orderedAscending
                 }
                 .map { model, descriptor in
                     AIModel.ClaudeCodePickerMenuOption(model: model, displayName: descriptor.optionDisplayName)
@@ -380,10 +432,16 @@ enum ClaudeCodeAIModelCatalog {
 
     private static func compatibleBackendOptionRank(_ rawModel: String?) -> Int {
         switch rawModel {
-        case .some(AgentModel.claudeHaiku.rawValue): 0
-        case .some(AgentModel.claudeSonnet.rawValue): 1
-        case .some(AgentModel.claudeOpus.rawValue): 2
-        default: 0
+        case .some(AgentModel.claudeHaiku.rawValue): return 0
+        case .some(AgentModel.claudeSonnet.rawValue): return 1
+        case .some(AgentModel.claudeOpus.rawValue): return 2
+        case let .some(raw):
+            if let index = ClaudeCompatibleProviderRuntimeBridge.directSelectableGLMModelRawValues.firstIndex(of: raw) {
+                return 10 + index
+            }
+            return 99
+        case nil:
+            return 99
         }
     }
 

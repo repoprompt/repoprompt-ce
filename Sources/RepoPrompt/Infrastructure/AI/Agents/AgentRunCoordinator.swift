@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptInstrumentation
 
 /// Identifies the type of headless agent run.
 enum AgentRunType {
@@ -24,7 +25,22 @@ struct AgentRunSpec {
 /// Shared coordinator for preparing, launching, and cleaning up headless agent runs.
 /// This centralises policy installation and provider orchestration for headless runs.
 final class AgentRunCoordinator {
+    struct GateRoutingReleaseResult {
+        let routingOutcome: MCPRoutingWaitOutcome
+        let gateRelease: HeadlessAgentConnectionGate.ReleaseResult
+
+        var routed: Bool {
+            routingOutcome.routed
+        }
+    }
+
     static let shared = AgentRunCoordinator()
+
+    private let perfRecorderBox = AgentModePerfRecorderBox()
+
+    func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorderBox.install(recorder)
+    }
 
     private let log = Logger(subsystem: "com.repoprompt.agents", category: "AgentRunCoordinator")
 
@@ -77,10 +93,11 @@ final class AgentRunCoordinator {
             reason: reason ?? "\(spec.type)",
             ttl: spec.connectionTTL,
             tabID: tabID,
-            purpose: runPurpose(for: spec.type)
+            purpose: runPurpose(for: spec.type),
+            requiresExpectedAgentPID: spec.agentKind.requiresExpectedPIDOwnedAgentModeMCPRouting
         )
 
-        let lease = MCPBootstrapLease(spec: leaseSpec)
+        let lease = MCPBootstrapLease(spec: leaseSpec, perfRecorder: perfRecorderBox.snapshot())
         let acquired = await lease.acquire()
         guard acquired else { throw CancellationError() }
         return lease
@@ -129,41 +146,53 @@ final class AgentRunCoordinator {
     /// Always releases the gate on timeout to prevent deadlocks.
     ///
     /// Uses event-driven waiting via `MCPRoutingWaiter` instead of polling. The waiter is notified when:
-    /// - `registerRunIDMapping` succeeds (routed = true)
-    /// - `cleanupRunIDMapping` is called (routed = false, early exit)
-    /// - Timeout expires (routed = false)
-    /// - Task is cancelled (routed = false, early exit via signalFailed)
+    /// - `registerRunIDMapping` succeeds
+    /// - cleanup or explicit routing failure resolves the run
+    /// - the selected absolute/adaptive deadline expires
+    /// - the individual waiting task is cancelled
     ///
     /// - Parameters:
     ///   - runID: The run identifier associated with routing state and waiter notifications.
     ///   - gateID: The gate ownership identifier to release when routing completes. Defaults to `runID`.
     ///   - timeoutMs: Maximum time to wait for routing before forcing release (default: 10,000 ms).
-    /// - Returns: `true` if routing succeeded, `false` on timeout, failure, or cancellation.
+    /// - Returns: Routing and gate-release diagnostics for the run.
     @discardableResult
-    func releaseGateWhenRouted(runID: UUID, gateID: UUID? = nil, timeoutMs: Int = defaultRoutingTimeoutMs) async -> Bool {
+    func releaseGateWhenRouted(
+        runID: UUID,
+        gateID: UUID? = nil,
+        timeoutMs: Int = defaultRoutingTimeoutMs,
+        waitPolicy: MCPRoutingWaitPolicy? = nil,
+        progressLifecycle: MCPBootstrapRoutingProgressLifecycle? = nil
+    ) async -> GateRoutingReleaseResult {
         let timeoutSeconds = TimeInterval(timeoutMs) / 1000.0
-
-        // Event-driven wait with cancellation support:
-        // On task cancellation, we signal failure immediately so the wait doesn't block until timeout.
-        let routed = await withTaskCancellationHandler {
-            await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: timeoutSeconds)
-        } onCancel: {
-            // Expedite: tell the waiter this run will never route (task was cancelled)
-            MCPRoutingWaiter.signalFailed(runID)
+        let routingOutcome: MCPRoutingWaitOutcome = if let waitPolicy {
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: runID,
+                policy: waitPolicy,
+                progressLifecycle: progressLifecycle
+            )
+        } else {
+            // Compatibility path: one absolute deadline that ignores connection observation.
+            await MCPRoutingWaiter.waitForRoutingOutcome(
+                runID: runID,
+                timeoutSeconds: timeoutSeconds,
+                progressLifecycle: progressLifecycle
+            )
         }
 
         let gateKey = gateID ?? runID
-        let released = await HeadlessAgentConnectionGate.completeIfActive(gateKey)
+        let gateRelease = await HeadlessAgentConnectionGate.completeIfActiveWithDiagnostics(gateKey)
 
-        if routed {
-            log.info("Gate release after routing event: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(released)")
+        if routingOutcome.routed {
+            log.info("Gate release after routing event: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(gateRelease.released)")
         } else {
-            log.info("Gate release after timeout/failure/cancel: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(released)")
+            log.info("Gate release after routing outcome \(String(describing: routingOutcome)): runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(gateRelease.released)")
         }
 
-        // Clean up waiter state to prevent memory leaks
-        await MCPRoutingWaiter.cleanup(runID: runID)
-        return routed
+        return GateRoutingReleaseResult(
+            routingOutcome: routingOutcome,
+            gateRelease: gateRelease
+        )
     }
 }
 

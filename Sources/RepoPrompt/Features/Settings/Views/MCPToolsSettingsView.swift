@@ -9,6 +9,17 @@ struct MCPToolsSettingsView: View {
         fontScale.preset
     }
 
+    private var windowToolsEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { server.windowToolsEnabled },
+            set: { enabled in
+                Task { @MainActor [weak server] in
+                    _ = await server?.setWindowToolsEnabled(enabled)
+                }
+            }
+        )
+    }
+
     @State private var searchText = ""
 
     var body: some View {
@@ -41,8 +52,9 @@ struct MCPToolsSettingsView: View {
 
     private var controlsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Toggle("Enable MCP tools for this window", isOn: $server.windowToolsEnabled)
-                .help("Allow external tools to interact with this window's workspace")
+            Toggle("Enable MCP tools for this window", isOn: windowToolsEnabledBinding)
+                .hoverTooltip("Allow external tools to interact with this window's workspace")
+                .accessibilityHint("Allow external tools to interact with this window's workspace")
 
             if !server.windowToolsEnabled {
                 HStack(spacing: 8) {

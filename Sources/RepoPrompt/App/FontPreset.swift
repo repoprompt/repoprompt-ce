@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  FontPreset.swift
 //  RepoPrompt

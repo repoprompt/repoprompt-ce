@@ -1,7 +1,115 @@
 import Foundation
 import MCP
+import RepoPromptFoundation
+import RepoPromptVCS
+
+struct WorkspaceGitDiffArtifactSelectionMergeResult: Equatable {
+    let selection: StoredSelection
+    let newlyAddedArtifacts: [GitDiffPublishedArtifact]
+}
+
+struct WorkspaceGitDiffArtifactSelectionService {
+    func mergePrimaryArtifacts(
+        existing: StoredSelection,
+        candidates: [GitDiffPublishedArtifact]
+    ) -> WorkspaceGitDiffArtifactSelectionMergeResult {
+        var selectedPaths = existing.selectedPaths
+        var selectedIdentities = Set(existing.selectedPaths.compactMap {
+            StoredSelectionPathNormalization.standardizedPath($0)
+        })
+        var newlyAddedArtifacts: [GitDiffPublishedArtifact] = []
+        var seenCandidates = Set<String>()
+
+        for candidate in candidates where candidate.selectionDisposition == .primaryAutoSelect {
+            guard let identity = StoredSelectionPathNormalization.standardizedPath(candidate.absolutePath),
+                  identity.hasPrefix("/"),
+                  seenCandidates.insert(identity).inserted
+            else { continue }
+            guard selectedIdentities.insert(identity).inserted else { continue }
+            selectedPaths.append(identity)
+            newlyAddedArtifacts.append(candidate)
+        }
+
+        return WorkspaceGitDiffArtifactSelectionMergeResult(
+            selection: StoredSelection(
+                selectedPaths: selectedPaths,
+                manualCodemapPaths: existing.manualCodemapPaths,
+                slices: existing.slices,
+                codemapAutoEnabled: existing.codemapAutoEnabled
+            ),
+            newlyAddedArtifacts: newlyAddedArtifacts
+        )
+    }
+}
 
 extension MCPServerViewModel {
+    @MainActor
+    func selectCreatedFile(
+        _ file: WorkspaceFileRecord?,
+        resolvedContext: MCPResolvedTabContextSnapshot,
+        metadata: MCPRequestMetadata,
+        lookupContext: WorkspaceLookupContext
+    ) async -> String? {
+        let warning = "The file was created, but its selection was not confirmed. Retry manage_selection for the same context_id."
+        let context = resolvedContext.snapshot
+        guard !Task.isCancelled,
+              let file,
+              let workspaceID = context.workspaceID,
+              let selectionCoordinator
+        else { return warning }
+
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        let connectionID = fileToolAuthorityConnectionID(metadata: metadata, routed: resolvedContext)
+        let source = AgentWorkspaceLookupContextSource(
+            activeAgentSessionID: context.activeAgentSessionID,
+            worktreeBindingState: context.worktreeBindingState
+        )
+        let addedPaths = lookupContext.logicalizeSelection(
+            StoredSelection(selectedPaths: [file.standardizedFullPath])
+        ).selectedPaths
+        var accepted = false
+        guard let transaction = await selectionCoordinator.transformSelection(
+            for: identity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: context.worktreeBindings.isEmpty,
+            { latestSelection in
+                guard !Task.isCancelled,
+                      fileToolLookupSnapshotIsCurrent(context, connectionID: connectionID),
+                      fileToolBindingSourceIsCurrent(source, for: context)
+                else { return latestSelection }
+                accepted = true
+                return mutatePreResolvedFullFilePaths(
+                    base: latestSelection,
+                    absolutePaths: addedPaths,
+                    mode: .add
+                )
+            }
+        ), accepted,
+        let canonical = selectionCoordinator.selectionSnapshot(
+            for: identity,
+            flushPendingUIIfActive: false
+        )?.selection
+        else { return warning }
+
+        let canonicalPaths = Set(StoredSelectionPathNormalization.standardizedPaths(canonical.selectedPaths))
+        guard addedPaths.allSatisfy({ canonicalPaths.contains($0) && canonical.slices[$0] == nil }) else {
+            return warning
+        }
+
+        if let connectionID,
+           var latest = tabContextByConnectionID[connectionID],
+           fileToolLookupSnapshotMatches(latest, context)
+        {
+            latest.selection = canonical
+            latest.selectionRevision = workspaceManager?.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: context.tabID
+            ) ?? transaction.revision
+            tabContextByConnectionID[connectionID] = latest
+        }
+        return nil
+    }
+
     /// Result of building a stored selection
     struct BuildStoredSelectionResult {
         let selection: StoredSelection
@@ -46,6 +154,7 @@ extension MCPServerViewModel {
         from inputs: ManageSelectionInputs,
         mode: String,
         existing: StoredSelection,
+        hasFullFileArtifactInputs: Bool = false,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> BuildStoredSelectionResult {
         let result = await mcpSelectionMutationService().buildManageSelectionSet(
@@ -54,12 +163,26 @@ extension MCPServerViewModel {
             sliceErrors: inputs.sliceErrors,
             mode: mode,
             existing: existing,
+            hasFullFileArtifactInputs: hasFullFileArtifactInputs,
             rootScope: lookupRootScope
         )
         return BuildStoredSelectionResult(
             selection: result.selection,
             invalidPaths: result.invalidPaths,
             codemapUnavailable: result.codemapUnavailable
+        )
+    }
+
+    @MainActor
+    func mutatePreResolvedFullFilePaths(
+        base: StoredSelection,
+        absolutePaths: [String],
+        mode: WorkspacePreResolvedFullFileMutationMode
+    ) -> StoredSelection {
+        mcpSelectionMutationService().mutatePreResolvedFullFilePaths(
+            base: base,
+            absolutePaths: absolutePaths,
+            mode: mode
         )
     }
 
@@ -141,8 +264,19 @@ extension MCPServerViewModel {
             stored: selection,
             codeMapUsage: effectiveMCPCodeMapUsage(promptVM.codeMapUsage)
         )
-        let collections = await SelectionReplyAssembler.collect(from: source, owner: self)
-        let formatter = PathFormatter(format: display, owner: self)
+        let lookupContext = WorkspaceLookupContext(rootScope: lookupRootScope, bindingProjection: nil)
+        let collections = await SelectionReplyAssembler.collect(
+            from: source,
+            owner: self,
+            rootScope: lookupRootScope,
+            contentPolicy: includeBlocks ? .loadContent : .cachedOnly,
+            lookupContext: lookupContext
+        )
+        let formatter = PathFormatter(
+            format: display,
+            owner: self,
+            rootScope: lookupRootScope
+        )
         let tokens = TokenServices(owner: self)
         var out = await SelectionReplyAssembler.buildSelectionReply(
             collections: collections,
@@ -156,7 +290,11 @@ extension MCPServerViewModel {
 
         // Inject minimal codeStructure.unmappedPaths to report pending codemaps
         if out.codeStructure == nil {
-            if let minimal = await buildUnmappedOnlyCodeStructure(collections: collections, display: display) {
+            if let minimal = await buildUnmappedOnlyCodeStructure(
+                collections: collections,
+                display: display,
+                rootScope: lookupRootScope
+            ) {
                 out = ToolResultDTOs.SelectionReply(
                     files: out.files,
                     totalTokens: out.totalTokens,
@@ -174,7 +312,9 @@ extension MCPServerViewModel {
                     userCopyTokens: out.userCopyTokens,
                     userChatTokens: out.userChatTokens,
                     normalizedCodeMapUsage: out.normalizedCodeMapUsage,
-                    tokenStats: out.tokenStats
+                    tokenStats: out.tokenStats,
+                    tokenAccounting: out.tokenAccounting,
+                    copyPresetProjection: out.copyPresetProjection
                 )
             }
         }
@@ -192,39 +332,14 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func addPrimaryGitDiffArtifactsToSelection(
+    func mergePrimaryGitDiffArtifactsIntoSelection(
         existing: StoredSelection,
-        paths: [String],
-        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async -> (selection: StoredSelection, autoSelectedPaths: [String]) {
-        let orderedPaths = paths
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .reduce(into: [String]()) { result, item in
-                if !result.contains(item) { result.append(item) }
-            }
-        guard !orderedPaths.isEmpty else {
-            return (existing, [])
-        }
-        let previouslySelected = Set(existing.selectedPaths)
-        let result = await addStoredSelectionPaths(
+        candidates: [GitDiffPublishedArtifact]
+    ) -> WorkspaceGitDiffArtifactSelectionMergeResult {
+        WorkspaceGitDiffArtifactSelectionService().mergePrimaryArtifacts(
             existing: existing,
-            paths: orderedPaths,
-            rawPaths: orderedPaths,
-            mode: "full",
-            lookupRootScope: lookupRootScope
+            candidates: candidates
         )
-        let resolvedFiles = await selectionFindFiles(
-            atPaths: orderedPaths,
-            lookupRootScope: lookupRootScope
-        )
-        let autoSelectedPaths = orderedPaths.filter { rawPath in
-            guard let file = resolvedFiles[rawPath] else { return false }
-            let fullPath = file.standardizedFullPath
-            return !previouslySelected.contains(fullPath)
-                && result.selection.selectedPaths.contains(fullPath)
-        }
-        return (result.selection, autoSelectedPaths)
     }
 
     @MainActor
@@ -276,14 +391,19 @@ extension MCPServerViewModel {
         rawPaths: [String],
         strict _: Bool,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async -> (StoredSelection, [String], Bool) {
+    ) async -> (selection: StoredSelection, invalidPaths: [String], mutated: Bool, validCandidateCount: Int) {
         let result = await mcpSelectionMutationService().promotePaths(
             existing: existing,
             paths: paths,
             rawPaths: rawPaths,
             rootScope: lookupRootScope
         )
-        return (result.selection, result.invalidPaths, result.mutated)
+        return (
+            result.selection,
+            result.invalidPaths,
+            result.mutated,
+            result.validCandidateCount
+        )
     }
 
     /// Result of demoting paths to codemap mode
@@ -292,6 +412,7 @@ extension MCPServerViewModel {
         let invalidPaths: [String]
         let codemapUnavailable: [String]
         let mutated: Bool
+        let validCandidateCount: Int
     }
 
     @MainActor
@@ -312,7 +433,8 @@ extension MCPServerViewModel {
             selection: result.selection,
             invalidPaths: result.invalidPaths,
             codemapUnavailable: result.codemapUnavailable,
-            mutated: result.mutated
+            mutated: result.mutated,
+            validCandidateCount: result.validCandidateCount
         )
     }
 }

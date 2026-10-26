@@ -1,16 +1,32 @@
 import Foundation
 import SwiftUI
 
+func oracleToolResultPopoverUserInfo(
+    item: AgentChatItem,
+    openContext: AgentOracleOpenContext?
+) -> [AnyHashable: Any]? {
+    let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolResultJSON)
+    return AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: chatID
+    )
+}
+
 struct ChatSendResultCard: View {
     let item: AgentChatItem
     let oracleOpenContext: AgentOracleOpenContext?
 
     private var isOracleTool: Bool {
-        (normalizedToolCardName(item.toolName) ?? "").lowercased() == "ask_oracle"
+        let toolName = (normalizedToolCardName(item.toolName) ?? "").lowercased()
+        return toolName == "ask_oracle" || toolName == "oracle_send"
     }
 
     private var dto: ToolResultDTOs.ChatSendDTO? {
         ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: item.toolResultJSON)
+    }
+
+    private var laneCoverage: OracleLaneCoverage? {
+        isOracleTool ? OracleLaneCoverage(lanes: dto?.oracleResults, oracleCount: dto?.oracleCount) : nil
     }
 
     /// Compact summary showing mode and a small amount of result context
@@ -18,7 +34,9 @@ struct ChatSendResultCard: View {
         guard let dto else { return "" }
         var parts: [String] = []
         if let mode = dto.mode { parts.append(mode) }
-        if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {
+        if let laneCoverage {
+            parts.append(laneCoverage.summaryText)
+        } else if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {
             parts.append(chatID)
         }
         if let diffs = dto.diffs, !diffs.isEmpty {
@@ -27,10 +45,17 @@ struct ChatSendResultCard: View {
         return parts.joined(separator: " • ")
     }
 
-    private var status: ToolCardStatus {
+    var status: ToolCardStatus {
+        if isOracleTool, dto?.status == "partial_failure" { return .warning }
         if item.toolIsError == true { return .failure }
         if let dto {
             if let errors = dto.errors, !errors.isEmpty { return .failure }
+            // A failed primary determines the canonical group outcome even when
+            // additional lanes completed. Coverage still supplies the subtitle.
+            if isOracleTool, dto.status == "failed" { return .failure }
+            if let coverageStatus = laneCoverage?.cardStatus { return coverageStatus }
+            // Invalid lane identities suppress the fraction, not the group's known warning.
+            if isOracleTool, dto.status == "partial_failure" || dto.status == "warning" { return .warning }
             if dto.response == nil || dto.response?.isEmpty == true,
                let diffs = dto.diffs,
                !diffs.isEmpty
@@ -43,17 +68,11 @@ struct ChatSendResultCard: View {
     }
 
     private var onTap: (() -> Void)? {
-        guard let oracleOpenContext else { return nil }
+        guard let userInfo = oracleToolResultPopoverUserInfo(
+            item: item,
+            openContext: oracleOpenContext
+        ) else { return nil }
         return {
-            var userInfo: [AnyHashable: Any] = ["windowID": oracleOpenContext.windowID]
-            if let tabID = oracleOpenContext.tabID
-                ?? AgentOracleToolRouting.stringValue(from: item.toolResultJSON, keys: ["context_id", "tab_id", "tabID"]).flatMap(UUID.init(uuidString:))
-            {
-                userInfo["tabID"] = tabID
-            }
-            if let chatID = dto?.chatID ?? oracleOpenContext.chatID {
-                userInfo["chatID"] = chatID
-            }
             NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
         }
     }

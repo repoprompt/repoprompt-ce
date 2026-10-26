@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 // MARK: - Selected Files Grid View
@@ -107,6 +108,7 @@ struct SelectedFilesGrid: View {
                                 PromptFileTagRow(
                                     entry: element.entry,
                                     kind: element.kind,
+                                    fileManager: fileManager,
                                     onRemove: onRemove,
                                     rowIndex: index
                                 )
@@ -158,7 +160,8 @@ struct SelectedFilesGrid: View {
             }
             .buttonStyle(CustomButtonStyle(verticalPadding: 3, horizontalPadding: 8))
             .disabled(entries.isEmpty)
-            .help(entries.isEmpty ? "No files to clear" : "Remove all selected files and codemaps")
+            .hoverTooltip(entries.isEmpty ? "No files to clear" : "Remove all selected files and codemaps")
+            .accessibilityHint(entries.isEmpty ? "No files to clear" : "Remove all selected files and codemaps")
         }
     }
 
@@ -238,6 +241,7 @@ struct SelectedFilesGrid: View {
 private struct PromptFileTagRow: View {
     let entry: PromptFileEntry
     let kind: SelectedFilesGrid.FileDisplayKind
+    let fileManager: WorkspaceFilesViewModel
     let onRemove: (PromptFileEntry) -> Void
     let rowIndex: Int
 
@@ -362,7 +366,8 @@ private struct PromptFileTagRow: View {
             FilePreviewPopover(
                 file: entry.file,
                 fileSlices: entry.ranges,
-                showCodeMap: entry.isCodemap,
+                codemapEntry: entry.codemap,
+                fileManager: fileManager,
                 showPreview: $showPopover
             )
         }
@@ -370,9 +375,8 @@ private struct PromptFileTagRow: View {
 
     private func copyToClipboard() {
         NSPasteboard.general.clearContents()
-        if entry.isCodemap {
-            let codemap = entry.file.fileAPI?.getFullAPIDescription(displayPath: entry.file.uniqueRelativePath) ?? ""
-            NSPasteboard.general.setString(codemap, forType: .string)
+        if let codemap = entry.codemap {
+            NSPasteboard.general.setString(codemap.text, forType: .string)
         } else if let content = entry.file.cachedContent {
             NSPasteboard.general.setString(content, forType: .string)
         } else {

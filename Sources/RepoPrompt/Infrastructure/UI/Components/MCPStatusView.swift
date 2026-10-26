@@ -394,18 +394,22 @@ struct MCPStatusView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-            // Always-allowed clients list
+            Text("Saved client names no longer skip approval. Names are self-reported, not verified identities.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            // Preserved legacy records; these do not grant admission.
             let allowedClients = server.dashboard?.alwaysAllowedClients ?? []
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("Trusted Clients")
+                Text("Legacy Client Names (Inactive)")
                     .font(.subheadline.weight(.medium))
 
                 if allowedClients.isEmpty {
                     HStack {
                         Image(systemName: "person.crop.circle.badge.questionmark")
                             .foregroundColor(.secondary)
-                        Text("No clients in the persistent allow-list")
+                        Text("No saved client names")
                             .foregroundColor(.secondary)
                     }
                     .font(.caption)
@@ -425,8 +429,8 @@ struct MCPStatusView: View {
 
     private func allowedClientRow(_ client: String) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: "checkmark.seal.fill")
-                .foregroundColor(.green)
+            Image(systemName: "person.crop.circle")
+                .foregroundColor(.secondary)
 
             Text(client)
                 .font(.subheadline)

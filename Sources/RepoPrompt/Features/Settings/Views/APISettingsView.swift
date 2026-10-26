@@ -7,6 +7,8 @@ struct APISettingsView: View {
     var onAPIKeyUpdated: (() -> Void)?
     var closeAction: (() -> Void)?
 
+    @StateObject private var secureStorageRepairViewModel = SecureStorageRepairViewModel()
+    @State private var showSecureStorageRepair = false
     @State private var showAlert = false
     @State private var alertMessage = ""
     @State private var isLoading = false
@@ -45,6 +47,12 @@ struct APISettingsView: View {
                         .font(fontPreset.subheadlineFont)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if secureStorageRepairViewModel.isAvailable {
+                    SecureStorageRepairBanner {
+                        showSecureStorageRepair = true
+                    }
                 }
 
                 // Recommendation banner (shows when API keys are configured)
@@ -118,6 +126,11 @@ struct APISettingsView: View {
                     )
 
                     if showOpenAIAdvanced {
+                        ProviderHTTPConsentView(endpoint: viewModel.openAIConsentURL, consentEndpoint: Binding(
+                            get: { viewModel.openAIHTTPConsentEndpoint },
+                            set: { viewModel.setOpenAIHTTPConsent($0) }
+                        ))
+                        .disabled(isLoadingOpenAIBaseURL || isLoadingOpenAI)
                         apiKeySection(
                             title: "OpenAI Base URL",
                             key: $viewModel.openAIBaseURL,
@@ -205,6 +218,7 @@ struct APISettingsView: View {
                     deleteAction: deleteGrokKey,
                     isLoading: isLoadingGrok,
                     infoURL: "https://console.x.ai/",
+                    caption: "Also passed to Grok Build for Agent Mode, Context Builder, Oracle and Chat, and model discovery (including Connect), even when you're signed in with grok login. Grok chooses which credential each request uses; requests to the xAI API that use the key are billed to the xAI API account.",
                     availableModels: viewModel.availableGrokModels,
                     selectedModel: $viewModel.grokCustomModel
                 )
@@ -272,6 +286,14 @@ struct APISettingsView: View {
             .padding()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(isPresented: $showSecureStorageRepair) {
+            SecureStorageRepairView(viewModel: secureStorageRepairViewModel) {
+                Task {
+                    await viewModel.loadStoredData()
+                    onAPIKeyUpdated?()
+                }
+            }
+        }
         .alert(isPresented: $showAlert) {
             Alert(
                 title: Text("API Key Management"),
@@ -620,6 +642,21 @@ struct APISettingsView: View {
                     TextField("https://example.openai.azure.com", text: $viewModel.azureBaseURL)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
+                ProviderHTTPConsentView(endpoint: viewModel.azureConsentURL, consentEndpoint: Binding(
+                    get: { viewModel.azureHTTPConsentEndpoint },
+                    set: { endpoint in
+                        Task {
+                            isLoadingAzure = true
+                            defer { isLoadingAzure = false }
+                            do { try await viewModel.setAzureHTTPConsent(endpoint) }
+                            catch {
+                                alertMessage = "Could not update HTTP consent: \(error.localizedDescription)"
+                                showAlert = true
+                            }
+                        }
+                    }
+                ))
+                .disabled(isLoadingAzure)
 
                 HStack {
                     Text("API Version")

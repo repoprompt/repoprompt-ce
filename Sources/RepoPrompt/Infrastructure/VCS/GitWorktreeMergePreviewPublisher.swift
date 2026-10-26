@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 actor GitWorktreeMergePreviewPublisher {
     static let shared = GitWorktreeMergePreviewPublisher()

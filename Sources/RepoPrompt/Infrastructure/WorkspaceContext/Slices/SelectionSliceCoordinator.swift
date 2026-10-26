@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 /// Dormant value-based façade around `PartitionStore` for selection slice persistence.
 ///
@@ -108,6 +110,23 @@ actor SelectionSliceCoordinator {
             scope: scope,
             updates: updates,
             mode: mode
+        )
+    }
+
+    @discardableResult
+    func applyPartitionUpdatesIfCurrent(
+        forRootPath rootPath: String,
+        scope: PartitionScope,
+        updates: [String: PartitionStore.SliceUpdate],
+        mode: SliceMutationMode,
+        expectedCurrent: [String: PartitionStore.StoredSlices]
+    ) async throws -> [String: PartitionStore.StoredSlices]? {
+        try await store.applyIfCurrent(
+            forRoot: (rootPath as NSString).standardizingPath,
+            scope: scope,
+            updates: updates,
+            mode: mode,
+            expectedCurrent: expectedCurrent
         )
     }
 

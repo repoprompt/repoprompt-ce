@@ -14,6 +14,7 @@ extension AgentModeViewModel {
             pendingAskUser: pendingAskUser(for: tabID),
             pendingUserInputRequest: pendingUserInputRequest(for: tabID),
             pendingApproval: pendingApproval(for: tabID),
+            pendingCodexHookReview: pendingCodexHookReview(for: tabID),
             pendingPermissionsRequest: pendingPermissionsRequest(for: tabID),
             pendingMCPElicitationRequest: pendingMCPElicitationRequest(for: tabID),
             pendingApplyEditsReview: pendingApplyEditsReview(for: tabID),
@@ -21,7 +22,7 @@ extension AgentModeViewModel {
             activeWorktreeMergeConflict: activeWorktreeMergeConflictOperation(for: tabID),
             activeRunID: session?.runID,
             activeAgentSessionID: session?.activeAgentSessionID,
-            activeRunAttemptID: session?.activeHeadlessRunAttemptID,
+            activeRunAttemptID: session?.activeRunAttemptID,
             latestUserSequenceIndex: session?.items.last(where: { $0.kind == .user })?.sequenceIndex,
             canForkCurrentSession: canForkCurrentSession,
             selectedAgent: selectedAgent,
@@ -31,6 +32,9 @@ extension AgentModeViewModel {
     }
 
     func syncRunInteractionUIState() {
+        #if DEBUG
+            test_syncRunInteractionCallCount += 1
+        #endif
         ui.runInteraction.update(makeRunInteractionUISnapshot())
     }
 }

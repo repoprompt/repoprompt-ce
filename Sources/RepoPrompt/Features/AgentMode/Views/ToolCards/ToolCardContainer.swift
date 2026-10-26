@@ -1,11 +1,5 @@
+import RepoPromptFileSystem
 import SwiftUI
-
-/// Shared time formatter for tool cards — avoids repeated DateFormatter allocations.
-private let toolCardTimeFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss"
-    return f
-}()
 
 func performAgentToolCardExpansionStateUpdateWithoutAnimation(_ update: () -> Void) {
     var transaction = Transaction(animation: nil)
@@ -211,7 +205,7 @@ struct ToolCardContainer<Content: View>: View {
                 if let headerTrailingView {
                     headerTrailingView
                 } else if showsTimestamp, let timestamp {
-                    Text(formattedTime(timestamp))
+                    MessageTimestampText(date: timestamp)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary.opacity(0.7))
                 }
@@ -236,7 +230,7 @@ struct ToolCardContainer<Content: View>: View {
                 if let headerTrailingView {
                     headerTrailingView
                 } else if showsTimestamp, let timestamp {
-                    Text(formattedTime(timestamp))
+                    MessageTimestampText(date: timestamp)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary.opacity(0.7))
                 }
@@ -293,10 +287,6 @@ struct ToolCardContainer<Content: View>: View {
         default:
             BubbleColors.toolResultBackground(colorScheme: colorScheme)
         }
-    }
-
-    private func formattedTime(_ date: Date) -> String {
-        toolCardTimeFormatter.string(from: date)
     }
 
     private var debugRenderStatePreference: [UUID: AgentToolCardRenderState] {
@@ -360,37 +350,78 @@ struct StaticToolCardContainer<Content: View>: View {
     }
 
     var body: some View {
-        Group {
-            if let onTap, headerTrailingView == nil {
-                Button(action: onTap) {
-                    cardBody
-                }
-                .buttonStyle(.plain)
-            } else if let onTap {
-                cardBody
-                    .onTapGesture(perform: onTap)
-            } else {
+        if let onTap, headerTrailingView == nil {
+            Button(action: onTap) {
                 cardBody
             }
+            .buttonStyle(.plain)
+        } else if let onTap {
+            cardBodyWithLeadingTap(onTap)
+        } else {
+            cardBody
         }
     }
 
     private var cardBody: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 6) {
+            cardContent {
                 standardHeaderRow
-                content()
             }
-            .padding(10)
-            .background(backgroundColor)
-            .cornerRadius(12)
-            .contentShape(Rectangle())
 
             Spacer(minLength: 40)
         }
     }
 
+    private func cardBodyWithLeadingTap(_ onTap: @escaping () -> Void) -> some View {
+        HStack {
+            cardContent {
+                standardHeaderRow(tappableLeadingAction: onTap)
+            }
+
+            Spacer(minLength: 40)
+        }
+    }
+
+    private func cardContent(@ViewBuilder header: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            header()
+            content()
+        }
+        .padding(10)
+        .background(backgroundColor)
+        .cornerRadius(12)
+        .contentShape(Rectangle())
+    }
+
     private var standardHeaderRow: some View {
+        standardHeaderRow(tappableLeadingAction: nil)
+    }
+
+    private func standardHeaderRow(tappableLeadingAction: (() -> Void)?) -> some View {
+        HStack(spacing: 6) {
+            if let tappableLeadingAction {
+                HStack(spacing: 6) {
+                    headerLeadingContent
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+                .onTapGesture(perform: tappableLeadingAction)
+            } else {
+                headerLeadingContent
+                Spacer()
+            }
+
+            if let headerTrailingView {
+                headerTrailingView
+            } else if showsTimestamp, let timestamp {
+                MessageTimestampText(date: timestamp)
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
+        }
+    }
+
+    private var headerLeadingContent: some View {
         HStack(spacing: 6) {
             Image(systemName: iconName)
                 .font(.system(size: 11))
@@ -410,16 +441,6 @@ struct StaticToolCardContainer<Content: View>: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-
-            Spacer()
-
-            if let headerTrailingView {
-                headerTrailingView
-            } else if showsTimestamp, let timestamp {
-                Text(formattedTime(timestamp))
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary.opacity(0.7))
-            }
         }
     }
 
@@ -432,10 +453,6 @@ struct StaticToolCardContainer<Content: View>: View {
         default:
             BubbleColors.toolResultBackground(colorScheme: colorScheme)
         }
-    }
-
-    private func formattedTime(_ date: Date) -> String {
-        toolCardTimeFormatter.string(from: date)
     }
 }
 
@@ -468,7 +485,7 @@ func toolIcon(for toolName: String?) -> String {
         return "doc.text"
     case "bash", "shell", "local_shell", "unified_exec", "exec_command", "run_shell_command":
         return "terminal"
-    case "search", "web_search", "web_search_request", "google_web_search", "search_web":
+    case "search", "web_read":
         return "globe"
     case "apply_edits", "mcp__RepoPrompt__apply_edits":
         return "pencil"
@@ -536,8 +553,10 @@ func toolDisplayName(for toolName: String?) -> String {
         return "Question"
     case "bash", "shell", "local_shell", "unified_exec", "exec_command", "run_shell_command":
         return "Bash"
-    case "search", "web_search", "web_search_request", "google_web_search", "search_web":
+    case "search":
         return "Web Search"
+    case "web_read":
+        return "Read Web Page"
     case "read", "Read":
         return "Read"
     case "read_file":

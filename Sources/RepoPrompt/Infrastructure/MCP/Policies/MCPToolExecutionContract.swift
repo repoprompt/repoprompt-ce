@@ -1,0 +1,6 @@
+import RepoPromptDomainRuntime
+
+typealias MCPToolExecutionCleanupDisposition = RepoPromptDomainRuntime.MCPToolExecutionCleanupDisposition
+typealias MCPToolExecutionContract = RepoPromptDomainRuntime.MCPToolExecutionContract
+typealias MCPToolExecutionDispatchError = RepoPromptDomainRuntime.MCPToolExecutionDispatchError
+typealias MCPToolExecutionContractCatalog = RepoPromptDomainRuntime.MCPToolExecutionContractCatalog

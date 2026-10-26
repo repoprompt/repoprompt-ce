@@ -38,49 +38,38 @@ private extension View {
     }
 }
 
-// MARK: - Measured Plain Text View
+// MARK: - Collapsible User Message
 
-/// Plain-text user message renderer backed by the markdown text view's
-/// synchronous `sizeThatFits` measurement path. This avoids the old
-/// intrinsic-size/AppKit invalidation loop and ignores any oversized height
-/// proposed by the transcript viewport.
-private struct MeasuredPlainTextView: View {
+struct CollapsibleUserMessagePreview {
     let text: String
-    let font: NSFont
-    let fallbackMeasurementWidth: CGFloat?
+    let needsCollapse: Bool
 
-    private var attributedString: NSAttributedString {
-        NSAttributedString(string: text, attributes: [
-            .font: font,
-            .foregroundColor: NSColor.textColor
-        ])
-    }
+    init(text: String, characterLimit: Int) {
+        precondition(characterLimit >= 0, "characterLimit must be nonnegative")
 
-    var body: some View {
-        AttributedTextView(
-            attributedString: attributedString,
-            isEditable: false,
-            allowsTextSelection: true,
-            fallbackMeasurementWidth: fallbackMeasurementWidth
-        )
+        guard let previewEnd = text.index(
+            text.startIndex,
+            offsetBy: characterLimit,
+            limitedBy: text.endIndex
+        ), previewEnd != text.endIndex else {
+            self.text = text
+            needsCollapse = false
+            return
+        }
+
+        self.text = String(text[..<previewEnd])
+        needsCollapse = true
     }
 }
-
-// MARK: - Collapsible User Message
 
 /// A user message view that collapses if the text exceeds a threshold.
 /// Provides expand/collapse functionality with smooth animations.
 struct CollapsibleUserMessage: View {
     let text: String
-
-    /// Number of characters to show in collapsed state
-    var previewCharCount: Int = 500
-
-    /// Label shown on expand button
-    var expandLabel: String = "Show more…"
-
-    /// Label shown on collapse button
-    var collapseLabel: String = "Show less"
+    let bareURLLinkificationPolicy: BareURLLinkificationPolicy
+    let previewCharCount: Int
+    let expandLabel: String
+    let collapseLabel: String
 
     // UI state
     @State private var isCollapsed = true
@@ -91,15 +80,32 @@ struct CollapsibleUserMessage: View {
         fontScale.preset
     }
 
-    private var displayText: String {
-        if text.count > previewCharCount, isCollapsed {
-            return String(text.prefix(previewCharCount))
-        }
-        return text
+    /// Computed with a bounded grapheme traversal and reused for rendering.
+    private let preview: CollapsibleUserMessagePreview
+
+    init(
+        text: String,
+        bareURLLinkificationPolicy: BareURLLinkificationPolicy = .disabled,
+        previewCharCount: Int = 500,
+        expandLabel: String = "Show more…",
+        collapseLabel: String = "Show less"
+    ) {
+        self.text = text
+        self.bareURLLinkificationPolicy = bareURLLinkificationPolicy
+        self.previewCharCount = previewCharCount
+        self.expandLabel = expandLabel
+        self.collapseLabel = collapseLabel
+        preview = CollapsibleUserMessagePreview(
+            text: text,
+            characterLimit: previewCharCount
+        )
     }
 
-    private var needsCollapse: Bool {
-        text.count > previewCharCount
+    private var displayText: String {
+        if preview.needsCollapse, isCollapsed {
+            return preview.text
+        }
+        return text
     }
 
     private func updateLastKnownContentWidth(_ width: CGFloat) {
@@ -118,24 +124,40 @@ struct CollapsibleUserMessage: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Use normal Text for small messages or collapsed state.
-            // Use the shared measured AppKit text path for expanded large messages.
-            if !needsCollapse || isCollapsed {
-                Text(displayText)
+        let shouldCollapse = preview.needsCollapse
+        let visibleText = displayText
+        let visibleTextMightContainBareWebURL = bareURLLinkificationPolicy.isEnabled &&
+            BareURLLinkifier.containsHTTPHTTPSURLSignal(in: visibleText)
+
+        return VStack(alignment: .leading, spacing: 6) {
+            // Keep the original SwiftUI Text path unless the displayed text has a
+            // cheap http/https signal. If it does, route through PlainProseTextView
+            // so the accurate detector can decide which ranges are real URLs.
+            if visibleTextMightContainBareWebURL {
+                PlainProseTextView(
+                    text: visibleText,
+                    font: fontPreset.nsFont,
+                    fallbackMeasurementWidth: lastKnownContentWidth,
+                    bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                    suppressLinksTouchingEndBoundary: shouldCollapse && isCollapsed
+                )
+                .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
+            } else if !shouldCollapse || isCollapsed {
+                Text(visibleText)
                     .font(fontPreset.font)
                     .textSelection(.enabled)
                     .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
             } else {
-                MeasuredPlainTextView(
-                    text: displayText,
+                PlainProseTextView(
+                    text: visibleText,
                     font: fontPreset.nsFont,
-                    fallbackMeasurementWidth: lastKnownContentWidth
+                    fallbackMeasurementWidth: lastKnownContentWidth,
+                    bareURLLinkificationPolicy: .disabled
                 )
                 .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
             }
 
-            if needsCollapse {
+            if shouldCollapse {
                 Button {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         isCollapsed.toggle()

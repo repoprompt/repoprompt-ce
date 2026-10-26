@@ -2,25 +2,53 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
+import RepoPromptShared
 
 @MainActor
-final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
-    let group: MCPWindowToolGroup = .agentSessionControl
+final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
+    let group: MCPAppToolGroup = .agentSessionControl
 
-    private let runtime: MCPWindowToolRuntime
-    private let dependencies: MCPWindowToolDependencies
+    private let runtime: MCPAppToolBinder
+    private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
-    init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
+    init(runtime: MCPAppToolBinder, execution: MCPAppPhysicalCapabilityAdapters.Execution) {
         self.runtime = runtime
-        self.dependencies = dependencies
+        dependencies = execution
     }
 
     func buildTools() -> [Tool] {
         [
+            agentSelfTool(),
             shareThoughtsTool(),
             setStatusTool(),
             waitForNextInstructionTool()
         ]
+    }
+
+    private func agentSelfTool() -> Tool {
+        guard let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentSelf) else {
+            preconditionFailure("Missing canonical self_compact definition")
+        }
+        return runtime.tool(
+            name: MCPWindowToolName.agentSelf,
+            freshnessPolicy: .none,
+            description: definition.description,
+            annotations: .init(
+                readOnlyHint: false, destructiveHint: true,
+                idempotentHint: false, openWorldHint: true
+            ),
+            inputSchema: .object(
+                properties: [
+                    "op": .string(description: "Required operation: context or compact.", enum: ["context", "compact"]),
+                    "note": .string(description: "[compact] Required verbatim note: 10% of window tokens × 4 UTF-8 bytes; 65,536 if unknown."),
+                    "idempotency_key": .string(description: "[compact] Required identical-retry key, at most 200 UTF-8 bytes.")
+                ],
+                required: ["op"]
+            )
+        ) { [dependencies] _, args in
+            try await dependencies.executeAgentSelf(args)
+        }
     }
 
     private func shareThoughtsTool() -> Tool {
@@ -57,8 +85,8 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
                 ],
                 required: ["thoughts"]
             )
-        ) { [dependencies] _, args in
-            try await Self.executeShareThoughts(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeShareThoughts(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
@@ -78,13 +106,14 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
                 ],
                 required: []
             )
-        ) { [dependencies] _, args in
-            try await Self.executeSetStatus(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeSetStatus(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
     private func waitForNextInstructionTool() -> Tool {
-        runtime.tool(
+        let defaultWaitSeconds = Int(MCPTimeoutPolicy.nextUserInstructionDefaultWaitSeconds)
+        return runtime.tool(
             name: MCPWindowToolName.waitForNextInstruction,
             freshnessPolicy: .none,
             description: """
@@ -96,6 +125,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
             **How it works:**
             - The `prompt` you provide IS your message to the user - make it your complete response
             - After you call this, you receive the user's reply as your next turn (like a normal conversation)
+            - The wait defaults to \(defaultWaitSeconds) seconds and honors a caller-supplied `timeout_seconds`; a timeout returns `timed_out: true`
             - Do NOT send a separate text response before calling this tool - the prompt IS your response
 
             **Writing your response (the `prompt` parameter):**
@@ -113,61 +143,71 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
                 properties: [
-                    "prompt": .string(description: "Your response to the user - what you want to say before waiting for their next instruction.")
+                    "prompt": .string(description: "Your response to the user - what you want to say before waiting for their next instruction."),
+                    "timeout_seconds": .integer(description: "Optional wait timeout in seconds. Default \(defaultWaitSeconds).")
                 ],
                 required: []
             )
-        ) { [dependencies] _, args in
-            try await Self.executeWaitForNextInstruction(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeWaitForNextInstruction(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
     private static func executeShareThoughts(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        invocationContext: ToolInvocationContext,
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         guard let thoughts = args["thoughts"]?.stringValue else {
             throw MCPError.invalidParams("thoughts is required")
         }
         let title = args["title"]?.stringValue
 
-        let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.shareThoughts)
+        let connectionID = try await dependencies.requireAgentModeConnection(invocationContext, MCPWindowToolName.shareThoughts)
         let targetWindow = try dependencies.requireTargetWindow()
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .shareThoughts)
 
         // Invariant: background tool updates are tab-scoped and must not steal tab focus.
-        await MainActor.run {
-            targetWindow.agentModeViewModel.shareThoughts(thoughts, title: title, tabID: tabID)
+        try await MainActor.run {
+            try targetWindow.agentModeViewModel.shareThoughts(
+                thoughts,
+                title: title,
+                target: target
+            )
         }
 
         return .object([
             "ok": .bool(true),
-            "context_id": .string(tabID.uuidString)
+            "context_id": .string(target.tabID.uuidString)
         ])
     }
 
     private static func executeSetStatus(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        invocationContext: ToolInvocationContext,
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
-        let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.setStatus)
+        let connectionID = try await dependencies.requireAgentModeConnection(invocationContext, MCPWindowToolName.setStatus)
         let trimmedSessionName = args["session_name"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionNameToApply = (trimmedSessionName?.isEmpty == false) ? trimmedSessionName : nil
 
         let targetWindow = try dependencies.requireTargetWindow()
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .setStatus)
 
         // Invariant: background status updates are tab-scoped and must not steal tab focus.
-        await MainActor.run {
+        try await MainActor.run {
             if let sessionNameToApply {
-                targetWindow.agentModeViewModel.renameSession(tabID: tabID, to: sessionNameToApply)
+                try targetWindow.agentModeViewModel.renameSession(
+                    target: target,
+                    to: sessionNameToApply
+                )
             }
         }
 
         var result: [String: Value] = [
             "ok": .bool(true),
-            "context_id": .string(tabID.uuidString),
+            "context_id": .string(target.tabID.uuidString),
             "session_name_applied": .bool(sessionNameToApply != nil)
         ]
         if let sessionNameToApply {
@@ -176,20 +216,29 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
         return .object(result)
     }
 
+    static func resolvedInstructionWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
+        let timeout = value?.intValue.map(TimeInterval.init) ?? MCPTimeoutPolicy.nextUserInstructionDefaultWaitSeconds
+        guard timeout > 0 else {
+            throw MCPError.invalidParams("timeout_seconds must be a positive integer.")
+        }
+        return timeout
+    }
+
     private static func executeWaitForNextInstruction(
         args: [String: Value],
-        dependencies: MCPWindowToolDependencies
+        invocationContext: ToolInvocationContext,
+        dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         let prompt = args["prompt"]?.stringValue
-        let timeout = args["timeout_seconds"]?.intValue.map { TimeInterval($0) } ?? 600
+        let timeout = try resolvedInstructionWaitTimeoutSeconds(args["timeout_seconds"])
 
         let targetWindow = try dependencies.requireTargetWindow()
-        let connectionID = ServerNetworkManager.currentConnectionID
-        let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        let connectionID = invocationContext.connectionID
+        let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .waitForInstruction)
 
         // Invariant: waiting state is stored on the target session; do not switch tabs here.
         let response = try await targetWindow.agentModeViewModel.waitForNextUserInstruction(
-            tabID: tabID,
+            target: target,
             prompt: prompt,
             timeoutSeconds: timeout
         )

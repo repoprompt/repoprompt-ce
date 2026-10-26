@@ -1,5 +1,7 @@
 import Combine
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptWorkspaceCore
 
 /// Supplies folder / file suggestions for "@" mentions.
 /// All public APIs are @MainActor because they touch Swift-UI view models.
@@ -13,15 +15,33 @@ final class MentionSuggestionService {
     // MARK: – Stored refs
 
     private weak var fileManager: WorkspaceFilesViewModel?
-    private let maxResults: Int
+    private var trackedFileManagerIdentity: ObjectIdentifier?
+    private var configuration: FileMentionPickerConfiguration
 
-    init(fileManager: WorkspaceFilesViewModel?, maxResults: Int = 5) {
-        self.fileManager = fileManager
-        self.maxResults = maxResults
+    private var maxResults: Int {
+        configuration.maxResults
     }
 
-    func updateFileManager(_ manager: WorkspaceFilesViewModel?) {
+    init(
+        fileManager: WorkspaceFilesViewModel?,
+        configuration: FileMentionPickerConfiguration = .compact
+    ) {
+        self.fileManager = fileManager
+        trackedFileManagerIdentity = fileManager.map(ObjectIdentifier.init)
+        self.configuration = configuration
+    }
+
+    @discardableResult
+    func updateFileManager(_ manager: WorkspaceFilesViewModel?) -> Bool {
+        let previousManagerWasDeallocated = fileManager == nil && trackedFileManagerIdentity != nil
+        let changed = previousManagerWasDeallocated || fileManager !== manager
         fileManager = manager
+        trackedFileManagerIdentity = manager.map(ObjectIdentifier.init)
+        return changed
+    }
+
+    func updateConfiguration(_ configuration: FileMentionPickerConfiguration) {
+        self.configuration = configuration
     }
 
     // MARK: – Public entry-point
@@ -136,11 +156,7 @@ final class MentionSuggestionService {
                     file.relativePath.range(of: searchQuery, options: .caseInsensitive) != nil
                 {
                     selectedMatches.append(
-                        MentionSuggestion(
-                            displayName: file.name,
-                            relativePath: file.relativePath,
-                            kind: .file
-                        )
+                        suggestion(for: file)
                     )
                 }
             }
@@ -176,11 +192,7 @@ final class MentionSuggestionService {
         }
 
         return files.map {
-            MentionSuggestion(
-                displayName: $0.name,
-                relativePath: $0.relativePath,
-                kind: .file
-            )
+            suggestion(for: $0)
         }
     }
 
@@ -204,15 +216,41 @@ final class MentionSuggestionService {
         }
         for file in folder.files where rows.count < limit {
             rows.append(
-                MentionSuggestion(
-                    displayName: file.name,
-                    relativePath: file.relativePath,
-                    kind: .file
-                )
+                suggestion(for: file)
             )
             if rows.count >= limit { break }
         }
         return rows
+    }
+
+    // MARK: – Helper: row construction
+
+    private func suggestion(for file: FileViewModel) -> MentionSuggestion {
+        MentionSuggestion(
+            displayName: file.name,
+            relativePath: file.relativePath,
+            kind: .file,
+            subtitle: subtitle(for: file)
+        )
+    }
+
+    private func subtitle(for file: FileViewModel) -> String? {
+        guard configuration.showsFileSubtitles else { return nil }
+
+        if let parent = parentDirectoryLabel(for: file.relativePath) {
+            return parent
+        }
+
+        let rootLabel = file.rootFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return rootLabel.isEmpty ? nil : rootLabel
+    }
+
+    private func parentDirectoryLabel(for relativePath: String) -> String? {
+        let normalized = StandardizedPath.relative(relativePath)
+        let parent = (normalized as NSString).deletingLastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !parent.isEmpty, parent != "." else { return nil }
+        return parent
     }
 
     // MARK: – Helper: recursive search
@@ -244,11 +282,7 @@ final class MentionSuggestionService {
         for file in folder.files where results.count < maxResults {
             if file.name.range(of: query, options: .caseInsensitive) != nil {
                 results.append(
-                    MentionSuggestion(
-                        displayName: file.name,
-                        relativePath: file.relativePath,
-                        kind: .file
-                    )
+                    suggestion(for: file)
                 )
                 if results.count >= maxResults { return }
             }

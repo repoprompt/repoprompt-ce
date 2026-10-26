@@ -1,4 +1,7 @@
 import Combine
+import RepoPromptProcess
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import SwiftUI
 
 #if DEBUG
@@ -204,7 +207,15 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
-    @Published var azureBaseURL: String = ""
+    @Published var azureHTTPConsentEndpoint: String?
+    @Published var azureBaseURL: String = "" {
+        didSet {
+            if azureHTTPConsentEndpoint != ProviderEndpointConsent.endpointIdentity(azureConsentURL) {
+                azureHTTPConsentEndpoint = nil
+            }
+        }
+    }
+
     @Published var azureApiKey: String = ""
     @Published var azureApiVersion: String = "2025-04-01-preview"
     @Published private(set) var availableAzureModels: [AzureOpenAIConfiguration.ModelDescriptor] = AzureOpenAIProvider.defaultModelDescriptors
@@ -212,12 +223,29 @@ public class APISettingsViewModel: ObservableObject {
     @Published var azureCustomModel: String = UserDefaults.standard.string(forKey: "customModelAzure") ?? ""
     @Published var anthropicApiKey: String = ""
     @Published var openAIApiKey: String = ""
-    @Published var openAIBaseURL: String = UserDefaults.standard.string(forKey: "customBaseURLOpenAI") ?? ""
+    @Published var openAIHTTPConsentEndpoint: String? = UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint")
+
+    @Published var openAIBaseURL: String = UserDefaults.standard.string(forKey: "customBaseURLOpenAI") ?? "" {
+        didSet {
+            if openAIHTTPConsentEndpoint != ProviderEndpointConsent.endpointIdentity(openAIConsentURL) {
+                openAIHTTPConsentEndpoint = nil
+            }
+        }
+    }
+
     @Published var isOpenAIBaseURLValid: Bool = false
     @Published var openAIServiceTier: String = UserDefaults.standard.string(forKey: "openAIServiceTier") ?? "auto"
     @Published var openAIShowServiceTierVariants: Bool = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
     @Published var ollamaURL: String = "http://localhost:11434"
-    @Published var customProviderURL: String = ""
+    @Published var customProviderHTTPConsentEndpoint: String?
+    @Published var customProviderURL: String = "" {
+        didSet {
+            if customProviderHTTPConsentEndpoint != ProviderEndpointConsent.endpointIdentity(customProviderConsentURL) {
+                customProviderHTTPConsentEndpoint = nil
+            }
+        }
+    }
+
     @Published var customProviderApiKey: String = ""
     @Published var isCustomProviderValid: Bool = false
     @Published private(set) var keychainAccessDiagnostics: [APIKeychainAccessDiagnostic] = []
@@ -287,18 +315,39 @@ public class APISettingsViewModel: ObservableObject {
     @Published var isCodexConnected: Bool = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
     @Published var codexError: String? = nil
     @Published private(set) var codexConnectionPhase: CodexConnectionPhase = UserDefaults.standard.bool(forKey: "CodexCLIConnected") ? .connected(resolvedExecutable: nil) : .idle
+    @Published private(set) var codexManagedLoginFlow: CodexManagedLoginFlow?
+    @Published private(set) var managedCodexAccount: CodexManagedAccount?
     @Published private(set) var availableCodexModels: [CodexAppServerClient.RemoteModel] = []
     private var codexLogCollector: CLIProcessLogCollector?
+    private var codexManagedLoginOperationID: UUID?
     // OpenCode CLI / ACP
     @Published var isOpenCodeConnected: Bool = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
     @Published var openCodeError: String? = nil
     @Published private(set) var availableOpenCodeModelOptions: [AgentModelOption] = []
     private var openCodeLogCollector: CLIProcessLogCollector?
-    // Cursor CLI / ACP
+    // Cursor Agent CLI / ACP
     @Published var isCursorConnected: Bool = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
     @Published var cursorError: String? = nil
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
     private var cursorLogCollector: CLIProcessLogCollector?
+    // Grok Build CLI / ACP
+    @Published var isGrokBuildConnected: Bool = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+    @Published var grokBuildError: String? = nil
+    @Published private(set) var availableGrokBuildModelOptions: [AgentModelOption] = []
+    private var grokBuildLogCollector: CLIProcessLogCollector?
+
+    /// Installed-runtime inputs are refreshed when CLI Providers or Agent Decisions is shown.
+    /// They intentionally remain separate from current-process Router verification.
+    @Published private(set) var isAntigravityRuntimeInstalled = false
+    @Published private(set) var isDevinRuntimeInstalled = false
+    @Published private(set) var directConnectedCLIProviders: Set<AgentProviderKind> = []
+
+    /// CLI connection flags are persisted configuration hints, not proof that the provider is
+    /// usable in the current process. Context Builder restoration waits for this validation pass
+    /// before accepting or replacing a saved provider/model selection.
+    @Published private(set) var isContextBuilderProviderValidationComplete = false
+    @Published private(set) var contextBuilderVerifiedCLIProviders: Set<AgentProviderKind> = []
+    private var contextBuilderProviderValidationTask: Task<Void, Never>?
 
     @Published var openRouterApiKey: String = ""
     @Published var isOpenRouterKeyValid: Bool = false
@@ -341,11 +390,21 @@ public class APISettingsViewModel: ObservableObject {
     private var codexModelsTask: Task<Void, Never>?
     private var openCodeModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
+    private var cursorModelsRefreshTask: Task<Void, Never>?
+    @Published private(set) var isDiscoveringCursorModels = false
+    @Published private(set) var cursorModelDiscoveryMessage: String?
+    private var grokBuildModelsTask: Task<Void, Never>?
+    private var devinModelsTask: Task<Void, Never>?
+    @Published private(set) var isDiscoveringDevinModels = false
+    @Published private(set) var devinModelDiscoveryMessage: String?
     private var openRouterModelsTask: Task<Void, Never>?
+    private var customModelsTask: Task<Void, Never>?
+    private var initialLoadTask: Task<Void, Never>?
     private var cliConnectionCancellables = Set<AnyCancellable>()
     private var hasLoadedStoredData = false
     private var isLoadingStoredData = false
     private var hasStoredZAIKey = false
+    private var agentAvailabilityCancellable: AnyCancellable?
 
     /// Current Claude Code-compatible backend configurations (GLM/Z.ai, Kimi, Custom), keyed by backend ID.
     ///
@@ -361,7 +420,7 @@ public class APISettingsViewModel: ObservableObject {
 
     private let compatibleBackendStore: ClaudeCodeCompatibleBackendStore = .shared
 
-    private let defaultZAIModels = ["glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.7-flash", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"]
+    private let defaultZAIModels = ["glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.7-flash", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"]
 
     var agentModeAvailabilityContext: AgentModelCatalog.AvailabilityContext {
         AgentModelCatalog.AvailabilityContext(
@@ -369,10 +428,174 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isCodexConnected,
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
+            grokBuildAvailable: isGrokBuildConnected,
+            antigravityAvailable: isAntigravityRuntimeInstalled,
+            devinAvailable: isDevinRuntimeInstalled,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
         )
+    }
+
+    /// Published mirror of `agentModeAvailabilityContext`. Consumers subscribe to this
+    /// instead of listening for change notifications: `@Published` replays the current
+    /// value on subscription, so observers constructed after a state change still
+    /// initialize correctly, and duplicate emissions are filtered by value with
+    /// `removeDuplicates()` rather than by guessing on the producer side whether a
+    /// notification is "needed".
+    @Published private(set) var agentAvailability: AgentModelCatalog.AvailabilityContext = .none
+
+    private func refreshAgentAvailability() {
+        let next = agentModeAvailabilityContext
+        guard next != agentAvailability else { return }
+        agentAvailability = next
+    }
+
+    /// Refreshes the shared predicates used by every direct CLI Provider card. This is UI
+    /// connection state only: routing still validates executable metadata independently.
+    func refreshDirectCLIProviderConnectionState() {
+        let antigravityInstalled = antigravityRuntimeInstalledProvider()
+        let devinInstalled = devinRuntimeInstalledProvider()
+        if isAntigravityRuntimeInstalled != antigravityInstalled {
+            isAntigravityRuntimeInstalled = antigravityInstalled
+        }
+        if isDevinRuntimeInstalled != devinInstalled {
+            isDevinRuntimeInstalled = devinInstalled
+        }
+        refreshDirectConnectedCLIProviders()
+        refreshAgentAvailability()
+    }
+
+    private func refreshDirectConnectedCLIProviders() {
+        var providers: Set<AgentProviderKind> = []
+        if isCodexConnected { providers.insert(.codexExec) }
+        if isClaudeCodeConnected { providers.insert(.claudeCode) }
+        if isOpenCodeConnected { providers.insert(.openCode) }
+        if isCursorConnected { providers.insert(.cursor) }
+        if isGrokBuildConnected { providers.insert(.grokBuild) }
+        if isAntigravityRuntimeInstalled { providers.insert(.antigravity) }
+        if isDevinRuntimeInstalled { providers.insert(.devin) }
+        guard providers != directConnectedCLIProviders else { return }
+        directConnectedCLIProviders = providers
+    }
+
+    /// Safety net behind the explicit `refreshAgentAvailability()` calls: recompute
+    /// whenever any published input of the availability context changes, so mutation
+    /// paths without an explicit refresh still converge. The main-queue hop defers the
+    /// recompute past `@Published`'s willSet emission, when the new value is readable.
+    private func installAgentAvailabilityObservers() {
+        agentAvailabilityCancellable = Publishers.MergeMany([
+            $isClaudeCodeConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isGrokBuildConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isAntigravityRuntimeInstalled.map { _ in () }.eraseToAnyPublisher(),
+            $isDevinRuntimeInstalled.map { _ in () }.eraseToAnyPublisher(),
+            $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
+            $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
+            $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
+        ])
+        .receive(on: DispatchQueue.main)
+        .sink { [weak self] _ in
+            self?.refreshDirectConnectedCLIProviders()
+            self?.refreshAgentAvailability()
+        }
+    }
+
+    /// Availability safe for restoring persisted Context Builder selections. A persisted
+    /// "connected" bit is treated as configured-but-unverified until a current-process health
+    /// check succeeds. Compatible backends are loaded from their actual config/secret state
+    /// before the validation pass completes.
+    var contextBuilderRestorationAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: isVerifiedContextBuilderProvider(.claudeCode) && isClaudeCodeConnected,
+            codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
+            openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
+            cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
+            grokBuildAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokBuildConnected,
+            devinAvailable: isDevinRuntimeInstalled,
+            zaiConfigured: compatibleBackendIsActive(.glmZAI),
+            kimiConfigured: compatibleBackendIsActive(.kimi),
+            customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
+        )
+    }
+
+    /// Provider availability safe for automatic routing. Persisted connection flags are only
+    /// configuration hints; Router may choose a provider only after this process has verified it.
+    var modelRouterAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        contextBuilderRestorationAvailabilityContext
+    }
+
+    var recommendationProviderStatusSnapshot: ProviderStatusSnapshot {
+        ProviderStatusSnapshot(
+            claudeCodeCLI: recommendationAvailability(isConnected: isClaudeCodeConnected, provider: .claudeCode),
+            codexCLI: recommendationAvailability(isConnected: isCodexConnected, provider: .codexExec),
+            cursorCLI: recommendationAvailability(isConnected: isCursorConnected, provider: .cursor),
+            grokBuildCLI: recommendationAvailability(isConnected: isGrokBuildConnected, provider: .grokBuild),
+            openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured)
+        )
+    }
+
+    private func recommendationAvailability(
+        isConnected: Bool,
+        provider: AgentProviderKind
+    ) -> ProviderStatusSnapshot.Availability {
+        guard isConnected else { return .notConfigured }
+        if isVerifiedContextBuilderProvider(provider) { return .ready }
+        return isContextBuilderProviderValidationComplete ? .notConfigured : .configured
+    }
+
+    private func isVerifiedContextBuilderProvider(_ provider: AgentProviderKind) -> Bool {
+        contextBuilderVerifiedCLIProviders.contains(provider)
+    }
+
+    private func setContextBuilderProviderVerified(
+        _ provider: AgentProviderKind,
+        verified: Bool
+    ) {
+        var updated = contextBuilderVerifiedCLIProviders
+        if verified {
+            updated.insert(provider)
+        } else {
+            updated.remove(provider)
+        }
+        guard updated != contextBuilderVerifiedCLIProviders else { return }
+        contextBuilderVerifiedCLIProviders = updated
+    }
+
+    private func contextBuilderProviderIsConnected(_ provider: AgentProviderKind) -> Bool {
+        switch provider {
+        case .claudeCode:
+            isClaudeCodeConnected
+        case .codexExec:
+            isCodexConnected
+        case .openCode:
+            isOpenCodeConnected
+        case .cursor:
+            isCursorConnected
+        case .grokBuild:
+            isGrokBuildConnected
+        case .antigravity:
+            isAntigravityRuntimeInstalled
+        case .devin:
+            isDevinRuntimeInstalled
+        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            false
+        }
+    }
+
+    private func applyContextBuilderProviderValidationResult(
+        _ verified: Bool,
+        provider: AgentProviderKind
+    ) {
+        let isConnected = contextBuilderProviderIsConnected(provider)
+        if verified, isConnected {
+            setContextBuilderProviderVerified(provider, verified: true)
+        } else if !isConnected || !isVerifiedContextBuilderProvider(provider) {
+            // Preserve a newer successful manual/live verification that raced this startup check.
+            setContextBuilderProviderVerified(provider, verified: false)
+        }
     }
 
     var isCodexExecutableUnavailable: Bool {
@@ -390,7 +613,8 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     var canAttemptCodexManagedLogin: Bool {
-        switch codexConnectionPhase {
+        guard !codexSessionFence.isLogoutInProgress else { return false }
+        return switch codexConnectionPhase {
         case .resolvingExecutable, .testingAppServer, .loggingIn, .executableUnavailable:
             false
         case .idle, .refreshingAuth, .authRequired, .connected, .failed:
@@ -400,41 +624,85 @@ public class APISettingsViewModel: ObservableObject {
 
     private func installCLIConnectionObservers() {
         Publishers.MergeMany([
-            NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in () },
-            NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in () },
-            NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in () },
-            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in () }
+            NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
+            NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
+            NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
+            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
+            NotificationCenter.default.publisher(for: .grokBuildConnectionChanged).map { _ in AgentProviderKind.grokBuild }
         ])
         .receive(on: DispatchQueue.main)
-        .sink { [weak self] _ in
-            self?.reloadCLIConnectionFlagsFromDefaults()
+        .sink { [weak self] provider in
+            guard let self else { return }
+            reloadCLIConnectionFlagsFromDefaults()
+            setContextBuilderProviderVerified(
+                provider,
+                verified: contextBuilderProviderIsConnected(provider)
+            )
+            guard provider == .codexExec else { return }
+            if isCodexConnected {
+                Task { [weak self] in
+                    await self?.refreshManagedCodexAccountSnapshotIfConnected()
+                }
+            } else {
+                applyAuthoritativeCodexDisconnectedState()
+            }
         }
         .store(in: &cliConnectionCancellables)
     }
 
+    private func applyAuthoritativeCodexDisconnectedState() {
+        managedCodexAccount = nil
+        codexConnectionPhase = .idle
+        codexError = nil
+        stopCodexModelsSubscription()
+        availableCodexModels = []
+    }
+
+    private func refreshManagedCodexAccountSnapshotIfConnected() async {
+        guard isCodexConnected else { return }
+        let publicationToken = codexSessionFence.capturePublicationToken()
+        let account = await codexManagedAuthRecovery.managedAccountSnapshot()
+        guard isCodexConnected,
+              codexSessionFence.allowsAuthenticationPublication(publicationToken)
+        else { return }
+        managedCodexAccount = account
+    }
+
     private func reloadCLIConnectionFlagsFromDefaults() {
         let wasCursorConnected = isCursorConnected
+        let wasGrokBuildConnected = isGrokBuildConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
             claudeCodeCLIStatus = .binaryPresent
         }
         isCodexConnected = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
+        if !isCodexConnected {
+            managedCodexAccount = nil
+        }
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
-        guard wasCursorConnected != isCursorConnected else { return }
-        if isCursorConnected {
-            startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
-        } else {
-            stopCursorModelsSubscription(clearModels: true)
+        isGrokBuildConnected = UserDefaults.standard.bool(forKey: "GrokBuildCLIConnected")
+        if wasGrokBuildConnected != isGrokBuildConnected {
+            if isGrokBuildConnected {
+                startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopGrokBuildModelsSubscription(clearModels: true)
+            }
         }
-        Task { await updateAvailableModels() }
+        if wasCursorConnected != isCursorConnected {
+            if isCursorConnected {
+                startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopCursorModelsSubscription(clearModels: true)
+            }
+            Task { await updateAvailableModels() }
+        }
     }
 
-    private func publishClaudeCodeGLMAvailability() {
-        let didChange = ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
+    private func refreshClaudeCodeGLMAvailability() {
+        ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
         compatibleBackendSecretPresence[.glmZAI] = hasStoredZAIKey
-        guard didChange else { return }
-        NotificationCenter.default.post(name: .claudeCodeGLMAvailabilityChanged, object: nil)
+        refreshAgentAvailability()
     }
 
     // MARK: - Claude Code-compatible backends ------------------------------------------------
@@ -449,7 +717,6 @@ public class APISettingsViewModel: ObservableObject {
         accessMode: KeychainAccessMode = .nonInteractive(reason: .backgroundAvailabilityCheck)
     ) async {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
-        let previousActiveBackends = Set(ClaudeCodeCompatibleBackendID.allCases.filter { compatibleBackendIsActive($0) })
         let store = compatibleBackendStore
         var configs: [ClaudeCodeCompatibleBackendID: ClaudeCodeCompatibleBackendConfig] = [:]
         var presence: [ClaudeCodeCompatibleBackendID: Bool] = [:]
@@ -463,10 +730,7 @@ public class APISettingsViewModel: ObservableObject {
         }
         compatibleBackendConfigs = configs
         compatibleBackendSecretPresence = presence
-        let currentActiveBackends = Set(ClaudeCodeCompatibleBackendID.allCases.filter { compatibleBackendIsActive($0) })
-        if previousActiveBackends != currentActiveBackends {
-            postCompatibleBackendAvailabilityChanged()
-        }
+        refreshAgentAvailability()
         await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
     }
 
@@ -479,7 +743,10 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     @discardableResult
-    func refreshClaudeCodeBinaryStatus(timeout: TimeInterval = 10) async -> Bool {
+    func refreshClaudeCodeBinaryStatus(
+        timeout: TimeInterval = 10,
+        forceProbe: Bool = false
+    ) async -> Bool {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         let previousStatus = claudeCodeCLIStatus
         if case .probing = claudeCodeCLIStatus {
@@ -487,7 +754,7 @@ public class APISettingsViewModel: ObservableObject {
             // concrete launch/test attempt will still surface command-not-found if needed.
             return true
         }
-        if isClaudeCodeConnected {
+        if isClaudeCodeConnected, !forceProbe {
             claudeCodeCLIStatus = .binaryPresent
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
             return true
@@ -498,6 +765,7 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Claude Code binary probe started")
         await CLIEnvironmentCache.shared.invalidate()
         var config = CLIProcessConfiguration(
+            shellLookupMode: .fallbackOnly,
             captureStdoutTailBytes: 16 * 1024,
             captureStderrTailBytes: 16 * 1024
         )
@@ -697,8 +965,8 @@ public class APISettingsViewModel: ObservableObject {
 
     /// Persists a Claude Code-compatible backend config and refreshes availability only if
     /// the active/enabled/valid state or model behavior actually changed. Text-field edits
-    /// (display name, slot-mapping IDs) are persisted without re-posting the availability
-    /// notification on every keystroke.
+    /// (display name, slot-mapping IDs) are persisted without queueing a Claude-family
+    /// model refresh on every keystroke.
     ///
     /// - Parameter config: The new config to persist (display name, base URL, auth, model behavior).
     @MainActor
@@ -718,7 +986,7 @@ public class APISettingsViewModel: ObservableObject {
             || previous.isValid != latest.isValid
             || modelBehaviorKind(previous.modelBehavior) != modelBehaviorKind(latest.modelBehavior)
         if materialStateChanged {
-            postCompatibleBackendAvailabilityChanged()
+            refreshAgentAvailability()
             queueClaudeFamilyModelAvailabilityRefreshIfNeeded(previousAvailability: previousAvailability)
         }
     }
@@ -747,15 +1015,12 @@ public class APISettingsViewModel: ObservableObject {
             hasStoredZAIKey = !trimmed.isEmpty
             isZaiKeyValid = hasStoredZAIKey
             availableZAIModels = hasStoredZAIKey ? defaultZAIModels : []
-            publishClaudeCodeGLMAvailability()
+            refreshClaudeCodeGLMAvailability()
+            await updateAvailableModels()
         } else {
             try await compatibleBackendStore.saveSecret(trimmed, for: id)
             compatibleBackendSecretPresence[id] = !trimmed.isEmpty
-        }
-        postCompatibleBackendAvailabilityChanged()
-        if id == .glmZAI {
-            await updateAvailableModels()
-        } else {
+            refreshAgentAvailability()
             await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
         }
     }
@@ -774,18 +1039,15 @@ public class APISettingsViewModel: ObservableObject {
             zaiApiKey = ""
             isZaiKeyValid = false
             availableZAIModels = []
-            publishClaudeCodeGLMAvailability()
+            refreshClaudeCodeGLMAvailability()
             zaiCustomModel = ""
             UserDefaults.standard.removeObject(forKey: "customModelZAI")
-        } else {
-            try await compatibleBackendStore.deleteSecret(for: id)
-            compatibleBackendSecretPresence[id] = false
-        }
-        postCompatibleBackendAvailabilityChanged()
-        if id == .glmZAI {
             await updateAvailableModels()
             resetPreferredModelIfNeeded(for: .zAI)
         } else {
+            try await compatibleBackendStore.deleteSecret(for: id)
+            compatibleBackendSecretPresence[id] = false
+            refreshAgentAvailability()
             await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
         }
     }
@@ -798,7 +1060,7 @@ public class APISettingsViewModel: ObservableObject {
         invalidateCompatibleBackendTestResult(for: id)
         compatibleBackendStore.resetConfig(for: id)
         compatibleBackendConfigs[id] = compatibleBackendStore.config(for: id)
-        postCompatibleBackendAvailabilityChanged()
+        refreshAgentAvailability()
         queueClaudeFamilyModelAvailabilityRefreshIfNeeded(previousAvailability: previousAvailability)
     }
 
@@ -819,15 +1081,8 @@ public class APISettingsViewModel: ObservableObject {
         return compatibleBackendStore.isConfigured(id)
     }
 
-    private func postCompatibleBackendAvailabilityChanged() {
-        // Reuse the existing .claudeCodeGLMAvailabilityChanged notification to keep pickers,
-        // recommendations, and agent-mode view models in sync for every compatible backend.
-        NotificationCenter.default.post(name: .claudeCodeGLMAvailabilityChanged, object: nil)
-    }
-
-    private func notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: ClaudeCodeCLIStatus) {
-        guard previousStatus.isKnownMissing != claudeCodeCLIStatus.isKnownMissing else { return }
-        postCompatibleBackendAvailabilityChanged()
+    private func notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus _: ClaudeCodeCLIStatus) {
+        refreshAgentAvailability()
     }
 
     private func queueClaudeFamilyModelAvailabilityRefreshIfNeeded(previousAvailability: Bool) {
@@ -842,19 +1097,120 @@ public class APISettingsViewModel: ObservableObject {
 
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
+    private let cursorModelPollingService: CursorACPModelPollingService
+    private let antigravityRuntimeInstalledProvider: @MainActor () -> Bool
+    private let devinRuntimeInstalledProvider: @MainActor () -> Bool
+    private let codexModelPollingService: CodexModelPollingService
+    private let codexManagedAuthRecovery: any CodexManagedAuthRecovering
+    private let codexSessionFence: CodexManagedSessionFence
+    private let codexExecutablePreflight: @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution
+    private let storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)?
+    private let contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)?
+    private var hasPreparedForWindowClose = false
 
-    init(aiQueriesService: AIQueriesService, keyManager: KeyManager, loadStoredDataOnInit: Bool = true) {
+    init(
+        aiQueriesService: AIQueriesService,
+        keyManager: KeyManager,
+        loadStoredDataOnInit: Bool = true,
+        codexModelPollingService: CodexModelPollingService = .shared,
+        cursorModelPollingService: CursorACPModelPollingService = .shared,
+        codexManagedAuthRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
+        codexSessionFence: CodexManagedSessionFence = .shared,
+        codexExecutablePreflight: @escaping @MainActor @Sendable (CLIProcessLogCollector?) async -> CodexProviderHelpers.CodexExecutableResolution = { collector in
+            await CodexProviderHelpers.preflightCodexExecutable(logCollector: collector)
+        },
+        storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
+        contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil,
+        antigravityRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
+            AntigravityRuntimeManager.installedRuntimeSync() != nil
+        },
+        devinRuntimeInstalledProvider: @escaping @MainActor () -> Bool = {
+            DevinRuntimeLocator.isInstalledSync()
+        }
+    ) {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
+        self.antigravityRuntimeInstalledProvider = antigravityRuntimeInstalledProvider
+        self.devinRuntimeInstalledProvider = devinRuntimeInstalledProvider
+        self.codexModelPollingService = codexModelPollingService
+        self.cursorModelPollingService = cursorModelPollingService
+        self.codexManagedAuthRecovery = codexManagedAuthRecovery
+        self.codexSessionFence = codexSessionFence
+        self.codexExecutablePreflight = codexExecutablePreflight
+        self.storedDataLoadBoundary = storedDataLoadBoundary
+        self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         installCLIConnectionObservers()
+        refreshDirectCLIProviderConnectionState()
+        installAgentAvailabilityObservers()
+        refreshAgentAvailability()
         if loadStoredDataOnInit {
-            Task {
-                await self.loadStoredDataIfNeeded()
+            initialLoadTask = Task { [weak self] in
+                guard let self else { return }
+                await loadStoredDataIfNeeded()
+                guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+                refreshDevinModels()
+                if let devinModelsTask {
+                    await devinModelsTask.value
+                }
+                await validateCachedContextBuilderProvidersIfNeeded()
             }
         }
     }
 
+    // A non-visual managed runtime leases this same live settings owner. Closing the source
+    // window withdraws only its UI lease; subscriptions stay process-owned until the last
+    // managed runtime settles. No availability snapshot or replacement settings loader is used.
+    private(set) var managedRuntimeLeaseCount = 0
+    private var windowCloseRequested = false
+
+    func retainForManagedRuntime() {
+        precondition(!hasPreparedForWindowClose)
+        managedRuntimeLeaseCount += 1
+    }
+
+    func releaseManagedRuntime() {
+        guard managedRuntimeLeaseCount > 0 else { return }
+        managedRuntimeLeaseCount -= 1
+        if managedRuntimeLeaseCount == 0, windowCloseRequested { prepareForWindowClose() }
+    }
+
+    func prepareForWindowClose() {
+        windowCloseRequested = true
+        guard managedRuntimeLeaseCount == 0, !hasPreparedForWindowClose else { return }
+        hasPreparedForWindowClose = true
+        initialLoadTask?.cancel()
+        initialLoadTask = nil
+        devinModelsTask?.cancel()
+        devinModelsTask = nil
+        openAIModelsTask?.cancel()
+        openAIModelsTask = nil
+        deepSeekModelsTask?.cancel()
+        deepSeekModelsTask = nil
+        fireworksModelsTask?.cancel()
+        fireworksModelsTask = nil
+        grokModelsTask?.cancel()
+        grokModelsTask = nil
+        groqModelsTask?.cancel()
+        groqModelsTask = nil
+        stopCodexModelsSubscription()
+        openCodeModelsTask?.cancel()
+        openCodeModelsTask = nil
+        stopCursorModelsSubscription()
+        stopGrokBuildModelsSubscription()
+        openRouterModelsTask?.cancel()
+        openRouterModelsTask = nil
+        customModelsTask?.cancel()
+        customModelsTask = nil
+        contextBuilderProviderValidationTask?.cancel()
+        contextBuilderProviderValidationTask = nil
+        cliConnectionCancellables.removeAll()
+        agentAvailabilityCancellable?.cancel()
+        agentAvailabilityCancellable = nil
+    }
+
     deinit {
+        initialLoadTask?.cancel()
+        devinModelsTask?.cancel()
         openAIModelsTask?.cancel()
         deepSeekModelsTask?.cancel()
         fireworksModelsTask?.cancel()
@@ -862,8 +1218,12 @@ public class APISettingsViewModel: ObservableObject {
         groqModelsTask?.cancel()
         codexModelsTask?.cancel()
         openCodeModelsTask?.cancel()
+        cursorModelsRefreshTask?.cancel()
         cursorModelsTask?.cancel()
+        grokBuildModelsTask?.cancel()
         openRouterModelsTask?.cancel()
+        customModelsTask?.cancel()
+        contextBuilderProviderValidationTask?.cancel()
     }
 
     @MainActor
@@ -897,6 +1257,7 @@ public class APISettingsViewModel: ObservableObject {
             } else {
                 customProviderURL = customConfig.url
             }
+            customProviderHTTPConsentEndpoint = customConfig.httpCredentialConsentEndpoint
             availableCustomModels = Array(customConfig.enabledModels).sorted()
             customEnabledModelSet = customConfig.enabledModels
             customProviderMaxTokensString = String(customConfig.maxTokens ?? 8192)
@@ -917,6 +1278,10 @@ public class APISettingsViewModel: ObservableObject {
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
         await loadAllKeys(accessMode: accessMode) // returns immediately; fetch tasks run in background
+        guard !Task.isCancelled, !hasPreparedForWindowClose else {
+            isLoadingStoredData = false
+            return
+        }
         hasLoadedStoredData = true
         isLoadingStoredData = false
     }
@@ -928,6 +1293,10 @@ public class APISettingsViewModel: ObservableObject {
         _ completion: @escaping () -> Void
     ) async {
         await loadAllKeys(accessMode: accessMode)
+        guard !Task.isCancelled, !hasPreparedForWindowClose else {
+            isLoadingStoredData = false
+            return
+        }
         hasLoadedStoredData = true
         isLoadingStoredData = false
         completion() // fires while background fetches still run
@@ -937,9 +1306,185 @@ public class APISettingsViewModel: ObservableObject {
     func loadStoredDataIfNeeded(
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
-        guard !hasLoadedStoredData, !isLoadingStoredData else { return }
+        guard !Task.isCancelled,
+              !hasPreparedForWindowClose,
+              !hasLoadedStoredData,
+              !isLoadingStoredData
+        else { return }
         isLoadingStoredData = true
         await loadStoredData(accessMode: accessMode)
+    }
+
+    /// Revalidates persisted CLI connection hints once per view-model lifetime. Startup uses
+    /// bounded, non-generation checks and the shared single-flight ACP pollers, so restoration
+    /// cannot reject a saved dynamic model before discovery has had a chance to run.
+    @MainActor
+    func validateCachedContextBuilderProvidersIfNeeded() async {
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+        if isContextBuilderProviderValidationComplete { return }
+        if let contextBuilderProviderValidationTask {
+            await contextBuilderProviderValidationTask.value
+            return
+        }
+
+        // Load persisted ACP catalogs before any provider result can trigger restoration.
+        // A live refresh may legitimately omit dynamic metadata, especially for Cursor.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+        if isContextBuilderProviderValidationComplete { return }
+        if let contextBuilderProviderValidationTask {
+            await contextBuilderProviderValidationTask.value
+            return
+        }
+        await contextBuilderProviderValidationWillBegin?()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+
+        let shouldValidateClaude = isClaudeCodeConnected
+        let shouldValidateClaudeBinary = hasActiveClaudeCompatibleBackend
+        let shouldValidateCodex = isCodexConnected
+        let codexPublicationToken = codexSessionFence.capturePublicationToken()
+        let shouldValidateOpenCode = isOpenCodeConnected
+        let shouldValidateCursor = isCursorConnected
+        let shouldValidateGrokBuild = isGrokBuildConnected
+
+        let task = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
+
+            async let claudeReady = probeCachedClaudeCodeConnection(
+                ifNeeded: shouldValidateClaude,
+                verifyBinaryForCompatibleBackends: shouldValidateClaudeBinary
+            )
+            async let codexReady = probeCachedCodexConnection(ifNeeded: shouldValidateCodex)
+            async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
+            async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
+            async let grokBuildReady = probeCachedGrokBuildConnection(ifNeeded: shouldValidateGrokBuild)
+            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokBuildReady)
+            guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+
+            applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
+            let codexPublicationAllowed = codexSessionFence.allowsAuthenticationPublication(codexPublicationToken)
+            applyContextBuilderProviderValidationResult(
+                codexPublicationAllowed && readiness.1,
+                provider: .codexExec
+            )
+            applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
+            applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
+            applyContextBuilderProviderValidationResult(readiness.4, provider: .grokBuild)
+            if codexPublicationAllowed,
+               isCodexConnected,
+               isVerifiedContextBuilderProvider(.codexExec)
+            {
+                startCodexModelsSubscriptionIfNeeded()
+            }
+            isContextBuilderProviderValidationComplete = true
+            contextBuilderProviderValidationTask = nil
+        }
+        contextBuilderProviderValidationTask = task
+        await task.value
+    }
+
+    private func probeCachedClaudeCodeConnection(
+        ifNeeded: Bool,
+        verifyBinaryForCompatibleBackends: Bool
+    ) async -> Bool {
+        guard ifNeeded || verifyBinaryForCompatibleBackends else { return false }
+        guard ifNeeded else {
+            _ = await refreshClaudeCodeBinaryStatus(timeout: 10, forceProbe: true)
+            return false
+        }
+
+        var config = CLIProcessConfiguration(
+            shellLookupMode: .fallbackOnly,
+            captureStdoutTailBytes: 8 * 1024,
+            captureStderrTailBytes: 8 * 1024
+        )
+        config.ensureAdditionalPaths(CLIPathHints.claudeCode)
+        let runner = CLIProcessRunner(config: config)
+        do {
+            let result = try await runner.run(
+                args: ["auth", "status", "--json"],
+                stdin: nil,
+                outputMode: .none,
+                timeout: 10
+            )
+            await runner.cancelAll()
+
+            if !result.timedOut,
+               let object = try? JSONSerialization.jsonObject(with: result.stdout),
+               let payload = object as? [String: Any],
+               let loggedIn = payload["loggedIn"] as? Bool
+            {
+                let previousStatus = claudeCodeCLIStatus
+                claudeCodeCLIStatus = .binaryPresent
+                notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+                return loggedIn
+            }
+
+            let diagnostic = String(data: result.stderr + result.stdout, encoding: .utf8)?.lowercased() ?? ""
+            if diagnostic.contains("unknown command") || diagnostic.contains("unknown option") {
+                return await refreshClaudeCodeBinaryStatus(timeout: 10, forceProbe: true)
+            }
+            return false
+        } catch {
+            await runner.cancelAll()
+            _ = await refreshClaudeCodeBinaryStatus(timeout: 10, forceProbe: true)
+            return false
+        }
+    }
+
+    private func probeCachedCodexConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        let publicationToken = codexSessionFence.capturePublicationToken()
+        let refreshResult = await codexManagedAuthRecovery.refreshManagedAccount()
+        guard codexSessionFence.allowsAuthenticationPublication(publicationToken) else { return false }
+        switch refreshResult {
+        case let .recovered(account):
+            managedCodexAccount = account
+            return true
+        case .requiresUserLogin, .executableUnavailable:
+            managedCodexAccount = nil
+            return false
+        }
+    }
+
+    private func probeCachedOpenCodeConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await OpenCodeACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        let service = OpenCodeACPModelPollingService.shared
+        let outcome = await service.refreshNow(workspacePath: nil)
+        if outcome == .noModelsAdvertised {
+            // Preserve the prior Boolean contract: empty discovery verified the connection only
+            // when a usable retained registry snapshot existed.
+            return await service.latestSnapshot() != nil
+        }
+        return outcome == .updated || outcome == .unchanged
+    }
+
+    private func probeCachedCursorConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await cursorModelPollingService.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        return await cursorModelPollingService.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedGrokBuildConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await GrokBuildACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        let outcome = await GrokBuildACPModelPollingService.shared.refreshNow(workspacePath: nil)
+        // Historically any completed Grok discovery, including readiness-only discovery with
+        // no model catalog, verified the connection for preflight.
+        return outcome == .updated || outcome == .unchanged || outcome == .noModelsAdvertised
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -993,6 +1538,8 @@ public class APISettingsViewModel: ObservableObject {
     func loadAllKeys(
         accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+
         // ── 0. Cancel previous background fetches ───────────────────────────────
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
@@ -1008,13 +1555,16 @@ public class APISettingsViewModel: ObservableObject {
         codexModelsTask = nil
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
-        cursorModelsTask?.cancel()
-        cursorModelsTask = nil
+        stopCursorModelsSubscription()
         openRouterModelsTask?.cancel()
         openRouterModelsTask = nil
+        customModelsTask?.cancel()
+        customModelsTask = nil
 
         keychainAccessDiagnostics.removeAll()
         loadNonSecretStoredData()
+        await storedDataLoadBoundary?()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ----------------------------------------------------------------
         // 1. Fetch tokens independently so one denied provider does not abort
@@ -1081,6 +1631,7 @@ public class APISettingsViewModel: ObservableObject {
             accessMode: accessMode,
             preserveExistingValueOnFailure: false
         )
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ----------------------------------------------------------------
         // 2. Restore Azure configuration if it was readable. Denied/noninteractive
@@ -1091,6 +1642,7 @@ public class APISettingsViewModel: ObservableObject {
            let config = try? JSONDecoder().decode(AzureOpenAIConfiguration.self, from: data)
         {
             azureBaseURL = config.baseURL.absoluteString
+            azureHTTPConsentEndpoint = config.httpCredentialConsentEndpoint
             azureApiKey = config.apiKey
             azureApiVersion = config.apiVersion
             availableAzureModels = AzureOpenAIProvider.mergedWithDefaultDescriptors(config.models)
@@ -1141,28 +1693,35 @@ public class APISettingsViewModel: ObservableObject {
         zaiApiKey = storedZAIKey
         isZaiKeyValid = hasStoredZAIKey
         availableZAIModels = isZaiKeyValid ? defaultZAIModels : []
-        publishClaudeCodeGLMAvailability()
+        refreshClaudeCodeGLMAvailability()
 
         customProviderApiKey = storedCustomProviderKey
 
         // ----------------------------------------------------------------
         // 4. Fire-and-forget model-catalogue fetches (always refresh)
         // ----------------------------------------------------------------
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isOpenAIKeyValid { openAIModelsTask = Task { await self.updateOpenAIModels() } }
         if isDeepSeekKeyValid { deepSeekModelsTask = Task { await self.updateDeepSeekModels() } }
         if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
         if isGrokKeyValid { grokModelsTask = Task { await self.updateGrokModels() } }
         if isGroqKeyValid { groqModelsTask = Task { await self.updateGroqModels() } }
-        if isCodexConnected { startCodexModelsSubscriptionIfNeeded() } else { stopCodexModelsSubscription() }
+        if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
+            startCodexModelsSubscriptionIfNeeded()
+        } else {
+            stopCodexModelsSubscription()
+        }
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
+        if isGrokBuildConnected { startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopGrokBuildModelsSubscription(clearModels: true) }
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
-        if isCustomProviderValid { Task { await self.fetchCustomModels() } }
+        if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
 
         // ----------------------------------------------------------------
         // 5. Build initial UI list from whatever caches we already have
         // ----------------------------------------------------------------
         await updateAvailableModels()
+        guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ----------------------------------------------------------------
         // 6. Load Claude Code-compatible backend state (GLM/Kimi/Custom)
@@ -1188,56 +1747,27 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     func saveOpenAIShowServiceTierVariants() {
-        let wasEnabled = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
-        UserDefaults.standard.set(openAIShowServiceTierVariants, forKey: "openAIShowServiceTierVariants")
-
-        // When turning variants OFF, normalize saved model preferences to strip tier wrappers
-        if wasEnabled, !openAIShowServiceTierVariants {
-            normalizeTierVariantPreferences()
-        }
+        Self.persistOpenAIShowServiceTierVariants(openAIShowServiceTierVariants)
 
         Task {
             await updateAvailableModels()
         }
     }
 
-    /// Strips tier variant wrappers from saved model preferences when variants are disabled.
-    /// This prevents "hidden forced tier" behavior where a tier-variant selection silently
-    /// continues to override the global tier even after the user turns off variants.
-    private func normalizeTierVariantPreferences() {
-        let settingsStore = GlobalSettingsStore.shared
-        if let rawValue = settingsStore.planningModelRaw(), !rawValue.isEmpty,
-           case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            settingsStore.setPlanningModelRaw(
-                base.rawValue,
-                reason: "api_settings.normalize_tier_variant.planning",
-                honorSync: false
-            )
+    @MainActor
+    static func persistOpenAIShowServiceTierVariants(
+        _ enabled: Bool,
+        defaults: UserDefaults = .standard,
+        normalizeDisabledVariants: @MainActor () -> Void = {
+            GlobalSettingsStore.shared.normalizeDisabledOpenAIServiceTierVariants()
         }
+    ) {
+        let wasEnabled = defaults.bool(forKey: "openAIShowServiceTierVariants")
+        defaults.set(enabled, forKey: "openAIShowServiceTierVariants")
 
-        let normalizedPlanning = settingsStore.planningModelRaw()?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if settingsStore.syncChatModelWithOracle(), !normalizedPlanning.isEmpty {
-            settingsStore.setPreferredComposeModelRaw(
-                normalizedPlanning,
-                reason: "api_settings.normalize_tier_variant.preferred_compose.sync_to_planning",
-                honorSync: false
-            )
-        } else if let rawValue = settingsStore.preferredComposeModelRaw(), !rawValue.isEmpty,
-                  case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            settingsStore.setPreferredComposeModelRaw(
-                base.rawValue,
-                reason: "api_settings.normalize_tier_variant.preferred_compose",
-                honorSync: false
-            )
-        }
-
-        let contextBuilderKey = "contextBuilderModel"
-        if let rawValue = UserDefaults.standard.string(forKey: contextBuilderKey), !rawValue.isEmpty,
-           case let .openAIServiceTierVariant(base, _) = AIModel.fromModelName(rawValue)
-        {
-            UserDefaults.standard.set(base.rawValue, forKey: contextBuilderKey)
+        // Install the parsing policy before synchronous Agent Models notifications fire.
+        if wasEnabled, !enabled {
+            normalizeDisabledVariants()
         }
     }
 
@@ -1347,6 +1877,33 @@ public class APISettingsViewModel: ObservableObject {
             return false
         }
         return host == "api.openai.com" || host.hasSuffix(".openai.com")
+    }
+
+    func refreshDevinModels(force: Bool = false) {
+        guard devinModelsTask == nil else { return }
+        isDiscoveringDevinModels = true
+        devinModelDiscoveryMessage = nil
+        devinModelsTask = Task { [weak self] in
+            guard let self else { return }
+            let outcome = await DevinModelDiscoveryService.shared.discoverIfNeeded(force: force)
+            guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
+            isDiscoveringDevinModels = false
+            switch outcome {
+            case .notInstalled:
+                devinModelDiscoveryMessage = "Devin CLI is not installed."
+            case let .discovered(modelCount):
+                devinModelDiscoveryMessage = "\(modelCount) models advertised by Devin."
+            case .noModelsAdvertised:
+                devinModelDiscoveryMessage = "Devin ACP advertised no selectable models."
+            case let .failed(message):
+                devinModelDiscoveryMessage = "Model discovery failed: \(message)"
+            case .cancelled:
+                devinModelDiscoveryMessage = nil
+            }
+            refreshAgentAvailability()
+            await updateAvailableModels()
+            devinModelsTask = nil
+        }
     }
 
     func updateAvailableModels() async {
@@ -1465,6 +2022,14 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.cursor))
         }
 
+        if isGrokBuildConnected {
+            modelSet.formUnion(AIModel.modelsForProvider(.grokBuild))
+        }
+
+        if DevinRuntimeLocator.isInstalledSync() {
+            modelSet.formUnion(AIModel.modelsForProvider(.devin))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -1529,10 +2094,12 @@ public class APISettingsViewModel: ObservableObject {
         case .customProvider: "custom"
         case .azure: "azure"
         case .cursor: "cursor"
+        case .grokBuild: "grok_build"
         case .ollama: "ollama"
         case .claudeCode: "claude_code"
         case .codex: "codex"
         case .openCode: "opencode"
+        case .devin: "devin"
         }
     }
 
@@ -1550,11 +2117,11 @@ public class APISettingsViewModel: ObservableObject {
             case .anthropic:
                 anthropicApiKey = trimmedKey
                 isAnthropicKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.claude4Sonnet, reason: "api_settings.validate_key.default_seed.anthropic")
+                seedPreferredComposeModelIfMissing(AIModel.claudeSonnet55, reason: "api_settings.validate_key.default_seed.anthropic")
             case .openAI:
                 openAIApiKey = trimmedKey
                 isOpenAIKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.gpt54Mini, reason: "api_settings.validate_key.default_seed.openai")
+                seedPreferredComposeModelIfMissing(AIModel.gpt6Luna, reason: "api_settings.validate_key.default_seed.openai")
             case .gemini:
                 geminiApiKey = trimmedKey
                 isGeminiKeyValid = true
@@ -1565,7 +2132,7 @@ public class APISettingsViewModel: ObservableObject {
             case .openRouter:
                 openRouterApiKey = trimmedKey
                 isOpenRouterKeyValid = true
-                seedPreferredComposeModelIfMissing(AIModel.openrouterClaude4Sonnet, reason: "api_settings.validate_key.default_seed.openrouter")
+                seedPreferredComposeModelIfMissing(AIModel.openrouterClaudeSonnet55, reason: "api_settings.validate_key.default_seed.openrouter")
             case .azure:
                 azureBaseURL = ""
                 azureApiKey = ""
@@ -1597,8 +2164,8 @@ public class APISettingsViewModel: ObservableObject {
                 zaiApiKey = trimmedKey
                 isZaiKeyValid = true
                 availableZAIModels = defaultZAIModels
-                publishClaudeCodeGLMAvailability()
-                seedPreferredComposeModelIfMissing(AIModel.zaiGLM5, reason: "api_settings.validate_key.default_seed.zai")
+                refreshClaudeCodeGLMAvailability()
+                seedPreferredComposeModelIfMissing(AIModel.zaiGLM52, reason: "api_settings.validate_key.default_seed.zai")
             case .claudeCode:
                 break
             case .codex:
@@ -1606,6 +2173,10 @@ public class APISettingsViewModel: ObservableObject {
             case .openCode:
                 break
             case .cursor:
+                break
+            case .grokBuild:
+                break
+            case .devin:
                 break
             }
 
@@ -1656,7 +2227,7 @@ public class APISettingsViewModel: ObservableObject {
             zaiApiKey = ""
             isZaiKeyValid = false
             availableZAIModels = []
-            publishClaudeCodeGLMAvailability()
+            refreshClaudeCodeGLMAvailability()
             zaiCustomModel = ""
             UserDefaults.standard.removeObject(forKey: "customModelZAI")
         case .claudeCode:
@@ -1666,6 +2237,10 @@ public class APISettingsViewModel: ObservableObject {
         case .openCode:
             break
         case .cursor:
+            break
+        case .grokBuild:
+            break
+        case .devin:
             break
         }
         await updateAvailableModels()
@@ -1681,6 +2256,20 @@ public class APISettingsViewModel: ObservableObject {
             let previousStatus = claudeCodeCLIStatus
             claudeCodeCLIStatus = status
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+        }
+
+        func test_completeContextBuilderProviderValidation(
+            verifiedProviders: Set<AgentProviderKind>
+        ) {
+            contextBuilderVerifiedCLIProviders = verifiedProviders
+            isContextBuilderProviderValidationComplete = true
+        }
+
+        func test_resetContextBuilderProviderValidation() {
+            contextBuilderProviderValidationTask?.cancel()
+            contextBuilderProviderValidationTask = nil
+            contextBuilderVerifiedCLIProviders = []
+            isContextBuilderProviderValidationComplete = false
         }
     #endif
 
@@ -1720,11 +2309,21 @@ public class APISettingsViewModel: ObservableObject {
                 )
             } else {
                 let replacement = availableModels.first(where: { !condition($0) })?.rawValue
-                if settingsStore.syncChatModelWithOracle(), planningRaw.isEmpty || planningModel.map(condition) == true {
+                // Only re-point the Oracle when there is a real replacement model. When
+                // `replacement` is nil (no other available model — e.g. the removed provider
+                // was the only one), preserve the existing Oracle planningModel instead of
+                // blanking it to nil: the Oracle is never auto-healed, so a nil write here
+                // would persist as "Oracle reset to nothing". The strict MCP oracle path
+                // already surfaces an explicit "not available" error for the stale value.
+                if let replacement,
+                   !replacement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   settingsStore.syncChatModelWithOracle(),
+                   planningRaw.isEmpty || planningModel.map(condition) == true
+                {
                     settingsStore.setPlanningModelRaw(
                         replacement,
                         reason: "api_settings.provider_reset.planning.\(reasonSuffix)",
-                        honorSync: false
+                        honorSync: true
                     )
                 }
                 settingsStore.setPreferredComposeModelRaw(
@@ -1756,11 +2355,17 @@ public class APISettingsViewModel: ObservableObject {
 
     func validateOpenAIKey() async throws -> Bool {
         let trimmed = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Use override if present
+        // Use override if present; malformed overrides must not fall back to another endpoint.
+        if !openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           OpenAIURLHelper.normalizeBaseURL(openAIBaseURL) == nil
+        {
+            throw ProviderEndpointConsent.ValidationError.invalidEndpoint
+        }
         let base = normalizedOpenAIBaseURL(openAIBaseURL)
         let ok = try await aiQueriesService.testOpenAIAPI(
             with: trimmed,
-            baseURL: base.isEmpty ? nil : base
+            baseURL: base.isEmpty ? nil : base,
+            httpCredentialConsentEndpoint: openAIHTTPConsentEndpoint
         )
         if ok {
             try await keyManager.saveAPIKey(trimmed, for: .openAI)
@@ -1775,6 +2380,11 @@ public class APISettingsViewModel: ObservableObject {
     @MainActor
     func validateAndSaveOpenAIBaseURL() async throws -> Bool {
         // Parse base and optional version from the user input
+        if !openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           OpenAIURLHelper.normalizeBaseURL(openAIBaseURL) == nil
+        {
+            throw ProviderEndpointConsent.ValidationError.invalidEndpoint
+        }
         let (baseURLString, version) = normalizedOpenAIBaseURLAndVersion(openAIBaseURL)
 
         // If no key is present, persist base/version but mark as not validated (old behavior preserved)
@@ -1786,13 +2396,15 @@ public class APISettingsViewModel: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: "customOpenAIVersionOverride")
             }
             openAIBaseURL = baseURLString
+            UserDefaults.standard.set(openAIHTTPConsentEndpoint, forKey: "openAIHTTPConsentEndpoint")
             isOpenAIBaseURLValid = false
             return true
         }
 
         // Validate using a temporary override that *includes* the version to ensure the probe hits the correct endpoint
         let baseForTest = version.map { "\(baseURLString)/\($0)" } ?? baseURLString
-        let ok = try await aiQueriesService.testOpenAIAPI(with: openAIApiKey, baseURL: baseForTest)
+        let consentEndpoint = openAIHTTPConsentEndpoint
+        let ok = try await aiQueriesService.testOpenAIAPI(with: openAIApiKey, baseURL: baseForTest, httpCredentialConsentEndpoint: consentEndpoint)
         if ok {
             UserDefaults.standard.set(baseURLString, forKey: "customBaseURLOpenAI")
             if let v = version, !v.isEmpty {
@@ -1801,6 +2413,8 @@ public class APISettingsViewModel: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: "customOpenAIVersionOverride")
             }
             openAIBaseURL = baseURLString
+            openAIHTTPConsentEndpoint = consentEndpoint
+            UserDefaults.standard.set(consentEndpoint, forKey: "openAIHTTPConsentEndpoint")
             isOpenAIBaseURLValid = true
             await updateOpenAIModels()
         } else {
@@ -1814,6 +2428,8 @@ public class APISettingsViewModel: ObservableObject {
     func resetOpenAIBaseURL() async {
         UserDefaults.standard.removeObject(forKey: "customBaseURLOpenAI")
         UserDefaults.standard.removeObject(forKey: "customOpenAIVersionOverride")
+        UserDefaults.standard.removeObject(forKey: "openAIHTTPConsentEndpoint")
+        openAIHTTPConsentEndpoint = nil
         openAIBaseURL = ""
         isOpenAIBaseURLValid = false
         await updateOpenAIModels()
@@ -2047,14 +2663,78 @@ public class APISettingsViewModel: ObservableObject {
             zaiApiKey = trimmed
             isZaiKeyValid = true
             availableZAIModels = defaultZAIModels
-            publishClaudeCodeGLMAvailability()
+            refreshClaudeCodeGLMAvailability()
             await updateAvailableModels()
         } else {
             isZaiKeyValid = false
             availableZAIModels = []
-            publishClaudeCodeGLMAvailability()
+            refreshClaudeCodeGLMAvailability()
         }
         return ok
+    }
+
+    func validateZAICodingPlanKey() async throws -> Bool {
+        let trimmed = zaiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ok: Bool
+        do {
+            ok = try await aiQueriesService.testZAICodingPlanAPI(with: trimmed)
+        } catch {
+            await markZAIValidationUnavailable()
+            throw error
+        }
+        if ok {
+            try await keyManager.saveAPIKey(trimmed, for: .zAI)
+            invalidateCompatibleBackendTestResult(for: .glmZAI)
+            hasStoredZAIKey = true
+            zaiApiKey = trimmed
+            isZaiKeyValid = true
+            availableZAIModels = defaultZAIModels
+            refreshClaudeCodeGLMAvailability()
+            await updateAvailableModels()
+        } else {
+            await markZAIValidationUnavailable()
+        }
+        return ok
+    }
+
+    private func markZAIValidationUnavailable() async {
+        isZaiKeyValid = false
+        availableZAIModels = []
+        refreshClaudeCodeGLMAvailability()
+        await updateAvailableModels()
+    }
+
+    func setOpenAIHTTPConsent(_ endpoint: String?) {
+        UserDefaults.standard.set(endpoint, forKey: "openAIHTTPConsentEndpoint")
+        openAIHTTPConsentEndpoint = endpoint
+    }
+
+    func setCustomProviderHTTPConsent(_ endpoint: String?) throws {
+        if endpoint == nil { try CustomProviderConfiguration.revokeHTTPConsent() }
+        customProviderHTTPConsentEndpoint = endpoint
+    }
+
+    func setAzureHTTPConsent(_ endpoint: String?) async throws {
+        if endpoint == nil, let stored = try await keyManager.getAPIKey(for: .azure), !stored.isEmpty {
+            guard let data = stored.data(using: .utf8) else { throw AIProviderError.providerNotConfigured }
+            let config = try JSONDecoder().decode(AzureOpenAIConfiguration.self, from: data).revokingHTTPConsent()
+            let encoded = try JSONEncoder().encode(config)
+            guard let json = String(data: encoded, encoding: .utf8) else { throw AIProviderError.providerNotConfigured }
+            try await keyManager.saveAPIKey(json, for: .azure)
+        }
+        azureHTTPConsentEndpoint = endpoint
+    }
+
+    var customProviderConsentURL: String {
+        OpenAIURLHelper.normalizeBaseURLString(customProviderURL) ?? customProviderURL
+    }
+
+    var openAIConsentURL: String {
+        OpenAIURLHelper.normalizeBaseURLString(openAIBaseURL) ?? openAIBaseURL
+    }
+
+    var azureConsentURL: String {
+        normalizeAzureBaseURL(from: azureBaseURL)?.absoluteString ?? azureBaseURL
     }
 
     // MARK: - Custom Provider (OpenAI-compatible)
@@ -2086,6 +2766,8 @@ public class APISettingsViewModel: ObservableObject {
         let previouslyEnabled = existingConfig?.enabledModels ?? []
 
         let apiKey = customProviderApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let consentEndpoint = customProviderHTTPConsentEndpoint
+        try ProviderEndpointConsent.validate(baseURL, credentialBearing: !apiKey.isEmpty, consentEndpoint: consentEndpoint)
         let userModel = customProviderUserModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let maxTokensValue = Int(customProviderMaxTokensString)
 
@@ -2099,7 +2781,8 @@ public class APISettingsViewModel: ObservableObject {
                 baseURL: URL(string: baseURL),
                 configuredMaxTokens: 16,
                 overrideVersion: detectedVersion,
-                includeUsageInStream: false
+                includeUsageInStream: false,
+                httpCredentialConsentEndpoint: consentEndpoint
             )
 
             let testMessage = AIMessage(
@@ -2128,7 +2811,8 @@ public class APISettingsViewModel: ObservableObject {
                 apiKey: apiKey,
                 defaultModel: "gpt-4o",
                 defaultTemperature: 0.7,
-                apiVersion: detectedVersion
+                apiVersion: detectedVersion,
+                httpCredentialConsentEndpoint: consentEndpoint
             )
 
             do {
@@ -2178,7 +2862,8 @@ public class APISettingsViewModel: ObservableObject {
             maxTokens: maxTokensValue,
             userPreferredModel: userModel.isEmpty ? nil : userModel,
             includeContentTypeHeader: customProviderIncludeContentType,
-            apiVersion: detectedVersion
+            apiVersion: detectedVersion,
+            httpCredentialConsentEndpoint: consentEndpoint
         )
         try CustomProviderConfiguration.save(config)
 
@@ -2235,11 +2920,14 @@ public class APISettingsViewModel: ObservableObject {
 
         AzureOpenAIProvider.debug("Starting validation for base URL \(normalizedURL.absoluteString) using API version \(trimmedVersion)")
 
+        let consentEndpoint = azureHTTPConsentEndpoint
+        try ProviderEndpointConsent.validate(normalizedURL, apiKey: trimmedKey, consentEndpoint: consentEndpoint)
         let discoveryVersions = AzureOpenAIProvider.discoveryAPIVersions
         let models = try await AzureOpenAIProvider.discoverDeployments(
             baseURL: normalizedURL,
             apiKey: trimmedKey,
-            apiVersions: discoveryVersions
+            apiVersions: discoveryVersions,
+            httpCredentialConsentEndpoint: consentEndpoint
         )
         let resolvedAPIVersion = trimmedVersion
         AzureOpenAIProvider.debug("Retrieved \(models.count) Azure deployments")
@@ -2273,7 +2961,8 @@ public class APISettingsViewModel: ObservableObject {
             apiVersion: resolvedAPIVersion,
             extraHeaders: nil,
             models: models,
-            defaultModelID: selectedDescriptor.id
+            defaultModelID: selectedDescriptor.id,
+            httpCredentialConsentEndpoint: consentEndpoint
         )
 
         AzureOpenAIProvider.debug("Testing Azure credentials against deployment \(selectedDescriptor.id) (base model: \(selectedDescriptor.baseModelID ?? "unknown"))")
@@ -2333,7 +3022,8 @@ public class APISettingsViewModel: ObservableObject {
         components.scheme = components.scheme ?? "https"
         components.host = host
         components.path = ""
-        return components.url
+        guard let url = components.url, ProviderEndpointConsent.endpointIdentity(url.absoluteString) != nil else { return nil }
+        return url
     }
 
     @MainActor
@@ -2350,7 +3040,8 @@ public class APISettingsViewModel: ObservableObject {
             let descriptors = try await AzureOpenAIProvider.discoverDeployments(
                 baseURL: normalizedURL,
                 apiKey: trimmedKey,
-                apiVersions: discoveryVersions
+                apiVersions: discoveryVersions,
+                httpCredentialConsentEndpoint: azureHTTPConsentEndpoint
             )
             availableAzureModels = AzureOpenAIProvider.mergedWithDefaultDescriptors(descriptors)
         } catch {
@@ -2383,15 +3074,19 @@ public class APISettingsViewModel: ObservableObject {
 
         do {
             let provider = CustomOpenAIProvider(
-                baseURL: customProviderURL,
+                baseURL: customProviderConsentURL,
                 apiKey: customProviderApiKey,
                 defaultModel: "",
-                defaultTemperature: 0.7
+                defaultTemperature: 0.7,
+                apiVersion: OpenAIURLHelper.splitBaseURLAndVersion(customProviderURL).version,
+                httpCredentialConsentEndpoint: customProviderHTTPConsentEndpoint
             )
 
             let models = try await provider.getAvailableModels()
+            guard !Task.isCancelled else { return }
             availableCustomModels = models
         } catch {
+            guard !Task.isCancelled else { return }
             availableCustomModels = []
             apiSettingsViewModelDebugLog("Error fetching custom models: \(error)")
         }
@@ -2400,6 +3095,7 @@ public class APISettingsViewModel: ObservableObject {
     // MARK: - Claude Code
 
     func testClaudeCodeConnection() async throws -> Bool {
+        let wasConnected = isClaudeCodeConnected
         let previousStatus = claudeCodeCLIStatus
         let collector = CLIProcessLogCollector()
         collector.append("Claude Code connection test started")
@@ -2418,6 +3114,10 @@ public class APISettingsViewModel: ObservableObject {
             await provider.dispose()
             collector.append("Claude Code provider disposed")
             isClaudeCodeConnected = ok
+            if !ok || !wasConnected {
+                await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
+            }
+            setContextBuilderProviderVerified(.claudeCode, verified: ok)
             if ok {
                 claudeCodeCLIStatus = .binaryPresent
             }
@@ -2440,7 +3140,9 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Disposing Claude Code provider resources after failure")
             await provider.dispose()
             collector.append("Claude Code provider disposed")
+            await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate()
             isClaudeCodeConnected = false
+            setContextBuilderProviderVerified(.claudeCode, verified: false)
             claudeCodeCLIStatus = Self.errorLooksLikeClaudeCodeBinaryMissing(error)
                 ? .binaryMissing(message: "Claude Code CLI isn't installed or isn't on PATH.")
                 : .binaryPresent
@@ -2491,9 +3193,16 @@ public class APISettingsViewModel: ObservableObject {
         error: String?,
         phase: CodexConnectionPhase,
         updateModels: Bool,
-        windowID: Int = 0
+        windowID: Int = 0,
+        publicationToken: CodexManagedSessionFence.Token? = nil
     ) async {
+        guard publicationToken.map { codexSessionFence.allowsAuthenticationPublication($0) } ?? true else { return }
+        if connected {
+            await codexModelPollingService.resumeAfterManagedAuthentication()
+            guard publicationToken.map { codexSessionFence.allowsAuthenticationPublication($0) } ?? true else { return }
+        }
         isCodexConnected = connected
+        setContextBuilderProviderVerified(.codexExec, verified: connected)
         codexError = error
         codexConnectionPhase = phase
         UserDefaults.standard.set(connected, forKey: "CodexCLIConnected")
@@ -2506,6 +3215,7 @@ public class APISettingsViewModel: ObservableObject {
         if updateModels {
             await updateAvailableModels()
         }
+        guard publicationToken.map { codexSessionFence.allowsAuthenticationPublication($0) } ?? true else { return }
         NotificationCenter.default.post(
             name: .codexConnectionChanged,
             object: nil,
@@ -2548,111 +3258,280 @@ public class APISettingsViewModel: ObservableObject {
             || lowered.contains("'codex' executable")
     }
 
-    func resetCodexConnectionForSignOut(windowID: Int) async {
-        codexLogCollector = nil
-        await applyCodexConnectionState(
-            connected: false,
-            error: nil,
-            phase: .idle,
-            updateModels: true,
-            windowID: windowID
-        )
+    func stopCodexSessionsAndSignOut(windowID: Int) async throws {
+        guard managedCodexAccount?.isConfirmedManagedAuthentication == true else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Managed Codex sign out is only available for a confirmed managed account."
+            )
+        }
+        codexManagedLoginOperationID = nil
+        codexManagedLoginFlow = nil
+        let result = await WindowStatesManager.shared.stopCodexSessionsAndSignOut()
+        switch result {
+        case .signedOut:
+            codexLogCollector = nil
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: nil,
+                phase: .idle,
+                updateModels: true,
+                windowID: windowID
+            )
+        case let .failed(message):
+            applyCodexConnectionPhase(.failed(message: message), error: message)
+            throw AIProviderError.invalidConfiguration(detail: message)
+        case let .executableUnavailable(message):
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: .executableUnavailable(message: message),
+                updateModels: true,
+                windowID: windowID
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
     }
 
     func startCodexManagedChatgptLogin(
-        openURL: @MainActor @escaping (URL) -> Void
+        openURL: @MainActor @escaping @Sendable (URL) -> Void
     ) async throws -> Bool {
+        guard let authenticationGeneration = codexSessionFence.beginAuthenticationAttempt() else {
+            throw AIProviderError.invalidConfiguration(detail: "Wait for Codex sign out to finish before signing in again.")
+        }
+        let operationID = beginCodexManagedLogin(flow: .browser)
+        defer { finishCodexManagedLogin(operationID: operationID) }
         await CLIEnvironmentCache.shared.invalidate()
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
         applyCodexConnectionPhase(.resolvingExecutable)
 
-        let resolution = await CodexProviderHelpers.preflightCodexExecutable()
+        let resolution = await codexExecutablePreflight(nil)
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
         guard resolution.status == .available else {
+            managedCodexAccount = nil
             await applyCodexConnectionState(
                 connected: false,
                 error: resolution.userMessage,
                 phase: .executableUnavailable(message: resolution.userMessage),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
 
         applyCodexConnectionPhase(.loggingIn)
 
-        let result = await CodexManagedAuthRecoveryService.shared.startManagedChatgptLogin(openURL: openURL)
+        let result = await codexManagedAuthRecovery.startManagedChatgptLogin(openURL: openURL)
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
         switch result {
-        case .authenticated:
+        case let .authenticated(account):
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = account
             await applyCodexConnectionState(
                 connected: true,
                 error: nil,
-                phase: .connected(resolvedExecutable: resolution.resolvedCommand),
-                updateModels: true
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
-            return true
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        case .authenticatedWithoutManagedAccount:
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
         case let .failed(message):
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: codexFailurePhase(for: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             throw AIProviderError.invalidConfiguration(detail: message)
         case let .executableUnavailable(message):
+            managedCodexAccount = nil
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: .executableUnavailable(message: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             throw AIProviderError.invalidConfiguration(detail: message)
         }
     }
 
+    func startCodexManagedChatgptDeviceCodeLogin(
+        presentDeviceCode: @MainActor @escaping @Sendable (CodexManagedChatgptDeviceCode, Bool) -> Void
+    ) async throws -> Bool {
+        guard let authenticationGeneration = codexSessionFence.beginAuthenticationAttempt() else {
+            throw AIProviderError.invalidConfiguration(detail: "Wait for Codex sign out to finish before signing in again.")
+        }
+        let operationID = beginCodexManagedLogin(flow: .deviceCode)
+        defer { finishCodexManagedLogin(operationID: operationID) }
+        await CLIEnvironmentCache.shared.invalidate()
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
+        applyCodexConnectionPhase(.resolvingExecutable)
+
+        let resolution = await codexExecutablePreflight(nil)
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
+        guard resolution.status == .available else {
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: resolution.userMessage,
+                phase: .executableUnavailable(message: resolution.userMessage),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
+        }
+
+        applyCodexConnectionPhase(.loggingIn)
+
+        let result = await codexManagedAuthRecovery.startManagedChatgptDeviceCodeLogin(
+            presentDeviceCode: presentDeviceCode
+        )
+        guard codexManagedLoginOperationID == operationID,
+              codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        else { return false }
+        switch result {
+        case let .authenticated(account):
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = account
+            await applyCodexConnectionState(
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        case .authenticatedWithoutManagedAccount:
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: true,
+                error: nil,
+                phase: .connected(resolvedExecutable: resolution.displayDescription),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            return codexSessionFence.allowsAuthenticationPublication(authenticationGeneration)
+        case let .failed(message):
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: codexFailurePhase(for: message),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        case let .executableUnavailable(message):
+            managedCodexAccount = nil
+            await applyCodexConnectionState(
+                connected: false,
+                error: message,
+                phase: .executableUnavailable(message: message),
+                updateModels: true,
+                publicationToken: authenticationGeneration
+            )
+            throw AIProviderError.invalidConfiguration(detail: message)
+        }
+    }
+
+    private func beginCodexManagedLogin(flow: CodexManagedLoginFlow) -> UUID {
+        let operationID = UUID()
+        codexManagedLoginOperationID = operationID
+        codexManagedLoginFlow = flow
+        return operationID
+    }
+
+    private func finishCodexManagedLogin(operationID: UUID) {
+        guard codexManagedLoginOperationID == operationID else { return }
+        codexManagedLoginOperationID = nil
+        codexManagedLoginFlow = nil
+    }
+
     func testCodexConnection() async throws -> Bool {
+        guard let authenticationGeneration = codexSessionFence.beginAuthenticationAttempt() else {
+            throw AIProviderError.invalidConfiguration(detail: "Wait for Codex sign out to finish before testing the connection.")
+        }
         let collector = CLIProcessLogCollector()
         collector.append("Codex CLI connection test started")
         codexLogCollector = collector
 
         collector.append("Refreshing login-shell environment cache")
         await CLIEnvironmentCache.shared.invalidate()
+        guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
 
         applyCodexConnectionPhase(.resolvingExecutable)
         collector.append("Resolving Codex CLI executable before authentication checks")
-        let resolution = await CodexProviderHelpers.preflightCodexExecutable(logCollector: collector)
+        let resolution = await codexExecutablePreflight(collector)
+        guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
         guard resolution.status == .available else {
+            managedCodexAccount = nil
             collector.append("Codex executable unavailable before managed authentication refresh")
             await applyCodexConnectionState(
                 connected: false,
                 error: resolution.userMessage,
                 phase: .executableUnavailable(message: resolution.userMessage),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(resolution.userMessage)")
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
-        collector.append("Codex executable resolved at \(resolution.resolvedCommand)")
+        collector.append("Codex executable resolved: \(resolution.displayDescription ?? resolution.debugMessage)")
 
         applyCodexConnectionPhase(.refreshingAuth)
         collector.append("Checking Codex managed authentication state before health check")
-        switch await CodexManagedAuthRecoveryService.shared.refreshManagedAccount() {
-        case .recovered:
+        let refreshResult = await codexManagedAuthRecovery.refreshManagedAccount()
+        guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
+        switch refreshResult {
+        case let .recovered(account):
+            guard codexSessionFence.finishAuthentication(token: authenticationGeneration) else { return false }
+            managedCodexAccount = account
             collector.append("Codex managed authentication preflight succeeded")
         case let .requiresUserLogin(message):
+            managedCodexAccount = nil
             collector.append("Codex managed authentication preflight requires user login")
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: .authRequired(message: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
         case let .executableUnavailable(message):
+            managedCodexAccount = nil
             collector.append("Codex executable unavailable before health check")
             await applyCodexConnectionState(
                 connected: false,
                 error: message,
                 phase: .executableUnavailable(message: message),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(message)")
             throw AIProviderError.invalidConfiguration(detail: message)
@@ -2661,7 +3540,7 @@ public class APISettingsViewModel: ObservableObject {
         applyCodexConnectionPhase(.testingAppServer)
 
         // Use an owned non-agent Codex client so health-check failures cannot poison chat or polling.
-        let provider = CodexCLIProvider(logCollector: collector)
+        let provider = CodexCLIProvider(logCollector: collector, perfRecorder: AIProviderFactory.perfRecorder)
         collector.append("Created Codex CLI provider for health check")
 
         do {
@@ -2669,13 +3548,16 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Health check completed with status: \(ok ? "success" : "empty response")")
             collector.append("Disposing Codex CLI provider resources")
             await provider.dispose()
+            guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
             await applyCodexConnectionState(
                 connected: ok,
                 error: ok ? nil : "Codex CLI health check returned an empty response.",
-                phase: ok ? .connected(resolvedExecutable: resolution.resolvedCommand) : .failed(message: "Codex CLI health check returned an empty response."),
-                updateModels: true
+                phase: ok ? .connected(resolvedExecutable: resolution.displayDescription) : .failed(message: "Codex CLI health check returned an empty response."),
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
+            guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             if ok {
                 collector.append("Codex CLI marked as connected")
                 codexLogCollector = nil
@@ -2685,13 +3567,15 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             collector.append("Disposing Codex CLI provider resources after failure")
             await provider.dispose()
+            guard codexSessionFence.allowsAuthenticationPublication(authenticationGeneration) else { return false }
             collector.append("Codex CLI provider disposed")
             let finalMessage = friendlyCodexMessage(for: error)
             await applyCodexConnectionState(
                 connected: false,
                 error: finalMessage,
                 phase: codexFailurePhase(for: finalMessage),
-                updateModels: true
+                updateModels: true,
+                publicationToken: authenticationGeneration
             )
             collector.append("User guidance: \(finalMessage)")
             throw error
@@ -2721,13 +3605,13 @@ public class APISettingsViewModel: ObservableObject {
 
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") {
-            return "Codex CLI is not installed. Install it and ensure it's available on PATH."
+            return "The selected Codex runtime is unavailable. Reinstall RepoPrompt CE or configure a valid explicit override."
         }
         if lowered.contains("permission denied") {
             return "Permission denied. Ensure the 'codex' executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") {
-            return "Codex CLI is not authenticated. Run 'codex login' in your terminal."
+            return CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage
         }
         return message
     }
@@ -2805,6 +3689,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Discovered \(snapshot.models.options.count) OpenCode model option(s)")
             availableOpenCodeModelOptions = snapshot.models.options
             isOpenCodeConnected = true
+            setContextBuilderProviderVerified(.openCode, verified: true)
             openCodeError = nil
             UserDefaults.standard.set(true, forKey: "OpenCodeCLIConnected")
             startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -2820,6 +3705,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             isOpenCodeConnected = false
+            setContextBuilderProviderVerified(.openCode, verified: false)
             openCodeError = friendlyOpenCodeMessage(for: error)
             UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
             stopOpenCodeModelsSubscription(clearModels: true)
@@ -2837,6 +3723,7 @@ public class APISettingsViewModel: ObservableObject {
 
     func disconnectOpenCode() {
         isOpenCodeConnected = false
+        setContextBuilderProviderVerified(.openCode, verified: false)
         openCodeError = nil
         UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
         stopOpenCodeModelsSubscription(clearModels: true)
@@ -2896,13 +3783,18 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func startOpenCodeModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose else { return }
         guard openCodeModelsTask == nil else { return }
         openCodeModelsTask = Task { [weak self, workspacePath] in
             let stream = await OpenCodeACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
-                    self?.availableOpenCodeModelOptions = snapshot.models.options
+                    guard let self else { return }
+                    availableOpenCodeModelOptions = snapshot.models.options
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.openCode, verified: true)
+                    }
                 }
                 await self?.updateAvailableModels()
             }
@@ -2919,9 +3811,32 @@ public class APISettingsViewModel: ObservableObject {
 
     // MARK: - Cursor CLI / ACP
 
+    #if DEBUG
+        func test_waitForCursorModelRefresh() async {
+            await cursorModelsRefreshTask?.value
+        }
+    #endif
+
+    func refreshCursorModels() {
+        guard !hasPreparedForWindowClose, isCursorConnected, cursorModelsRefreshTask == nil else { return }
+        isDiscoveringCursorModels = true
+        cursorModelDiscoveryMessage = nil
+        cursorModelsRefreshTask = Task { [weak self] in
+            let result = await cursorModelPollingService.refreshCatalog(workspacePath: nil)
+            guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
+            isDiscoveringCursorModels = false
+            cursorModelsRefreshTask = nil
+            if let message = result.errorMessage {
+                cursorModelDiscoveryMessage = "\(message) Try Refresh Models again."
+            } else if let count = result.advertisedCount {
+                cursorModelDiscoveryMessage = "\(count) models advertised."
+            }
+        }
+    }
+
     func testCursorConnection() async throws -> Bool {
         let collector = CLIProcessLogCollector()
-        collector.append("Cursor CLI connection test started")
+        collector.append("Cursor Agent CLI connection test started")
         collector.append("Preferred Cursor model fallback: \(AgentModel.cursorAuto.rawValue)")
         cursorLogCollector = collector
 
@@ -2930,24 +3845,34 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Starting Cursor ACP model discovery preflight")
 
         do {
-            let snapshot = try await CursorACPModelPollingService.shared.discoverOnce(workspacePath: nil)
+            let snapshot = try await cursorModelPollingService.discoverOnce(workspacePath: nil)
             let cursorOptions = AgentModelCatalog.options(
                 for: .cursor,
                 availability: AgentModelCatalog.AvailabilityContext(cursorAvailable: true, zaiConfigured: false)
             )
             if let snapshot {
                 collector.append("Discovered \(snapshot.models.options.count) Cursor model option(s)")
+                let reconciliationIssues = CursorAIModelCatalog.reconciliationIssues(comparedTo: snapshot.models)
+                if reconciliationIssues.isEmpty {
+                    collector.append("Release-gated Cursor model metadata matches the live catalog")
+                } else {
+                    collector.append("Release-gated Cursor model metadata has \(reconciliationIssues.count) live difference(s)")
+                    for issue in reconciliationIssues {
+                        collector.append("Cursor metadata difference: \(issue)")
+                    }
+                }
                 availableCursorModelOptions = cursorOptions
             } else {
                 collector.append("Cursor ACP preflight completed without dynamic model metadata; using Auto fallback")
                 availableCursorModelOptions = cursorOptions
             }
             isCursorConnected = true
+            setContextBuilderProviderVerified(.cursor, verified: true)
             cursorError = nil
             UserDefaults.standard.set(true, forKey: "CursorCLIConnected")
             startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
             await updateAvailableModels()
-            collector.append("Cursor CLI marked as connected")
+            collector.append("Cursor Agent CLI marked as connected")
             cursorLogCollector = nil
             NotificationCenter.default.post(
                 name: .cursorConnectionChanged,
@@ -2958,6 +3883,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             isCursorConnected = false
+            setContextBuilderProviderVerified(.cursor, verified: false)
             cursorError = friendlyCursorMessage(for: error)
             UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
             stopCursorModelsSubscription(clearModels: true)
@@ -2975,6 +3901,7 @@ public class APISettingsViewModel: ObservableObject {
 
     func disconnectCursor() {
         isCursorConnected = false
+        setContextBuilderProviderVerified(.cursor, verified: false)
         cursorError = nil
         UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
         stopCursorModelsSubscription(clearModels: true)
@@ -2995,7 +3922,7 @@ public class APISettingsViewModel: ObservableObject {
             case let .invalidConfiguration(detail):
                 return detail
             case let .apiError(source):
-                return source?.localizedDescription ?? "Unknown Cursor CLI error"
+                return source?.localizedDescription ?? "Unknown Cursor Agent CLI error"
             default:
                 return error.localizedDescription
             }
@@ -3003,16 +3930,16 @@ public class APISettingsViewModel: ObservableObject {
         let message = error.localizedDescription
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
-            return "Cursor CLI ACP server was not found. Install Cursor CLI and ensure `cursor-agent acp` or `cursor agent acp` is available on PATH."
+            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` or the verified `agent acp` entrypoint is available."
         }
         if lowered.contains("permission denied") {
-            return "Permission denied. Ensure the `cursor-agent` executable is accessible."
+            return "Permission denied. Ensure the Cursor `cursor-agent` or `agent` executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
-            return "Cursor CLI is not authenticated. Set `CURSOR_API_KEY`/`CURSOR_AUTH_TOKEN` or complete Cursor login."
+            return "Cursor Agent CLI is not authenticated. Set `CURSOR_API_KEY`/`CURSOR_AUTH_TOKEN` or complete Cursor login."
         }
         if lowered.contains("does not advertise acp") || lowered.contains("acp support") {
-            return "Installed Cursor CLI does not support ACP mode. Update Cursor CLI and ensure `cursor-agent acp --help` works."
+            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` or `agent acp --help` identifies Cursor ACP."
         }
         return message
     }
@@ -3029,7 +3956,7 @@ public class APISettingsViewModel: ObservableObject {
         let exportDate = Date()
         let url = try collector.writeMarkdownToDownloads(
             baseFilename: "RepoPrompt-CursorTrace",
-            title: "Cursor CLI Connection Trace",
+            title: "Cursor Agent CLI Connection Trace",
             timestamp: exportDate
         )
         collector.append("Trace exported to \(url.lastPathComponent)")
@@ -3037,16 +3964,21 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func startCursorModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose else { return }
         guard cursorModelsTask == nil else { return }
         cursorModelsTask = Task { [weak self, workspacePath] in
-            let stream = await CursorACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await _ in stream {
+            let stream = await cursorModelPollingService.subscribe(workspacePath: workspacePath)
+            for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
-                    self?.availableCursorModelOptions = AgentModelCatalog.options(
+                    guard let self else { return }
+                    availableCursorModelOptions = AgentModelCatalog.options(
                         for: .cursor,
                         availability: AgentModelCatalog.AvailabilityContext(cursorAvailable: true, zaiConfigured: false)
                     )
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.cursor, verified: true)
+                    }
                 }
                 await self?.updateAvailableModels()
             }
@@ -3054,10 +3986,167 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func stopCursorModelsSubscription(clearModels: Bool = false) {
+        cursorModelsRefreshTask?.cancel()
+        cursorModelsRefreshTask = nil
+        isDiscoveringCursorModels = false
+        cursorModelDiscoveryMessage = nil
         cursorModelsTask?.cancel()
         cursorModelsTask = nil
         if clearModels {
             availableCursorModelOptions = []
+        }
+    }
+
+    // MARK: - Grok Build CLI / ACP
+
+    func testGrokBuildConnection() async throws -> Bool {
+        let collector = CLIProcessLogCollector()
+        collector.append("Grok Build CLI connection test started")
+        grokBuildLogCollector = collector
+
+        collector.append("Refreshing login-shell environment cache")
+        await CLIEnvironmentCache.shared.invalidate()
+        collector.append("Starting Grok Build ACP model discovery preflight")
+
+        do {
+            let snapshot = try await GrokBuildACPModelPollingService.shared.discoverOnce(workspacePath: nil)
+            let grokOptions = AgentModelCatalog.options(
+                for: .grokBuild,
+                availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+            )
+            if let snapshot {
+                collector.append("Discovered \(snapshot.models.options.count) Grok Build model option(s)")
+                availableGrokBuildModelOptions = grokOptions
+            } else {
+                collector.append("Grok Build ACP preflight completed without dynamic model metadata; using Default")
+                availableGrokBuildModelOptions = grokOptions
+            }
+            isGrokBuildConnected = true
+            setContextBuilderProviderVerified(.grokBuild, verified: true)
+            grokBuildError = nil
+            UserDefaults.standard.set(true, forKey: "GrokBuildCLIConnected")
+            startGrokBuildModelsSubscriptionIfNeeded(workspacePath: nil)
+            await updateAvailableModels()
+            collector.append("Grok Build CLI marked as connected")
+            grokBuildLogCollector = nil
+            NotificationCenter.default.post(
+                name: .grokBuildConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            return true
+        } catch {
+            collector.append("Connection test threw error: \(error.localizedDescription)")
+            isGrokBuildConnected = false
+            setContextBuilderProviderVerified(.grokBuild, verified: false)
+            grokBuildError = Self.friendlyGrokBuildMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
+            stopGrokBuildModelsSubscription(clearModels: true)
+            await updateAvailableModels()
+            let finalMessage = grokBuildError ?? error.localizedDescription
+            collector.append("User guidance: \(finalMessage)")
+            NotificationCenter.default.post(
+                name: .grokBuildConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            throw error
+        }
+    }
+
+    func disconnectGrokBuild() {
+        isGrokBuildConnected = false
+        setContextBuilderProviderVerified(.grokBuild, verified: false)
+        grokBuildError = nil
+        UserDefaults.standard.set(false, forKey: "GrokBuildCLIConnected")
+        stopGrokBuildModelsSubscription(clearModels: true)
+        Task {
+            await updateAvailableModels()
+        }
+        NotificationCenter.default.post(
+            name: .grokBuildConnectionChanged,
+            object: nil,
+            userInfo: ["windowID": 0]
+        )
+    }
+
+    static func friendlyGrokBuildMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError {
+            switch providerError {
+            case let .invalidConfiguration(detail):
+                return detail
+            case let .apiError(source):
+                return source?.localizedDescription ?? "Unknown Grok Build CLI error"
+            default:
+                return error.localizedDescription
+            }
+        }
+        let message = error.localizedDescription
+        let lowered = message.lowercased()
+        if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
+            return "Grok Build CLI was not found. Install it (`npm i -g @xai-official/grok` or https://x.ai/cli/install.sh) and ensure `grok agent stdio` is available."
+        }
+        if lowered.contains("permission denied") {
+            return "Permission denied. Ensure the `grok` executable is accessible."
+        }
+        if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
+            return "Grok Build is not authenticated. Run `grok login` or set `XAI_API_KEY`."
+        }
+        if lowered.contains("stdio") {
+            return "Installed Grok Build CLI does not advertise the ACP stdio subcommand. Update Grok Build and ensure `grok agent --help` lists `stdio`."
+        }
+        if lowered.contains("authentication required") {
+            return "Grok Build needs authentication. Run `grok login` in Terminal, or save a Grok (xAI) API key under Settings → API Providers, then try Connect again."
+        }
+        return message
+    }
+
+    func hasGrokBuildTrace() -> Bool {
+        grokBuildLogCollector?.isEmpty == false
+    }
+
+    func dumpGrokBuildTrace() throws -> URL {
+        guard let collector = grokBuildLogCollector else {
+            throw CLIProcessLogCollectorError.noEntries
+        }
+        collector.append("Exporting trace to Downloads folder")
+        let exportDate = Date()
+        let url = try collector.writeMarkdownToDownloads(
+            baseFilename: "RepoPrompt-GrokBuildTrace",
+            title: "Grok Build CLI Connection Trace",
+            timestamp: exportDate
+        )
+        collector.append("Trace exported to \(url.lastPathComponent)")
+        return url
+    }
+
+    private func startGrokBuildModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose else { return }
+        guard grokBuildModelsTask == nil else { return }
+        grokBuildModelsTask = Task { [weak self, workspacePath] in
+            let stream = await GrokBuildACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    availableGrokBuildModelOptions = AgentModelCatalog.options(
+                        for: .grokBuild,
+                        availability: AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+                    )
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.grokBuild, verified: true)
+                    }
+                }
+                await self?.updateAvailableModels()
+            }
+        }
+    }
+
+    private func stopGrokBuildModelsSubscription(clearModels: Bool = false) {
+        grokBuildModelsTask?.cancel()
+        grokBuildModelsTask = nil
+        if clearModels {
+            availableGrokBuildModelOptions = []
         }
     }
 
@@ -3169,7 +4258,8 @@ public class APISettingsViewModel: ObservableObject {
                 apiKey: openAIApiKey,
                 defaultModel: "gpt-3.5-turbo",
                 defaultTemperature: 0.7,
-                apiVersion: version
+                apiVersion: version,
+                httpCredentialConsentEndpoint: openAIHTTPConsentEndpoint
             )
             let models = try await provider.getAvailableModels()
             await MainActor.run { availableOpenAIModels = models }
@@ -3216,19 +4306,24 @@ public class APISettingsViewModel: ObservableObject {
     /// Starts a subscription to the centralized Codex model polling service.
     /// Replaces the previous ephemeral-client one-shot refresh.
     private func startCodexModelsSubscriptionIfNeeded() {
+        guard !hasPreparedForWindowClose else { return }
         guard codexModelsTask == nil else { return }
-        codexModelsTask = Task { [weak self] in
+        let codexModelPollingService = codexModelPollingService
+        codexModelsTask = Task { [weak self, codexModelPollingService] in
             guard let self else { return }
 
             // subscribe() starts the polling loop if idle and immediately yields the latest
             // snapshot (if available). The polling loop refreshes immediately on first tick,
             // so no explicit refreshNow() is needed here.
-            let stream = await CodexModelPollingService.shared.subscribe()
+            let stream = await codexModelPollingService.subscribe()
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
-                await MainActor.run {
+                let didPublish = await MainActor.run {
+                    guard snapshot.isAuthorizedForPublication else { return false }
                     self.availableCodexModels = snapshot.models
+                    return true
                 }
+                guard didPublish else { continue }
                 await updateAvailableModels()
             }
         }
@@ -3238,6 +4333,47 @@ public class APISettingsViewModel: ObservableObject {
         codexModelsTask?.cancel()
         codexModelsTask = nil
     }
+
+    #if DEBUG
+        func test_refreshManagedCodexAccountSnapshotIfConnected() async {
+            await refreshManagedCodexAccountSnapshotIfConnected()
+        }
+
+        func test_applyAuthoritativeCodexDisconnectedState() {
+            applyAuthoritativeCodexDisconnectedState()
+        }
+
+        func test_startCodexModelsSubscriptionIfNeeded() {
+            startCodexModelsSubscriptionIfNeeded()
+        }
+
+        var test_hasCodexModelsSubscriptionTask: Bool {
+            codexModelsTask != nil
+        }
+
+        var test_hasPreparedForWindowClose: Bool {
+            hasPreparedForWindowClose
+        }
+
+        var test_hasFinishedInitialStoredDataLoad: Bool {
+            hasLoadedStoredData && !isLoadingStoredData
+        }
+
+        var test_initialLoadTask: Task<Void, Never>? {
+            initialLoadTask
+        }
+
+        var test_hasContextBuilderProviderValidationTask: Bool {
+            contextBuilderProviderValidationTask != nil
+        }
+
+        func test_cancelAndDrainCodexModelsSubscription() async {
+            let task = codexModelsTask
+            task?.cancel()
+            codexModelsTask = nil
+            await task?.value
+        }
+    #endif
 
     private func updateGrokModels() async {
         guard isGrokKeyValid else { return }

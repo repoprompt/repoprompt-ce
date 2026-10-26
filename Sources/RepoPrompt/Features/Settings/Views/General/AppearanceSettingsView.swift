@@ -1,3 +1,6 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+
 //
 //  AppearanceSettingsView.swift
 //  RepoPrompt
@@ -43,10 +46,24 @@ struct AppearanceSettingsView: View {
         )
     }
 
+    private var showDatesInMessageTimestampsBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.showDatesInMessageTimestamps() },
+            set: { globalSettings.setShowDatesInMessageTimestamps($0) }
+        )
+    }
+
     private var experimentalAttributedTextEditorBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.experimentalAttributedTextEditor() },
             set: { globalSettings.setExperimentalAttributedTextEditor($0) }
+        )
+    }
+
+    private var fileMentionPickerStyleBinding: Binding<FileMentionPickerStyle> {
+        Binding(
+            get: { globalSettings.fileMentionPickerStyle() },
+            set: { globalSettings.setFileMentionPickerStyle($0) }
         )
     }
 
@@ -118,6 +135,12 @@ struct AppearanceSettingsView: View {
                             description: "Enable tooltips when hovering over elements.",
                             isOn: showTooltipsBinding
                         )
+
+                        SettingToggle(
+                            title: "Show dates in message timestamps",
+                            description: "Add Yesterday, weekday, or date labels to message and tool timestamps.",
+                            isOn: showDatesInMessageTimestampsBinding
+                        )
                     }
                 }
                 .padding(.horizontal, fontPreset.scaledClamped(16, max: 24))
@@ -130,18 +153,38 @@ struct AppearanceSettingsView: View {
                     title: "Text Editing",
                     description: "Configure text editing behavior"
                 ) {
-                    SettingToggle(
-                        title: "Enable Spell Checking in Instructions",
-                        description: "Check for spelling mistakes in the instructions text area",
-                        isOn: $promptViewModel.spellCheckInstructions
-                    )
+                    VStack(alignment: .leading, spacing: 8) {
+                        SettingToggle(
+                            title: "Enable Spell Checking in Instructions",
+                            description: "Check for spelling mistakes in the instructions text area",
+                            isOn: $promptViewModel.spellCheckInstructions
+                        )
 
-                    // Experimental toggle for the @-mention menu
-                    SettingToggle(
-                        title: "Enable @-Mention Menu (Experimental)",
-                        description: "Allows you to tag files directly in the compose prompt box using \"@file\" suggestions.",
-                        isOn: experimentalAttributedTextEditorBinding
-                    )
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("@ File Picker Style")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
+
+                            Picker("@ File Picker Style", selection: fileMentionPickerStyleBinding) {
+                                ForEach(FileMentionPickerStyle.allCases) { style in
+                                    Text(style.displayName).tag(style)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(width: fontPreset.scaledClamped(240, max: 320), alignment: .leading)
+
+                            Text("Choose Compact or Expanded density for file @ mention suggestions.")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                                .foregroundColor(.secondary)
+                        }
+
+                        // Experimental toggle for the @-mention menu
+                        SettingToggle(
+                            title: "Enable @-Mention Menu (Experimental)",
+                            description: "Allows you to tag files directly in the compose prompt box using \"@file\" suggestions.",
+                            isOn: experimentalAttributedTextEditorBinding
+                        )
+                    }
                 }
                 .padding(.horizontal, fontPreset.scaledClamped(16, max: 24))
                 .padding(.bottom, fontPreset.scaledClamped(16, max: 24))

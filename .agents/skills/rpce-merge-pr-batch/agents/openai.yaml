@@ -1,0 +1,4 @@
+interface:
+  display_name: "Merge RepoPrompt CE PR Batch"
+  short_description: "Safely integrate an authorized PR batch"
+  default_prompt: "Use $rpce-merge-pr-batch to integrate and normally merge this explicitly ordered RepoPrompt CE PR list while preserving my original checkout; stop before any force-push, admin bypass, branch deletion, app lifecycle change, or deployment I have not separately authorized."

@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  AgentModelsSettingsView.swift
 //  RepoPrompt
@@ -25,35 +27,40 @@ import SwiftUI
 /// inline with row-level and bulk Apply controls.
 struct AgentModelsSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
-    @ObservedObject var contextBuilderVM: ContextBuilderAgentViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
     let windowID: Int
+    let workspaceID: UUID?
     let workspaceName: String?
     var onNavigate: ((SettingsTab) -> Void)?
 
     @StateObject private var viewModel: AgentModelsSettingsViewModel
     @State private var showAdvanced: Bool = false
     @State private var showSettingsPopover: Bool = false
+    @State private var showCopyWorkspaceToGlobalConfirmation: Bool = false
 
     init(
         promptVM: PromptViewModel,
-        contextBuilderVM: ContextBuilderAgentViewModel,
         apiSettingsVM: APISettingsViewModel,
         windowID: Int,
+        workspaceID: UUID? = nil,
         workspaceName: String? = nil,
+        settingsManager: (any SettingsManaging)? = nil,
         onNavigate: ((SettingsTab) -> Void)? = nil,
-        viewModel: AgentModelsSettingsViewModel? = nil
+        viewModel: AgentModelsSettingsViewModel? = nil,
+        repromptCurrentProvider: @escaping () -> AgentProviderKind? = { nil }
     ) {
         self.promptVM = promptVM
-        self.contextBuilderVM = contextBuilderVM
         self.apiSettingsVM = apiSettingsVM
         self.windowID = windowID
+        self.workspaceID = workspaceID
         self.workspaceName = workspaceName
         self.onNavigate = onNavigate
         _viewModel = StateObject(wrappedValue: viewModel ?? AgentModelsSettingsViewModel(
-            promptVM: promptVM,
-            contextBuilderVM: contextBuilderVM,
-            apiSettingsVM: apiSettingsVM
+            apiSettingsVM: apiSettingsVM,
+            workspaceID: workspaceID,
+            workspaceName: workspaceName,
+            settingsManager: settingsManager,
+            repromptCurrentProvider: repromptCurrentProvider
         ))
     }
 
@@ -61,7 +68,10 @@ struct AgentModelsSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
-                recommendationBanner
+                scopeRoutingSection
+                if viewModel.showsRecommendationActions {
+                    recommendationBanner
+                }
                 oracleSection
                 contextBuilderSection
                 roleDefaultsSection
@@ -73,7 +83,26 @@ struct AgentModelsSettingsView: View {
             .padding(16)
         }
         .onAppear {
+            viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: workspaceName)
             viewModel.refresh()
+        }
+        .onChange(of: workspaceID) { _, newWorkspaceID in
+            viewModel.updateWorkspaceContext(workspaceID: newWorkspaceID, workspaceName: workspaceName)
+        }
+        .onChange(of: workspaceName) { _, newWorkspaceName in
+            viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: newWorkspaceName)
+        }
+        .confirmationDialog(
+            "Copy workspace settings to global?",
+            isPresented: $showCopyWorkspaceToGlobalConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Copy to Global", role: .destructive) {
+                viewModel.copyWorkspaceSettingsToGlobal()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This overwrites the global Agent Models profile used by all workspaces that inherit global settings.")
         }
     }
 
@@ -94,8 +123,11 @@ struct AgentModelsSettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
-                scopeChip(label: "Scope: Global", systemImage: "globe")
-                if let workspaceName, !workspaceName.isEmpty {
+                scopeChip(
+                    label: viewModel.effectiveScopeDescription,
+                    systemImage: viewModel.isEditingWorkspaceSettings ? "rectangle.stack.badge.person.crop" : "globe"
+                )
+                if let workspaceName = viewModel.workspaceDisplayName {
                     scopeChip(label: "Workspace: \(workspaceName)", systemImage: "rectangle.stack")
                 }
             }
@@ -114,6 +146,107 @@ struct AgentModelsSettingsView: View {
         .padding(.vertical, 4)
         .background(Color.secondary.opacity(0.08))
         .cornerRadius(4)
+    }
+
+    // MARK: - Scope routing
+
+    private var scopeRoutingSection: some View {
+        settingsCard {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Text(viewModel.workspaceAgentModelsTitle)
+                        .font(.headline)
+                    Spacer(minLength: 0)
+                }
+
+                if viewModel.hasWorkspace {
+                    Picker("Agent Models scope", selection: Binding(
+                        get: { viewModel.inheritanceMode },
+                        set: { viewModel.setInheritanceMode($0) }
+                    )) {
+                        Text("Use global settings").tag(AgentModelsInheritanceMode.useGlobalSettings)
+                        Text("Use workspace overrides").tag(AgentModelsInheritanceMode.useWorkspaceOverrides)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityLabel("Agent Models inheritance mode")
+
+                    Text(scopeRoutingExplanation)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    scopeCopySettingsFooter
+                } else {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.secondary)
+                        Text(viewModel.noWorkspaceExplanation)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .background(Color.primary.opacity(0.03))
+                    .cornerRadius(6)
+                }
+            }
+        }
+    }
+
+    private var scopeRoutingExplanation: String {
+        switch viewModel.inheritanceMode {
+        case .useGlobalSettings:
+            "This workspace will use global Agent Models settings. Changes below edit global settings."
+        case .useWorkspaceOverrides:
+            "This workspace will use workspace-specific Agent Models overrides. Changes below edit this workspace only."
+        }
+    }
+
+    private var scopeCopySettingsFooter: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+                .padding(.top, 2)
+
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(scopeCopySettingsTitle)
+                        .font(.callout).bold()
+                    Text(scopeCopySettingsDescription)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                Button(scopeCopySettingsButtonTitle) {
+                    if viewModel.isEditingWorkspaceSettings {
+                        showCopyWorkspaceToGlobalConfirmation = true
+                    } else {
+                        viewModel.copyGlobalSettingsToWorkspaceOverrides()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private var scopeCopySettingsTitle: String {
+        viewModel.isEditingWorkspaceSettings
+            ? "Copy workspace settings to global"
+            : "Copy global settings to workspace"
+    }
+
+    private var scopeCopySettingsDescription: String {
+        viewModel.isEditingWorkspaceSettings
+            ? "Overwrite global Agent Models settings with this workspace’s current overrides."
+            : "Create workspace overrides from the current global Agent Models settings and switch this workspace to Use workspace overrides."
+    }
+
+    private var scopeCopySettingsButtonTitle: String {
+        viewModel.isEditingWorkspaceSettings ? "Copy to Global" : "Copy to Workspace"
     }
 
     // MARK: - Recommendation Banner
@@ -195,12 +328,6 @@ struct AgentModelsSettingsView: View {
                 let differingCount = roleDefaultDiffCount(for: agentDefaults)
                 previewLine(icon: "person.3", text: "Role defaults: \(differingCount) of \(agentDefaults.recommendedRoleDefaults.count) differ")
             }
-            if viewModel.contextBuilderDrift != nil {
-                previewLine(
-                    icon: "exclamationmark.triangle",
-                    text: "Context Builder values differ between Global and this workspace."
-                )
-            }
         }
     }
 
@@ -227,21 +354,108 @@ struct AgentModelsSettingsView: View {
 
     private var oracleSection: some View {
         settingsCard {
-            sectionHeader(title: "Oracle Model", subtitle: "Used by ask_oracle, oracle_send, plan/review, and Context Builder analysis.")
+            sectionHeader(
+                title: "Oracle Models",
+                subtitle: "Choose a primary Oracle and up to four additional models. Grouped requests run each model independently and keep results separate in roster order."
+            )
 
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(0 ..< viewModel.oracleCount, id: \.self) { index in
+                    oracleRow(at: index)
+                }
+
+                Button {
+                    viewModel.addOracle()
+                } label: {
+                    Label("Add Oracle", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!viewModel.canAddOracle)
+                .hoverTooltip(
+                    viewModel.canAddOracle
+                        ? "Add another Oracle model."
+                        : "Choose an Oracle first, or remove an Oracle to stay within the five-model limit."
+                )
+
+                Divider()
+                oracleReconciliationGuidanceEditor
+                Divider()
+                AgentRepromptSettingsEditor(viewModel: viewModel)
+            }
+        }
+    }
+
+    private var oracleReconciliationGuidanceEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Reconciliation guidance")
+                .font(.callout.weight(.medium))
+            Text("Used when two or more Oracle answers are returned to the calling agent. The agent reconciles them; no extra synthesis model runs. Changes affect future requests. Blank text restores the default; the lane manifest and end marker remain fixed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TextEditor(text: $viewModel.oracleReconciliationGuidanceDraft)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .frame(height: 160)
+                .padding(6)
+                .background(Color.primary.opacity(0.03), in: RoundedRectangle(cornerRadius: 6))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                }
+                .accessibilityLabel("Oracle reconciliation guidance")
+
+            HStack {
+                Button("Save") { viewModel.saveOracleReconciliationGuidanceDraft() }
+                    .disabled(viewModel.oracleGuidanceHasConflict || !viewModel.isOracleGuidanceDraftDirty)
+                    .accessibilityLabel("Save Oracle reconciliation guidance")
+                Button("Restore Default") { viewModel.restoreDefaultOracleReconciliationGuidance() }
+                    .disabled(viewModel.oracleGuidanceHasConflict || (
+                        !viewModel.isOracleGuidanceDraftDirty && viewModel.profileSnapshot.oracleReconciliationGuidance == nil
+                    ))
+                    .accessibilityLabel("Restore default Oracle reconciliation guidance")
+                if viewModel.oracleGuidanceHasConflict {
+                    Button("Reload Current Text") { viewModel.reloadOracleReconciliationGuidanceDraft() }
+                        .accessibilityLabel("Reload Oracle reconciliation guidance")
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+
+            if viewModel.oracleGuidanceHasConflict {
+                Text("Settings or scope changed while you were editing. Reload the current text before saving; this discards your draft.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func oracleRow(at index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .center, spacing: 12) {
+                Text(viewModel.oracleLabel(at: index))
+                    .font(.callout.weight(.medium))
+                    .frame(width: 112, alignment: .leading)
+
                 AIModelDropdown(
                     promptViewModel: promptVM,
                     showSettingsPopover: $showSettingsPopover,
                     windowID: windowID,
                     useBorderlessStyle: false,
                     isInGeneralSettings: true,
-                    destination: viewModel.oracleModelDestination
+                    destination: index == 0
+                        ? viewModel.oracleModelDestination
+                        : viewModel.additionalOracleModelDestination(at: index - 1)
                 )
 
                 Spacer(minLength: 0)
 
-                if let recommendedName = viewModel.recommendedOracleModelName,
+                if index == 0,
+                   viewModel.showsRecommendationActions,
+                   let recommendedName = viewModel.recommendedOracleModelName,
                    !viewModel.isOracleRecommendationSatisfied
                 {
                     Text("Recommended: \(recommendedName)")
@@ -253,6 +467,14 @@ struct AgentModelsSettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                } else if index > 0 {
+                    Button(role: .destructive) {
+                        viewModel.removeOracle(at: index - 1)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .hoverTooltip("Remove \(viewModel.oracleLabel(at: index))")
                 }
             }
 
@@ -260,10 +482,11 @@ struct AgentModelsSettingsView: View {
                 Image(systemName: "cpu")
                     .foregroundColor(.secondary)
                     .font(.caption)
-                Text("Using: \(viewModel.currentOracleModelName)")
+                Text("Using: \(viewModel.oracleModelName(at: index))")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+            .padding(.leading, 124)
         }
     }
 
@@ -273,7 +496,7 @@ struct AgentModelsSettingsView: View {
         settingsCard {
             sectionHeader(title: "Context Builder Agent", subtitle: "Used to discover files and build optimized context for Oracle, plans, and reviews.")
 
-            if promptVM.availableAgentKinds.isEmpty {
+            if !viewModel.hasConnectedCLIProvider {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle")
                         .foregroundColor(.secondary)
@@ -303,9 +526,9 @@ struct AgentModelsSettingsView: View {
                                 .font(.callout)
                                 .foregroundColor(.secondary)
                             AgentModelSelectionSummaryLabel(
-                                agentKind: promptVM.contextBuilderAgent,
-                                rawModel: promptVM.contextBuilderAgentModelRaw,
-                                title: "\(promptVM.contextBuilderAgent.displayName) · \(promptVM.contextBuilderAgentModelDisplayName)",
+                                agentKind: viewModel.selectedContextBuilderAgent,
+                                rawModel: viewModel.selectedContextBuilderModelRaw,
+                                title: "\(viewModel.selectedContextBuilderAgent.displayName) · \(viewModel.selectedContextBuilderDisplayName)",
                                 iconFont: .caption
                             )
                             .font(.callout)
@@ -319,9 +542,34 @@ struct AgentModelsSettingsView: View {
                         .cornerRadius(6)
                     }
 
+                    if let providerID = viewModel.selectedContextBuilderAgent.acpProviderID {
+                        let expectedScope = viewModel.editingScope
+                        let expectedModelRaw = viewModel.selectedContextBuilderModelRaw
+                        ACPModelParameterProbeView(
+                            modelRaw: expectedModelRaw,
+                            providerID: providerID,
+                            probeContext: .resolved(promptVM.activeWorkspaceRootPath),
+                            pinnedValueRaw: viewModel.contextBuilderThinkingParameterValueRaw,
+                            isEnabled: true
+                        ) { configID, value in
+                            viewModel.setContextBuilderModelParameter(
+                                ACPModelParameterSelection.thinkingPin(
+                                    configID: configID,
+                                    valueRaw: value,
+                                    providerID: providerID,
+                                    modelRaw: expectedModelRaw
+                                ),
+                                expectedProviderID: providerID,
+                                expectedModelRaw: expectedModelRaw,
+                                expectedScope: expectedScope
+                            )
+                        }
+                    }
+
                     Spacer(minLength: 0)
 
-                    if let recommendedCB = viewModel.recommendedContextBuilderDescription,
+                    if viewModel.showsRecommendationActions,
+                       let recommendedCB = viewModel.recommendedContextBuilderDescription,
                        !viewModel.isContextBuilderRecommendationSatisfied
                     {
                         Text("Recommended: \(recommendedCB)")
@@ -336,49 +584,7 @@ struct AgentModelsSettingsView: View {
                     }
                 }
             }
-
-            if let drift = viewModel.contextBuilderDrift {
-                contextBuilderDriftResolver(drift: drift)
-            }
         }
-    }
-
-    private func contextBuilderDriftResolver(
-        drift: AgentModelsSettingsViewModel.ContextBuilderDrift
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Context Builder values differ")
-                        .font(.caption.bold())
-                        .foregroundColor(.orange)
-                    Text("MCP runs use \(drift.globalDescription). UI runs in this workspace use \(drift.workspaceDescription).")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                Button("Use MCP for both") {
-                    viewModel.resolveContextBuilderDriftUsingGlobal()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
-                Button("Use UI for both") {
-                    viewModel.resolveContextBuilderDriftUsingWorkspace()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-        }
-        .padding(8)
-        .background(Color.orange.opacity(0.08))
-        .cornerRadius(6)
     }
 
     // MARK: - Role Defaults
@@ -393,7 +599,7 @@ struct AgentModelsSettingsView: View {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle")
                         .foregroundColor(.secondary)
-                    Text("Connect Claude Code, Codex, OpenCode, or Cursor to configure role defaults.")
+                    Text("Connect Claude Code, Codex, OpenCode, Cursor, or Grok Build to configure role defaults.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     Spacer(minLength: 0)
@@ -501,14 +707,44 @@ struct AgentModelsSettingsView: View {
                     .cornerRadius(4)
                 }
                 .fixedSize()
+
+                if let providerID = resolution.effective.agent.acpProviderID {
+                    // Capture the write target at render time; the view model re-checks it against
+                    // LIVE state before writing, so a stale menu (a scope switch while it was
+                    // open leaves the discovery key identical) cannot write to the old scope.
+                    let expectedScope = viewModel.editingScope
+                    let expectedModelRaw = resolution.effective.modelRaw
+                    ACPModelParameterProbeView(
+                        modelRaw: expectedModelRaw,
+                        providerID: providerID,
+                        probeContext: .resolved(promptVM.activeWorkspaceRootPath),
+                        pinnedValueRaw: resolution.thinkingParameterValueRaw
+                    ) { configID, value in
+                        viewModel.setRoleModelParameter(
+                            ACPModelParameterSelection.thinkingPin(
+                                configID: configID,
+                                valueRaw: value,
+                                providerID: providerID,
+                                modelRaw: expectedModelRaw
+                            ),
+                            for: resolution.role,
+                            expectedProviderID: providerID,
+                            expectedModelRaw: expectedModelRaw,
+                            expectedScope: expectedScope
+                        )
+                    }
+                }
             }
 
-            if resolution.hasCustomOverride, !resolution.overrideUnavailable {
+            let pinState = resolution.pinState
+            if let message = pinState.message,
+               let actionTitle = pinState.actionTitle
+            {
                 HStack(spacing: 6) {
-                    Text("Recommended: \(resolution.recommendedDisplayName)")
+                    Text(message)
                         .font(.caption2)
-                        .foregroundColor(.orange)
-                    Button("Apply") {
+                        .foregroundColor(pinState.usesWarningStyle ? .orange : .secondary)
+                    Button(actionTitle) {
                         viewModel.applyRoleDefault(resolution)
                     }
                     .font(.caption2)
@@ -516,13 +752,6 @@ struct AgentModelsSettingsView: View {
                     .foregroundColor(.accentColor)
                 }
                 .padding(.leading, 30)
-            }
-
-            if resolution.overrideUnavailable {
-                Text("Saved override unavailable; using recommended default.")
-                    .font(.caption2)
-                    .foregroundColor(.orange)
-                    .padding(.leading, 30)
             }
         }
     }
@@ -593,7 +822,7 @@ struct AgentModelsSettingsView: View {
     /// no longer requires a click to uncover.
     ///
     /// SEARCH-HELPER: Agent Models related settings, Oracle Model Presets link,
-    /// Benchmark Model link, related-settings footer
+    /// related-settings footer
     private var relatedSettingsSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Related Settings")
@@ -605,12 +834,6 @@ struct AgentModelsSettingsView: View {
                 title: "Oracle Model Presets",
                 detail: "Named Oracle model choices exposed to MCP clients.",
                 tab: .modelPresets
-            )
-            linkRow(
-                icon: "gauge",
-                title: "Benchmark Model",
-                detail: "Head-to-head model benchmarks.",
-                tab: .benchmark
             )
         }
         .padding(.top, 8)

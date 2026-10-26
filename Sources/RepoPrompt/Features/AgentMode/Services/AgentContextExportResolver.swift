@@ -1,0 +1,2087 @@
+import CryptoKit
+import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
+
+struct AgentContextExportSource: Equatable {
+    let tabID: UUID?
+    let promptText: String
+    let selection: StoredSelection
+    let selectedMetaPromptIDs: [UUID]
+    let tabName: String?
+    let activeAgentSessionID: UUID?
+    let worktreeBindings: [AgentSessionWorktreeBinding]
+
+    var hasWorktreeBindings: Bool {
+        activeAgentSessionID != nil && !worktreeBindings.isEmpty
+    }
+
+    var exportContextIdentity: AgentContextExportIdentity {
+        AgentContextExportIdentity(
+            tabID: tabID,
+            selection: selection,
+            activeAgentSessionID: activeAgentSessionID,
+            worktreeBindingFingerprint: Self.worktreeBindingFingerprint(worktreeBindings)
+        )
+    }
+
+    static func worktreeBindingFingerprint(_ bindings: [AgentSessionWorktreeBinding]) -> String {
+        AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
+    }
+}
+
+struct AgentContextExportIdentity: Equatable, Hashable {
+    let tabID: UUID?
+    let selection: StoredSelection
+    let activeAgentSessionID: UUID?
+    let worktreeBindingFingerprint: String
+}
+
+struct AgentContextSelectionSummary: Equatable {
+    let totalExplicitFileCount: Int
+    let fullFileCount: Int
+    let slicedFileCount: Int
+    let codemapFileCount: Int
+    let sliceRangeCount: Int
+
+    static func filesOnly(_ count: Int) -> AgentContextSelectionSummary {
+        AgentContextSelectionSummary(
+            totalExplicitFileCount: count,
+            fullFileCount: count,
+            slicedFileCount: 0,
+            codemapFileCount: 0,
+            sliceRangeCount: 0
+        )
+    }
+
+    var compactText: String {
+        fileCountText
+    }
+
+    var headlineText: String {
+        guard let sliceCountText else { return fileCountText }
+        return "\(fileCountText) · \(sliceCountText)"
+    }
+
+    private var fileCountText: String {
+        "\(totalExplicitFileCount) file\(totalExplicitFileCount == 1 ? "" : "s")"
+    }
+
+    private var sliceCountText: String? {
+        guard sliceRangeCount > 0 else { return nil }
+        return "\(sliceRangeCount) slice\(sliceRangeCount == 1 ? "" : "s")"
+    }
+}
+
+struct AgentContextExportSourceBuildRequest {
+    let requestedTabID: UUID?
+    let activeComposeTabID: UUID?
+    let activePromptText: String
+    let selectionSnapshot: WorkspaceSelectionCoordinator.Snapshot?
+    let composeTabs: [ComposeTabState]
+    let explicitActiveAgentSessionID: UUID?
+    let worktreeBindingsProvider: (UUID, UUID?) -> [AgentSessionWorktreeBinding]
+}
+
+enum AgentContextExportSourceBuilder {
+    static func makeSource(_ request: AgentContextExportSourceBuildRequest) -> AgentContextExportSource {
+        let resolvedTabID = request.requestedTabID
+            ?? request.selectionSnapshot?.tabID
+            ?? request.activeComposeTabID
+        let tab = resolvedTabID.flatMap { tabID in
+            request.composeTabs.first { $0.id == tabID }
+        }
+        let selectionSnapshotApplies = request.selectionSnapshot?.tabID == resolvedTabID
+        let selection = selectionSnapshotApplies
+            ? request.selectionSnapshot?.selection ?? StoredSelection()
+            : tab?.selection ?? StoredSelection()
+        let promptText = resolvedTabID == request.activeComposeTabID
+            ? request.activePromptText
+            : tab?.promptText ?? request.activePromptText
+        let sessionID = request.explicitActiveAgentSessionID ?? tab?.activeAgentSessionID
+        let bindings = sessionID.map { request.worktreeBindingsProvider($0, resolvedTabID) } ?? []
+
+        return AgentContextExportSource(
+            tabID: resolvedTabID,
+            promptText: promptText,
+            selection: selection,
+            selectedMetaPromptIDs: tab?.selectedMetaPromptIDs ?? [],
+            tabName: tab?.name,
+            activeAgentSessionID: sessionID,
+            worktreeBindings: bindings
+        )
+    }
+}
+
+struct AgentContextExportModel: Equatable {
+    let source: AgentContextExportSource
+    let lookupContext: WorkspaceLookupContext
+    let rows: [AgentContextExportRow]
+    let totalSelectedDisplayTokens: Int
+    let missingPaths: [String]
+    let invalidPaths: [String]
+    let codemapPresentation: WorkspaceCodemapOperationPresentation
+
+    var fileCount: Int {
+        rows.count
+    }
+
+    var codemapCoverage: WorkspaceCodemapOperationPresentationCoverage {
+        codemapPresentation.coverage
+    }
+
+    var codemapIssues: [WorkspaceCodemapOperationIssue] {
+        codemapPresentation.issues
+    }
+}
+
+struct AgentContextExportRow: Identifiable, Equatable {
+    enum Metrics: Equatable {
+        struct Known: Equatable {
+            let tokenCount: Int
+            let tokenPercentage: Double
+            let lineCount: Int?
+        }
+
+        case unknown
+        case known(Known)
+
+        static func known(tokenCount: Int, tokenPercentage: Double, lineCount: Int?) -> Metrics {
+            .known(Known(tokenCount: tokenCount, tokenPercentage: tokenPercentage, lineCount: lineCount))
+        }
+
+        var knownValues: Known? {
+            guard case let .known(values) = self else { return nil }
+            return values
+        }
+
+        var tokenSortKey: Int {
+            knownValues?.tokenCount ?? 0
+        }
+    }
+
+    enum Kind: Int, Equatable {
+        case codemap = 0
+        case slices = 1
+        case full = 2
+
+        var iconName: String {
+            switch self {
+            case .codemap: "square.grid.2x2"
+            case .slices: "scissors"
+            case .full: "doc.text"
+            }
+        }
+
+        var badgeText: String? {
+            switch self {
+            case .codemap: "Codemap"
+            case .slices: "Slices"
+            case .full: nil
+            }
+        }
+    }
+
+    let id: ResolvedPromptFileEntryID
+    let kind: Kind
+    let rootID: UUID
+    let relativePath: String
+    let displayPath: String
+    let displayName: String
+    let physicalPath: String?
+    let directoryDisplay: String?
+    let lineRanges: [LineRange]?
+    let metrics: Metrics
+    let rootDisplayName: String
+    let rootColorKey: String
+    let showRootPill: Bool
+    let canRemove: Bool
+    let resolvedContentLocation: ResolvedFileContentLocation?
+    let removesAutomaticSourceIntent: Bool
+
+    init(
+        id: ResolvedPromptFileEntryID,
+        kind: Kind,
+        rootID: UUID,
+        relativePath: String,
+        displayPath: String,
+        displayName: String,
+        physicalPath: String? = nil,
+        directoryDisplay: String?,
+        lineRanges: [LineRange]?,
+        metrics: Metrics = .unknown,
+        rootDisplayName: String = "",
+        rootColorKey: String = "",
+        showRootPill: Bool = false,
+        canRemove: Bool,
+        resolvedContentLocation: ResolvedFileContentLocation? = nil,
+        removesAutomaticSourceIntent: Bool = false
+    ) {
+        self.id = id
+        self.kind = kind
+        self.rootID = rootID
+        self.relativePath = relativePath
+        self.displayPath = displayPath
+        self.displayName = displayName
+        self.physicalPath = physicalPath
+        self.directoryDisplay = directoryDisplay
+        self.lineRanges = lineRanges
+        self.metrics = metrics
+        self.rootDisplayName = rootDisplayName
+        self.rootColorKey = rootColorKey
+        self.showRootPill = showRootPill
+        self.canRemove = canRemove
+        self.resolvedContentLocation = resolvedContentLocation
+        self.removesAutomaticSourceIntent = removesAutomaticSourceIntent
+    }
+}
+
+extension AgentContextExportRow {
+    enum ContentPurpose {
+        case preview
+        case copy
+    }
+
+    func withMetricsAndRootMetadata(
+        metrics: Metrics,
+        rootMetadata: AgentContextExportResolver.RowRootMetadata?
+    ) -> AgentContextExportRow {
+        AgentContextExportRow(
+            id: id,
+            kind: kind,
+            rootID: rootID,
+            relativePath: relativePath,
+            displayPath: displayPath,
+            displayName: displayName,
+            physicalPath: physicalPath,
+            directoryDisplay: directoryDisplay,
+            lineRanges: lineRanges,
+            metrics: metrics,
+            rootDisplayName: rootMetadata?.displayName ?? rootDisplayName,
+            rootColorKey: rootMetadata?.colorKey ?? rootColorKey,
+            showRootPill: rootMetadata?.showPill ?? showRootPill,
+            canRemove: canRemove,
+            resolvedContentLocation: resolvedContentLocation,
+            removesAutomaticSourceIntent: removesAutomaticSourceIntent
+        )
+    }
+
+    func withMetrics(_ metrics: Metrics) -> AgentContextExportRow {
+        withMetricsAndRootMetadata(metrics: metrics, rootMetadata: nil)
+    }
+
+    var canPromoteToFullFile: Bool {
+        kind == .codemap
+    }
+
+    var canDemoteToCodemap: Bool {
+        kind != .codemap
+    }
+
+    var canClearSlices: Bool {
+        kind == .slices
+    }
+}
+
+enum AgentContextPreviewContentPolicy {
+    static let maximumBytes = 256_000
+    static let maximumCharacters = 200_000
+
+    static func boundedPreviewText(_ text: String, wasTruncated: Bool = false) -> String {
+        let exceedsCharacterLimit = text.count > maximumCharacters
+        guard wasTruncated || exceedsCharacterLimit else { return text }
+        let preview = exceedsCharacterLimit ? String(text.prefix(maximumCharacters)) : text
+        return """
+        \(preview)
+
+        … Preview truncated to avoid retaining large file content. Copy the file content for the full text.
+        """
+    }
+}
+
+struct AgentContextClipboardRequest {
+    let cfg: PromptContextResolved
+    let source: AgentContextExportSource
+    let store: WorkspaceFileContextStore
+    let lookupContext: WorkspaceLookupContext
+    let filePathDisplay: FilePathDisplay
+    let onlyIncludeRootsWithSelectedFiles: Bool
+    let showCodeMapMarkers: Bool
+    let metaInstructions: [MetaInstruction]
+    let includeDatetimeInUserInstructions: Bool
+    let promptSectionsOrder: [PromptSection]
+    let disabledPromptSections: Set<PromptSection>
+    let duplicateUserInstructionsAtTop: Bool
+    let reviewGitContext: FrozenPromptGitReviewContext
+    let completeGitDiffProvider: () async -> String
+}
+
+typealias AgentCodemapPresentationPlan = WorkspaceCodemapOperationPresentationPlan
+
+enum AgentContextExportResolver {
+    enum ResolutionPhase {
+        case codemapFileRecords
+        case metricsAssembly
+        case finalModelAssembly
+    }
+
+    typealias ResolutionPhaseDidBegin = @Sendable (ResolutionPhase) -> Void
+
+    private static func checkCancellation() throws(CancellationError) {
+        guard !Task.isCancelled else { throw CancellationError() }
+    }
+
+    private struct RowResolutionEntry {
+        let entry: ResolvedPromptFileEntry
+        let canRemove: Bool
+        let removesAutomaticSourceIntent: Bool
+    }
+
+    private struct RowResolution {
+        let rows: [RowResolutionEntry]
+        let selectedFileIDs: Set<UUID>
+        let missingPaths: [String]
+        let invalidPaths: [String]
+    }
+
+    private struct PresentationAuthoritySnapshot {
+        let lookupContext: WorkspaceLookupContext
+        let physicalSelection: StoredSelection
+        let rootScope: WorkspaceLookupRootScope
+        let roots: [WorkspaceRootRef]
+        let logicalRootDisplayNamesByRootID: [UUID: String]
+        let presentationPlan: AgentCodemapPresentationPlan
+    }
+
+    private struct ModelPresentationAttempt {
+        let authority: PresentationAuthoritySnapshot
+        let resolution: RowResolution
+    }
+
+    struct RowRootMetadata {
+        let displayName: String
+        let colorKey: String
+        let showPill: Bool
+    }
+
+    static func selectionSummary(for selection: StoredSelection) -> AgentContextSelectionSummary {
+        let selectedFileKeys = Set(selection.selectedPaths.map(normalizedSelectionKey))
+        let manualCodemapKeys = Set(selection.manualCodemapPaths.map(normalizedSelectionKey))
+        var explicitFileKeys = selectedFileKeys.union(manualCodemapKeys)
+        var slicedFileKeys = Set<String>()
+        var sliceRangeCount = 0
+
+        for (path, ranges) in selection.slices where !ranges.isEmpty {
+            let key = normalizedSelectionKey(path)
+            explicitFileKeys.insert(key)
+            slicedFileKeys.insert(key)
+            sliceRangeCount += ranges.count
+        }
+
+        let fullFileKeys = selectedFileKeys.subtracting(slicedFileKeys)
+        let codemapFileKeys = manualCodemapKeys
+            .subtracting(selectedFileKeys)
+            .subtracting(slicedFileKeys)
+
+        return AgentContextSelectionSummary(
+            totalExplicitFileCount: explicitFileKeys.count,
+            fullFileCount: fullFileKeys.count,
+            slicedFileCount: slicedFileKeys.count,
+            codemapFileCount: codemapFileKeys.count,
+            sliceRangeCount: sliceRangeCount
+        )
+    }
+
+    static func explicitSelectionFileCount(_ selection: StoredSelection) -> Int {
+        selectionSummary(for: selection).totalExplicitFileCount
+    }
+
+    static func displayFileCount(
+        resolvedModel _: AgentContextExportModel?,
+        sourceSelection: StoredSelection
+    ) -> Int {
+        selectionSummary(for: sourceSelection).totalExplicitFileCount
+    }
+
+    private static func selectionNeedsResolution(_ selection: StoredSelection, codeMapUsage: CodeMapUsage) -> Bool {
+        if !selection.selectedPaths.isEmpty { return true }
+        if selection.slices.contains(where: { !$0.value.isEmpty }) { return true }
+        switch codeMapUsage {
+        case .auto:
+            return !selection.manualCodemapPaths.isEmpty
+        case .complete:
+            return true
+        case .none, .selected:
+            return false
+        }
+    }
+
+    private static func shouldEmitInterimFileRows(for selection: StoredSelection, codeMapUsage: CodeMapUsage) -> Bool {
+        guard hasExplicitFileRows(selection) else { return false }
+        switch codeMapUsage {
+        case .auto:
+            return selection.codemapAutoEnabled || !selection.manualCodemapPaths.isEmpty
+        case .complete:
+            return true
+        case .none, .selected:
+            return false
+        }
+    }
+
+    private static func hasExplicitFileRows(_ selection: StoredSelection) -> Bool {
+        if !selection.selectedPaths.isEmpty { return true }
+        return selection.slices.contains { !$0.value.isEmpty }
+    }
+
+    static func lookupContext(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore
+    ) async -> WorkspaceLookupContext {
+        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).event("resolver.lookupContext.start", fields: AgentSelectedFilesDiagnostics.sourceFields(source))
+        let context = await AgentWorkspaceLookupContextResolver.lookupContext(
+            source: AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: source.activeAgentSessionID,
+                worktreeBindings: source.worktreeBindings
+            ),
+            store: store
+        )
+        var fields = AgentSelectedFilesDiagnostics.sourceFields(source)
+        fields["rootScope"] = String(describing: context.rootScope)
+        fields["hasProjection"] = String(context.bindingProjection != nil)
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent("resolver.lookupContext", startMS: startMS, fields: fields)
+        return context
+    }
+
+    static func resolveModel(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore,
+        filePathDisplay: FilePathDisplay,
+        codeMapUsage: CodeMapUsage,
+        entryMetricsSnapshot: PromptContextEntryMetricsSnapshot? = nil,
+        accountingService: PromptContextAccountingService = PromptContextAccountingService(),
+        presentationCoordinator: WorkspaceCodemapPresentationCoordinator? = nil,
+        interimFileRowsHandler: ((AgentContextExportModel) async -> Void)? = nil,
+        presentationWillBeginForTesting: (@Sendable () async throws(CancellationError) -> Void)? = nil,
+        phaseDidBeginForTesting: ResolutionPhaseDidBegin? = nil
+    ) async throws -> AgentContextExportModel {
+        try checkCancellation()
+        let totalStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        var startFields = AgentSelectedFilesDiagnostics.sourceFields(source)
+        startFields["filePathDisplay"] = String(describing: filePathDisplay)
+        startFields["codeMapUsage"] = String(describing: codeMapUsage)
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).event("resolver.resolveModel.start", fields: startFields)
+        guard selectionNeedsResolution(source.selection, codeMapUsage: codeMapUsage) else {
+            AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
+                "resolver.resolveModel.fastEmpty",
+                startMS: totalStartMS,
+                fields: startFields
+            )
+            return AgentContextExportModel(
+                source: source,
+                lookupContext: .visibleWorkspace,
+                rows: [],
+                totalSelectedDisplayTokens: 0,
+                missingPaths: [],
+                invalidPaths: [],
+                codemapPresentation: .empty
+            )
+        }
+
+        if let displayModel = try await resolveMetadataOnlyWorktreeModel(
+            source: source,
+            filePathDisplay: filePathDisplay,
+            codeMapUsage: codeMapUsage,
+            perfRecorder: store.perfRecorder,
+            entryMetricsSnapshot: entryMetricsSnapshot,
+            accountingService: accountingService,
+            phaseDidBeginForTesting: phaseDidBeginForTesting,
+            totalStartMS: totalStartMS,
+            fields: startFields
+        ) {
+            return displayModel
+        }
+
+        let lookupContext = await authoritativeLookupContext(
+            source: source,
+            store: store,
+            fallback: .visibleWorkspace
+        )
+        let physicalizeStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        let physicalSelection = lookupContext.physicalizeSelection(source.selection)
+        var physicalizeFields = AgentSelectedFilesDiagnostics.selectionFields(physicalSelection)
+        physicalizeFields["hasProjection"] = String(lookupContext.bindingProjection != nil)
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent("resolver.physicalizeSelection", startMS: physicalizeStartMS, fields: physicalizeFields)
+
+        let resolveRowsStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        let resolution = await resolveRows(
+            selection: physicalSelection,
+            store: store,
+            rootScope: lookupContext.rootScope,
+            profile: .uiAssisted
+        )
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
+            "resolver.resolveRows",
+            startMS: resolveRowsStartMS,
+            fields: [
+                "rowEntries": String(resolution.rows.count),
+                "missingPaths": String(resolution.missingPaths.count),
+                "invalidPaths": String(resolution.invalidPaths.count)
+            ]
+        )
+
+        let roots = await store.rootRefs(scope: lookupContext.rootScope)
+        let logicalRootDisplayNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
+        if shouldEmitInterimFileRows(for: physicalSelection, codeMapUsage: codeMapUsage), let interimFileRowsHandler {
+            let interimModel = try await makeModel(
+                source: source,
+                lookupContext: lookupContext,
+                resolution: resolution,
+                roots: roots,
+                codemapFilesByID: [:],
+                store: store,
+                filePathDisplay: filePathDisplay,
+                codeMapUsage: .none,
+                codemapPresentation: .empty,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNames,
+                entryMetricsSnapshot: entryMetricsSnapshot ?? .empty,
+                phaseDidBeginForTesting: phaseDidBeginForTesting
+            )
+            await interimFileRowsHandler(interimModel)
+            try checkCancellation()
+        }
+        if codeMapUsage == .none {
+            return try await makeModel(
+                source: source,
+                lookupContext: lookupContext,
+                resolution: resolution,
+                roots: roots,
+                codemapFilesByID: [:],
+                store: store,
+                filePathDisplay: filePathDisplay,
+                codeMapUsage: codeMapUsage,
+                codemapPresentation: .empty,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNames,
+                entryMetricsSnapshot: entryMetricsSnapshot,
+                phaseDidBeginForTesting: phaseDidBeginForTesting
+            )
+        }
+        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: store)
+        do {
+            try await presentationWillBeginForTesting?()
+            return try await coordinator.withPresentation(
+                prepareAttempt: {
+                    let attempt = await modelPresentationAttempt(
+                        source: source,
+                        store: store,
+                        codeMapUsage: codeMapUsage
+                    )
+                    return WorkspaceCodemapPresentationAttempt(
+                        context: attempt,
+                        intent: attempt.authority.presentationPlan.intent,
+                        rootScope: attempt.authority.rootScope,
+                        logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID,
+                        requestedCodemapCount: requestedCodemapCount(
+                            for: attempt.authority.presentationPlan.intent,
+                            codeMapUsage: codeMapUsage
+                        )
+                    )
+                }
+            ) { attempt, presentation in
+                let presentation = merging(
+                    presentation,
+                    preflightIssues: attempt.authority.presentationPlan.preflightIssues
+                )
+                let resolution = await validatedSelectedFallbackResolution(
+                    attempt.resolution,
+                    presentation: presentation,
+                    store: store,
+                    codeMapUsage: codeMapUsage
+                )
+                try checkCancellation()
+                phaseDidBeginForTesting?(.codemapFileRecords)
+                let codemapFilesByID = await codemapFileRecordsByID(
+                    for: presentation,
+                    resolution: resolution,
+                    roots: attempt.authority.roots,
+                    store: store,
+                    codeMapUsage: codeMapUsage
+                )
+                return try await makeModel(
+                    source: source,
+                    lookupContext: attempt.authority.lookupContext,
+                    resolution: resolution,
+                    roots: attempt.authority.roots,
+                    codemapFilesByID: codemapFilesByID,
+                    store: store,
+                    filePathDisplay: filePathDisplay,
+                    codeMapUsage: codeMapUsage,
+                    codemapPresentation: presentation,
+                    logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID,
+                    entryMetricsSnapshot: entryMetricsSnapshot,
+                    phaseDidBeginForTesting: phaseDidBeginForTesting
+                )
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
+                .cancelled
+            } else {
+                .coordinationUnavailable
+            }
+            let attempt = await modelPresentationAttempt(
+                source: source,
+                store: store,
+                codeMapUsage: codeMapUsage
+            )
+            let presentation = merging(
+                unavailablePresentation(issue),
+                preflightIssues: attempt.authority.presentationPlan.preflightIssues
+            )
+            let resolution = await validatedSelectedFallbackResolution(
+                attempt.resolution,
+                presentation: presentation,
+                store: store,
+                codeMapUsage: codeMapUsage
+            )
+            try checkCancellation()
+            phaseDidBeginForTesting?(.codemapFileRecords)
+            let codemapFilesByID = await codemapFileRecordsByID(
+                for: presentation,
+                resolution: resolution,
+                roots: attempt.authority.roots,
+                store: store,
+                codeMapUsage: codeMapUsage
+            )
+            return try await makeModel(
+                source: source,
+                lookupContext: attempt.authority.lookupContext,
+                resolution: resolution,
+                roots: attempt.authority.roots,
+                codemapFilesByID: codemapFilesByID,
+                store: store,
+                filePathDisplay: filePathDisplay,
+                codeMapUsage: codeMapUsage,
+                codemapPresentation: presentation,
+                logicalRootDisplayNamesByRootID: attempt.authority.logicalRootDisplayNamesByRootID,
+                entryMetricsSnapshot: entryMetricsSnapshot,
+                phaseDidBeginForTesting: phaseDidBeginForTesting
+            )
+        }
+    }
+
+    static func buildClipboardContent(
+        _ request: AgentContextClipboardRequest,
+        presentationCoordinator: WorkspaceCodemapPresentationCoordinator? = nil
+    ) async -> String {
+        let coordinator = presentationCoordinator ?? WorkspaceCodemapPresentationCoordinator(store: request.store)
+        do {
+            return try await coordinator.withPresentation(
+                prepareAttempt: {
+                    let authority = await presentationAuthoritySnapshot(
+                        source: request.source,
+                        store: request.store,
+                        codeMapUsage: request.cfg.codeMapUsage,
+                        fallbackLookupContext: request.lookupContext,
+                        excludingWorkspaceGitData: true
+                    )
+                    return WorkspaceCodemapPresentationAttempt(
+                        context: authority,
+                        intent: authority.presentationPlan.intent,
+                        rootScope: authority.rootScope,
+                        logicalRootDisplayNamesByRootID: authority.logicalRootDisplayNamesByRootID,
+                        requestedCodemapCount: requestedCodemapCount(
+                            for: authority.presentationPlan.intent,
+                            codeMapUsage: request.cfg.codeMapUsage
+                        )
+                    )
+                }
+            ) { authority, presentation in
+                await assembleClipboardContent(
+                    clipboardRequest(request, lookupContext: authority.lookupContext),
+                    codemapPresentation: merging(
+                        presentation,
+                        preflightIssues: authority.presentationPlan.preflightIssues
+                    )
+                )
+            }
+        } catch {
+            let issue: WorkspaceCodemapOperationIssue = if Task.isCancelled || error is CancellationError {
+                .cancelled
+            } else {
+                .coordinationUnavailable
+            }
+            let authority = await presentationAuthoritySnapshot(
+                source: request.source,
+                store: request.store,
+                codeMapUsage: request.cfg.codeMapUsage,
+                fallbackLookupContext: request.lookupContext,
+                excludingWorkspaceGitData: true
+            )
+            return await assembleClipboardContent(
+                clipboardRequest(request, lookupContext: authority.lookupContext),
+                codemapPresentation: merging(
+                    unavailablePresentation(issue),
+                    preflightIssues: authority.presentationPlan.preflightIssues
+                )
+            )
+        }
+    }
+
+    static func loadRowContent(
+        for row: AgentContextExportRow,
+        model: AgentContextExportModel,
+        store: WorkspaceFileContextStore,
+        purpose: AgentContextExportRow.ContentPurpose
+    ) async -> String? {
+        switch row.kind {
+        case .codemap:
+            guard let entry = model.codemapPresentation.renderedEntriesByFileID[row.id.fileID],
+                  entry.rootEpoch.rootID == row.rootID,
+                  !entry.text.isEmpty
+            else { return nil }
+            let text = entry.text
+            return purpose == .preview ? AgentContextPreviewContentPolicy.boundedPreviewText(text) : text
+        case .full:
+            if let resolvedContentLocation = row.resolvedContentLocation {
+                return await loadDirectFileContent(
+                    location: resolvedContentLocation,
+                    lineRanges: nil,
+                    purpose: purpose
+                )
+            }
+            if purpose == .preview {
+                guard let prefix = try? await store.readContentPrefix(
+                    rootID: row.rootID,
+                    relativePath: row.relativePath,
+                    maximumBytes: AgentContextPreviewContentPolicy.maximumBytes
+                ) else {
+                    return nil
+                }
+                return AgentContextPreviewContentPolicy.boundedPreviewText(
+                    prefix.content,
+                    wasTruncated: prefix.truncated
+                )
+            }
+            return try? await store.readContent(rootID: row.rootID, relativePath: row.relativePath)
+        case .slices:
+            if let resolvedContentLocation = row.resolvedContentLocation {
+                return await loadDirectFileContent(
+                    location: resolvedContentLocation,
+                    lineRanges: row.lineRanges,
+                    purpose: purpose
+                )
+            }
+            guard let content = try? await store.readContent(rootID: row.rootID, relativePath: row.relativePath) else {
+                return nil
+            }
+            let renderedContent: String = if let ranges = row.lineRanges, !ranges.isEmpty {
+                SliceAssemblyBuilder.build(from: content, ranges: ranges).combinedText
+            } else {
+                content
+            }
+            return purpose == .preview ? AgentContextPreviewContentPolicy.boundedPreviewText(renderedContent) : renderedContent
+        }
+    }
+
+    static func removeRow(
+        _ row: AgentContextExportRow,
+        from selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        store: WorkspaceFileContextStore
+    ) async -> StoredSelection {
+        let originalKeys = Array(Set(
+            selection.selectedPaths + selection.manualCodemapPaths + selection.slices.keys
+        ))
+        let physicalKeysByOriginal = Dictionary(uniqueKeysWithValues: originalKeys.map {
+            ($0, physicalizedKey($0, lookupContext: lookupContext))
+        })
+        let requests = Set(physicalKeysByOriginal.values).map { physical in
+            WorkspacePathLookupRequest(
+                userPath: physical,
+                profile: .uiAssisted,
+                rootScope: lookupContext.rootScope
+            )
+        }
+        let results = await store.lookupPaths(requests)
+        let targetDirectPath = row.physicalPath.map(StandardizedPath.absolute)
+        let removedKeys = Set(originalKeys.filter { original in
+            guard let physical = physicalKeysByOriginal[original] else { return false }
+            if let targetDirectPath, StandardizedPath.absolute(physical) == targetDirectPath {
+                return true
+            }
+            return results[physical]?.file?.id == row.id.fileID
+        })
+        let selectedPaths = selection.selectedPaths.filter { !removedKeys.contains($0) }
+        let manualCodemapPaths = selection.manualCodemapPaths.filter { !removedKeys.contains($0) }
+        let slices = selection.slices.filter { path, ranges in
+            !ranges.isEmpty && !removedKeys.contains(path)
+        }
+        return StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: row.removesAutomaticSourceIntent && removedKeys.isEmpty
+                ? false
+                : selection.codemapAutoEnabled
+        )
+    }
+
+    private static func authoritativeLookupContext(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore,
+        fallback: WorkspaceLookupContext
+    ) async -> WorkspaceLookupContext {
+        guard source.hasWorktreeBindings else { return fallback }
+        return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
+            source: AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: source.activeAgentSessionID,
+                worktreeBindings: source.worktreeBindings
+            ),
+            store: store
+        )
+    }
+
+    private static func presentationAuthoritySnapshot(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage,
+        fallbackLookupContext: WorkspaceLookupContext,
+        excludingWorkspaceGitData: Bool
+    ) async -> PresentationAuthoritySnapshot {
+        let lookupContext = await authoritativeLookupContext(
+            source: source,
+            store: store,
+            fallback: fallbackLookupContext
+        )
+        let physicalSelection = lookupContext.physicalizeSelection(source.selection)
+        let rootScope = excludingWorkspaceGitData
+            ? lookupContext.rootScope.excludingWorkspaceGitData
+            : lookupContext.rootScope
+        let roots = await store.rootRefs(scope: rootScope)
+        let presentationPlan = await codemapPresentationPlan(
+            codeMapUsage: codeMapUsage,
+            selection: physicalSelection,
+            store: store,
+            rootScope: rootScope,
+            profile: .uiAssisted
+        )
+        let logicalRootDisplayNamesByRootID = await lookupContext.logicalRootDisplayNamesByRootID(
+            store: store
+        )
+        return PresentationAuthoritySnapshot(
+            lookupContext: lookupContext,
+            physicalSelection: physicalSelection,
+            rootScope: rootScope,
+            roots: roots,
+            logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+            presentationPlan: presentationPlan
+        )
+    }
+
+    private static func modelPresentationAttempt(
+        source: AgentContextExportSource,
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage
+    ) async -> ModelPresentationAttempt {
+        let authority = await presentationAuthoritySnapshot(
+            source: source,
+            store: store,
+            codeMapUsage: codeMapUsage,
+            fallbackLookupContext: .visibleWorkspace,
+            excludingWorkspaceGitData: false
+        )
+        let resolution = await resolveRows(
+            selection: authority.physicalSelection,
+            store: store,
+            rootScope: authority.rootScope,
+            profile: .uiAssisted
+        )
+        return ModelPresentationAttempt(authority: authority, resolution: resolution)
+    }
+
+    private static func requestedCodemapCount(
+        for intent: WorkspaceCodemapOperationPresentationIntent,
+        codeMapUsage: CodeMapUsage
+    ) -> Int? {
+        guard codeMapUsage == .selected else { return nil }
+        guard case let .exact(fileIDs, _) = intent else { return 0 }
+        return Set(fileIDs).count
+    }
+
+    private static func clipboardRequest(
+        _ request: AgentContextClipboardRequest,
+        lookupContext: WorkspaceLookupContext
+    ) -> AgentContextClipboardRequest {
+        AgentContextClipboardRequest(
+            cfg: request.cfg,
+            source: request.source,
+            store: request.store,
+            lookupContext: lookupContext,
+            filePathDisplay: request.filePathDisplay,
+            onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: request.showCodeMapMarkers,
+            metaInstructions: request.metaInstructions,
+            includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
+            promptSectionsOrder: request.promptSectionsOrder,
+            disabledPromptSections: request.disabledPromptSections,
+            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
+            reviewGitContext: request.reviewGitContext,
+            completeGitDiffProvider: request.completeGitDiffProvider
+        )
+    }
+
+    private static func validatedSelectedFallbackResolution(
+        _ resolution: RowResolution,
+        presentation: WorkspaceCodemapOperationPresentation,
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage
+    ) async -> RowResolution {
+        guard codeMapUsage == .selected else { return resolution }
+        guard !Task.isCancelled else {
+            return cancelledSelectedFallbackResolution(resolution)
+        }
+        var rows: [RowResolutionEntry] = []
+        rows.reserveCapacity(resolution.rows.count)
+        var missingPaths = resolution.missingPaths
+        for row in resolution.rows {
+            let file = row.entry.file
+            if let rendered = presentation.renderedEntriesByFileID[file.id],
+               rendered.rootEpoch.rootID == file.rootID
+            {
+                rows.append(row)
+                continue
+            }
+            do {
+                guard try await store.readContent(
+                    rootID: file.rootID,
+                    relativePath: file.standardizedRelativePath,
+                    workloadClass: .promptAccounting
+                ) != nil else {
+                    missingPaths.append(file.standardizedRelativePath)
+                    continue
+                }
+                rows.append(row)
+            } catch {
+                if Task.isCancelled || error is CancellationError {
+                    return cancelledSelectedFallbackResolution(resolution)
+                }
+                missingPaths.append(file.standardizedRelativePath)
+            }
+        }
+        return RowResolution(
+            rows: rows,
+            selectedFileIDs: resolution.selectedFileIDs,
+            missingPaths: Array(Set(missingPaths)).sorted(),
+            invalidPaths: resolution.invalidPaths
+        )
+    }
+
+    private static func cancelledSelectedFallbackResolution(
+        _ resolution: RowResolution
+    ) -> RowResolution {
+        RowResolution(
+            rows: [],
+            selectedFileIDs: resolution.selectedFileIDs,
+            missingPaths: resolution.missingPaths,
+            invalidPaths: resolution.invalidPaths
+        )
+    }
+
+    private static func loadDirectFileContent(
+        location: ResolvedFileContentLocation,
+        lineRanges: [LineRange]?,
+        purpose: AgentContextExportRow.ContentPurpose
+    ) async -> String? {
+        if purpose == .preview, lineRanges?.isEmpty != false {
+            return await Task.detached(priority: .userInitiated) {
+                guard let file = try? FileHandle(forReadingFrom: location.resolvedFileURL) else { return nil }
+                defer { try? file.close() }
+                guard let data = try? file.read(upToCount: AgentContextPreviewContentPolicy.maximumBytes + 1) else {
+                    return nil
+                }
+                let truncated = data.count > AgentContextPreviewContentPolicy.maximumBytes
+                let boundedData = truncated ? data.prefix(AgentContextPreviewContentPolicy.maximumBytes) : data[...]
+                let text = Self.decodeText(Data(boundedData))
+                return AgentContextPreviewContentPolicy.boundedPreviewText(text, wasTruncated: truncated)
+            }.value
+        }
+        guard let content = try? await FileSystemService.loadEntireFileContentOptimized(
+            at: location,
+            workloadClass: .interactiveRead
+        ) else {
+            return nil
+        }
+        let renderedContent: String = if let lineRanges, !lineRanges.isEmpty {
+            SliceAssemblyBuilder.build(from: content, ranges: lineRanges).combinedText
+        } else {
+            content
+        }
+        return purpose == .preview
+            ? AgentContextPreviewContentPolicy.boundedPreviewText(renderedContent)
+            : renderedContent
+    }
+
+    static func removeSelectionSnapshot(_ snapshot: StoredSelection, from selection: StoredSelection) -> StoredSelection {
+        let selectedSnapshotKeys = Set(snapshot.selectedPaths.map(normalizedSelectionKey))
+        let manualSnapshotKeys = Set(snapshot.manualCodemapPaths.map(normalizedSelectionKey))
+        let sliceSnapshotKeys = Set(snapshot.slices.keys.map(normalizedSelectionKey))
+        let selectedPaths = selection.selectedPaths.filter { !selectedSnapshotKeys.contains(normalizedSelectionKey($0)) }
+        let manualCodemapPaths = selection.manualCodemapPaths.filter {
+            !manualSnapshotKeys.contains(normalizedSelectionKey($0))
+        }
+        let slices = selection.slices.filter { path, ranges in
+            !ranges.isEmpty && !sliceSnapshotKeys.contains(normalizedSelectionKey(path))
+        }
+        return StoredSelection(
+            selectedPaths: selectedPaths,
+            manualCodemapPaths: manualCodemapPaths,
+            slices: slices,
+            codemapAutoEnabled: selection.codemapAutoEnabled
+        )
+    }
+
+    private static func resolveMetadataOnlyWorktreeModel(
+        source: AgentContextExportSource,
+        filePathDisplay: FilePathDisplay,
+        codeMapUsage: CodeMapUsage,
+        perfRecorder: any AgentModePerfRecording,
+        entryMetricsSnapshot: PromptContextEntryMetricsSnapshot?,
+        accountingService: PromptContextAccountingService,
+        phaseDidBeginForTesting: ResolutionPhaseDidBegin?,
+        totalStartMS: Double?,
+        fields startFields: [String: String]
+    ) async throws -> AgentContextExportModel? {
+        let startMS = AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).timestampMSIfEnabled()
+        guard source.hasWorktreeBindings,
+              source.worktreeBindings.count >= 1,
+              metadataOnlyBindingsAreSafe(source.worktreeBindings),
+              codeMapUsage == .none,
+              let sessionID = source.activeAgentSessionID
+        else { return nil }
+
+        guard let projection = lightweightProjection(
+            sessionID: sessionID,
+            bindings: source.worktreeBindings
+        ) else { return nil }
+
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: projection.lookupRootScope,
+            bindingProjection: projection
+        )
+        var rows: [AgentContextExportRow] = []
+        var missingPaths: [String] = []
+        var invalidPaths: [String] = []
+        var seenPhysicalPaths = Set<String>()
+        try checkCancellation()
+
+        let selectedPaths = source.selection.selectedPaths
+        for path in selectedPaths {
+            try checkCancellation()
+            let translatedPath = lookupContext.translateInputPath(path)
+            var requiresStoreFallback = false
+            guard let row = metadataOnlyRow(
+                originalPath: path,
+                translatedPath: translatedPath,
+                lineRanges: sliceRanges(forOriginalPath: path, translatedPath: translatedPath, selection: source.selection),
+                projection: projection,
+                filePathDisplay: filePathDisplay,
+                missingPaths: &missingPaths,
+                invalidPaths: &invalidPaths,
+                requiresStoreFallback: &requiresStoreFallback
+            ) else {
+                if requiresStoreFallback || metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
+                    return nil
+                }
+                continue
+            }
+            guard let location = row.resolvedContentLocation,
+                  seenPhysicalPaths.insert(location.resolvedFileURL.path).inserted
+            else { continue }
+            rows.append(row)
+            try checkCancellation()
+        }
+
+        for (path, ranges) in source.selection.slices where !ranges.isEmpty && !selectedPaths.contains(where: { normalizedSelectionKey($0) == normalizedSelectionKey(path) }) {
+            try checkCancellation()
+            let translatedPath = lookupContext.translateInputPath(path)
+            var requiresStoreFallback = false
+            guard let row = metadataOnlyRow(
+                originalPath: path,
+                translatedPath: translatedPath,
+                lineRanges: ranges,
+                projection: projection,
+                filePathDisplay: filePathDisplay,
+                missingPaths: &missingPaths,
+                invalidPaths: &invalidPaths,
+                requiresStoreFallback: &requiresStoreFallback
+            ) else {
+                if requiresStoreFallback || metadataOnlyPathRequiresStoreFallback(translatedPath, projection: projection) {
+                    return nil
+                }
+                continue
+            }
+            guard let location = row.resolvedContentLocation,
+                  seenPhysicalPaths.insert(location.resolvedFileURL.path).inserted
+            else { continue }
+            rows.append(row)
+            try checkCancellation()
+        }
+
+        let directMetricsSnapshot: PromptContextEntryMetricsSnapshot
+        if let entryMetricsSnapshot {
+            directMetricsSnapshot = entryMetricsSnapshot
+        } else {
+            let metricEntries = rows.map { row in
+                PromptContextResolvedContentMetricsEntry(
+                    fileID: row.id.fileID,
+                    rootID: row.rootID,
+                    location: row.resolvedContentLocation!,
+                    renderedDisplayPath: row.displayPath,
+                    lineRanges: row.lineRanges
+                )
+            }
+            directMetricsSnapshot = try await accountingService.calculateEntryMetricsSnapshot(
+                resolvedContentEntries: metricEntries
+            )
+        }
+        try checkCancellation()
+        let selectedPhysicalRootIDs = Set(rows.map(\.rootID))
+        let rootMetadata = rootMetadataByPhysicalRootID(
+            for: projection,
+            selectedPhysicalRootIDs: selectedPhysicalRootIDs
+        )
+        rows = rows.map { row in
+            row.withMetricsAndRootMetadata(
+                metrics: metrics(from: directMetricsSnapshot.metric(forFileID: row.id.fileID)),
+                rootMetadata: rootMetadata[row.rootID]
+            )
+        }
+        rows.sort(by: rowSort)
+        try checkCancellation()
+        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).durationEvent(
+            "resolver.metadataOnlyWorktreeModel",
+            startMS: startMS,
+            fields: [
+                "rowCount": String(rows.count),
+                "missingPaths": String(missingPaths.count),
+                "invalidPaths": String(invalidPaths.count),
+                "bindingCount": String(source.worktreeBindings.count)
+            ]
+        )
+        var completeFields = startFields
+        completeFields["rowCount"] = String(rows.count)
+        completeFields["missingPaths"] = String(missingPaths.count)
+        completeFields["invalidPaths"] = String(invalidPaths.count)
+        completeFields["hasProjection"] = "true"
+        completeFields["metadataOnly"] = "true"
+        AgentSelectedFilesDiagnostics(perfRecorder: perfRecorder).durationEvent(
+            "resolver.resolveModel.complete",
+            startMS: totalStartMS,
+            fields: completeFields
+        )
+        try checkCancellation()
+        phaseDidBeginForTesting?(.finalModelAssembly)
+        try checkCancellation()
+        return AgentContextExportModel(
+            source: source,
+            lookupContext: lookupContext,
+            rows: rows,
+            totalSelectedDisplayTokens: directMetricsSnapshot.totalSelectedDisplayTokens,
+            missingPaths: Array(Set(missingPaths)).sorted(),
+            invalidPaths: Array(Set(invalidPaths)).sorted(),
+            codemapPresentation: .empty
+        )
+    }
+
+    static func codemapPresentationPlan(
+        codeMapUsage: CodeMapUsage,
+        selection: StoredSelection,
+        store: WorkspaceFileContextStore,
+        rootScope: WorkspaceLookupRootScope,
+        profile: PathLocateProfile
+    ) async -> AgentCodemapPresentationPlan {
+        await WorkspaceCodemapPresentationIntentResolver.plan(
+            codeMapUsage: codeMapUsage,
+            selection: selection,
+            store: store,
+            rootScope: rootScope,
+            profile: profile
+        )
+    }
+
+    static func merging(
+        _ presentation: WorkspaceCodemapOperationPresentation,
+        preflightIssues: [WorkspaceCodemapOperationIssue]
+    ) -> WorkspaceCodemapOperationPresentation {
+        WorkspaceCodemapPresentationIntentResolver.merging(
+            presentation,
+            preflightIssues: preflightIssues
+        )
+    }
+
+    private static func makeModel(
+        source: AgentContextExportSource,
+        lookupContext: WorkspaceLookupContext,
+        resolution: RowResolution,
+        roots: [WorkspaceRootRef],
+        codemapFilesByID: [UUID: WorkspaceFileRecord],
+        store: WorkspaceFileContextStore,
+        filePathDisplay: FilePathDisplay,
+        codeMapUsage: CodeMapUsage,
+        codemapPresentation: WorkspaceCodemapOperationPresentation,
+        logicalRootDisplayNamesByRootID: [UUID: String],
+        entryMetricsSnapshot: PromptContextEntryMetricsSnapshot?,
+        phaseDidBeginForTesting: ResolutionPhaseDidBegin?
+    ) async throws(CancellationError) -> AgentContextExportModel {
+        var rowEntries = resolution.rows
+        if codeMapUsage == .selected {
+            rowEntries = rowEntries.map { rowEntry in
+                guard let rendered = codemapPresentation.renderedEntriesByFileID[rowEntry.entry.file.id],
+                      rendered.rootEpoch.rootID == rowEntry.entry.file.rootID
+                else { return rowEntry }
+                return RowResolutionEntry(
+                    entry: ResolvedPromptFileEntry(
+                        file: rowEntry.entry.file,
+                        isCodemap: true,
+                        mode: .codemap,
+                        loadedContent: nil,
+                        rootFolderPath: rowEntry.entry.rootFolderPath
+                    ),
+                    canRemove: rowEntry.canRemove,
+                    removesAutomaticSourceIntent: rowEntry.removesAutomaticSourceIntent
+                )
+            }
+        } else if codeMapUsage == .auto || codeMapUsage == .complete {
+            var seenAccountingIdentities = PromptContextAccountingIdentitySet()
+            for rowEntry in rowEntries {
+                _ = seenAccountingIdentities.insert(rowEntry.entry)
+            }
+            let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
+            for rendered in codemapPresentation.orderedEntries {
+                guard !resolution.selectedFileIDs.contains(rendered.fileID),
+                      let file = codemapFilesByID[rendered.fileID],
+                      file.rootID == rendered.rootEpoch.rootID
+                else { continue }
+                let rootPath = rootsByID[file.rootID]?.standardizedFullPath
+                append(
+                    ResolvedPromptFileEntry(
+                        file: file,
+                        isCodemap: true,
+                        mode: .codemap,
+                        loadedContent: nil,
+                        rootFolderPath: rootPath
+                    ),
+                    canRemove: codeMapUsage == .auto,
+                    removesAutomaticSourceIntent: codeMapUsage == .auto,
+                    to: &rowEntries,
+                    seenAccountingIdentities: &seenAccountingIdentities
+                )
+            }
+        }
+        try checkCancellation()
+        phaseDidBeginForTesting?(.metricsAssembly)
+        let metricsSnapshot: PromptContextEntryMetricsSnapshot = if let entryMetricsSnapshot {
+            entryMetricsSnapshot
+        } else {
+            await PromptContextAccountingService().calculateEntryMetricsSnapshot(
+                entries: rowEntries.map(\.entry),
+                store: store,
+                codemapPresentation: codemapPresentation,
+                filePathDisplay: filePathDisplay,
+                displayPathResolver: { entry in
+                    displayPath(
+                        for: entry,
+                        roots: roots,
+                        lookupContext: lookupContext,
+                        logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+                        filePathDisplay: filePathDisplay
+                    )
+                }
+            )
+        }
+        let selectedPhysicalRootIDs = Set(rowEntries.map(\.entry.file.rootID))
+        let rootMetadata = rootMetadataByPhysicalRootID(
+            roots: roots,
+            lookupContext: lookupContext,
+            logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+            selectedPhysicalRootIDs: selectedPhysicalRootIDs
+        )
+        let rows = rowEntries.map { rowEntry in
+            row(
+                from: rowEntry.entry,
+                roots: roots,
+                lookupContext: lookupContext,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+                filePathDisplay: filePathDisplay,
+                canRemove: rowEntry.canRemove,
+                removesAutomaticSourceIntent: rowEntry.removesAutomaticSourceIntent,
+                metricsSnapshot: metricsSnapshot,
+                rootMetadata: rootMetadata[rowEntry.entry.file.rootID]
+            )
+        }.sorted(by: rowSort)
+        try checkCancellation()
+        phaseDidBeginForTesting?(.finalModelAssembly)
+        return AgentContextExportModel(
+            source: source,
+            lookupContext: lookupContext,
+            rows: rows,
+            totalSelectedDisplayTokens: metricsSnapshot.totalSelectedDisplayTokens,
+            missingPaths: logicalizedIssuePaths(
+                resolution.missingPaths,
+                roots: roots,
+                lookupContext: lookupContext,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
+            ),
+            invalidPaths: logicalizedIssuePaths(
+                resolution.invalidPaths,
+                roots: roots,
+                lookupContext: lookupContext,
+                logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID
+            ),
+            codemapPresentation: codemapPresentation
+        )
+    }
+
+    private static func codemapFileRecordsByID(
+        for presentation: WorkspaceCodemapOperationPresentation,
+        resolution: RowResolution,
+        roots: [WorkspaceRootRef],
+        store: WorkspaceFileContextStore,
+        codeMapUsage: CodeMapUsage
+    ) async -> [UUID: WorkspaceFileRecord] {
+        guard codeMapUsage == .auto || codeMapUsage == .complete else { return [:] }
+
+        var wantedIDsByRootID: [UUID: Set<UUID>] = [:]
+        for rendered in presentation.orderedEntries where !resolution.selectedFileIDs.contains(rendered.fileID) {
+            wantedIDsByRootID[rendered.rootEpoch.rootID, default: []].insert(rendered.fileID)
+        }
+        guard !wantedIDsByRootID.isEmpty else { return [:] }
+
+        let allowedRootIDs = Set(roots.map(\.id))
+        let wantedFileCount = wantedIDsByRootID.values.reduce(0) { $0 + $1.count }
+        var filesByID: [UUID: WorkspaceFileRecord] = [:]
+        var skippedOutOfScopeCount = 0
+        for (rootID, wantedIDs) in wantedIDsByRootID {
+            guard allowedRootIDs.contains(rootID) else {
+                skippedOutOfScopeCount += wantedIDs.count
+                continue
+            }
+            for fileID in wantedIDs {
+                guard let file = await store.file(id: fileID), file.rootID == rootID else { continue }
+                filesByID[fileID] = file
+            }
+        }
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).event(
+            "resolver.codemapFileRecords",
+            fields: [
+                "wantedFiles": String(wantedFileCount),
+                "resolvedFiles": String(filesByID.count),
+                "skippedOutOfScope": String(skippedOutOfScopeCount)
+            ]
+        )
+        return filesByID
+    }
+
+    private static func rootMetadataByPhysicalRootID(
+        for projection: WorkspaceRootBindingProjection,
+        selectedPhysicalRootIDs: Set<UUID>
+    ) -> [UUID: RowRootMetadata] {
+        let boundRoots = projection.boundRootsForMetadata
+        let logicalRootPathsByPhysicalRootID = Dictionary(uniqueKeysWithValues: boundRoots.map { boundRoot in
+            (boundRoot.physicalRoot.id, boundRoot.logicalRoot.standardizedFullPath)
+        })
+        let selectedLogicalRootPaths = Set(selectedPhysicalRootIDs.compactMap { logicalRootPathsByPhysicalRootID[$0] })
+        let showRootPill = selectedLogicalRootPaths.count > 1
+        return Dictionary(uniqueKeysWithValues: boundRoots.map { boundRoot in
+            (
+                boundRoot.physicalRoot.id,
+                RowRootMetadata(
+                    displayName: boundRoot.logicalRoot.name,
+                    colorKey: boundRoot.logicalRoot.standardizedFullPath,
+                    showPill: showRootPill
+                )
+            )
+        })
+    }
+
+    private static func rootMetadataByPhysicalRootID(
+        roots: [WorkspaceRootRef],
+        lookupContext: WorkspaceLookupContext,
+        logicalRootDisplayNamesByRootID: [UUID: String],
+        selectedPhysicalRootIDs: Set<UUID>
+    ) -> [UUID: RowRootMetadata] {
+        let boundRootsByPhysicalRootID = Dictionary(
+            (lookupContext.bindingProjection?.boundRootsForMetadata ?? []).map { ($0.physicalRoot.id, $0) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        let logicalRootPathsByPhysicalRootID = Dictionary(uniqueKeysWithValues: roots.map { root in
+            (root.id, boundRootsByPhysicalRootID[root.id]?.logicalRoot.standardizedFullPath ?? root.standardizedFullPath)
+        })
+        let selectedLogicalRootPaths = Set(selectedPhysicalRootIDs.compactMap { logicalRootPathsByPhysicalRootID[$0] })
+        let showRootPill = selectedLogicalRootPaths.count > 1
+        return Dictionary(uniqueKeysWithValues: roots.map { root in
+            let boundRoot = boundRootsByPhysicalRootID[root.id]
+            return (
+                root.id,
+                RowRootMetadata(
+                    displayName: logicalRootDisplayNamesByRootID[root.id] ?? boundRoot?.logicalRoot.name ?? root.name,
+                    colorKey: logicalRootPathsByPhysicalRootID[root.id] ?? root.standardizedFullPath,
+                    showPill: showRootPill
+                )
+            )
+        })
+    }
+
+    private static func metrics(from metric: PromptContextEntryMetric?) -> AgentContextExportRow.Metrics {
+        guard let metric else { return .unknown }
+        return .known(
+            tokenCount: metric.displayTokenCount,
+            tokenPercentage: metric.displayPercentage,
+            lineCount: metric.includedLineCount
+        )
+    }
+
+    static func unavailablePresentation(
+        _ issue: WorkspaceCodemapOperationIssue
+    ) -> WorkspaceCodemapOperationPresentation {
+        WorkspaceCodemapOperationPresentation(
+            orderedEntries: [],
+            coverage: .unavailable([issue]),
+            issues: [issue],
+            publicationReceipt: nil
+        )
+    }
+
+    private static func assembleClipboardContent(
+        _ request: AgentContextClipboardRequest,
+        codemapPresentation: WorkspaceCodemapOperationPresentation
+    ) async -> String {
+        let cfg = request.cfg
+        let coordinator = AutomaticReviewGitDiffCoordinator()
+        let preAssembly = await PromptContextPreAssemblyService.resolve(
+            PromptContextPreAssemblyRequest(
+                cfg: cfg,
+                selection: request.source.selection,
+                store: request.store,
+                lookupContext: request.lookupContext,
+                filePathDisplay: request.filePathDisplay,
+                onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: request.showCodeMapMarkers,
+                selectedGitDiffFolderPolicy: .filesOnly,
+                selectedGitDiffLookupProfile: .mcpSelection,
+                selectedGitDiffArtifactPolicy: .respectGitInclusion,
+                reviewGitContext: request.reviewGitContext,
+                selectedGitDiffProvider: { automaticRequest in
+                    await coordinator.resolve(automaticRequest)
+                },
+                completeGitDiffProvider: {
+                    await request.completeGitDiffProvider()
+                }
+            ),
+            codemapPresentation: codemapPresentation
+        )
+        return await PromptPackagingService.generateClipboardContent(
+            metaInstructions: request.metaInstructions,
+            userInstructions: cfg.includeUserPrompt ? request.source.promptText : "",
+            files: preAssembly.entries,
+            fileTreeContent: preAssembly.fileTreeContent,
+            gitDiff: preAssembly.gitDiff,
+            includeSavedPrompts: !request.metaInstructions.isEmpty,
+            includeFiles: cfg.includeFiles,
+            includeUserPrompt: cfg.includeUserPrompt,
+            filePathDisplay: request.filePathDisplay,
+            codemapPresentation: preAssembly.codemapPresentation,
+            includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
+            promptSectionsOrder: request.promptSectionsOrder,
+            disabledPromptSections: request.disabledPromptSections,
+            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
+            displayPathResolver: { entry in
+                preAssembly.displayPath(for: entry)
+            }
+        )
+    }
+
+    private static func metadataOnlyBindingsAreSafe(_ bindings: [AgentSessionWorktreeBinding]) -> Bool {
+        do {
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(bindings)
+        } catch {
+            return false
+        }
+        return bindings.allSatisfy { binding in
+            guard let logicalPath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(binding.logicalRootPath),
+                  let worktreePath = AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(binding.worktreeRootPath)
+            else { return false }
+            return logicalPath != worktreePath
+        }
+    }
+
+    private static func lightweightProjection(
+        sessionID: UUID,
+        bindings: [AgentSessionWorktreeBinding]
+    ) -> WorkspaceRootBindingProjection? {
+        guard !bindings.isEmpty else { return nil }
+        let boundRoots = bindings.map { binding in
+            let logicalPath = StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath)
+            let physicalPath = StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
+            let logicalRoot = WorkspaceRootRef(
+                id: stableUUID(namespace: "agent-selected-files-logical-root", rawValue: logicalPath),
+                name: binding.logicalRootName ?? URL(fileURLWithPath: logicalPath).lastPathComponent,
+                fullPath: logicalPath
+            )
+            let physicalRoot = WorkspaceRootRef(
+                id: stableUUID(namespace: "agent-selected-files-physical-root", rawValue: physicalPath),
+                name: logicalRoot.name,
+                fullPath: physicalPath
+            )
+            return WorkspaceRootBindingProjection.BoundRoot(
+                logicalRoot: logicalRoot,
+                physicalRoot: physicalRoot,
+                binding: binding,
+                sessionRootAuthorization: nil
+            )
+        }
+        return WorkspaceRootBindingProjection(
+            sessionID: sessionID,
+            boundRoots: boundRoots,
+            visibleLogicalRoots: boundRoots.map(\.logicalRoot),
+            lookupPhysicalRootPaths: []
+        )
+    }
+
+    private static func metadataOnlyRow(
+        originalPath: String,
+        translatedPath: String,
+        lineRanges: [LineRange]?,
+        projection: WorkspaceRootBindingProjection,
+        filePathDisplay: FilePathDisplay,
+        missingPaths: inout [String],
+        invalidPaths: inout [String],
+        requiresStoreFallback: inout Bool
+    ) -> AgentContextExportRow? {
+        let trimmed = translatedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            invalidPaths.append(originalPath)
+            return nil
+        }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        let physicalPath = StandardizedPath.absolute(expanded)
+        guard let boundRoot = projection.boundRoot(containingPhysicalAbsolutePath: physicalPath) else {
+            return nil
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: physicalPath, isDirectory: &isDirectory) else {
+            missingPaths.append(physicalPath)
+            return nil
+        }
+        guard !isDirectory.boolValue else { return nil }
+        guard let resolvedContentLocation = safeDirectContentLocation(
+            physicalPath,
+            boundRoot: boundRoot
+        ) else {
+            requiresStoreFallback = true
+            return nil
+        }
+
+        let relativePath = StandardizedPath.relative(
+            String(physicalPath.dropFirst(boundRoot.physicalRoot.standardizedFullPath.count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        )
+        let displayPath = projection.projectedLogicalDisplayPath(
+            forPhysicalPath: physicalPath,
+            display: filePathDisplay
+        ) ?? originalPath
+        let displayName = URL(fileURLWithPath: displayPath).lastPathComponent
+        let mode: PromptFileEntryMode = lineRanges?.isEmpty == false ? .sliced : .fullFile
+        return AgentContextExportRow(
+            id: ResolvedPromptFileEntryID(
+                fileID: stableUUID(namespace: "agent-selected-files-row", rawValue: physicalPath),
+                mode: mode,
+                lineRanges: lineRanges
+            ),
+            kind: mode == .sliced ? .slices : .full,
+            rootID: boundRoot.physicalRoot.id,
+            relativePath: relativePath,
+            displayPath: displayPath,
+            displayName: displayName.isEmpty ? URL(fileURLWithPath: physicalPath).lastPathComponent : displayName,
+            physicalPath: physicalPath,
+            directoryDisplay: directoryDisplay(for: displayPath, fallbackRootName: boundRoot.logicalRoot.name),
+            lineRanges: lineRanges,
+            canRemove: true,
+            resolvedContentLocation: resolvedContentLocation
+        )
+    }
+
+    private static func safeDirectContentLocation(
+        _ physicalPath: String,
+        boundRoot: WorkspaceRootBindingProjection.BoundRoot
+    ) -> ResolvedFileContentLocation? {
+        let resolvedRootURL = URL(
+            fileURLWithPath: boundRoot.physicalRoot.standardizedFullPath,
+            isDirectory: true
+        ).resolvingSymlinksInPath().standardizedFileURL
+        let resolvedFileURL = URL(fileURLWithPath: physicalPath)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        let resolvedRootPath = StandardizedPath.absolute(resolvedRootURL.path)
+        let resolvedFilePath = StandardizedPath.absolute(resolvedFileURL.path)
+        guard StandardizedPath.isDescendant(resolvedFilePath, of: resolvedRootPath) else {
+            return nil
+        }
+        let relativePath = StandardizedPath.relative(
+            String(resolvedFilePath.dropFirst(resolvedRootPath.count + 1))
+        )
+        return ResolvedFileContentLocation(
+            resolvedRootURL: resolvedRootURL,
+            resolvedFileURL: resolvedFileURL,
+            relativePath: relativePath
+        )
+    }
+
+    private static func metadataOnlyPathRequiresStoreFallback(
+        _ translatedPath: String,
+        projection: WorkspaceRootBindingProjection
+    ) -> Bool {
+        let trimmed = translatedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return true }
+        let physicalPath = StandardizedPath.absolute(expanded)
+        guard projection.boundRoot(containingPhysicalAbsolutePath: physicalPath) != nil else { return true }
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: physicalPath, isDirectory: &isDirectory) && isDirectory.boolValue
+    }
+
+    private static func sliceRanges(
+        forOriginalPath originalPath: String,
+        translatedPath: String,
+        selection: StoredSelection
+    ) -> [LineRange]? {
+        let candidateKeys = [
+            originalPath,
+            normalizedSelectionKey(originalPath),
+            translatedPath,
+            normalizedSelectionKey(translatedPath)
+        ]
+        for key in candidateKeys {
+            if let ranges = selection.slices[key], !ranges.isEmpty {
+                return ranges
+            }
+        }
+        return nil
+    }
+
+    private static func stableUUID(namespace: String, rawValue: String) -> UUID {
+        var digest = Array(SHA256.hash(data: Data("\(namespace)|\(rawValue)".utf8)))
+        digest[6] = (digest[6] & 0x0F) | 0x50
+        digest[8] = (digest[8] & 0x3F) | 0x80
+        let bytes: uuid_t = (
+            digest[0], digest[1], digest[2], digest[3],
+            digest[4], digest[5], digest[6], digest[7],
+            digest[8], digest[9], digest[10], digest[11],
+            digest[12], digest[13], digest[14], digest[15]
+        )
+        return UUID(uuid: bytes)
+    }
+
+    private static func decodeText(_ data: Data) -> String {
+        if let utf8 = String(data: data, encoding: .utf8) {
+            return utf8
+        }
+        if let unicode = String(data: data, encoding: .unicode) {
+            return unicode
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func resolveRows(
+        selection: StoredSelection,
+        store: WorkspaceFileContextStore,
+        rootScope: WorkspaceLookupRootScope,
+        profile: PathLocateProfile
+    ) async -> RowResolution {
+        let totalStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).event(
+            "resolver.resolveRows.start",
+            fields: [
+                "selectedPaths": String(selection.selectedPaths.count),
+                "sliceFiles": String(selection.slices.count(where: { !$0.value.isEmpty })),
+                "manualCodemapPaths": String(selection.manualCodemapPaths.count),
+                "rootScope": String(describing: rootScope)
+            ]
+        )
+        var rows: [RowResolutionEntry] = []
+        var missingPaths: [String] = []
+        var invalidPaths: [String] = []
+        var seenAccountingIdentities = PromptContextAccountingIdentitySet()
+        var selectedFileIDs = Set<UUID>()
+
+        let selectedRequests = selection.selectedPaths.map {
+            WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+        }
+        let selectedLookupStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        let selectedLookupResults = await store.lookupSelectionPaths(selectedRequests)
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
+            "resolver.lookupSelectedPaths",
+            startMS: selectedLookupStartMS,
+            fields: [
+                "requestCount": String(selectedRequests.count),
+                "resultCount": String(selectedLookupResults.count)
+            ]
+        )
+
+        var selectedPathResultsByPath = selectedLookupResults
+        for path in selection.selectedPaths where selectedPathResultsByPath[path] == nil {
+            if let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) {
+                selectedPathResultsByPath[path] = result
+            }
+        }
+        let directlySelectedFileIDs = Set(selectedPathResultsByPath.values.compactMap { $0.file?.id })
+
+        let orderedSlicePaths = StoredSelectionPathNormalization.orderedSlicePaths(selection.slices)
+        let slicePaths = orderedSlicePaths.filter { path in
+            selection.slices[path]?.isEmpty == false && selectedPathResultsByPath[path] == nil
+        }
+        let sliceLookupRequests = slicePaths.map {
+            WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+        }
+        let sliceLookupStartMS = AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
+        let sliceLookupResults: [String: WorkspacePathLookupResult] = if sliceLookupRequests.isEmpty {
+            [:]
+        } else {
+            await store.lookupSelectionPaths(sliceLookupRequests)
+        }
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
+            "resolver.lookupSlicePaths",
+            startMS: sliceLookupStartMS,
+            fields: [
+                "requestCount": String(sliceLookupRequests.count),
+                "resultCount": String(sliceLookupResults.count)
+            ]
+        )
+        var slicePathResults: [String: WorkspacePathLookupResult] = [:]
+        var sliceRangesByFileID: [UUID: [LineRange]] = [:]
+        for path in orderedSlicePaths {
+            guard let ranges = selection.slices[path], !ranges.isEmpty else { continue }
+            let result: WorkspacePathLookupResult? = if let cached = selectedPathResultsByPath[path]
+                ?? sliceLookupResults[path]
+            {
+                cached
+            } else {
+                await store.lookupPath(path, profile: profile, rootScope: rootScope)
+            }
+            guard let result else { continue }
+            slicePathResults[path] = result
+            if let file = result.file {
+                StoredSelectionPathNormalization.mergeSliceRanges(
+                    ranges,
+                    for: file.id,
+                    into: &sliceRangesByFileID
+                )
+            }
+        }
+
+        for path in selection.selectedPaths {
+            let result = selectedPathResultsByPath[path]
+            guard let result else {
+                if await appendDirectoryRows(
+                    for: path,
+                    store: store,
+                    rootScope: rootScope,
+                    directlySelectedFileIDs: directlySelectedFileIDs,
+                    sliceRangesByFileID: sliceRangesByFileID,
+                    selectedFileIDs: &selectedFileIDs,
+                    rows: &rows,
+                    seenAccountingIdentities: &seenAccountingIdentities
+                ) {
+                    continue
+                }
+                missingPaths.append(path)
+                continue
+            }
+
+            if let file = result.file {
+                selectedFileIDs.insert(file.id)
+                let ranges = sliceRangesByFileID[file.id]
+                let entry = ResolvedPromptFileEntry(
+                    file: file,
+                    lineRanges: ranges,
+                    mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
+                    loadedContent: nil,
+                    rootFolderPath: result.location.rootPath
+                )
+                append(entry, canRemove: true, to: &rows, seenAccountingIdentities: &seenAccountingIdentities)
+            } else if let folder = result.folder {
+                let files = await store.files(inRoot: folder.rootID)
+                let prefix = folder.standardizedRelativePath
+                for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
+                    guard !directlySelectedFileIDs.contains(file.id) else { continue }
+                    selectedFileIDs.insert(file.id)
+                    let ranges = sliceRangesByFileID[file.id]
+                    let entry = ResolvedPromptFileEntry(
+                        file: file,
+                        lineRanges: ranges,
+                        mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
+                        loadedContent: nil,
+                        rootFolderPath: result.location.rootPath
+                    )
+                    append(
+                        entry,
+                        canRemove: ranges?.isEmpty == false,
+                        to: &rows,
+                        seenAccountingIdentities: &seenAccountingIdentities
+                    )
+                }
+            } else {
+                invalidPaths.append(path)
+            }
+        }
+
+        for path in orderedSlicePaths {
+            guard selection.slices[path]?.isEmpty == false else { continue }
+            guard let result = slicePathResults[path] else {
+                missingPaths.append(path)
+                continue
+            }
+            guard let file = result.file else {
+                invalidPaths.append(path)
+                continue
+            }
+            guard !selectedFileIDs.contains(file.id),
+                  let ranges = sliceRangesByFileID[file.id]
+            else { continue }
+            selectedFileIDs.insert(file.id)
+            let entry = ResolvedPromptFileEntry(
+                file: file,
+                lineRanges: ranges,
+                mode: .sliced,
+                loadedContent: nil,
+                rootFolderPath: result.location.rootPath
+            )
+            append(entry, canRemove: true, to: &rows, seenAccountingIdentities: &seenAccountingIdentities)
+        }
+
+        AgentSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).durationEvent(
+            "resolver.resolveRows.complete",
+            startMS: totalStartMS,
+            fields: [
+                "rowEntries": String(rows.count),
+                "selectedFileIDs": String(selectedFileIDs.count),
+                "missingPaths": String(Set(missingPaths).count),
+                "invalidPaths": String(Set(invalidPaths).count)
+            ]
+        )
+        return RowResolution(
+            rows: rows,
+            selectedFileIDs: selectedFileIDs,
+            missingPaths: Array(Set(missingPaths)).sorted(),
+            invalidPaths: Array(Set(invalidPaths)).sorted()
+        )
+    }
+
+    private static func row(
+        from entry: ResolvedPromptFileEntry,
+        roots: [WorkspaceRootRef],
+        lookupContext: WorkspaceLookupContext,
+        logicalRootDisplayNamesByRootID: [UUID: String],
+        filePathDisplay: FilePathDisplay,
+        canRemove: Bool,
+        removesAutomaticSourceIntent: Bool,
+        metricsSnapshot: PromptContextEntryMetricsSnapshot,
+        rootMetadata: RowRootMetadata?
+    ) -> AgentContextExportRow {
+        let displayPath = displayPath(
+            for: entry,
+            roots: roots,
+            lookupContext: lookupContext,
+            logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+            filePathDisplay: filePathDisplay
+        )
+        let kind: AgentContextExportRow.Kind = if entry.isCodemap {
+            .codemap
+        } else if entry.lineRanges?.isEmpty == false {
+            .slices
+        } else {
+            .full
+        }
+        let displayName = URL(fileURLWithPath: displayPath).lastPathComponent
+        let fallbackRootName = logicalRootDisplayNamesByRootID[entry.file.rootID]
+        let directory = directoryDisplay(for: displayPath, fallbackRootName: fallbackRootName)
+        return AgentContextExportRow(
+            id: entry.id,
+            kind: kind,
+            rootID: entry.file.rootID,
+            relativePath: entry.file.standardizedRelativePath,
+            displayPath: displayPath,
+            displayName: displayName.isEmpty ? entry.file.name : displayName,
+            physicalPath: entry.file.standardizedFullPath,
+            directoryDisplay: directory,
+            lineRanges: entry.lineRanges,
+            metrics: metrics(
+                from: metricsSnapshot.metric(forFileID: entry.file.id)
+                    ?? metricsSnapshot.metric(forStandardizedFullPath: entry.file.standardizedFullPath)
+            ),
+            rootDisplayName: rootMetadata?.displayName ?? fallbackRootName ?? "",
+            rootColorKey: rootMetadata?.colorKey ?? entry.rootFolderPath ?? entry.file.standardizedFullPath,
+            showRootPill: rootMetadata?.showPill ?? false,
+            canRemove: canRemove,
+            removesAutomaticSourceIntent: removesAutomaticSourceIntent
+        )
+    }
+
+    private static func displayPath(
+        for entry: ResolvedPromptFileEntry,
+        roots: [WorkspaceRootRef],
+        lookupContext: WorkspaceLookupContext,
+        logicalRootDisplayNamesByRootID: [UUID: String],
+        filePathDisplay: FilePathDisplay
+    ) -> String {
+        lookupContext.logicalDisplayPath(
+            for: entry.file,
+            roots: roots,
+            rootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
+            display: filePathDisplay
+        ) ?? entry.file.standardizedRelativePath
+    }
+
+    private static func directoryDisplay(for displayPath: String, fallbackRootName: String?) -> String? {
+        let directory = (displayPath as NSString).deletingLastPathComponent
+        if directory != ".", !directory.isEmpty {
+            return directory
+        }
+        guard let fallbackRootName, !fallbackRootName.isEmpty else { return nil }
+        return fallbackRootName
+    }
+
+    private static func logicalizedIssuePaths(
+        _ paths: [String],
+        roots: [WorkspaceRootRef],
+        lookupContext: WorkspaceLookupContext,
+        logicalRootDisplayNamesByRootID: [UUID: String]
+    ) -> [String] {
+        Array(Set(paths.map { path in
+            if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                forPhysicalPath: path,
+                display: .relative
+            ) {
+                return projected
+            }
+            let absolute = StandardizedPath.absolute(path)
+            if path.hasPrefix("/"), let root = roots.first(where: {
+                absolute == $0.standardizedFullPath || absolute.hasPrefix($0.standardizedFullPath + "/")
+            }), let label = logicalRootDisplayNamesByRootID[root.id] {
+                let relative = String(absolute.dropFirst(root.standardizedFullPath.count))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                return relative.isEmpty ? label : "\(label)/\(relative)"
+            }
+            return path.hasPrefix("/") ? "unmapped:\(URL(fileURLWithPath: path).lastPathComponent)" : path
+        })).sorted()
+    }
+
+    static func rowSort(_ lhs: AgentContextExportRow, _ rhs: AgentContextExportRow) -> Bool {
+        if lhs.metrics.tokenSortKey != rhs.metrics.tokenSortKey {
+            return lhs.metrics.tokenSortKey > rhs.metrics.tokenSortKey
+        }
+        if lhs.kind != rhs.kind { return lhs.kind.rawValue < rhs.kind.rawValue }
+        if lhs.displayName != rhs.displayName {
+            return lhs.displayName.utf8.lexicographicallyPrecedes(rhs.displayName.utf8)
+        }
+        if lhs.displayPath != rhs.displayPath {
+            return lhs.displayPath.utf8.lexicographicallyPrecedes(rhs.displayPath.utf8)
+        }
+        if lhs.rootID != rhs.rootID { return lhs.rootID.uuidString < rhs.rootID.uuidString }
+        return lhs.id.fileID.uuidString < rhs.id.fileID.uuidString
+    }
+
+    private static func appendDirectoryRows(
+        for path: String,
+        store: WorkspaceFileContextStore,
+        rootScope: WorkspaceLookupRootScope,
+        directlySelectedFileIDs: Set<UUID>,
+        sliceRangesByFileID: [UUID: [LineRange]],
+        selectedFileIDs: inout Set<UUID>,
+        rows: inout [RowResolutionEntry],
+        seenAccountingIdentities: inout PromptContextAccountingIdentitySet
+    ) async -> Bool {
+        let roots = await store.rootRefs(scope: rootScope)
+        var handled = false
+        for root in roots {
+            guard let relativePrefix = directoryRelativePrefix(path, in: root) else { continue }
+            let absoluteDirectory = ((root.standardizedFullPath as NSString).appendingPathComponent(relativePrefix) as NSString).standardizingPath
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: absoluteDirectory, isDirectory: &isDirectory), isDirectory.boolValue else { continue }
+            handled = true
+            let files = await store.files(inRoot: root.id)
+            for file in files where relativePrefix.isEmpty || file.standardizedRelativePath.hasPrefix(relativePrefix + "/") {
+                guard !directlySelectedFileIDs.contains(file.id) else { continue }
+                selectedFileIDs.insert(file.id)
+                let ranges = sliceRangesByFileID[file.id]
+                let entry = ResolvedPromptFileEntry(
+                    file: file,
+                    lineRanges: ranges,
+                    mode: (ranges?.isEmpty == false) ? .sliced : .fullFile,
+                    loadedContent: nil,
+                    rootFolderPath: root.standardizedFullPath
+                )
+                append(
+                    entry,
+                    canRemove: ranges?.isEmpty == false,
+                    to: &rows,
+                    seenAccountingIdentities: &seenAccountingIdentities
+                )
+            }
+        }
+        return handled
+    }
+
+    private static func directoryRelativePrefix(_ path: String, in root: WorkspaceRootRef) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            let standardized = StandardizedPath.absolute(expanded)
+            guard standardized == root.standardizedFullPath || StandardizedPath.isDescendant(standardized, of: root.standardizedFullPath) else { return nil }
+            if standardized == root.standardizedFullPath { return "" }
+            return StandardizedPath.relative(String(standardized.dropFirst(root.standardizedFullPath.count + 1)))
+        }
+        return StandardizedPath.relative(expanded)
+    }
+
+    private static func append(
+        _ entry: ResolvedPromptFileEntry,
+        canRemove: Bool,
+        removesAutomaticSourceIntent: Bool = false,
+        to rows: inout [RowResolutionEntry],
+        seenAccountingIdentities: inout PromptContextAccountingIdentitySet
+    ) {
+        guard seenAccountingIdentities.insert(entry) else { return }
+        rows.append(RowResolutionEntry(
+            entry: entry,
+            canRemove: canRemove,
+            removesAutomaticSourceIntent: removesAutomaticSourceIntent
+        ))
+    }
+
+    private static func physicalizedKey(_ path: String, lookupContext: WorkspaceLookupContext) -> String {
+        let translated = lookupContext.translateInputPath(path)
+        if translated.hasPrefix("/") {
+            return StandardizedPath.absolute(translated)
+        }
+        return StandardizedPath.relative(translated)
+    }
+
+    private static func normalizedSelectionKey(_ path: String) -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        return expanded.hasPrefix("/") ? StandardizedPath.absolute(expanded) : StandardizedPath.relative(expanded)
+    }
+
+    private static func utf8Precedes(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
+    }
+}

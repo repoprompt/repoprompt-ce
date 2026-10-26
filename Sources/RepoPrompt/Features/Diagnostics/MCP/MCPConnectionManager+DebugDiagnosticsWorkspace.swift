@@ -2,6 +2,8 @@
 
 import Foundation
 import MCP
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 #if DEBUG
     extension ServerNetworkManager {
@@ -38,10 +40,6 @@ import MCP
                     guard let selectedPathsOptional else {
                         return debugDiagnosticsError(op: op, code: "invalid_params", message: "`selected_paths` must be an array of strings when provided.")
                     }
-                    let autoCodemapPathsOptional = debugStringArray(arguments, "auto_codemap_paths", op: op)
-                    guard let autoCodemapPathsOptional else {
-                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "`auto_codemap_paths` must be an array of strings when provided.")
-                    }
                     let parsedSlices = Self.debugParseSelectionFixtureSlices(arguments["slices"])
                     if let message = parsedSlices.error {
                         return debugDiagnosticsError(op: op, code: "invalid_params", message: message)
@@ -49,7 +47,6 @@ import MCP
                     let slices = parsedSlices.slices ?? [:]
                     let selection = StoredSelection(
                         selectedPaths: (selectedPathsOptional ?? []).map(StandardizedPath.absolute),
-                        autoCodemapPaths: (autoCodemapPathsOptional ?? []).map(StandardizedPath.absolute),
                         slices: slices,
                         codemapAutoEnabled: debugBool(arguments, "codemap_auto_enabled") ?? true
                     )
@@ -159,7 +156,6 @@ import MCP
                 "snapshotFlushedPendingUI": true,
                 "requestedSelectionSignature": requestedFields["selectionSignature"] ?? "",
                 "requestedSelectedPaths": requestedFields["selectedPaths"] ?? "0",
-                "requestedAutoCodemapPaths": requestedFields["autoCodemapPaths"] ?? "0",
                 "requestedSliceFiles": requestedFields["sliceFiles"] ?? "0",
                 "requestedSliceRanges": requestedFields["sliceRanges"] ?? "0",
                 "requestedCodemapAutoEnabled": requestedFields["codemapAutoEnabled"] ?? "false",
@@ -175,7 +171,7 @@ import MCP
                         fields: WorkspaceSelectionDebugSignature.unprefixedFields(for: window.workspaceManager.composeTab(with: flushed.tabID ?? UUID())?.selection ?? flushed.selection)
                     )
                     let finalURL = try await window.workspaceManager.saveWorkspaceToFileAsync(activeWorkspace, source: .debugWorkspaceSelectionFixtureApply)
-                    await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: finalURL)
+                    await WorkspaceDiskWriterComposition.processWriter.flush(url: finalURL)
                     extra["workspaceSaveFlushed"] = true
                     if let diskSelection = Self.debugDiskActiveComposeTabSelection(window: window) {
                         WorkspaceRestorePerfLog.event(
@@ -270,7 +266,7 @@ import MCP
             guard let workspace = window.workspaceManager.activeWorkspace else { return nil }
             let url = window.workspaceManager.workspaceFileURL(for: workspace)
             guard FileManager.default.fileExists(atPath: url.path),
-                  let diskWorkspace = try? WorkspaceManagerViewModel.loadWorkspaceFromFile(at: url)
+                  let diskWorkspace = try? WorkspaceManagerViewModel.loadWorkspaceFromFile(at: url, scheduleNormalizationWriteback: false)
             else {
                 return nil
             }
@@ -537,8 +533,12 @@ import MCP
                 "visibleWorkspacePlusGitData"
             case .allLoaded:
                 "allLoaded"
+            case .allLoadedExcludingGitData:
+                "allLoadedExcludingGitData"
             case .sessionBoundWorkspace:
                 "sessionBoundWorkspace"
+            case .validatedSessionBoundWorkspace:
+                "validatedSessionBoundWorkspace"
             }
         }
 

@@ -1,0 +1,174 @@
+import Foundation
+@_exported import RepoPromptWorkspaceCore
+
+package enum StoredSelectionPathNormalization {
+    /// Canonicalizes stored selection path state.
+    /// Policy: canonical absolute keys win over legacy/raw variants for the same file.
+    package static func standardizedPath(_ rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return StandardizedPath.absolute(trimmed)
+    }
+
+    package static func standardizedPaths(_ paths: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+        result.reserveCapacity(paths.count)
+        for rawPath in paths {
+            guard let standardized = standardizedPath(rawPath), seen.insert(standardized).inserted else { continue }
+            result.append(standardized)
+        }
+        return result
+    }
+
+    package static func orderedSlicePaths(_ slices: [String: [LineRange]]) -> [String] {
+        slices.keys.sorted {
+            let lhs = standardizedPath($0) ?? $0
+            let rhs = standardizedPath($1) ?? $1
+            if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
+            return $0.utf8.lexicographicallyPrecedes($1.utf8)
+        }
+    }
+
+    package static func mergeSliceRanges(
+        _ ranges: [LineRange],
+        for fileID: UUID,
+        into rangesByFileID: inout [UUID: [LineRange]]
+    ) {
+        guard var mergedRanges = rangesByFileID[fileID] else {
+            rangesByFileID[fileID] = ranges
+            return
+        }
+        mergedRanges.append(contentsOf: ranges)
+        let normalizedRanges = SliceRangeMath.normalize(mergedRanges)
+        // Empty line ranges mean full-file content downstream. Preserve the prior
+        // nonempty value if malformed decoded ranges normalize away entirely.
+        guard !normalizedRanges.isEmpty else { return }
+        rangesByFileID[fileID] = normalizedRanges
+    }
+
+    package static func standardizedSlices(_ slices: [String: [LineRange]]) -> [String: [LineRange]] {
+        guard !slices.isEmpty else { return [:] }
+
+        var canonical: [String: [LineRange]] = [:]
+        var legacyFallbacks: [String: [LineRange]] = [:]
+
+        for (rawPath, ranges) in slices where !ranges.isEmpty {
+            guard let standardized = standardizedPath(rawPath) else { continue }
+            if rawPath == standardized {
+                canonical[standardized] = ranges
+                continue
+            }
+
+            if var existing = legacyFallbacks[standardized] {
+                existing.append(contentsOf: ranges)
+                legacyFallbacks[standardized] = SliceRangeMath.normalize(existing)
+            } else {
+                legacyFallbacks[standardized] = ranges
+            }
+        }
+
+        for (path, ranges) in legacyFallbacks where canonical[path] == nil {
+            canonical[path] = ranges
+        }
+        return canonical
+    }
+}
+
+package enum GitDiffPathNormalization {
+    @inline(__always)
+    package static func normalizedAbsolutePath(_ path: String) -> String {
+        StandardizedPath.absolute(path).precomposedStringWithCanonicalMapping
+    }
+
+    package static func normalizedAbsolutePaths(_ paths: [String]) -> [String] {
+        paths.map(normalizedAbsolutePath)
+    }
+
+    private struct NormalizedGitPathspec: Hashable {
+        let plain: String
+        let requiresLiteralMagic: Bool
+    }
+
+    package static func gitPathspecs(from paths: [String], repoRootPath: String) -> [String] {
+        var seen = Set<Data>()
+        return normalizedGitPathspecs(from: paths, repoRootPath: repoRootPath).compactMap { normalized in
+            seen.insert(Data(normalized.plain.utf8)).inserted ? normalized.plain : nil
+        }
+    }
+
+    /// Produces command pathspecs while preserving user-authored relative Git pathspec semantics.
+    /// Absolute inputs are app/worktree-derived paths and must be literalized before invoking Git.
+    package static func gitDiscoveryPathspecs(from paths: [String], repoRootPath: String) -> [String] {
+        var seen = Set<Data>()
+        return normalizedGitPathspecs(from: paths, repoRootPath: repoRootPath).compactMap { normalized in
+            let pathspec = normalized.requiresLiteralMagic
+                ? literalGitPathspec(normalized.plain)
+                : normalized.plain
+            return seen.insert(Data(pathspec.utf8)).inserted ? pathspec : nil
+        }
+    }
+
+    package static func literalGitPathspecs(_ paths: [String]) -> [String] {
+        paths.map(literalGitPathspec)
+    }
+
+    private static func literalGitPathspec(_ path: String) -> String {
+        ":(literal)\(path)"
+    }
+
+    private static func normalizedGitPathspecs(
+        from paths: [String],
+        repoRootPath: String
+    ) -> [NormalizedGitPathspec] {
+        guard let root = try? WorkspaceAbsolutePath.nativeText(removingCurrentDirectoryComponents(repoRootPath)) else { return [] }
+        var results: [NormalizedGitPathspec] = []
+        results.reserveCapacity(paths.count)
+
+        for rawPath in paths {
+            guard !rawPath.isEmpty, !StandardizedPath.containsNUL(rawPath) else { continue }
+            guard rawPath.hasPrefix("/") else {
+                results.append(NormalizedGitPathspec(plain: rawPath, requiresLiteralMagic: false))
+                continue
+            }
+            guard let path = try? WorkspaceAbsolutePath.nativeText(removingCurrentDirectoryComponents(rawPath)), path.isLexicallyWithin(root) else {
+                continue
+            }
+            if path.directoryKey == root.directoryKey {
+                results.append(NormalizedGitPathspec(plain: ".", requiresLiteralMagic: true))
+                continue
+            }
+            guard let relative = try? path.relative(to: root), let pathspec = try? relative.utf8ForWire() else { continue }
+            results.append(NormalizedGitPathspec(plain: pathspec, requiresLiteralMagic: true))
+        }
+        return results
+    }
+
+    /// Git projection may ignore standalone '.' components, including before the root prefix.
+    /// Do not collapse '..': crossing a symlink can give parent traversal a different meaning.
+    private static func removingCurrentDirectoryComponents(_ path: String) -> String {
+        let projected = path.split(separator: "/", omittingEmptySubsequences: false)
+            .filter { $0 != "." }.joined(separator: "/")
+        return path.hasSuffix("/.") ? projected + "/" : projected
+    }
+
+    package static func gitRelativePaths(from absolutePaths: [String], repoRootPath: String) -> [String] {
+        let standardizedRoot = normalizedAbsolutePath(repoRootPath)
+        var results: [String] = []
+        results.reserveCapacity(absolutePaths.count)
+        for abs in absolutePaths {
+            let standardizedAbs = normalizedAbsolutePath(abs)
+            guard StandardizedPath.isDescendant(standardizedAbs, of: standardizedRoot) else { continue }
+            guard standardizedAbs != standardizedRoot else { continue }
+            let suffix: Substring = if standardizedRoot == "/" {
+                standardizedAbs.dropFirst()
+            } else {
+                standardizedAbs.dropFirst(standardizedRoot.count)
+            }
+            let relative = StandardizedPath.relative(String(suffix))
+            guard !relative.isEmpty else { continue }
+            results.append(relative)
+        }
+        return results
+    }
+}

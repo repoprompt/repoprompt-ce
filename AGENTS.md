@@ -13,7 +13,13 @@ Before every commit or push, read and run the repository-local `$rpce-contributi
 .agents/skills/rpce-contribution-check/scripts/preflight.sh push
 ```
 
-Stage only the intended changes, then use `commit` mode before creating a commit; rerun it after any staging change, including partial-staging updates. Use `push` mode after committing but before pushing the intended current branch. The skill enforces redacted staged-index and outgoing-range secret scanning, repository guardrails, clean push boundaries, and the applicable coordinated validation lanes. Obtain explicit user approval immediately before any force-push, history rewrite, branch deletion, fork deletion, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app.
+Stage only the intended changes, then use `commit` mode before creating a commit; rerun it after any staging change, including partial-staging updates. Use `push` mode after committing but before pushing the intended current branch. These default modes are mandatory safety gates: they enforce redacted staged-index and outgoing-range secret scanning, repository guardrails, and clean push boundaries. Default `push` does not run heavyweight lint/test/build lanes; use the explicit `pr-ready` lane when you need the computed-outgoing-range path-selected local PR-ready pass:
+
+```bash
+.agents/skills/rpce-contribution-check/scripts/preflight.sh pr-ready
+```
+
+Focused validation and release validation remain explicit; use the validation matrix plus commands such as `make dev-release-preflight` / `make dev-release-artifact` when the changed boundary requires them. Obtain explicit user approval immediately before any force-push, history rewrite, branch deletion, fork deletion, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app.
 
 Local `docs/investigations/*.md` reports are intentionally left unignored so RepoPrompt tooling can read them. Do not stage or merge these local investigation artifacts unless intentionally requested.
 
@@ -26,7 +32,7 @@ make dev-run    # coordinated build, package, stop existing RepoPrompt, and laun
 
 `make dev-run` routes through the developer daemon (see "Developer daemon / coordinated validation") and remains the ordinary FIFO coordinated launch path. For a user-directed newest lifecycle action, use `./conductor app relaunch`; the Finder launcher uses that operation when `python3` is available. The uncoordinated equivalents are `make run` or `./Scripts/run.sh`.
 
-Debug packaging may auto-detect an Apple Development signing identity for a valid local app signature, but auto-detected debug signing still uses ephemeral in-memory secure storage to avoid macOS Keychain prompts. Set an explicit `SIGN_IDENTITY="Apple Development: ..."` to opt in to persistent debug Keychain storage; `DEBUG_SECURE_STORAGE_BACKEND=keychain` is also supported for explicit debug storage opt-in when the signed app has a TeamIdentifier. If no stable identity is available, set `ALLOW_ADHOC_SIGNING=1` to build an ad-hoc debug app; ad-hoc debug builds use ephemeral in-memory secure storage, so API keys and secure permission changes do not persist across launches. Release packaging requires `SIGN_IDENTITY` and continues to use real Keychain storage.
+Debug packaging may auto-detect an Apple Development signing identity for a valid local app signature and persistent, team-isolated Keychain storage. Set `DEBUG_SECURE_STORAGE_BACKEND=alternate-in-memory` to opt out of persistence for a signed debug build. If no stable identity is available, set `ALLOW_ADHOC_SIGNING=1` to build an ad-hoc debug app; ad-hoc debug builds use ephemeral in-memory secure storage, so API keys and secure permission changes do not persist across launches. Release packaging requires `SIGN_IDENTITY` and continues to use real Keychain storage.
 
 ## Debug
 
@@ -34,6 +40,7 @@ Package without launching:
 
 ```bash
 make dev-build                  # coordinated debug package (preferred)
+make dev-codex-schema-check     # coordinated bounded Codex app-server schema drift check
 # uncoordinated equivalents:
 make build
 ./Scripts/package_app.sh debug
@@ -56,6 +63,30 @@ SwiftPM’s architecture-specific build output is usually under:
 ```text
 .build/arm64-apple-macosx/debug/
 ```
+
+## Generated Xcode workspace
+
+The repository-owned workspace is a disposable developer convenience under
+`.build/xcode`; `Package.swift`, conductor, and `Scripts/package_app.sh` remain
+authoritative.
+
+```bash
+make xcode                  # generate and open
+make xcode-generate         # generate without opening
+make xcode-validate         # explicit full validation with xcodebuild -list
+make xcode-clean            # remove generated workspace metadata
+```
+
+`make xcode-validate` is the canonical generated-workspace check and runs through local `pr-ready` for Xcode workspace boundary changes or the dedicated `Xcode Workspace Validation` workflow.
+
+Xcode 26.3 exposes the native `RepoPrompt` and `repoprompt-mcp` product schemes.
+Use `RepoPrompt CE App` and `RepoPrompt CE MCP` for conductor-coordinated debug
+products. `RepoPrompt CE Tests` delegates to conductor, which owns the sandboxed
+test environment the root suites require. Do not
+edit or commit `.build/xcode`, use these schemes for release/archive work, or
+assume canceling Xcode cancels a queued conductor job; inspect
+`./conductor job list` after cancellation. See
+[`docs/architecture/xcode-workspace.md`](docs/architecture/xcode-workspace.md).
 
 ## Debug CLI / MCP
 
@@ -113,9 +144,11 @@ These settings are intentionally DEBUG-only. If a key is unavailable, confirm `r
 
 ## Developer daemon / coordinated validation
 
-Prefer the developer daemon as the default way to build, run, and validate. Two properties are the whole reason it exists — and the reason to reach for it instead of a bare `swift build` / `swift test`:
+Prefer the developer daemon as the default way to build, run, and validate. Four properties are the whole reason it exists — and the reason to reach for it instead of a bare `swift build` / `swift test`:
 
 - **Lane-serialized job queue** — every job claims named lanes (`build`, `debugArtifact`, `liveApp`, `release`, `style`); the daemon runs jobs that share a lane one at a time while letting unrelated lanes proceed concurrently. That serial queue is what stops multiple agents from building, launching, or running style tooling over each other and corrupting `.build` or the live app.
+- **Machine-wide heavy-job slots** — Swift/Xcode-heavy daemon jobs acquire per-user global heavy admission under `/tmp/repoprompt-ce-dev-locks-<uid>/`, independent of daemon socket overrides. The default capacity is 1; set `REPOPROMPT_DEV_HEAVY_SLOTS=N` explicitly to allow more concurrent heavy jobs. If `job status` or `job wait` shows `global-wait` or "waiting for global heavy slot", another checkout/worktree is already running heavy work; wait on the ticket instead of bypassing conductor with direct `swift`/`xcodebuild` commands or starting duplicate jobs. Holder metadata is display-only and identifies the operation/ticket/repo/worktree when available.
+- **Machine-wide live-app lock** — debug app stop/launch/relaunch/smoke-launch lifecycle work acquires a separate per-user `live-app.lock`, so worktree-local daemons cannot mutate the singleton debug app at the same time.
 - **Tickets + async jobs** — every job gets a ticket and can run detached (`--async`). Fire a build, keep working, and query or wait on it later (`job status` / `job wait`) instead of blocking on a long compile. Jobs survive reconnects and are reusable by `--request-key`.
 
 `conductor` is repo-internal developer tooling for this checkout; the daemon auto-starts on first use.
@@ -127,6 +160,7 @@ make dev-status
 make dev-build
 make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRODUCT=RepoPrompt|repoprompt-mcp|all, default all)
 make dev-run
+make dev-launch-existing                         # launch current DebugApps bundle without building
 make dev-test                                       # full coordinated test suite
 make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
 make dev-provider-test                              # RepoPromptAgentProviders package tests (FILTER= also supported)
@@ -138,6 +172,7 @@ make dev-format         # mutates first-party Swift files; run only when intende
 make dev-format-tools-status
 make dev-check-format-tools
 make dev-install-format-tools
+make dev-codex-schema-check                         # unlaned generated-schema contract check
 ```
 
 Lane detail: the mutating `format` daemon job also claims `build` (it rewrites files the compiler reads); non-mutating `format-check` and `lint` use only `style`; read-only `format-tools-status` is intentionally unlaned so it never queues behind a build.
@@ -157,7 +192,8 @@ Daemon output defaults are intentionally concise for agent use: synchronous `dev
 
 Behavior notes:
 
-- `make dev-run` (daemon `run`) still delegates to the debug launch flow and stops any existing `RepoPrompt`, same as `make run`; it remains FIFO and does not supersede older lifecycle work.
+- `make dev-run` (daemon `run`) builds/packages a unique staged app under heavy admission, releases that heavy slot, then takes the live-app lock for stop/staged-bundle activation/open/confirm against the shared `DebugApps/RepoPrompt.app` bundle. A build/package failure performs no lifecycle action and does not mutate the live bundle.
+- `./conductor app launch-existing` / `make dev-launch-existing` requires the shared debug app bundle to already exist, reports bundle provenance, never waits for heavy admission, and never falls back to building.
 - `./conductor app relaunch` is the overriding interactive relaunch used by the Finder launcher; like `app stop`, it can cancel older active or queued `liveApp` work. It builds/packages before replacing the visible app, so a failure before lifecycle work begins does not itself stop or reopen an already-running app.
 - Do not assume an in-flight `run`, `smoke`, or diagnostics job will complete if another operator issues `app stop` or interactive `app relaunch`.
 - `make dev-smoke` is the non-disruptive live-only check: it assumes the CE debug app is already running and the debug CLI is installed/resolvable.
@@ -166,7 +202,7 @@ Behavior notes:
 - Style checks (`make dev-format-check`, `make dev-lint`) are non-mutating and do not auto-install tools; `make dev-install-format-tools` is the explicit install path.
 - Do not run `make dev-format` unless formatting mutation is intended. If a format job is canceled after starting, inspect `git diff` and rerun format or restore files as needed.
 
-Direct / uncoordinated commands — use only when the daemon is unavailable (for example, no `python3`):
+Direct / uncoordinated commands — use only when the daemon is unavailable but required tooling, including `python3`, remains available:
 
 ```bash
 make build
@@ -174,17 +210,18 @@ make run
 make test
 ```
 
-These do not claim daemon lanes or lifecycle supersession, so when multiple agents are active they can build, launch, or run style tooling over each other; a direct launch may reopen the app after a coordinated stop. The Finder launcher also falls back to this direct behavior when `python3` is unavailable, with process-only status/stop controls. Prefer the `dev-*` aliases when the daemon is available. The manual `rpce-cli-debug` commands above remain valid for direct live MCP validation.
+These do not claim daemon lanes or lifecycle supersession, so when multiple agents are active they can build, launch, or run style tooling over each other; a direct launch may reopen the app after a coordinated stop. The Finder launcher requires `python3` and does not provide an uncoordinated no-Python fallback because safe lifecycle actions require exact debug-executable identity checks. Prefer the `dev-*` aliases when the daemon is available. The manual `rpce-cli-debug` commands above remain valid for direct live MCP validation.
 
 ## Source placement rules
 
-See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). In short:
+See `docs/architecture/source-layout.md` for the full ownership map and documented exceptions, and `docs/architecture/provider-plugins.md` for the Agent Mode provider plugin seam (Claude-compatible package, bridge/adapter layout, "add a new provider" recipe). Before changing Agent Mode cross-session oversight, read [`docs/architecture/agent-session-oversight-auto-wake.md`](docs/architecture/agent-session-oversight-auto-wake.md): it records the four disjoint owners, why a snooze suppresses admission but never delivery, and why the `.cancelledBeforeDispatch` tombstone is a transport fence whose dependency lives in a different file. In short:
 
+- The shipped `RepoPrompt` executable target lives under `Sources/RepoPromptExecutable` and must remain a one-file entry shell over the internal `RepoPromptApp` target; do not add implementation code there.
 - Product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
-- App lifecycle, launch/configuration, command, and composition-root wiring stays under `Sources/RepoPrompt/App`.
-- Cross-cutting service/platform substrate goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
+- App lifecycle, launch/configuration, command, and composition-root wiring stays under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
+- Cross-cutting service/platform substrate stays under `Sources/RepoPrompt/Infrastructure/<Area>` in the `RepoPromptApp` target.
 - App-wide notification names and root app views/view models belong under `Sources/RepoPrompt/App`.
-- Bridging-header-sensitive support stays under `Sources/RepoPrompt/Support` unless `Package.swift` is updated in the same change.
+- No first-party target uses an Objective-C bridging header. C declarations live in a C target (for example `Sources/RepoPromptC/include`) and Swift files `import` that module explicitly.
 - Reusable UI, diffing, regex, networking, process, security, and utility substrate should use the narrowest `Sources/RepoPrompt/Infrastructure/<Area>` owner.
 - App-integrated diagnostics belong under `Sources/RepoPrompt/Features/Diagnostics` and need a documented entry point/purpose.
 - App/CLI protocol code shared by both products belongs under `Sources/RepoPromptShared`.
@@ -245,6 +282,7 @@ make dev-test FILTER=WorkspaceFileContextStoreTests
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
 make dev-provider-test
+make dev-codex-schema-check
 make guardrails
 make doctor
 make dev-build
@@ -255,6 +293,10 @@ Run the smallest relevant daemon build/test command above to validate a change. 
 Direct `swift test --filter <name>` and `swift build --product <name>` still work and produce the same result, but they are uncoordinated — use them only when the daemon is unavailable (for example, no `python3`), and avoid them when other agents may be building.
 
 Use `make dev-run` (or `make run`) only when it is safe to stop any existing RepoPrompt instance and launch the local debug app.
+
+### XCTest optimization inventory and timing
+
+See [`docs/testing.md`](docs/testing.md) for the contributor workflow, test-quality guidance, exact focused-filter examples, and handoff checklist. Routine executable adds, renames, consolidations, and removals require the affected focused test plus broader target or full-suite validation when the changed boundary warrants it.
 
 ## Cleanup
 

@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  MentionSuggestionView.swift
 //  RepoPrompt
@@ -17,9 +19,10 @@ import SwiftUI
 final class MentionSuggestionListModel: ObservableObject {
     @Published var suggestions: [MentionSuggestion] = []
     @Published var highlightedIndex: Int = 0
+    @Published var visibleRowLimit: Int = 5
 
-    /// Called when the user clicks a row. The overlay controller wires this up
-    /// to update the highlight and optionally commit the selection.
+    /// Called when the user clicks a row. The overlay controller uses it to
+    /// make that row the current keyboard selection.
     var onRowClicked: ((Int) -> Void)?
 }
 
@@ -32,6 +35,10 @@ struct MentionSuggestionRowView: View {
 
     private var rowHeight: CGFloat {
         FontScalePreset.current.rowHeight + 4
+    }
+
+    static func accessibilityTraits(isHighlighted: Bool) -> AccessibilityTraits {
+        isHighlighted ? .isSelected : []
     }
 
     var body: some View {
@@ -74,6 +81,7 @@ struct MentionSuggestionRowView: View {
                 .fill(isHighlighted ? Color.accentColor.opacity(0.25) : Color.clear)
         )
         .contentShape(Rectangle())
+        .accessibilityAddTraits(Self.accessibilityTraits(isHighlighted: isHighlighted))
         .onTapGesture {
             onTap?()
         }
@@ -131,7 +139,7 @@ struct MentionSuggestionListView: View {
 
     private var suggestionList: some View {
         ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: model.suggestions.count > 5) {
+            ScrollView(.vertical, showsIndicators: model.suggestions.count > model.visibleRowLimit) {
                 VStack(spacing: 2) {
                     ForEach(
                         Array(model.suggestions.enumerated()),
@@ -145,9 +153,9 @@ struct MentionSuggestionListView: View {
                         .id(index)
                     }
                 }
-                .padding(.vertical, 4)
                 .padding(.horizontal, 4)
             }
+            .contentMargins(.vertical, 4, for: .scrollContent)
             .onChange(of: model.highlightedIndex) { _, newValue in
                 proxy.scrollTo(newValue)
             }

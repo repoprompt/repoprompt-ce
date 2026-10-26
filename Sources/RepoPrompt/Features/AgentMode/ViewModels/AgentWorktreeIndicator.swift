@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import SwiftUI
 
 /// View-model summary describing the bound-worktree visual identity for one
@@ -21,6 +23,8 @@ struct AgentWorktreeIndicator: Equatable, Identifiable {
     let branch: String?
     /// Resolved, non-empty display label for the worktree.
     let label: String
+    /// Raw persisted label before display-time humanization.
+    let rawLabel: String
     /// Validated `#RRGGBB` color hex for the worktree's visual identity.
     let colorHex: String
     /// SF Symbol name for the worktree capsule glyph.
@@ -53,7 +57,8 @@ extension AgentWorktreeIndicator {
             worktreeRootPath: summary.worktreeRootPath,
             worktreeName: summary.worktreeName,
             branch: summary.branch,
-            label: resolvedLabel(for: summary, resolvedIdentity: resolvedIdentity),
+            label: resolvedDisplayLabel(for: summary, resolvedIdentity: resolvedIdentity),
+            rawLabel: resolvedRawLabel(for: summary, resolvedIdentity: resolvedIdentity),
             colorHex: resolvedColorHex(for: summary, resolvedIdentity: resolvedIdentity),
             iconName: resolvedIdentity.iconName,
             markerStyle: resolvedIdentity.markerStyle,
@@ -89,7 +94,15 @@ extension AgentWorktreeIndicator {
         }
     }
 
-    private static func resolvedLabel(
+    private static func resolvedDisplayLabel(
+        for summary: AgentSessionWorktreeBindingSummary,
+        resolvedIdentity: WorktreeVisualIdentity
+    ) -> String {
+        let rawLabel = resolvedRawLabel(for: summary, resolvedIdentity: resolvedIdentity)
+        return GitWorktreeDisplayLabelHumanizer.displayLabel(for: rawLabel) ?? rawLabel
+    }
+
+    private static func resolvedRawLabel(
         for summary: AgentSessionWorktreeBindingSummary,
         resolvedIdentity: WorktreeVisualIdentity
     ) -> String {
@@ -139,9 +152,25 @@ extension AgentWorktreeIndicator {
         "WT \(label)"
     }
 
+    /// Available worktrees may collapse to a compact `WT` fallback at narrow widths.
+    /// Unavailable worktrees keep their identifying label visible for recovery.
+    var allowsCompactCapsule: Bool {
+        isAvailable
+    }
+
+    /// Missing physical worktree path exposed for recovery actions.
+    var missingWorktreePath: String? {
+        guard !isAvailable else { return nil }
+        let trimmed = worktreeRootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// Tooltip / help text describing the bound worktree.
     var tooltipText: String {
-        var parts = ["Worktree: \(label)"]
+        var parts = ["Agent execution worktree: \(label)"]
+        if rawLabel != label {
+            parts.append("raw \(rawLabel)")
+        }
         if let branch, !branch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             parts.append("branch \(branch)")
         }
@@ -155,9 +184,10 @@ extension AgentWorktreeIndicator {
 
     /// VoiceOver-friendly description.
     var accessibilityText: String {
-        isAvailable
-            ? "Bound to worktree \(label) for root \(displayRootName)"
-            : "Bound to worktree \(label) for root \(displayRootName), worktree unavailable"
+        let rawSuffix = rawLabel == label ? "" : ", raw name \(rawLabel)"
+        return isAvailable
+            ? "Bound to worktree \(label) for root \(displayRootName)\(rawSuffix)"
+            : "Bound to worktree \(label) for root \(displayRootName)\(rawSuffix), worktree unavailable"
     }
 }
 

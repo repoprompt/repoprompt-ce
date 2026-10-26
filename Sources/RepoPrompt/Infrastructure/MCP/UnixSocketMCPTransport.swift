@@ -9,6 +9,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 #if DEBUG
@@ -21,13 +22,443 @@ import RepoPromptShared
     private func unixSocketMCPTransportDebugLog(_ message: @autoclosure () -> String) {}
 #endif
 
+#if DEBUG
+    private final class UnixSocketMCPTransportCallbackGate: @unchecked Sendable {
+        enum Kind: Hashable {
+            case terminal
+            case cancellation
+        }
+
+        private let lock = NSLock()
+        private var heldKinds: Set<Kind> = []
+        private var pendingCallbacks: [Kind: [@Sendable () -> Void]] = [:]
+
+        func hold(_ kind: Kind) {
+            lock.lock()
+            heldKinds.insert(kind)
+            lock.unlock()
+        }
+
+        func submit(_ kind: Kind, callback: @escaping @Sendable () -> Void) {
+            lock.lock()
+            guard heldKinds.contains(kind) else {
+                lock.unlock()
+                callback()
+                return
+            }
+            pendingCallbacks[kind, default: []].append(callback)
+            lock.unlock()
+        }
+
+        func release(_ kind: Kind) {
+            lock.lock()
+            heldKinds.remove(kind)
+            let callbacks = pendingCallbacks.removeValue(forKey: kind) ?? []
+            lock.unlock()
+            callbacks.forEach { $0() }
+        }
+
+        func pendingCount(_ kind: Kind) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return pendingCallbacks[kind]?.count ?? 0
+        }
+    }
+
+    private final class UnixSocketMCPTransportWriteHooks: @unchecked Sendable {
+        private let lock = NSLock()
+        private var ordinaryWriteWouldBlock: (@Sendable () -> Void)?
+        private var executionWatchdogDidSeal: (@Sendable () -> Void)?
+
+        func setOrdinaryWriteWouldBlock(_ hook: (@Sendable () -> Void)?) {
+            lock.withLock { ordinaryWriteWouldBlock = hook }
+        }
+
+        func setExecutionWatchdogDidSeal(_ hook: (@Sendable () -> Void)?) {
+            lock.withLock { executionWatchdogDidSeal = hook }
+        }
+
+        func notifyOrdinaryWriteWouldBlock() {
+            let hook = lock.withLock { ordinaryWriteWouldBlock }
+            hook?()
+        }
+
+        func notifyExecutionWatchdogDidSeal() {
+            let hook = lock.withLock { executionWatchdogDidSeal }
+            hook?()
+        }
+    }
+
+    struct UnixSocketMCPTransportCleanupSnapshot {
+        let hasActiveReader: Bool
+        let pendingReaderCancellationCount: Int
+        let earlyReaderCancellationCount: Int
+        let readerIsRetained: Bool
+        let terminalCallbackCount: Int
+        let pendingTerminalCallbackCount: Int
+        let cancellationCallbackCount: Int
+        let finalizationCount: Int
+        let descriptorCloseCount: Int
+        let staleCancellationCount: Int
+        let staleTerminalCount: Int
+        let socketIsOwned: Bool
+    }
+#endif
+
+private final class MCPTransportIngressGate: @unchecked Sendable {
+    enum OfferResult {
+        case accepted
+        case overflow(MCPReceiveBufferOverflowError)
+        case terminal
+    }
+
+    private let lock = NSLock()
+    private let capacity: Int
+    private var acceptedFrameCount = 0
+    private var droppedFrameCount = 0
+    private var highWaterMark = 0
+    private var isTerminal = false
+    private var terminalCause: MCPTransportTerminalCause?
+
+    init(capacity: Int) {
+        self.capacity = max(1, capacity)
+    }
+
+    func offer(
+        _ frame: Data,
+        to continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+    ) -> OfferResult {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !isTerminal else {
+            return .terminal
+        }
+
+        switch continuation.yield(frame) {
+        case let .enqueued(remainingCapacity):
+            acceptedFrameCount += 1
+            highWaterMark = max(highWaterMark, capacity - remainingCapacity)
+            return .accepted
+        case .dropped:
+            droppedFrameCount += 1
+            highWaterMark = capacity
+            isTerminal = true
+            terminalCause = .receiveBufferOverflow
+            return .overflow(MCPReceiveBufferOverflowError(
+                capacity: capacity,
+                highWaterMark: highWaterMark
+            ))
+        case .terminated:
+            isTerminal = true
+            return .terminal
+        @unknown default:
+            isTerminal = true
+            return .terminal
+        }
+    }
+
+    func closeAndSnapshot() -> MCPTransportIngressSnapshot {
+        lock.lock()
+        isTerminal = true
+        let snapshot = makeSnapshot()
+        lock.unlock()
+        return snapshot
+    }
+
+    func snapshot() -> MCPTransportIngressSnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return makeSnapshot()
+    }
+
+    private func makeSnapshot() -> MCPTransportIngressSnapshot {
+        MCPTransportIngressSnapshot(
+            receiveBufferCapacity: capacity,
+            acceptedFrameCount: acceptedFrameCount,
+            droppedFrameCount: droppedFrameCount,
+            receiveBufferHighWaterMark: highWaterMark,
+            isTerminal: isTerminal,
+            terminalCause: terminalCause
+        )
+    }
+}
+
+typealias MCPTransportResponseDeliveryGate = MCPDomainResponseDeliveryTracker
+
+/// Rejects explicit `null` request IDs before they reach the MCP SDK, which
+/// decodes them as empty strings. A genuine empty-string ID remains valid.
+private enum MCPExplicitNullRequestIDIngressValidation {
+    struct Result {
+        let forwardedFrame: Data?
+        let rejectedRequestCount: Int
+    }
+
+    static func validate(_ frame: Data) -> Result {
+        guard let root = try? JSONSerialization.jsonObject(with: frame, options: [.fragmentsAllowed]) else {
+            return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+        }
+
+        func hasExplicitNullRequestID(_ value: Any) -> Bool {
+            guard let message = value as? [String: Any],
+                  message["method"] is String,
+                  message.keys.contains("id")
+            else {
+                return false
+            }
+            return JSONRPCBridgeID.parseJSONValue(message["id"]) == .null
+        }
+
+        if let batch = root as? [Any] {
+            let rejectedRequestCount = batch.count(where: hasExplicitNullRequestID)
+            guard rejectedRequestCount > 0 else {
+                return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+            }
+            let forwardedMessages = batch.filter { !hasExplicitNullRequestID($0) }
+            guard !forwardedMessages.isEmpty else {
+                return .init(forwardedFrame: nil, rejectedRequestCount: rejectedRequestCount)
+            }
+            guard let forwardedFrame = try? JSONSerialization.data(
+                withJSONObject: forwardedMessages,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            ) else {
+                return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+            }
+            return .init(
+                forwardedFrame: forwardedFrame,
+                rejectedRequestCount: rejectedRequestCount
+            )
+        }
+
+        guard hasExplicitNullRequestID(root) else {
+            return .init(forwardedFrame: frame, rejectedRequestCount: 0)
+        }
+        return .init(forwardedFrame: nil, rejectedRequestCount: 1)
+    }
+}
+
+final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
+    struct Token: Hashable {
+        fileprivate let connectionID: String
+        fileprivate let connectionGeneration: UInt64
+        fileprivate let requestID: JSONRPCBridgeID
+    }
+
+    struct DispatchIdentity: Equatable {
+        let connectionID: String
+        let connectionGeneration: UInt64
+        let requestID: JSONRPCBridgeID
+    }
+
+    struct Deadline: @unchecked Sendable {
+        let instant: Duration
+        let now: @Sendable () -> Duration
+
+        var hasExpired: Bool {
+            now() >= instant
+        }
+
+        var remainingSeconds: TimeInterval {
+            let remaining = instant - now()
+            guard remaining > .zero else { return 0 }
+            let components = remaining.components
+            return TimeInterval(components.seconds)
+                + TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000
+        }
+    }
+
+    static let shared = MCPExportResponseDeliveryDeadlineRegistry()
+
+    static let requestIdentityArgumentKey = "_repoprompt_transport_request_identity"
+
+    private let lock = NSLock()
+    private var pendingRequests: Set<Token> = []
+    private var deadlines: [Token: Deadline] = [:]
+
+    private init() {}
+
+    /// Carries the transport-observed JSON-RPC identity through SDK dispatch without
+    /// relying on handler admission order, which may differ from socket frame order.
+    @discardableResult
+    func recordAcceptedClientFrame(
+        _ frame: Data,
+        connectionID: String,
+        connectionGeneration: UInt64
+    ) -> Data {
+        let hadNewline = frame.last == UInt8(ascii: "\n")
+        guard let json = try? JSONSerialization.jsonObject(with: frame) else { return frame }
+        var recordedTokens: [Token] = []
+
+        func annotate(_ value: Any) -> Any {
+            if var object = value as? [String: Any] {
+                guard object["method"] as? String == "tools/call",
+                      let requestID = JSONRPCBridgeID.parseJSONValue(object["id"]),
+                      requestID != .null,
+                      var params = object["params"] as? [String: Any],
+                      let requestedToolName = params["name"] as? String
+                else { return object }
+                let canonicalToolName = ServerNetworkManager.canonicalToolName(for: requestedToolName)
+                guard canonicalToolName == "prompt" || canonicalToolName == "workspace_context" else {
+                    return object
+                }
+                var arguments: [String: Any] = [:]
+                if let presentArguments = params["arguments"] {
+                    // Only absent arguments may be synthesized. Substituting an empty object for a
+                    // present-but-malformed value would hand the SDK a well-formed call and silently
+                    // run the default read, so leave such a request untouched for validation to reject.
+                    guard let objectArguments = presentArguments as? [String: Any] else { return object }
+                    arguments = objectArguments
+                }
+                arguments[Self.requestIdentityArgumentKey] = [
+                    "connection_id": connectionID,
+                    "connection_generation": String(connectionGeneration),
+                    "request_id": requestID.description
+                ]
+                params["arguments"] = arguments
+                object["params"] = params
+                recordedTokens.append(Token(
+                    connectionID: connectionID,
+                    connectionGeneration: connectionGeneration,
+                    requestID: requestID
+                ))
+                return object
+            }
+            if let batch = value as? [Any] {
+                return batch.map(annotate)
+            }
+            return value
+        }
+
+        let annotated = annotate(json)
+        guard !recordedTokens.isEmpty,
+              var encoded = try? JSONSerialization.data(withJSONObject: annotated, options: [.sortedKeys])
+        else { return frame }
+        if hadNewline { encoded.append(UInt8(ascii: "\n")) }
+        lock.withLock { pendingRequests.formUnion(recordedTokens) }
+        return encoded
+    }
+
+    static func dispatchIdentity(from value: Value?) -> DispatchIdentity? {
+        guard let object = value?.objectValue,
+              let connectionID = object["connection_id"]?.stringValue,
+              let generationString = object["connection_generation"]?.stringValue,
+              let connectionGeneration = UInt64(generationString),
+              let requestIDString = object["request_id"]?.stringValue,
+              let requestID = JSONRPCBridgeID.parseFaultSelector(requestIDString),
+              requestID != .null
+        else { return nil }
+        return DispatchIdentity(
+            connectionID: connectionID,
+            connectionGeneration: connectionGeneration,
+            requestID: requestID
+        )
+    }
+
+    func claimToolRequest(
+        connectionID: String,
+        connectionGeneration: UInt64,
+        requestID: JSONRPCBridgeID
+    ) -> Token? {
+        let token = Token(
+            connectionID: connectionID,
+            connectionGeneration: connectionGeneration,
+            requestID: requestID
+        )
+        return lock.withLock {
+            guard pendingRequests.remove(token) != nil else { return nil }
+            return token
+        }
+    }
+
+    #if DEBUG
+        func deadlineForTesting(
+            connectionID: String,
+            connectionGeneration: UInt64,
+            requestID: JSONRPCBridgeID
+        ) -> Deadline? {
+            lock.withLock {
+                deadlines[Token(
+                    connectionID: connectionID,
+                    connectionGeneration: connectionGeneration,
+                    requestID: requestID
+                )]
+            }
+        }
+    #endif
+
+    func install(_ deadline: Deadline, for token: Token) {
+        lock.withLock { deadlines[token] = deadline }
+    }
+
+    func deadline(
+        forServerFrame frame: Data,
+        connectionID: String,
+        connectionGeneration: UInt64
+    ) -> Deadline? {
+        let responseIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
+            frame,
+            direction: .serverToClient
+        ).compactMap(\.id)
+        return lock.withLock {
+            responseIDs.compactMap { requestID in
+                deadlines[Token(
+                    connectionID: connectionID,
+                    connectionGeneration: connectionGeneration,
+                    requestID: requestID
+                )]
+            }.min { $0.instant < $1.instant }
+        }
+    }
+
+    func completeServerFrame(
+        _ frame: Data,
+        connectionID: String,
+        connectionGeneration: UInt64
+    ) {
+        let responseIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
+            frame,
+            direction: .serverToClient
+        ).compactMap(\.id)
+        lock.withLock {
+            for requestID in responseIDs {
+                deadlines.removeValue(forKey: Token(
+                    connectionID: connectionID,
+                    connectionGeneration: connectionGeneration,
+                    requestID: requestID
+                ))
+            }
+        }
+    }
+
+    func removeConnection(connectionID: String, connectionGeneration: UInt64) {
+        lock.withLock {
+            pendingRequests = pendingRequests.filter {
+                $0.connectionID != connectionID
+                    || $0.connectionGeneration != connectionGeneration
+            }
+            deadlines = deadlines.filter {
+                $0.key.connectionID != connectionID
+                    || $0.key.connectionGeneration != connectionGeneration
+            }
+        }
+    }
+}
+
 /// A Transport implementation using UNIX domain sockets for local MCP communication.
 ///
 /// This transport connects to a UNIX socket created by the CLI within a connection folder.
 /// It provides efficient, low-latency communication using event-driven I/O via
 /// DispatchSourceRead, avoiding the CPU overhead of polling.
 public actor UnixSocketMCPTransport: Transport {
+    private enum WriteOutcome: Equatable {
+        case delivered
+        case preemptedByExecutionWatchdog
+    }
+
     private let socketURL: URL?
+    private let timelineConnectionID: String?
+    private let timelineCorrelationConnectionID: String?
+    private let timelineConnectionGeneration: UInt64
     public let logger: Logger
 
     private var socketFD: Int32 = -1
@@ -38,46 +469,90 @@ public actor UnixSocketMCPTransport: Transport {
     /// If true, this transport was created with an existing FD (no connect needed)
     private let ownsExistingFD: Bool
 
-    // Message stream for received data
-    private nonisolated let messageStream: AsyncThrowingStream<Data, Swift.Error>
-    private var messageContinuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+    private struct InboundChannel {
+        let stream: AsyncThrowingStream<Data, Swift.Error>
+        let continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation
+        let gate: MCPTransportIngressGate
 
-    // Close notification stream for cleanup signaling
-    private nonisolated let closeStream: AsyncStream<Void>
-    private var closeContinuation: AsyncStream<Void>.Continuation
+        init(capacity: Int) {
+            var continuation: AsyncThrowingStream<Data, Swift.Error>.Continuation!
+            stream = AsyncThrowingStream(
+                Data.self,
+                bufferingPolicy: .bufferingOldest(capacity)
+            ) { continuation = $0 }
+            self.continuation = continuation
+            gate = MCPTransportIngressGate(capacity: capacity)
+        }
+    }
+
+    private struct CloseChannel {
+        let stream: AsyncStream<MCPTransportCloseSnapshot>
+        let continuation: AsyncStream<MCPTransportCloseSnapshot>.Continuation
+
+        init() {
+            var continuation: AsyncStream<MCPTransportCloseSnapshot>.Continuation!
+            stream = AsyncStream(MCPTransportCloseSnapshot.self) { continuation = $0 }
+            self.continuation = continuation
+        }
+    }
+
+    /// Connection-local inbound and close channels. URL-backed transports replace
+    /// these after teardown so a successor connection cannot inherit terminal state.
+    private let receiveBufferCapacity: Int
+    private var inboundChannel: InboundChannel
+    private var closeChannel: CloseChannel
     private var closeSignaled = false
+    private var firstCloseSnapshot: MCPTransportCloseSnapshot?
 
-    // Event-driven read source (replaces poll loop)
-    private var reader: NewlineDelimitedSocketReader?
+    /// Event-driven read source (replaces poll loop)
     private let readQueue = DispatchQueue(label: "com.repoprompt.mcp.unix.read", qos: .userInitiated)
 
-    /// Track fd that the read source is bound to (helps avoid closing wrong fd on reuse)
-    private var readSourceFD: Int32?
-    private var readSourceToken: UInt64?
-    private var readSourceSocketOwnershipGeneration: UInt64?
     private var nextReadSourceToken: UInt64 = 0
+
+    private struct ReaderIdentity: Hashable {
+        let fd: Int32
+        let token: UInt64
+        let socketOwnershipGeneration: UInt64
+    }
+
+    private struct ActiveReaderOwnership {
+        let identity: ReaderIdentity
+        let reader: NewlineDelimitedSocketReader
+    }
 
     /// Retains cancelled readers until their delayed cancel handlers perform final close.
     /// The transport retainer intentionally forms a temporary cycle so cleanup does not
     /// depend on an external manager keeping this actor alive after disconnect returns.
     private struct PendingReaderCancellation {
-        let fd: Int32
-        let socketOwnershipGeneration: UInt64
+        let identity: ReaderIdentity
         let reader: NewlineDelimitedSocketReader
         let transportRetainer: UnixSocketMCPTransport
     }
 
+    private var activeReaderOwnership: ActiveReaderOwnership?
     private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]
+    private var earlyReaderCancellations: Set<ReaderIdentity> = []
 
     /// Changes whenever socketFD is replaced or synchronously closed.
     private var socketOwnershipGeneration: UInt64 = 0
 
-    /// Optional error captured when read loop terminates (for diagnostics/logging)
-    private var readError: Swift.Error?
-
     #if DEBUG
+        private nonisolated let callbackGate = UnixSocketMCPTransportCallbackGate()
+        private weak var debugLastReader: NewlineDelimitedSocketReader?
+        private var debugTerminalCallbackCount = 0
+        private var debugCancellationCallbackCount = 0
+        private var debugReaderFinalizationCount = 0
+        private var debugDescriptorCloseCount = 0
+        private var debugStaleCancellationCount = 0
+        private var debugStaleTerminalCount = 0
         /// Forces the adopted-FD startup path to fail after preparation but before reader ownership.
         private var failNextExistingFDConnectBeforeReaderStart = false
+        /// Leaves a selected overflow pending so tests can race it with another teardown path.
+        private var deferNextReceiveOverflowTeardown = false
+        private var debugBeforeInboundFrameOfferForTesting: (@Sendable () -> Void)?
+        private var debugBeforeOrdinaryWriteForTesting: (@Sendable () -> Void)?
+        private var debugAfterWriteProgressForTesting: (@Sendable (_ bytesWritten: Int) -> Void)?
+        private nonisolated let debugWriteHooks = UnixSocketMCPTransportWriteHooks()
     #endif
 
     /// Generation counter that increments on each connection close/open cycle.
@@ -85,6 +560,8 @@ public actor UnixSocketMCPTransport: Transport {
     private var fdGeneration: UInt64 = 0
 
     private var lastActivityTime: Date?
+    private let responseDeliveryGate = MCPDomainResponseDeliveryTracker()
+    private nonisolated let executionWatchdogResponseLedger = MCPExecutionWatchdogResponseLedger()
 
     /// Connection timeout when waiting for socket to appear and accept connections
     private let connectionTimeout: TimeInterval = 30.0
@@ -102,30 +579,22 @@ public actor UnixSocketMCPTransport: Transport {
     public init(
         socketURL: URL,
         logger: Logger? = nil,
-        writeStallTimeout: TimeInterval = 30.0,
-        writePollIntervalMilliseconds: Int32 = 250
+        writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
+        writePollIntervalMilliseconds: Int32 = 250,
+        receiveBufferCapacity: Int = 1024
     ) {
+        let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         self.socketURL = socketURL
+        timelineConnectionID = nil
+        timelineCorrelationConnectionID = nil
+        timelineConnectionGeneration = 1
         ownsExistingFD = false
         self.logger = Self.createLogger(logger)
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
-
-        // Initialize streams
-        var msgCont: AsyncThrowingStream<Data, Swift.Error>.Continuation!
-        messageStream = AsyncThrowingStream(
-            Data.self,
-            bufferingPolicy: .bufferingOldest(1024)
-        ) { continuation in
-            msgCont = continuation
-        }
-        messageContinuation = msgCont
-
-        var closeCont: AsyncStream<Void>.Continuation!
-        closeStream = AsyncStream(Void.self) { continuation in
-            closeCont = continuation
-        }
-        closeContinuation = closeCont
+        self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
+        inboundChannel = InboundChannel(capacity: sanitizedReceiveBufferCapacity)
+        closeChannel = CloseChannel()
     }
 
     /// Creates a transport using an already-connected file descriptor.
@@ -135,10 +604,15 @@ public actor UnixSocketMCPTransport: Transport {
     ///   - logger: Optional logger
     public init(
         connectedFD: Int32,
+        connectionID: UUID? = nil,
+        correlationConnectionID: String? = nil,
+        connectionGeneration: UInt64 = 1,
         logger: Logger? = nil,
-        writeStallTimeout: TimeInterval = 30.0,
-        writePollIntervalMilliseconds: Int32 = 250
+        writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
+        writePollIntervalMilliseconds: Int32 = 250,
+        receiveBufferCapacity: Int = 1024
     ) throws {
+        let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         do {
             try POSIXDescriptorSupport.setCloseOnExec(connectedFD)
         } catch {
@@ -150,28 +624,18 @@ public actor UnixSocketMCPTransport: Transport {
         }
 
         socketURL = nil
+        timelineConnectionID = connectionID?.uuidString
+        timelineCorrelationConnectionID = correlationConnectionID ?? connectionID?.uuidString
+        timelineConnectionGeneration = connectionGeneration
         socketFD = connectedFD
         ownsExistingFD = true
         isConnected = false
         self.logger = Self.createLogger(logger)
         self.writeStallTimeout = writeStallTimeout
         self.writePollIntervalMilliseconds = Self.sanitizedWritePollIntervalMilliseconds(writePollIntervalMilliseconds)
-
-        // Initialize streams
-        var msgCont: AsyncThrowingStream<Data, Swift.Error>.Continuation!
-        messageStream = AsyncThrowingStream(
-            Data.self,
-            bufferingPolicy: .bufferingOldest(1024)
-        ) { continuation in
-            msgCont = continuation
-        }
-        messageContinuation = msgCont
-
-        var closeCont: AsyncStream<Void>.Continuation!
-        closeStream = AsyncStream(Void.self) { continuation in
-            closeCont = continuation
-        }
-        closeContinuation = closeCont
+        self.receiveBufferCapacity = sanitizedReceiveBufferCapacity
+        inboundChannel = InboundChannel(capacity: sanitizedReceiveBufferCapacity)
+        closeChannel = CloseChannel()
     }
 
     private static func createLogger(_ logger: Logger?) -> Logger {
@@ -208,9 +672,7 @@ public actor UnixSocketMCPTransport: Transport {
 
         unixSocketMCPTransportDebugLog("connecting to \(socketURL.path)")
 
-        isStopping = false
-        streamFinished = false
-        closeSignaled = false
+        prepareForConnectionAttempt()
 
         // Wait for socket file to appear and connect
         let startTime = Date()
@@ -218,7 +680,13 @@ public actor UnixSocketMCPTransport: Transport {
 
         while Date().timeIntervalSince(startTime) < connectionTimeout {
             if Task.isCancelled {
-                throw MCPError.connectionClosed
+                let error = CancellationError()
+                tearDownSocket(
+                    error: error,
+                    cause: .connectCancelled,
+                    initiator: .app
+                )
+                throw error
             }
 
             // Check if socket file exists
@@ -238,7 +706,12 @@ public actor UnixSocketMCPTransport: Transport {
                     lastError = error
                 } catch {
                     // Other error - fail this connection attempt cleanly.
-                    tearDownSocket(error: error)
+                    tearDownSocket(
+                        error: error,
+                        cause: .connectFailure,
+                        initiator: .transport,
+                        errno: Self.errnoValue(from: error)
+                    )
                     throw error
                 }
             }
@@ -249,7 +722,14 @@ public actor UnixSocketMCPTransport: Transport {
 
         // Timeout reached
         logger.error("UnixSocketMCPTransport connection timeout after \(connectionTimeout)s")
-        throw lastError ?? MCPError.internalError("Timeout connecting to UNIX socket at \(socketURL.path)")
+        let error = lastError ?? MCPError.internalError("Timeout connecting to UNIX socket at \(socketURL.path)")
+        tearDownSocket(
+            error: error,
+            cause: .connectFailure,
+            initiator: .transport,
+            errno: Self.errnoValue(from: error)
+        )
+        throw error
     }
 
     /// Disconnects from the UNIX socket.
@@ -258,7 +738,11 @@ public actor UnixSocketMCPTransport: Transport {
         guard isConnected || !isStopping else { return }
 
         mcpConnectionLog("UnixSocketMCPTransport disconnecting")
-        tearDownSocket(error: MCPError.connectionClosed)
+        tearDownSocket(
+            error: MCPError.connectionClosed,
+            cause: .localDisconnect,
+            initiator: .app
+        )
         mcpConnectionLog("UnixSocketMCPTransport disconnect requested")
     }
 
@@ -270,11 +754,327 @@ public actor UnixSocketMCPTransport: Transport {
             throw MCPError.connectionClosed
         }
 
-        let framed = Self.frameWithNewlineIfNeeded(message)
+        let candidateFrame = Self.frameWithNewlineIfNeeded(message)
+        let preparedFrame: MCPExecutionWatchdogResponseLedger.PreparedFrame
+        switch executionWatchdogResponseLedger.prepareServerFrameForDelivery(candidateFrame) {
+        case let .frame(frame):
+            preparedFrame = frame
+        case let .suppressed(phase, terminalReason):
+            MCPResponseDeliveryTracer.emitFrame(
+                layer: "app_uds_transport",
+                phase: phase,
+                frame: candidateFrame,
+                direction: .serverToClient,
+                connectionID: timelineCorrelationConnectionID,
+                connectionGeneration: timelineConnectionGeneration,
+                terminalReason: terminalReason
+            )
+            return
+        }
+        let framed = preparedFrame.data
+        let responseDeadline: MCPExportResponseDeliveryDeadlineRegistry.Deadline? = if let timelineConnectionID {
+            MCPExportResponseDeliveryDeadlineRegistry.shared.deadline(
+                forServerFrame: framed,
+                connectionID: timelineConnectionID,
+                connectionGeneration: timelineConnectionGeneration
+            )
+        } else {
+            nil
+        }
+        #if DEBUG
+            let recordedResponses: [MCPRequestTimelineRegistry.RecordedMessage] = if let timelineConnectionID {
+                MCPRequestTimelineRegistry.shared.recordedResponses(
+                    in: framed,
+                    connectionID: timelineConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            } else {
+                []
+            }
+        #endif
+        func emitResponseWriteTrace(
+            phase: String,
+            terminalReason: String? = nil
+        ) {
+            #if DEBUG
+                if recordedResponses.isEmpty {
+                    MCPResponseDeliveryTracer.emitFrame(
+                        layer: "app_uds_transport",
+                        phase: phase,
+                        frame: framed,
+                        direction: .serverToClient,
+                        connectionID: timelineCorrelationConnectionID,
+                        connectionGeneration: timelineConnectionGeneration,
+                        terminalReason: terminalReason
+                    )
+                } else {
+                    for response in recordedResponses {
+                        MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                            layer: "app_uds_transport",
+                            phase: phase,
+                            connectionID: response.identity.connectionID ?? timelineCorrelationConnectionID,
+                            connectionGeneration: timelineConnectionGeneration,
+                            direction: .serverToClient,
+                            id: response.metadata.id,
+                            method: response.metadata.method,
+                            tool: response.metadata.tool,
+                            requestOrdinal: response.metadata.requestOrdinal,
+                            framedByteCount: framed.count,
+                            framedSHA256: MCPResponseDeliveryTracer.sha256Hex(framed),
+                            terminalReason: terminalReason,
+                            requestIdentity: response.identity,
+                            providerActive: false,
+                            networkScopeActive: false,
+                            permitActive: false,
+                            publicationPending: phase != "transport_write_completed",
+                            terminalBarrier: terminalReason != nil
+                        ))
+                    }
+                }
+            #else
+                MCPResponseDeliveryTracer.emitFrame(
+                    layer: "app_uds_transport",
+                    phase: phase,
+                    frame: framed,
+                    direction: .serverToClient,
+                    connectionGeneration: fdGeneration,
+                    terminalReason: terminalReason
+                )
+            #endif
+        }
 
-        try await writeAll(framed)
+        emitResponseWriteTrace(phase: "sdk_encode_completed")
+        do {
+            try Task.checkCancellation()
+            try enforceResponseDeliveryDeadline(responseDeadline, framedByteCount: framed.count)
+            // Encoding proves the SDK produced a response frame; this boundary proves the
+            // transport began attempting the write, which distinguishes a later stall or close.
+            emitResponseWriteTrace(phase: "transport_write_started")
+            let writeOutcome = try writeAll(
+                framed,
+                responseDeadline: responseDeadline,
+                sealPolicy: preparedFrame.sealPolicy
+            )
+            guard writeOutcome == .delivered else {
+                emitResponseWriteTrace(
+                    phase: "watchdog_inflight_response_preempted",
+                    terminalReason: "tool_execution_watchdog"
+                )
+                return
+            }
+            try enforceResponseDeliveryDeadline(responseDeadline, framedByteCount: framed.count)
+        } catch {
+            // A cancelled partial frame cannot leave the connection reusable because its
+            // remaining bytes would corrupt the next JSON-RPC frame.
+            if isConnected {
+                closeAfterSendFailure(error, cause: .writeFailure)
+            }
+            // writeAll may close the transport before returning. Keep the response identities
+            // captured before the write so terminal failure still joins to its invocation.
+            emitResponseWriteTrace(
+                phase: "transport_write_failed",
+                terminalReason: firstCloseSnapshot?.cause.rawValue ?? "app_uds_send_failed"
+            )
+            throw error
+        }
+        executionWatchdogResponseLedger.recordDeliveredServerFrame(framed)
+        responseDeliveryGate.recordDeliveredServerFrame(framed)
         lastActivityTime = Date()
+        if let timelineConnectionID {
+            MCPExportResponseDeliveryDeadlineRegistry.shared.completeServerFrame(
+                framed,
+                connectionID: timelineConnectionID,
+                connectionGeneration: timelineConnectionGeneration
+            )
+        }
+        emitResponseWriteTrace(phase: "transport_write_completed")
+        #if DEBUG
+            if let timelineConnectionID {
+                MCPRequestTimelineRegistry.shared.completeResponses(
+                    recordedResponses,
+                    connectionID: timelineConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            }
+        #endif
         mcpTransportLog("UnixSocketMCPTransport sent \(framed.count) bytes successfully")
+    }
+
+    private func sendExplicitNullRequestIDErrors(count: Int) async {
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": NSNull(),
+            "error": [
+                "code": -32600,
+                "message": "Invalid Request"
+            ]
+        ]
+        guard let frame = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return
+        }
+        for _ in 0 ..< count {
+            do {
+                try await send(frame)
+            } catch {
+                logger.debug("Failed to write explicit-null JSON-RPC invalid-request error: \(error)")
+                return
+            }
+        }
+    }
+
+    /// Emits one standards-compliant server error per request accepted before the
+    /// watchdog sealed this connection. This runs after the watchdog's existing
+    /// cleanup grace expires and before `disconnect()` closes the socket. It makes
+    /// only immediate nonblocking writes: a backpressured or partial stream cannot
+    /// receive a further valid JSON-RPC frame and is closed instead.
+    nonisolated func sendExecutionWatchdogTerminalErrors(
+        context: MCPExecutionWatchdogTerminalContext,
+        trailingControlFrame: Data? = nil
+    ) async -> Int {
+        executionWatchdogResponseLedger.seal()
+        #if DEBUG
+            debugWriteHooks.notifyExecutionWatchdogDidSeal()
+        #endif
+        return await deliverExecutionWatchdogTerminalErrors(
+            context: context,
+            trailingControlFrame: trailingControlFrame
+        )
+    }
+
+    private func deliverExecutionWatchdogTerminalErrors(
+        context: MCPExecutionWatchdogTerminalContext,
+        trailingControlFrame: Data?
+    ) -> Int {
+        defer { executionWatchdogResponseLedger.finishTerminalDelivery() }
+        let requestIDs = executionWatchdogResponseLedger.takeOutstandingRequestIDsAfterSeal()
+        var deliveredCount = 0
+        for requestID in requestIDs {
+            guard let frame = Self.executionWatchdogTerminalErrorFrame(
+                requestID: requestID,
+                context: context
+            ) else {
+                continue
+            }
+            do {
+                try writeExecutionWatchdogTerminalFrame(
+                    frame,
+                    terminalReason: context.reason,
+                    tracePhase: "watchdog_terminal_error_written"
+                )
+                deliveredCount += 1
+            } catch {
+                // A failed terminal write already transitions the socket to closed.
+                // Do not add another write or poll grace after the watchdog's
+                // completed cleanup window.
+                logger.debug("Failed to write watchdog terminal JSON-RPC error: \(error)")
+                break
+            }
+        }
+        if let trailingControlFrame,
+           isConnected
+        {
+            do {
+                // The CLI uses this existing control notification to retain
+                // watchdog provenance after it forwards the per-request errors.
+                try writeExecutionWatchdogTerminalFrame(
+                    trailingControlFrame,
+                    terminalReason: context.reason,
+                    tracePhase: "watchdog_terminate_notification_written"
+                )
+            } catch {
+                logger.debug("Failed to write watchdog terminate notification: \(error)")
+            }
+        }
+        return deliveredCount
+    }
+
+    private static func executionWatchdogTerminalErrorFrame(
+        requestID: JSONRPCBridgeID,
+        context: MCPExecutionWatchdogTerminalContext
+    ) -> Data? {
+        let id: Any
+        switch requestID {
+        case let .number(value):
+            id = value
+        case let .string(value):
+            id = value
+        case .null:
+            return nil
+        }
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": [
+                "code": MCPExecutionWatchdogTerminalContext.jsonRPCServerErrorCode,
+                "message": MCPExecutionWatchdogTerminalContext.message,
+                "data": [
+                    "reason": context.reason,
+                    "tool_name": context.toolName,
+                    "handler_phase": context.handlerPhase,
+                    "invocation_id": context.invocationID.uuidString
+                ]
+            ]
+        ]
+        guard var data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) else {
+            return nil
+        }
+        data.append(UInt8(ascii: "\n"))
+        return data
+    }
+
+    /// Writes one complete watchdog-terminal frame without waiting for POLLOUT. The
+    /// watchdog has already spent its configured cleanup grace, so a fresh write
+    /// stall allowance here would extend the caller-visible timeout.
+    private func writeExecutionWatchdogTerminalFrame(
+        _ frame: Data,
+        terminalReason: String,
+        tracePhase: String
+    ) throws {
+        guard isConnected, socketFD >= 0 else { throw MCPError.connectionClosed }
+        let fd = socketFD
+        let generation = fdGeneration
+        do {
+            try Self.ensureNonBlocking(fd: fd)
+            guard isConnected, fdGeneration == generation else {
+                throw MCPError.connectionClosed
+            }
+            let written = frame.withUnsafeBytes { bytes -> Int in
+                guard let baseAddress = bytes.baseAddress else { return -1 }
+                return Darwin.write(fd, baseAddress, frame.count)
+            }
+            guard written == frame.count else {
+                let error = MCPError.transportError(UnixSocketWriteStalledError(
+                    stallTimeout: 0,
+                    bytesRemaining: max(0, frame.count - max(0, written)),
+                    totalBytes: frame.count
+                ))
+                closeAfterSendFailure(error, cause: .writeFailure)
+                throw error
+            }
+        } catch {
+            if isConnected {
+                closeAfterSendFailure(error, cause: .writeFailure)
+            }
+            throw error
+        }
+        responseDeliveryGate.recordDeliveredServerFrame(frame)
+        lastActivityTime = Date()
+        if let timelineConnectionID {
+            MCPExportResponseDeliveryDeadlineRegistry.shared.completeServerFrame(
+                frame,
+                connectionID: timelineConnectionID,
+                connectionGeneration: timelineConnectionGeneration
+            )
+        }
+        MCPResponseDeliveryTracer.emitFrame(
+            layer: "app_uds_transport",
+            phase: tracePhase,
+            frame: frame,
+            direction: .serverToClient,
+            connectionID: timelineCorrelationConnectionID,
+            connectionGeneration: timelineConnectionGeneration,
+            terminalReason: terminalReason
+        )
     }
 
     /// Appends a newline delimiter if the message doesn't already end with one.
@@ -291,13 +1091,21 @@ public actor UnixSocketMCPTransport: Transport {
 
     /// Returns the async stream of received messages.
     public func receive() -> AsyncThrowingStream<Data, Swift.Error> {
-        messageStream
+        inboundChannel.stream
     }
 
     /// Returns the close notification stream.
     /// Use this to detect when the socket closes so connections can be cleaned up promptly.
-    public func closed() -> AsyncStream<Void> {
-        closeStream
+    public func closed() -> AsyncStream<MCPTransportCloseSnapshot> {
+        closeChannel.stream
+    }
+
+    public func closeSnapshot() -> MCPTransportCloseSnapshot? {
+        firstCloseSnapshot
+    }
+
+    func ingressSnapshot() -> MCPTransportIngressSnapshot {
+        inboundChannel.gate.snapshot()
     }
 
     /// Returns seconds since last activity, or nil if never active.
@@ -306,7 +1114,28 @@ public actor UnixSocketMCPTransport: Transport {
         return Date().timeIntervalSince(lastActivityTime)
     }
 
+    func responseDeliverySnapshot() async -> MCPResponseDeliverySnapshot {
+        responseDeliveryGate.snapshot()
+    }
+
+    func waitUntilResponseDeliveryDrained() async -> Bool {
+        await responseDeliveryGate.waitUntilDrained()
+    }
+
     // MARK: - Private Implementation
+
+    private func prepareForConnectionAttempt() {
+        responseDeliveryGate.reset()
+        executionWatchdogResponseLedger.reset()
+        isStopping = false
+        if streamFinished || closeSignaled {
+            inboundChannel = InboundChannel(capacity: receiveBufferCapacity)
+            closeChannel = CloseChannel()
+        }
+        streamFinished = false
+        closeSignaled = false
+        firstCloseSnapshot = nil
+    }
 
     /// Connects to the UNIX socket at socketURL.
     private func connectToSocket() throws {
@@ -380,6 +1209,9 @@ public actor UnixSocketMCPTransport: Transport {
     private func closeSocket() {
         if socketFD >= 0 {
             Darwin.close(socketFD)
+            #if DEBUG
+                debugDescriptorCloseCount += 1
+            #endif
             socketFD = -1
             socketOwnershipGeneration &+= 1
         }
@@ -388,7 +1220,55 @@ public actor UnixSocketMCPTransport: Transport {
     /// Wakes blocked I/O and deterministically transfers final-close responsibility.
     /// If a reader exists, its cancel handler remains the sole final-close owner to
     /// avoid a stale callback closing a reused descriptor number.
-    private func tearDownSocket(error: Swift.Error?) {
+    private func tearDownSocket(
+        error proposedError: Swift.Error?,
+        cause proposedCause: MCPTransportTerminalCause,
+        initiator proposedInitiator: MCPTerminalInitiator,
+        errno proposedErrno: Int32? = nil
+    ) {
+        guard !streamFinished else { return }
+        responseDeliveryGate.close()
+        if let timelineConnectionID {
+            MCPExportResponseDeliveryDeadlineRegistry.shared.removeConnection(
+                connectionID: timelineConnectionID,
+                connectionGeneration: timelineConnectionGeneration
+            )
+        }
+        #if DEBUG
+            if let timelineConnectionID {
+                MCPRequestTimelineRegistry.shared.removeConnection(
+                    connectionID: timelineConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            }
+        #endif
+        let ingressSnapshot = inboundChannel.gate.closeAndSnapshot()
+        let overflowError = MCPReceiveBufferOverflowError(
+            capacity: ingressSnapshot.receiveBufferCapacity,
+            highWaterMark: ingressSnapshot.receiveBufferHighWaterMark
+        )
+        let resolvedError: Swift.Error? = if ingressSnapshot.terminalCause == .receiveBufferOverflow {
+            overflowError
+        } else {
+            proposedError
+        }
+        if firstCloseSnapshot == nil {
+            firstCloseSnapshot = MCPTransportCloseSnapshot(
+                cause: ingressSnapshot.terminalCause == .receiveBufferOverflow
+                    ? .receiveBufferOverflow
+                    : proposedCause,
+                initiator: ingressSnapshot.terminalCause == .receiveBufferOverflow
+                    ? .transport
+                    : proposedInitiator,
+                errno: ingressSnapshot.terminalCause == .receiveBufferOverflow
+                    ? nil
+                    : proposedErrno,
+                errorDescription: resolvedError.map { String(describing: $0) }
+            )
+        }
+        if ingressSnapshot.terminalCause == .receiveBufferOverflow {
+            logger.error("UnixSocketMCPTransport ingress terminated: \(String(describing: resolvedError))")
+        }
         isConnected = false
         isStopping = true
 
@@ -399,14 +1279,18 @@ public actor UnixSocketMCPTransport: Transport {
         if !pendingReaderCancellationOwnsCurrentSocket() {
             closeSocket()
         }
-        transitionToClosed(error: error)
+        transitionToClosed(error: resolvedError)
     }
 
     private func connectExistingFD() throws {
         if isConnected {
-            guard reader != nil else {
+            guard activeReaderOwnership != nil else {
                 let error = MCPError.connectionClosed
-                tearDownSocket(error: error)
+                tearDownSocket(
+                    error: error,
+                    cause: .connectFailure,
+                    initiator: .transport
+                )
                 throw error
             }
             return
@@ -414,7 +1298,11 @@ public actor UnixSocketMCPTransport: Transport {
 
         guard !streamFinished, !closeSignaled, socketFD >= 0 else {
             let error = MCPError.connectionClosed
-            tearDownSocket(error: error)
+            tearDownSocket(
+                error: error,
+                cause: .connectFailure,
+                initiator: .transport
+            )
             throw error
         }
 
@@ -439,9 +1327,29 @@ public actor UnixSocketMCPTransport: Transport {
             lastActivityTime = Date()
             unixSocketMCPTransportDebugLog("started with existing FD \(socketFD)")
         } catch {
-            tearDownSocket(error: error)
+            tearDownSocket(
+                error: error,
+                cause: .connectFailure,
+                initiator: .transport,
+                errno: Self.errnoValue(from: error)
+            )
             throw error
         }
+    }
+
+    private nonisolated static func errnoValue(from error: Swift.Error) -> Int32? {
+        if let posixError = error as? POSIXError {
+            return posixError.code.rawValue
+        }
+        return nil
+    }
+
+    private nonisolated static func readErrorInitiator(errno: Int32?) -> MCPTerminalInitiator {
+        errno == ECONNRESET ? .peer : .transport
+    }
+
+    private nonisolated static func isPeerWriteHangupErrno(_ errno: Int32) -> Bool {
+        errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN
     }
 
     #if DEBUG
@@ -457,7 +1365,95 @@ public actor UnixSocketMCPTransport: Transport {
         func debugFailNextExistingFDConnectBeforeReaderStart() {
             failNextExistingFDConnectBeforeReaderStart = true
         }
+
+        func debugDeferNextReceiveOverflowTeardown() {
+            deferNextReceiveOverflowTeardown = true
+        }
+
+        func debugHoldReaderTerminalCallback() {
+            callbackGate.hold(.terminal)
+        }
+
+        func debugReleaseReaderTerminalCallbacks() {
+            callbackGate.release(.terminal)
+        }
+
+        func debugHoldReaderCancellationCallback() {
+            callbackGate.hold(.cancellation)
+        }
+
+        func debugReleaseReaderCancellationCallbacks() {
+            callbackGate.release(.cancellation)
+        }
+
+        func debugSetBeforeInboundFrameOfferForTesting(
+            _ handler: (@Sendable () -> Void)?
+        ) {
+            debugBeforeInboundFrameOfferForTesting = handler
+        }
+
+        func debugSetBeforeOrdinaryWriteForTesting(
+            _ handler: (@Sendable () -> Void)?
+        ) {
+            debugBeforeOrdinaryWriteForTesting = handler
+        }
+
+        func debugSetAfterWriteProgressForTesting(
+            _ handler: (@Sendable (_ bytesWritten: Int) -> Void)?
+        ) {
+            debugAfterWriteProgressForTesting = handler
+        }
+
+        func debugSetOrdinaryWriteWouldBlockForTesting(
+            _ handler: (@Sendable () -> Void)?
+        ) {
+            debugWriteHooks.setOrdinaryWriteWouldBlock(handler)
+        }
+
+        func debugSetExecutionWatchdogDidSealForTesting(
+            _ handler: (@Sendable () -> Void)?
+        ) {
+            debugWriteHooks.setExecutionWatchdogDidSeal(handler)
+        }
+
+        func debugTriggerReadErrorForCleanupTest(_ code: POSIXErrorCode = .EIO) {
+            guard let identity = activeReaderOwnership?.identity else { return }
+            handleReaderTerminal(.error(POSIXError(code)), from: identity)
+        }
+
+        func debugCleanupSnapshot() -> UnixSocketMCPTransportCleanupSnapshot {
+            UnixSocketMCPTransportCleanupSnapshot(
+                hasActiveReader: activeReaderOwnership != nil,
+                pendingReaderCancellationCount: pendingReaderCancellations.count,
+                earlyReaderCancellationCount: earlyReaderCancellations.count,
+                readerIsRetained: debugLastReader != nil,
+                terminalCallbackCount: debugTerminalCallbackCount,
+                pendingTerminalCallbackCount: callbackGate.pendingCount(.terminal),
+                cancellationCallbackCount: debugCancellationCallbackCount,
+                finalizationCount: debugReaderFinalizationCount,
+                descriptorCloseCount: debugDescriptorCloseCount,
+                staleCancellationCount: debugStaleCancellationCount,
+                staleTerminalCount: debugStaleTerminalCount,
+                socketIsOwned: socketFD >= 0
+            )
+        }
     #endif
+
+    private nonisolated func scheduleReaderTerminalCallback(_ callback: @escaping @Sendable () -> Void) {
+        #if DEBUG
+            callbackGate.submit(.terminal, callback: callback)
+        #else
+            callback()
+        #endif
+    }
+
+    private nonisolated func scheduleReaderCancellationCallback(_ callback: @escaping @Sendable () -> Void) {
+        #if DEBUG
+            callbackGate.submit(.cancellation, callback: callback)
+        #else
+            callback()
+        #endif
+    }
 
     private nonisolated static func ensureNonBlocking(fd: Int32) throws {
         let flags = fcntl(fd, F_GETFL)
@@ -474,7 +1470,11 @@ public actor UnixSocketMCPTransport: Transport {
     /// Uses non-blocking writes plus bounded POLLOUT waits for backpressure.
     /// The stall deadline resets whenever any bytes are successfully written.
     /// Guards against FD reuse races by checking fdGeneration after each sleep.
-    private func writeAll(_ data: Data) async throws {
+    private func writeAll(
+        _ data: Data,
+        responseDeadline: MCPExportResponseDeliveryDeadlineRegistry.Deadline?,
+        sealPolicy: MCPExecutionWatchdogResponseLedger.PreparedFrameSealPolicy
+    ) throws -> WriteOutcome {
         // Fast-fail if we're obviously disconnected
         guard isConnected, socketFD >= 0 else {
             throw MCPError.connectionClosed
@@ -488,13 +1488,26 @@ public actor UnixSocketMCPTransport: Transport {
         do {
             try Self.ensureNonBlocking(fd: fd)
         } catch {
-            closeAfterSendFailure(error)
+            closeAfterSendFailure(error, cause: .writeFailure, errno: Self.errnoValue(from: error))
             throw error
         }
         var remaining = data
         var lastProgressAt = Date()
+        var bytesWritten = 0
+        #if DEBUG
+            debugBeforeOrdinaryWriteForTesting?()
+        #endif
 
         while !remaining.isEmpty {
+            if let outcome = try executionWatchdogPreemptionOutcome(
+                sealPolicy: sealPolicy,
+                bytesWritten: bytesWritten,
+                totalBytes: data.count
+            ) {
+                return outcome
+            }
+            try Task.checkCancellation()
+            try enforceResponseDeliveryDeadline(responseDeadline, framedByteCount: data.count)
             // Re-check that we're still talking to the same connection epoch.
             guard isConnected, fdGeneration == gen else {
                 throw MCPError.connectionClosed
@@ -505,7 +1518,7 @@ public actor UnixSocketMCPTransport: Transport {
                     bytesRemaining: remaining.count,
                     totalBytes: data.count
                 ))
-                closeAfterSendFailure(error)
+                closeAfterSendFailure(error, cause: .writeStall)
                 throw error
             }
 
@@ -518,31 +1531,74 @@ public actor UnixSocketMCPTransport: Transport {
                 if err == EINTR {
                     continue // Interrupted, retry
                 } else if err == EAGAIN || err == EWOULDBLOCK {
-                    try waitForSocketWritable(
+                    #if DEBUG
+                        debugWriteHooks.notifyOrdinaryWriteWouldBlock()
+                    #endif
+                    if let outcome = try executionWatchdogPreemptionOutcome(
+                        sealPolicy: sealPolicy,
+                        bytesWritten: bytesWritten,
+                        totalBytes: data.count
+                    ) {
+                        return outcome
+                    }
+                    if let outcome = try waitForSocketWritable(
                         fd: fd,
                         generation: gen,
                         lastProgressAt: lastProgressAt,
                         totalBytes: data.count,
-                        bytesRemaining: remaining.count
-                    )
+                        bytesRemaining: remaining.count,
+                        bytesWritten: bytesWritten,
+                        responseDeadline: responseDeadline,
+                        sealPolicy: sealPolicy
+                    ) {
+                        return outcome
+                    }
                     continue
-                } else if err == EPIPE || err == ECONNRESET {
-                    closeAfterSendFailure(MCPError.connectionClosed)
+                } else if Self.isPeerWriteHangupErrno(err) {
+                    closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer, errno: err)
                     throw MCPError.connectionClosed
                 } else {
                     let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
-                    closeAfterSendFailure(error)
+                    closeAfterSendFailure(error, cause: .writeFailure, errno: err)
                     throw error
                 }
             } else if written == 0 {
                 // On sockets, a 0-length write generally means closed / unusable
-                closeAfterSendFailure(MCPError.connectionClosed)
+                closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer)
                 throw MCPError.connectionClosed
             }
 
             remaining = remaining.dropFirst(written)
+            bytesWritten += written
             lastProgressAt = Date()
+            #if DEBUG
+                debugAfterWriteProgressForTesting?(written)
+            #endif
+            try enforceResponseDeliveryDeadline(responseDeadline, framedByteCount: data.count)
         }
+        return .delivered
+    }
+
+    private func executionWatchdogPreemptionOutcome(
+        sealPolicy: MCPExecutionWatchdogResponseLedger.PreparedFrameSealPolicy,
+        bytesWritten: Int,
+        totalBytes: Int
+    ) throws -> WriteOutcome? {
+        guard executionWatchdogResponseLedger.shouldPreemptOrdinaryWrite(
+            with: sealPolicy
+        ) else {
+            return nil
+        }
+        guard bytesWritten > 0 else {
+            return .preemptedByExecutionWatchdog
+        }
+
+        let error = MCPError.transportError(UnixSocketExecutionWatchdogPartialFrameError(
+            bytesWritten: bytesWritten,
+            totalBytes: totalBytes
+        ))
+        closeAfterSendFailure(error, cause: .writeFailure)
+        throw error
     }
 
     private func waitForSocketWritable(
@@ -550,9 +1606,21 @@ public actor UnixSocketMCPTransport: Transport {
         generation: UInt64,
         lastProgressAt: Date,
         totalBytes: Int,
-        bytesRemaining: Int
-    ) throws {
+        bytesRemaining: Int,
+        bytesWritten: Int,
+        responseDeadline: MCPExportResponseDeliveryDeadlineRegistry.Deadline?,
+        sealPolicy: MCPExecutionWatchdogResponseLedger.PreparedFrameSealPolicy
+    ) throws -> WriteOutcome? {
         while true {
+            if let outcome = try executionWatchdogPreemptionOutcome(
+                sealPolicy: sealPolicy,
+                bytesWritten: bytesWritten,
+                totalBytes: totalBytes
+            ) {
+                return outcome
+            }
+            try Task.checkCancellation()
+            try enforceResponseDeliveryDeadline(responseDeadline, framedByteCount: totalBytes)
             guard isConnected, fdGeneration == generation else {
                 throw MCPError.connectionClosed
             }
@@ -564,19 +1632,23 @@ public actor UnixSocketMCPTransport: Transport {
                     bytesRemaining: bytesRemaining,
                     totalBytes: totalBytes
                 ))
-                closeAfterSendFailure(error)
+                closeAfterSendFailure(error, cause: .writeStall)
                 throw error
             }
 
             var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
             let remainingMs = max(1, Int32(remainingStallSeconds * 1000))
-            let pollTimeout = min(writePollIntervalMilliseconds, remainingMs)
+            let deadlineMs = responseDeadline.map {
+                max(0, Int32(min(TimeInterval(Int32.max), $0.remainingSeconds * 1000)))
+            } ?? Int32.max
+            let pollTimeout = min(writePollIntervalMilliseconds, min(remainingMs, deadlineMs))
             let result = poll(&pfd, 1, pollTimeout)
 
             if result < 0 {
                 if errno == EINTR { continue }
-                let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO))
-                closeAfterSendFailure(error)
+                let err = errno
+                let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
+                closeAfterSendFailure(error, cause: .writeFailure, errno: err)
                 throw error
             }
 
@@ -584,20 +1656,72 @@ public actor UnixSocketMCPTransport: Transport {
                 continue
             }
 
-            if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
-                closeAfterSendFailure(MCPError.connectionClosed)
+            if pfd.revents & Int16(POLLNVAL) != 0 {
+                let error = MCPError.transportError(POSIXError(.EBADF))
+                closeAfterSendFailure(error, cause: .writeFailure, errno: EBADF)
+                throw error
+            }
+
+            if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
+                closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer)
                 throw MCPError.connectionClosed
             }
 
             if pfd.revents & Int16(POLLOUT) != 0 {
-                return
+                if let outcome = try executionWatchdogPreemptionOutcome(
+                    sealPolicy: sealPolicy,
+                    bytesWritten: bytesWritten,
+                    totalBytes: totalBytes
+                ) {
+                    return outcome
+                }
+                return nil
             }
         }
     }
 
-    private func closeAfterSendFailure(_ error: Swift.Error) {
+    private func enforceResponseDeliveryDeadline(
+        _ deadline: MCPExportResponseDeliveryDeadlineRegistry.Deadline?,
+        framedByteCount: Int
+    ) throws {
+        guard deadline?.hasExpired == true else { return }
+        let error = MCPError.transportError(UnixSocketResponseDeliveryDeadlineExceededError(
+            framedByteCount: framedByteCount
+        ))
+        closeAfterSendFailure(error, cause: .writeFailure)
+        throw error
+    }
+
+    private func closeAfterSendFailure(
+        _ error: Swift.Error,
+        cause: MCPTransportTerminalCause,
+        initiator: MCPTerminalInitiator = .transport,
+        errno: Int32? = nil
+    ) {
         logger.error("UnixSocketMCPTransport send failed; closing transport: \(String(describing: error))")
-        tearDownSocket(error: error)
+        tearDownSocket(
+            error: error,
+            cause: cause,
+            initiator: initiator,
+            errno: errno
+        )
+    }
+
+    private struct UnixSocketResponseDeliveryDeadlineExceededError: Swift.Error, CustomStringConvertible {
+        let framedByteCount: Int
+
+        var description: String {
+            "Unix socket response delivery exceeded its absolute deadline (frame bytes: \(framedByteCount))"
+        }
+    }
+
+    private struct UnixSocketExecutionWatchdogPartialFrameError: Swift.Error, CustomStringConvertible {
+        let bytesWritten: Int
+        let totalBytes: Int
+
+        var description: String {
+            "Execution watchdog sealed after a partial socket frame (written \(bytesWritten)/\(totalBytes) bytes)"
+        }
     }
 
     private struct UnixSocketWriteStalledError: Swift.Error, CustomStringConvertible {
@@ -617,123 +1741,291 @@ public actor UnixSocketMCPTransport: Transport {
         try ReadSourceFDPreflight.validateOpenFD(fd, label: "UnixSocketMCPTransport read socket")
         stopReadSource()
 
-        // Track which FD this source is bound to
         nextReadSourceToken &+= 1
-        let token = nextReadSourceToken
-        readSourceFD = fd
-        readSourceToken = token
-        readSourceSocketOwnershipGeneration = socketOwnershipGeneration
+        let identity = ReaderIdentity(
+            fd: fd,
+            token: nextReadSourceToken,
+            socketOwnershipGeneration: socketOwnershipGeneration
+        )
 
-        let cont = messageContinuation
+        let inboundChannel = inboundChannel
+        let ingressGeneration = executionWatchdogResponseLedger.currentGeneration
+        let deliveryGeneration = responseDeliveryGate.currentGeneration
         let log = logger
+        #if DEBUG
+            let debugBeforeInboundFrameOfferForTesting = debugBeforeInboundFrameOfferForTesting
+        #endif
 
         let newReader = NewlineDelimitedSocketReader(
             fd: fd,
             queue: readQueue,
             logger: log,
-            onFrame: { frame in
-                mcpTransportLog("UnixSocketMCPTransport yielding message of \(frame.count) bytes")
-                cont.yield(frame)
+            onFrame: { [weak self] frame in
+                guard let self else { return }
+                let ingressValidation = MCPExplicitNullRequestIDIngressValidation.validate(frame)
+                if ingressValidation.rejectedRequestCount > 0 {
+                    Task {
+                        await self.sendExplicitNullRequestIDErrors(
+                            count: ingressValidation.rejectedRequestCount
+                        )
+                    }
+                }
+                guard let forwardedFrame = ingressValidation.forwardedFrame else { return }
+                do {
+                    guard try executionWatchdogResponseLedger.recordAcceptedClientFrame(
+                        forwardedFrame,
+                        expectedGeneration: ingressGeneration
+                    ) else { return }
+                } catch {
+                    Task { await self.handleClientCancellationOwnershipFailure(error, from: identity) }
+                    return
+                }
+                responseDeliveryGate.recordAcceptedClientFrame(
+                    forwardedFrame,
+                    expectedGeneration: deliveryGeneration
+                )
+                let dispatchFrame: Data = if let timelineConnectionID {
+                    MCPExportResponseDeliveryDeadlineRegistry.shared.recordAcceptedClientFrame(
+                        forwardedFrame,
+                        connectionID: timelineConnectionID,
+                        connectionGeneration: timelineConnectionGeneration
+                    )
+                } else {
+                    forwardedFrame
+                }
+                #if DEBUG
+                    let recordedTimelineRequests: [MCPRequestTimelineRegistry.RecordedMessage] = if let timelineConnectionID {
+                        MCPRequestTimelineRegistry.shared.recordAcceptedFrame(
+                            forwardedFrame,
+                            connectionID: timelineConnectionID,
+                            correlationConnectionID: timelineCorrelationConnectionID ?? timelineConnectionID,
+                            connectionGeneration: timelineConnectionGeneration
+                        )
+                    } else {
+                        []
+                    }
+                    // Handler dispatch can run as soon as offer resumes a waiting consumer,
+                    // so correlation identity must already be claimable at this boundary.
+                    debugBeforeInboundFrameOfferForTesting?()
+                #endif
+                switch inboundChannel.gate.offer(dispatchFrame, to: inboundChannel.continuation) {
+                case .accepted:
+                    #if DEBUG
+                        if let timelineConnectionID {
+                            for request in recordedTimelineRequests {
+                                MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                                    layer: "app_uds_transport",
+                                    phase: "frame_accepted",
+                                    connectionID: request.identity.connectionID ?? timelineCorrelationConnectionID,
+                                    connectionGeneration: timelineConnectionGeneration,
+                                    direction: .clientToServer,
+                                    id: request.metadata.id,
+                                    method: request.metadata.method,
+                                    tool: request.metadata.tool,
+                                    requestOrdinal: request.metadata.requestOrdinal,
+                                    framedByteCount: forwardedFrame.count,
+                                    framedSHA256: MCPResponseDeliveryTracer.sha256Hex(forwardedFrame),
+                                    requestIdentity: request.identity
+                                ))
+                            }
+                        }
+                    #endif
+                    mcpTransportLog("UnixSocketMCPTransport accepted message of \(forwardedFrame.count) bytes")
+                case let .overflow(error):
+                    mcpConnectionLog("UnixSocketMCPTransport receive buffer overflow; terminating connection")
+                    let transport = self
+                    Task { await transport.handleReceiveBufferOverflow(error, from: identity) }
+                case .terminal:
+                    break
+                }
             },
-            onEOF: { hasResidual in
-                mcpConnectionLog("UnixSocketMCPTransport received EOF")
-                Task { self.handleReadEOF(hasResidualData: hasResidual) }
+            onTerminal: { [weak self] terminal in
+                guard let transport = self else { return }
+                transport.scheduleReaderTerminalCallback {
+                    Task { await transport.handleReaderTerminal(terminal, from: identity) }
+                }
             },
-            onError: { error in
-                Task { self.handleReadError(error: error) }
+            onBytesRead: { [weak self] in
+                guard let transport = self else { return }
+                Task { await transport.noteActivity(from: identity) }
             },
-            onBytesRead: { Task { self.noteActivity() } },
             onCancel: { [weak self] in
-                mcpConnectionLog("UnixSocketMCPTransport read source cancelled for fd=\(fd) token=\(token)")
-                Task { await self?.readSourceDidCancel(fd: fd, token: token) }
+                guard let transport = self else { return }
+                mcpConnectionLog(
+                    "UnixSocketMCPTransport read source cancelled for fd=\(identity.fd) token=\(identity.token)"
+                )
+                transport.scheduleReaderCancellationCallback {
+                    Task { await transport.readSourceDidCancel(identity) }
+                }
             }
         )
 
-        reader = newReader
+        activeReaderOwnership = ActiveReaderOwnership(identity: identity, reader: newReader)
+        #if DEBUG
+            debugLastReader = newReader
+        #endif
         do {
             try newReader.start()
         } catch {
-            reader = nil
-            readSourceFD = nil
-            readSourceToken = nil
-            readSourceSocketOwnershipGeneration = nil
+            if activeReaderOwnership?.identity == identity {
+                activeReaderOwnership = nil
+            }
             throw error
         }
         mcpConnectionLog("UnixSocketMCPTransport read source started for fd=\(fd)")
     }
 
-    /// Stops the read source. Does NOT close the FD - that happens in cancelHandler.
+    /// Moves active reader ownership to the cancellation finalizer before requesting cancellation.
     private func stopReadSource() {
-        guard let reader else { return }
-        guard let fd = readSourceFD,
-              let token = readSourceToken,
-              let socketOwnershipGeneration = readSourceSocketOwnershipGeneration
-        else {
-            self.reader = nil
-            readSourceFD = nil
-            readSourceToken = nil
-            readSourceSocketOwnershipGeneration = nil
-            reader.stop()
-            return
-        }
+        guard let activeOwnership = activeReaderOwnership else { return }
+        activeReaderOwnership = nil
 
-        pendingReaderCancellations[token] = PendingReaderCancellation(
-            fd: fd,
-            socketOwnershipGeneration: socketOwnershipGeneration,
-            reader: reader,
+        let identity = activeOwnership.identity
+        pendingReaderCancellations[identity.token] = PendingReaderCancellation(
+            identity: identity,
+            reader: activeOwnership.reader,
             transportRetainer: self
         )
-        self.reader = nil
-        readSourceFD = nil
-        readSourceToken = nil
-        readSourceSocketOwnershipGeneration = nil
-        reader.stop()
-        // Note: retained reader cleanup happens in readSourceDidCancel
+        activeOwnership.reader.stop()
+
+        if earlyReaderCancellations.contains(identity) {
+            finalizeReaderCancellation(identity)
+        }
     }
 
     private func pendingReaderCancellationOwnsCurrentSocket() -> Bool {
         pendingReaderCancellations.values.contains { ownership in
-            ownership.fd == socketFD &&
-                ownership.socketOwnershipGeneration == socketOwnershipGeneration
+            ownership.identity.fd == socketFD &&
+                ownership.identity.socketOwnershipGeneration == socketOwnershipGeneration
         }
     }
 
-    /// Called by the read source's cancel handler. Closes the FD safely.
-    private func readSourceDidCancel(fd: Int32, token: UInt64) {
-        guard let ownership = pendingReaderCancellations.removeValue(forKey: token) else { return }
-        guard ownership.fd == fd else {
-            logger.error("UnixSocketMCPTransport reader cancellation fd mismatch for token=\(token)")
+    /// Called by the read source's cancel handler. Cancellation may beat terminal teardown.
+    private func readSourceDidCancel(_ identity: ReaderIdentity) {
+        #if DEBUG
+            debugCancellationCallbackCount += 1
+        #endif
+
+        if pendingReaderCancellations[identity.token]?.identity == identity {
+            finalizeReaderCancellation(identity)
             return
         }
 
-        if socketFD == fd, socketOwnershipGeneration != ownership.socketOwnershipGeneration {
-            logger.warning("UnixSocketMCPTransport skipping stale reader cancellation close for reused fd=\(fd)")
+        if activeReaderOwnership?.identity == identity {
+            earlyReaderCancellations.insert(identity)
             return
         }
 
-        Darwin.close(fd)
-        if socketFD == fd {
-            socketFD = -1
-            socketOwnershipGeneration &+= 1
+        #if DEBUG
+            debugStaleCancellationCount += 1
+        #endif
+    }
+
+    /// Sole final-close owner for a reader cancellation identity.
+    private func finalizeReaderCancellation(_ identity: ReaderIdentity) {
+        guard pendingReaderCancellations[identity.token]?.identity == identity,
+              let ownership = pendingReaderCancellations.removeValue(forKey: identity.token)
+        else {
+            return
+        }
+        earlyReaderCancellations.remove(identity)
+        withExtendedLifetime(ownership) {
+            #if DEBUG
+                debugReaderFinalizationCount += 1
+            #endif
+
+            if socketFD == identity.fd,
+               socketOwnershipGeneration != identity.socketOwnershipGeneration
+            {
+                logger.warning(
+                    "UnixSocketMCPTransport skipping stale reader cancellation close for reused fd=\(identity.fd)"
+                )
+                return
+            }
+
+            Darwin.close(identity.fd)
+            #if DEBUG
+                debugDescriptorCloseCount += 1
+            #endif
+            if socketFD == identity.fd {
+                socketFD = -1
+                socketOwnershipGeneration &+= 1
+            }
         }
     }
 
-    /// Called when read encounters an error.
-    private func handleReadError(error: Swift.Error) {
-        readError = error
-        tearDownSocket(error: error)
+    private func handleClientCancellationOwnershipFailure(
+        _ error: Swift.Error,
+        from identity: ReaderIdentity
+    ) {
+        guard activeReaderOwnership?.identity == identity, !streamFinished else { return }
+        tearDownSocket(
+            error: error,
+            cause: .clientCancellationOwnershipFailure,
+            initiator: .transport
+        )
     }
 
-    /// Called when read encounters EOF.
-    /// - Parameter hasResidualData: If true, buffer had incomplete frame data
-    private func handleReadEOF(hasResidualData: Bool) {
-        if hasResidualData {
+    private func handleReceiveBufferOverflow(
+        _ error: MCPReceiveBufferOverflowError,
+        from identity: ReaderIdentity
+    ) {
+        guard activeReaderOwnership?.identity == identity else { return }
+        guard !streamFinished else { return }
+        #if DEBUG
+            if deferNextReceiveOverflowTeardown {
+                deferNextReceiveOverflowTeardown = false
+                return
+            }
+        #endif
+        tearDownSocket(
+            error: error,
+            cause: .receiveBufferOverflow,
+            initiator: .transport
+        )
+    }
+
+    private func handleReaderTerminal(
+        _ terminal: NewlineDelimitedSocketReaderTerminal,
+        from identity: ReaderIdentity
+    ) {
+        #if DEBUG
+            debugTerminalCallbackCount += 1
+        #endif
+
+        guard activeReaderOwnership?.identity == identity else {
+            #if DEBUG
+                debugStaleTerminalCount += 1
+            #endif
+            return
+        }
+
+        switch terminal {
+        case let .error(error):
+            let errorNumber = Self.errnoValue(from: error)
+            tearDownSocket(
+                error: error,
+                cause: .readError,
+                initiator: Self.readErrorInitiator(errno: errorNumber),
+                errno: errorNumber
+            )
+        case let .eof(hasResidualData):
+            mcpConnectionLog("UnixSocketMCPTransport received EOF")
+            guard hasResidualData else {
+                tearDownSocket(
+                    error: nil,
+                    cause: .peerEOF,
+                    initiator: .peer
+                )
+                return
+            }
             // Treat residual incomplete frame as a protocol error
             let truncationError = MCPError.internalError("Connection closed with incomplete frame data")
-            readError = truncationError
-            tearDownSocket(error: truncationError)
-        } else {
-            tearDownSocket(error: nil)
+            tearDownSocket(
+                error: truncationError,
+                cause: .incompleteEOF,
+                initiator: .peer
+            )
         }
     }
 
@@ -752,7 +2044,8 @@ public actor UnixSocketMCPTransport: Transport {
     }
 
     /// Updates the activity timestamp (called from read handler).
-    private func noteActivity() {
+    private func noteActivity(from identity: ReaderIdentity) {
+        guard activeReaderOwnership?.identity == identity else { return }
         lastActivityTime = Date()
     }
 
@@ -761,9 +2054,9 @@ public actor UnixSocketMCPTransport: Transport {
         guard !streamFinished else { return }
         streamFinished = true
         if let error {
-            messageContinuation.finish(throwing: error)
+            inboundChannel.continuation.finish(throwing: error)
         } else {
-            messageContinuation.finish()
+            inboundChannel.continuation.finish()
         }
     }
 
@@ -771,7 +2064,9 @@ public actor UnixSocketMCPTransport: Transport {
     private func signalClosedOnce() {
         guard !closeSignaled else { return }
         closeSignaled = true
-        closeContinuation.yield()
-        closeContinuation.finish()
+        if let firstCloseSnapshot {
+            closeChannel.continuation.yield(firstCloseSnapshot)
+        }
+        closeChannel.continuation.finish()
     }
 }

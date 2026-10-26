@@ -1,5 +1,6 @@
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptFoundation
 import XCTest
 
 final class DebugSelectionFixtureParserTests: XCTestCase {

@@ -38,10 +38,12 @@ struct AgentAttachmentStripSnapshot: Equatable {
     private struct TaggedFileRenderKey: Equatable {
         let id: UUID
         let displayName: String
+        let relativePath: String
 
         init(_ attachment: AgentTaggedFileAttachment) {
             id = attachment.id
             displayName = attachment.displayName
+            relativePath = attachment.relativePath
         }
     }
 }
@@ -205,17 +207,20 @@ struct AgentAttachmentsStrip: View, Equatable {
     }
 
     private func fileAttachmentCard(_ attachment: AgentTaggedFileAttachment) -> some View {
-        HStack(spacing: 6) {
+        let path = attachment.relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = path.isEmpty ? attachment.displayName : path
+        return HStack(spacing: 6) {
             Image(systemName: "doc.fill")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                 .foregroundStyle(.secondary)
 
-            Text(attachment.displayName)
+            Text(title)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                 .foregroundStyle(.primary)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                .truncationMode(.middle)
                 .frame(maxWidth: fontPreset.scaledMetric(170), alignment: .leading)
+                .accessibilityLabel(attachment.relativePath)
 
             if allowsRemoval, let onRemoveTaggedFile {
                 Button {
@@ -234,7 +239,7 @@ struct AgentAttachmentsStrip: View, Equatable {
         .padding(.vertical, 6)
         .background(Color.secondary.opacity(0.08))
         .clipShape(Capsule())
-        .help(attachment.relativePath)
+        .hoverTooltip(attachment.relativePath)
     }
 
     private func title(for attachment: AgentImageAttachment) -> String {

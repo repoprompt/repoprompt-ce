@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, CustomStringConvertible {
     let rawValue: String
@@ -25,6 +26,7 @@ struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, Cus
     static let renameWorkspace = WorkspaceSaveSource("renameWorkspace")
     static let setWorkspaceHidden = WorkspaceSaveSource("setWorkspaceHidden")
     static let setWorkspaceHiddenFromSnapshot = WorkspaceSaveSource("setWorkspaceHiddenFromSnapshot")
+    static let consolidatedWorkspaceRestore = WorkspaceSaveSource("consolidatedWorkspaceRestore")
     static let rootReorder = WorkspaceSaveSource("rootReorder")
     static let rootRemove = WorkspaceSaveSource("rootRemove")
     static let rootAdd = WorkspaceSaveSource("rootAdd")
@@ -41,10 +43,13 @@ struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, Cus
     static let clearActiveAgentSessionIDReferences = WorkspaceSaveSource("clearActiveAgentSessionIDReferences")
     static let duplicateCleanupPreSwitch = WorkspaceSaveSource("duplicateCleanupPreSwitch")
     static let duplicateCleanupCanonicalMerge = WorkspaceSaveSource("duplicateCleanupCanonicalMerge")
+    static let duplicateCleanupRetireDuplicate = WorkspaceSaveSource("duplicateCleanupRetireDuplicate")
     static let createDefaultWorkspace = WorkspaceSaveSource("createDefaultWorkspace")
     static let normalizationWriteback = WorkspaceSaveSource("normalizationWriteback")
     static let refreshWorkspace = WorkspaceSaveSource("refreshWorkspace")
     static let mcpTabContextEndOfRun = WorkspaceSaveSource("mcpTabContextEndOfRun")
+    /// Finishes this presentation's own interrupted save during Agent admission (#1089).
+    static let agentAdmissionOwnedWorkingConvergence = WorkspaceSaveSource("agentAdmissionOwnedWorkingConvergence")
     #if DEBUG
         /// DEBUG diagnostics/fixture save attribution for workspace selection fixture apply flows.
         static let debugWorkspaceSelectionFixtureApply = WorkspaceSaveSource("debugWorkspaceSelectionFixtureApply")
@@ -68,7 +73,6 @@ struct WorkspaceSaveSelectionSummary: Equatable {
     let tabID: UUID?
     let signature: String?
     let selectedPaths: Int
-    let autoCodemapPaths: Int
     let sliceFiles: Int
     let sliceRanges: Int
     let codemapAutoEnabled: Bool
@@ -76,7 +80,6 @@ struct WorkspaceSaveSelectionSummary: Equatable {
     init(tabID: UUID?, selection: StoredSelection?) {
         self.tabID = tabID
         selectedPaths = selection?.selectedPaths.count ?? 0
-        autoCodemapPaths = selection?.autoCodemapPaths.count ?? 0
         sliceFiles = selection?.slices.count ?? 0
         sliceRanges = selection?.slices.values.reduce(0) { $0 + $1.count } ?? 0
         codemapAutoEnabled = selection?.codemapAutoEnabled ?? true
@@ -91,7 +94,6 @@ struct WorkspaceSaveSelectionSummary: Equatable {
         var result: [String: String] = [
             "\(prefix)TabID": tabID.map { String($0.uuidString.prefix(8)) } ?? "<none>",
             "\(prefix)SelectedPaths": "\(selectedPaths)",
-            "\(prefix)AutoCodemapPaths": "\(autoCodemapPaths)",
             "\(prefix)SliceFiles": "\(sliceFiles)",
             "\(prefix)SliceRanges": "\(sliceRanges)",
             "\(prefix)CodemapAutoEnabled": "\(codemapAutoEnabled)"
@@ -147,15 +149,17 @@ struct WorkspaceSavePayloadMetadata: Equatable {
     }
 }
 
-enum WorkspaceSaveTracer {
-    static func event(
+struct WorkspaceSaveTracer {
+    let restorePerfRecorder: any WorkspaceRestorePerfRecording
+
+    func event(
         _ name: String,
         metadata: WorkspaceSavePayloadMetadata?,
         url: URL? = nil,
         extra fields: [String: String] = [:]
     ) {
         #if DEBUG
-            guard WorkspaceRestorePerfLog.isEnabled else { return }
+            guard restorePerfRecorder.isEnabled else { return }
             var payload = fields
             if let metadata {
                 payload.merge(baseFields(for: metadata)) { current, _ in current }
@@ -163,11 +167,11 @@ enum WorkspaceSaveTracer {
             if let url {
                 payload["url"] = url.lastPathComponent
             }
-            WorkspaceRestorePerfLog.event(name, fields: payload)
+            restorePerfRecorder.event(name, fields: payload)
         #endif
     }
 
-    static func capture(
+    func capture(
         metadata: WorkspaceSavePayloadMetadata,
         url: URL? = nil,
         liveUI: StoredSelection?,
@@ -185,16 +189,16 @@ enum WorkspaceSaveTracer {
     }
 
     #if DEBUG
-        private static func baseFields(for metadata: WorkspaceSavePayloadMetadata) -> [String: String] {
+        private func baseFields(for metadata: WorkspaceSavePayloadMetadata) -> [String: String] {
             var fields: [String: String] = [
-                "payloadID": WorkspaceRestorePerfLog.shortID(metadata.payloadID),
+                "payloadID": restorePerfRecorder.shortID(metadata.payloadID),
                 "source": metadata.source.rawValue,
                 "windowID": metadata.owner.windowID.map(String.init) ?? "<none>",
-                "managerID": metadata.owner.managerID.map { WorkspaceRestorePerfLog.shortID($0) } ?? "<none>",
-                "workspaceID": WorkspaceRestorePerfLog.shortID(metadata.workspaceID),
+                "managerID": metadata.owner.managerID.map { restorePerfRecorder.shortID($0) } ?? "<none>",
+                "workspaceID": restorePerfRecorder.shortID(metadata.workspaceID),
                 "workspaceName": metadata.workspaceName,
                 "workspaceDateModified": String(format: "%.6f", metadata.workspaceDateModified.timeIntervalSince1970),
-                "activeTabID": metadata.activeTabID.map { WorkspaceRestorePerfLog.shortID($0) } ?? "<none>",
+                "activeTabID": metadata.activeTabID.map { restorePerfRecorder.shortID($0) } ?? "<none>",
                 "activeSelectionRevision": "\(metadata.activeSelectionRevision)",
                 "createdAt": String(format: "%.6f", metadata.createdAt.timeIntervalSince1970)
             ]

@@ -1,32 +1,12 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Per-stream identifier for cancellation.
 public typealias ChatStreamID = UUID
 
-/// Groups all token-usage info so we can extend it later.
-public struct ChatTokenInfo: Codable, Equatable {
-    public let promptTokens: Int?
-    public let completionTokens: Int?
-    public let cost: Double?
-
-    public init(
-        promptTokens: Int? = nil,
-        completionTokens: Int? = nil,
-        cost: Double? = nil
-    ) {
-        self.promptTokens = promptTokens
-        self.completionTokens = completionTokens
-        self.cost = cost
-    }
-}
-
-/// The output of our Chat stream, now carrying a TokenInfo block.
-public struct ChatStreamOutput {
-    public let text: String
-    public let reasoning: String?
-    public let tokens: ChatTokenInfo
-    public let isFinal: Bool
-}
+public typealias ChatTokenInfo = RepoPromptDomainRuntime.ChatTokenInfo
+public typealias ChatStreamTerminalOutcome = RepoPromptDomainRuntime.ChatStreamTerminalOutcome
+public typealias ChatStreamOutput = RepoPromptDomainRuntime.ChatStreamOutput
 
 struct PartialBuffer {
     var chunks: [String] = []
@@ -230,16 +210,51 @@ actor TaskManager {
 }
 
 public class AIQueriesService {
+    typealias SendPromptOverride = @Sendable (
+        _ message: AIMessage,
+        _ model: AIModel
+    ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>)
+    typealias CleanupProviderConversationOverride = @Sendable (
+        _ handle: ProviderConversationCleanupHandle,
+        _ model: AIModel,
+        _ action: ProviderConversationCleanupAction
+    ) async -> ProviderConversationCleanupOutcome
+
     private let taskManager = TaskManager()
+
+    #if DEBUG
+        /// Cancellation-connected replacement transport. Registration is acknowledged before
+        /// returning to sendMessage, including cancellation that raced registration.
+        func registerControlledStreamForTesting(
+            id: ChatStreamID,
+            continuation: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation,
+            producer: Task<Void, Never>
+        ) async {
+            await taskManager.storeContinuation(continuation, for: id)
+            await taskManager.addTask(producer, for: id)
+        }
+
+        func removeControlledStreamForTesting(id: ChatStreamID) async {
+            await taskManager.removeTask(for: id)
+        }
+    #endif
     private let chunkSizeThreshold = 8000 // e.g. 8KB
     private let timeThreshold: TimeInterval = 0.7 // 0.4 seconds
     private let providerPool: DisposableProviderPool
     private let keyManager: KeyManager
+    private let sendPromptOverride: SendPromptOverride?
+    private let cleanupProviderConversationOverride: CleanupProviderConversationOverride?
     private var currentModel: AIModel
 
-    init(keyManager: KeyManager) {
+    init(
+        keyManager: KeyManager,
+        sendPromptOverride: SendPromptOverride? = nil,
+        cleanupProviderConversationOverride: CleanupProviderConversationOverride? = nil
+    ) {
         currentModel = .claude4Sonnet
         self.keyManager = keyManager
+        self.sendPromptOverride = sendPromptOverride
+        self.cleanupProviderConversationOverride = cleanupProviderConversationOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -247,10 +262,14 @@ public class AIQueriesService {
         model: AIModel,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
-        keyManager: KeyManager
+        keyManager: KeyManager,
+        sendPromptOverride: SendPromptOverride? = nil,
+        cleanupProviderConversationOverride: CleanupProviderConversationOverride? = nil
     ) {
         currentModel = model
         self.keyManager = keyManager
+        self.sendPromptOverride = sendPromptOverride
+        self.cleanupProviderConversationOverride = cleanupProviderConversationOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -281,15 +300,80 @@ public class AIQueriesService {
         return trimmed.hasPrefix("**") || trimmed.contains("****")
     }
 
+    static func transportActivityOutput(for result: AIStreamResult) -> ChatStreamOutput? {
+        guard result.type == AIStreamResult.transportActivityType else { return nil }
+        return ChatStreamOutput(
+            text: "",
+            reasoning: nil,
+            tokens: ChatTokenInfo(),
+            isTransportActivity: true
+        )
+    }
+
+    static func terminalOutcome(for result: AIStreamResult) throws -> ChatStreamTerminalOutcome? {
+        switch result.type {
+        case "message_stop":
+            return .completed
+        case AIStreamResult.incompleteType:
+            guard let reason = result.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !reason.isEmpty
+            else {
+                throw AIProviderError.invalidResponse(
+                    detail: "The provider reported incomplete termination without a reason."
+                )
+            }
+            return .incomplete(reason: reason)
+        default:
+            return nil
+        }
+    }
+
+    static func cleanupHandle(for result: AIStreamResult, model: AIModel) -> ProviderConversationCleanupHandle? {
+        if let explicit = result.cleanupHandle {
+            return explicit.hasProviderIdentifier ? explicit : nil
+        }
+        guard let providerSessionID = result.providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !providerSessionID.isEmpty
+        else {
+            return nil
+        }
+        let handle = ProviderConversationCleanupHandle(
+            provider: String(describing: model.providerType),
+            sessionID: providerSessionID
+        )
+        return handle.hasProviderIdentifier ? handle : nil
+    }
+
     /// Cancel only the specified stream.
     func cancelStream(id: ChatStreamID) async {
         await taskManager.cancelTask(for: id)
+    }
+
+    func cleanupProviderConversation(
+        handle: ProviderConversationCleanupHandle,
+        model: AIModel,
+        action: ProviderConversationCleanupAction = .delete
+    ) async -> ProviderConversationCleanupOutcome {
+        if let cleanupProviderConversationOverride {
+            return await cleanupProviderConversationOverride(handle, model, action)
+        }
+        do {
+            let provider = try await providerPool.createProvider(for: model)
+            defer { Task { await provider.dispose() } }
+            return await provider.cleanupConversation(handle, action: action)
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
     }
 
     func sendPrompt(
         _ aiMessage: AIMessage,
         model: AIModel
     ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>) {
+        if let sendPromptOverride {
+            return try await sendPromptOverride(aiMessage, model)
+        }
+
         let taskId = UUID()
         await taskManager.createPartialBuffer(for: taskId)
 
@@ -320,6 +404,7 @@ public class AIQueriesService {
                         var wasCancelled = false
                         var sawMessageStop = false
                         var lastTokenInfo: ChatTokenInfo?
+                        var cleanupHandle: ProviderConversationCleanupHandle?
                         let shouldEagerlyFlushReasoning = Self.shouldEagerlyFlushReasoningSummaries(for: model)
 
                         // Loop through the partial stream
@@ -330,6 +415,11 @@ public class AIQueriesService {
                             if Task.isCancelled || managerCancelled {
                                 wasCancelled = true
                                 break streamLoop
+                            }
+
+                            if let activityOutput = Self.transportActivityOutput(for: result) {
+                                continuation.yield(activityOutput)
+                                continue streamLoop
                             }
 
                             var shouldYield = false
@@ -365,6 +455,10 @@ public class AIQueriesService {
                                 }
                             }
 
+                            if let resultCleanupHandle = Self.cleanupHandle(for: result, model: model) {
+                                cleanupHandle = resultCleanupHandle
+                            }
+
                             // Track last known token info for final flush
                             let chunkTokenInfo = ChatTokenInfo(
                                 promptTokens: result.promptTokens,
@@ -375,11 +469,12 @@ public class AIQueriesService {
                                 lastTokenInfo = chunkTokenInfo
                             }
 
-                            // If the provider signals end of message or buffers are ready to be flushed.
-                            if result.type == "message_stop" || shouldYield {
+                            let terminalOutcome = try Self.terminalOutcome(for: result)
+
+                            // Flush when the provider reports a terminal outcome or buffers are ready.
+                            if terminalOutcome != nil || shouldYield {
                                 let (combinedText, combinedReasoning, bufferedTokenInfo, _) = await self.taskManager.flushBuffer(for: taskId)
-                                let isFinal = (result.type == "message_stop")
-                                if isFinal { sawMessageStop = true }
+                                if terminalOutcome == .completed { sawMessageStop = true }
 
                                 // Prefer buffered counts; fall back to this chunk's counts
                                 let tokenInfo = bufferedTokenInfo ?? chunkTokenInfo
@@ -389,10 +484,11 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: isFinal
+                                        terminalOutcome: terminalOutcome,
+                                        cleanupHandle: cleanupHandle
                                     )
                                 )
-                                if isFinal {
+                                if terminalOutcome != nil {
                                     break streamLoop
                                 }
                             }
@@ -404,7 +500,7 @@ public class AIQueriesService {
                             _ = await self.taskManager.flushBuffer(for: taskId)
                             continuation.finish(throwing: CancellationError())
                         } else if !sawMessageStop {
-                            // Stream ended without message_stop - flush any remaining buffer as final
+                            // Stream ended without message_stop - flush remaining content as non-final
                             let (combinedText, combinedReasoning, bufferedTokenInfo, didHaveContent) = await self.taskManager.flushBuffer(for: taskId)
                             if didHaveContent {
                                 let tokenInfo = bufferedTokenInfo ?? lastTokenInfo ?? ChatTokenInfo()
@@ -413,7 +509,7 @@ public class AIQueriesService {
                                         text: combinedText,
                                         reasoning: combinedReasoning.map(ReasoningTextFormatter.normalize),
                                         tokens: tokenInfo,
-                                        isFinal: true
+                                        cleanupHandle: cleanupHandle
                                     )
                                 )
                             }
@@ -477,7 +573,7 @@ public class AIQueriesService {
         }
     }
 
-    func testOpenAIAPI(with apiKey: String? = nil, baseURL: String? = nil) async throws -> Bool {
+    func testOpenAIAPI(with apiKey: String? = nil, baseURL: String? = nil, httpCredentialConsentEndpoint: String? = nil) async throws -> Bool {
         let key: String? = if let apiKey {
             apiKey
         } else {
@@ -490,6 +586,9 @@ public class AIQueriesService {
         let overrideRaw = baseURL ?? UserDefaults.standard.string(forKey: "customBaseURLOpenAI")
         let split = OpenAIURLHelper.splitBaseURLAndVersion(overrideRaw)
         let base = split.base
+        if let overrideRaw, !overrideRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, base == nil {
+            throw ProviderEndpointConsent.ValidationError.invalidEndpoint
+        }
         // If a version is present in the override string, prefer it; otherwise look for stored override
         let storedVersion = UserDefaults.standard.string(forKey: "customOpenAIVersionOverride")
         let version = split.version ?? storedVersion
@@ -499,7 +598,8 @@ public class AIQueriesService {
             apiKey: key,
             baseURL: base,
             configuredMaxTokens: nil,
-            overrideVersion: version
+            overrideVersion: version,
+            httpCredentialConsentEndpoint: baseURL == nil ? UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint") : httpCredentialConsentEndpoint
         )
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
@@ -601,6 +701,29 @@ public class AIQueriesService {
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
 
+    func testZAICodingPlanAPI(with apiKey: String? = nil) async throws -> Bool {
+        let key: String = if let apiKey {
+            apiKey
+        } else {
+            try await keyManager.getAPIKey(for: .zAI) ?? ""
+        }
+        let provider = ZAIProvider(apiKey: key, endpoint: .codingPlan)
+        let hasCodingPlanAccess = try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .zaiGLM47) }
+        if hasCodingPlanAccess {
+            return true
+        }
+
+        let generalProvider = ZAIProvider(apiKey: key, endpoint: .generalAPI)
+        let hasGeneralAccess = try await withTimeout(seconds: 30) { try await generalProvider.testAPIKey() }
+        if hasGeneralAccess {
+            throw AIProviderError.invalidConfiguration(
+                detail: "This Z.ai API key is valid, but it does not have an active GLM Coding Plan. CC Zai in Agent Mode requires a Z.ai GLM Coding Plan subscription."
+            )
+        }
+
+        return false
+    }
+
     private func withTimeout<T>(seconds: TimeInterval, operation: @escaping () async throws -> T) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {
@@ -618,12 +741,13 @@ public class AIQueriesService {
 
     struct TimeoutError: Error {}
 
-    func testCustomProviderAPI(url: String, apiKey: String, model: String) async throws -> Bool {
+    func testCustomProviderAPI(url: String, apiKey: String, model: String, httpCredentialConsentEndpoint: String? = nil) async throws -> Bool {
         try await OpenAIProvider.testCustomProviderAPI(
             url: url,
             apiKey: apiKey,
             model: model,
-            timeout: 30.0
+            timeout: 30.0,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 }
@@ -642,7 +766,8 @@ extension OpenAIProvider {
         url: String,
         apiKey: String,
         model: String,
-        timeout: TimeInterval = 8.0
+        timeout: TimeInterval = 8.0,
+        httpCredentialConsentEndpoint: String? = nil
     ) async throws -> Bool {
         // ── 1. Normalize and split base + version ────────────────────────────────
         let split = OpenAIURLHelper.splitBaseURLAndVersion(url)
@@ -655,7 +780,8 @@ extension OpenAIProvider {
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: 16, // keep the test cheap
-            overrideVersion: split.version
+            overrideVersion: split.version,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
 
         // ── 3. Perform a tiny completion call ───────────────────────────────

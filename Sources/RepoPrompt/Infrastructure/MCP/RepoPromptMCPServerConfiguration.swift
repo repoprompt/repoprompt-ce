@@ -14,6 +14,9 @@ struct RepoPromptMCPServerConfiguration: Equatable, Hashable {
     }
 
     static let defaultServerName = "RepoPromptCE"
+    /// Stable Grok-only name avoids the common imported `RepoPromptCE` collision: Grok
+    /// drops client servers matching disabled Claude/Cursor imports, even on session/load.
+    static let grokBuildRuntimeServerName = "RepoPromptCEGrokRuntime"
 
     let name: String
     let command: String
@@ -33,7 +36,7 @@ struct RepoPromptMCPServerConfiguration: Equatable, Hashable {
     }
 
     static var repoPrompt: Self {
-        Self()
+        Self(args: ["--backend", "app"])
     }
 
     var environmentDictionary: [String: String] {
@@ -61,6 +64,7 @@ struct RepoPromptMCPServerConfiguration: Equatable, Hashable {
 
     var acpJSONObject: [String: Any] {
         [
+            "type": "stdio",
             "name": name,
             "command": command,
             "args": args,

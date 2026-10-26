@@ -5,7 +5,7 @@ protocol CursorACPModelDiscoveryClient: Sendable {
 }
 
 struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
-    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
+    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
     typealias ControllerFactory = @Sendable (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
 
     private let providerFactory: ProviderFactory
@@ -14,16 +14,9 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
     init(
         providerFactory: @escaping ProviderFactory = { agent, modelString in
             if agent == .cursor {
-                return CursorACPAgentProvider(
-                    config: CursorAgentConfig(
-                        enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-                        modelString: modelString,
-                        includeRepoPromptMCPServer: false,
-                        cleanupProjectMCPConfig: false
-                    )
-                )
+                return Self.makeCursorProvider(modelString: modelString)
             }
-            return ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+            return try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -31,6 +24,23 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
     ) {
         self.providerFactory = providerFactory
         self.controllerFactory = controllerFactory
+    }
+
+    #if DEBUG
+        static func test_makeCursorProvider(modelString: String?) -> CursorACPAgentProvider {
+            makeCursorProvider(modelString: modelString)
+        }
+    #endif
+
+    private static func makeCursorProvider(modelString: String?) -> CursorACPAgentProvider {
+        CursorACPAgentProvider(
+            config: CursorAgentConfig(
+                enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
+                modelString: modelString,
+                includeRepoPromptMCPServer: false,
+                cleanupProjectMCPApproval: false
+            )
+        )
     }
 
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels? {
@@ -43,8 +53,8 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
             attachments: [],
             taskLabelKind: nil
         )
-        guard let provider = providerFactory(.cursor, preferredModel) else { return nil }
-        let support = await provider.support(for: request)
+        guard let provider = try await providerFactory(.cursor, preferredModel) else { return nil }
+        let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(
                 detail: support.reason ?? "Cursor ACP is not available."
@@ -54,8 +64,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
         let controller = try controllerFactory(provider, request)
         do {
             _ = try await controller.bootstrap()
-            try? await controller.setSessionModel(preferredModel)
-            let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .cursor)
+            let snapshot = try await controller.cursorAvailableModelCatalog()
             await controller.shutdown()
             return snapshot
         } catch {
@@ -79,14 +88,24 @@ actor CursorACPModelPollingService {
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date
+        let isLiveDiscovery: Bool
     }
 
     private let client: any CursorACPModelDiscoveryClient
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    private var inFlightRefresh: Task<Void, Never>?
+    struct RefreshResult {
+        let isReady: Bool
+        let advertisedCount: Int?
+        let errorMessage: String?
+    }
+
+    private var inFlightRefresh: Task<RefreshResult, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
+    #if DEBUG
+        private var testRefreshNowInFlightJoinObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
+    #endif
     private var latest: Snapshot?
     private var preferredWorkspacePath: String?
     private var isShutdown = false
@@ -100,9 +119,23 @@ actor CursorACPModelPollingService {
     }
 
     func latestSnapshot() async -> Snapshot? {
-        if let latest { return latest }
+        if let latest {
+            return latest
+        }
         return await registrySnapshotAfterWarmingStore()
     }
+
+    #if DEBUG
+        func test_refreshNowInFlightJoinEvents() -> AsyncStream<Void> {
+            let id = UUID()
+            let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            testRefreshNowInFlightJoinObservers[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeTestRefreshNowInFlightJoinObserver(id) }
+            }
+            return stream
+        }
+    #endif
 
     func discoverOnce(workspacePath: String?) async throws -> Snapshot? {
         guard !isShutdown else { return nil }
@@ -147,14 +180,21 @@ actor CursorACPModelPollingService {
         return stream
     }
 
-    func refreshNow(workspacePath: String?) async {
-        guard !isShutdown else { return }
+    @discardableResult
+    func refreshNow(workspacePath: String?) async -> Bool {
+        await refreshCatalog(workspacePath: workspacePath).isReady
+    }
+
+    func refreshCatalog(workspacePath: String?) async -> RefreshResult {
+        guard !isShutdown else { return .init(isReady: false, advertisedCount: nil, errorMessage: "Cursor discovery is stopped.") }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
-            await existing.value
-            return
+            #if DEBUG
+                publishTestRefreshNowInFlightJoin()
+            #endif
+            return await existing.value
         }
-        await performRefresh()
+        return await performRefresh()
     }
 
     func shutdown(finishSubscribers: Bool = true) async {
@@ -163,6 +203,13 @@ actor CursorACPModelPollingService {
         pollingTask = nil
         inFlightRefresh?.cancel()
         inFlightRefresh = nil
+        #if DEBUG
+            let activeTestJoinObservers = testRefreshNowInFlightJoinObservers
+            testRefreshNowInFlightJoinObservers.removeAll()
+            for continuation in activeTestJoinObservers.values {
+                continuation.finish()
+            }
+        #endif
         if finishSubscribers {
             let activeContinuations = continuations
             continuations.removeAll()
@@ -178,7 +225,7 @@ actor CursorACPModelPollingService {
         pollingTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                await performRefresh()
+                _ = await performRefresh()
                 do {
                     try await Task.sleep(nanoseconds: intervalNanos)
                 } catch {
@@ -199,35 +246,65 @@ actor CursorACPModelPollingService {
         stopPollingIfIdle()
     }
 
-    private func performRefresh() async {
-        guard !isShutdown else { return }
+    #if DEBUG
+        private func publishTestRefreshNowInFlightJoin() {
+            for continuation in testRefreshNowInFlightJoinObservers.values {
+                continuation.yield(())
+            }
+        }
+
+        private func removeTestRefreshNowInFlightJoinObserver(_ id: UUID) {
+            testRefreshNowInFlightJoinObservers.removeValue(forKey: id)
+        }
+    #endif
+
+    private func performRefresh() async -> RefreshResult {
+        guard !isShutdown else { return .init(isReady: false, advertisedCount: nil, errorMessage: "Cursor discovery is stopped.") }
         if let existing = inFlightRefresh {
-            await existing.value
-            return
+            return await existing.value
         }
 
         let workspacePath = preferredWorkspacePath
-        let task = Task { [weak self, workspacePath] in
-            guard let self else { return }
+        let task = Task<RefreshResult, Never> { [weak self, workspacePath] in
+            guard let self else { return .init(isReady: false, advertisedCount: nil, errorMessage: nil) }
             do {
-                guard let discovered = try await client.discoverModels(workspacePath: workspacePath) else { return }
-                guard !Task.isCancelled else { return }
-                await applyRefreshResult(discovered)
+                let discovered = try await client.discoverModels(workspacePath: workspacePath)
+                guard !Task.isCancelled else { return .init(isReady: false, advertisedCount: nil, errorMessage: nil) }
+                if let discovered {
+                    await applyRefreshResult(discovered)
+                    return .init(isReady: true, advertisedCount: discovered.options.count, errorMessage: nil)
+                }
+                await publishLiveReadinessWithoutModels()
+                return .init(isReady: true, advertisedCount: nil, errorMessage: "Cursor returned no model metadata. Previous models were kept.")
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
+                return .init(isReady: false, advertisedCount: nil, errorMessage: error.localizedDescription)
             }
         }
         inFlightRefresh = task
         defer { inFlightRefresh = nil }
-        await task.value
+        return await task.value
+    }
+
+    private func publishLiveReadinessWithoutModels() {
+        guard !isShutdown else { return }
+        let models = latest?.models
+            ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)
+            ?? ACPDiscoveredSessionModels(options: [], currentModelRaw: nil)
+        let snapshot = Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: true)
+        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
+        latest = snapshot
+        for continuation in continuations.values {
+            continuation.yield(snapshot)
+        }
     }
 
     private func applyRefreshResult(_ discovered: ACPDiscoveredSessionModels) {
         guard !isShutdown else { return }
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .cursor)
         guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor) else { return }
-        let snapshot = Snapshot(models: normalized, fetchedAt: Date())
-        guard latest?.models != snapshot.models else { return }
+        let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
+        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
         latest = snapshot
         for continuation in continuations.values {
             continuation.yield(snapshot)
@@ -238,7 +315,7 @@ actor CursorACPModelPollingService {
         guard let models = await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .cursor) else {
             return nil
         }
-        return Snapshot(models: models, fetchedAt: Date())
+        return Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: false)
     }
 
     private func normalizedWorkspacePath(_ path: String?) -> String? {

@@ -29,6 +29,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
     /// effort level delegates end-to-end to this closure so active Claude sessions pick
     /// up the new effort via the existing AgentModeViewModel scheduling path.
     var onClaudeEffortLevelChanged: ((ClaudeCodeEffortLevel) -> Void)?
+    var claudeEffortLevelProvider: (() -> ClaudeCodeEffortLevel?)?
 
     init(
         defaults: UserDefaults = .standard,
@@ -37,6 +38,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         diagnostics: AgentPermissionStorageDiagnosticsViewModel? = nil,
         notificationCenter: NotificationCenter = .default,
         onProviderPreferenceChanged: ((AgentProviderBindingID) -> Void)? = nil,
+        claudeEffortLevelProvider: (() -> ClaudeCodeEffortLevel?)? = nil,
         onClaudeEffortLevelChanged: ((ClaudeCodeEffortLevel) -> Void)? = nil
     ) {
         self.defaults = defaults
@@ -58,6 +60,7 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         self.notificationCenter = notificationCenter
         self.onProviderPreferenceChanged = onProviderPreferenceChanged
         self.onClaudeEffortLevelChanged = onClaudeEffortLevelChanged
+        self.claudeEffortLevelProvider = claudeEffortLevelProvider
         subscribeToSecureStoreChanges()
     }
 
@@ -75,7 +78,10 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
     func controlsBinding(for providerID: AgentProviderBindingID) -> AgentProviderControlsBinding? {
         guard let bindingService else { return nil }
         _ = revision // ensure SwiftUI redraws when this VM publishes changes
-        return bindingService.topLevelSettingsControlsBinding(providerID: providerID)
+        return bindingService.topLevelSettingsControlsBinding(
+            providerID: providerID,
+            claudeEffortLevel: providerID == .claude ? claudeEffortLevelProvider?() : nil
+        )
     }
 
     func summaries(
@@ -97,72 +103,57 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
         finalizeProviderMutation(for: id.providerID)
     }
 
-    func setCodexBashToolEnabled(_ enabled: Bool) {
+    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) {
         if let bindingService {
-            bindingService.setCodexBashToolEnabled(enabled)
+            bindingService.applyCodexToolSettingMutation(mutation)
         } else {
-            CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            switch mutation {
+            case let .bashTool(enabled):
+                CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            case let .searchTool(enabled):
+                CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
+            case let .goalSupport(enabled):
+                CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
+            case let .computerUse(enabled):
+                CodexAgentModeBooleanPreference.computerUse.setEnabled(enabled, defaults: defaults)
+            case let .reasoningSummaries(enabled):
+                CodexAgentModeBooleanPreference.reasoningSummaries.setEnabled(enabled, defaults: defaults)
+            case let .memories(enabled):
+                CodexAgentModeBooleanPreference.memories.setEnabled(enabled, defaults: defaults)
+            case let .apps(enabled):
+                CodexAgentModeBooleanPreference.apps.setEnabled(enabled, defaults: defaults)
+            case let .plugins(enabled):
+                CodexAgentModeBooleanPreference.plugins.setEnabled(enabled, defaults: defaults)
+            case let .mcpElicitation(enabled):
+                CodexAgentModeBooleanPreference.mcpElicitation.setEnabled(enabled, defaults: defaults)
+            case let .toolSuggestions(enabled):
+                CodexAgentModeBooleanPreference.toolSuggestions.setEnabled(enabled, defaults: defaults)
+            case let .mcpServer(normalizedName, enabled):
+                CodexAgentToolPreferences.setMCPServerEnabled(
+                    normalizedName: normalizedName,
+                    isEnabled: enabled,
+                    defaults: defaults,
+                    secureStore: securePermissions
+                )
+            }
         }
         finalizeProviderMutation(for: .codex)
     }
 
-    func setCodexSearchToolEnabled(_ enabled: Bool) {
+    func applyClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation) {
         if let bindingService {
-            bindingService.setCodexSearchToolEnabled(enabled)
+            bindingService.applyClaudeToolSettingMutation(mutation)
         } else {
-            CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
-        }
-        finalizeProviderMutation(for: .codex)
-    }
-
-    func setCodexGoalSupportEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setCodexGoalSupportEnabled(enabled)
-        } else if defaults === UserDefaults.standard {
-            GlobalSettingsStore.shared.setCodexGoalSupportEnabled(enabled)
-        } else {
-            CodexGoalSupport.setEnabled(enabled, defaults: defaults)
-        }
-        finalizeProviderMutation(for: .codex)
-    }
-
-    func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
-        if let bindingService {
-            bindingService.setCodexMCPServerEnabled(normalizedName: normalizedName, enabled: enabled)
-        } else {
-            CodexAgentToolPreferences.setMCPServerEnabled(
-                normalizedName: normalizedName,
-                isEnabled: enabled,
-                defaults: defaults,
-                secureStore: securePermissions
-            )
-        }
-        finalizeProviderMutation(for: .codex)
-    }
-
-    func setClaudeBashToolEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setClaudeBashToolEnabled(enabled)
-        } else {
-            ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        }
-        finalizeProviderMutation(for: .claude)
-    }
-
-    func setClaudeMCPStrictModeEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setClaudeMCPStrictModeEnabled(enabled)
-        } else {
-            ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
-        }
-        finalizeProviderMutation(for: .claude)
-    }
-
-    func setClaudeToolSearchEnabled(_ enabled: Bool) {
-        if let bindingService {
-            bindingService.setClaudeToolSearchEnabled(enabled)
-        } else {
-            ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
+            switch mutation {
+            case let .bashTool(enabled):
+                ClaudeAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            case let .mcpStrictMode(enabled):
+                ClaudeAgentToolPreferences.setMCPStrictModeEnabled(enabled, defaults: defaults, secureStore: securePermissions)
+            case let .toolSearch(enabled):
+                ClaudeAgentToolPreferences.setToolSearchEnabled(enabled, defaults: defaults)
+            case let .agentModePromptDelivery(delivery):
+                ClaudeAgentToolPreferences.setAgentModePromptDelivery(delivery, defaults: defaults)
+            }
         }
         finalizeProviderMutation(for: .claude)
     }
@@ -202,8 +193,14 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
             ClaudeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .openCode(level):
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .antigravity(level):
+            AntigravityAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .grokBuild(level):
+            GrokBuildAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .devin(level):
+            DevinAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
     }
 

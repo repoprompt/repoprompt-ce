@@ -26,7 +26,7 @@ struct MCPRoutingState: Codable {
         var lastWorkspaceID: UUID?
 
         /// Last known workspace instance number - deterministic after restore
-        /// Used as fallback when workspace UUID doesn't match (e.g., user didn't restore workspaces)
+        /// Used with the stable workspace UUID to validate a target after restart.
         var lastWorkspaceInstanceNumber: Int?
 
         /// For debugging / dashboards
@@ -45,10 +45,7 @@ enum MCPRoutingStateStore {
     /// Set to true to enable debug logging for MCP routing state operations
     static var debugLoggingEnabled = false
     private static var url: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(
-            "Library/Application Support/RepoPrompt/mcp-routing.json"
-        )
+        MCPFilesystemConstants.identity.routingStateURL()
     }
 
     static func load() -> MCPRoutingState {

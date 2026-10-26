@@ -100,7 +100,7 @@ struct AgentPermissionsPopoverView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Open Agent Permissions → Sub-Agents")
+                .hoverTooltip("Open Agent Permissions → Sub-Agents")
                 .accessibilityLabel(
                     "\(deepLinkTitle(for: subagentVM.globalPolicy)) in Agent Permissions settings"
                 )

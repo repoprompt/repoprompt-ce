@@ -1,8 +1,9 @@
-@testable import RepoPrompt
+@testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
-final class WindowCloseCoordinatorDecisionTests: XCTestCase {
+final class WindowCloseCoordinatorPolicyTests: XCTestCase {
     func testTerminationAndAuthorizationAllowDespiteOtherwiseBlockingImpact() {
         let otherwiseBlockingSnapshot = makeSnapshot(
             isLastAppWindow: true,
@@ -83,11 +84,7 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
         let cases: [(name: String, snapshot: WindowCloseImpactSnapshot, expected: WindowCloseDecision)] = [
             (
                 "last tools-enabled window without connections",
-                makeSnapshot(
-                    isLastAppWindow: true,
-                    isLastMCPEnabledWindow: true,
-                    mcp: mcp(toolsEnabled: true)
-                ),
+                makeSnapshot(isLastAppWindow: true, isLastMCPEnabledWindow: true, mcp: mcp(toolsEnabled: true)),
                 .confirm(lastWindowMCPConfirmation(connectionCount: 0))
             ),
             (
@@ -101,17 +98,10 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
             ),
             (
                 "last MCP-enabled window with idle connection",
-                makeSnapshot(
-                    isLastMCPEnabledWindow: true,
-                    mcp: mcp(liveConnectionCount: 1, hasIdleLiveConnections: true)
-                ),
+                makeSnapshot(isLastMCPEnabledWindow: true, mcp: mcp(liveConnectionCount: 1, hasIdleLiveConnections: true)),
                 .confirm(disconnectMCPConfirmation(connectionCount: 1))
             ),
-            (
-                "non-last MCP-enabled window with idle connection",
-                makeSnapshot(mcp: mcp(liveConnectionCount: 1, hasIdleLiveConnections: true)),
-                .allow
-            ),
+            ("non-last MCP-enabled window with idle connection", makeSnapshot(mcp: mcp(liveConnectionCount: 1, hasIdleLiveConnections: true)), .allow),
             ("ordinary close", makeSnapshot(), .allow)
         ]
 
@@ -133,12 +123,7 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
     }
 
     private func activity(id: String, count: Int, singular: String, plural: String) -> WindowCloseActivityItem {
-        WindowCloseActivityItem(
-            id: id,
-            count: count,
-            singularLabel: singular,
-            pluralLabel: plural
-        )
+        WindowCloseActivityItem(id: id, count: count, singularLabel: singular, pluralLabel: plural)
     }
 
     private func makeSnapshot(
@@ -208,5 +193,49 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
             secondaryButtonTitle: "Hide and Keep Running",
             secondaryAction: .backgroundWindow
         )
+    }
+}
+
+final class WindowPresentationVisibilityPolicyTests: XCTestCase {
+    func testPresentationRequiresEveryOnScreenCondition() {
+        let cases: [(visible: Bool, minimized: Bool, unoccluded: Bool, hidden: Bool, expected: Bool)] = [
+            (true, false, true, false, true),
+            (false, false, true, false, false),
+            (true, true, true, false, false),
+            (true, false, false, false, false),
+            (true, false, true, true, false)
+        ]
+        for item in cases {
+            XCTAssertEqual(WindowPresentationVisibility.isVisible(
+                windowIsVisible: item.visible,
+                isMiniaturized: item.minimized,
+                occlusionIsVisible: item.unoccluded,
+                appIsHidden: item.hidden
+            ), item.expected)
+        }
+    }
+}
+
+@MainActor
+final class WindowStateAttachmentAdmissionTests: XCTestCase {
+    func testClosingRefusesLateAttachmentButStillAllowsDetachCleanup() async {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+
+        let state = WindowState()
+        let window = NSObject()
+        var updates: [String] = []
+        state.performWindowAttachment(window) { _ in updates.append("attach") }
+        XCTAssertEqual(updates, ["attach"])
+
+        state.beginClose()
+        state.performWindowAttachment(window) { _ in updates.append("late attach") }
+        state.performWindowAttachment(nil as NSObject?) { _ in updates.append("detach cleanup") }
+        state.beginClose()
+        state.performWindowAttachment(window) { _ in updates.append("attach after repeated close") }
+
+        XCTAssertEqual(updates, ["attach", "detach cleanup"])
+        await state.tearDown()
     }
 }

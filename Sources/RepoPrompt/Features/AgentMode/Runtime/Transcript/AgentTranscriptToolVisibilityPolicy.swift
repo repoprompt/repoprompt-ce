@@ -109,15 +109,16 @@ enum AgentTranscriptToolVisibilityPolicy {
     }
 
     private static func canonicalAlias(forNormalizedName normalized: String) -> String? {
-        switch normalized {
+        if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(normalized) {
+            return webCanonical
+        }
+        return switch normalized {
         case "readfile", "read_file":
             "read_file"
         case "read_file_tool", "read_file_contents":
             "read_file"
         case "file_search", "filesearch", "grep":
             "file_search"
-        case "search", "web_search", "web_search_request", "google_web_search", "search_web":
-            "search"
         case "bash", "shell", "local_shell", "unified_exec", "exec", "exec_command", "run_shell_command", "command":
             "bash"
         case "filechange", "file_change":

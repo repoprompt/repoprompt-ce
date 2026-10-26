@@ -156,10 +156,12 @@ public extension ClaudeCompatibleBackendID {
                 baseURL: "https://api.z.ai/api/anthropic",
                 auth: .anthropicAuthToken,
                 modelBehavior: .claudeSlotMapping(ClaudeCompatibleSlotMapping(
-                    haiku: "glm-4.7",
-                    sonnet: "glm-5-turbo",
-                    opus: "glm-5.1"
-                ))
+                    haiku: "glm-4.5-air",
+                    sonnet: "glm-5.2[1m]",
+                    opus: "glm-5.2[1m]"
+                )),
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .kimi:
             ClaudeCompatibleBackendConfig(
@@ -168,7 +170,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "https://api.kimi.com/coding/",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .custom:
             ClaudeCompatibleBackendConfig(
@@ -177,7 +181,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         }
     }
@@ -206,16 +212,7 @@ public extension ClaudeCompatibleBackendConfig {
     }
 
     var normalizedBaseURL: String? {
-        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let components = URLComponents(string: trimmed),
-              let scheme = components.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              components.host?.isEmpty == false
-        else {
-            return nil
-        }
-        return trimmed
+        ProviderEndpointConsentPolicy.endpointIdentity(baseURL)
     }
 
     var normalized: ClaudeCompatibleBackendConfig {
@@ -231,12 +228,17 @@ public extension ClaudeCompatibleBackendConfig {
             displayName: normalizedDisplayName,
             baseURL: baseURL.trimmingCharacters(in: .whitespacesAndNewlines),
             auth: auth,
-            modelBehavior: normalizedBehavior
+            modelBehavior: normalizedBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 
     var isValid: Bool {
-        guard normalizedBaseURL != nil else { return false }
+        guard normalizedBaseURL != nil,
+              requestTimeoutMilliseconds.map(ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains) ?? true,
+              contextWindowTokens.map(ClaudeCompatibleBackendLimits.contextWindowTokens.contains) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true
@@ -244,10 +246,91 @@ public extension ClaudeCompatibleBackendConfig {
             return mapping.isValid
         }
     }
+
+    func withSlotOverride(slot: String, backendModelID: String) -> ClaudeCompatibleBackendConfig {
+        guard case let .claudeSlotMapping(mapping) = modelBehavior else { return self }
+        let normalizedMapping = mapping.normalized
+        let overrideBehavior: ClaudeCompatibleBackendModelBehavior
+        switch slot.lowercased() {
+        case ClaudeCompatibleModelNormalizer.haikuRequestedModelRawValue:
+            overrideBehavior = .claudeSlotMapping(ClaudeCompatibleSlotMapping(
+                haiku: backendModelID,
+                sonnet: normalizedMapping.sonnet,
+                opus: normalizedMapping.opus
+            ))
+        case ClaudeCompatibleModelNormalizer.defaultRequestedModelRawValue:
+            overrideBehavior = .claudeSlotMapping(ClaudeCompatibleSlotMapping(
+                haiku: normalizedMapping.haiku,
+                sonnet: backendModelID,
+                opus: normalizedMapping.opus
+            ))
+        case ClaudeCompatibleModelNormalizer.opusRequestedModelRawValue:
+            overrideBehavior = .claudeSlotMapping(ClaudeCompatibleSlotMapping(
+                haiku: normalizedMapping.haiku,
+                sonnet: normalizedMapping.sonnet,
+                opus: backendModelID
+            ))
+        default:
+            return self
+        }
+        return ClaudeCompatibleBackendConfig(
+            id: id,
+            isEnabled: isEnabled,
+            displayName: displayName,
+            baseURL: baseURL,
+            auth: auth,
+            modelBehavior: overrideBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
+        )
+    }
+}
+
+struct ClaudeCompatibleEffortEncodedModel: Equatable {
+    private static let knownEffortSuffixes: Set<String> = ["low", "medium", "high", "max", "xhigh", "x-high"]
+
+    let baseModel: String?
+    let effortRaw: String?
+
+    init(raw: String?) {
+        guard let raw else {
+            baseModel = nil
+            effortRaw = nil
+            return
+        }
+
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            baseModel = nil
+            effortRaw = nil
+            return
+        }
+
+        let lowercased = trimmed.lowercased()
+        if let separator = lowercased.lastIndex(of: ":") {
+            let suffixStart = lowercased.index(after: separator)
+            let suffix = String(lowercased[suffixStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if Self.knownEffortSuffixes.contains(suffix) {
+                let base = String(trimmed[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+                baseModel = base.isEmpty || base.lowercased() == ClaudeCompatibleModelNormalizer.defaultSentinelRawValue ? nil : base
+                effortRaw = suffix == "x-high" ? "xhigh" : suffix
+                return
+            }
+        }
+
+        baseModel = lowercased == ClaudeCompatibleModelNormalizer.defaultSentinelRawValue ? nil : trimmed
+        effortRaw = nil
+    }
+
+    var hasEffort: Bool {
+        effortRaw != nil
+    }
 }
 
 public enum ClaudeCompatibleBackendEnvironmentBuilder {
     private static let glmTimeoutMilliseconds = "3000000"
+    private static let glmAutoCompactWindow = "1000000"
 
     public static func removedEnvironmentKeys(config: ClaudeCompatibleBackendConfig) -> Set<String> {
         let configuredAuthKey = config.normalized.auth.environmentVariableName
@@ -256,16 +339,36 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
 
     public static func environment(
         config: ClaudeCompatibleBackendConfig,
-        apiKey: String
-    ) -> [String: String] {
+        apiKey: String,
+        selectedBackendModelID: String? = nil
+    ) throws -> [String: String] {
         let normalizedConfig = config.normalized
+        try ProviderEndpointConsentPolicy.validate(
+            normalizedConfig.baseURL,
+            credentialBearing: !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            consentEndpoint: normalizedConfig.httpCredentialConsentEndpoint
+        )
+        guard let baseURL = normalizedConfig.normalizedBaseURL else {
+            throw ProviderEndpointConsentPolicy.ValidationError.invalidEndpoint
+        }
         var environment: [String: String] = [
-            "ANTHROPIC_BASE_URL": normalizedConfig.normalizedBaseURL ?? normalizedConfig.baseURL,
+            "ANTHROPIC_BASE_URL": baseURL,
             normalizedConfig.auth.environmentVariableName: apiKey
         ]
 
         if normalizedConfig.id == .glmZAI {
             environment["API_TIMEOUT_MS"] = glmTimeoutMilliseconds
+            if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: selectedBackendModelID) == 1_000_000 {
+                environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = glmAutoCompactWindow
+            }
+        }
+
+        if let timeout = normalizedConfig.requestTimeoutMilliseconds, ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains(timeout) {
+            environment["API_TIMEOUT_MS"] = String(timeout)
+        }
+        if let window = normalizedConfig.contextWindowTokens, ClaudeCompatibleBackendLimits.contextWindowTokens.contains(window) {
+            // The auto-compact threshold cannot raise an unknown model's assumed context window.
+            environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(window)
         }
 
         if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {
@@ -280,27 +383,51 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
 }
 
 public enum ClaudeCompatibleModelNormalizer {
-    public static let defaultModelRawValue = "glm-5-turbo"
-    public static let haikuEquivalentModelRawValue = "glm-4.7"
-    public static let opusEquivalentModelRawValue = "glm-5.1"
+    public static let defaultModelRawValue = "glm-5.2[1m]"
+    public static let haikuEquivalentModelRawValue = "glm-4.5-air"
+    public static let opusEquivalentModelRawValue = "glm-5.2[1m]"
     public static let defaultRequestedModelRawValue = "sonnet"
     public static let haikuRequestedModelRawValue = "haiku"
     public static let opusRequestedModelRawValue = "opus"
     public static let defaultSentinelRawValue = "default"
     public static let kimiNoModelRawValue = "kimi-code"
     public static let customNoModelRawValue = "custom-claude-compatible"
+    public static let directSelectableGLMModelRawValues: [String] = [
+        "glm-4.7",
+        "glm-5-turbo",
+        "glm-5.1"
+    ]
 
     public static let supportedModelRawValues: [String] = [
         haikuEquivalentModelRawValue,
+        "glm-4.7",
+        "glm-5.2",
         defaultModelRawValue,
-        opusEquivalentModelRawValue
+        "glm-5-turbo",
+        "glm-5.1"
     ]
 
     public static func normalizedRequestedModel(_ rawModel: String?) -> String? {
-        guard let rawModel else { return nil }
-        let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed != defaultSentinelRawValue else { return nil }
-        return trimmed
+        ClaudeCompatibleEffortEncodedModel(raw: rawModel).baseModel
+    }
+
+    public static func isDirectSelectableGLMModel(_ rawModel: String?) -> Bool {
+        guard let normalized = normalizedRequestedModel(rawModel)?.lowercased() else { return false }
+        return directSelectableGLMModelRawValues.contains(normalized)
+    }
+
+    public static func directSelectableGLMSlotRawValue(for rawModel: String?) -> String? {
+        guard let normalized = normalizedRequestedModel(rawModel)?.lowercased() else { return nil }
+        switch normalized {
+        case "glm-4.7":
+            return haikuRequestedModelRawValue
+        case "glm-5-turbo":
+            return defaultRequestedModelRawValue
+        case "glm-5.1":
+            return opusRequestedModelRawValue
+        default:
+            return nil
+        }
     }
 
     public static func isGLMModel(
@@ -339,11 +466,11 @@ public enum ClaudeCompatibleModelNormalizer {
         }
 
         switch normalized {
-        case haikuEquivalentModelRawValue:
+        case haikuEquivalentModelRawValue, "glm-4.7":
             return haikuRequestedModelRawValue
-        case defaultModelRawValue:
+        case "glm-5.2", defaultModelRawValue, "glm-5-turbo":
             return defaultRequestedModelRawValue
-        case opusEquivalentModelRawValue:
+        case "glm-5.1":
             return opusRequestedModelRawValue
         default:
             return nil
@@ -375,15 +502,25 @@ public enum ClaudeCompatibleModelNormalizer {
         }
 
         switch normalized {
-        case haikuEquivalentModelRawValue:
+        case haikuEquivalentModelRawValue, "glm-4.7":
             return haikuRequestedModelRawValue
-        case defaultModelRawValue:
+        case "glm-5.2", defaultModelRawValue, "glm-5-turbo":
             return defaultRequestedModelRawValue
-        case opusEquivalentModelRawValue:
+        case "glm-5.1":
             return opusRequestedModelRawValue
         default:
             return nil
         }
+    }
+
+    public static func supportsXHighEffort(_ rawModel: String?) -> Bool {
+        guard let normalized = normalizedRequestedModel(rawModel)?.lowercased() else { return false }
+        return normalized == "glm-5.2" || normalized == "glm-5.2[1m]"
+    }
+
+    public static func contextWindowTokens(forBackendModelID rawModel: String?) -> Int? {
+        guard let normalized = normalizedRequestedModel(rawModel)?.lowercased() else { return nil }
+        return normalized == "glm-5.2[1m]" ? 1_000_000 : nil
     }
 
     public static func noModelRawValue(for backendID: ClaudeCompatibleBackendID) -> String {
@@ -487,21 +624,51 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "\(config.normalizedDisplayName) has an invalid backend configuration.")
         }
 
+        let requestedSpecifier = ClaudeCompatibleEffortEncodedModel(raw: requestedModel)
         let effectiveModel: String?
+        let selectedBackendModelID: String?
+        let environmentConfig: ClaudeCompatibleBackendConfig
         switch config.modelBehavior {
         case .noModel:
-            guard isAllowedNoModelSelection(requestedModel, backendID: backendID) else {
+            guard !requestedSpecifier.hasEffort,
+                  isAllowedNoModelSelection(requestedModel, backendID: backendID)
+            else {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
             }
             effectiveModel = nil
+            selectedBackendModelID = nil
+            environmentConfig = config
         case .claudeSlotMapping:
+            if config.id == .glmZAI,
+               let directBackendModelID = requestedSpecifier.baseModel?.lowercased(),
+               let directSlot = ClaudeCompatibleModelNormalizer.directSelectableGLMSlotRawValue(for: directBackendModelID)
+            {
+                if requestedSpecifier.effortRaw == "xhigh",
+                   !ClaudeCompatibleModelNormalizer.supportsXHighEffort(directBackendModelID)
+                {
+                    throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
+                }
+                effectiveModel = directSlot
+                selectedBackendModelID = directBackendModelID
+                environmentConfig = config.withSlotOverride(slot: directSlot, backendModelID: directBackendModelID)
+                break
+            }
             guard let slot = ClaudeCompatibleModelNormalizer.normalizedSlotModel(
                 requestedModel,
                 config: config
-            ) else {
+            ),
+                let backendModelID = backendModelID(forSlot: slot, config: config)
+            else {
+                throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
+            }
+            if requestedSpecifier.effortRaw == "xhigh",
+               !ClaudeCompatibleModelNormalizer.supportsXHighEffort(backendModelID)
+            {
                 throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "Unsupported \(config.normalizedDisplayName) model selection.")
             }
             effectiveModel = slot
+            selectedBackendModelID = backendModelID
+            environmentConfig = config
         }
 
         let rawSecret: String? = if backendID == .glmZAI {
@@ -513,13 +680,32 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "\(config.normalizedDisplayName) requires a configured API key.")
         }
 
-        return ClaudeCompatibleLaunchEnvironment(
+        return try ClaudeCompatibleLaunchEnvironment(
             effectiveModel: effectiveModel,
-            environmentOverrides: ClaudeCompatibleBackendEnvironmentBuilder.environment(config: config, apiKey: apiKey),
+            environmentOverrides: ClaudeCompatibleBackendEnvironmentBuilder.environment(
+                config: environmentConfig,
+                apiKey: apiKey,
+                selectedBackendModelID: selectedBackendModelID
+            ),
             removedEnvironmentKeys: ClaudeCompatibleBackendEnvironmentBuilder.removedEnvironmentKeys(config: config),
             backendID: backendID,
             suppressesEffortSettings: config.modelBehavior == .noModel
         )
+    }
+
+    private func backendModelID(forSlot slot: String, config: ClaudeCompatibleBackendConfig) -> String? {
+        guard case let .claudeSlotMapping(mapping) = config.modelBehavior else { return nil }
+        let normalizedMapping = mapping.normalized
+        switch slot.lowercased() {
+        case ClaudeCompatibleModelNormalizer.haikuRequestedModelRawValue:
+            return normalizedMapping.haiku
+        case ClaudeCompatibleModelNormalizer.defaultRequestedModelRawValue:
+            return normalizedMapping.sonnet
+        case ClaudeCompatibleModelNormalizer.opusRequestedModelRawValue:
+            return normalizedMapping.opus
+        default:
+            return nil
+        }
     }
 
     private func isAllowedNoModelSelection(

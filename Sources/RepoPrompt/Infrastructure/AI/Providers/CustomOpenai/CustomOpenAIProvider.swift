@@ -1,23 +1,8 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptFoundation
 
-/// Common chat completion parameters
-enum CompletionParams {
-    struct Message {
-        enum Role: String {
-            case system
-            case user
-            case assistant
-        }
-
-        enum Content {
-            case text(String)
-            case contentArray([Content])
-        }
-
-        let role: Role
-        let content: Content
-    }
-}
+typealias CompletionParams = RepoPromptDomainRuntime.CompletionParams
 
 /// Provider-specific errors with detailed status codes and messages
 enum CustomOpenAIProviderError: Error {
@@ -64,6 +49,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     // Configuration
     private let baseURL: String
     private let apiKey: String
+    private let httpCredentialConsentEndpoint: String?
     private let defaultModel: String
     private let defaultTemperature: Double
     private let customHeaders: [String: String]
@@ -120,20 +106,20 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         }
     }
 
-    struct ChatMessage: Codable {
+    struct ChatMessage: Encodable {
         let role: String
-        let content: String
+        let content: CompletionParams.Message.Content
     }
 
     /// Added support for max_tokens and temperature in the request payload
-    struct ChatRequest: Codable {
+    struct ChatRequest: Encodable {
         let model: String
         let messages: [ChatMessage]
         let max_tokens: Int?
         let temperature: Double?
     }
 
-    struct ChatStreamRequest: Codable {
+    struct ChatStreamRequest: Encodable {
         let model: String
         let messages: [ChatMessage]
         let stream: Bool
@@ -177,11 +163,13 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         configuredMaxTokens: Int? = nil,
         includeContentTypeHeader: Bool = false,
         apiVersion: String? = nil,
+        httpCredentialConsentEndpoint: String? = nil,
         httpClient: HTTPClient = DefaultHTTPClient.aiClient,
         streamingHttpClient: HTTPClient = DefaultHTTPClient.aiStreamingClient
     ) {
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.apiKey = apiKey
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
         self.defaultModel = defaultModel
         self.defaultTemperature = defaultTemperature
         self.customHeaders = customHeaders
@@ -192,11 +180,12 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         self.streamingHttpClient = streamingHttpClient
     }
 
-    private func urlFor(path: String) -> URL? {
+    private func urlFor(path: String) throws -> URL? {
+        try ProviderEndpointConsent.validate(baseURL, credentialBearing: ProviderEndpointConsent.hasCredentials(apiKey: apiKey, customHeaders: customHeaders), consentEndpoint: httpCredentialConsentEndpoint)
         if let v = apiVersion, !v.isEmpty {
-            URL(string: "\(baseURL)/\(v)/\(path)")
+            return URL(string: "\(baseURL)/\(v)/\(path)")
         } else {
-            URL(string: "\(baseURL)/\(path)")
+            return URL(string: "\(baseURL)/\(path)")
         }
     }
 
@@ -217,7 +206,9 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
             }
         }
 
-        headers["Authorization"] = "Bearer \(apiKey)"
+        if !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            headers["Authorization"] = "Bearer \(apiKey)"
+        }
         headers.merge(customHeaders) { _, new in new }
         return headers
     }
@@ -354,7 +345,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     }
 
     func getAvailableModels() async throws -> [String] {
-        guard let url = urlFor(path: "models") else {
+        guard let url = try urlFor(path: "models") else {
             throw CustomOpenAIProviderError.invalidResponse(message: "Invalid base URL: \(baseURL)")
         }
 
@@ -385,66 +376,16 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     // NEW: createMessages(for:)
     // ---------------------------------------
     private func createMessages(for aiMessage: AIMessage) -> [CompletionParams.Message] {
-        var results: [CompletionParams.Message] = []
-
-        // 1) System prompt
-        if !aiMessage.systemPrompt.isEmpty {
-            results.append(
-                CompletionParams.Message(
-                    role: .system,
-                    content: .text(aiMessage.systemPrompt)
-                )
-            )
-        }
-
-        // Collect file tree, file blocks, and meta instructions into one block
-        var additionsForFinalUserMessage = ""
-        if !aiMessage.fileTree.isEmpty {
-            additionsForFinalUserMessage += aiMessage.fileTreeXML + "\n"
-        }
-        if !aiMessage.fileBlocks.isEmpty {
-            additionsForFinalUserMessage += aiMessage.fileBlocksXML + "\n"
-        }
-        for meta in aiMessage.metaPrompts {
-            additionsForFinalUserMessage += meta + "\n"
-        }
-
-        // Find the index of the last user message
-        let conversation = aiMessage.conversationMessages
-        let lastUserIndex = conversation.lastIndex { $0.role == .user }
-
-        // Build the conversation in chronological order
-        for (index, entry) in conversation.enumerated() {
-            let role: CompletionParams.Message.Role = entry.role == .user ? .user : .assistant
-
-            if role == .user {
-                var userContent = ""
-
-                // If this is the last user message, add context before the message
-                if index == lastUserIndex, !additionsForFinalUserMessage.isEmpty {
-                    userContent = additionsForFinalUserMessage + "\n" + entry.content
-                } else {
-                    userContent = entry.content
-                }
-
-                results.append(
-                    CompletionParams.Message(
-                        role: .user,
-                        content: .text(userContent)
-                    )
-                )
-            } else {
-                results.append(
-                    CompletionParams.Message(
-                        role: .assistant,
-                        content: .text(entry.content)
-                    )
-                )
-            }
-        }
-
-        return results
+        CustomOpenAIMessageBuilder.messages(for: aiMessage)
     }
+
+    #if DEBUG
+        func serializedMessagesForTesting(
+            _ aiMessage: AIMessage
+        ) -> [CompletionParams.Message] {
+            createMessages(for: aiMessage)
+        }
+    #endif
 
     /// completeMessage now accepts temperature as a param
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult {
@@ -543,9 +484,16 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                         }
 
                         // Successfully connected - process the stream
+                        var transportActivity = ProviderTransportActivityThrottle()
                         for try await line in bytes.lines {
                             if Task.isCancelled {
                                 throw CancellationError()
+                            }
+
+                            // Keepalive comments and content-less deltas are dropped below;
+                            // any received line still proves the response is alive (#803).
+                            if transportActivity.shouldEmit(at: .now) {
+                                continuation.yield(ProviderTransportActivity.result())
                             }
 
                             // Check for SSE error events
@@ -650,7 +598,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         maxTokens: Int? = nil,
         temperature: Double? = nil
     ) throws -> URLRequest {
-        guard let url = urlFor(path: "chat/completions") else {
+        guard let url = try urlFor(path: "chat/completions") else {
             throw CustomOpenAIProviderError.invalidResponse(message: "Invalid base URL: \(baseURL)")
         }
 
@@ -661,22 +609,8 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        let openAIMessages = messages.map { message -> ChatMessage in
-            let content: String = switch message.content {
-            case let .text(text):
-                text
-            case let .contentArray(array):
-                array.compactMap { chunk -> String? in
-                    if case let .text(part) = chunk {
-                        return part
-                    }
-                    return nil
-                }.joined(separator: "\n")
-            }
-            return ChatMessage(
-                role: message.role.rawValue,
-                content: content
-            )
+        let openAIMessages = messages.map { message in
+            ChatMessage(role: message.role.rawValue, content: message.content)
         }
 
         // Use the provided temperature if available, or fall back to the provider default

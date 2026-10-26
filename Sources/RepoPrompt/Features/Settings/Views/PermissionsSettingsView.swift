@@ -424,7 +424,8 @@ private struct TrustedClientRow: View {
                         .foregroundColor(.secondary.opacity(isHovering ? 1 : 0.5))
                 }
                 .buttonStyle(PlainButtonStyle())
-                .help("Remove all permissions for this client")
+                .hoverTooltip("Remove all permissions for this client")
+                .accessibilityLabel("Remove all permissions for this client")
             }
             .padding(12)
             .background(Color.primary.opacity(0.03))

@@ -2,14 +2,13 @@ import SwiftUI
 
 struct LicenseUpdatesSettingsView: View {
     @ObservedObject var windowState: WindowState
-    private var sparkleManager: SparkleUpdaterManager {
-        SparkleUpdaterManager.shared
-    }
+    @ObservedObject private var sparkleManager: SparkleUpdaterManager
 
     var closeAction: (() -> Void)?
 
     init(windowState: WindowState, closeAction: (() -> Void)? = nil) {
         self.windowState = windowState
+        _sparkleManager = ObservedObject(wrappedValue: SparkleUpdaterManager.shared)
         self.closeAction = closeAction
     }
 
@@ -22,30 +21,85 @@ struct LicenseUpdatesSettingsView: View {
                 ) {
                     VStack(alignment: .leading, spacing: 16) {
                         HStack(spacing: 8) {
-                            Image(systemName: sparkleManager.updateAvailable ? "arrow.down.circle.fill" : "checkmark.circle.fill")
-                                .foregroundColor(sparkleManager.updateAvailable ? .blue : .green)
-
-                            Text(
-                                sparkleManager.updateAvailable ?
-                                    "Version \(sparkleManager.updateVersion ?? "Unknown") is available" :
-                                    "You have the latest version"
+                            Image(
+                                systemName: sparkleManager.updateAvailable
+                                    ? "arrow.down.circle.fill"
+                                    : sparkleManager.appcastCheckState == .succeeded
+                                    ? "checkmark.circle.fill"
+                                    : "arrow.triangle.2.circlepath.circle"
                             )
-                            .foregroundColor(sparkleManager.updateAvailable ? .blue : .secondary)
+                            .foregroundColor(
+                                sparkleManager.updateAvailable
+                                    ? .blue
+                                    : sparkleManager.appcastCheckState == .succeeded ? .green : .secondary
+                            )
+
+                            Text(sparkleManager.updateStatusText)
+                                .foregroundColor(sparkleManager.updateAvailable ? .blue : .secondary)
 
                             Spacer()
 
-                            Button("Check for Updates") {
+                            Button(sparkleManager.appcastCheckState == .checking ? "Checking…" : "Check for Updates") {
                                 sparkleManager.checkForUpdates()
-                                closeAction?()
+                                if !sparkleManager.isDiscoveryOnly {
+                                    closeAction?()
+                                }
                             }
                             .buttonStyle(.bordered)
+                            .disabled(!sparkleManager.canInitiateUpdateCheck)
                         }
 
-                        if sparkleManager.updateAvailable {
-                            Button("Install Update") {
-                                sparkleManager.installUpdate()
+                        if let message = sparkleManager.updateWarningMessage {
+                            Label(message, systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+
+                        if let recoveryURL = sparkleManager.migrationRecoveryDownloadsURL {
+                            Link("Stable releases / recovery downloads", destination: recoveryURL)
+                                .font(.caption)
+                            Text(SparkleUpdaterManager.recoveryDownloadsCaveat)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if let availableUpdate = sparkleManager.availableUpdate {
+                            if sparkleManager.canInstallAvailableUpdate {
+                                Button(availableUpdate.installButtonTitle) {
+                                    sparkleManager.installUpdate()
+                                }
+                                .buttonStyle(.borderedProminent)
+                            } else if sparkleManager.manualUpdateDownloadURL != nil {
+                                Button(availableUpdate.manualDownloadButtonTitle) {
+                                    sparkleManager.performAvailableUpdateAction()
+                                }
+                                .buttonStyle(.borderedProminent)
                             }
-                            .buttonStyle(.borderedProminent)
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Picker(
+                                "Update Channel",
+                                selection: Binding(
+                                    get: { sparkleManager.updateChannel },
+                                    set: { sparkleManager.setUpdateChannel($0) }
+                                )
+                            ) {
+                                ForEach(UpdateChannel.allCases) { channel in
+                                    Text(channel.displayName).tag(channel)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+
+                            Text(sparkleManager.updateChannel.shortDescription)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+
+                            if sparkleManager.updateChannel == .tip {
+                                Text("Tip builds are signed and notarized builds from the latest passing main branch. Returning to Stable takes effect with the next stable release; reinstall Stable to switch immediately.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
                         }
 
                         Toggle(
@@ -56,6 +110,10 @@ struct LicenseUpdatesSettingsView: View {
                             )
                         )
                     }
+                }
+
+                if sparkleManager.updateChannel == .tip, let history = sparkleManager.tipHistoryStore {
+                    TipBuildHistoryView(store: history, manager: sparkleManager)
                 }
 
                 Spacer()

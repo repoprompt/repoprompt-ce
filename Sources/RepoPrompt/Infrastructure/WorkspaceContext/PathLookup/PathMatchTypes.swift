@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 // MARK: - Path Match Result Types
 
@@ -10,6 +12,11 @@ struct PathMatchLocation {
 }
 
 // MARK: - Immutable Snapshot Types
+
+struct PathMatchCacheIdentity: Hashable {
+    let scopeID: UInt64
+    let snapshotID: UInt64
+}
 
 /// Static part of the snapshot (expensive to build, cached).
 /// Immutable, cross-actor-safe snapshot used by PathMatcher and PathMatchWorker.
@@ -26,20 +33,24 @@ struct StaticPathMatchData {
     /// Matching policy - current default is case-insensitive
     let caseSensitive: Bool
 
-    /// Monotonic id to allow caching of indexes per snapshot generation.
-    /// Bumped by WorkspaceFilesViewModel when the file hierarchy changes.
+    /// Scope plus snapshot identity used to retain unaffected cached path indexes.
+    let cacheIdentity: PathMatchCacheIdentity
+
+    /// Monotonic id to allow callers to compare snapshot generations.
     let id: UInt64
 
     init(
         filesByFullPath: [String: FileRecord],
         foldersByFullPath: [String: FolderRecord],
         rootFolders: [FolderRecord],
+        cacheScopeID: UInt64 = 0,
         id: UInt64,
         caseSensitive: Bool = false
     ) {
         self.filesByFullPath = filesByFullPath
         self.foldersByFullPath = foldersByFullPath
         self.rootFolders = rootFolders
+        cacheIdentity = PathMatchCacheIdentity(scopeID: cacheScopeID, snapshotID: id)
         self.id = id
 
         // Handle potential case-insensitive collisions by keeping the first occurrence

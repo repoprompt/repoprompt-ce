@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
 
 // MARK: - Headless Mode
 
@@ -14,6 +16,9 @@ enum HeadlessMode {
 /// A frozen snapshot of tab state for headless generation.
 /// Used when running plan/chat via AIQueriesService without activating the tab.
 struct HeadlessContextSnapshot {
+    /// Exact workspace authority for inactive/background generation.
+    let workspaceID: UUID?
+
     /// The compose tab this snapshot came from
     let tabID: UUID
 
@@ -22,6 +27,33 @@ struct HeadlessContextSnapshot {
 
     /// Frozen selection from ComposeTabState.selection
     let selection: StoredSelection
+
+    /// Frozen logical-to-physical workspace projection for this request.
+    let lookupContext: WorkspaceLookupContext?
+
+    /// Frozen artifact authority, comparison intent, and logical checkout labels.
+    let reviewGitContext: FrozenPromptGitReviewContext
+
+    /// Exact final Context Builder review authority. Nil for every general prompt route.
+    let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
+
+    init(
+        workspaceID: UUID? = nil,
+        tabID: UUID,
+        promptText: String,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
+    ) {
+        self.workspaceID = workspaceID
+        self.tabID = tabID
+        self.promptText = promptText
+        self.selection = selection
+        self.lookupContext = lookupContext
+        self.reviewGitContext = reviewGitContext
+        self.finalReviewAuthorization = finalReviewAuthorization
+    }
 }
 
 // MARK: - Headless AIMessage Builders
@@ -42,45 +74,22 @@ extension PromptViewModel {
         model: AIModel,
         mode: HeadlessMode = .plan,
         gitScopeOverride: GitInclusion? = nil,
-        gitBaseOverride: String? = nil
-    ) async -> AIMessage {
-        // 1. Resolve file entries from the frozen snapshot selection through the headless store.
-        let store = workspaceFileContextStore
-        let accountingService = PromptContextAccountingService()
-        let resolution = await accountingService.resolveEntries(
-            selection: snapshot.selection,
-            store: store,
-            rootScope: .allLoaded,
-            profile: .uiAssisted,
-            codeMapUsage: .auto // Plan always uses auto
+        oraclePromptConfiguration: OraclePromptConfiguration? = nil
+    ) async throws -> AIMessage {
+        let effectiveGitScope = mode == .review ? (gitScopeOverride ?? .selected) : .none
+        var headlessConfig = oraclePromptConfiguration?.promptContext ?? PromptContextResolved(
+            includeFiles: true,
+            includeUserPrompt: true,
+            includeMetaPrompts: false,
+            includeFileTree: true,
+            fileTreeMode: .auto,
+            codeMapUsage: .auto,
+            gitInclusion: effectiveGitScope,
+            storedPromptIds: []
         )
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
-        let (diffEntries, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(resolution.entries)
-
-        // 2. Generate file contents
-        let fileBlocks = PromptPackagingService.generateFileContents(
-            codeEntries,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: codemapSnapshots
-        )
-
-        // 3. Build file tree (auto mode for plan) from the headless store snapshot.
-        let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-            selection: snapshot.selection,
-            request: WorkspaceFileTreeSnapshotRequest(
-                mode: .auto,
-                filePathDisplay: filePathDisplayOption,
-                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-                includeLegend: true,
-                showCodeMapMarkers: true,
-                rootScope: .allLoaded
-            ),
-            profile: .uiAssisted
-        )
-        let fileTree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-
+        headlessConfig.gitInclusion = effectiveGitScope
         // 4. System prompt based on mode
-        let systemPrompt: String = {
+        let systemPrompt: String = oraclePromptConfiguration?.systemPrompt ?? {
             switch mode {
             case .plan:
                 let custom = customPlanningPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -103,77 +112,58 @@ extension PromptViewModel {
 
         // 5. Single-user conversation
         let conversation = [ConversationEntry(role: .user, content: snapshot.promptText)]
+        let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
+        // Oracle-bound headless prompts (Context Builder) must not silently omit selected files.
+        let requiresSelectedFileContent = oraclePromptConfiguration != nil
+        if requiresSelectedFileContent, headlessConfig.includeFiles {
+            try await PromptSelectedFileContentRequirement.awaitAppliedIngress(
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                store: workspaceFileContextStore
+            )
+        }
 
-        let gitDiff: String? = await PromptPackagingService.resolveGitDiff(
-            fromDiffEntries: diffEntries
-        ) {
-            guard mode == .review else { return nil }
-            let effectiveScope = gitScopeOverride ?? .selected
-            switch effectiveScope {
-            case .none:
-                return nil
-            case .selected:
-                let selectedPaths = await resolvedSelectedGitDiffPaths(for: snapshot.selection)
-                return await gitViewModel.getDiffForAbsolutePaths(selectedPaths, vs: gitBaseOverride, forceRefreshStatus: true)
-            case .complete:
-                return await gitViewModel.getDiffUsing(inclusionMode: .all, vs: gitBaseOverride, forceRefreshStatus: true)
+        return try await withPreassembledPromptContext(
+            cfg: headlessConfig,
+            selection: snapshot.selection,
+            lookupContext: lookupContext,
+            reviewGitContext: snapshot.reviewGitContext,
+            sourceTabID: snapshot.tabID,
+            finalReviewAuthorization: snapshot.finalReviewAuthorization
+        ) { preAssembly in
+            if requiresSelectedFileContent {
+                try PromptSelectedFileContentRequirement.validate(preAssembly, config: headlessConfig)
             }
-        }
-
-        // 6. Assemble AIMessage (no warning, no meta prompts)
-        return PromptPackagingService.buildAIMessage(
-            systemPrompt: systemPrompt,
-            metaInstructions: [],
-            fileTree: fileTree,
-            fileContents: fileBlocks,
-            gitDiff: gitDiff,
-            conversation: conversation,
-            temperature: setModelTemperature ? modelTemperature : nil,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
-        )
-    }
-
-    @MainActor
-    func resolvedSelectedGitDiffPaths(for selection: StoredSelection) async -> [String] {
-        let candidates = MCPServerViewModel.gitDiffCandidates(from: selection)
-        guard !candidates.isEmpty else { return [] }
-
-        let store = workspaceFileContextStore
-        let requests = candidates.map {
-            WorkspacePathLookupRequest(userPath: $0, profile: .uiAssisted, rootScope: .allLoaded)
-        }
-        let resolved = await store.lookupPaths(requests)
-
-        var seen = Set<String>()
-        var selectedPaths: [String] = []
-
-        func append(_ fullPath: String) {
-            let standardized = StandardizedPath.absolute(fullPath)
-            guard seen.insert(standardized).inserted else { return }
-            selectedPaths.append(standardized)
-        }
-
-        for candidate in candidates {
-            guard let result = resolved[candidate] else { continue }
-            if let file = result.file {
-                append(file.standardizedFullPath)
-                continue
+            let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
+                preAssembly.entries
+            )
+            let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
+                { entry in preAssembly.displayPath(for: entry) }
+            } else {
+                nil
             }
-
-            guard let folder = result.folder else { continue }
-            let prefix = folder.standardizedRelativePath
-            let files = await store.files(inRoot: folder.rootID)
-            for file in files {
-                let isInFolder = prefix.isEmpty
-                    || file.standardizedRelativePath == prefix
-                    || file.standardizedRelativePath.hasPrefix(prefix + "/")
-                guard isInFolder else { continue }
-                append(file.standardizedFullPath)
-            }
+            let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
+                codeEntries,
+                filePathDisplay: self.filePathDisplayOption,
+                codemapPresentation: preAssembly.codemapPresentation,
+                displayPathResolver: displayPathResolver
+            )
+            let fileTree = PromptPackagingService.combinedFileMapContent(
+                fileTreeContent: preAssembly.fileTreeContent,
+                codemapBlocks: partitionedBlocks.codemapBlocks
+            ) ?? ""
+            return PromptPackagingService.buildAIMessage(
+                systemPrompt: systemPrompt,
+                metaInstructions: oraclePromptConfiguration?.metaInstructions ?? [],
+                fileTree: fileTree,
+                fileContents: partitionedBlocks.contentBlocks,
+                gitDiff: preAssembly.gitDiff,
+                conversation: conversation,
+                temperature: self.setModelTemperature ? self.modelTemperature : nil,
+                promptSectionsOrder: self.promptSectionsOrder,
+                disabledPromptSections: self.disabledPromptSections,
+                duplicateUserInstructionsAtTop: self.duplicateUserInstructionsAtTop
+            )
         }
-
-        return selectedPaths
     }
 }

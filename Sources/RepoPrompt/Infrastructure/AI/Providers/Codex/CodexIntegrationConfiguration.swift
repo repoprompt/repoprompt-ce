@@ -1,19 +1,40 @@
 import Foundation
+import RepoPromptShared
 
 /// Codex-specific integration configuration helpers.
 ///
 /// This namespace owns Codex CLI config.toml parsing/mutation, RepoPrompt MCP
 /// installation/repair, and Codex runtime override construction.
 enum CodexIntegrationConfiguration {
-    private static let toolTimeoutDefaultsKey = "CodexToolTimeoutMigratedV3"
-    private static let desiredToolTimeoutSeconds = 10000
+    static let toolTimeoutDefaultsKey = "CodexToolTimeoutMigratedV5"
+    // Codex applies this timeout to every tool on the MCP server. Preserve the existing
+    // multi-hour budget because Oracle and Context Builder remain synchronous and have no
+    // per-tool timeout exemption.
+    static let desiredToolTimeoutSeconds = MCPTimeoutPolicy.codexServerActiveTimeoutSeconds
+    static let desiredSupportsParallelToolCalls = true
     static let desiredToolOutputTokenLimit = 25000
 
+    static let directOnlyToolNamespace = "mcp__RepoPromptCE"
+
+    // RepoPrompt owns the RepoPromptCE MCP block's launch/policy keys, the global
+    // tool output limit already managed by this integration, and exactly these two
+    // [features.code_mode] keys: enabled and direct_only_tool_namespaces. Other
+    // user-authored TOML is preserved; ambiguous/conflicting code-mode layouts fail
+    // before any write.
+
+    /// Serializes in-process read-modify-write access to RepoPrompt's owned Codex config across concurrent
+    /// Codex startup/provisioning paths. Cross-process writers remain outside this lock's scope.
+    private static let fileLock = NSLock()
     private static let tomlBareKeyCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
     private static let repoPromptMCPConfiguration = RepoPromptMCPServerConfiguration.repoPrompt
     private static let repoPromptMCPServerName = RepoPromptMCPServerConfiguration.defaultServerName
     private static var serverCommand: String {
         repoPromptMCPConfiguration.command
+    }
+
+    private static var serverArgumentsTOML: String {
+        let values = repoPromptMCPConfiguration.args.map { "\"\($0)\"" }
+        return "[\(values.joined(separator: ", "))]"
     }
 
     struct ServerEntry {
@@ -26,6 +47,7 @@ enum CodexIntegrationConfiguration {
         let content: String
         let changed: Bool
         let wasRepoPromptServerPresent: Bool
+        let conflictMessage: String?
     }
 
     private struct BlockRange {
@@ -66,19 +88,13 @@ enum CodexIntegrationConfiguration {
             CodexOverrides.ToolPolicy(
                 toolOutputTokenLimit: desiredToolOutputTokenLimit,
                 shellToolEnabled: false,
-                webSearchRequestEnabled: false,
-                viewImageToolEnabled: false,
-                includeApplyPatchTool: false,
-                parallelToolCallsEnabled: nil
+                webSearchRequestEnabled: false
             )
         case .terminal:
             CodexOverrides.ToolPolicy(
                 toolOutputTokenLimit: desiredToolOutputTokenLimit,
                 shellToolEnabled: nil,
-                webSearchRequestEnabled: nil,
-                viewImageToolEnabled: nil,
-                includeApplyPatchTool: false,
-                parallelToolCallsEnabled: nil
+                webSearchRequestEnabled: nil
             )
         }
 
@@ -86,12 +102,31 @@ enum CodexIntegrationConfiguration {
     }
 
     static func configDirectoryURL() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(".codex", isDirectory: true)
+        CodexRuntimeAuthority.statePaths().codexHome
     }
 
     static func configURL() -> URL {
         configDirectoryURL().appendingPathComponent("config.toml")
+    }
+
+    /// Called only by the explicit Settings import action, never during provider startup.
+    static func importUserMCPServers(sourceURL: URL, destinationURL: URL? = nil, resetPermissions: ([String]) throws -> Void = { names in
+        guard CodexAgentToolPreferences.disableImportedMCPServers(names) else { throw CodexUserMCPImport.Failure.writeFailed }
+    }) throws -> CodexUserMCPImport.Result {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+        return try CodexUserMCPImport.importFile(sourceURL: sourceURL, destinationURL: destinationURL ?? configURL(), resetPermissions: resetPermissions)
+    }
+
+    /// Reuse the integration's quoted/dotted-key parser without exposing its mutation machinery.
+    static func importTableHeader(_ line: String) -> (path: [String], isArray: Bool)? {
+        guard let header = parseTOMLHeader(line) else { return nil }
+        return (header.keyPath.map(\.normalized), header.isArrayTable)
+    }
+
+    static func importAssignment(_ line: String) -> (path: [String], value: String)? {
+        guard let assignment = parseTOMLAssignment(line) else { return nil }
+        return (assignment.keyPath.map(\.normalized), String(assignment.valueText))
     }
 
     static func cliPathComponent(forNormalizedServerName name: String) -> String {
@@ -116,7 +151,11 @@ enum CodexIntegrationConfiguration {
             case "\t":
                 escaped.append("\\t")
             default:
-                escaped.append(character)
+                if scalar.value < 32 || scalar.value == 127 {
+                    escaped.append(String(format: "\\u%04X", scalar.value))
+                } else {
+                    escaped.append(character)
+                }
             }
         }
 
@@ -155,18 +194,32 @@ enum CodexIntegrationConfiguration {
         mcpServerEntries().map(\.normalizedName)
     }
 
-    /// Installs the RepoPrompt MCP server into Codex CLI (`~/.codex/config.toml`).
+    /// Installs the RepoPrompt MCP server into RepoPrompt's isolated Codex config.
     ///
     /// Invoked from the UI when users opt-in to the integration. Ensures our MCP server exists and is
     /// enabled globally so Codex can use it outside of discovery runs.
     @discardableResult
-    static func installPersistentMCPConfig() -> (success: Bool, wasAlreadyPresent: Bool) {
+    static func installPersistentMCPConfig(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        let runtime: CodexRuntimeAuthority.Runtime
+        switch CodexRuntimeAuthority.resolveConfigured(
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+        ) {
+        case let .success(resolved):
+            runtime = resolved
+        case let .failure(failure):
+            return (false, false, failure.localizedDescription)
+        }
+
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let fm = FileManager.default
-        let codexDir = configDirectoryURL()
         let configURL = configURL()
 
         do {
-            try fm.createDirectory(at: codexDir, withIntermediateDirectories: true, attributes: nil)
+            try runtime.prepareState(fileManager: fm)
 
             let content: String = if fm.fileExists(atPath: configURL.path) {
                 (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
@@ -179,15 +232,18 @@ enum CodexIntegrationConfiguration {
                 defaultEnabledIfMissing: true,
                 forceEnabled: true
             )
+            if let conflictMessage = mutation.conflictMessage {
+                return (false, mutation.wasRepoPromptServerPresent, conflictMessage)
+            }
             if mutation.changed {
                 try mutation.content.write(to: configURL, atomically: true, encoding: .utf8)
             }
 
             UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
-            return (true, mutation.wasRepoPromptServerPresent)
+            return (true, mutation.wasRepoPromptServerPresent, nil)
         } catch {
             print("CodexIntegrationConfiguration – Codex install failed: \(error)")
-            return (false, false)
+            return (false, false, "RepoPrompt could not update its isolated Codex config: \(error.localizedDescription)")
         }
     }
 
@@ -195,13 +251,31 @@ enum CodexIntegrationConfiguration {
     /// `enabled = false` so normal Codex usage stays opt-in, while the agent enables it at runtime via
     /// `-c` overrides.
     @discardableResult
-    static func ensureServerForDiscovery() -> (success: Bool, wasAlreadyPresent: Bool) {
+    static func ensureServerForDiscovery(
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        switch CodexRuntimeAuthority.resolveConfigured(
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+        ) {
+        case let .success(resolved):
+            ensureServerForDiscovery(runtime: resolved)
+        case let .failure(failure):
+            (false, false, failure.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    static func ensureServerForDiscovery(
+        runtime: CodexRuntimeAuthority.Runtime
+    ) -> (success: Bool, wasAlreadyPresent: Bool, errorMessage: String?) {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let fm = FileManager.default
-        let codexDir = configDirectoryURL()
         let configURL = configURL()
 
         do {
-            try fm.createDirectory(at: codexDir, withIntermediateDirectories: true, attributes: nil)
+            try runtime.prepareState(fileManager: fm)
 
             let content: String = if fm.fileExists(atPath: configURL.path) {
                 (try? String(contentsOf: configURL, encoding: .utf8)) ?? ""
@@ -214,24 +288,39 @@ enum CodexIntegrationConfiguration {
                 defaultEnabledIfMissing: false,
                 forceEnabled: nil
             )
+            if let conflictMessage = mutation.conflictMessage {
+                return (false, mutation.wasRepoPromptServerPresent, conflictMessage)
+            }
             if mutation.changed {
                 try mutation.content.write(to: configURL, atomically: true, encoding: .utf8)
-                UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
             }
+            UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
 
-            return (true, mutation.wasRepoPromptServerPresent)
+            return (true, mutation.wasRepoPromptServerPresent, nil)
         } catch {
             print("CodexIntegrationConfiguration – Codex discovery ensure failed: \(error)")
-            return (false, false)
+            return (false, false, "RepoPrompt could not update its isolated Codex config: \(error.localizedDescription)")
         }
     }
 
     static func mutatedPersistentMCPConfigContent(
         from content: String,
         defaultEnabledIfMissing: Bool,
-        forceEnabled: Bool?
+        forceEnabled: Bool?,
+        supportsDirectOnlyToolNamespaces: Bool = true
     ) -> PersistentMCPConfigMutationResult {
         var lines = splitTOMLLines(content)
+        if let conflictMessage = codeModePolicyConflict(
+            in: lines,
+            supportsDirectOnlyToolNamespaces: supportsDirectOnlyToolNamespaces
+        ) {
+            return PersistentMCPConfigMutationResult(
+                content: content,
+                changed: false,
+                wasRepoPromptServerPresent: mcpServerEntries(from: content).contains { $0.normalizedName == repoPromptMCPServerName },
+                conflictMessage: conflictMessage
+            )
+        }
         let ensureResult = ensureRepoPromptServer(
             in: &lines,
             defaultEnabledIfMissing: defaultEnabledIfMissing,
@@ -240,12 +329,14 @@ enum CodexIntegrationConfiguration {
 
         _ = stripToolOutputLimitFromRepoPromptBlocks(in: &lines)
         _ = ensureGlobalToolOutputLimit(in: &lines)
+        _ = ensureCodeModePolicy(in: &lines)
 
         let final = lines.joined(separator: "\n")
         return PersistentMCPConfigMutationResult(
             content: final,
             changed: final != content,
-            wasRepoPromptServerPresent: ensureResult.wasPresent
+            wasRepoPromptServerPresent: ensureResult.wasPresent,
+            conflictMessage: nil
         )
     }
 
@@ -256,6 +347,9 @@ enum CodexIntegrationConfiguration {
     }
 
     static func removeInstallEntry() {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let fm = FileManager.default
         let configURL = configURL()
         guard fm.fileExists(atPath: configURL.path) else { return }
@@ -279,11 +373,18 @@ enum CodexIntegrationConfiguration {
         }
     }
 
-    /// Ensures existing Codex CLI configs include the RepoPrompt tool timeout override.
+    /// Ensures existing Codex CLI configs include the RepoPrompt MCP policy required by V5:
+    /// the preserved 10,000-active-second server timeout and enabled parallel tool calls.
+    ///
+    /// Codex has no per-tool timeout exemption, so lowering this server-wide value would also
+    /// truncate synchronous Oracle and Context Builder operations that can legitimately run for hours.
     /// - Parameter force: When true, bypasses the once-per-install guard and rechecks the file.
-    /// - Returns: `true` if the RepoPrompt entry was located (and now has the desired timeout).
+    /// - Returns: `true` if the RepoPrompt entry was located and now has the desired policy.
     @discardableResult
     static func ensureToolTimeout(force: Bool = false) -> Bool {
+        fileLock.lock()
+        defer { fileLock.unlock() }
+
         let defaults = UserDefaults.standard
         if !force, defaults.bool(forKey: toolTimeoutDefaultsKey) {
             return true
@@ -316,10 +417,6 @@ enum CodexIntegrationConfiguration {
         var sectionStart: Int?
         var isRepoPromptSection = false
         var commandMatches = false
-        var commandLineIndex: Int?
-        var argsLineIndex: Int?
-        var timeoutLineIndex: Int?
-        var timeoutValue: Int?
         var foundTarget = false
         var needsWrite = false
         var completed = false
@@ -328,26 +425,17 @@ enum CodexIntegrationConfiguration {
             sectionStart = index
             isRepoPromptSection = isRepoPrompt
             commandMatches = false
-            commandLineIndex = nil
-            argsLineIndex = nil
-            timeoutLineIndex = nil
-            timeoutValue = nil
         }
 
         func finalizeSection(before index: Int) {
             guard isRepoPromptSection, commandMatches, !completed else { return }
             foundTarget = true
 
-            if let timeoutIndex = timeoutLineIndex {
-                if timeoutValue != desiredToolTimeoutSeconds {
-                    lines[timeoutIndex] = "tool_timeout_sec = \(desiredToolTimeoutSeconds)"
+            if let sectionStart {
+                var block = BlockRange(start: sectionStart, end: index)
+                if ensureRepoPromptPolicyKeys(in: &lines, blockRange: &block) {
                     needsWrite = true
                 }
-            } else {
-                let insertionBase = argsLineIndex ?? commandLineIndex ?? sectionStart ?? max(0, index - 1)
-                let insertionIndex = min(lines.count, insertionBase + 1)
-                lines.insert("tool_timeout_sec = \(desiredToolTimeoutSeconds)", at: insertionIndex)
-                needsWrite = true
             }
 
             completed = true
@@ -365,24 +453,13 @@ enum CodexIntegrationConfiguration {
                 continue
             }
 
-            if isRepoPromptSection, let assignment = parseTOMLAssignment(line) {
-                if assignment.isSingleKey("args") {
-                    argsLineIndex = idx
-                }
-
-                if assignment.isSingleKey("command"),
-                   let value = parseTOMLStringValue(assignment.valueText)
-                {
-                    let candidate = canonicalizedPath(for: value)
-                    if candidate == desiredCommand {
-                        commandMatches = true
-                        commandLineIndex = idx
-                    }
-                }
-
-                if assignment.isSingleKey("tool_timeout_sec") {
-                    timeoutLineIndex = idx
-                    timeoutValue = parseTOMLIntegerValue(assignment.valueText)
+            if isRepoPromptSection,
+               let assignment = parseTOMLAssignment(line),
+               assignment.isSingleKey("command"),
+               let value = parseTOMLStringValue(assignment.valueText)
+            {
+                if canonicalizedPath(for: value) == desiredCommand {
+                    commandMatches = true
                 }
             }
 
@@ -601,11 +678,16 @@ enum CodexIntegrationConfiguration {
             if ch == quote {
                 let end = text.index(after: cursor)
                 let raw = String(text[start ..< end])
-                let normalized = quote == "\""
-                    ? decodeDoubleQuotedTomlKey(inner)
-                    : inner.replacingOccurrences(of: "''", with: "'")
+                let normalized: String
+                if quote == "\"" {
+                    guard let decoded = decodeDoubleQuotedTomlKey(inner) else { return nil }
+                    normalized = decoded
+                } else {
+                    normalized = inner
+                }
                 return (TOMLKeyComponent(raw: raw, normalized: normalized), end)
             }
+            guard ch.unicodeScalars.allSatisfy({ $0.value == 9 || ($0.value >= 32 && $0.value != 127) }) else { return nil }
             inner.append(ch)
             cursor = text.index(after: cursor)
         }
@@ -656,6 +738,19 @@ enum CodexIntegrationConfiguration {
             cursor = text.index(after: cursor)
         }
         return nil
+    }
+
+    private static func parseTOMLBooleanValue(_ valueText: Substring) -> Bool? {
+        let stripped = stripComment(fromValueText: String(valueText))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        switch stripped {
+        case "true":
+            return true
+        case "false":
+            return false
+        default:
+            return nil
+        }
     }
 
     private static func parseTOMLIntegerValue(_ valueText: Substring) -> Int? {
@@ -763,17 +858,14 @@ enum CodexIntegrationConfiguration {
         }
     }
 
-    private static func decodeDoubleQuotedTomlKey(_ value: String) -> String {
+    static func decodeDoubleQuotedTomlKey(_ value: String) -> String? {
         var result = ""
         result.reserveCapacity(value.count)
 
         var iterator = value.makeIterator()
         while let ch = iterator.next() {
             if ch == "\\" {
-                guard let next = iterator.next() else {
-                    result.append("\\")
-                    break
-                }
+                guard let next = iterator.next() else { return nil }
                 switch next {
                 case "\"":
                     result.append("\"")
@@ -789,33 +881,151 @@ enum CodexIntegrationConfiguration {
                     result.append("\u{0C}")
                 case "r":
                     result.append("\r")
-                case "u":
+                case "u", "U":
+                    let count = next == "u" ? 4 : 8
                     var hex = ""
-                    for _ in 0 ..< 4 {
+                    for _ in 0 ..< count {
                         if let digit = iterator.next() {
                             hex.append(digit)
                         } else {
                             break
                         }
                     }
-                    if hex.count == 4,
+                    if hex.count == count, hex.allSatisfy(\.isHexDigit),
                        let scalar = UInt32(hex, radix: 16),
                        let unicode = UnicodeScalar(scalar)
                     {
                         result.append(Character(unicode))
                     } else {
-                        result.append("\\u")
-                        result.append(hex)
+                        return nil
                     }
                 default:
-                    result.append(next)
+                    return nil
                 }
             } else {
+                guard ch.unicodeScalars.allSatisfy({ $0.value == 9 || ($0.value >= 32 && $0.value != 127) }) else { return nil }
                 result.append(ch)
             }
         }
 
         return result
+    }
+
+    private static func isCodeModeHeader(_ line: String) -> Bool {
+        guard let header = parseTOMLHeader(line), !header.isArrayTable else { return false }
+        return header.keyPath.map(\.normalized) == ["features", "code_mode"]
+    }
+
+    private static func codeModePolicyConflict(
+        in lines: [String],
+        supportsDirectOnlyToolNamespaces: Bool
+    ) -> String? {
+        guard supportsDirectOnlyToolNamespaces else {
+            return "RepoPrompt did not update Codex config because this external Codex version predates RepoPrompt's external-runtime compatibility floor (minimum \(CodexRuntimeAuthority.minimumExternalVersion)). Update the explicit override or use the bundled runtime."
+        }
+
+        let codeModePath = ["features", "code_mode"]
+        let ownedKeys = Set(["enabled", "direct_only_tool_namespaces", "non_prefixed_mcp_tool_names"])
+        let blocks = blockRanges(in: lines, whereHeaderMatches: isCodeModeHeader)
+        if blocks.count > 1 {
+            return "RepoPrompt did not update Codex config because multiple [features.code_mode] blocks exist. Merge them, then retry."
+        }
+
+        var currentTablePath: [String] = []
+        for line in lines {
+            if let header = parseTOMLHeader(line) {
+                currentTablePath = header.keyPath.map(\.normalized)
+                if header.isArrayTable,
+                   currentTablePath == ["features"] || currentTablePath.starts(with: codeModePath)
+                {
+                    return "RepoPrompt did not update Codex config because an array-table definition conflicts with RepoPrompt's owned [features.code_mode] policy. Preserve the setting in a regular table layout, then retry."
+                }
+                if currentTablePath.count > codeModePath.count,
+                   currentTablePath.starts(with: codeModePath),
+                   ownedKeys.contains(currentTablePath[codeModePath.count])
+                {
+                    return "RepoPrompt did not update Codex config because a table definition redefines an owned [features.code_mode] key. Remove the conflicting table, then retry."
+                }
+                continue
+            }
+
+            guard let assignment = parseTOMLAssignment(line) else { continue }
+            let localPath = assignment.keyPath.map(\.normalized)
+            let fullPath = currentTablePath + localPath
+            let inlineTableValue = stripComment(fromValueText: String(assignment.valueText))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .hasPrefix("{")
+
+            if currentTablePath == codeModePath {
+                if let key = localPath.first, ownedKeys.contains(key) {
+                    guard localPath.count == 1 else {
+                        return "RepoPrompt did not update Codex config because a dotted definition redefines the owned [features.code_mode].\(key) key. Preserve that key as a scalar or array, then retry."
+                    }
+                    if key == "non_prefixed_mcp_tool_names" {
+                        return "RepoPrompt did not update Codex config because [features.code_mode].non_prefixed_mcp_tool_names conflicts with the owned direct-only RepoPrompt namespace policy. Remove that key, then retry."
+                    }
+                    if inlineTableValue {
+                        return "RepoPrompt did not update Codex config because an inline table redefines the owned [features.code_mode].\(key) key. Preserve that key as a scalar or array, then retry."
+                    }
+                }
+                continue
+            }
+
+            if fullPath == ["features"] || fullPath == codeModePath ||
+                (fullPath.count > codeModePath.count && fullPath.starts(with: codeModePath))
+            {
+                return "RepoPrompt did not update Codex config because a dotted or inline definition conflicts with RepoPrompt's owned [features.code_mode] table. Convert it to a regular [features.code_mode] block, then retry."
+            }
+        }
+        return nil
+    }
+
+    @discardableResult
+    private static func ensureCodeModePolicy(in lines: inout [String]) -> Bool {
+        var changed = false
+        var blocks = blockRanges(in: lines, whereHeaderMatches: isCodeModeHeader)
+        if blocks.isEmpty {
+            appendBlock(
+                [
+                    "[features.code_mode]",
+                    "enabled = true",
+                    "direct_only_tool_namespaces = [\"\(directOnlyToolNamespace)\"]"
+                ],
+                to: &lines
+            )
+            return true
+        }
+
+        var block = blocks.removeFirst()
+        if ensureKey(
+            "enabled",
+            value: "true",
+            in: &lines,
+            blockRange: &block,
+            force: true,
+            isSemanticallyEquivalent: { parseTOMLBooleanValue($0) == true }
+        ) {
+            changed = true
+        }
+        if ensureKey(
+            "direct_only_tool_namespaces",
+            value: "[\"\(directOnlyToolNamespace)\"]",
+            in: &lines,
+            blockRange: &block,
+            afterKey: "enabled",
+            force: true,
+            isSemanticallyEquivalent: isRepoPromptDirectOnlyNamespaceArray
+        ) {
+            changed = true
+        }
+        return changed
+    }
+
+    private static func isRepoPromptDirectOnlyNamespaceArray(_ valueText: Substring) -> Bool {
+        let compact = stripComment(fromValueText: String(valueText))
+            .filter { !$0.isWhitespace }
+        return compact == "[\"\(directOnlyToolNamespace)\"]" ||
+            compact == "['\(directOnlyToolNamespace)']"
     }
 
     static func ensureRepoPromptServer(
@@ -856,17 +1066,17 @@ enum CodexIntegrationConfiguration {
         if ensureKey("command", value: "\"\(serverCommand)\"", in: &lines, blockRange: &block, force: true) {
             changed = true
         }
-        if ensureKey("args", value: "[]", in: &lines, blockRange: &block, afterKey: "command", force: true) {
+        if ensureKey("args", value: serverArgumentsTOML, in: &lines, blockRange: &block, afterKey: "command", force: true) {
             changed = true
         }
-        if ensureKey("tool_timeout_sec", value: "\(desiredToolTimeoutSeconds)", in: &lines, blockRange: &block, afterKey: "args", force: true) {
+        if ensureRepoPromptPolicyKeys(in: &lines, blockRange: &block) {
             changed = true
         }
 
         if shouldIncludeEnabledKey {
             let desiredEnabled = (forceEnabled ?? defaultEnabledIfMissing) ? "true" : "false"
             let forceFlag = forceEnabled != nil
-            if ensureKey("enabled", value: desiredEnabled, in: &lines, blockRange: &block, afterKey: "tool_output_token_limit", force: forceFlag) {
+            if ensureKey("enabled", value: desiredEnabled, in: &lines, blockRange: &block, afterKey: "supports_parallel_tool_calls", force: forceFlag) {
                 changed = true
             }
         }
@@ -964,26 +1174,74 @@ enum CodexIntegrationConfiguration {
         return changed
     }
 
+    private static func ensureRepoPromptPolicyKeys(
+        in lines: inout [String],
+        blockRange: inout BlockRange
+    ) -> Bool {
+        var changed = false
+        let timeoutInsertionKey = firstIndex(ofKey: "args", in: lines, within: blockRange) == nil
+            ? "command"
+            : "args"
+
+        if ensureKey(
+            "tool_timeout_sec",
+            value: "\(desiredToolTimeoutSeconds)",
+            in: &lines,
+            blockRange: &blockRange,
+            afterKey: timeoutInsertionKey,
+            force: true,
+            isSemanticallyEquivalent: { parseTOMLIntegerValue($0) == desiredToolTimeoutSeconds }
+        ) {
+            changed = true
+        }
+        if ensureKey(
+            "supports_parallel_tool_calls",
+            value: "\(desiredSupportsParallelToolCalls)",
+            in: &lines,
+            blockRange: &blockRange,
+            afterKey: "tool_timeout_sec",
+            force: true,
+            isSemanticallyEquivalent: { parseTOMLBooleanValue($0) == desiredSupportsParallelToolCalls }
+        ) {
+            changed = true
+        }
+
+        return changed
+    }
+
     private static func ensureKey(
         _ key: String,
         value: String,
         in lines: inout [String],
         blockRange: inout BlockRange,
         afterKey: String? = nil,
-        force: Bool = false
+        force: Bool = false,
+        isSemanticallyEquivalent: ((Substring) -> Bool)? = nil
     ) -> Bool {
         var changed = false
         let desiredLine = "\(key) = \(value)"
         let indices = keyLineIndices(for: key, in: lines, within: blockRange)
 
         if let first = indices.first {
-            let trimmed = lines[first].trimmingCharacters(in: .whitespacesAndNewlines)
-            if force, trimmed != desiredLine {
-                lines[first] = desiredLine
+            let preferred = if let isSemanticallyEquivalent {
+                indices.first { index in
+                    parseTOMLAssignment(lines[index]).map { assignment in
+                        isSemanticallyEquivalent(assignment.valueText)
+                    } ?? false
+                } ?? first
+            } else {
+                first
+            }
+            let trimmed = lines[preferred].trimmingCharacters(in: .whitespacesAndNewlines)
+            let equivalent = parseTOMLAssignment(lines[preferred]).map { assignment in
+                isSemanticallyEquivalent?(assignment.valueText) ?? false
+            } ?? false
+            if force, !equivalent, trimmed != desiredLine {
+                lines[preferred] = desiredLine
                 changed = true
             }
 
-            for extra in indices.dropFirst().reversed() {
+            for extra in indices.filter({ $0 != preferred }).reversed() {
                 lines.remove(at: extra)
                 blockRange.end -= 1
                 changed = true
@@ -1032,8 +1290,9 @@ enum CodexIntegrationConfiguration {
         var lines = [
             "[mcp_servers.\(cliPathComponent(forNormalizedServerName: repoPromptMCPServerName))]",
             "command = \"\(serverCommand)\"",
-            "args = []",
-            "tool_timeout_sec = \(desiredToolTimeoutSeconds)"
+            "args = \(serverArgumentsTOML)",
+            "tool_timeout_sec = \(desiredToolTimeoutSeconds)",
+            "supports_parallel_tool_calls = \(desiredSupportsParallelToolCalls)"
         ]
         if includeEnabled {
             lines.append("enabled = \(enabled ? "true" : "false")")

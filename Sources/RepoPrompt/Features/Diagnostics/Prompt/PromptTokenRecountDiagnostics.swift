@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 #if DEBUG
     enum PromptTokenRecountDiagnostics {

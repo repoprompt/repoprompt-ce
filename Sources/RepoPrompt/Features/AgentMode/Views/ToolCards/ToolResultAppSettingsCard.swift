@@ -9,7 +9,7 @@ struct AppSettingsCardPresentation: Equatable {
 
 enum AppSettingsCardPresentationBuilder {
     static func callSubtitle(argsJSON: String?) -> String? {
-        guard let args = ToolRawJSON.object(from: argsJSON) else { return nil }
+        guard let args = ToolJSON.rawObject(from: argsJSON) else { return nil }
         let op = normalizedOp(string(args, key: "op")) ?? "app_settings"
         switch op {
         case "list":
@@ -24,7 +24,7 @@ enum AppSettingsCardPresentationBuilder {
     }
 
     static func build(argsJSON: String?, resultJSON: String?, toolIsError: Bool?) -> AppSettingsCardPresentation {
-        let args = ToolRawJSON.object(from: argsJSON)
+        let args = ToolJSON.rawObject(from: argsJSON)
         let preferredResultJSON = ToolJSON.preferredStructuredResultJSON(from: resultJSON)
         let result = resultObject(from: resultJSON, preferredResultJSON: preferredResultJSON)
         let op = normalizedOp(string(result, key: "op"))
@@ -53,10 +53,10 @@ enum AppSettingsCardPresentationBuilder {
     }
 
     private static func resultObject(from raw: String?, preferredResultJSON: String?) -> [String: Any]? {
-        if let object = ToolRawJSON.object(from: preferredResultJSON) {
+        if let object = ToolJSON.rawObject(from: preferredResultJSON) {
             return object
         }
-        return ToolRawJSON.object(from: raw)
+        return ToolJSON.rawObject(from: raw)
     }
 
     private static func listCallSubtitle(args: [String: Any]) -> String {

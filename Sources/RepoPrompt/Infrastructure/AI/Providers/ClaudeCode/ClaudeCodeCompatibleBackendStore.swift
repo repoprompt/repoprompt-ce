@@ -1,7 +1,17 @@
 import Foundation
+import RepoPromptSecureStorage
 
 final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     static let shared = ClaudeCodeCompatibleBackendStore()
+
+    // The catalogue owner injects its synchronous invalidator. The store knows no agent IDs or
+    // admission types; copying the handler releases this lock before invoking higher-level work.
+    private static let configurationChangeHandlerLock = NSLock()
+    private static var configurationChangeHandler: (@Sendable () -> Void)?
+
+    static func setConfigurationChangeHandler(_ handler: @escaping @Sendable () -> Void) {
+        configurationChangeHandlerLock.withLock { configurationChangeHandler = handler }
+    }
 
     static let configsDefaultsKey = "ClaudeCodeCompatibleBackendConfigs"
     private static let configuredDefaultsKeyPrefix = "ClaudeCodeCompatibleBackendConfigured."
@@ -25,7 +35,16 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     func config(for id: ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig {
         lock.lock()
         defer { lock.unlock() }
-        return loadConfigsLocked()[id.rawValue] ?? id.defaultPreset
+        var configs = loadConfigsLocked()
+        guard let persisted = configs[id.rawValue] else { return id.defaultPreset }
+
+        if let migrated = migratedConfigIfNeededLocked(persisted, for: id) {
+            configs[id.rawValue] = migrated
+            saveConfigsLocked(configs)
+            return migrated
+        }
+
+        return persisted
     }
 
     func saveConfig(_ config: ClaudeCodeCompatibleBackendConfig) {
@@ -33,6 +52,10 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
         defer { lock.unlock() }
         var configs = loadConfigsLocked()
         var normalized = config.normalized
+        let previous = configs[config.id.rawValue] ?? config.id.defaultPreset
+        if ProviderEndpointConsent.endpointIdentity(previous.baseURL) != ProviderEndpointConsent.endpointIdentity(normalized.baseURL) {
+            normalized.httpCredentialConsentEndpoint = nil
+        }
         normalized.updatedAt = Date()
         configs[normalized.id.rawValue] = normalized
         saveConfigsLocked(configs)
@@ -81,7 +104,7 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
         for id: ClaudeCodeCompatibleBackendID,
         accessMode: KeychainAccessMode = .interactive
     ) async throws -> String? {
-        try await secureService.getAPIKey(for: id.secretIdentifier, accessMode: accessMode)
+        try await secureService.getAPIKey(for: id.secureStorageAccount, accessMode: accessMode)
     }
 
     func saveSecret(_ secret: String, for id: ClaudeCodeCompatibleBackendID) async throws {
@@ -90,17 +113,54 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
             try await deleteSecret(for: id)
             return
         }
-        try secureService.saveAPIKey(trimmed, for: id.secretIdentifier)
+        try secureService.saveAPIKey(trimmed, for: id.secureStorageAccount)
         _ = setConfigured(true, for: id)
     }
 
     func deleteSecret(for id: ClaudeCodeCompatibleBackendID) async throws {
-        try secureService.deleteAPIKey(for: id.secretIdentifier)
+        try secureService.deleteAPIKey(for: id.secureStorageAccount)
         _ = setConfigured(false, for: id)
     }
 
     func configuredDefaultsKey(for id: ClaudeCodeCompatibleBackendID) -> String {
         Self.configuredDefaultsKeyPrefix + id.rawValue
+    }
+
+    private static let legacyGLMDefaultSlotMapping = ClaudeCodeCompatibleBackendConfig.ClaudeSlotMapping(
+        haiku: "glm-4.7",
+        sonnet: "glm-5-turbo",
+        opus: "glm-5.1"
+    )
+
+    /// Callers must hold `lock` for the entire read/migration sequence.
+    private func migratedConfigIfNeededLocked(
+        _ config: ClaudeCodeCompatibleBackendConfig,
+        for id: ClaudeCodeCompatibleBackendID
+    ) -> ClaudeCodeCompatibleBackendConfig? {
+        guard id == .glmZAI,
+              case let .claudeSlotMapping(mapping) = config.modelBehavior,
+              case let .claudeSlotMapping(defaultMapping) = ClaudeCodeCompatibleBackendID.glmZAI.defaultPreset.modelBehavior
+        else { return nil }
+
+        var migratedMapping = mapping
+        var didMigrate = false
+        if migratedMapping.haiku == Self.legacyGLMDefaultSlotMapping.haiku {
+            migratedMapping.haiku = defaultMapping.haiku
+            didMigrate = true
+        }
+        if migratedMapping.sonnet == Self.legacyGLMDefaultSlotMapping.sonnet {
+            migratedMapping.sonnet = defaultMapping.sonnet
+            didMigrate = true
+        }
+        if migratedMapping.opus == Self.legacyGLMDefaultSlotMapping.opus {
+            migratedMapping.opus = defaultMapping.opus
+            didMigrate = true
+        }
+        guard didMigrate else { return nil }
+
+        var migrated = config
+        migrated.modelBehavior = .claudeSlotMapping(migratedMapping)
+        return migrated
     }
 
     /// Callers must hold `lock` for the entire read/legacy-migration sequence.
@@ -134,6 +194,8 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
         let encoder = JSONEncoder()
         guard let data = try? encoder.encode(configs) else { return }
         defaults.set(data, forKey: Self.configsDefaultsKey)
+        let handler = Self.configurationChangeHandlerLock.withLock { Self.configurationChangeHandler }
+        handler?()
     }
 }
 
@@ -161,7 +223,7 @@ enum ClaudeCodeCompatibleBackendIntegration {
     static func environment(
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String
-    ) -> [String: String] {
-        ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
+    ) throws -> [String: String] {
+        try ClaudeCompatibleProviderRuntimeBridge.backendEnvironment(config: config, apiKey: apiKey)
     }
 }

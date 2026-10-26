@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// A drop-in replacement for `TextKitView` that supports "@" mentions.
@@ -27,6 +28,7 @@ struct AttributedTextKitView: NSViewRepresentable {
     weak var fileManager: WorkspaceFilesViewModel?
 
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
 
     private var resolvedFontSize: CGFloat {
         if let fontSize {
@@ -49,6 +51,7 @@ struct AttributedTextKitView: NSViewRepresentable {
     class Coordinator: NSObject, NSTextViewDelegate {
         private let parent: AttributedTextKitView
         private let undoMgr = UndoManager()
+        private weak var fileManager: WorkspaceFilesViewModel?
         var mentionCoord: MentionCoordinator?
         fileprivate weak var mentionTV: MentionTextView?
 
@@ -75,6 +78,7 @@ struct AttributedTextKitView: NSViewRepresentable {
 
         init(_ parent: AttributedTextKitView) {
             self.parent = parent
+            fileManager = parent.fileManager
             internalText = parent.text
             wasEmpty = parent.text.isEmpty
             undoMgr.levelsOfUndo = 100
@@ -119,12 +123,27 @@ struct AttributedTextKitView: NSViewRepresentable {
             undoMgr
         }
 
+        func performExternalReplacement(
+            in textView: NSTextView,
+            mutation: () -> Void
+        ) {
+            TextViewUndoSafeReplacement.perform(
+                in: textView,
+                undoManager: undoMgr,
+                mutation: mutation
+            )
+        }
+
+        func clearUndoHistory() {
+            undoMgr.removeAllActions()
+        }
+
         /// Called by MentionCoordinator via closure
-        fileprivate func commit(_ suggestion: MentionSuggestion) {
+        func commit(_ suggestion: MentionSuggestion) {
             guard isActive else { return }
             let path = suggestion.relativePath
             tokenCounts[path] = (tokenCounts[path] ?? 0) + 1
-            parent.fileManager?.selectPath(path, kind: suggestion.kind)
+            fileManager?.selectPath(path, kind: suggestion.kind)
         }
 
         /// Called by MentionCoordinator via closure
@@ -134,8 +153,13 @@ struct AttributedTextKitView: NSViewRepresentable {
             let newCount = max((tokenCounts[path] ?? 1) - 1, 0)
             tokenCounts[path] = newCount
             if newCount == 0 {
-                parent.fileManager?.deselectPath(path, kind: payload.kind)
+                fileManager?.deselectPath(path, kind: payload.kind)
             }
+        }
+
+        func updateFileManager(_ manager: WorkspaceFilesViewModel?) {
+            fileManager = manager
+            mentionCoord?.updateFileManager(manager)
         }
 
         /// Syncs the internal token-count table with a freshly computed set of counts.
@@ -244,13 +268,15 @@ struct AttributedTextKitView: NSViewRepresentable {
         // ------------------------------------------------------------------
         // Mention system wiring
         // ------------------------------------------------------------------
+        let fileMentionPickerConfiguration = globalSettings.fileMentionPickerConfiguration()
         let svc = MentionSuggestionService(
             fileManager: fileManager,
-            maxResults: 5
+            configuration: fileMentionPickerConfiguration
         )
         let mc = MentionCoordinator(
             textView: textView,
             suggestionService: svc,
+            configuration: fileMentionPickerConfiguration,
             commitHandler: { [weak c = context.coordinator] sugg in
                 c?.commit(sugg)
             },
@@ -309,6 +335,10 @@ struct AttributedTextKitView: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         guard let textView = nsView.documentView as? NSTextView else { return }
+
+        let fileMentionPickerConfiguration = globalSettings.fileMentionPickerConfiguration()
+        context.coordinator.updateFileManager(fileManager)
+        context.coordinator.mentionCoord?.updateConfiguration(fileMentionPickerConfiguration)
 
         // Ensure non-contiguous layout stays disabled (fixes Intel Mac issues)
         if let layoutManager = textView.layoutManager,
@@ -383,10 +413,12 @@ struct AttributedTextKitView: NSViewRepresentable {
 
                 // NEW: guard delegate echo while we apply programmatic updates
                 (textView as? MentionTextView)?.resetTransientEditingState()
-                context.coordinator.isApplyingExternalWrite = true
-                textView.string = text
-                context.coordinator.internalText = text
-                context.coordinator.isApplyingExternalWrite = false
+                context.coordinator.performExternalReplacement(in: textView) {
+                    context.coordinator.isApplyingExternalWrite = true
+                    textView.string = text
+                    context.coordinator.internalText = text
+                    context.coordinator.isApplyingExternalWrite = false
+                }
 
                 textView.setSelectedRange(previousSelection.clamped(to: textView.currentStringLength()))
 
@@ -432,6 +464,7 @@ struct AttributedTextKitView: NSViewRepresentable {
         coordinator.pendingLayoutTask?.cancel()
         coordinator.pendingLayoutTask = nil
 
+        coordinator.clearUndoHistory()
         coordinator.mentionTV = nil
         coordinator.mentionCoord = nil
         coordinator.isActive = false

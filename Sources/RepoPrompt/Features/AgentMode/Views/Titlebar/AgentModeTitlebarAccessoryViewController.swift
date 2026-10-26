@@ -36,7 +36,8 @@ private struct AgentModeTitlebarNewSessionView: View {
                 isHovering = hovering
             }
         }
-        .help("New Session")
+        .hoverTooltip("New Session", .bottom)
+        .accessibilityLabel("New Session")
     }
 }
 

@@ -1,4 +1,8 @@
 import Foundation
+import RepoPromptC
+import RepoPromptFileSystem
+import RepoPromptRegexCore
+import RepoPromptWorkspaceCore
 
 // Wildmatch flags for pattern matching
 private let WM_NOESCAPE: UInt32 = 0x01
@@ -420,6 +424,18 @@ private struct SearchScanPlan {
     let contentFreshnessPolicy: FileContentFreshnessPolicy
 }
 
+protocol WorkspaceSearchFileProjection: AnyObject {
+    var id: UUID { get }
+    var name: String { get }
+    var relativePath: String { get }
+    var standardizedRelativePath: String { get }
+    var fullPath: String { get }
+    var standardizedFullPath: String { get }
+    var standardizedRootFolderPath: String { get }
+    var fileExtension: String? { get }
+    func searchContentSnapshot(freshnessPolicy: FileContentFreshnessPolicy) async -> FileSearchContentSnapshot
+}
+
 private struct SearchFileDescriptor {
     let id: UUID
     let name: String
@@ -431,7 +447,7 @@ private struct SearchFileDescriptor {
     let fileExtension: String?
     let contentSnapshot: (FileContentFreshnessPolicy) async throws -> FileSearchContentSnapshot
 
-    init(file: FileViewModel) {
+    init(file: any WorkspaceSearchFileProjection) {
         id = file.id
         name = file.name
         relativePath = file.relativePath
@@ -448,9 +464,7 @@ private struct SearchFileDescriptor {
     init(
         record: WorkspaceFileRecord,
         rootPath: String,
-        store: WorkspaceFileContextStore,
-        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator,
-        searchID: UUID
+        store: WorkspaceFileContextStore
     ) {
         id = record.id
         name = record.name
@@ -464,75 +478,44 @@ private struct SearchFileDescriptor {
             return ext.isEmpty ? nil : ext
         }()
         contentSnapshot = { policy in
-            try await contentFetchCoordinator.withContentFetchPermit(for: store, searchID: searchID) {
-                switch policy {
-                case .validateDiskMetadata:
-                    let freshnessState = EditFlowPerf.begin(
-                        EditFlowPerf.Stage.Search.contentFreshnessValidation,
-                        EditFlowPerf.Dimensions(
-                            contentSource: "storeDisk",
-                            freshnessPolicy: "validateDiskMetadata"
-                        )
-                    )
-                    guard let current = await store.validateCatalogFileStillPresent(record) else {
-                        EditFlowPerf.end(
-                            EditFlowPerf.Stage.Search.contentFreshnessValidation,
-                            freshnessState,
-                            EditFlowPerf.Dimensions(
-                                outcome: "missing",
-                                contentSource: "storeDisk",
-                                freshnessPolicy: "validateDiskMetadata"
-                            )
-                        )
-                        return FileSearchContentSnapshot(
-                            content: nil,
-                            contentRevision: nil,
-                            modificationDate: record.modificationDate ?? .distantPast,
-                            isFresh: false
-                        )
-                    }
-                    EditFlowPerf.end(
-                        EditFlowPerf.Stage.Search.contentFreshnessValidation,
-                        freshnessState,
-                        EditFlowPerf.Dimensions(
-                            outcome: "current",
-                            contentSource: "storeDisk",
-                            freshnessPolicy: "validateDiskMetadata"
-                        )
-                    )
-                    return try await Self.loadStoreContentSnapshot(record: current, store: store)
-                case .cachedMetadata:
-                    return try await Self.loadStoreContentSnapshot(record: record, store: store)
-                }
+            let freshnessPolicy = switch policy {
+            case .validateDiskMetadata:
+                "validateDiskMetadata"
+            case .cachedMetadata:
+                "cachedMetadata"
             }
-        }
-    }
-
-    private static func loadStoreContentSnapshot(
-        record: WorkspaceFileRecord,
-        store: WorkspaceFileContextStore
-    ) async throws -> FileSearchContentSnapshot {
-        do {
-            let loaded = try await store.readContentWithDate(
-                rootID: record.rootID,
-                relativePath: record.standardizedRelativePath,
-                workloadClass: .contentSearch
+            let freshnessState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.Search.contentFreshnessValidation,
+                EditFlowPerf.Dimensions(
+                    contentSource: "storeSnapshot",
+                    freshnessPolicy: freshnessPolicy
+                )
             )
-            return FileSearchContentSnapshot(
-                content: loaded.content,
-                contentRevision: nil,
-                modificationDate: loaded.modificationDate,
-                isFresh: true
-            )
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            return FileSearchContentSnapshot(
-                content: nil,
-                contentRevision: nil,
-                modificationDate: record.modificationDate ?? .distantPast,
-                isFresh: false
-            )
+            var outcome = "error"
+            defer {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.Search.contentFreshnessValidation,
+                    freshnessState,
+                    EditFlowPerf.Dimensions(
+                        outcome: outcome,
+                        contentSource: "storeSnapshot",
+                        freshnessPolicy: freshnessPolicy
+                    )
+                )
+            }
+            do {
+                let snapshot = try await store.searchContentSnapshot(
+                    for: record,
+                    freshnessPolicy: policy
+                )
+                outcome = snapshot.isFresh ? "current" : "missing"
+                return snapshot
+            } catch is CancellationError {
+                outcome = "cancelled"
+                throw CancellationError()
+            } catch {
+                throw error
+            }
         }
     }
 }
@@ -576,23 +559,54 @@ private struct SearchPathBatchResult {
     let hits: [(ordinal: Int, path: String)]
 }
 
+struct OrderedSearchBatchWindow {
+    let batchCount: Int
+    let maxEnqueueLead: Int
+    private(set) var nextBatchToEnqueue = 0
+    private(set) var nextBatchToDrain = 0
+
+    init(batchCount: Int, maxEnqueueLead: Int) {
+        precondition(batchCount >= 0)
+        precondition(maxEnqueueLead > 0)
+        self.batchCount = batchCount
+        self.maxEnqueueLead = maxEnqueueLead
+    }
+
+    var enqueueLead: Int {
+        nextBatchToEnqueue - nextBatchToDrain
+    }
+
+    mutating func takeNextBatchToEnqueue() -> Int? {
+        guard nextBatchToEnqueue < batchCount,
+              nextBatchToEnqueue < nextBatchToDrain + maxEnqueueLead
+        else { return nil }
+        defer { nextBatchToEnqueue += 1 }
+        return nextBatchToEnqueue
+    }
+
+    mutating func advanceDrainFrontier() {
+        precondition(nextBatchToDrain < nextBatchToEnqueue)
+        nextBatchToDrain += 1
+    }
+}
+
 /// Ripgrep-style asynchronous searcher, fully cancellable.
 actor FileSearchActor {
+    static func pathSearchInputPrecedes(_ lhsPath: String, _ rhsPath: String) -> Bool {
+        WorkspaceFileContextStore.compareUTF8Binary(lhsPath, rhsPath) == .orderedAscending
+    }
+
     private static func descriptors(
         for files: [WorkspaceFileRecord],
         rootsByID: [UUID: WorkspaceRootRecord],
-        store: WorkspaceFileContextStore,
-        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator,
-        searchID: UUID
+        store: WorkspaceFileContextStore
     ) -> [SearchFileDescriptor] {
         files.compactMap { file in
             guard let root = rootsByID[file.rootID] else { return nil }
             return SearchFileDescriptor(
                 record: file,
                 rootPath: root.standardizedFullPath,
-                store: store,
-                contentFetchCoordinator: contentFetchCoordinator,
-                searchID: searchID
+                store: store
             )
         }
     }
@@ -648,9 +662,6 @@ actor FileSearchActor {
     /// interrupted by cooperative cancellation.
     private static let maxPCRE2FullScanBytes = 1_000_000 // 1 MB
 
-    /// Number of files scanned by each content worker task.
-    private static let contentScanBatchSize = 16
-
     /// Number of paths evaluated by each path worker task.
     private static let pathScanBatchSize = 128
 
@@ -658,6 +669,24 @@ actor FileSearchActor {
     /// We default to the number of CPU cores (but at least 4) so the search
     /// stays responsive without flooding the executor with thousands of jobs.
     private static let maxConcurrentTasks = max(4, ProcessInfo.processInfo.activeProcessorCount)
+
+    /// Resolves the measured production content-batch size from a stable worker count.
+    /// The policy targets eight batches per worker, then clamps nonempty batches to 2...4 files.
+    /// A single-file search remains a single-file batch.
+    static func contentScanBatchSize(fileCount: Int, workerCount: Int) -> Int {
+        guard fileCount > 0 else { return 0 }
+        let resolvedWorkerCount = max(4, workerCount)
+        let (filesPerWorkerTarget, overflowed) = resolvedWorkerCount.multipliedReportingOverflow(by: 8)
+        let targetBatchSize: Int
+        if overflowed || filesPerWorkerTarget >= fileCount {
+            targetBatchSize = 1
+        } else {
+            let quotient = fileCount / filesPerWorkerTarget
+            let remainder = fileCount % filesPerWorkerTarget
+            targetBatchSize = quotient + (remainder == 0 ? 0 : 1)
+        }
+        return min(fileCount, min(4, max(2, targetBatchSize)))
+    }
 
     /// Cache of numeric line indexes keyed by file path and content fingerprint.
     private static let lineIndexCache: NSCache<NSString, SearchLineIndexBox> = {
@@ -970,7 +999,7 @@ actor FileSearchActor {
         isRegex: Bool = false,
         wasAutoCorrected: inout Bool?,
         options: SearchOptions = SearchOptions(),
-        in files: [FileViewModel]
+        in files: [any WorkspaceSearchFileProjection]
     ) async throws -> [SearchMatch] {
         var materializingOptions = options
         materializingOptions.countOnly = false
@@ -991,9 +1020,7 @@ actor FileSearchActor {
         options: SearchOptions = SearchOptions(),
         in files: [WorkspaceFileRecord],
         rootsByID: [UUID: WorkspaceRootRecord],
-        store: WorkspaceFileContextStore,
-        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared,
-        searchID: UUID = UUID()
+        store: WorkspaceFileContextStore
     ) async throws -> [SearchMatch] {
         var materializingOptions = options
         materializingOptions.countOnly = false
@@ -1005,9 +1032,7 @@ actor FileSearchActor {
             in: Self.descriptors(
                 for: files,
                 rootsByID: rootsByID,
-                store: store,
-                contentFetchCoordinator: contentFetchCoordinator,
-                searchID: searchID
+                store: store
             )
         )
         return result.matches
@@ -1153,7 +1178,7 @@ actor FileSearchActor {
         pattern: String,
         isRegex: Bool = false,
         options: SearchOptions = SearchOptions(),
-        in files: [FileViewModel]
+        in files: [any WorkspaceSearchFileProjection]
     ) async throws -> [SearchMatch] {
         var autoCorrected: Bool? = nil
         return try await search(
@@ -1317,14 +1342,20 @@ actor FileSearchActor {
             .sorted { $0.fullPath < $1.fullPath }
             .enumerated()
             .map { SearchFileInput(ordinal: $0.offset, file: $0.element) }
-        let batches = Self.makeContentBatches(entries)
+        let contentBatchSize = Self.contentScanBatchSize(
+            fileCount: entries.count,
+            workerCount: Self.maxConcurrentTasks
+        )
+        let batches = Self.makeContentBatches(entries, batchSize: contentBatchSize)
         let scanKind = Self.scanKind(for: plan)
         let contentScanState = EditFlowPerf.begin(
             EditFlowPerf.Stage.Search.contentScanTotal,
             EditFlowPerf.Dimensions(
                 taskCount: batches.count,
+                workerCount: Self.maxConcurrentTasks,
                 admittedFileCount: files.count,
                 scanKind: scanKind,
+                batchSize: contentBatchSize,
                 isRegex: isRegex,
                 countOnly: countOnly
             )
@@ -1332,8 +1363,10 @@ actor FileSearchActor {
         var contentScanOutcome = "completed"
         var scannedFileCount = 0
 
-        var nextBatchToEnqueue = 0
-        var nextBatchToDrain = 0
+        var batchWindow = OrderedSearchBatchWindow(
+            batchCount: batches.count,
+            maxEnqueueLead: Self.maxConcurrentTasks
+        )
         var pending: [Int: SearchContentBatchResult] = [:]
         var emittedMatches: [SearchMatch] = []
         var totalCount = 0
@@ -1347,37 +1380,37 @@ actor FileSearchActor {
                     outcome: contentScanOutcome,
                     matchCount: totalCount,
                     taskCount: batches.count,
+                    workerCount: Self.maxConcurrentTasks,
                     admittedFileCount: files.count,
                     scannedFileCount: scannedFileCount,
                     matchedFileCount: matchedFileCount,
                     scanKind: scanKind,
+                    batchSize: contentBatchSize,
                     isRegex: isRegex,
                     countOnly: countOnly
                 )
             )
         }
 
-        func enqueueNextBatch(into group: inout ThrowingTaskGroup<SearchContentBatchResult, Error>) {
-            guard nextBatchToEnqueue < batches.count else { return }
-            let batch = batches[nextBatchToEnqueue]
-            nextBatchToEnqueue += 1
-            group.addTask { [entries] in
-                try await Self.scanContentBatch(batch, entries: entries, plan: plan)
+        func refillBatchWindow(into group: inout ThrowingTaskGroup<SearchContentBatchResult, Error>) {
+            while let batchIndex = batchWindow.takeNextBatchToEnqueue() {
+                let batch = batches[batchIndex]
+                group.addTask { [entries] in
+                    try await Self.scanContentBatch(batch, entries: entries, plan: plan)
+                }
             }
         }
 
         do {
             try await withThrowingTaskGroup(of: SearchContentBatchResult.self) { group in
-                let initialCount = min(Self.maxConcurrentTasks, batches.count)
-                for _ in 0 ..< initialCount {
-                    enqueueNextBatch(into: &group)
-                }
+                refillBatchWindow(into: &group)
 
                 scanLoop: while let batchResult = try await group.next() {
                     scannedFileCount += batchResult.fileResults.count
                     pending[batchResult.index] = batchResult
 
-                    while let ready = pending.removeValue(forKey: nextBatchToDrain) {
+                    var drainAdvanced = false
+                    while let ready = pending.removeValue(forKey: batchWindow.nextBatchToDrain) {
                         for fileResult in ready.fileResults {
                             perFileErrors.append(contentsOf: fileResult.errors)
                             totalCount += fileResult.summary.lineMatchCount
@@ -1395,10 +1428,13 @@ actor FileSearchActor {
                                 break scanLoop
                             }
                         }
-                        nextBatchToDrain += 1
+                        batchWindow.advanceDrainFrontier()
+                        drainAdvanced = true
                     }
 
-                    enqueueNextBatch(into: &group)
+                    if drainAdvanced {
+                        refillBatchWindow(into: &group)
+                    }
                 }
             }
         } catch {
@@ -1426,14 +1462,18 @@ actor FileSearchActor {
         )
     }
 
-    private static func makeContentBatches(_ entries: [SearchFileInput]) -> [SearchContentBatch] {
+    private static func makeContentBatches(
+        _ entries: [SearchFileInput],
+        batchSize: Int
+    ) -> [SearchContentBatch] {
         guard !entries.isEmpty else { return [] }
+        precondition(batchSize > 0)
         var batches: [SearchContentBatch] = []
-        batches.reserveCapacity((entries.count + contentScanBatchSize - 1) / contentScanBatchSize)
+        batches.reserveCapacity(((entries.count - 1) / batchSize) + 1)
         var batchIndex = 0
         var start = 0
         while start < entries.count {
-            let end = min(start + contentScanBatchSize, entries.count)
+            let end = min(start + batchSize, entries.count)
             batches.append(SearchContentBatch(index: batchIndex, range: start ..< end))
             batchIndex += 1
             start = end
@@ -1464,6 +1504,7 @@ actor FileSearchActor {
         let perfState = EditFlowPerf.begin(
             EditFlowPerf.Stage.Search.contentBatch,
             EditFlowPerf.Dimensions(
+                workerCount: Self.maxConcurrentTasks,
                 scanKind: scanKind(for: plan),
                 batchSize: batchSize,
                 isRegex: plan.engine != nil,
@@ -1481,6 +1522,7 @@ actor FileSearchActor {
                 perfState,
                 EditFlowPerf.Dimensions(
                     matchCount: matchCount,
+                    workerCount: Self.maxConcurrentTasks,
                     scannedFileCount: scannedFileCount,
                     scanKind: scanKind(for: plan),
                     batchSize: batchSize,
@@ -1618,6 +1660,10 @@ actor FileSearchActor {
                 document: (plan.countOnly || summary.hits.isEmpty) ? nil : document,
                 summary: summary,
                 errors: []
+            )
+        } catch let error as ContentReadSchedulerError {
+            throw StoreBackedWorkspaceSearchAdmissionError.contentReadQueueFull(
+                retryAfterMilliseconds: error.retryAfterMilliseconds
             )
         } catch let error as StoreBackedWorkspaceSearchAdmissionError {
             throw error
@@ -2212,7 +2258,7 @@ actor FileSearchActor {
     func searchPaths(
         pattern: String,
         limit: Int = 100,
-        in files: [FileViewModel],
+        in files: [any WorkspaceSearchFileProjection],
         caseInsensitive: Bool = true,
         isRegex: Bool = false, // ← NEW
         aliasByRootPath: [String: String]? = nil
@@ -2233,8 +2279,6 @@ actor FileSearchActor {
         in files: [WorkspaceFileRecord],
         rootsByID: [UUID: WorkspaceRootRecord],
         store: WorkspaceFileContextStore,
-        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared,
-        searchID: UUID = UUID(),
         caseInsensitive: Bool = true,
         isRegex: Bool = false,
         aliasByRootPath: [String: String]? = nil
@@ -2245,9 +2289,7 @@ actor FileSearchActor {
             in: Self.descriptors(
                 for: files,
                 rootsByID: rootsByID,
-                store: store,
-                contentFetchCoordinator: contentFetchCoordinator,
-                searchID: searchID
+                store: store
             ),
             caseInsensitive: caseInsensitive,
             isRegex: isRegex,
@@ -2301,46 +2343,129 @@ actor FileSearchActor {
             isRegex: useRegex,
             aliasByRootPath: aliasByRootPath
         )
-        let entries = files.enumerated().map { SearchPathInput(ordinal: $0.offset, file: $0.element) }
+        #if DEBUG
+            let sortAndInputStart = WorkspaceFileSearchDebugTiming.now()
+        #endif
+        let entries = files
+            .sorted { Self.pathSearchInputPrecedes($0.fullPath, $1.fullPath) }
+            .enumerated()
+            .map { SearchPathInput(ordinal: $0.offset, file: $0.element) }
+        #if DEBUG
+            let sortAndInputEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.collector?.recordSortAndInput(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: sortAndInputStart,
+                    through: sortAndInputEnd
+                ),
+                inputCount: entries.count
+            )
+            let batchAndEnqueueStart = WorkspaceFileSearchDebugTiming.now()
+        #endif
         let batches = Self.makePathBatches(entries)
-        var nextBatchToEnqueue = 0
-        var nextBatchToDrain = 0
+        var batchWindow = OrderedSearchBatchWindow(
+            batchCount: batches.count,
+            maxEnqueueLead: Self.maxConcurrentTasks
+        )
         var pending: [Int: SearchPathBatchResult] = [:]
         var hits: [String] = []
         hits.reserveCapacity(min(limit, 16))
+        #if DEBUG
+            let diagnosticReturnLimit = max(
+                1,
+                WorkspaceFileSearchDebugContext.collector?.requestedPathLimit() ?? limit
+            )
+            var diagnosticDrainedBatchCount = 0
+            var diagnosticEntriesExamined = 0
+            var diagnosticDrainedBatchCountThroughHit = 0
+            var diagnosticEntriesExaminedThroughHit = 0
+            var diagnosticReturnedHitOrdinal = 0
+            var diagnosticReturnedHitPrefixLength = 0
+            var diagnosticDrainStart: UInt64 = 0
+            var diagnosticFirstHitEnd: UInt64?
+        #endif
 
-        func enqueueNextBatch(into group: inout ThrowingTaskGroup<SearchPathBatchResult, Error>) {
-            guard nextBatchToEnqueue < batches.count else { return }
-            let batch = batches[nextBatchToEnqueue]
-            nextBatchToEnqueue += 1
-            group.addTask { [entries] in
-                try await Self.scanPathBatch(batch, entries: entries, plan: plan)
+        func refillBatchWindow(into group: inout ThrowingTaskGroup<SearchPathBatchResult, Error>) {
+            while let batchIndex = batchWindow.takeNextBatchToEnqueue() {
+                let batch = batches[batchIndex]
+                group.addTask { [entries] in
+                    try await Self.scanPathBatch(batch, entries: entries, plan: plan)
+                }
             }
         }
 
         try await withThrowingTaskGroup(of: SearchPathBatchResult.self) { group in
-            let initialCount = min(Self.maxConcurrentTasks, batches.count)
-            for _ in 0 ..< initialCount {
-                enqueueNextBatch(into: &group)
-            }
+            refillBatchWindow(into: &group)
+            #if DEBUG
+                let initialEnqueueEnd = WorkspaceFileSearchDebugTiming.now()
+                WorkspaceFileSearchDebugContext.collector?.recordBatchAndInitialEnqueue(
+                    nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: batchAndEnqueueStart,
+                        through: initialEnqueueEnd
+                    ),
+                    totalBatchCount: batches.count,
+                    initiallyEnqueuedBatchCount: batchWindow.nextBatchToEnqueue
+                )
+                diagnosticDrainStart = initialEnqueueEnd
+            #endif
 
             scanLoop: while let batchResult = try await group.next() {
                 pending[batchResult.index] = batchResult
 
-                while let ready = pending.removeValue(forKey: nextBatchToDrain) {
+                var drainAdvanced = false
+                while let ready = pending.removeValue(forKey: batchWindow.nextBatchToDrain) {
+                    #if DEBUG
+                        diagnosticDrainedBatchCount += 1
+                        diagnosticEntriesExamined += batches[ready.index].range.count
+                    #endif
                     for hit in ready.hits.sorted(by: { $0.ordinal < $1.ordinal }) {
                         hits.append(hit.path)
+                        #if DEBUG
+                            if diagnosticFirstHitEnd == nil, hits.count >= diagnosticReturnLimit {
+                                diagnosticDrainedBatchCountThroughHit = diagnosticDrainedBatchCount
+                                diagnosticEntriesExaminedThroughHit = diagnosticEntriesExamined
+                                diagnosticReturnedHitOrdinal = hit.ordinal + 1
+                                diagnosticReturnedHitPrefixLength = hits.count
+                                diagnosticFirstHitEnd = WorkspaceFileSearchDebugTiming.now()
+                            }
+                        #endif
                         if hits.count >= limit {
                             group.cancelAll()
                             break scanLoop
                         }
                     }
-                    nextBatchToDrain += 1
+                    batchWindow.advanceDrainFrontier()
+                    drainAdvanced = true
                 }
 
-                enqueueNextBatch(into: &group)
+                if drainAdvanced {
+                    refillBatchWindow(into: &group)
+                }
             }
         }
+        #if DEBUG
+            let diagnosticGroupEnd = WorkspaceFileSearchDebugTiming.now()
+            let diagnosticDrainEnd = diagnosticFirstHitEnd ?? diagnosticGroupEnd
+            if diagnosticFirstHitEnd == nil {
+                diagnosticDrainedBatchCountThroughHit = diagnosticDrainedBatchCount
+                diagnosticEntriesExaminedThroughHit = diagnosticEntriesExamined
+            }
+            WorkspaceFileSearchDebugContext.collector?.recordDeterministicDrainToHit(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: diagnosticDrainStart,
+                    through: diagnosticDrainEnd
+                ),
+                drainedBatchCount: diagnosticDrainedBatchCountThroughHit,
+                entriesExamined: diagnosticEntriesExaminedThroughHit,
+                returnedHitOrdinal: diagnosticReturnedHitOrdinal,
+                returnedHitPrefixLength: diagnosticReturnedHitPrefixLength
+            )
+            WorkspaceFileSearchDebugContext.collector?.recordPostHitResidual(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: diagnosticDrainEnd,
+                    through: diagnosticGroupEnd
+                )
+            )
+        #endif
 
         return hits
     }
@@ -2529,7 +2654,7 @@ actor FileSearchActor {
         isRegex: Bool = false,
         wasAutoCorrected: inout Bool?,
         options: SearchOptions = SearchOptions(),
-        in files: [FileViewModel],
+        in files: [any WorkspaceSearchFileProjection],
         aliasByRootPath: [String: String]? = nil
     ) async throws -> SearchResults {
         try await searchUnified(
@@ -2550,24 +2675,46 @@ actor FileSearchActor {
         in files: [WorkspaceFileRecord],
         rootsByID: [UUID: WorkspaceRootRecord],
         store: WorkspaceFileContextStore,
-        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared,
-        searchID: UUID = UUID(),
         aliasByRootPath: [String: String]? = nil
     ) async throws -> SearchResults {
-        try await searchUnified(
-            pattern: pattern,
-            isRegex: isRegex,
-            wasAutoCorrected: &wasAutoCorrected,
-            options: options,
-            in: Self.descriptors(
+        #if DEBUG
+            let descriptorStart = WorkspaceFileSearchDebugTiming.now()
+            let descriptors = Self.descriptors(
                 for: files,
                 rootsByID: rootsByID,
-                store: store,
-                contentFetchCoordinator: contentFetchCoordinator,
-                searchID: searchID
-            ),
-            aliasByRootPath: aliasByRootPath
-        )
+                store: store
+            )
+            let descriptorEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.collector?.recordDescriptors(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: descriptorStart,
+                    through: descriptorEnd
+                ),
+                sourceCount: files.count,
+                builtCount: descriptors.count
+            )
+            return try await searchUnified(
+                pattern: pattern,
+                isRegex: isRegex,
+                wasAutoCorrected: &wasAutoCorrected,
+                options: options,
+                in: descriptors,
+                aliasByRootPath: aliasByRootPath
+            )
+        #else
+            return try await searchUnified(
+                pattern: pattern,
+                isRegex: isRegex,
+                wasAutoCorrected: &wasAutoCorrected,
+                options: options,
+                in: Self.descriptors(
+                    for: files,
+                    rootsByID: rootsByID,
+                    store: store
+                ),
+                aliasByRootPath: aliasByRootPath
+            )
+        #endif
     }
 
     private func searchUnified(
@@ -2584,7 +2731,17 @@ actor FileSearchActor {
         let effectiveIsRegex = isRegex
 
         // Filter files by extensions and exclude patterns first
+        #if DEBUG
+            let filterStart = WorkspaceFileSearchDebugTiming.now()
+        #endif
         let filteredFiles = filterFiles(files, options: options)
+        #if DEBUG
+            let filterEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.collector?.recordActorFilter(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: filterStart, through: filterEnd),
+                admittedCount: filteredFiles.count
+            )
+        #endif
 
         // Decide effective strategy when `.auto`
         let effectiveMode: SearchMode = {
@@ -2761,7 +2918,7 @@ actor FileSearchActor {
         pattern: String,
         isRegex: Bool = false,
         options: SearchOptions = SearchOptions(),
-        in files: [FileViewModel],
+        in files: [any WorkspaceSearchFileProjection],
         aliasByRootPath: [String: String]? = nil
     ) async throws -> SearchResults {
         // Entry point for MCP tool integration
@@ -2784,8 +2941,6 @@ actor FileSearchActor {
         in files: [WorkspaceFileRecord],
         rootsByID: [UUID: WorkspaceRootRecord],
         store: WorkspaceFileContextStore,
-        contentFetchCoordinator: StoreBackedWorkspaceSearchContentFetchAdmissionCoordinator = .shared,
-        searchID: UUID = UUID(),
         aliasByRootPath: [String: String]? = nil
     ) async throws -> SearchResults {
         var autoCorrected: Bool? = nil
@@ -2797,8 +2952,6 @@ actor FileSearchActor {
             in: files,
             rootsByID: rootsByID,
             store: store,
-            contentFetchCoordinator: contentFetchCoordinator,
-            searchID: searchID,
             aliasByRootPath: aliasByRootPath
         )
     }

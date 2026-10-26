@@ -13,7 +13,8 @@ extension MCPBootstrapLeaseSpec {
         reason: String? = nil,
         ttl: TimeInterval,
         tabID: UUID? = nil,
-        purpose: MCPRunPurpose
+        purpose: MCPRunPurpose,
+        requiresExpectedAgentPID: Bool = false
     ) -> MCPBootstrapLeaseSpec {
         MCPBootstrapLeaseSpec(
             runID: runID,
@@ -29,7 +30,7 @@ extension MCPBootstrapLeaseSpec {
             purpose: purpose,
             taskLabelKind: nil,
             allowsAgentExternalControlTools: false,
-            requiresExpectedAgentPID: false
+            requiresExpectedAgentPID: requiresExpectedAgentPID
         )
     }
 }

@@ -25,7 +25,7 @@ struct AgentLogEntryRowView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            Text(timestamp)
+            MessageTimestampText(date: entry.timestamp)
                 .font(.caption2)
                 .foregroundColor(.secondary.opacity(0.7))
                 .monospacedDigit()
@@ -40,12 +40,6 @@ struct AgentLogEntryRowView: View {
             return String(entry.message.dropFirst("Using tool: ".count))
         }
         return entry.message
-    }
-
-    private var timestamp: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter.string(from: entry.timestamp)
     }
 
     private var icon: String {

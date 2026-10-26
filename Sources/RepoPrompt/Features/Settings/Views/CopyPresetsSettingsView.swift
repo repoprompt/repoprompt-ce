@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 struct CopyPresetsSettingsView: View {
@@ -152,6 +153,21 @@ struct CopyPresetsSettingsView: View {
         } message: {
             Text("Are you sure you want to delete '\(presetToDelete?.name ?? "")'? This action cannot be undone.")
         }
+        .background {
+            PresetPersistenceErrorAlertHost(
+                message: presetManager.persistenceErrorMessage ?? "The preset change couldn't be saved.",
+                isPresented: persistenceErrorBinding
+            )
+        }
+    }
+
+    private var persistenceErrorBinding: Binding<Bool> {
+        Binding(
+            get: { presetManager.persistenceErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented { presetManager.clearPersistenceError() }
+            }
+        )
     }
 
     // MARK: - Header
@@ -347,7 +363,8 @@ private struct CopyPresetRow: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.small)
-            .help(isShown ? "Shown in quick menu" : "Hidden from quick menu")
+            .hoverTooltip(isShown ? "Shown in quick menu" : "Hidden from quick menu")
+            .accessibilityLabel("Show \(preset.name) in quick menu")
 
             // 2) Title area: icon inline with name, then Built-in/Custom badge, then compact readable chips
             VStack(alignment: .leading, spacing: 2) {

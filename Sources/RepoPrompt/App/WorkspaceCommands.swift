@@ -1,9 +1,11 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 /// Extra File-menu items that operate on the *focused* window’s workspace.
 struct WorkspaceCommands: Commands {
-    /// Shared window tracker injected from the app.
-    @ObservedObject var windowStatesManager: WindowStatesManager
+    /// Shared window tracker injected from the app. Not observed: `focusedWindow` is resolved when
+    /// an action runs, so the menu does not need to rebuild on every window open/close.
+    let windowStatesManager: WindowStatesManager
 
     /// The window currently in focus, or (as a fallback) the most-recently created one.
     private var focusedWindow: WindowState? {

@@ -1,7 +1,35 @@
 import Foundation
+import RepoPromptSettingsCore
+
+// MARK: - Agent Session Metadata
+
+/// Lightweight metadata for agent session listing
+struct AgentSessionMeta {
+    let id: UUID
+    let composeTabID: UUID?
+    let name: String
+    let lastModified: Date
+    let itemCount: Int
+    let agentKind: String?
+    let agentModel: String?
+    let lastRunState: String?
+    let acpModelParameterSelections: [ACPModelParameterSelection]
+    let parentSessionID: UUID?
+    let createdByOverseerSessionID: UUID?
+    let isMCPOriginated: Bool
+    let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
+    let activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
+}
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 2
+    /// 8 adds canonical transcript-turn counts for history analytics.
+    ///
+    /// Organizational placement (`organizationalParentID`, `delegationScopeID`) is additive and
+    /// `decodeIfPresent` *without* a bump: a version bump makes every not-yet-reopened workspace's
+    /// index unreadable to the cross-workspace `history` scan until rebuilt, which would change
+    /// external `history` output. A record missing the fields falls back to spawn provenance, and
+    /// placement only ever exists after this build writes it.
+    static let currentSchemaVersion = 8
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -55,9 +83,23 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var agentKindRaw: String?
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
+    var acpModelParameterSelections: [ACPModelParameterSelection]
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
+    /// Deliberately **not** listed in `lacksTranscriptDerivedFields`: this is session configuration,
+    /// not a transcript-derived completeness signal, so a record missing it is not stale.
+    var autoWakeOnOversightUpdates: Bool
+    var agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID>
+    var routineWakeIntervalEnabled: Bool
+    var routineWakeIntervalSeconds: Int
+    var periodicIdleWakeEnabled: Bool
+    var periodicIdleWakeIntervalSeconds: Int
     var parentSessionID: UUID?
+    var createdByOverseerSessionID: UUID?
+    /// Mutable organizational placement; `nil` follows spawn provenance. Deliberately **not** listed
+    /// in `lacksTranscriptDerivedFields`: it is session configuration, not transcript-derived.
+    var organizationalParentID: UUID?
+    var delegationScopeID: UUID?
     var isMCPOriginated: Bool
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
@@ -65,9 +107,49 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var observedFileSize: Int64?
     var observedFileModificationDate: Date?
     var lastIndexedAt: Date
+    var firstActivityAt: Date?
+    var lastActivityAt: Date?
+    var keyPaths: Set<String>
+    var coveredTurnDurationSeconds: Int
+    var interActiveIntervalGapSeconds: [Int]
+    var toolCallCount: Int
+    var transcriptTurnCount: Int
+
+    /// Default idle threshold in minutes. Gaps between merged active intervals longer than this are idle.
+    static let defaultIdleThresholdMinutes = 10
 
     var activityDate: Date {
         AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
+    }
+
+    /// Active duration at the default idle threshold, derived from the stored primitives.
+    var activeDurationSeconds: Int {
+        activeDurationSeconds(thresholdMinutes: Self.defaultIdleThresholdMinutes)
+    }
+
+    /// Active duration at a custom idle threshold (minutes). Gaps greater than the threshold are idle;
+    /// gaps less than or equal are active and merged in.
+    func activeDurationSeconds(thresholdMinutes: Int) -> Int {
+        let thresholdSeconds = thresholdMinutes * 60
+        let activeGaps = interActiveIntervalGapSeconds.reduce(0) { $0 + ($1 <= thresholdSeconds ? $1 : 0) }
+        return coveredTurnDurationSeconds + activeGaps
+    }
+
+    /// True when this record carries no transcript-derived fields, i.e. it was built from a
+    /// transcript-less stub during a cheap `rebuildMetadataIndex` pass. The history tool uses this to
+    /// decide which records need on-demand enrichment: any populated transcript-derived field implies a real
+    /// transcript was already seen (the save/load path), so the record is passed through unchanged.
+    ///
+    /// Maintenance: any new transcript-derived field must be added to this check, or a stub-built
+    /// record carrying it would be misclassified as indexed and silently skip on-demand enrichment.
+    var lacksTranscriptDerivedFields: Bool {
+        firstActivityAt == nil
+            && lastActivityAt == nil
+            && coveredTurnDurationSeconds == 0
+            && interActiveIntervalGapSeconds.isEmpty
+            && keyPaths.isEmpty
+            && toolCallCount == 0
+            && transcriptTurnCount == 0
     }
 
     init(
@@ -84,16 +166,33 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentKindRaw: String?,
         agentModelRaw: String?,
         agentReasoningEffortRaw: String?,
+        acpModelParameterSelections: [ACPModelParameterSelection] = [],
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
+        autoWakeOnOversightUpdates: Bool = false,
+        agentSessionLinkAutoWakeTargetSessionIDs: Set<UUID> = [],
+        routineWakeIntervalEnabled: Bool = false,
+        routineWakeIntervalSeconds: Int = AgentSessionLinkRoutineWakeInterval.defaultSeconds,
+        periodicIdleWakeEnabled: Bool = false,
+        periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         parentSessionID: UUID?,
+        createdByOverseerSessionID: UUID? = nil,
+        organizationalParentID: UUID? = nil,
+        delegationScopeID: UUID? = nil,
         isMCPOriginated: Bool,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = [],
         serializationVersion: Int?,
         observedFileSize: Int64?,
         observedFileModificationDate: Date?,
-        lastIndexedAt: Date
+        lastIndexedAt: Date,
+        firstActivityAt: Date? = nil,
+        lastActivityAt: Date? = nil,
+        keyPaths: Set<String> = [],
+        coveredTurnDurationSeconds: Int = 0,
+        interActiveIntervalGapSeconds: [Int] = [],
+        toolCallCount: Int = 0,
+        transcriptTurnCount: Int = 0
     ) {
         self.id = id
         self.filename = filename
@@ -108,9 +207,19 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.agentKindRaw = agentKindRaw
         self.agentModelRaw = agentModelRaw
         self.agentReasoningEffortRaw = agentReasoningEffortRaw
+        self.acpModelParameterSelections = ACPModelParameterSelection.normalized(acpModelParameterSelections)
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
+        self.autoWakeOnOversightUpdates = autoWakeOnOversightUpdates
+        self.agentSessionLinkAutoWakeTargetSessionIDs = agentSessionLinkAutoWakeTargetSessionIDs
+        self.routineWakeIntervalEnabled = routineWakeIntervalEnabled
+        self.routineWakeIntervalSeconds = AgentSessionLinkRoutineWakeInterval.normalized(routineWakeIntervalSeconds)
+        self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
+        self.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds)
         self.parentSessionID = parentSessionID
+        self.createdByOverseerSessionID = createdByOverseerSessionID
+        self.organizationalParentID = organizationalParentID
+        self.delegationScopeID = delegationScopeID
         self.isMCPOriginated = isMCPOriginated
         self.worktreeBindingSummaries = worktreeBindingSummaries
         self.activeWorktreeMergeSummaries = activeWorktreeMergeSummaries
@@ -118,6 +227,13 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.observedFileSize = observedFileSize
         self.observedFileModificationDate = observedFileModificationDate
         self.lastIndexedAt = lastIndexedAt
+        self.firstActivityAt = firstActivityAt
+        self.lastActivityAt = lastActivityAt
+        self.keyPaths = keyPaths
+        self.coveredTurnDurationSeconds = coveredTurnDurationSeconds
+        self.interActiveIntervalGapSeconds = interActiveIntervalGapSeconds
+        self.toolCallCount = toolCallCount
+        self.transcriptTurnCount = transcriptTurnCount
     }
 
     enum CodingKeys: String, CodingKey {
@@ -134,9 +250,19 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case agentKindRaw
         case agentModelRaw
         case agentReasoningEffortRaw
+        case acpModelParameterSelections
         case lastRunStateRaw
         case autoEditEnabled
+        case autoWakeOnOversightUpdates
+        case agentSessionLinkAutoWakeTargetSessionIDs
+        case routineWakeIntervalEnabled
+        case routineWakeIntervalSeconds
+        case periodicIdleWakeEnabled
+        case periodicIdleWakeIntervalSeconds
         case parentSessionID
+        case createdByOverseerSessionID
+        case organizationalParentID
+        case delegationScopeID
         case isMCPOriginated
         case worktreeBindingSummaries
         case activeWorktreeMergeSummaries
@@ -144,6 +270,13 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case observedFileSize
         case observedFileModificationDate
         case lastIndexedAt
+        case firstActivityAt
+        case lastActivityAt
+        case keyPaths
+        case coveredTurnDurationSeconds
+        case interActiveIntervalGapSeconds
+        case toolCallCount
+        case transcriptTurnCount
     }
 
     init(from decoder: Decoder) throws {
@@ -161,9 +294,36 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentKindRaw = try container.decodeIfPresent(String.self, forKey: .agentKindRaw)
         agentModelRaw = try container.decodeIfPresent(String.self, forKey: .agentModelRaw)
         agentReasoningEffortRaw = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffortRaw)
+        acpModelParameterSelections = try ACPModelParameterSelection.normalized(
+            container.decodeIfPresent(
+                [ACPModelParameterSelection].self,
+                forKey: .acpModelParameterSelections
+            ) ?? []
+        )
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
+        autoWakeOnOversightUpdates = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .autoWakeOnOversightUpdates
+        ) ?? false
+        agentSessionLinkAutoWakeTargetSessionIDs = try container.decodeIfPresent(
+            Set<UUID>.self,
+            forKey: .agentSessionLinkAutoWakeTargetSessionIDs
+        ) ?? []
+        routineWakeIntervalEnabled = try container.decodeIfPresent(Bool.self, forKey: .routineWakeIntervalEnabled) ?? false
+        routineWakeIntervalSeconds = try AgentSessionLinkRoutineWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .routineWakeIntervalSeconds)
+                ?? AgentSessionLinkRoutineWakeInterval.defaultSeconds
+        )
+        periodicIdleWakeEnabled = try container.decodeIfPresent(Bool.self, forKey: .periodicIdleWakeEnabled) ?? false
+        periodicIdleWakeIntervalSeconds = try AgentSessionLinkPeriodicWakeInterval.normalized(
+            container.decodeIfPresent(Int.self, forKey: .periodicIdleWakeIntervalSeconds)
+                ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
+        )
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+        createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
+        organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
+        delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         worktreeBindingSummaries = try container.decodeIfPresent([AgentSessionWorktreeBindingSummary].self, forKey: .worktreeBindingSummaries) ?? []
         activeWorktreeMergeSummaries = try container.decodeIfPresent([AgentSessionWorktreeMergeSummary].self, forKey: .activeWorktreeMergeSummaries) ?? []
@@ -171,6 +331,13 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         observedFileSize = try container.decodeIfPresent(Int64.self, forKey: .observedFileSize)
         observedFileModificationDate = try container.decodeIfPresent(Date.self, forKey: .observedFileModificationDate)
         lastIndexedAt = try container.decodeIfPresent(Date.self, forKey: .lastIndexedAt) ?? savedAt
+        firstActivityAt = try container.decodeIfPresent(Date.self, forKey: .firstActivityAt)
+        lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
+        keyPaths = try container.decodeIfPresent(Set<String>.self, forKey: .keyPaths) ?? []
+        coveredTurnDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .coveredTurnDurationSeconds) ?? 0
+        interActiveIntervalGapSeconds = try container.decodeIfPresent([Int].self, forKey: .interActiveIntervalGapSeconds) ?? []
+        toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
+        transcriptTurnCount = try container.decodeIfPresent(Int.self, forKey: .transcriptTurnCount) ?? 0
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -186,8 +353,18 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKindRaw: agentKindRaw,
             agentModelRaw: agentModelRaw,
             agentReasoningEffortRaw: agentReasoningEffortRaw,
+            acpModelParameterSelections: acpModelParameterSelections,
             autoEditEnabled: autoEditEnabled,
+            autoWakeOnOversightUpdates: autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: agentSessionLinkAutoWakeTargetSessionIDs,
+            routineWakeIntervalEnabled: routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
             parentSessionID: parentSessionID,
+            createdByOverseerSessionID: createdByOverseerSessionID,
+            organizationalParentID: organizationalParentID,
+            delegationScopeID: delegationScopeID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -205,7 +382,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKind: agentKindRaw,
             agentModel: agentModelRaw,
             lastRunState: lastRunStateRaw,
+            acpModelParameterSelections: acpModelParameterSelections,
             parentSessionID: parentSessionID,
+            createdByOverseerSessionID: createdByOverseerSessionID,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
@@ -226,15 +405,32 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && agentKindRaw == other.agentKindRaw
             && agentModelRaw == other.agentModelRaw
             && agentReasoningEffortRaw == other.agentReasoningEffortRaw
+            && acpModelParameterSelections == other.acpModelParameterSelections
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
+            && autoWakeOnOversightUpdates == other.autoWakeOnOversightUpdates
+            && agentSessionLinkAutoWakeTargetSessionIDs == other.agentSessionLinkAutoWakeTargetSessionIDs
+            && routineWakeIntervalEnabled == other.routineWakeIntervalEnabled
+            && routineWakeIntervalSeconds == other.routineWakeIntervalSeconds
+            && periodicIdleWakeEnabled == other.periodicIdleWakeEnabled
+            && periodicIdleWakeIntervalSeconds == other.periodicIdleWakeIntervalSeconds
             && parentSessionID == other.parentSessionID
+            && createdByOverseerSessionID == other.createdByOverseerSessionID
+            && organizationalParentID == other.organizationalParentID
+            && delegationScopeID == other.delegationScopeID
             && isMCPOriginated == other.isMCPOriginated
             && worktreeBindingSummaries == other.worktreeBindingSummaries
             && activeWorktreeMergeSummaries == other.activeWorktreeMergeSummaries
             && serializationVersion == other.serializationVersion
             && observedFileSize == other.observedFileSize
             && observedFileModificationDate == other.observedFileModificationDate
+            && firstActivityAt == other.firstActivityAt
+            && lastActivityAt == other.lastActivityAt
+            && keyPaths == other.keyPaths
+            && coveredTurnDurationSeconds == other.coveredTurnDurationSeconds
+            && interActiveIntervalGapSeconds == other.interActiveIntervalGapSeconds
+            && toolCallCount == other.toolCallCount
+            && transcriptTurnCount == other.transcriptTurnCount
     }
 
     static func record(
@@ -244,7 +440,13 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         observedFileModificationDate: Date?,
         lastIndexedAt: Date = Date()
     ) -> AgentSessionMetadataRecord {
-        AgentSessionMetadataRecord(
+        let turns = session.transcript?.turns ?? []
+        let aggregatedKeyPaths = Self.computeKeyPaths(from: turns)
+        let activityBounds = Self.computeActivityBounds(from: turns)
+        let durationPrimitives = Self.computeDurationPrimitives(from: turns)
+        let computedToolCallCount = Self.computeToolCallCount(from: turns)
+
+        return AgentSessionMetadataRecord(
             id: session.id,
             filename: fileURL.lastPathComponent,
             workspaceID: session.workspaceID,
@@ -258,17 +460,195 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentKindRaw: session.agentKind,
             agentModelRaw: session.agentModel,
             agentReasoningEffortRaw: session.agentReasoningEffort,
+            acpModelParameterSelections: session.acpModelParameterSelections,
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
+            autoWakeOnOversightUpdates: session.autoWakeOnOversightUpdates,
+            agentSessionLinkAutoWakeTargetSessionIDs: session.agentSessionLinkAutoWakeTargetSessionIDs,
+            routineWakeIntervalEnabled: session.routineWakeIntervalEnabled,
+            routineWakeIntervalSeconds: session.routineWakeIntervalSeconds,
+            periodicIdleWakeEnabled: session.periodicIdleWakeEnabled,
+            periodicIdleWakeIntervalSeconds: session.periodicIdleWakeIntervalSeconds,
             parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID,
+            organizationalParentID: session.organizationalParentID,
+            delegationScopeID: session.delegationScopeID,
             isMCPOriginated: session.isMCPOriginated,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
             serializationVersion: session.serializationVersion,
             observedFileSize: observedFileSize,
             observedFileModificationDate: observedFileModificationDate,
-            lastIndexedAt: lastIndexedAt
+            lastIndexedAt: lastIndexedAt,
+            firstActivityAt: activityBounds.first,
+            lastActivityAt: activityBounds.last,
+            keyPaths: aggregatedKeyPaths,
+            coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
+            interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
+            toolCallCount: computedToolCallCount,
+            transcriptTurnCount: turns.count
         )
+    }
+
+    /// Aggregate file key paths across turns: prefers compacted summary `keyPaths`, falling back to
+    /// walking tool executions in response-span activities. Shared by the index factory and the
+    /// history tool's on-demand enrichment so key-path extraction has one definition.
+    private static func computeKeyPaths(from turns: [AgentTranscriptTurn]) -> Set<String> {
+        var collected: Set<String> = []
+        for turn in turns {
+            if let summaryPaths = turn.summary?.keyPaths, !summaryPaths.isEmpty {
+                collected.formUnion(summaryPaths)
+                continue
+            }
+            for span in turn.responseSpans {
+                for activity in span.activities {
+                    guard let exec = activity.toolExecution else { continue }
+                    collected.formUnion(exec.keyPaths)
+                }
+            }
+        }
+        return collected
+    }
+
+    /// Return a copy with the transcript-derived fields (activity bounds, keyPaths, toolCount,
+    /// duration primitives) recomputed from `turns`. The `history` tool calls this to enrich index
+    /// records that were rebuilt from lightweight stubs (`firstActivityAt == nil`) on demand, so the
+    /// shared `rebuildMetadataIndex` path — which feeds the agent-mode sidebar and workspace restore —
+    /// never decodes full session transcripts just to precompute fields only history consumes. Records
+    /// already fully indexed (via the save/load path) need not call this.
+    func enrichingTranscriptDerivedFields(from turns: [AgentTranscriptTurn]) -> AgentSessionMetadataRecord {
+        var copy = self
+        let bounds = Self.computeActivityBounds(from: turns)
+        let primitives = Self.computeDurationPrimitives(from: turns)
+        copy.firstActivityAt = bounds.first
+        copy.lastActivityAt = bounds.last
+        copy.keyPaths = Self.computeKeyPaths(from: turns)
+        copy.coveredTurnDurationSeconds = primitives.coveredSeconds
+        copy.interActiveIntervalGapSeconds = primitives.gapSeconds
+        copy.toolCallCount = Self.computeToolCallCount(from: turns)
+        copy.transcriptTurnCount = turns.count
+        return copy
+    }
+
+    /// Compute first and last activity timestamps from transcript turns.
+    private static func computeActivityBounds(from turns: [AgentTranscriptTurn]) -> (first: Date?, last: Date?) {
+        var first: Date?
+        var last: Date?
+
+        func include(_ date: Date?) {
+            guard let date else { return }
+            if first.map({ date < $0 }) ?? true {
+                first = date
+            }
+            if last.map({ date > $0 }) ?? true {
+                last = date
+            }
+        }
+
+        for turn in turns {
+            include(turn.startedAt)
+            include(turn.lastActivityAt)
+            include(turn.completedAt)
+            for activity in turn.allActivities {
+                include(activity.timestamp)
+            }
+        }
+
+        return (first, last)
+    }
+
+    /// Compute tool call count from transcript turns.
+    /// Compacted turns retain only `summary.toolCount`; active turns retain tool execution activities.
+    private static func computeToolCallCount(from turns: [AgentTranscriptTurn]) -> Int {
+        turns.reduce(0) { total, turn in
+            if let summaryToolCount = turn.summary?.toolCount, summaryToolCount > 0 {
+                return total + summaryToolCount
+            }
+            return total + turn.responseSpans.reduce(0) { spanTotal, span in
+                spanTotal + span.activities.count(where: { $0.toolExecution != nil })
+            }
+        }
+    }
+
+    /// Sorts and merges overlapping/contiguous intervals (sorted by start, then end) so nested
+    /// or overlapping turns are never double-counted. Zero-duration (point) intervals are retained.
+    /// Shared between persisted duration-primitive computation and per-group history attribution.
+    static func mergedIntervals(_ intervals: [(start: Date, end: Date)]) -> [(start: Date, end: Date)] {
+        guard !intervals.isEmpty else { return [] }
+        let sorted = intervals.sorted { lhs, rhs in
+            lhs.start < rhs.start || (lhs.start == rhs.start && lhs.end < rhs.end)
+        }
+        var merged: [(start: Date, end: Date)] = [sorted[0]]
+        for interval in sorted.dropFirst() {
+            let lastIndex = merged.count - 1
+            if interval.start > merged[lastIndex].end {
+                merged.append(interval)
+            } else {
+                merged[lastIndex].end = max(merged[lastIndex].end, interval.end)
+            }
+        }
+        return merged
+    }
+
+    /// Active duration for an arbitrary interval set: merged covered time plus inter-interval gaps
+    /// `<= thresholdMinutes`. Mirrors per-record ``activeDurationSeconds(thresholdMinutes:)`` so
+    /// calendar `history.time` attribution agrees with session/workspace grouping.
+    static func activeDurationSeconds(intervals: [(start: Date, end: Date)], thresholdMinutes: Int) -> Int {
+        let merged = mergedIntervals(intervals)
+        guard !merged.isEmpty else { return 0 }
+        let thresholdSeconds = thresholdMinutes * 60
+        var covered = 0
+        var activeGaps = 0
+        for (index, interval) in merged.enumerated() {
+            covered += Int(interval.end.timeIntervalSince(interval.start))
+            if index > 0 {
+                let gap = Int(interval.start.timeIntervalSince(merged[index - 1].end))
+                if gap > 0, gap <= thresholdSeconds { activeGaps += gap }
+            }
+        }
+        return max(0, covered + activeGaps)
+    }
+
+    /// Convert a turn into observed work intervals. Provider response spans are continuous active
+    /// intervals; request, summary, turn-boundary, and individual activity timestamps are points.
+    /// This preserves measured provider work without treating a turn that waits hours or days for
+    /// an approval/resume as continuously active.
+    static func activityIntervals(from turn: AgentTranscriptTurn) -> [(start: Date, end: Date)] {
+        var timestamps: [Date] = [turn.startedAt]
+        if let requestTimestamp = turn.request?.timestamp { timestamps.append(requestTimestamp) }
+        if let lastUserInteractionAt = turn.summary?.lastUserInteractionAt { timestamps.append(lastUserInteractionAt) }
+        if let lastActivityAt = turn.lastActivityAt { timestamps.append(lastActivityAt) }
+        if let completedAt = turn.completedAt { timestamps.append(completedAt) }
+        var intervals: [(start: Date, end: Date)] = []
+        for span in turn.responseSpans {
+            timestamps.append(span.startedAt)
+            if let lastActivityAt = span.lastActivityAt { timestamps.append(lastActivityAt) }
+            if let completedAt = span.completedAt { timestamps.append(completedAt) }
+            timestamps.append(contentsOf: span.activities.map(\.timestamp))
+            let spanEnd = span.completedAt ?? span.lastActivityAt ?? span.startedAt
+            if spanEnd >= span.startedAt {
+                intervals.append((start: span.startedAt, end: spanEnd))
+            }
+        }
+        intervals.append(contentsOf: Array(Set(timestamps)).sorted().map { (start: $0, end: $0) })
+        return intervals
+    }
+
+    static func computeDurationPrimitives(from turns: [AgentTranscriptTurn]) -> (coveredSeconds: Int, gapSeconds: [Int]) {
+        let intervals = turns.flatMap(Self.activityIntervals(from:))
+        let merged = mergedIntervals(intervals)
+        guard !merged.isEmpty else { return (0, []) }
+
+        var coveredSeconds = 0
+        var gapSeconds: [Int] = []
+        for (index, interval) in merged.enumerated() {
+            coveredSeconds += Int(interval.end.timeIntervalSince(interval.start))
+            if index > 0 {
+                let gap = Int(interval.start.timeIntervalSince(merged[index - 1].end))
+                if gap > 0 { gapSeconds.append(gap) }
+            }
+        }
+        return (max(0, coveredSeconds), gapSeconds)
     }
 }
 

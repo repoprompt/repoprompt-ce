@@ -95,63 +95,50 @@ extension AgentModeViewModel {
         providerPreferenceDidChange(providerID, bumpProviderBindingRevision: false)
     }
 
-    func setCodexBashToolEnabled(_ enabled: Bool) {
-        providerBindingService.setCodexBashToolEnabled(enabled)
+    func applyCodexToolSettingMutation(_ mutation: CodexToolSettingMutation) {
+        providerBindingService.applyCodexToolSettingMutation(mutation)
         providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
     }
 
-    func setCodexSearchToolEnabled(_ enabled: Bool) {
-        providerBindingService.setCodexSearchToolEnabled(enabled)
-        providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
-    }
-
-    func setCodexGoalSupportEnabled(_ enabled: Bool) {
-        providerBindingService.setCodexGoalSupportEnabled(enabled)
-        providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
-    }
-
-    func setCodexMCPServerEnabled(normalizedName: String, enabled: Bool) {
-        providerBindingService.setCodexMCPServerEnabled(normalizedName: normalizedName, enabled: enabled)
-        providerPreferenceDidChange(.codex, bumpProviderBindingRevision: false)
-    }
-
-    func setClaudeBashToolEnabled(_ enabled: Bool) {
-        providerBindingService.setClaudeBashToolEnabled(enabled)
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
-    }
-
-    func setClaudeMCPStrictModeEnabled(_ enabled: Bool) {
-        providerBindingService.setClaudeMCPStrictModeEnabled(enabled)
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
-    }
-
-    func setClaudeToolSearchEnabled(_ enabled: Bool) {
-        providerBindingService.setClaudeToolSearchEnabled(enabled)
+    func applyClaudeToolSettingMutation(_ mutation: ClaudeToolSettingMutation) {
+        providerBindingService.applyClaudeToolSettingMutation(mutation)
         providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
     }
 
     func setClaudeEffortLevel(_ level: ClaudeCodeEffortLevel) {
         if let activeSession, activeSession.selectedAgent.usesClaudeTooling {
+            guard AgentModelCatalog.supportedClaudeEfforts(
+                forSelectedModelRaw: activeSession.selectedModelRaw,
+                agentKind: activeSession.selectedAgent
+            ).contains(level) else { return }
+            activeSession.selectedClaudeEffortRaw = level.rawValue
             providerBindingService.setClaudeEffortLevel(
                 level,
                 forModelRaw: activeSession.selectedModelRaw,
                 agentKind: activeSession.selectedAgent
             )
+            if activeSession.isMCPOriginated {
+                activeSession.selectedReasoningEffortRaw = level.rawValue
+            }
+            activeSession.isDirty = true
+            scheduleSave(for: activeSession)
+            updateBindingsFromSession(activeSession)
+            claudeCoordinator.scheduleApplyCurrentClaudeModelAndEffortIfPossible(
+                for: activeSession,
+                reason: "claude_effort_changed"
+            )
         } else {
             providerBindingService.setClaudeEffortLevel(level)
         }
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
-        for session in sessions.values where session.runState.isActive {
-            claudeCoordinator.scheduleApplyCurrentClaudeModelAndEffortIfPossible(
-                for: session,
-                reason: "claude_effort_changed"
-            )
-        }
+        syncAllActiveUIState()
     }
 
-    func setClaudeAgentModePromptDelivery(_ delivery: ClaudeAgentToolPreferences.AgentModePromptDelivery) {
-        providerBindingService.setClaudeAgentModePromptDelivery(delivery)
-        providerPreferenceDidChange(.claude, bumpProviderBindingRevision: false)
+    func restoreClaudeEffort(from persisted: AgentSession, to session: TabSession) {
+        session.selectedClaudeEffortRaw = session.selectedAgent.usesClaudeTooling
+            ? persisted.agentReasoningEffort : nil
+        if session.selectedAgent.usesClaudeTooling {
+            _ = claudeCoordinator.currentClaudeEffortLevel(for: session)
+        }
     }
 
     func providerPreferenceDidChange(
@@ -166,7 +153,6 @@ extension AgentModeViewModel {
             sessions: Array(sessions.values),
             currentTabID: currentTabID,
             codexCoordinator: codexCoordinator,
-            claudeCoordinator: claudeCoordinator,
             scheduleSave: { [weak self] tabID in
                 self?.scheduleSave(for: tabID)
             },

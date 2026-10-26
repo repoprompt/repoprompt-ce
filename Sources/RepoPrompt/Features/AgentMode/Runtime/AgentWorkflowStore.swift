@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptShared
 import SwiftUI
 
 // MARK: - Agent Workflow Store
@@ -126,20 +127,15 @@ final class AgentWorkflowStore: ObservableObject {
 
     // MARK: Filesystem paths
 
-    /// `~/Library/Application Support/RepoPrompt/Workflows/`
+    /// `~/Library/Application Support/RepoPrompt CE/Workflows/`
     static var workflowsDirectoryURL: URL {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!
-        return appSupport
-            .appendingPathComponent("RepoPrompt", isDirectory: true)
-            .appendingPathComponent("Workflows", isDirectory: true)
+        AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("Workflows", isDirectory: true)
     }
 
     @discardableResult
     static func ensureWorkflowsDirectoryExists() throws -> URL {
         let url = workflowsDirectoryURL
+        try AppProfileLocations.current.validateMetadataFile(url)
         let fm = FileManager.default
         if !fm.fileExists(atPath: url.path) {
             try fm.createDirectory(at: url, withIntermediateDirectories: true)
@@ -322,6 +318,7 @@ final class AgentWorkflowStore: ObservableObject {
     /// Deletes a custom workflow file.
     func deleteWorkflow(_ definition: AgentWorkflowDefinition) throws {
         guard let url = fileURL(for: definition) else { return }
+        try AppProfileLocations.current.validateMetadataFile(url)
         try FileManager.default.removeItem(at: url)
         refresh()
     }
@@ -348,6 +345,7 @@ final class AgentWorkflowStore: ObservableObject {
         let dir = try Self.ensureWorkflowsDirectoryExists()
         let slug = Self.sanitizedFilename(from: name)
         let fileURL = uniqueWorkflowFileURL(in: dir, baseSlug: slug)
+        try AppProfileLocations.current.validateMetadataFile(fileURL)
         try content.write(to: fileURL, atomically: true, encoding: .utf8)
         refresh()
         return customWorkflows.first(where: { $0.customID == id })

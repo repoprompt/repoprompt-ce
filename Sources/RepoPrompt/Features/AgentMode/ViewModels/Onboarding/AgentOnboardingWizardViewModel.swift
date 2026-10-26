@@ -74,6 +74,7 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
     @Published var isLoadingCodex = false
     @Published var isLoadingOpenCode = false
     @Published var isLoadingCursor = false
+    @Published var isLoadingGrokBuild = false
 
     // MCP & CLI installers
     @Published var cliInstallStatus: CLIPathInstaller.InstallationStatus = .notInstalled
@@ -136,6 +137,7 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
                 api.$isCodexConnected.map { _ in () },
                 api.$isOpenCodeConnected.map { _ in () },
                 api.$isCursorConnected.map { _ in () },
+                api.$isGrokBuildConnected.map { _ in () },
                 api.$isOpenAIKeyValid.map { _ in () }
             )
             .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
@@ -218,6 +220,10 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
         apiSettingsViewModel?.isCursorConnected ?? false
     }
 
+    var grokBuildConnected: Bool {
+        apiSettingsViewModel?.isGrokBuildConnected ?? false
+    }
+
     var claudeCodeError: String? {
         apiSettingsViewModel?.claudeCodeError
     }
@@ -232,6 +238,10 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
 
     var cursorError: String? {
         apiSettingsViewModel?.cursorError
+    }
+
+    var grokBuildError: String? {
+        apiSettingsViewModel?.grokBuildError
     }
 
     func testClaudeCode() {
@@ -286,6 +296,19 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
         }
     }
 
+    func testGrokBuild() {
+        isLoadingGrokBuild = true
+        Task {
+            do {
+                _ = try await apiSettingsViewModel?.testGrokBuildConnection()
+            } catch {
+                // Error state is set on apiSettingsViewModel
+            }
+            isLoadingGrokBuild = false
+            refreshProviderStatus()
+        }
+    }
+
     // MARK: - MCP & CLI Installers
 
     func refreshInstallStatuses() {
@@ -303,7 +326,12 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
             showInstallFeedback("VS Code configured")
         case "Codex CLI":
             let result = MCPIntegrationHelper.installInCodex()
-            showInstallFeedback(result.success ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured") : "Codex config failed", isError: !result.success)
+            showInstallFeedback(
+                result.success
+                    ? (result.wasAlreadyPresent ? "Codex already configured" : "Codex configured")
+                    : (result.errorMessage ?? "Codex config failed"),
+                isError: !result.success
+            )
         case "OpenCode":
             let result = MCPIntegrationHelper.installInOpenCode()
             showInstallFeedback(result.success ? (result.wasAlreadyPresent ? "OpenCode already configured" : "OpenCode configured") : "OpenCode config failed", isError: !result.success)

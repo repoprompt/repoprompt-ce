@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 struct AgentRuntimeSidebarView: View {
@@ -5,9 +6,11 @@ struct AgentRuntimeSidebarView: View {
     @ObservedObject var oracleViewModel: OracleViewModel
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject var runtimeVM: AgentRuntimeSidebarViewModel
+    let selectionCoordinator: WorkspaceSelectionCoordinator?
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
+    let worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
     let onCollapse: () -> Void
 
     @State private var oracleAutoScrollEnabled: Bool = false
@@ -77,6 +80,7 @@ struct AgentRuntimeSidebarView: View {
             }
         }
         .frame(minWidth: 300, idealWidth: 320, maxWidth: 360, maxHeight: .infinity)
+        .messageTimestampEnvironment()
         .onChange(of: currentTabID) { _, _ in
             selectedOracleSessionID = nil
             selectLatestOracleSessionIfNeeded()
@@ -107,8 +111,12 @@ struct AgentRuntimeSidebarView: View {
     }
 
     private var headerState: RuntimeSidebarHeaderState {
-        if isContextBuilderRunning { return .init(mode: .contextBuilder) }
-        if isOracleStreaming { return .init(mode: .oracle) }
+        if isContextBuilderRunning {
+            return .init(mode: .contextBuilder)
+        }
+        if isOracleStreaming {
+            return .init(mode: .oracle)
+        }
         return .init(
             mode: .idle(
                 fileCount: runtimeVM.snapshot.selectionFileCount ?? 0,
@@ -209,7 +217,9 @@ struct AgentRuntimeSidebarView: View {
             in: tabChatSessions,
             streamingSessionIDs: oracleViewModel.streamingSessions
         )
-        if resolvedID == selectedOracleSessionID { return }
+        if resolvedID == selectedOracleSessionID {
+            return
+        }
         guard let resolvedID else { return }
         selectedOracleSessionID = resolvedID
     }
@@ -287,26 +297,24 @@ struct AgentRuntimeSidebarView: View {
 
     /// Estimates used tokens from the agent transcript character count when codex usage isn't available.
     private var estimatedUsedTokens: Int? {
-        runtimeVM.snapshot.usedTokens ?? runtimeVM.snapshot.estimatedTranscriptTokens
+        runtimeVM.snapshot.displayUsedTokens
     }
 
     private var contextWindowTokens: Int {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 
+    @ViewBuilder
     private var contextUsageSection: some View {
-        Group {
-            if let usedTokens = estimatedUsedTokens {
-                AgentContextIndicator(
-                    contextWindowTokens: contextWindowTokens,
-                    usedTokens: usedTokens,
-                    sourceLabel: runtimeVM.snapshot.usedTokens != nil
-                        ? runtimeVM.snapshot.usageSource.label
-                        : "Estimated",
-                    style: .labeled
-                )
-                .sidebarCard()
-            }
+        if estimatedUsedTokens != nil || runtimeVM.snapshot.awaitingPostCompactionUsage {
+            AgentContextIndicator(
+                contextWindowTokens: contextWindowTokens,
+                usedTokens: estimatedUsedTokens,
+                sourceLabel: runtimeVM.snapshot.displayUsageLabel,
+                awaitingPostCompactionUsage: runtimeVM.snapshot.awaitingPostCompactionUsage,
+                style: .labeled
+            )
+            .sidebarCard()
         }
     }
 
@@ -316,8 +324,13 @@ struct AgentRuntimeSidebarView: View {
         AgentExportCard(
             promptManager: promptManager,
             tokenCounter: promptManager.tokenCountingViewModel,
+            selectionCoordinator: selectionCoordinator,
             fileCount: runtimeVM.snapshot.selectionFileCount,
-            selectionTokens: runtimeVM.snapshot.selectionTokens
+            selectionTokens: runtimeVM.snapshot.selectionTokens,
+            showsFilesButton: true,
+            currentTabID: currentTabID,
+            activeAgentSessionID: activeAgentSessionID,
+            worktreeBindingsProvider: worktreeBindingsProvider
         )
         .sidebarCard()
     }
@@ -406,164 +419,6 @@ private struct AgentRuntimeSidebarHeaderStatusView: View {
                 }
             }
         }
-    }
-}
-
-struct AgentExportCard: View {
-    @ObservedObject var promptManager: PromptViewModel
-    @ObservedObject var tokenCounter: TokenCountingViewModel
-    let fileCount: Int?
-    let selectionTokens: Int?
-
-    @State private var showSelectedFilesPopover = false
-
-    private var displayFileCount: Int {
-        fileCount ?? 0
-    }
-
-    private var displayTokens: Int? {
-        if let selectionTokens, selectionTokens > 0 {
-            return selectionTokens
-        }
-        let fallbackTokens = tokenCounter.copyContextTotalTokens
-        return fallbackTokens > 0 ? fallbackTokens : nil
-    }
-
-    private var tokenColor: Color {
-        guard let tokens = displayTokens else { return .secondary }
-        if tokens > 100_000 { return .red }
-        if tokens >= 60000 { return .orange }
-        return .green
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Row 1: "Export Context" + token count + files + Copy
-            HStack(spacing: 6) {
-                Text("Export Context")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-
-                if let tokens = displayTokens {
-                    Text("~\(AgentContextIndicator.formatTokens(tokens))")
-                        .font(.system(size: 11, weight: .bold, design: .rounded))
-                        .foregroundStyle(tokenColor)
-                }
-
-                Spacer()
-
-                filesButton
-
-                Button {
-                    let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
-                    Task {
-                        let clipboard = await promptManager.buildClipboard(for: cfg)
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(clipboard, forType: .string)
-                    }
-                } label: {
-                    HStack(spacing: 5) {
-                        Image(systemName: "doc.on.clipboard")
-                            .font(.system(size: 10))
-                        Text("Copy")
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                }
-                .buttonStyle(CustomButtonStyle(
-                    verticalPadding: 5,
-                    horizontalPadding: 10,
-                    height: 26
-                ))
-            }
-
-            // Row 2: Instructions editor (always visible)
-            instructionsEditor
-        }
-    }
-
-    // MARK: - Files Button (opens SelectedFilesGrid popover)
-
-    private var filesButton: some View {
-        let selectionCount = promptManager.fileManager.selectedFiles.count
-
-        return Button {
-            showSelectedFilesPopover.toggle()
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "doc.on.doc")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text("\(selectionCount) file\(selectionCount == 1 ? "" : "s")")
-                    .font(.system(size: 10, weight: .medium))
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
-            )
-        }
-        .buttonStyle(.plain)
-        .popover(isPresented: $showSelectedFilesPopover) {
-            let promptEntries = promptManager.promptSnapshotEntriesForChatCached()
-            SelectedFilesGrid(
-                entries: promptEntries,
-                fileManager: promptManager.fileManager,
-                onRemove: { entry in
-                    if entry.isCodemap {
-                        if promptManager.fileManager.isAutoCodemapFile(entry.file) {
-                            promptManager.fileManager.removeCodemapFile(entry.file)
-                        } else {
-                            promptManager.fileManager.toggleFile(entry.file)
-                        }
-                    } else {
-                        promptManager.fileManager.toggleFile(entry.file)
-                    }
-                }
-            )
-            .frame(width: 380)
-            .frame(
-                minHeight: 200,
-                idealHeight: min(500, Double(max(selectionCount, 1)) * 40 + 100),
-                maxHeight: 500
-            )
-        }
-    }
-
-    // MARK: - Instructions Editor
-
-    private static let placeholderText = """
-    Tell the receiving model what to do with this context — e.g. "Plan a fix for the login crash" or "Help me debug the auth flow".
-
-    Tip: Ask the agent to write this prompt for you.
-    """
-
-    private var instructionsEditor: some View {
-        ZStack(alignment: .topLeading) {
-            TextEditor(text: $promptManager.promptText)
-                .font(.system(size: 11))
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 150, maxHeight: 150)
-
-            if promptManager.promptText.isEmpty {
-                Text(Self.placeholderText)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .padding(.top, 6)
-                    .padding(.leading, 5)
-                    .allowsHitTesting(false)
-            }
-        }
-        .padding(6)
-        .background(Color(NSColor.textBackgroundColor).opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
-        )
     }
 }
 

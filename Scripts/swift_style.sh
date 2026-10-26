@@ -27,9 +27,23 @@ fi
 STYLE_PATHS=(
     "Package.swift"
     "Sources/RepoPrompt"
+    "Sources/RepoPromptExecutable"
     "Sources/RepoPromptMCP"
+    "Sources/RepoPromptMCPCore"
     "Sources/RepoPromptShared"
+    "Sources/RepoPromptFileSystem"
+    "Sources/RepoPromptVCS"
+    "Sources/RepoPromptPersistence"
+    "Sources/RepoPromptSettingsCore"
+    "Sources/RepoPromptProviderQuota"
+    "Tests/RepoPromptFileSystemTests"
+    "Tests/RepoPromptVCSTests"
+    "Tests/RepoPromptPersistenceTests"
+    "Tests/RepoPromptSettingsCoreTests"
+    "Tests/RepoPromptProviderQuotaTests"
     "Tests/RepoPromptTests"
+    "Tests/RepoPromptMCPCoreTests"
+    "Tests/RepoPromptTestSupport"
     "Packages/RepoPromptAgentProviders/Package.swift"
     "Packages/RepoPromptAgentProviders/Sources"
     "Packages/RepoPromptAgentProviders/Tests"
@@ -41,16 +55,16 @@ EXCLUDED_SWIFT_PREFIXES=(
 )
 
 EXCLUDED_SWIFT_FILES=(
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Build.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+DeepPlan.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Investigate.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Optimize.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+OracleExport.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Orchestrate.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Refactor.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Reminder.swift"
-    "Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+Review.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPromptSharedFragments.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Build.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+DeepPlan.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Investigate.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Optimize.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+OracleExport.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Orchestrate.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Refactor.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Reminder.swift"
+    "Sources/RepoPromptShared/Workflows/WorkflowPrompt+Review.swift"
 )
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
@@ -79,6 +93,7 @@ should_include_swift_file(){
 }
 
 SWIFT_FILES=()
+SWIFT_FILES_COLLECTED=0
 collect_swift_files(){
     local path full file
     SWIFT_FILES=()
@@ -100,12 +115,21 @@ collect_swift_files(){
             fail "Configured Swift style path does not exist: $path"
         fi
     done
+    SWIFT_FILES_COLLECTED=1
+}
+
+ensure_swift_files_collected(){
+    if (( SWIFT_FILES_COLLECTED == 0 )); then
+        collect_swift_files
+    fi
 }
 
 run_swiftformat(){
     local mode="$1"
-    ensure_tool swiftformat
-    collect_swift_files
+    local swiftformat_bin
+
+    swiftformat_bin="$("$ROOT_DIR/Scripts/install_format_tools.sh" resolve-swiftformat)" || exit
+    ensure_swift_files_collected
 
     if (( ${#SWIFT_FILES[@]} == 0 )); then
         fail "No Swift files found in configured style scope."
@@ -120,24 +144,15 @@ run_swiftformat(){
     fi
 
     cd "$ROOT_DIR"
-    run swiftformat "${args[@]}" "${SWIFT_FILES[@]}"
+    run "$swiftformat_bin" "${args[@]}" "${SWIFT_FILES[@]}"
 }
 
 run_swiftlint(){
     ensure_tool swiftlint
-    collect_swift_files
 
-    if (( ${#SWIFT_FILES[@]} == 0 )); then
-        fail "No Swift files found in configured style scope."
-    fi
-
-    local index
-    export SCRIPT_INPUT_FILE_COUNT="${#SWIFT_FILES[@]}"
-    for index in "${!SWIFT_FILES[@]}"; do
-        export "SCRIPT_INPUT_FILE_$index=${SWIFT_FILES[$index]}"
-    done
-
-    local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --use-script-input-files)
+    # Full-repo lint lets SwiftLint discover files from .swiftlint.yml instead of
+    # paying the large environment/script-input overhead for every Swift file.
+    local args=(lint --strict --config "$ROOT_DIR/.swiftlint.yml" --quiet --force-exclude)
     if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
         args+=(--reporter github-actions-logging)
     fi

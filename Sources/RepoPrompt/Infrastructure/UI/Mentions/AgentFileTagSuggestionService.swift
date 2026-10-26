@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class AgentFileTagSuggestionService {
@@ -12,6 +13,7 @@ final class AgentFileTagSuggestionService {
         let nameLower: String
         let scorePathLower: String
         let standardizedFullPath: String
+        let expandedSubtitle: String?
     }
 
     private nonisolated static let excludedPathComponent = "_git_data"
@@ -22,79 +24,97 @@ final class AgentFileTagSuggestionService {
     private let store: WorkspaceFileContextStore?
     private let searchService: WorkspaceSearchService?
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
+    private let lookupContextProvider: (() async -> WorkspaceLookupContext)?
     private let maxResults: Int
+    private let showsFileSubtitles: Bool
 
     private var cachedCandidates: [FileCandidate] = []
+    private var cachedLookupContext: WorkspaceLookupContext = .visibleWorkspace
     private var cachedGenerationSignature: UInt64?
-    private var cachedHasMultipleRoots: Bool = false
 
     init(
         store: WorkspaceFileContextStore?,
         searchService: WorkspaceSearchService?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
-        maxResults: Int = 5
+        lookupContextProvider: (() async -> WorkspaceLookupContext)? = nil,
+        maxResults: Int = 5,
+        showsFileSubtitles: Bool = false
     ) {
         self.store = store
         self.searchService = searchService
         self.selectionCoordinator = selectionCoordinator
+        self.lookupContextProvider = lookupContextProvider
         self.maxResults = maxResults
+        self.showsFileSubtitles = showsFileSubtitles
     }
 
     func suggestions(for rawQuery: String) async -> [MentionSuggestion] {
         guard let store else { return [] }
 
+        let lookupContext = await currentLookupContext()
+        if cachedLookupContext != lookupContext {
+            cachedCandidates.removeAll()
+            cachedGenerationSignature = nil
+            cachedLookupContext = lookupContext
+        }
         let query = RepoSearchQueryFactory.make(rawQuery, supportsWildcards: false)
         if query.isEmpty {
-            let selected = await selectedSuggestionsForEmptyQuery(store: store)
+            let selected = await selectedSuggestionsForEmptyQuery(store: store, lookupContext: lookupContext)
             if !selected.isEmpty {
                 return Array(selected.prefix(maxResults))
             }
-            if !cachedCandidates.isEmpty {
-                return Array(cachedCandidates.prefix(maxResults)).map(Self.makeSuggestion(from:))
+            let currentGeneration = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+            if !cachedCandidates.isEmpty,
+               cachedGenerationSignature == currentGeneration
+            {
+                return Array(cachedCandidates.prefix(maxResults)).map { makeSuggestion(from: $0) }
             }
+            cachedCandidates.removeAll()
+            cachedGenerationSignature = nil
             return []
         }
 
         let candidateLimit = max(maxResults * Self.indexCandidateMultiplier, Self.minimumIndexCandidateLimit)
-        let catalogResults = await catalogResults(for: query.raw, limit: candidateLimit, store: store)
-        let candidates = await makeCandidates(from: catalogResults, store: store)
+        let catalogResults = await catalogResults(for: query.raw, limit: candidateLimit, store: store, lookupContext: lookupContext)
+        let candidates = await makeCandidates(from: catalogResults, store: store, lookupContext: lookupContext)
         guard !candidates.isEmpty else { return [] }
         cachedCandidates = candidates
-        cachedGenerationSignature = await store.catalogGeneration(rootScope: .visibleWorkspace)
-        cachedHasMultipleRoots = await store.rootRefs(scope: .visibleWorkspace).count > 1
+        cachedGenerationSignature = await store.catalogGeneration(rootScope: lookupContext.rootScope)
         return scoredSuggestions(from: candidates, query: query)
     }
 
     private func catalogResults(
         for query: String,
         limit: Int,
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext
     ) async -> [WorkspaceSearchCatalogEntry] {
-        if let searchService {
+        if lookupContext.bindingProjection == nil, let searchService {
             let result = await searchService.search(query, limit: limit)
             if result.isIndexReady, !result.isStale {
-                let visibleRootIDs = await Set(store.rootRefs(scope: .visibleWorkspace).map(\.id))
+                let visibleRootIDs = await Set(store.rootRefs(scope: lookupContext.rootScope).map(\.id))
                 let scopedResults = result.results.filter { visibleRootIDs.contains($0.rootID) }
                 return Array(scopedResults.prefix(limit))
             }
         }
-        return await storeBackedCatalogResults(for: query, limit: limit, store: store)
+        return await storeBackedCatalogResults(for: query, limit: limit, store: store, lookupContext: lookupContext)
     }
 
     private func storeBackedCatalogResults(
         for query: String,
         limit: Int,
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext
     ) async -> [WorkspaceSearchCatalogEntry] {
-        let snapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+        let snapshot = await store.searchCatalogSnapshot(rootScope: lookupContext.rootScope)
         let entries = snapshot.entries
         let boundedLimit = max(0, limit)
         guard boundedLimit > 0 else { return [] }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return Array(entries.prefix(boundedLimit)) }
 
-        let indexedPaths = entries.map { $0.displayPath + "\n" + $0.standardizedFullPath }
-        let index = await PathSearchIndex(paths: indexedPaths)
+        let indexedPaths = entries.map { searchHaystack(for: $0, lookupContext: lookupContext) }
+        let index = await PathSearchIndex.build(paths: indexedPaths)
         let hits = await index.search(trimmed, limit: boundedLimit)
         var seenIDs = Set<UUID>()
         var results: [WorkspaceSearchCatalogEntry] = []
@@ -107,15 +127,33 @@ final class AgentFileTagSuggestionService {
         return results
     }
 
+    private func searchHaystack(for entry: WorkspaceSearchCatalogEntry, lookupContext: WorkspaceLookupContext) -> String {
+        let logicalPath = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+            forPhysicalPath: entry.standardizedFullPath,
+            display: .relative
+        )
+        return [
+            logicalPath,
+            entry.displayPath,
+            entry.name,
+            entry.standardizedRelativePath,
+            entry.standardizedFullPath
+        ]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+        .joined(separator: "\n")
+    }
+
     private func makeCandidates(
         from entries: [WorkspaceSearchCatalogEntry],
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext
     ) async -> [FileCandidate] {
         let filtered = entries.filter {
             !Self.shouldExcludeFromSuggestions(relativePath: $0.standardizedRelativePath)
         }
         guard !filtered.isEmpty else { return [] }
-        let roots = await store.rootRefs(scope: .visibleWorkspace)
+        let roots = await store.rootRefs(scope: lookupContext.rootScope)
         let hasMultipleRoots = roots.count > 1
         let countByFileName = Dictionary(grouping: filtered, by: { $0.name.lowercased() })
             .mapValues(\.count)
@@ -123,8 +161,8 @@ final class AgentFileTagSuggestionService {
             .mapValues { Set($0.map { $0.rootName.lowercased() }) }
 
         var candidates = filtered.map { entry in
-            let tokenRelativePath = hasMultipleRoots ? entry.displayPath : entry.standardizedRelativePath
-            let scoreRelativePath = entry.standardizedRelativePath
+            let tokenRelativePath = tokenPath(for: entry, roots: roots, lookupContext: lookupContext)
+            let scoreRelativePath = tokenRelativePath
             let fileNameKey = entry.name.lowercased()
             let isDuplicateName = (countByFileName[fileNameKey] ?? 0) > 1
             let spansMultipleRoots = (rootNamesByFileName[fileNameKey]?.count ?? 0) > 1
@@ -147,16 +185,19 @@ final class AgentFileTagSuggestionService {
                 displayName: entry.name,
                 disambiguationLabel: disambiguationLabel,
                 commitDisplayText: Self.commitDisplayText(
-                    fileName: entry.name,
                     tokenRelativePath: tokenRelativePath,
-                    isDuplicateName: isDuplicateName
+                    fallbackFileName: entry.name
                 ),
                 matchName: entry.name,
                 tokenRelativePath: tokenRelativePath,
                 scoreRelativePath: scoreRelativePath,
                 nameLower: entry.name.lowercased(),
                 scorePathLower: scoreRelativePath.lowercased(),
-                standardizedFullPath: entry.standardizedFullPath
+                standardizedFullPath: entry.standardizedFullPath,
+                expandedSubtitle: Self.expandedSubtitleLabel(
+                    for: tokenRelativePath,
+                    fallbackRootLabel: rootLabel
+                )
             )
         }
         candidates.sort { lhs, rhs in
@@ -166,6 +207,62 @@ final class AgentFileTagSuggestionService {
             return lhs.tokenRelativePath < rhs.tokenRelativePath
         }
         return candidates
+    }
+
+    private func currentLookupContext() async -> WorkspaceLookupContext {
+        if let lookupContextProvider {
+            return await lookupContextProvider()
+        }
+        return .visibleWorkspace
+    }
+
+    private func tokenPath(
+        for entry: WorkspaceSearchCatalogEntry,
+        roots: [WorkspaceRootRef],
+        lookupContext: WorkspaceLookupContext
+    ) -> String {
+        if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
+            forPhysicalPath: entry.standardizedFullPath
+        ) {
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
+                root: projected.root,
+                relativePath: projected.relativePath,
+                visibleRoots: lookupContext.bindingProjection?.visibleLogicalRootRefs ?? roots
+            )
+        }
+        if let root = roots.first(where: { $0.id == entry.rootID }) {
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
+                root: root,
+                relativePath: entry.standardizedRelativePath,
+                visibleRoots: roots
+            )
+        }
+        return entry.standardizedRelativePath
+    }
+
+    private func tokenPath(
+        for file: WorkspaceFileRecord,
+        roots: [WorkspaceRootRef],
+        hasMultipleRoots _: Bool,
+        lookupContext: WorkspaceLookupContext
+    ) -> String {
+        if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
+            forPhysicalPath: file.standardizedFullPath
+        ) {
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
+                root: projected.root,
+                relativePath: projected.relativePath,
+                visibleRoots: lookupContext.bindingProjection?.visibleLogicalRootRefs ?? roots
+            )
+        }
+        if let root = roots.first(where: { $0.id == file.rootID }) {
+            return ClientPathFormatter.nonAbsoluteDisplayPath(
+                root: root,
+                relativePath: file.standardizedRelativePath,
+                visibleRoots: roots
+            )
+        }
+        return file.standardizedRelativePath
     }
 
     private func scoredSuggestions(from candidates: [FileCandidate], query: RepoSearchQuery) -> [MentionSuggestion] {
@@ -204,16 +301,21 @@ final class AgentFileTagSuggestionService {
 
         return scored
             .prefix(maxResults)
-            .map { Self.makeSuggestion(from: $0.candidate) }
+            .map { makeSuggestion(from: $0.candidate) }
     }
 
     /// Build the suggestion list for a bare `@` from the active stored selection.
     /// This path does not refresh all workspace candidates or materialize UI VMs.
-    private func selectedSuggestionsForEmptyQuery(store: WorkspaceFileContextStore) async -> [MentionSuggestion] {
+    private func selectedSuggestionsForEmptyQuery(
+        store: WorkspaceFileContextStore,
+        lookupContext: WorkspaceLookupContext
+    ) async -> [MentionSuggestion] {
         guard let selectionCoordinator else { return [] }
-        let selection = selectionCoordinator.activeSelectionSnapshot(flushPendingUI: true).selection
+        let selection = lookupContext.physicalizeSelection(
+            selectionCoordinator.activeSelectionSnapshot(flushPendingUI: true).selection
+        )
         guard !selection.selectedPaths.isEmpty else { return [] }
-        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        let visibleRoots = await store.rootRefs(scope: lookupContext.rootScope)
         let hasMultipleRoots = visibleRoots.count > 1
         let candidateByPath = makeCandidateByTokenPath()
         var seenIdentities = Set<String>()
@@ -221,25 +323,31 @@ final class AgentFileTagSuggestionService {
         suggestions.reserveCapacity(min(maxResults, selection.selectedPaths.count))
 
         for path in selection.selectedPaths {
-            guard let lookup = await store.lookupPath(WorkspacePathLookupRequest(userPath: path, profile: .mcpSelection, rootScope: .visibleWorkspace)),
+            guard let lookup = await store.lookupPath(WorkspacePathLookupRequest(userPath: path, profile: .mcpSelection, rootScope: lookupContext.rootScope)),
                   let file = lookup.file else { continue }
             guard !Self.shouldExcludeFromSuggestions(relativePath: file.standardizedRelativePath) else { continue }
             guard seenIdentities.insert(file.standardizedFullPath).inserted else { continue }
-            let tokenRelativePath: String = if hasMultipleRoots,
-                                               let root = visibleRoots.first(where: { $0.id == file.rootID })
-            {
-                ClientPathFormatter.displayPath(root: root, relativePath: file.standardizedRelativePath, visibleRoots: visibleRoots)
-            } else {
-                file.standardizedRelativePath
-            }
+            let tokenRelativePath = tokenPath(
+                for: file,
+                roots: visibleRoots,
+                hasMultipleRoots: hasMultipleRoots,
+                lookupContext: lookupContext
+            )
             if let candidate = candidateByPath[tokenRelativePath] {
-                suggestions.append(Self.makeSuggestion(from: candidate))
+                suggestions.append(makeSuggestion(from: candidate))
             } else {
+                let rootLabel = visibleRoots
+                    .first(where: { $0.id == file.rootID })?
+                    .name
                 suggestions.append(MentionSuggestion(
                     displayName: file.name,
                     relativePath: tokenRelativePath,
                     kind: .file,
-                    commitDisplayText: file.name
+                    subtitle: expandedSubtitleLabel(for: tokenRelativePath, fallbackRootLabel: rootLabel),
+                    commitDisplayText: Self.commitDisplayText(
+                        tokenRelativePath: tokenRelativePath,
+                        fallbackFileName: file.name
+                    )
                 ))
             }
             if suggestions.count >= maxResults { break }
@@ -257,26 +365,30 @@ final class AgentFileTagSuggestionService {
         )
     }
 
-    private static func makeSuggestion(from candidate: FileCandidate) -> MentionSuggestion {
+    private func makeSuggestion(from candidate: FileCandidate) -> MentionSuggestion {
         MentionSuggestion(
             displayName: candidate.displayName,
             relativePath: candidate.tokenRelativePath,
             kind: .file,
-            subtitle: candidate.disambiguationLabel,
+            subtitle: showsFileSubtitles ? candidate.expandedSubtitle : candidate.disambiguationLabel,
             commitDisplayText: candidate.commitDisplayText
         )
     }
 
+    private func expandedSubtitleLabel(for tokenRelativePath: String, fallbackRootLabel: String?) -> String? {
+        guard showsFileSubtitles else { return nil }
+        return Self.expandedSubtitleLabel(for: tokenRelativePath, fallbackRootLabel: fallbackRootLabel)
+    }
+
     nonisolated static func commitDisplayText(
-        fileName: String,
         tokenRelativePath: String,
-        isDuplicateName: Bool
+        fallbackFileName: String
     ) -> String {
-        let trimmedFileName = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !isDuplicateName, !trimmedFileName.isEmpty {
-            return trimmedFileName
+        let trimmedPath = tokenRelativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPath.isEmpty {
+            return trimmedPath
         }
-        return tokenRelativePath
+        return fallbackFileName.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private nonisolated static func shouldExcludeFromSuggestions(relativePath: String) -> Bool {
@@ -294,12 +406,22 @@ final class AgentFileTagSuggestionService {
         return parentComponents.joined(separator: "/")
     }
 
+    private nonisolated static func expandedSubtitleLabel(
+        for tokenRelativePath: String,
+        fallbackRootLabel: String?
+    ) -> String? {
+        if let parentLabel = parentDirectoryLabel(for: tokenRelativePath), !parentLabel.isEmpty {
+            return parentLabel
+        }
+        let rootLabel = fallbackRootLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return rootLabel.isEmpty ? nil : rootLabel
+    }
+
     #if DEBUG
 
         // MARK: - Testing support
 
-        func seedCandidateCacheForTesting(tokenPaths: [String], hasMultipleRoots: Bool) {
-            cachedHasMultipleRoots = hasMultipleRoots
+        func seedCandidateCacheForTesting(tokenPaths: [String]) {
             cachedCandidates = tokenPaths.map { tokenPath in
                 let basename = (tokenPath as NSString).lastPathComponent
                 return FileCandidate(
@@ -311,7 +433,11 @@ final class AgentFileTagSuggestionService {
                     scoreRelativePath: tokenPath,
                     nameLower: basename.lowercased(),
                     scorePathLower: tokenPath.lowercased(),
-                    standardizedFullPath: tokenPath
+                    standardizedFullPath: tokenPath,
+                    expandedSubtitle: Self.expandedSubtitleLabel(
+                        for: tokenPath,
+                        fallbackRootLabel: nil
+                    )
                 )
             }
         }

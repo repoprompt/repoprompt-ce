@@ -1,6 +1,11 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 import SwiftUI
 #if DEBUG || EDIT_FLOW_PERF
     import os
@@ -79,15 +84,19 @@ struct FileHierarchyIndex {
         let scanInvocationCount: Int
     }
 
-    // New: Store file & folder ViewModels by their fullPath.
+    // Store file & folder ViewModels by canonical path and store-backed identity.
     var filesByFullPath: [String: FileViewModel] = [:]
     var foldersByFullPath: [String: FolderViewModel] = [:]
+    var filesByID: [UUID: FileViewModel] = [:]
+    var foldersByID: [UUID: FolderViewModel] = [:]
     var filePathsByRoot: [String: Set<String>] = [:]
     var folderPathsByRoot: [String: Set<String>] = [:]
 
     mutating func clearAll() {
         filesByFullPath.removeAll()
         foldersByFullPath.removeAll()
+        filesByID.removeAll()
+        foldersByID.removeAll()
         filePathsByRoot.removeAll()
         folderPathsByRoot.removeAll()
     }
@@ -112,21 +121,35 @@ struct FileHierarchyIndex {
         let path = folder.standardizedFullPath
         let ownerRootKey = rootKey.map(StandardizedPath.absolute) ?? StandardizedPath.absolute(folder.rootPath)
         if let existing = foldersByFullPath.updateValue(folder, forKey: path) {
+            if foldersByID[existing.id] === existing {
+                foldersByID.removeValue(forKey: existing.id)
+            }
             let previousRootKey = StandardizedPath.absolute(existing.rootPath)
             if previousRootKey != ownerRootKey {
                 Self.removePath(path, from: &folderPathsByRoot, rootKey: previousRootKey)
             }
         }
+        foldersByID[folder.id] = folder
         folderPathsByRoot[ownerRootKey, default: []].insert(path)
         if path == ownerRootKey {
             _ = filePathsByRoot[ownerRootKey, default: []]
         }
     }
 
+    mutating func rekeyFolder(_ folder: FolderViewModel, from oldID: UUID) {
+        if foldersByID[oldID] === folder {
+            foldersByID.removeValue(forKey: oldID)
+        }
+        foldersByID[folder.id] = folder
+    }
+
     @discardableResult
     mutating func removeFolder(forKey path: String, expectedRootKey: String? = nil) -> FolderViewModel? {
         let standardizedPath = StandardizedPath.absolute(path)
         let removed = foldersByFullPath.removeValue(forKey: standardizedPath)
+        if let removed, foldersByID[removed.id] === removed {
+            foldersByID.removeValue(forKey: removed.id)
+        }
         let ownerRootKey = removed.map { StandardizedPath.absolute($0.rootPath) }
             ?? expectedRootKey.map(StandardizedPath.absolute)
         if let ownerRootKey {
@@ -139,11 +162,15 @@ struct FileHierarchyIndex {
         let path = file.standardizedFullPath
         let ownerRootKey = rootKey.map(StandardizedPath.absolute) ?? file.standardizedRootFolderPath
         if let existing = filesByFullPath.updateValue(file, forKey: path) {
+            if filesByID[existing.id] === existing {
+                filesByID.removeValue(forKey: existing.id)
+            }
             let previousRootKey = existing.standardizedRootFolderPath
             if previousRootKey != ownerRootKey {
                 Self.removePath(path, from: &filePathsByRoot, rootKey: previousRootKey)
             }
         }
+        filesByID[file.id] = file
         filePathsByRoot[ownerRootKey, default: []].insert(path)
     }
 
@@ -151,6 +178,9 @@ struct FileHierarchyIndex {
     mutating func removeFile(forKey path: String, expectedRootKey: String? = nil) -> FileViewModel? {
         let standardizedPath = StandardizedPath.absolute(path)
         let removed = filesByFullPath.removeValue(forKey: standardizedPath)
+        if let removed, filesByID[removed.id] === removed {
+            filesByID.removeValue(forKey: removed.id)
+        }
         let ownerRootKey = removed?.standardizedRootFolderPath
             ?? expectedRootKey.map(StandardizedPath.absolute)
         if let ownerRootKey {
@@ -173,10 +203,18 @@ struct FileHierarchyIndex {
         folderPathsByRoot.removeValue(forKey: rootKey)
         filePathsByRoot.removeValue(forKey: rootKey)
         for folderPath in folderPaths {
-            foldersByFullPath.removeValue(forKey: folderPath)
+            if let removed = foldersByFullPath.removeValue(forKey: folderPath),
+               foldersByID[removed.id] === removed
+            {
+                foldersByID.removeValue(forKey: removed.id)
+            }
         }
         for filePath in filePaths {
-            filesByFullPath.removeValue(forKey: filePath)
+            if let removed = filesByFullPath.removeValue(forKey: filePath),
+               filesByID[removed.id] === removed
+            {
+                filesByID.removeValue(forKey: removed.id)
+            }
         }
     }
 
@@ -267,10 +305,18 @@ struct FileHierarchyIndex {
             filePathsByRoot[standardizedRootKey] = []
         }
         for folderPath in folderPaths {
-            foldersByFullPath.removeValue(forKey: folderPath)
+            if let removed = foldersByFullPath.removeValue(forKey: folderPath),
+               foldersByID[removed.id] === removed
+            {
+                foldersByID.removeValue(forKey: removed.id)
+            }
         }
         for filePath in filePaths {
-            filesByFullPath.removeValue(forKey: filePath)
+            if let removed = filesByFullPath.removeValue(forKey: filePath),
+               filesByID[removed.id] === removed
+            {
+                filesByID.removeValue(forKey: removed.id)
+            }
         }
     }
 }
@@ -327,16 +373,70 @@ private struct FolderTopologyApplyOutcome {
     let parentFolderForStateRecompute: FolderViewModel?
 }
 
+private struct SliceRebaseSourceSnapshot {
+    let text: String
+    let modificationTime: Double
+}
+
 private struct ReplaySliceRebaseRequest {
     let file: FileViewModel
     let relativePath: String
+    let sourceSnapshot: SliceRebaseSourceSnapshot?
+}
+
+private struct HiddenSessionSliceRebaseTarget {
+    let identity: WorkspaceSelectionIdentity
+    let logicalFullPath: String
+    let agentSessionID: UUID
+    let bindingFingerprint: String
+    let physicalRootPaths: Set<String>
+}
+
+private struct HiddenSessionSliceRebaseRequest {
+    let rootID: UUID
+    let rootLifetimeID: UUID
+    let fileID: UUID
+    let physicalRootPath: String
+    let physicalFullPath: String
+    let relativePath: String
+    let sourceSnapshot: SliceRebaseSourceSnapshot?
+    let targets: [HiddenSessionSliceRebaseTarget]
+}
+
+private struct HiddenSessionRootLifetimeKey: Hashable {
+    let rootID: UUID
+    let rootLifetimeID: UUID
+}
+
+private struct SlicePartitionRebaseCommit {
+    let scope: PartitionScope
+    let ranges: [LineRange]
+    let anchors: [SliceAnchor]?
+    let expectedStoredSlices: PartitionStore.StoredSlices
+    let hiddenSessionTarget: HiddenSessionSliceRebaseTarget?
+    let expectedLogicalRanges: [LineRange]?
+
+    init(
+        scope: PartitionScope,
+        ranges: [LineRange],
+        anchors: [SliceAnchor]?,
+        expectedStoredSlices: PartitionStore.StoredSlices,
+        hiddenSessionTarget: HiddenSessionSliceRebaseTarget? = nil,
+        expectedLogicalRanges: [LineRange]? = nil
+    ) {
+        self.scope = scope
+        self.ranges = ranges
+        self.anchors = anchors
+        self.expectedStoredSlices = expectedStoredSlices
+        self.hiddenSessionTarget = hiddenSessionTarget
+        self.expectedLogicalRanges = expectedLogicalRanges
+    }
 }
 
 private struct ReplayRootPassAccumulator {
     let rootKey: String
     var processedDigests: [WorkspaceFilesViewModel.FileSystemDeltaDigest] = []
     var topologyChanged = false
-    var codeScanFilesByID: [UUID: FileViewModel] = [:]
     var sliceRebasesByFullPath: [String: ReplaySliceRebaseRequest] = [:]
 }
 
@@ -402,7 +502,6 @@ class WorkspaceFilesViewModel: ObservableObject {
     var cancellables = Set<AnyCancellable>()
     let folderRefreshPublisher = PassthroughSubject<FolderViewModel, Never>()
     let selectionClearedPublisher = PassthroughSubject<Void, Never>()
-    let codeMapUpdatePublisher = PassthroughSubject<Void, Never>() // New publisher
     let fileSystemChangedPublisher = PassthroughSubject<Void, Never>() // Publisher for file system changes
 
     /// Emitted once after a prepared root delta pass is finalized.
@@ -475,6 +574,20 @@ class WorkspaceFilesViewModel: ObservableObject {
         case supplementalSystem
     }
 
+    enum GitDataRootLoadError: LocalizedError, Equatable {
+        case systemWorkspace(workspaceID: UUID)
+        case exactRootUnavailable(path: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .systemWorkspace(workspaceID):
+                "Git-data roots are unavailable for system workspace \(workspaceID.uuidString)."
+            case let .exactRootUnavailable(path):
+                "The loaded Git-data root does not have the expected workspace Git-data identity: \(path)"
+            }
+        }
+    }
+
     private func workspaceRootKind(for rootKind: RootKind, url: URL) -> WorkspaceRootKind {
         switch rootKind {
         case .user:
@@ -512,12 +625,14 @@ class WorkspaceFilesViewModel: ObservableObject {
         registerExpansionTracking(for: folder)
         // Mark snapshot cache as dirty
         invalidateStaticSnapshot(forRootFullPath: folder.standardizedFullPath)
+        publishRootShellProjectionsChanged()
     }
 
     @MainActor
     func removeRootFolder(_ folder: FolderViewModel) {
         let stdPath = folder.standardizedFullPath
         let rootKey = rootKey(forPath: folder.fullPath)
+        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: folder.id)
         unregisterExpansionTracking(for: folder)
         rootFolders.removeAll { $0.id == folder.id }
         rootShellPersistenceKeysByRootKey.removeValue(forKey: rootKey)
@@ -536,6 +651,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         if rootFolders.isEmpty {
             allFoldersUnloadedPublisher.send(())
         }
+        publishRootShellProjectionsChanged()
     }
 
     @MainActor
@@ -558,34 +674,149 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
-    @Published private(set) var selectedFiles: [FileViewModel] = []
-    @Published private(set) var autoCodemapFiles: [FileViewModel] = []
+    @Published private(set) var selectionStateRevision: UInt64 = 0
+    @Published private(set) var codemapMarkerReadinessRevision: UInt64 = 0
+
+    @Published private(set) var selectedFiles: [FileViewModel] = [] {
+        didSet {
+            guard selectedFiles.map(\.id) != oldValue.map(\.id) else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
+    @Published private(set) var autoCodemapFiles: [FileViewModel] = [] {
+        didSet {
+            guard autoCodemapFiles.map(\.id) != oldValue.map(\.id) else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
+    @Published private(set) var manualCodemapFiles: [FileViewModel] = [] {
+        didSet {
+            guard manualCodemapFiles.map(\.id) != oldValue.map(\.id) else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
     private var autoCodemapFileIDs: Set<UUID> = []
+    private var manualCodemapFileIDs: Set<UUID> = []
     @Published var codemapAutoEnabled: Bool = true {
         didSet {
             guard codemapAutoEnabled != oldValue else { return }
+            selectionStateRevision &+= 1
+            invalidateAutomaticCodemapSelection()
+            // Crossing either direction invalidates the transient inferred projection.
+            // Explicit manual files are added only after auto mode is disabled.
+            resetAutoCodemapFiles([])
             if codemapAutoEnabled {
+                resetManualCodemapFiles([])
                 scheduleAutoCodemapSync()
-            } else {
-                autoCodemapSyncTask?.cancel()
-                autoCodemapSyncTask = nil
             }
         }
     }
 
+    private struct AutomaticCodemapPendingMarker: Hashable {
+        let rootEpoch: WorkspaceCodemapRootEpoch
+        let fileID: UUID
+        let requestGeneration: UInt64
+    }
+
     private var autoCodemapSyncTask: Task<Void, Never>?
+    private var autoCodemapReadinessRetryTask: Task<Void, Never>?
+    private var autoCodemapSelectionGeneration: UInt64 = 0
+    private var autoCodemapReadinessRetryAvailable = false
+    private var autoCodemapReadinessRetryPending = false
+    private var autoCodemapPendingMarkers: Set<AutomaticCodemapPendingMarker> = []
+    private var autoCodemapVisibleRootIDs: Set<UUID> = []
 
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var error: FileManagerError?
 
     var showEmptyFolders: Bool = false
     var skipSymlinks: Bool = true
-    var respectGitignore: Bool = true
     var respectRepoIgnore: Bool = true
     var respectCursorignore: Bool = true
     var enableHierarchicalIgnores: Bool = true
 
     var onRootFoldersChanged: (() -> Void)?
+    private let rootShellProjectionsChangedSubject = PassthroughSubject<Void, Never>()
+    private let codemapRootStatusesChangedSubject = PassthroughSubject<Void, Never>()
+    private var codemapRootStatusesByRootID: [UUID: WorkspaceCodemapRootStatusSnapshot] = [:]
+    private var acceptedCodemapRootStatusRevision: UInt64?
+    private var rootShellProjectionChangeBatchDepth = 0
+    private var hasPendingRootShellProjectionChange = false
+
+    var rootShellProjectionsChangedPublisher: AnyPublisher<Void, Never> {
+        rootShellProjectionsChangedSubject.eraseToAnyPublisher()
+    }
+
+    var codemapRootStatusesChangedPublisher: AnyPublisher<Void, Never> {
+        codemapRootStatusesChangedSubject.eraseToAnyPublisher()
+    }
+
+    func codemapRootStatus(rootID: UUID) -> WorkspaceCodemapRootStatusSnapshot? {
+        codemapRootStatusesByRootID[rootID]
+    }
+
+    func setCodemapGenerationSuspended(rootID: UUID, suspended: Bool) async {
+        _ = await workspaceFileContextStore.setCodemapGenerationSuspended(
+            rootID: rootID,
+            suspended: suspended
+        )
+        let update = await workspaceFileContextStore.currentCodemapRootStatusUpdate()
+        handleCodemapRootStatus(update)
+    }
+
+    @discardableResult
+    func prioritizeCodemapGraphIndexNow(
+        rootID: UUID
+    ) async -> WorkspaceCodemapGraphIndexPrioritizeDisposition {
+        let disposition = await workspaceFileContextStore.prioritizeCodemapGraphIndexNow(
+            rootID: rootID
+        )
+        let update = await workspaceFileContextStore.currentCodemapRootStatusUpdate()
+        handleCodemapRootStatus(update)
+        return disposition
+    }
+
+    @MainActor
+    func beginRootShellProjectionChangeBatch() {
+        rootShellProjectionChangeBatchDepth += 1
+    }
+
+    @MainActor
+    func endRootShellProjectionChangeBatch() {
+        guard rootShellProjectionChangeBatchDepth > 0 else { return }
+        rootShellProjectionChangeBatchDepth -= 1
+        guard rootShellProjectionChangeBatchDepth == 0, hasPendingRootShellProjectionChange else { return }
+        hasPendingRootShellProjectionChange = false
+        publishRootShellProjectionsChanged()
+    }
+
+    @MainActor
+    private func publishRootFoldersChanged() {
+        onRootFoldersChanged?()
+    }
+
+    @MainActor
+    private func publishRootShellProjectionsChanged() {
+        if rootShellProjectionChangeBatchDepth > 0 {
+            hasPendingRootShellProjectionChange = true
+            return
+        }
+        publishRootFoldersChanged()
+        rootShellProjectionsChangedSubject.send(())
+
+        let visibleRootIDs = Set(visibleRootFolders.map(\.id))
+        guard visibleRootIDs != autoCodemapVisibleRootIDs else { return }
+        autoCodemapVisibleRootIDs = visibleRootIDs
+        guard codemapAutoEnabled else { return }
+        invalidateAutomaticCodemapSelection()
+        resetAutoCodemapFiles([])
+        if !visibleSelectedFileIDs().isEmpty {
+            scheduleAutoCodemapSync()
+        }
+    }
 
     @Published private var selectedFileIDs: Set<UUID> = []
     private var isSelectionBatching = false
@@ -596,16 +827,26 @@ class WorkspaceFilesViewModel: ObservableObject {
     let workspaceFileContextStore: WorkspaceFileContextStore
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
     private var selectionCoordinatorCancellable: AnyCancellable?
+    private var pendingPresentationTasks: [UUID: Task<Void, Never>] = [:]
     private var workspaceFileContextRootsByRootKey: [RootKey: WorkspaceRootRecord] = [:]
     private var preloadedWorkspaceFileContextRootsByRootKey: [RootKey: WorkspaceRootRecord] = [:]
     private var rootShellPersistenceKeysByRootKey: [RootKey: WorkspaceRootShellPersistenceKey] = [:]
     private var partitionStoreSaveCancellable: AnyCancellable?
     private var fileSystemSettingsCancellable: AnyCancellable?
+    private var nonGitCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingCancellable: AnyCancellable?
+    private var globalCodeMapsSettingRevision: UInt64 = 0
     private var forceReloadOnNextFileSystemSettingsRefresh = false
 
     private let selectionSliceCoordinator = SelectionSliceCoordinator()
     private var currentSlicesByRoot: [String: [String: PartitionStore.StoredSlices]] = [:]
-    @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:]
+    @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:] {
+        didSet {
+            guard selectionSlicesByFileID != oldValue else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
     private var sliceSnapshotRebuildDeferralDepth = 0
     private var sliceSnapshotRebuildPending = false
     #if DEBUG
@@ -613,17 +854,19 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
     private var sliceRebaseTasksByFullPath: [String: Task<Void, Never>] = [:]
     private var sliceRebaseTaskIDsByFullPath: [String: UUID] = [:]
+    private var sliceRebaseRegistrationGenerationByFullPath: [String: UInt64] = [:]
+    private var sliceRebaseSourceSnapshotByFullPath: [String: SliceRebaseSourceSnapshot] = [:]
+    private var sliceRebaseCommitTasksByFullPath: [String: Task<Void, Never>] = [:]
+    private var sliceRebaseCommitIDsByFullPath: [String: UUID] = [:]
+    private var sessionWorktreeBindingStatesProvider: (@MainActor (Set<UUID>) -> [UUID: AgentSessionWorktreeBindingState])?
+    private var hiddenSessionHandledGenerationByRootLifetime: [HiddenSessionRootLifetimeKey: UInt64] = [:]
+    private var hiddenSessionRootLifetimeByPhysicalPath: [String: HiddenSessionRootLifetimeKey] = [:]
     /// Monotonic revision incremented for any partition save seen in the current workspace.
     /// Used to avoid re-checking files already confirmed as "no slices" until new saves occur.
     private var partitionSliceSaveRevision: UInt64 = 0
     /// Cache of files confirmed to have no slices at `partitionSliceSaveRevision`.
     private var noSlicesKnownRevisionByFullPath: [String: UInt64] = [:]
     private var workspaceSaveDebounceTask: Task<Void, Never>?
-
-    private var isInitialRootLoadScanDeferralActive = false
-    private var deferredInitialRootLoadScanRoots = Set<String>()
-    private var deferredInitialRootLoadScanFlushTask: Task<Void, Never>?
-    private var deferredInitialRootLoadScanFlushTaskID: UUID?
 
     // MARK: - Path Search Caches
 
@@ -757,19 +1000,16 @@ class WorkspaceFilesViewModel: ObservableObject {
     private let fileSearchActor = FileSearchActor()
     private let deltaReplayPreparationActor = DeltaReplayPreparationActor()
 
-    @Published var remainingScanCount: Int = 0
-    @Published var totalFilesSeen: Int = 0
-
     // We'll keep your existing references to isLoading, selectedFiles, etc.
     // If you don't need these placeholders, remove them.
     private var currentFolderLoadingTask: Task<Void, Error>?
     private var currentFolderLoadingTaskID: UUID?
 
-    private var scanProgressTask: Task<Void, Never>?
-
     #if !DEBUG
         typealias RootReplayPassPerfSample = Never
     #endif
+
+    private var appliedIndexProjectionHandledGenerationByRootID: [UUID: UInt64] = [:]
 
     #if DEBUG
         struct IndexRebuildPerfSample: Equatable {
@@ -839,8 +1079,6 @@ class WorkspaceFilesViewModel: ObservableObject {
             let rebuildCleanupCandidateFolderKeys: Int?
             let rebuildCleanupCandidateFileKeys: Int?
             let rebuildUsedOwnershipFallback: Bool?
-            let codeScanBatchInvocationCount: Int
-            let codeScanBatchFileCount: Int
             let sliceRebaseBatchInvocationCount: Int
             let sliceRebaseCandidateCount: Int
             let invalidateSnapshotDurationMS: Double
@@ -856,8 +1094,6 @@ class WorkspaceFilesViewModel: ObservableObject {
             let onRootFoldersChangedInvocationCount: Int
             let snapshotInvalidationCount: Int
             let deltaAppliedPublisherInvocationCount: Int
-            let codeScanBatchInvocationCount: Int
-            let codeScanBatchFileCount: Int
             let sliceRebaseBatchInvocationCount: Int
             let sliceRebaseCandidateCount: Int
             let onRootFoldersChangedDurationMS: Double
@@ -906,10 +1142,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             let totalOnRootFoldersChangedInvocationCount: Int
             let totalSnapshotInvalidationCount: Int
             let totalDeltaAppliedPublisherInvocationCount: Int
-            let totalReplayCodeScanBatchInvocationCount: Int
             let totalReplaySliceRebaseBatchInvocationCount: Int
             let totalRebuildDurationMS: Double
-            let totalCodeScanBatchFileCount: Int
             let totalSliceRebaseCandidateCount: Int
             let totalInvalidateSnapshotDurationMS: Double
             let preReplayServiceFlushes: [ServiceFlushSample]
@@ -932,17 +1166,148 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var currentReplayParentLookupCount = 0
         private var deltaReplayChunkSizeOverride: Int?
         private var deltaReplayInterChunkDelayNanosecondsOverride: UInt64?
+
+        struct AppliedIndexProjectionDiagnosticsSnapshot: Equatable {
+            let handledEventCount: Int
+            let handledGenerationByRootID: [UUID: UInt64]
+            let directFileIDLookupCount: Int
+            let directFolderIDLookupCount: Int
+            let directIDLookupMissCount: Int
+            let canonicalResyncCount: Int
+            let indexRebuildCount: Int
+            let indexRebuildTotalDurationMS: Double
+            let indexRebuildTraversalDurationMS: Double
+            let indexRebuildVisitedFolderCount: Int
+            let indexRebuildVisitedFileCount: Int
+        }
+
+        struct ApplyEditsRebaseProbePathSnapshot: Equatable {
+            let handledGeneration: UInt64
+            let registrationGeneration: UInt64
+            let hasPendingRebaseTask: Bool
+        }
+
+        private var appliedIndexProjectionHandledEventCount = 0
+        private var appliedIndexProjectionDirectFileIDLookupCount = 0
+        private var appliedIndexProjectionDirectFolderIDLookupCount = 0
+        private var appliedIndexProjectionDirectIDLookupMissCount = 0
+        private var appliedIndexProjectionCanonicalResyncCount = 0
+        private var appliedIndexProjectionIndexRebuildCount = 0
+        private var appliedIndexProjectionIndexRebuildTotalDurationMS: Double = 0
+        private var appliedIndexProjectionIndexRebuildTraversalDurationMS: Double = 0
+        private var appliedIndexProjectionIndexRebuildVisitedFolderCount = 0
+        private var appliedIndexProjectionIndexRebuildVisitedFileCount = 0
+        private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
+        private var hiddenSessionSliceRebaseWillCommitHandler: (@Sendable (String) async -> Void)?
+        private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
+
+        func setAppliedIndexProjectionWillHandleHandlerForTesting(
+            _ handler: (@Sendable (UUID, UInt64) async -> Void)?
+        ) {
+            appliedIndexProjectionWillHandleHandler = handler
+        }
+
+        func setHiddenSessionSliceRebaseWillCommitHandlerForTesting(
+            _ handler: (@Sendable (String) async -> Void)?
+        ) {
+            hiddenSessionSliceRebaseWillCommitHandler = handler
+        }
+
+        func setAppliedIndexProjectionStateObserverForTesting(
+            _ observer: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
+        ) {
+            appliedIndexProjectionStateObserver = observer
+            observer?(appliedIndexProjectionDiagnosticsSnapshot())
+        }
+
+        @MainActor
+        func debugApplyEditsRebaseProbePathSnapshot(
+            fullPath rawFullPath: String,
+            rootID: UUID
+        ) -> ApplyEditsRebaseProbePathSnapshot {
+            let fullPath = StandardizedPath.absolute(rawFullPath)
+            return ApplyEditsRebaseProbePathSnapshot(
+                handledGeneration: appliedIndexProjectionHandledGenerationByRootID[rootID] ?? 0,
+                registrationGeneration: sliceRebaseRegistrationGenerationByFullPath[fullPath] ?? 0,
+                hasPendingRebaseTask: sliceRebaseTasksByFullPath[fullPath] != nil
+            )
+        }
+
+        @MainActor
+        func debugWaitForAppliedIndexGeneration(
+            rootID: UUID,
+            targetGeneration: UInt64,
+            deadline: ContinuousClock.Instant
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            while appliedIndexProjectionHandledGenerationByRootID[rootID, default: 0] < targetGeneration,
+                  clock.now < deadline
+            {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            return appliedIndexProjectionHandledGenerationByRootID[rootID, default: 0] >= targetGeneration
+        }
+
+        func appliedIndexProjectionDiagnosticsSnapshot() -> AppliedIndexProjectionDiagnosticsSnapshot {
+            AppliedIndexProjectionDiagnosticsSnapshot(
+                handledEventCount: appliedIndexProjectionHandledEventCount,
+                handledGenerationByRootID: appliedIndexProjectionHandledGenerationByRootID,
+                directFileIDLookupCount: appliedIndexProjectionDirectFileIDLookupCount,
+                directFolderIDLookupCount: appliedIndexProjectionDirectFolderIDLookupCount,
+                directIDLookupMissCount: appliedIndexProjectionDirectIDLookupMissCount,
+                canonicalResyncCount: appliedIndexProjectionCanonicalResyncCount,
+                indexRebuildCount: appliedIndexProjectionIndexRebuildCount,
+                indexRebuildTotalDurationMS: appliedIndexProjectionIndexRebuildTotalDurationMS,
+                indexRebuildTraversalDurationMS: appliedIndexProjectionIndexRebuildTraversalDurationMS,
+                indexRebuildVisitedFolderCount: appliedIndexProjectionIndexRebuildVisitedFolderCount,
+                indexRebuildVisitedFileCount: appliedIndexProjectionIndexRebuildVisitedFileCount
+            )
+        }
+
+        private func notifyAppliedIndexProjectionStateChanged() {
+            appliedIndexProjectionStateObserver?(appliedIndexProjectionDiagnosticsSnapshot())
+        }
+
+        func resetAppliedIndexProjectionLookupDiagnosticsForTesting() {
+            appliedIndexProjectionDirectFileIDLookupCount = 0
+            appliedIndexProjectionDirectFolderIDLookupCount = 0
+            appliedIndexProjectionDirectIDLookupMissCount = 0
+        }
     #endif
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
-    private var workspaceStoreCodemapBridgeTask: Task<Void, Never>?
+    private var codemapMarkerReadinessTask: Task<Void, Never>?
+    private var codemapRootStatusTask: Task<Void, Never>?
     private let alwaysReadableHomeDirectoryURL: URL
+    private let automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
+    private let automaticCodemapReadinessRetryPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
+    private let automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter
+    private let automaticCodemapReadinessRetryDelay: Duration
+    private let defaultApplicationOpener: DefaultApplicationOpener
+    let restorePerfRecorder: any WorkspaceRestorePerfRecording
 
     init(
         alwaysReadableHomeDirectoryURL: URL? = nil,
-        workspaceFileContextStore: WorkspaceFileContextStore
+        workspaceFileContextStore: WorkspaceFileContextStore,
+        automaticCodemapSelectionRequestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .default,
+        automaticCodemapReadinessRetryPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy = .init(
+            maximumReadinessRounds: 16,
+            initialBackoffMilliseconds: 50,
+            maximumBackoffMilliseconds: 1000,
+            maximumTotalWait: .seconds(10)
+        ),
+        automaticCodemapSelectionWaiter: WorkspaceCodemapAutomaticSelectionWaiter = .production,
+        automaticCodemapReadinessRetryDelay: Duration = .milliseconds(400),
+        defaultApplicationOpener: DefaultApplicationOpener = .system,
+        restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder()
     ) {
+        self.restorePerfRecorder = restorePerfRecorder
         self.alwaysReadableHomeDirectoryURL = (alwaysReadableHomeDirectoryURL ?? FileManager.default.homeDirectoryForCurrentUser).standardizedFileURL
         self.workspaceFileContextStore = workspaceFileContextStore
+        self.automaticCodemapSelectionRequestPolicy = automaticCodemapSelectionRequestPolicy
+        self.automaticCodemapReadinessRetryPolicy = automaticCodemapReadinessRetryPolicy
+        self.automaticCodemapSelectionWaiter = automaticCodemapSelectionWaiter
+        self.automaticCodemapReadinessRetryDelay = automaticCodemapReadinessRetryDelay
+        self.defaultApplicationOpener = defaultApplicationOpener
         // If you store sortMethod in user defaults, do that here
         if let loaded = SortMethod(rawValue: storedSortMethod) {
             currentSortMethod = loaded
@@ -954,9 +1319,9 @@ class WorkspaceFilesViewModel: ObservableObject {
         // before any FileSystemService instances can be created for loaded folders.
         syncFileSystemPreferencesFromGlobalSettings()
 
-        subscribeToScanProgress()
         subscribeToWorkspaceStoreDeltaEvents()
-        subscribeToWorkspaceStoreCodemapUpdates()
+        subscribeToCodemapMarkerReadinessUpdates()
+        subscribeToCodemapRootStatusUpdates()
         subscribeToPartitionStoreSaves()
         subscribeToFileSystemPreferenceChanges()
     }
@@ -972,19 +1337,46 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     deinit {
         // Cancel the subscriptions if this VM goes away
-        scanProgressTask?.cancel()
         workspaceStoreDeltaBridgeTask?.cancel()
-        workspaceStoreCodemapBridgeTask?.cancel()
+        codemapMarkerReadinessTask?.cancel()
+        codemapRootStatusTask?.cancel()
         autoCodemapSyncTask?.cancel()
+        autoCodemapReadinessRetryTask?.cancel()
         for task in sliceRebaseTasksByFullPath.values {
             task.cancel()
         }
         sliceRebaseTasksByFullPath.removeAll()
         sliceRebaseTaskIDsByFullPath.removeAll()
         workspaceSaveDebounceTask?.cancel()
+        for task in pendingPresentationTasks.values {
+            task.cancel()
+        }
+        pendingPresentationTasks.removeAll()
         selectionCoordinatorCancellable?.cancel()
         partitionStoreSaveCancellable?.cancel()
         fileSystemSettingsCancellable?.cancel()
+    }
+
+    /// Compatibility setter for narrow callers. Production composition installs
+    /// the batch provider below so a multi-tab projection shares one authority scan.
+    func setSessionWorktreeBindingsProvider(
+        _ provider: @escaping @MainActor (UUID) -> [AgentSessionWorktreeBinding]
+    ) {
+        sessionWorktreeBindingStatesProvider = { sessionIDs in
+            Dictionary(uniqueKeysWithValues: sessionIDs.map { sessionID in
+                (sessionID, .hydrated(provider(sessionID)))
+            })
+        }
+    }
+
+    func setSessionWorktreeBindingStatesProvider(
+        _ provider: @escaping @MainActor (Set<UUID>) -> [UUID: AgentSessionWorktreeBindingState]
+    ) {
+        sessionWorktreeBindingStatesProvider = provider
+    }
+
+    private func sessionWorktreeBindingState(for sessionID: UUID) -> AgentSessionWorktreeBindingState {
+        sessionWorktreeBindingStatesProvider?([sessionID])[sessionID] ?? .unavailable
     }
 
     func attachSelectionCoordinator(_ coordinator: WorkspaceSelectionCoordinator) {
@@ -992,14 +1384,24 @@ class WorkspaceFilesViewModel: ObservableObject {
         selectionCoordinatorCancellable?.cancel()
         selectionCoordinatorCancellable = coordinator.changes
             .sink { [weak self, weak coordinator] change in
-                guard change.source != .uiFlush else { return }
-                Task { @MainActor [weak self, weak coordinator] in
-                    guard let self, let coordinator else { return }
-                    guard change.tabID == nil || change.tabID == currentTabID else { return }
-                    let current = snapshotSelection()
-                    guard current != change.selection else { return }
-                    await coordinator.withApplyingSelectionMirror {
-                        await self.applyStoredSelection(change.selection)
+                guard change.source != .uiFlush, !change.source.isMCPSelectionSource else { return }
+                MainActor.assumeIsolated {
+                    self?.launchPresentationTask { [weak self, weak coordinator] in
+                        guard let self, let coordinator else { return }
+                        if let changeTabID = change.tabID {
+                            guard let activeIdentity = coordinator.activeSelectionIdentity(),
+                                  activeIdentity.tabID == changeTabID,
+                                  coordinator.selectionSnapshot(
+                                      for: activeIdentity,
+                                      flushPendingUIIfActive: false
+                                  )?.selection == change.selection
+                            else { return }
+                        }
+                        let current = snapshotSelection()
+                        guard current != change.selection else { return }
+                        await coordinator.withApplyingSelectionMirror {
+                            await self.applyStoredSelection(change.selection)
+                        }
                     }
                 }
             }
@@ -1009,18 +1411,42 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspaceManager = manager
         currentWorkspaceID = manager.activeWorkspaceID
         manager.addWorkspaceDidSwitchListener(label: "fileManager") { [weak self] workspace in
-            guard let self else { return }
-            Task { @MainActor in
-                await self.handleWorkspaceSwitch(to: workspace)
+            MainActor.assumeIsolated {
+                self?.launchPresentationTask { [weak self] in
+                    await self?.handleWorkspaceSwitch(to: workspace)
+                }
             }
         }
         if let activeWorkspace = manager.activeWorkspace {
-            Task { @MainActor in
-                await self.handleWorkspaceSwitch(to: activeWorkspace)
+            launchPresentationTask { [weak self] in
+                await self?.handleWorkspaceSwitch(to: activeWorkspace)
             }
         } else {
             currentSlicesByRoot.removeAll()
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
+        }
+    }
+
+    private func launchPresentationTask(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.pendingPresentationTasks.removeValue(forKey: taskID) }
+            await operation()
+        }
+        pendingPresentationTasks[taskID] = task
+    }
+
+    /// Waits for concrete workspace-switch and stored-selection presentation tasks that were
+    /// synchronously registered before this barrier, including work they register in turn.
+    /// Callers must not invoke this from inside a tracked presentation task.
+    func waitForPendingPresentationTasks() async {
+        while !pendingPresentationTasks.isEmpty {
+            let tasks = Array(pendingPresentationTasks.values)
+            for task in tasks {
+                await task.value
+            }
         }
     }
 
@@ -1033,7 +1459,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     private func handleWorkspaceSwitch(to workspace: WorkspaceModel?) async {
         #if DEBUG
-            let switchSlicesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let switchSlicesStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         currentWorkspaceID = workspace?.id
         currentTabID = nil
@@ -1041,10 +1467,10 @@ class WorkspaceFilesViewModel: ObservableObject {
             currentSlicesByRoot.removeAll()
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "workspaceFiles.workspaceSwitchSlices.clear",
                     fields: [
-                        "duration": switchSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": switchSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -1052,10 +1478,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
 
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "workspaceFiles.workspaceSwitchSlices.begin",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
+                    "workspaceID": restorePerfRecorder.shortID(workspaceID),
                     "rootCount": "\(rootFolders.count)"
                 ]
             )
@@ -1074,13 +1500,13 @@ class WorkspaceFilesViewModel: ObservableObject {
         currentSlicesByRoot = refreshed
         requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "workspaceFiles.workspaceSwitchSlices.end",
                 fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(workspaceID),
+                    "workspaceID": restorePerfRecorder.shortID(workspaceID),
                     "rootCount": "\(rootFolders.count)",
                     "rootsWithSlices": "\(refreshed.count)",
-                    "duration": switchSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": switchSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -1098,64 +1524,888 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     #endif
 
-    /// Subscribes to store-owned codemap scan progress.
-    private func subscribeToScanProgress() {
-        scanProgressTask = Task { [weak self] in
-            guard let self else { return }
-            let stream = await workspaceFileContextStore.codemapScanProgressUpdates()
-            for await (remaining, total) in stream {
-                await MainActor.run {
-                    self.updateScanProgress(remaining: remaining, total: total)
-                }
-            }
-        }
-    }
-
-    private func updateScanProgress(remaining: Int, total: Int) {
-        remainingScanCount = remaining
-        totalFilesSeen = total
-        // No extra counter needed – updating the two @Published props is enough
-    }
-
     private func subscribeToWorkspaceStoreDeltaEvents() {
-        workspaceStoreDeltaBridgeTask = Task { [weak self] in
-            guard let self else { return }
-            let stream = await workspaceFileContextStore.appliedIndexEvents()
+        // Capture the store (not self) and re-acquire self per event so a
+        // closed window's view model is released once nothing else retains it;
+        // deinit then cancels this task, which finishes the stream iterator.
+        // The per-iteration `guard let self` is load-bearing: buffered events
+        // can still be delivered after cancellation, and must not reach a dead
+        // VM. These tasks are only ever cancelled from deinit — never cancel
+        // them while the VM is alive (a mid-apply cancel could half-apply a
+        // projection).
+        let store = workspaceFileContextStore
+        workspaceStoreDeltaBridgeTask = Task { [weak self, store] in
+            let stream = await store.appliedIndexEvents()
             for await event in stream {
+                guard let self else { return }
                 await handleWorkspaceAppliedIndexEvent(event)
             }
         }
     }
 
-    private func subscribeToWorkspaceStoreCodemapUpdates() {
-        workspaceStoreCodemapBridgeTask = Task { [weak self] in
-            guard let self else { return }
-            let stream = await workspaceFileContextStore.codemapUpdates()
+    private func subscribeToCodemapMarkerReadinessUpdates() {
+        let store = workspaceFileContextStore
+        codemapMarkerReadinessTask = Task { [weak self, store] in
+            let stream = await store.codemapMarkerReadinessUpdates()
             for await event in stream {
-                handleWorkspaceStoreCodemapUpdateEvent(event)
+                guard let self else { return }
+                handleCodemapMarkerReadiness(event)
             }
         }
     }
 
+    private func subscribeToCodemapRootStatusUpdates() {
+        let store = workspaceFileContextStore
+        codemapRootStatusTask = Task { [weak self, store] in
+            let stream = await store.codemapRootStatusUpdates()
+            for await update in stream {
+                guard let self else { return }
+                handleCodemapRootStatus(update)
+            }
+        }
+    }
+
+    private struct WorkspaceAppliedIndexModificationTargets {
+        let filesByID: [UUID: FileViewModel]
+        let foldersByID: [UUID: FolderViewModel]
+    }
+
+    private enum WorkspaceAppliedIndexModificationResolution {
+        case targets(WorkspaceAppliedIndexModificationTargets)
+        case requiresCanonicalResync
+        case rootNoLongerCurrent
+    }
+
     @MainActor
     private func handleWorkspaceAppliedIndexEvent(_ event: WorkspaceAppliedIndexBatchEvent) async {
-        let rootKey = rootKey(forPath: event.rootPath)
-        guard let targetRootVM = rootFolders.first(where: { $0.id == event.rootID || $0.standardizedFullPath == rootKey }) else { return }
+        #if DEBUG
+            if let appliedIndexProjectionWillHandleHandler {
+                await appliedIndexProjectionWillHandleHandler(event.rootID, event.generation)
+            }
+        #endif
+
+        guard !Task.isCancelled else { return }
+        _ = await handleHiddenSessionRootAppliedIndexEvent(event)
+        guard let (rootKey, targetRootVM) = currentWorkspaceAppliedIndexRoot(for: event) else { return }
+        let handledGeneration = appliedIndexProjectionHandledGenerationByRootID[event.rootID] ?? 0
+        guard event.generation > handledGeneration else { return }
+
         if event.isRootUnload {
-            guard rootFolders.contains(where: { $0.id == targetRootVM.id }) else { return }
             _ = detachRootShellReferences(targetRootVM)
+            recordHandledWorkspaceAppliedIndexEvent()
             return
         }
 
+        let nextExpectedGeneration = handledGeneration &+ 1
+        if event.requiresFullResync || event.generation != nextExpectedGeneration {
+            _ = await resyncAndRecordWorkspaceAppliedIndexProjection(
+                for: event,
+                rootKey: rootKey,
+                targetRootVM: targetRootVM
+            )
+            return
+        }
+
+        let modificationTargets: WorkspaceAppliedIndexModificationTargets
+        switch await resolveContiguousWorkspaceAppliedIndexModificationTargets(
+            for: event,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM
+        ) {
+        case let .targets(resolvedTargets):
+            modificationTargets = resolvedTargets
+        case .requiresCanonicalResync:
+            _ = await resyncAndRecordWorkspaceAppliedIndexProjection(
+                for: event,
+                rootKey: rootKey,
+                targetRootVM: targetRootVM
+            )
+            return
+        case .rootNoLongerCurrent:
+            return
+        }
+
+        guard await applyWorkspaceAppliedIndexEvent(
+            event,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM,
+            useCanonicalSnapshotMetadata: false,
+            modificationTargets: modificationTargets
+        ) else { return }
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordProjectionModification(
+                rootID: event.rootID,
+                fileIDs: event.modifiedFileIDs,
+                generation: event.generation
+            )
+        #endif
+        appliedIndexProjectionHandledGenerationByRootID[event.rootID] = event.generation
+        recordHandledWorkspaceAppliedIndexEvent()
+    }
+
+    @MainActor
+    private func handleHiddenSessionRootAppliedIndexEvent(
+        _ event: WorkspaceAppliedIndexBatchEvent
+    ) async -> Bool {
+        guard let rootLifetimeID = event.rootLifetimeID else { return false }
+        let lifetimeKey = HiddenSessionRootLifetimeKey(
+            rootID: event.rootID,
+            rootLifetimeID: rootLifetimeID
+        )
+        if event.isRootUnload {
+            cancelHiddenSessionSliceRebases(for: lifetimeKey)
+            hiddenSessionHandledGenerationByRootLifetime.removeValue(forKey: lifetimeKey)
+            return true
+        }
+        guard let root = await workspaceFileContextStore.roots().first(where: { $0.id == event.rootID }),
+              root.kind == .sessionWorktree,
+              root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
+        else { return false }
+
+        let handled = hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] ?? 0
+        guard event.generation > handled else { return true }
+        guard let records = await workspaceFileContextStore.appliedIndexRecordLookup(
+            rootID: event.rootID,
+            fileIDs: event.modifiedFileIDs,
+            folderIDs: []
+        ) else { return false }
+        let expected = handled &+ 1
+        guard event.generation == expected, !event.requiresFullResync else {
+            cancelHiddenSessionSliceRebases(for: lifetimeKey)
+            hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] = event.generation
+            return true
+        }
+
+        let modifiedFilesByID = records.filesByID
+        let targetsByFileID = await hiddenSessionSliceRebaseTargets(
+            physicalRootPath: root.standardizedFullPath,
+            modifiedFilesByID: modifiedFilesByID
+        ) ?? [:]
+
+        for fileID in event.modifiedFileIDs {
+            guard let file = modifiedFilesByID[fileID],
+                  let targets = targetsByFileID[fileID],
+                  !targets.isEmpty
+            else { continue }
+            let eventSource = event.modifiedFileSourceSnapshotsByID[fileID]
+            let sourceSnapshot: SliceRebaseSourceSnapshot? = eventSource.flatMap { source in
+                guard source.rootID == event.rootID,
+                      source.rootLifetimeID == rootLifetimeID,
+                      source.fileID == fileID,
+                      source.relativePath == file.standardizedRelativePath,
+                      source.fullPath == file.standardizedFullPath
+                else { return nil }
+                return SliceRebaseSourceSnapshot(
+                    text: source.text,
+                    modificationTime: source.modificationTime
+                )
+            }
+            scheduleHiddenSessionSliceRebase(HiddenSessionSliceRebaseRequest(
+                rootID: event.rootID,
+                rootLifetimeID: rootLifetimeID,
+                fileID: fileID,
+                physicalRootPath: root.standardizedFullPath,
+                physicalFullPath: file.standardizedFullPath,
+                relativePath: file.standardizedRelativePath,
+                sourceSnapshot: sourceSnapshot,
+                targets: targets
+            ))
+        }
+        hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] = event.generation
+        return true
+    }
+
+    @MainActor
+    private func hiddenSessionSliceRebaseTargets(
+        physicalRootPath: String,
+        modifiedFilesByID: [UUID: WorkspaceFileRecord]
+    ) async -> [UUID: [HiddenSessionSliceRebaseTarget]]? {
+        guard let provider = sessionWorktreeBindingStatesProvider,
+              let workspace = workspaceManager?.activeWorkspace,
+              !modifiedFilesByID.isEmpty
+        else { return nil }
+
+        // Slice presence and relative-path eligibility are independent of binding
+        // authority. Apply them first so the expensive global binding snapshot is
+        // requested only for tabs that can target at least one modified file.
+        let pathIndex = HiddenSessionSlicePathIndex(
+            relativePathsByFileID: modifiedFilesByID.mapValues { $0.standardizedRelativePath }
+        )
+        let candidateTabs = workspace.composeTabs.compactMap { tab -> (
+            tab: ComposeTabState,
+            sessionID: UUID,
+            slices: [String: [LineRange]],
+            candidateFileIDs: Set<UUID>
+        )? in
+            guard let sessionID = tab.activeAgentSessionID else { return nil }
+            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
+            guard !slices.isEmpty else { return nil }
+            let candidateFileIDs = pathIndex.matchingFileIDs(for: Array(slices.keys))
+            guard !candidateFileIDs.isEmpty else { return nil }
+            return (tab, sessionID, slices, candidateFileIDs)
+        }
+        guard !candidateTabs.isEmpty else { return [:] }
+
+        let bindingStates = provider(Set(candidateTabs.map(\.sessionID)))
+        var targetsByFileID: [UUID: [HiddenSessionSliceRebaseTarget]] = [:]
+        for candidate in candidateTabs {
+            guard case let .hydrated(bindings) = bindingStates[candidate.sessionID] else { continue }
+            let matchingBindings = bindings.filter {
+                StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath) == physicalRootPath
+            }
+            guard matchingBindings.count == 1, let binding = matchingBindings.first else { continue }
+            let physicalRootPaths = Set(bindings.map {
+                StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath)
+            })
+            let fingerprint = AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
+            guard await workspaceFileContextStore.sessionWorktreeOwnershipCovers(
+                ownerID: candidate.sessionID,
+                bindingFingerprint: fingerprint,
+                physicalRootPaths: physicalRootPaths
+            ) else { continue }
+
+            for fileID in candidate.candidateFileIDs {
+                guard let file = modifiedFilesByID[fileID],
+                      let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
+                          forPhysicalPath: file.standardizedFullPath,
+                          binding: binding
+                      ),
+                      candidate.slices[logicalFullPath]?.isEmpty == false
+                else { continue }
+                targetsByFileID[fileID, default: []].append(HiddenSessionSliceRebaseTarget(
+                    identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: candidate.tab.id),
+                    logicalFullPath: logicalFullPath,
+                    agentSessionID: candidate.sessionID,
+                    bindingFingerprint: fingerprint,
+                    physicalRootPaths: physicalRootPaths
+                ))
+            }
+        }
+        return targetsByFileID
+    }
+
+    @MainActor
+    private func scheduleHiddenSessionSliceRebase(_ request: HiddenSessionSliceRebaseRequest) {
+        let fullPath = request.physicalFullPath
+        if sliceRebaseSourceSnapshotByFullPath[fullPath] == nil, let sourceSnapshot = request.sourceSnapshot {
+            sliceRebaseSourceSnapshotByFullPath[fullPath] = sourceSnapshot
+        }
+        guard sliceRebaseSourceSnapshotByFullPath[fullPath] != nil else { return }
+        let lifetimeKey = HiddenSessionRootLifetimeKey(
+            rootID: request.rootID,
+            rootLifetimeID: request.rootLifetimeID
+        )
+        hiddenSessionRootLifetimeByPhysicalPath[fullPath] = lifetimeKey
+        registerSliceRebaseTask(fullPath: fullPath) { [weak self] taskID in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if let commitTask = sliceRebaseCommitTasksByFullPath[fullPath] {
+                await commitTask.value
+            }
+            let registrationGeneration = sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
+            guard await isHiddenSessionSliceRebaseCurrent(
+                request,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration
+            ), let sourceSnapshot = sliceRebaseSourceSnapshotByFullPath[fullPath],
+            let loadedSnapshot = await stableSliceRebaseSnapshot(
+                rootID: request.rootID,
+                relativePath: request.relativePath
+            ), await isHiddenSessionSliceRebaseCurrent(
+                request,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration
+            )
+            else { return }
+
+            var currentTargets: [HiddenSessionSliceRebaseTarget] = []
+            for target in request.targets where await isHiddenSessionSliceRebaseTargetCurrent(target) {
+                currentTargets.append(target)
+            }
+            guard !currentTargets.isEmpty else { return }
+
+            var partitionCommits: [SlicePartitionRebaseCommit] = []
+            for target in currentTargets {
+                guard let expectedLogicalRanges = await hiddenSessionSliceRangesIfTargetCurrent(target) else {
+                    continue
+                }
+                let scope = PartitionScope(
+                    workspaceID: target.identity.workspaceID,
+                    tabID: target.identity.tabID
+                )
+                let data = await selectionSliceCoordinator.loadSlices(
+                    forRootPath: request.physicalRootPath,
+                    scope: scope
+                )
+                guard let stored = data[request.relativePath], !stored.ranges.isEmpty else { continue }
+                let oldText = sliceRebaseSourceText(
+                    sourceSnapshot: sourceSnapshot,
+                    stored: stored,
+                    currentText: loadedSnapshot.text
+                )
+                guard oldText != loadedSnapshot.text else { continue }
+                let computed = await Self.computeSliceRebaseConsumer(
+                    oldText: oldText,
+                    newText: loadedSnapshot.text,
+                    stored: stored,
+                    fullPath: fullPath,
+                    scope: "hidden-partition"
+                )
+                guard !computed.isStale else { continue }
+                partitionCommits.append(SlicePartitionRebaseCommit(
+                    scope: scope,
+                    ranges: computed.ranges,
+                    anchors: computed.anchors,
+                    expectedStoredSlices: stored,
+                    hiddenSessionTarget: target,
+                    expectedLogicalRanges: expectedLogicalRanges
+                ))
+            }
+
+            #if DEBUG
+                if let hiddenSessionSliceRebaseWillCommitHandler {
+                    await hiddenSessionSliceRebaseWillCommitHandler(fullPath)
+                }
+            #endif
+
+            let commitID = UUID()
+            sliceRebaseCommitIDsByFullPath[fullPath] = commitID
+            let commitTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer {
+                    if sliceRebaseCommitIDsByFullPath[fullPath] == commitID {
+                        sliceRebaseCommitTasksByFullPath.removeValue(forKey: fullPath)
+                        sliceRebaseCommitIDsByFullPath.removeValue(forKey: fullPath)
+                    }
+                }
+                guard await isHiddenSessionSliceRebaseCurrent(
+                    request,
+                    taskID: taskID,
+                    registrationGeneration: registrationGeneration
+                ) else { return }
+                for commit in partitionCommits {
+                    guard await isHiddenSessionSliceRebaseCurrent(
+                        request,
+                        taskID: taskID,
+                        registrationGeneration: registrationGeneration
+                    ) else { return }
+                    if let target = commit.hiddenSessionTarget,
+                       let expectedLogicalRanges = commit.expectedLogicalRanges
+                    {
+                        guard await hiddenSessionSliceRangesIfTargetCurrent(target) == expectedLogicalRanges else {
+                            continue
+                        }
+                    }
+                    do {
+                        guard try await selectionSliceCoordinator.applyPartitionUpdatesIfCurrent(
+                            forRootPath: request.physicalRootPath,
+                            scope: commit.scope,
+                            updates: [
+                                request.relativePath: PartitionStore.SliceUpdate(
+                                    ranges: commit.ranges,
+                                    fileModificationTime: loadedSnapshot.modificationTime,
+                                    anchors: commit.anchors
+                                )
+                            ],
+                            mode: .setPaths,
+                            expectedCurrent: [request.relativePath: commit.expectedStoredSlices]
+                        ) != nil else {
+                            return
+                        }
+                    } catch {
+                        return
+                    }
+                }
+                var stillCurrentTargets: [HiddenSessionSliceRebaseTarget] = []
+                for target in currentTargets where await isHiddenSessionSliceRebaseTargetCurrent(target) {
+                    stillCurrentTargets.append(target)
+                }
+                guard !stillCurrentTargets.isEmpty else { return }
+                let targets = stillCurrentTargets.map { (identity: $0.identity, fullPath: $0.logicalFullPath) }
+                await workspaceManager?.rebaseSlicesForFilesAcrossTabs(
+                    targets: targets,
+                    asyncTransform: { identity, logicalFullPath, currentRanges in
+                        if let commit = partitionCommits.first(where: { commit in
+                            guard let target = commit.hiddenSessionTarget else { return false }
+                            return target.identity == identity && target.logicalFullPath == logicalFullPath
+                        }), let expectedLogicalRanges = commit.expectedLogicalRanges {
+                            let normalizedCurrent = SliceRangeMath.normalize(currentRanges)
+                            let normalizedCommitted = SliceRangeMath.normalize(commit.ranges)
+                            if normalizedCurrent == normalizedCommitted {
+                                return normalizedCurrent
+                            }
+                            if normalizedCurrent == SliceRangeMath.normalize(expectedLogicalRanges) {
+                                return normalizedCommitted
+                            }
+                        }
+
+                        return await Task.detached(priority: .utility) {
+                            let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+                            let result = SliceRebaseEngine.rebase(
+                                oldText: sourceSnapshot.text,
+                                newText: loadedSnapshot.text,
+                                oldRanges: currentRanges,
+                                anchors: nil
+                            )
+                            #if DEBUG
+                                MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
+                                    fullPath: logicalFullPath,
+                                    durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
+                                    scope: "hidden-tab"
+                                )
+                            #endif
+                            return result.isStale ? currentRanges : result.rebased
+                        }.value
+                    }
+                )
+                guard await isHiddenSessionSliceRebaseCurrent(
+                    request,
+                    taskID: taskID,
+                    registrationGeneration: registrationGeneration
+                ) else { return }
+                sliceRebaseSourceSnapshotByFullPath[fullPath] = loadedSnapshot
+            }
+            sliceRebaseCommitTasksByFullPath[fullPath] = commitTask
+            await commitTask.value
+        }
+    }
+
+    @MainActor
+    private func isHiddenSessionSliceRebaseCurrent(
+        _ request: HiddenSessionSliceRebaseRequest,
+        taskID: UUID,
+        registrationGeneration: UInt64
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              sliceRebaseTaskIDsByFullPath[request.physicalFullPath] == taskID,
+              sliceRebaseRegistrationGenerationByFullPath[request.physicalFullPath, default: 0] == registrationGeneration,
+              hiddenSessionRootLifetimeByPhysicalPath[request.physicalFullPath] == HiddenSessionRootLifetimeKey(
+                  rootID: request.rootID,
+                  rootLifetimeID: request.rootLifetimeID
+              ), await workspaceFileContextStore.sliceRebaseFileIsCurrent(
+                  rootID: request.rootID,
+                  rootLifetimeID: request.rootLifetimeID,
+                  fileID: request.fileID,
+                  relativePath: request.relativePath,
+                  fullPath: request.physicalFullPath
+              )
+        else { return false }
+        return true
+    }
+
+    @MainActor
+    private func isHiddenSessionSliceRebaseTargetCurrent(
+        _ target: HiddenSessionSliceRebaseTarget
+    ) async -> Bool {
+        await hiddenSessionSliceRangesIfTargetCurrent(target) != nil
+    }
+
+    @MainActor
+    private func hiddenSessionSliceRangesIfTargetCurrent(
+        _ target: HiddenSessionSliceRebaseTarget
+    ) async -> [LineRange]? {
+        guard let manager = workspaceManager,
+              let tab = manager.composeTab(for: target.identity),
+              tab.activeAgentSessionID == target.agentSessionID,
+              let ranges = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)[target.logicalFullPath],
+              !ranges.isEmpty,
+              case let .hydrated(bindings) = sessionWorktreeBindingState(for: target.agentSessionID)
+        else { return nil }
+        guard AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings) == target.bindingFingerprint,
+              Set(bindings.map {
+                  StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath)
+              }) == target.physicalRootPaths,
+              await workspaceFileContextStore.sessionWorktreeOwnershipCovers(
+                  ownerID: target.agentSessionID,
+                  bindingFingerprint: target.bindingFingerprint,
+                  physicalRootPaths: target.physicalRootPaths
+              )
+        else { return nil }
+        return SliceRangeMath.normalize(ranges)
+    }
+
+    @MainActor
+    private func cancelHiddenSessionSliceRebases(for lifetimeKey: HiddenSessionRootLifetimeKey) {
+        let paths = hiddenSessionRootLifetimeByPhysicalPath.compactMap { path, key in
+            key == lifetimeKey ? path : nil
+        }
+        for path in paths {
+            sliceRebaseTasksByFullPath.removeValue(forKey: path)?.cancel()
+            sliceRebaseCommitTasksByFullPath.removeValue(forKey: path)?.cancel()
+            sliceRebaseTaskIDsByFullPath.removeValue(forKey: path)
+            sliceRebaseCommitIDsByFullPath.removeValue(forKey: path)
+            sliceRebaseSourceSnapshotByFullPath.removeValue(forKey: path)
+            hiddenSessionRootLifetimeByPhysicalPath.removeValue(forKey: path)
+        }
+    }
+
+    @MainActor
+    private func currentWorkspaceAppliedIndexRoot(
+        for event: WorkspaceAppliedIndexBatchEvent
+    ) -> (rootKey: RootKey, root: FolderViewModel)? {
+        let rootKey = rootKey(forPath: event.rootPath)
+        guard workspaceFileContextRootsByRootKey[rootKey]?.id == event.rootID,
+              let root = rootFolders.first(where: { $0.id == event.rootID }),
+              root.standardizedFullPath == rootKey,
+              fileHierarchyIndex.foldersByID[event.rootID] === root
+        else {
+            return nil
+        }
+        return (rootKey, root)
+    }
+
+    @MainActor
+    private func isCurrentWorkspaceAppliedIndexRoot(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        targetRootVM: FolderViewModel
+    ) -> Bool {
+        guard !Task.isCancelled,
+              let current = currentWorkspaceAppliedIndexRoot(for: event)
+        else {
+            return false
+        }
+        return current.root === targetRootVM
+    }
+
+    @MainActor
+    private func isCurrentAttachedRoot(
+        _ root: FolderViewModel,
+        expectedRootID: UUID? = nil
+    ) -> Bool {
+        guard !Task.isCancelled else { return false }
+        let rootKey = StandardizedPath.absolute(root.standardizedFullPath)
+        let rootID = expectedRootID ?? root.id
+        return root.id == rootID
+            && workspaceFileContextRootsByRootKey[rootKey]?.id == rootID
+            && rootFolders.contains(where: { $0 === root })
+            && fileHierarchyIndex.foldersByID[rootID] === root
+            && fileHierarchyIndex.foldersByFullPath[rootKey] === root
+    }
+
+    @MainActor
+    private func recordHandledWorkspaceAppliedIndexEvent() {
+        #if DEBUG
+            appliedIndexProjectionHandledEventCount += 1
+            notifyAppliedIndexProjectionStateChanged()
+        #endif
+    }
+
+    @MainActor
+    private func resyncAndRecordWorkspaceAppliedIndexProjection(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel
+    ) async -> Bool {
+        guard let resyncedGeneration = await resyncWorkspaceAppliedIndexProjection(
+            for: event,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM
+        ) else {
+            return false
+        }
+        appliedIndexProjectionHandledGenerationByRootID[event.rootID] = resyncedGeneration
+        #if DEBUG
+            appliedIndexProjectionCanonicalResyncCount += 1
+        #endif
+        recordHandledWorkspaceAppliedIndexEvent()
+        return true
+    }
+
+    @MainActor
+    private func resolveContiguousWorkspaceAppliedIndexModificationTargets(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel
+    ) async -> WorkspaceAppliedIndexModificationResolution {
+        var filesByID: [UUID: FileViewModel] = [:]
+        filesByID.reserveCapacity(event.modifiedFileIDs.count)
+        var missingFileIDs: [UUID] = []
+        missingFileIDs.reserveCapacity(event.modifiedFileIDs.count)
+        for fileID in event.modifiedFileIDs {
+            guard let file = projectedFileForAppliedIndexModification(id: fileID) else {
+                missingFileIDs.append(fileID)
+                continue
+            }
+            guard isConsistentProjectedFile(file, id: fileID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+            filesByID[fileID] = file
+        }
+
+        var foldersByID: [UUID: FolderViewModel] = [:]
+        foldersByID.reserveCapacity(event.modifiedFolderIDs.count)
+        var missingFolderIDs: [UUID] = []
+        missingFolderIDs.reserveCapacity(event.modifiedFolderIDs.count)
+        for folderID in event.modifiedFolderIDs {
+            guard let folder = projectedFolderForAppliedIndexModification(id: folderID) else {
+                missingFolderIDs.append(folderID)
+                continue
+            }
+            guard isConsistentProjectedFolder(folder, id: folderID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+            foldersByID[folderID] = folder
+        }
+
+        guard !missingFileIDs.isEmpty || !missingFolderIDs.isEmpty else {
+            return .targets(WorkspaceAppliedIndexModificationTargets(
+                filesByID: filesByID,
+                foldersByID: foldersByID
+            ))
+        }
+
+        guard let lookup = await workspaceFileContextStore.appliedIndexRecordLookup(
+            rootID: event.rootID,
+            fileIDs: missingFileIDs,
+            folderIDs: missingFolderIDs
+        ),
+            lookup.root.id == event.rootID,
+            lookup.root.standardizedFullPath == rootKey,
+            lookup.generation >= event.generation
+        else {
+            return .requiresCanonicalResync
+        }
+        guard !Task.isCancelled,
+              let current = currentWorkspaceAppliedIndexRoot(for: event),
+              current.root === targetRootVM
+        else {
+            return .rootNoLongerCurrent
+        }
+
+        for (fileID, file) in filesByID {
+            guard isConsistentProjectedFile(file, id: fileID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+        }
+        for (folderID, folder) in foldersByID {
+            guard isConsistentProjectedFolder(folder, id: folderID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+        }
+
+        for fileID in missingFileIDs {
+            guard let record = lookup.filesByID[fileID] else {
+                return .requiresCanonicalResync
+            }
+            let fileByID = fileHierarchyIndex.filesByID[fileID]
+            let fileByPath = fileHierarchyIndex.filesByFullPath[record.standardizedFullPath]
+            switch (fileByID, fileByPath) {
+            case (nil, nil):
+                continue
+            case let (idFile?, pathFile?) where idFile === pathFile
+                && isConsistentProjectedFile(
+                    idFile,
+                    id: fileID,
+                    rootKey: rootKey,
+                    expectedFullPath: record.standardizedFullPath
+                ):
+                filesByID[fileID] = idFile
+            default:
+                return .requiresCanonicalResync
+            }
+        }
+
+        for folderID in missingFolderIDs {
+            guard let record = lookup.foldersByID[folderID] else {
+                return .requiresCanonicalResync
+            }
+            let folderByID = fileHierarchyIndex.foldersByID[folderID]
+            let folderByPath = fileHierarchyIndex.foldersByFullPath[record.standardizedFullPath]
+            switch (folderByID, folderByPath) {
+            case (nil, nil):
+                continue
+            case let (idFolder?, pathFolder?) where idFolder === pathFolder
+                && isConsistentProjectedFolder(
+                    idFolder,
+                    id: folderID,
+                    rootKey: rootKey,
+                    expectedFullPath: record.standardizedFullPath
+                ):
+                foldersByID[folderID] = idFolder
+            default:
+                return .requiresCanonicalResync
+            }
+        }
+
+        return .targets(WorkspaceAppliedIndexModificationTargets(
+            filesByID: filesByID,
+            foldersByID: foldersByID
+        ))
+    }
+
+    @MainActor
+    private func resolveStrictWorkspaceAppliedIndexModificationTargets(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey
+    ) -> WorkspaceAppliedIndexModificationTargets? {
+        var filesByID: [UUID: FileViewModel] = [:]
+        filesByID.reserveCapacity(event.modifiedFileIDs.count)
+        for fileID in event.modifiedFileIDs {
+            guard let file = projectedFileForAppliedIndexModification(id: fileID),
+                  isConsistentProjectedFile(file, id: fileID, rootKey: rootKey)
+            else {
+                return nil
+            }
+            filesByID[fileID] = file
+        }
+
+        var foldersByID: [UUID: FolderViewModel] = [:]
+        foldersByID.reserveCapacity(event.modifiedFolderIDs.count)
+        for folderID in event.modifiedFolderIDs {
+            guard let folder = projectedFolderForAppliedIndexModification(id: folderID),
+                  isConsistentProjectedFolder(folder, id: folderID, rootKey: rootKey)
+            else {
+                return nil
+            }
+            foldersByID[folderID] = folder
+        }
+        return WorkspaceAppliedIndexModificationTargets(filesByID: filesByID, foldersByID: foldersByID)
+    }
+
+    @MainActor
+    private func isConsistentProjectedFile(
+        _ file: FileViewModel,
+        id: UUID,
+        rootKey: RootKey,
+        expectedFullPath: String? = nil
+    ) -> Bool {
+        file.id == id
+            && file.standardizedRootFolderPath == rootKey
+            && (expectedFullPath.map { file.standardizedFullPath == $0 } ?? true)
+            && fileHierarchyIndex.filesByID[id] === file
+            && fileHierarchyIndex.filesByFullPath[file.standardizedFullPath] === file
+    }
+
+    @MainActor
+    private func isConsistentProjectedFolder(
+        _ folder: FolderViewModel,
+        id: UUID,
+        rootKey: RootKey,
+        expectedFullPath: String? = nil
+    ) -> Bool {
+        folder.id == id
+            && StandardizedPath.absolute(folder.rootPath) == rootKey
+            && (expectedFullPath.map { folder.standardizedFullPath == $0 } ?? true)
+            && fileHierarchyIndex.foldersByID[id] === folder
+            && fileHierarchyIndex.foldersByFullPath[folder.standardizedFullPath] === folder
+    }
+
+    @MainActor
+    private func resyncWorkspaceAppliedIndexProjection(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel
+    ) async -> UInt64? {
+        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
+              snapshot.root.id == event.rootID,
+              snapshot.root.standardizedFullPath == rootKey,
+              snapshot.generation >= event.generation,
+              let current = currentWorkspaceAppliedIndexRoot(for: event),
+              current.root === targetRootVM
+        else {
+            return nil
+        }
+
+        rebuildFileHierarchyIndex(for: targetRootVM)
+
+        let canonicalFilePaths = Set(snapshot.files.map(\.standardizedFullPath))
+        let canonicalFolderPaths = Set(snapshot.folders.map(\.standardizedFullPath)).union([rootKey])
+        let currentFilePaths = fileHierarchyIndex.filePathsByRoot[rootKey]
+            ?? Set(fileHierarchyIndex.filesByFullPath.keys.filter { StandardizedPath.isDescendant($0, of: rootKey) })
+        let currentFolderPaths = fileHierarchyIndex.folderPathsByRoot[rootKey]
+            ?? Set(fileHierarchyIndex.foldersByFullPath.keys.filter { StandardizedPath.isDescendant($0, of: rootKey) })
+
+        let upsertedFiles = snapshot.files.filter { record in
+            fileHierarchyIndex.filesByFullPath[record.standardizedFullPath]?.id != record.id
+        }
+        let upsertedFolders = snapshot.folders.filter { record in
+            !record.standardizedRelativePath.isEmpty
+                && fileHierarchyIndex.foldersByFullPath[record.standardizedFullPath]?.id != record.id
+        }
+        let modifiedFileIDs = snapshot.files.compactMap { record -> UUID? in
+            guard let modificationDate = record.modificationDate,
+                  let currentFile = fileHierarchyIndex.filesByFullPath[record.standardizedFullPath],
+                  currentFile.id == record.id,
+                  currentFile.modificationDate != modificationDate
+            else {
+                return nil
+            }
+            return record.id
+        }
+        let modifiedFolderIDs = snapshot.folders.compactMap { record -> UUID? in
+            guard !record.standardizedRelativePath.isEmpty,
+                  let modificationDate = record.modificationDate,
+                  let currentFolder = fileHierarchyIndex.foldersByFullPath[record.standardizedFullPath],
+                  currentFolder.id == record.id,
+                  currentFolder.modificationDate != modificationDate
+            else {
+                return nil
+            }
+            return record.id
+        }
+        let removedFilePaths = currentFilePaths.subtracting(canonicalFilePaths).map {
+            StandardizedPath.relative(String($0.dropFirst(rootKey.count)))
+        }
+        let removedFolderPaths = currentFolderPaths.subtracting(canonicalFolderPaths).map {
+            StandardizedPath.relative(String($0.dropFirst(rootKey.count)))
+        }
+
+        guard !upsertedFiles.isEmpty || !upsertedFolders.isEmpty
+            || !removedFilePaths.isEmpty || !removedFolderPaths.isEmpty
+            || !modifiedFileIDs.isEmpty || !modifiedFolderIDs.isEmpty
+        else {
+            return snapshot.generation
+        }
+
+        let resyncEvent = WorkspaceAppliedIndexBatchEvent(
+            rootID: event.rootID,
+            rootPath: rootKey,
+            generation: snapshot.generation,
+            upsertedFiles: upsertedFiles,
+            upsertedFolders: upsertedFolders,
+            removedFilePaths: removedFilePaths,
+            removedFolderPaths: removedFolderPaths,
+            modifiedFileIDs: modifiedFileIDs,
+            modifiedFolderIDs: modifiedFolderIDs
+        )
+        guard let modificationTargets = resolveStrictWorkspaceAppliedIndexModificationTargets(
+            for: resyncEvent,
+            rootKey: rootKey
+        ), await applyWorkspaceAppliedIndexEvent(
+            resyncEvent,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM,
+            useCanonicalSnapshotMetadata: true,
+            modificationTargets: modificationTargets
+        ) else {
+            return nil
+        }
+        return snapshot.generation
+    }
+
+    @MainActor
+    private func applyWorkspaceAppliedIndexEvent(
+        _ event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel,
+        useCanonicalSnapshotMetadata: Bool,
+        modificationTargets: WorkspaceAppliedIndexModificationTargets
+    ) async -> Bool {
+        guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+            return false
+        }
+
+        var needsIndexRebuild = useCanonicalSnapshotMetadata
         var topologyChanged = false
         var dirtyFolders: [UUID: FolderViewModel] = [:]
+        var removedSubtrees: [RemovedFolderSubtree] = []
         let sortedFolders = event.upsertedFolders.sorted { lhs, rhs in
             let lhsDepth = lhs.standardizedRelativePath.split(separator: "/").count
             let rhsDepth = rhs.standardizedRelativePath.split(separator: "/").count
             if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
             return lhs.standardizedRelativePath < rhs.standardizedRelativePath
         }
-        for folder in sortedFolders where !folder.standardizedRelativePath.isEmpty {
+        for folder in sortedFolders where folder.rootID == event.rootID && !folder.standardizedRelativePath.isEmpty {
             if let outcome = handleNewFolder(record: folder, onRootFolder: targetRootVM) {
                 topologyChanged = true
                 if let parent = outcome.parentFolderForStateRecompute {
@@ -1163,47 +2413,131 @@ class WorkspaceFilesViewModel: ObservableObject {
                 }
             }
         }
-        for file in event.upsertedFiles {
-            if let outcome = await handleNewFile(record: file, onRootFolder: targetRootVM) {
+        for file in event.upsertedFiles where file.rootID == event.rootID {
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            let outcome = await handleNewFile(
+                record: file,
+                onRootFolder: targetRootVM,
+                useRecordModificationDateForExistingFile: useCanonicalSnapshotMetadata
+            )
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            if let outcome {
                 topologyChanged = true
                 if let parent = outcome.parentFolderForStateRecompute {
                     dirtyFolders[parent.id] = parent
                 }
             }
         }
-        for path in event.removedFilePaths {
-            let fullPath = StandardizedPath.join(standardizedRoot: rootKey, standardizedRelativePath: path)
+
+        var removedFileFullPaths = Set(event.removedFilePaths.map {
+            StandardizedPath.join(standardizedRoot: rootKey, standardizedRelativePath: $0)
+        })
+        for fileID in event.removedFileIDs {
+            if let file = fileHierarchyIndex.filesByID[fileID], file.standardizedRootFolderPath == rootKey {
+                removedFileFullPaths.insert(file.standardizedFullPath)
+            }
+        }
+        for fullPath in removedFileFullPaths {
             guard let fileVM = findFileByFullPath(fullPath) else { continue }
-            let formerParent = fileVM.parentFolder ?? parentFolderForRelativePath(path, under: targetRootVM)
+            let formerParent = fileVM.parentFolder ?? parentFolderForRelativePath(fileVM.relativePath, under: targetRootVM)
             removeFileFromParentChildrenArray(fileVM)
             fileHierarchyIndex.removeFile(forKey: fullPath, expectedRootKey: rootKey)
             topologyChanged = true
             if let formerParent { dirtyFolders[formerParent.id] = formerParent }
         }
-        for path in event.removedFolderPaths.sorted(by: { $0.count > $1.count }) where !path.isEmpty {
+
+        var removedFolderRelativePaths = Set(event.removedFolderPaths.map(StandardizedPath.relative))
+        for folderID in event.removedFolderIDs {
+            if let folder = fileHierarchyIndex.foldersByID[folderID],
+               folder !== targetRootVM,
+               StandardizedPath.absolute(folder.rootPath) == rootKey
+            {
+                removedFolderRelativePaths.insert(folder.relativePath)
+            }
+        }
+        for path in removedFolderRelativePaths.sorted(by: { $0.count > $1.count }) where !path.isEmpty {
             if let removed = removeFolderRecursive(in: targetRootVM, relativePath: path) {
+                removedSubtrees.append(removed)
                 topologyChanged = true
                 if let parent = removed.formerParentFolder ?? parentFolderForRelativePath(path, under: targetRootVM) {
                     dirtyFolders[parent.id] = parent
                 }
+            } else {
+                let fullPath = StandardizedPath.join(
+                    standardizedRoot: rootKey,
+                    standardizedRelativePath: path
+                )
+                let matcher = RemovedFolderPathMatcher(removedFolderPaths: [fullPath])
+                let standardizedRootKey = StandardizedPath.absolute(rootKey)
+                let hasIndexedDescendantFiles = if let ownedFilePaths = fileHierarchyIndex.filePathsByRoot[standardizedRootKey] {
+                    ownedFilePaths.contains {
+                        matcher.containsPathEqualToOrInsideRemovedFolder($0)
+                    }
+                } else {
+                    fileHierarchyIndex.filesByFullPath.values.contains { file in
+                        file.standardizedRootFolderPath == standardizedRootKey
+                            && matcher.containsPathEqualToOrInsideRemovedFolder(file.standardizedFullPath)
+                    }
+                }
+                if fileHierarchyIndex.foldersByFullPath[fullPath] != nil || hasIndexedDescendantFiles {
+                    needsIndexRebuild = true
+                }
             }
         }
-        for fileID in event.modifiedFileIDs {
-            guard let fileVM = fileHierarchyIndex.filesByFullPath.values.first(where: { $0.id == fileID }) else { continue }
-            do {
-                let date = try await workspaceFileContextStore.fileModificationDate(rootID: event.rootID, relativePath: fileVM.relativePath)
-                await fileVM.setModificationDate(date, forceInvalidation: true)
-            } catch {
-                await fileVM.setModificationDate(Date(), forceInvalidation: true)
+        if !removedSubtrees.isEmpty {
+            let cleanupOutcome = performBatchedIncrementalRemovedSubtreeCleanup(removedSubtrees, rootKey: rootKey)
+            if !cleanupOutcome.succeeded {
+                needsIndexRebuild = true
             }
-            requestCodeScan(for: fileVM)
-            scheduleSliceRebasesForModifiedFiles([ReplaySliceRebaseRequest(file: fileVM, relativePath: fileVM.relativePath)])
+        }
+
+        for fileID in event.modifiedFileIDs {
+            guard let fileVM = modificationTargets.filesByID[fileID] else { continue }
+            let sourceSnapshot = await trustworthySliceRebaseSourceSnapshot(for: fileVM)
+            let date: Date
+            do {
+                date = try await workspaceFileContextStore.fileModificationDate(
+                    rootID: event.rootID,
+                    relativePath: fileVM.relativePath
+                )
+            } catch {
+                date = Date()
+            }
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            await fileVM.setModificationDate(date, forceInvalidation: true)
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            scheduleSliceRebasesForModifiedFiles([
+                ReplaySliceRebaseRequest(
+                    file: fileVM,
+                    relativePath: fileVM.relativePath,
+                    sourceSnapshot: sourceSnapshot
+                )
+            ])
         }
         for folderID in event.modifiedFolderIDs {
-            guard let folderVM = fileHierarchyIndex.foldersByFullPath.values.first(where: { $0.id == folderID }) else { continue }
-            if let date = try? await workspaceFileContextStore.itemModificationDateIfAvailable(rootID: event.rootID, relativePath: folderVM.relativePath) {
+            guard let folderVM = modificationTargets.foldersByID[folderID] else { continue }
+            let date = try? await workspaceFileContextStore.itemModificationDateIfAvailable(
+                rootID: event.rootID,
+                relativePath: folderVM.relativePath
+            )
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            if let date {
                 folderVM.setModificationDate(date)
             }
+        }
+
+        guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+            return false
         }
         flushPendingInserts()
         if topologyChanged {
@@ -1212,70 +2546,88 @@ class WorkspaceFilesViewModel: ObservableObject {
             } else {
                 recomputeAncestorStates(startingAtFolders: Array(dirtyFolders.values))
             }
+        }
+        if needsIndexRebuild {
             rebuildFileHierarchyIndex(for: targetRootVM)
         }
-        onRootFoldersChanged?()
+        publishRootFoldersChanged()
         fileSystemDeltasAppliedPublisher.send(FileSystemDeltasAppliedEvent(rootKey: rootKey, deltas: []))
         invalidateStaticSnapshot(forRootFullPath: targetRootVM.standardizedFullPath)
+        return true
     }
 
     @MainActor
-    private func handleWorkspaceStoreCodemapUpdateEvent(_ event: WorkspaceCodemapUpdateEvent) {
-        var updated = false
-        var shouldScheduleAutoSync = false
-
-        for snapshot in event.snapshots {
-            guard let fileVM = findFileByFullPath(snapshot.fullPath) else { continue }
-            let currentApi = validatedFileAPI(for: fileVM)
-            let wasTracked = currentApi != nil
-            let isSelected = selectedFileIDs.contains(fileVM.id)
-            fileVM.setCodeMap(snapshot.fileAPI)
-            let acceptedApi = validatedFileAPI(for: fileVM)
-            guard !codeMapAPIsMatch(currentApi, acceptedApi) else { continue }
-            if acceptedApi != nil {
-                if !wasTracked || !isSelected {
-                    shouldScheduleAutoSync = true
-                }
-            } else if wasTracked {
-                shouldScheduleAutoSync = true
-            }
-            updated = true
-        }
-
-        if !event.removedFileIDs.isEmpty || event.isRootUnload {
-            let removedFileIDs = Set(event.removedFileIDs)
-            let removedFiles = allFilesSnapshot(sorted: false).filter { file in
-                removedFileIDs.contains(file.id)
-                    || (event.isRootUnload && file.standardizedRootFolderPath == event.rootPath)
-            }
-            for file in removedFiles where validatedFileAPI(for: file) != nil {
-                file.setCodeMap(nil)
-                shouldScheduleAutoSync = true
-                updated = true
-            }
-        }
-
-        guard updated else { return }
-        codeMapUpdatePublisher.send(())
-        if shouldScheduleAutoSync {
-            scheduleAutoCodemapSync()
-        }
+    private func projectedFileForAppliedIndexModification(id: UUID) -> FileViewModel? {
+        #if DEBUG
+            appliedIndexProjectionDirectFileIDLookupCount += 1
+        #endif
+        let file = fileHierarchyIndex.filesByID[id]
+        #if DEBUG
+            if file == nil { appliedIndexProjectionDirectIDLookupMissCount += 1 }
+        #endif
+        return file
     }
 
-    private func codeMapAPIsMatch(_ lhs: FileAPI?, _ rhs: FileAPI?) -> Bool {
-        switch (lhs, rhs) {
-        case (nil, nil):
-            true
-        case let (left?, right?):
-            standardizedAPIFilePath(left) == standardizedAPIFilePath(right)
-                && left.apiDescription == right.apiDescription
-        case (nil, _?), (_?, nil):
-            false
+    @MainActor
+    private func projectedFolderForAppliedIndexModification(id: UUID) -> FolderViewModel? {
+        #if DEBUG
+            appliedIndexProjectionDirectFolderIDLookupCount += 1
+        #endif
+        let folder = fileHierarchyIndex.foldersByID[id]
+        #if DEBUG
+            if folder == nil { appliedIndexProjectionDirectIDLookupMissCount += 1 }
+        #endif
+        return folder
+    }
+
+    @MainActor
+    private func handleCodemapMarkerReadiness(
+        _ event: WorkspaceCodemapMarkerReadinessEvent
+    ) {
+        guard visibleRootFolders.contains(where: { $0.id == event.rootEpoch.rootID }) else { return }
+        codemapMarkerReadinessRevision &+= 1
+        guard codemapAutoEnabled, autoCodemapReadinessRetryPending,
+              event.changes.contains(where: { change in
+                  change.state == .ready && autoCodemapPendingMarkers.contains(
+                      AutomaticCodemapPendingMarker(
+                          rootEpoch: event.rootEpoch,
+                          fileID: change.fileID,
+                          requestGeneration: change.requestGeneration
+                      )
+                  ) && change.pathGeneration == change.requestGeneration
+              })
+        else { return }
+        scheduleAutoCodemapSync(readinessTriggered: true)
+    }
+
+    @MainActor
+    private func handleCodemapRootStatus(_ update: WorkspaceCodemapRootStatusUpdate) {
+        if let acceptedCodemapRootStatusRevision,
+           update.revision <= acceptedCodemapRootStatusRevision
+        {
+            return
+        }
+        acceptedCodemapRootStatusRevision = update.revision
+        let next = Dictionary(uniqueKeysWithValues: update.roots.map {
+            ($0.rootEpoch.rootID, $0)
+        })
+        guard next != codemapRootStatusesByRootID else { return }
+        codemapRootStatusesByRootID = next
+        codemapRootStatusesChangedSubject.send(())
+        if codemapAutoEnabled, autoCodemapReadinessRetryPending,
+           update.roots.contains(where: { root in
+               visibleRootFolders.contains(where: { $0.id == root.rootEpoch.rootID }) &&
+                   (
+                       root.availability == .ready || root.availability == .updating ||
+                           root.availability == .reconciling
+                   )
+           })
+        {
+            scheduleAutoCodemapSync(readinessTriggered: true)
         }
     }
 
     func cancelAllLoadingTasks() {
-        discardDeferredInitialRootLoadScans()
         invalidateAllRootLoadTokens()
         // Cancel the currently running folder loading task, if any.
         currentFolderLoadingTask?.cancel()
@@ -1371,7 +2723,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         if let subscription = expansionSubscriptions.removeValue(forKey: oldID) {
             subscription.cancel()
         }
+        let pendingChildren = pendingChildInserts.removeValue(forKey: oldID)
+        let pendingParent = pendingInsertParents.removeValue(forKey: oldID)
         folder.adoptCanonicalIDForStoreCorrelation(canonicalID)
+        fileHierarchyIndex.rekeyFolder(folder, from: oldID)
+        if let pendingChildren {
+            pendingChildInserts[canonicalID, default: []].append(contentsOf: pendingChildren)
+        }
+        if let pendingParent {
+            pendingInsertParents[canonicalID] = pendingParent
+        }
         registerExpansionTracking(for: folder)
     }
 
@@ -1394,14 +2755,14 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func restoreExpansionState(from paths: [String]) async {
         #if DEBUG
-            let restoreExpansionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let restoreExpansionStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var restoreExpansionOutcome = "completed"
             var restoreExpansionTargetFolders = 0
             var restoreExpansionCollapseCount = 0
             var restoreExpansionExpandCount = 0
             var restoreExpansionDidChange = false
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.restoreExpansion",
                     fields: [
                         "requestedPaths": "\(paths.count)",
@@ -1411,7 +2772,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "expandCount": "\(restoreExpansionExpandCount)",
                         "didChange": "\(restoreExpansionDidChange)",
                         "outcome": restoreExpansionOutcome,
-                        "duration": restoreExpansionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": restoreExpansionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -1586,7 +2947,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             currentWorkspaceID = workspaceID
         }
         if notifyRootChange {
-            onRootFoldersChanged?()
+            publishRootShellProjectionsChanged()
         }
         return RootShellAttachment(folder: rootFolderVM, didAppend: true)
     }
@@ -1627,7 +2988,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func detachRootShellReferences(_ folder: FolderViewModel) -> WorkspaceRootRecord? {
         let stdRoot = folder.standardizedFullPath
         let rootKey = rootKey(forPath: folder.fullPath)
-        removeDeferredInitialRootLoadScanRoot(stdRoot)
+        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: folder.id)
         unregisterExpansionTracking(for: folder)
         dropSelections(underFolderFullPath: folder.fullPath)
         normalizeSelectionState()
@@ -1646,7 +3007,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         invalidateStaticSnapshot(forRootFullPath: stdRoot)
         removeHierarchyGenerationEntry(forRootFullPath: stdRoot)
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
         if rootFolders.isEmpty {
             allFoldersUnloadedPublisher.send(())
         }
@@ -1662,7 +3023,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         fileHierarchyIndex.insertFolder(folder, rootKey: rootKey)
         registerExpansionTracking(for: folder)
         invalidateStaticSnapshot(forRootFullPath: folder.standardizedFullPath)
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
     }
 
     /// When refreshRootFolderStateAfterLoad is false, the caller must perform a later
@@ -1678,7 +3039,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         // Use stable string key for root/service mirrors (avoids URL key instability)
         let rootKey = rootKey(forPath: url.path)
         #if DEBUG
-            let loadFolderTotalStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let loadFolderTotalStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let restorePerfRootKind = restorePerfRootKindName(rootKind)
             let restorePerfRootName = url.lastPathComponent
         #endif
@@ -1695,14 +3056,14 @@ class WorkspaceFilesViewModel: ObservableObject {
             workspaceFilesDebugLog("Root shell already loaded: \(url.path)")
             isLoading = false
             #if DEBUG
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "folderLoad.total",
                     fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                        "workspaceID": restorePerfRecorder.shortID(workspace.id),
                         "rootKind": restorePerfRootKind,
                         "rootName": restorePerfRootName,
                         "outcome": "alreadyLoaded",
-                        "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
@@ -1727,13 +3088,12 @@ class WorkspaceFilesViewModel: ObservableObject {
                 try validateRootLoadToken(loadToken)
 
                 #if DEBUG
-                    let storeLoadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    let storeLoadStartMS = restorePerfRecorder.timestampMSIfEnabled()
                 #endif
                 let workspaceRootRecord = try await workspaceFileContextStore.loadRoot(
                     path: rootPath,
                     isSystemRoot: rootKind == .supplementalSystem,
                     kind: workspaceRootKind(for: rootKind, url: url),
-                    respectGitignore: self.respectGitignore,
                     respectRepoIgnore: self.respectRepoIgnore,
                     respectCursorignore: self.respectCursorignore,
                     skipSymlinks: self.skipSymlinks,
@@ -1741,16 +3101,16 @@ class WorkspaceFilesViewModel: ObservableObject {
                     cancelUnderlyingLoadOnCallerCancellation: true
                 )
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.storeLoad",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
-                            "rootID": WorkspaceRestorePerfLog.shortID(workspaceRootRecord.id),
+                            "rootID": restorePerfRecorder.shortID(workspaceRootRecord.id),
                             "wasPreloadedCandidate": "\(preloadedWorkspaceFileContextRootsByRootKey[rootKey] != nil)",
                             "outcome": "success",
-                            "duration": storeLoadStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": storeLoadStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -1758,13 +3118,22 @@ class WorkspaceFilesViewModel: ObservableObject {
                 try validateRootLoadToken(loadToken)
 
                 #if DEBUG
-                    let rootVMInitStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+                    let rootVMInitStartMS = restorePerfRecorder.timestampMSIfEnabled()
                 #endif
-                let rootShellAttachment = try attachRootShellInternal(
-                    for: workspaceRootRecord,
-                    workspaceID: workspace.id,
-                    notifyRootChange: false
-                )
+                let rootShellAttachment: RootShellAttachment
+                do {
+                    beginRootShellProjectionChangeBatch()
+                    defer { endRootShellProjectionChangeBatch() }
+                    rootShellAttachment = try attachRootShellInternal(
+                        for: workspaceRootRecord,
+                        workspaceID: workspace.id,
+                        notifyRootChange: true
+                    )
+                    try validateRootLoadToken(loadToken)
+                    if rootKind == .user {
+                        reorderRootFolders(to: workspace.repoPaths)
+                    }
+                }
                 let rootFolderVM = rootShellAttachment.folder
                 attachedRootFolder = rootFolderVM
                 if rootShellAttachment.didAppend {
@@ -1772,13 +3141,13 @@ class WorkspaceFilesViewModel: ObservableObject {
                     appendedRootFolder = rootFolderVM
                 }
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.rootShellAttach",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
-                            "duration": rootVMInitStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": rootVMInitStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                     if let rootLoadDidAttachRootShellHandler {
@@ -1786,15 +3155,10 @@ class WorkspaceFilesViewModel: ObservableObject {
                     }
                 #endif
                 try validateRootLoadToken(loadToken)
-
-                if rootKind == .user {
-                    reorderRootFolders(to: workspace.repoPaths)
-                }
-                try validateRootLoadToken(loadToken)
                 rootShellLoadedPaths.insert(stdRootPath)
                 invalidateStaticSnapshot(forRootFullPath: rootFolderVM.standardizedFullPath)
 
-                await performPostCatalogRootWork(
+                try await performPostCatalogRootWork(
                     for: workspaceRootRecord,
                     workspace: workspace,
                     rootKind: rootKind
@@ -1809,19 +3173,50 @@ class WorkspaceFilesViewModel: ObservableObject {
                 folderBeingAdded = nil
                 folderDidFinishLoadingPublisher.send(rootFolderVM)
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.total",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
                             "outcome": "success",
-                            "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
             } catch {
                 let tokenIsCurrent = isRootLoadTokenCurrent(loadToken)
+                let loadedRootIsCurrent = loadedWorkspaceRootRecord.map {
+                    workspaceFileContextRootsByRootKey[rootKey]?.id == $0.id
+                } ?? false
+                let shouldRetainLoadedRoot = error is FileSystemWatcherActivationError
+                    && tokenIsCurrent
+                    && loadedRootIsCurrent
+                    && attachedRootFolder != nil
+                if shouldRetainLoadedRoot, let attachedRootFolder {
+                    if refreshRootFolderStateAfterLoad {
+                        refreshRootFolderState()
+                    }
+                    isLoading = false
+                    folderBeingAdded = nil
+                    folderDidFinishLoadingPublisher.send(attachedRootFolder)
+                    #if DEBUG
+                        restorePerfRecorder.event(
+                            "folderLoad.total",
+                            fields: [
+                                "workspaceID": restorePerfRecorder.shortID(workspace.id),
+                                "rootKind": restorePerfRootKind,
+                                "rootName": restorePerfRootName,
+                                "outcome": "watcherErrorRetained",
+                                "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            ]
+                        )
+                    #endif
+                    print("Loaded folder without active watcher: \(error)")
+                    self.error = .failedToLoadFolder(error)
+                    throw error
+                }
+
                 let lifecycleIsCurrent = rootLoadLifecycleGeneration == loadToken.lifecycleGeneration
                 let currentRootGeneration = rootLoadGenerationByRootKey[rootKey]
                 let hasNewerRootLoadForKey = if lifecycleIsCurrent {
@@ -1833,7 +3228,6 @@ class WorkspaceFilesViewModel: ObservableObject {
                 let loadOwnsRootShell = appendedRootFolder != nil || !hadRootShellBeforeLoad
                 if canCleanSharedRootState {
                     await workspaceFileContextStore.cancelRootLoad(path: rootPath)
-                    removeDeferredInitialRootLoadScanRoot(stdRootPath)
                 }
                 if let loadedWorkspaceRootRecord {
                     if canCleanSharedRootState, loadOwnsRootShell {
@@ -1869,14 +3263,14 @@ class WorkspaceFilesViewModel: ObservableObject {
                 }
 
                 #if DEBUG
-                    WorkspaceRestorePerfLog.event(
+                    restorePerfRecorder.event(
                         "folderLoad.total",
                         fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                            "workspaceID": restorePerfRecorder.shortID(workspace.id),
                             "rootKind": restorePerfRootKind,
                             "rootName": restorePerfRootName,
                             "outcome": error is CancellationError ? "cancelled" : "error",
-                            "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            "duration": loadFolderTotalStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                         ]
                     )
                 #endif
@@ -1912,26 +3306,27 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
-    func onAllFoldersLoaded() async {
-        await rescanAllFilesIfLoaded()
-    }
-
     @MainActor
     func performPostCatalogRootWork(
         for rootRecord: WorkspaceRootRecord,
         workspace: WorkspaceModel,
         rootKind: RootKind
-    ) async {
+    ) async throws {
         let rootKey = rootKey(forPath: rootRecord.standardizedFullPath)
         guard workspaceFileContextRootsByRootKey[rootKey]?.id == rootRecord.id else { return }
         currentWorkspaceID = workspace.id
 
         let rootReplayIngressGeneration = advanceRootReplayIngressGeneration(forRootKey: rootKey)
         await workspaceFileContextStore.registerDeferredReplayRootGeneration(rootReplayIngressGeneration, forRootKey: rootKey)
+        // A watcher activation failure must still be surfaced to the caller, but it must not
+        // skip persisted selection-slice hydration for an otherwise loaded root, so the throw is
+        // deferred until the remaining post-catalog work completes.
+        var deferredWatcherStartError: Error?
         do {
             try await workspaceFileContextStore.startWatchingRoot(id: rootRecord.id)
         } catch {
-            print("Failed to start watcher for root \(rootRecord.standardizedFullPath): \(error)")
+            if error is CancellationError { throw error }
+            deferredWatcherStartError = error
         }
         guard workspaceFileContextRootsByRootKey[rootKey]?.id == rootRecord.id else { return }
 
@@ -1947,15 +3342,8 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
 
-        if codeScanEnabled, rootKind == .user {
-            if isInitialRootLoadScanDeferralActive {
-                deferredInitialRootLoadScanRoots.insert(rootRecord.standardizedFullPath)
-            } else {
-                enqueueInitialRootLoadRequests(
-                    rootRecords: [rootRecord],
-                    purgeCachesOnEmptyInitialRequests: true
-                )
-            }
+        if let deferredWatcherStartError {
+            throw deferredWatcherStartError
         }
     }
 
@@ -1994,23 +3382,27 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspace: WorkspaceModel,
         workspaceManager: WorkspaceManagerViewModel,
         refreshRootFolderStateAfterLoad: Bool = true
-    ) async {
+    ) async throws -> WorkspaceRootRef {
         guard workspace.isSystemWorkspace == false else {
-            return
+            throw GitDataRootLoadError.systemWorkspace(workspaceID: workspace.id)
         }
+
         let gitDataURL = workspaceManager.gitDataDirectory(for: workspace)
-        if isFolderAlreadyLoaded(gitDataURL) {
-            return
-        }
-        do {
+        if !isFolderAlreadyLoaded(gitDataURL) {
             try await loadSupplementalRoot(
                 at: gitDataURL,
                 for: workspace,
                 refreshRootFolderStateAfterLoad: refreshRootFolderStateAfterLoad
             )
-        } catch {
-            print("Failed to load _git_data root: \(error)")
         }
+
+        guard let exactRoot = await workspaceFileContextStore.exactRootRef(
+            path: gitDataURL.path,
+            kind: .workspaceGitData
+        ) else {
+            throw GitDataRootLoadError.exactRootUnavailable(path: gitDataURL.path)
+        }
+        return exactRoot
     }
 
     private func removeFolderBeingAdded() {
@@ -2025,16 +3417,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         cleanupSharedRootState: Bool = true
     ) {
         let stdPath = folder.standardizedFullPath
-        if cleanupSharedRootState {
-            removeDeferredInitialRootLoadScanRoot(stdPath)
-        }
+        if cleanupSharedRootState {}
         unregisterExpansionTracking(for: folder)
         if cleanupSharedRootState {
             removeRootFolderReferences(folder)
         }
         // Remove only this captured partial VM. A newer same-path load can reuse the
         // stable store root ID, so ID-based removal can detach the new owner.
+        let rootCountBeforeRemoval = rootFolders.count
         rootFolders.removeAll { $0 === folder }
+        let removedRootFolder = rootFolders.count != rootCountBeforeRemoval
         if let currentFolderBeingAdded = folderBeingAdded, currentFolderBeingAdded === folder {
             folderBeingAdded = nil
         }
@@ -2066,6 +3458,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             removeHierarchyGenerationEntry(forRootFullPath: stdPath)
         }
         invalidateStaticSnapshot(forRootFullPath: nil)
+        if removedRootFolder {
+            publishRootShellProjectionsChanged()
+        }
     }
 
     private func unloadRootFolder(for url: URL) async {
@@ -2139,7 +3534,6 @@ class WorkspaceFilesViewModel: ObservableObject {
                 if let workspaceRoot {
                     let storeIgnoreRulesChanged = try await workspaceFileContextStore.refreshFileSystemSettings(
                         rootID: workspaceRoot.id,
-                        respectGitignore: respectGitignore,
                         respectRepoIgnore: respectRepoIgnore,
                         respectCursorignore: respectCursorignore,
                         skipSymlinks: skipSymlinks,
@@ -2166,9 +3560,8 @@ class WorkspaceFilesViewModel: ObservableObject {
         // If this refresh genuinely unloaded/reloaded roots, emit one final broad
         // invalidation after the in-place work settles. Pure soft refreshes and
         if didStructurallyRefreshRoots && !didReorderRoots {
-            onRootFoldersChanged?()
+            publishRootShellProjectionsChanged()
         }
-        await rescanAllFilesIfLoaded()
         return didStructurallyRefreshRoots || didReorderRoots
     }
 
@@ -2328,6 +3721,12 @@ class WorkspaceFilesViewModel: ObservableObject {
             reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, rootKey: rootKey, stats: &stats)
             let reindexTraversalDurationMS = debugPerfElapsedMS(since: traversalStartMS)
 
+            let totalDurationMS = debugPerfElapsedMS(since: totalStartMS)
+            appliedIndexProjectionIndexRebuildCount += 1
+            appliedIndexProjectionIndexRebuildTotalDurationMS += totalDurationMS
+            appliedIndexProjectionIndexRebuildTraversalDurationMS += reindexTraversalDurationMS
+            appliedIndexProjectionIndexRebuildVisitedFolderCount += stats.visitedFolderCount
+            appliedIndexProjectionIndexRebuildVisitedFileCount += stats.visitedFileCount
             lastIndexRebuildPerfSample = IndexRebuildPerfSample(
                 rootKey: rootKey,
                 totalFolderKeysBefore: totalFolderKeysBefore,
@@ -2343,7 +3742,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 reindexTraversalDurationMS: reindexTraversalDurationMS,
                 reindexVisitedFolderCount: stats.visitedFolderCount,
                 reindexVisitedFileCount: stats.visitedFileCount,
-                totalDurationMS: debugPerfElapsedMS(since: totalStartMS)
+                totalDurationMS: totalDurationMS
             )
         #else
             reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, rootKey: rootKey)
@@ -2687,7 +4086,6 @@ class WorkspaceFilesViewModel: ObservableObject {
         let shouldFlushPendingInserts = chunk.summary.fileAddedCount > 0
         var dirtyFolderStateStarts: [UUID: FolderViewModel] = [:]
         var requiresFullRootFolderStateRefresh = false
-        var batchedCodeScanFiles: [UUID: FileViewModel] = [:]
         var batchedSliceRebases: [String: ReplaySliceRebaseRequest] = [:]
         #if DEBUG
             let fileAddedCount = chunk.summary.fileAddedCount
@@ -2724,8 +4122,6 @@ class WorkspaceFilesViewModel: ObservableObject {
             var rebuildCleanupCandidateFolderKeys: Int?
             var rebuildCleanupCandidateFileKeys: Int?
             var rebuildUsedOwnershipFallback: Bool?
-            var codeScanBatchInvocationCount = 0
-            var codeScanBatchFileCount = 0
             var sliceRebaseBatchInvocationCount = 0
             var sliceRebaseCandidateCount = 0
             var invalidateSnapshotDurationMS = 0.0
@@ -2823,13 +4219,11 @@ class WorkspaceFilesViewModel: ObservableObject {
                 if let outcome = await handleNewFile(
                     relativePath: rel,
                     onRootFolder: targetRootVM,
-                    requestCodeScanImmediately: false,
                     preparedReplayPathMetadata: replayPathMetadata,
                     recordID: fileRecordID,
                     parentFolderID: parentFolderID
                 ) {
                     observedStoreDeltas.append(prepared)
-                    batchedCodeScanFiles[outcome.file.id] = outcome.file
                     if let parentFolder = outcome.parentFolderForStateRecompute {
                         dirtyFolderStateStarts[parentFolder.id] = parentFolder
                     } else {
@@ -2913,6 +4307,7 @@ class WorkspaceFilesViewModel: ObservableObject {
 
             case let .fileModified(_, maybeDate):
                 if let fileVM = findFileByFullPath(fullPath) {
+                    let sourceSnapshot = await trustworthySliceRebaseSourceSnapshot(for: fileVM)
                     observedStoreDeltas.append(prepared)
                     if let date = maybeDate {
                         await fileVM.setModificationDate(date, forceInvalidation: true)
@@ -2927,10 +4322,11 @@ class WorkspaceFilesViewModel: ObservableObject {
                             await fileVM.setModificationDate(Date(), forceInvalidation: true)
                         }
                     }
-                    batchedCodeScanFiles[fileVM.id] = fileVM
+                    let existingRebase = batchedSliceRebases[fileVM.standardizedFullPath]
                     batchedSliceRebases[fileVM.standardizedFullPath] = ReplaySliceRebaseRequest(
                         file: fileVM,
-                        relativePath: rel
+                        relativePath: rel,
+                        sourceSnapshot: existingRebase?.sourceSnapshot ?? sourceSnapshot
                     )
                 }
                 processedDigests.append(.fileModified(rel))
@@ -3036,9 +4432,6 @@ class WorkspaceFilesViewModel: ObservableObject {
         if topologyChanged {
             accumulator.topologyChanged = true
         }
-        for (fileID, file) in batchedCodeScanFiles {
-            accumulator.codeScanFilesByID[fileID] = file
-        }
         for (fullPath, request) in batchedSliceRebases {
             accumulator.sliceRebasesByFullPath[fullPath] = request
         }
@@ -3086,8 +4479,6 @@ class WorkspaceFilesViewModel: ObservableObject {
                 rebuildCleanupCandidateFolderKeys: rebuildCleanupCandidateFolderKeys,
                 rebuildCleanupCandidateFileKeys: rebuildCleanupCandidateFileKeys,
                 rebuildUsedOwnershipFallback: rebuildUsedOwnershipFallback,
-                codeScanBatchInvocationCount: 0,
-                codeScanBatchFileCount: 0,
                 sliceRebaseBatchInvocationCount: 0,
                 sliceRebaseCandidateCount: 0,
                 invalidateSnapshotDurationMS: invalidateSnapshotDurationMS,
@@ -3122,16 +4513,14 @@ class WorkspaceFilesViewModel: ObservableObject {
         #if DEBUG
             let onRootsChangedStartMS = debugPerfTimestampMS()
         #endif
-        onRootFoldersChanged?()
+        publishRootFoldersChanged()
         #if DEBUG
             onRootFoldersChangedDurationMS = debugPerfElapsedMS(since: onRootsChangedStartMS)
         #endif
         fileSystemDeltasAppliedPublisher.send(
             FileSystemDeltasAppliedEvent(rootKey: accumulator.rootKey, deltas: accumulator.processedDigests)
         )
-        let codeScanFiles = Array(accumulator.codeScanFilesByID.values)
         let sliceRebases = Array(accumulator.sliceRebasesByFullPath.values)
-        flushReplayChunkCodeScanBatch(codeScanFiles)
         scheduleSliceRebasesForModifiedFiles(sliceRebases)
         #if DEBUG
             return RootReplayPassPerfSample(
@@ -3143,8 +4532,6 @@ class WorkspaceFilesViewModel: ObservableObject {
                 onRootFoldersChangedInvocationCount: 1,
                 snapshotInvalidationCount: accumulator.topologyChanged ? 1 : 0,
                 deltaAppliedPublisherInvocationCount: 1,
-                codeScanBatchInvocationCount: codeScanFiles.isEmpty ? 0 : 1,
-                codeScanBatchFileCount: codeScanFiles.count,
                 sliceRebaseBatchInvocationCount: sliceRebases.isEmpty ? 0 : 1,
                 sliceRebaseCandidateCount: sliceRebases.count,
                 onRootFoldersChangedDurationMS: onRootFoldersChangedDurationMS,
@@ -3550,7 +4937,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func handleNewFile(
         record: WorkspaceFileRecord,
         onRootFolder root: FolderViewModel,
-        requestCodeScanImmediately: Bool = true
+        useRecordModificationDateForExistingFile: Bool = false
     ) async -> FileAdditionApplyOutcome? {
         let metadata = FileViewModel.PrecomputedPathMetadata.preparedReplay(
             standardizedAbsolutePath: record.standardizedFullPath,
@@ -3560,11 +4947,12 @@ class WorkspaceFilesViewModel: ObservableObject {
         return await handleNewFile(
             relativePath: record.standardizedRelativePath,
             onRootFolder: root,
-            requestCodeScanImmediately: requestCodeScanImmediately,
             preparedReplayPathMetadata: metadata,
             recordID: record.id,
             parentFolderID: record.parentFolderID,
-            modificationDate: record.modificationDate ?? Date()
+            modificationDate: record.modificationDate ?? Date(),
+            useProvidedModificationDateForExistingFile: useRecordModificationDateForExistingFile,
+            expectedRootID: record.rootID
         )
     }
 
@@ -3595,8 +4983,7 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     @MainActor
     private func materializeFileViewModel(
-        record: WorkspaceFileRecord,
-        requestCodeScanImmediately: Bool = false
+        record: WorkspaceFileRecord
     ) async -> FileViewModel? {
         guard !Task.isCancelled else { return nil }
         guard let currentRecord = await workspaceFileContextStore.file(
@@ -3631,8 +5018,7 @@ class WorkspaceFilesViewModel: ObservableObject {
 
         guard let outcome = await handleNewFile(
             record: currentRecord,
-            onRootFolder: rootFolder,
-            requestCodeScanImmediately: requestCodeScanImmediately
+            onRootFolder: rootFolder
         ) else {
             return nil
         }
@@ -3648,7 +5034,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
         invalidateStaticSnapshot(forRootFullPath: rootKey)
         await clearPathResolutionCaches()
-        onRootFoldersChanged?()
+        publishRootFoldersChanged()
         return outcome.file
     }
 
@@ -3656,12 +5042,15 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func handleNewFile(
         relativePath: String,
         onRootFolder root: FolderViewModel,
-        requestCodeScanImmediately: Bool = true,
         preparedReplayPathMetadata: FileViewModel.PrecomputedPathMetadata? = nil,
         recordID: UUID? = nil,
         parentFolderID: UUID? = nil,
-        modificationDate: Date = Date()
+        modificationDate: Date = Date(),
+        useProvidedModificationDateForExistingFile: Bool = false,
+        expectedRootID: UUID? = nil
     ) async -> FileAdditionApplyOutcome? {
+        guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
+
         let stdAbs: String
         if let preparedReplayPathMetadata {
             stdAbs = preparedReplayPathMetadata.standardizedFullPath
@@ -3679,11 +5068,16 @@ class WorkspaceFilesViewModel: ObservableObject {
             adoptCanonicalFolderIDForStoreCorrelation(intendedParentFolder, canonicalID: parentFolderID)
         } else if !parentRelativePath.isEmpty,
                   let intendedParentFolder,
-                  let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath],
-                  let parentRecord = await workspaceFileContextStore.folder(rootID: workspaceRoot.id, relativePath: parentRelativePath),
-                  intendedParentFolder.id != parentRecord.id
+                  let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath]
         {
-            adoptCanonicalFolderIDForStoreCorrelation(intendedParentFolder, canonicalID: parentRecord.id)
+            let parentRecord = await workspaceFileContextStore.folder(
+                rootID: workspaceRoot.id,
+                relativePath: parentRelativePath
+            )
+            guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
+            if let parentRecord, intendedParentFolder.id != parentRecord.id {
+                adoptCanonicalFolderIDForStoreCorrelation(intendedParentFolder, canonicalID: parentRecord.id)
+            }
         }
 
         // If already tracked, only refresh m-date & scan. If store replay later supplies
@@ -3694,21 +5088,25 @@ class WorkspaceFilesViewModel: ObservableObject {
                 removeFileFromParentChildrenArray(existing)
                 fileHierarchyIndex.removeFile(forKey: stdAbs, expectedRootKey: root.standardizedFullPath)
             } else {
-                do {
-                    guard let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath] else {
-                        throw FileManagerError.fileSystemServiceNotFoundWithContext("Workspace store root unavailable for '\(root.standardizedFullPath)'.")
+                let resolvedModificationDate: Date
+                if useProvidedModificationDateForExistingFile {
+                    resolvedModificationDate = modificationDate
+                } else {
+                    do {
+                        guard let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath] else {
+                            throw FileManagerError.fileSystemServiceNotFoundWithContext("Workspace store root unavailable for '\(root.standardizedFullPath)'.")
+                        }
+                        resolvedModificationDate = try await workspaceFileContextStore.fileModificationDate(
+                            rootID: workspaceRoot.id,
+                            relativePath: relativePath
+                        )
+                    } catch {
+                        resolvedModificationDate = Date()
                     }
-                    let diskDate = try await workspaceFileContextStore.fileModificationDate(
-                        rootID: workspaceRoot.id,
-                        relativePath: relativePath
-                    )
-                    await existing.setModificationDate(diskDate, forceInvalidation: true)
-                } catch {
-                    await existing.setModificationDate(Date(), forceInvalidation: true)
                 }
-                if requestCodeScanImmediately {
-                    requestCodeScan(for: existing)
-                }
+                guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
+                await existing.setModificationDate(resolvedModificationDate, forceInvalidation: true)
+                guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
                 if newlyCreatedFilePaths.remove(creationKey) != nil {
                     performSelectionBatch { existing.setIsChecked(true) }
                 }
@@ -3718,6 +5116,8 @@ class WorkspaceFilesViewModel: ObservableObject {
                 )
             }
         }
+
+        guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
 
         let newFile = File(
             id: recordID ?? UUID(),
@@ -3758,9 +5158,6 @@ class WorkspaceFilesViewModel: ObservableObject {
 
         fileHierarchyIndex.insertFile(fileVM, rootKey: root.standardizedFullPath)
 
-        if requestCodeScanImmediately {
-            requestCodeScan(for: fileVM)
-        }
         insertFile(fileVM, under: root, relativePath: relativePath)
 
         if newlyCreatedFilePaths.remove(creationKey) != nil {
@@ -3894,7 +5291,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         if !fileIDs.isDisjoint(with: autoCodemapFileIDs) {
             autoCodemapFileIDs.subtract(fileIDs)
             autoCodemapFiles.removeAll { fileIDs.contains($0.id) }
-            codeMapUpdatePublisher.send(())
+        }
+        if !fileIDs.isDisjoint(with: manualCodemapFileIDs) {
+            manualCodemapFileIDs.subtract(fileIDs)
+            manualCodemapFiles.removeAll { fileIDs.contains($0.id) }
         }
         for file in uniqueFiles {
             if selectionSlicesByFileID.removeValue(forKey: file.id) != nil {
@@ -3912,6 +5312,10 @@ class WorkspaceFilesViewModel: ObservableObject {
             sliceRebaseTasksByFullPath[file.standardizedFullPath]?.cancel()
             sliceRebaseTasksByFullPath.removeValue(forKey: file.standardizedFullPath)
             sliceRebaseTaskIDsByFullPath.removeValue(forKey: file.standardizedFullPath)
+            sliceRebaseSourceSnapshotByFullPath.removeValue(forKey: file.standardizedFullPath)
+            sliceRebaseCommitTasksByFullPath[file.standardizedFullPath]?.cancel()
+            sliceRebaseCommitTasksByFullPath.removeValue(forKey: file.standardizedFullPath)
+            sliceRebaseCommitIDsByFullPath.removeValue(forKey: file.standardizedFullPath)
             noSlicesKnownRevisionByFullPath.removeValue(forKey: file.standardizedFullPath)
         }
         if shouldRebuildSelectionSliceSnapshot {
@@ -3993,18 +5397,13 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     @MainActor
-    private func flushReplayChunkCodeScanBatch(_ files: [FileViewModel]) {
-        guard !files.isEmpty else { return }
-        enqueueReplayScanRequests(forFiles: files)
-    }
-
-    @MainActor
     private func scheduleSliceRebasesForModifiedFiles(_ requests: [ReplaySliceRebaseRequest]) {
         guard !requests.isEmpty else { return }
         for request in requests {
             scheduleSliceRebaseForModifiedFile(
                 request.file,
-                relativePath: request.relativePath
+                relativePath: request.relativePath,
+                sourceSnapshot: request.sourceSnapshot
             )
         }
     }
@@ -4244,15 +5643,6 @@ class WorkspaceFilesViewModel: ObservableObject {
         return nil
     }
 
-    /// Provides baseline file content for a given path.
-    /// This is a "back door" method that subclasses can override to provide
-    /// content without needing full FileViewModel infrastructure (e.g., for benchmarks).
-    /// Default implementation returns nil.
-    @MainActor
-    func getBaselineContent(forPath relativePath: String, rootIdentifier: UUID?) async -> String? {
-        nil
-    }
-
     private func findFilesByName(_ fileName: String, in folder: FolderViewModel) -> [FileViewModel] {
         let normalizedFileName = (fileName as NSString).lastPathComponent
         let standardizedFileName = (normalizedFileName as NSString).standardizingPath
@@ -4364,9 +5754,9 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func unloadRootFolder(_ folder: FolderViewModel) async {
         let signpost = WorkspaceExitPerf.begin("unloadRootFolder")
+        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: folder.id)
         defer { WorkspaceExitPerf.end("unloadRootFolder", signpost) }
         let stdRoot = folder.standardizedFullPath
-        removeDeferredInitialRootLoadScanRoot(stdRoot)
         unregisterExpansionTracking(for: folder)
         // Folder expansion state is now stored in the FolderViewModel itself
         // No need to unregister from ExpansionManager
@@ -4401,7 +5791,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             await workspaceFileContextStore.unloadRoot(id: workspaceRoot.id)
         }
 
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
 
         if currentSlicesByRoot.removeValue(forKey: stdRoot) != nil {
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
@@ -4522,6 +5912,48 @@ class WorkspaceFilesViewModel: ObservableObject {
         return values.sorted { $0.standardizedFullPath < $1.standardizedFullPath }
     }
 
+    func fileViewModel(id: UUID) -> FileViewModel? {
+        fileHierarchyIndex.filesByID[id]
+    }
+
+    func codemapPreview(for fileID: UUID) async -> WorkspaceCodemapUIPreviewDisposition {
+        guard let file = fileHierarchyIndex.filesByID[fileID] else { return .revoked }
+        let selectionRevision = selectionStateRevision
+        let hierarchyRevision = hierarchyGenerationSignature
+        let presentation: WorkspaceCodemapOperationPresentation
+        do {
+            let rootDisplayNames = await WorkspaceLookupContext(
+                rootScope: .allLoaded,
+                bindingProjection: nil
+            ).logicalRootDisplayNamesByRootID(store: workspaceFileContextStore)
+            presentation = try await WorkspaceCodemapPresentationCoordinator(
+                store: workspaceFileContextStore
+            ).presentation(
+                for: .exact(fileIDs: [fileID], completeRootSet: false),
+                rootScope: .allLoaded,
+                logicalRootDisplayNamesByRootID: rootDisplayNames
+            )
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                return .revoked
+            }
+            let issue = WorkspaceCodemapOperationIssue.coordinationUnavailable
+            return .unavailable(coverage: .unavailable([issue]), issues: [issue])
+        }
+
+        guard !Task.isCancelled,
+              selectionStateRevision == selectionRevision,
+              hierarchyGenerationSignature == hierarchyRevision,
+              fileHierarchyIndex.filesByID[fileID] === file
+        else { return .revoked }
+
+        let snapshot = WorkspaceCodemapUIPresentationSnapshot(presentation)
+        if let entry = snapshot.entriesByFileID[fileID] {
+            return .ready(entry)
+        }
+        return .unavailable(coverage: snapshot.coverage, issues: snapshot.issues)
+    }
+
     /// Recursively collect all FileViewModels from all root folders.
     func getAllFileViewModels() -> [FileViewModel] {
         var allFiles: [FileViewModel] = []
@@ -4535,22 +5967,13 @@ class WorkspaceFilesViewModel: ObservableObject {
         switch scope {
         case .allLoaded:
             return getAllFileViewModels()
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .sessionBoundWorkspace:
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoadedExcludingGitData, .sessionBoundWorkspace,
+             .validatedSessionBoundWorkspace:
             let allowedRoots = allowedRootPaths(in: scope)
             return allFilesSnapshot(sorted: false).filter {
                 allowedRoots.contains($0.standardizedRootFolderPath)
             }
         }
-    }
-
-    /// Collect all files that have codemaps available
-    @MainActor
-    func collectAllFilesWithCodemaps() -> [FileViewModel] {
-        let indexedFiles = allFilesSnapshot(sorted: true)
-        if !indexedFiles.isEmpty || rootFolders.isEmpty {
-            return indexedFiles.filter { $0.fileAPI != nil }
-        }
-        return getAllFileViewModels().filter { $0.fileAPI != nil }
     }
 
     /// 4) Helper to gather FileViewModels recursively
@@ -4692,10 +6115,8 @@ class WorkspaceFilesViewModel: ObservableObject {
             var totalOnRootFoldersChangedInvocationCount = 0
             var totalSnapshotInvalidationCount = 0
             var totalDeltaAppliedPublisherInvocationCount = 0
-            var totalReplayCodeScanBatchInvocationCount = 0
             var totalReplaySliceRebaseBatchInvocationCount = 0
             var totalRebuildDurationMS = 0.0
-            var totalCodeScanBatchFileCount = 0
             var totalSliceRebaseCandidateCount = 0
             var totalInvalidateSnapshotDurationMS = 0.0
             chunkSize = max(deltaReplayChunkSizeOverride ?? baseChunkSize, 1)
@@ -4740,9 +6161,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 totalOnRootFoldersChangedInvocationCount += sample.onRootFoldersChangedInvocationCount
                 totalSnapshotInvalidationCount += sample.snapshotInvalidationCount
                 totalDeltaAppliedPublisherInvocationCount += sample.deltaAppliedPublisherInvocationCount
-                totalReplayCodeScanBatchInvocationCount += sample.codeScanBatchInvocationCount
                 totalReplaySliceRebaseBatchInvocationCount += sample.sliceRebaseBatchInvocationCount
-                totalCodeScanBatchFileCount += sample.codeScanBatchFileCount
                 totalSliceRebaseCandidateCount += sample.sliceRebaseCandidateCount
                 totalInvalidateSnapshotDurationMS += sample.invalidateSnapshotDurationMS
             }
@@ -4919,10 +6338,8 @@ class WorkspaceFilesViewModel: ObservableObject {
                 totalOnRootFoldersChangedInvocationCount: totalOnRootFoldersChangedInvocationCount,
                 totalSnapshotInvalidationCount: totalSnapshotInvalidationCount,
                 totalDeltaAppliedPublisherInvocationCount: totalDeltaAppliedPublisherInvocationCount,
-                totalReplayCodeScanBatchInvocationCount: totalReplayCodeScanBatchInvocationCount,
                 totalReplaySliceRebaseBatchInvocationCount: totalReplaySliceRebaseBatchInvocationCount,
                 totalRebuildDurationMS: totalRebuildDurationMS,
-                totalCodeScanBatchFileCount: totalCodeScanBatchFileCount,
                 totalSliceRebaseCandidateCount: totalSliceRebaseCandidateCount,
                 totalInvalidateSnapshotDurationMS: totalInvalidateSnapshotDurationMS,
                 preReplayServiceFlushes: preReplayServiceFlushes,
@@ -4940,15 +6357,14 @@ class WorkspaceFilesViewModel: ObservableObject {
         await unloadRootFolder(for: stdURL)
     }
 
-    func unloadAllRootFolders(cancelScans: Bool = true) async {
+    func unloadAllRootFolders() async {
         let signpost = WorkspaceExitPerf.begin("unloadAllRootFolders")
         defer { WorkspaceExitPerf.end("unloadAllRootFolders", signpost) }
-        await unloadAllRootFoldersFast(cancelScans: cancelScans)
+        await unloadAllRootFoldersFast()
     }
 
     @MainActor
-    private func unloadAllRootFoldersFast(cancelScans: Bool) async {
-        clearDeferredInitialRootLoadScanState(keepingActiveDeferral: isInitialRootLoadScanDeferralActive)
+    private func unloadAllRootFoldersFast() async {
         invalidateAllRootLoadTokens()
         currentFolderLoadingTask?.cancel()
         currentFolderLoadingTask = nil
@@ -4997,9 +6413,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         error = nil
         fileHierarchyIndex.clearAll()
         fileHierarchyIndex = FileHierarchyIndex()
+        appliedIndexProjectionHandledGenerationByRootID.removeAll(keepingCapacity: true)
         autoCodemapSyncTask?.cancel()
         autoCodemapSyncTask = nil
         resetAutoCodemapFiles([])
+        resetManualCodemapFiles([])
         rootShellLoadedPaths.removeAll()
         rootHierarchyGenerations.removeAll()
         hierarchyGenerationSignature &+= 1
@@ -5008,10 +6426,6 @@ class WorkspaceFilesViewModel: ObservableObject {
         await Task.yield()
 
         await workspaceFileContextStore.unloadRoots(ids: storeRootsToUnload.map(\.id))
-
-        if cancelScans {
-            await cancelAllScans()
-        }
 
         // Preserve a clean final state after actor cleanup and any unload events that
         // raced in from the store bridge.
@@ -5027,6 +6441,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         resetSelection()
         fileHierarchyIndex.clearAll()
         fileHierarchyIndex = FileHierarchyIndex()
+        appliedIndexProjectionHandledGenerationByRootID.removeAll(keepingCapacity: true)
         rootShellLoadedPaths.removeAll()
         rootHierarchyGenerations.removeAll()
         invalidateStaticSnapshot(forRootFullPath: nil)
@@ -5034,7 +6449,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         if hadRoots {
             allFoldersUnloadedPublisher.send(())
         }
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
     }
 
     @MainActor
@@ -5212,6 +6627,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         selectionClearedPublisher.send()
         autoCodemapSyncTask?.cancel()
         resetAutoCodemapFiles([])
+        resetManualCodemapFiles([])
         codemapAutoEnabled = true
 
         guard persistWorkspace else { return }
@@ -6719,7 +8135,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         let reorderedRoots = userRoots + systemRoots
         guard rootFolders.map(\.id) != reorderedRoots.map(\.id) else { return false }
         rootFolders = reorderedRoots
-        onRootFoldersChanged?()
+        publishRootShellProjectionsChanged()
         return true
     }
 
@@ -6872,16 +8288,32 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func roots(in scope: LookupRootScope) -> [FolderViewModel] {
         switch scope {
         case .visibleWorkspace:
-            visibleRootFolders
+            return visibleRootFolders
         case .visibleWorkspacePlusGitData:
-            visibleRootFolders + gitDataRootFolders()
+            return visibleRootFolders + gitDataRootFolders()
         case .allLoaded:
-            rootFolders
-        case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
-            rootFolders.filter { root in
+            return rootFolders
+        case .allLoadedExcludingGitData:
+            let gitDataRootIDs = Set(gitDataRootFolders().map(\.id))
+            return rootFolders.filter { !gitDataRootIDs.contains($0.id) }
+        case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
+            return rootFolders.filter { root in
                 if physicalRootPaths.contains(root.standardizedFullPath) { return true }
                 return visibleRootFolders.contains(where: { $0.id == root.id })
-                    && !logicalRootPaths.contains(root.standardizedFullPath)
+                    && canonicalRootPaths.contains(root.standardizedFullPath)
+            }
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots, includesGitData):
+            guard case let .valid(selector) = WorkspaceLookupRootSelectorValidator.validate(
+                canonicalRoots: canonicalRoots,
+                physicalRoots: physicalRoots
+            ) else { return [] }
+            return rootFolders.filter { root in
+                selector.canonicalRootPathsByID[root.id] == root.standardizedFullPath
+                    || selector.physicalRootPathsByID[root.id] == root.standardizedFullPath
+                    || (
+                        includesGitData && !canonicalRoots.isEmpty && physicalRoots.isEmpty
+                            && gitDataRootFolders().contains { $0.id == root.id }
+                    )
             }
         }
     }
@@ -7505,6 +8937,37 @@ class WorkspaceFilesViewModel: ObservableObject {
             let usedFallbackGlobalScan: Bool
         }
 
+        struct AppliedIndexProjectionIndexSnapshot: Equatable {
+            let filePathsByID: [UUID: String]
+            let folderPathsByID: [UUID: String]
+            let fileIDsByPath: [String: UUID]
+            let folderIDsByPath: [String: UUID]
+        }
+
+        @MainActor
+        func currentSlicesByRootForTesting() -> [String: [String: PartitionStore.StoredSlices]] {
+            currentSlicesByRoot
+        }
+
+        @MainActor
+        func applyWorkspaceAppliedIndexEventForTesting(_ event: WorkspaceAppliedIndexBatchEvent) async {
+            await handleWorkspaceAppliedIndexEvent(event)
+        }
+
+        @MainActor
+        func appliedIndexProjectedFileForTesting(id: UUID) -> FileViewModel? {
+            fileHierarchyIndex.filesByID[id]
+        }
+
+        func appliedIndexProjectionIndexSnapshotForTesting() -> AppliedIndexProjectionIndexSnapshot {
+            AppliedIndexProjectionIndexSnapshot(
+                filePathsByID: fileHierarchyIndex.filesByID.mapValues(\.standardizedFullPath),
+                folderPathsByID: fileHierarchyIndex.foldersByID.mapValues(\.standardizedFullPath),
+                fileIDsByPath: fileHierarchyIndex.filesByFullPath.mapValues(\.id),
+                folderIDsByPath: fileHierarchyIndex.foldersByFullPath.mapValues(\.id)
+            )
+        }
+
         @MainActor
         func coalesceDeltasForTesting(_ deltas: [FileSystemDelta], inRoot standardizedRoot: String? = nil) -> [FileSystemDelta] {
             coalesceDeltas(deltas, inRoot: standardizedRoot)
@@ -7614,6 +9077,11 @@ class WorkspaceFilesViewModel: ObservableObject {
             fileHierarchyIndex.insertFile(file, rootKey: file.standardizedRootFolderPath)
         }
 
+        @MainActor
+        func injectIndexedFolderForTesting(_ folder: FolderViewModel) {
+            fileHierarchyIndex.insertFolder(folder, rootKey: StandardizedPath.absolute(folder.rootPath))
+        }
+
         /// Attach the selection callback and toggle a file into `selectedFiles`
         /// through the normal commit path. Mirrors what `attachSelectionCallback`
         /// does for fresh view models so tests can exercise code paths that read
@@ -7624,12 +9092,6 @@ class WorkspaceFilesViewModel: ObservableObject {
                 self?.handleCheckStateChanged(changed, isChecked: isChecked)
             }
             setFileToggled(file, isToggled: true)
-        }
-
-        @MainActor
-        func cachedCodeMapAPIForTesting(fullPath: String) -> FileAPI? {
-            guard let file = findFileByFullPath(StandardizedPath.absolute(fullPath)) else { return nil }
-            return validatedFileAPI(for: file)
         }
 
         @MainActor
@@ -7670,11 +9132,6 @@ class WorkspaceFilesViewModel: ObservableObject {
             @MainActor
             func deferredReplayBufferDiagnosticsForTesting() async -> DeferredReplayBufferDiagnostics {
                 await workspaceFileContextStore.deferredReplayDiagnosticsSnapshot()
-            }
-
-            @MainActor
-            func debugCodemapMemoryCounters() async -> CodeScanActor.CodemapMemoryCounters {
-                await workspaceFileContextStore.codemapMemoryCounters()
             }
         #endif
 
@@ -7756,39 +9213,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
-    private var codeScanEnabled = true
-
-    // Add at the class level in WorkspaceFilesViewModel
-    private var codeScanTasks: [UUID: Task<Void, Never>] = [:]
-    private var currentBatchScanTask: Task<Void, Never>?
-
-    // NEW: holds the most recent ad-hoc "enqueue scans for files" task
-    private var currentAdhocScanEnqueueTask: Task<Void, Never>?
-    private var replayScanEnqueueTasks: [UUID: Task<Void, Never>] = [:]
-
     @MainActor private var cachedSearchFolderSuffixIndexByScope: [LookupRootScope: (generation: UInt64, index: SearchFolderSuffixIndex<FolderViewModel>)] = [:]
-
-    private struct InitialRootEnqueueTask {
-        let id: UUID
-        let task: Task<Void, Never>
-    }
-
-    // NEW: per-root initial-load enqueue tasks (avoid cross-root cancellation)
-    private var initialRootScanEnqueueTasks: [String: InitialRootEnqueueTask] = [:]
-
-    /// Cancels any currently queued/active scans in the actor, plus any local tasks
-    func setCodeScanEnabled(_ isEnabled: Bool) async {
-        let wasEnabled = codeScanEnabled
-        codeScanEnabled = isEnabled
-        if !wasEnabled, isEnabled {
-            // Just got enabled, rescan if needed
-            await rescanAllFilesIfLoaded()
-        } else if !isEnabled {
-            // Disabled state should always perform comprehensive VM-level cancellation,
-            // even if callers repeat the request while already disabled.
-            await cancelAllScans()
-        }
-    }
 
     // ------------------------------------------------------------------
     // MARK: Unified bulk path selection helpers (files and folders)
@@ -8190,7 +9615,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         #if DEBUG
             let currentSlicesAfter = sliceStoreCounts(currentSlicesByRoot)
             let projectionRangeCount = projection.values.reduce(0) { $0 + $1.count }
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection.sliceMirror",
                 fields: [
                     "requestedSliceFiles": "\(requestedSlices.count)",
@@ -8202,7 +9627,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                     "projectionAfterFiles": "\(projection.count)",
                     "projectionAfterRanges": "\(projectionRangeCount)",
                     "selectedFiles": "\(selectedFiles.count)",
-                    "currentTabID": WorkspaceRestorePerfLog.shortID(currentTabID)
+                    "currentTabID": restorePerfRecorder.shortID(currentTabID)
                 ]
             )
         #endif
@@ -8218,14 +9643,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     #endif
 
-    private func standardizedAPIFilePath(_ api: FileAPI) -> String {
-        StandardizedPath.absolute(api.filePath)
-    }
-
     @MainActor
     func hydrateSlicesForActiveTab(from tabSelection: StoredSelection) async {
         #if DEBUG
-            let hydrateSlicesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let hydrateSlicesStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var hydrateSlicesOutcome = "completed"
             var hydrateSlicesRootCount = rootFolders.count
             var hydrateSlicesRequestedFiles = tabSelection.slices.count
@@ -8234,7 +9655,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             var hydrateSlicesPendingPersistRoots = 0
             var hydrateSlicesPendingPersistFiles = 0
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.hydrateSlices",
                     fields: [
                         "rootCount": "\(hydrateSlicesRootCount)",
@@ -8244,7 +9665,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "pendingPersistRoots": "\(hydrateSlicesPendingPersistRoots)",
                         "pendingPersistFiles": "\(hydrateSlicesPendingPersistFiles)",
                         "outcome": hydrateSlicesOutcome,
-                        "duration": hydrateSlicesStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": hydrateSlicesStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -8388,16 +9809,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         scope: PartitionScope
     ) async {
         #if DEBUG
-            let applySlicesSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applySlicesSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.applySlicesSnapshot",
                     fields: [
                         "rootCount": "\(snapshot.count)",
                         "snapshotFiles": "\(snapshot.values.reduce(0) { $0 + $1.count })",
                         "pendingPersistRoots": "\(pendingPersist.count)",
                         "pendingPersistFiles": "\(pendingPersist.values.reduce(0) { $0 + $1.count })",
-                        "duration": applySlicesSnapshotStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": applySlicesSnapshotStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -8428,17 +9849,17 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func onActiveTabChangedFast(_ tab: ComposeTabState) {
         #if DEBUG
-            let activeTabFastStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let activeTabFastStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         setActiveTabID(tab.id)
         selectionSlicesByFileID.removeAll()
         requestSelectionSliceSnapshotRebuild(reason: "activeTabChanged.fast")
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.activeTabChanged.fast",
                 fields: [
-                    "tabID": WorkspaceRestorePerfLog.shortID(tab.id),
-                    "duration": activeTabFastStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "tabID": restorePerfRecorder.shortID(tab.id),
+                    "duration": activeTabFastStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -8450,17 +9871,17 @@ class WorkspaceFilesViewModel: ObservableObject {
         selection: StoredSelection
     ) async {
         #if DEBUG
-            let activeTabHeavyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let activeTabHeavyStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var activeTabHeavyOutcome = "completed"
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.activeTabChanged.heavy",
                     fields: [
-                        "tabID": WorkspaceRestorePerfLog.shortID(tabID),
+                        "tabID": restorePerfRecorder.shortID(tabID),
                         "selectedPaths": "\(selection.selectedPaths.count)",
                         "sliceFiles": "\(selection.slices.count)",
                         "outcome": activeTabHeavyOutcome,
-                        "duration": activeTabHeavyStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": activeTabHeavyStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -8496,8 +9917,11 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     private func sliceAnchorContent(for file: FileViewModel) async -> String? {
         let snapshot = await file.cachedContentSnapshot()
-        if let content = snapshot.content {
+        if let content = snapshot.content, snapshot.isFresh {
             return content
+        }
+        if let loaded = await file.latestContent {
+            return loaded
         }
 
         let rootKey = file.standardizedRootFolderPath
@@ -8932,7 +10356,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             sliceSnapshotRebuildPending = true
             #if DEBUG
                 sliceSnapshotRebuildPendingReasons.insert(reason)
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.rebuildSlicesSnapshot",
                     fields: [
                         "mode": "deferredRequest",
@@ -8977,10 +10401,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         pendingReasons: Set<String>
     ) {
         #if DEBUG
-            let rebuildStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let rebuildStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var snapshotFiles = 0
             defer {
-                WorkspaceRestorePerfLog.event(
+                restorePerfRecorder.event(
                     "selection.rebuildSlicesSnapshot",
                     fields: [
                         "mode": mode,
@@ -8988,7 +10412,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                         "pendingReasons": pendingReasons.sorted().joined(separator: ","),
                         "selectedFiles": "\(selectedFiles.count)",
                         "snapshotFiles": "\(snapshotFiles)",
-                        "duration": rebuildStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "duration": rebuildStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             }
@@ -9023,470 +10447,6 @@ class WorkspaceFilesViewModel: ObservableObject {
             parentFolderID: file.parentFolder?.id,
             modificationDate: file.modificationDate
         )
-    }
-
-    func initCodeScanState(_ isEnabled: Bool) {
-        codeScanEnabled = isEnabled
-    }
-
-    @MainActor
-    func beginDeferringInitialRootLoadScans() {
-        clearDeferredInitialRootLoadScanState(keepingActiveDeferral: false)
-        isInitialRootLoadScanDeferralActive = true
-    }
-
-    @MainActor
-    func discardDeferredInitialRootLoadScans() {
-        clearDeferredInitialRootLoadScanState(keepingActiveDeferral: false)
-    }
-
-    @MainActor
-    func flushDeferredInitialRootLoadScans() {
-        guard isInitialRootLoadScanDeferralActive else {
-            clearDeferredInitialRootLoadScanState(keepingActiveDeferral: false)
-            return
-        }
-
-        isInitialRootLoadScanDeferralActive = false
-        let rootPaths = deferredInitialRootLoadScanRoots
-        deferredInitialRootLoadScanRoots.removeAll()
-        deferredInitialRootLoadScanFlushTask?.cancel()
-        deferredInitialRootLoadScanFlushTask = nil
-        deferredInitialRootLoadScanFlushTaskID = nil
-
-        guard codeScanEnabled, !rootPaths.isEmpty else { return }
-        #if DEBUG
-            WorkspaceRestorePerfLog.event(
-                "codemap.deferredInitialScanFlush.begin",
-                fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(currentWorkspaceID),
-                    "rootPathCount": "\(rootPaths.count)"
-                ]
-            )
-        #endif
-
-        let taskID = UUID()
-        deferredInitialRootLoadScanFlushTaskID = taskID
-        deferredInitialRootLoadScanFlushTask = Task(priority: .utility) { @MainActor [weak self] in
-            guard let self else { return }
-            defer {
-                if self.deferredInitialRootLoadScanFlushTaskID == taskID {
-                    self.deferredInitialRootLoadScanFlushTask = nil
-                    self.deferredInitialRootLoadScanFlushTaskID = nil
-                }
-            }
-
-            guard codeScanEnabled else { return }
-            #if DEBUG
-                let flushTotalStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-                let rootRecordsStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            #endif
-            let rootRecords = await workspaceFileContextStore.rootRecords(
-                forRootFolderPaths: rootPaths.sorted(),
-                includeSystemRoots: false
-            )
-            #if DEBUG
-                WorkspaceRestorePerfLog.event(
-                    "codemap.deferredInitialScanFlush.rootRecords",
-                    fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(currentWorkspaceID),
-                        "rootPathCount": "\(rootPaths.count)",
-                        "rootRecordCount": "\(rootRecords.count)",
-                        "duration": rootRecordsStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                    ]
-                )
-            #endif
-            guard !Task.isCancelled, codeScanEnabled, !rootRecords.isEmpty else {
-                #if DEBUG
-                    WorkspaceRestorePerfLog.event(
-                        "codemap.deferredInitialScanFlush.end",
-                        fields: [
-                            "workspaceID": WorkspaceRestorePerfLog.shortID(currentWorkspaceID),
-                            "rootPathCount": "\(rootPaths.count)",
-                            "rootRecordCount": "\(rootRecords.count)",
-                            "outcome": Task.isCancelled ? "cancelled" : "skipped",
-                            "duration": flushTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                        ]
-                    )
-                #endif
-                return
-            }
-            enqueueInitialRootLoadRequests(
-                rootRecords: rootRecords,
-                purgeCachesOnEmptyInitialRequests: true
-            )
-            #if DEBUG
-                WorkspaceRestorePerfLog.event(
-                    "codemap.deferredInitialScanFlush.end",
-                    fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(currentWorkspaceID),
-                        "rootPathCount": "\(rootPaths.count)",
-                        "rootRecordCount": "\(rootRecords.count)",
-                        "outcome": "enqueued",
-                        "duration": flushTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                    ]
-                )
-            #endif
-        }
-    }
-
-    @MainActor
-    private func clearDeferredInitialRootLoadScanState(keepingActiveDeferral: Bool) {
-        deferredInitialRootLoadScanFlushTask?.cancel()
-        deferredInitialRootLoadScanFlushTask = nil
-        deferredInitialRootLoadScanFlushTaskID = nil
-        deferredInitialRootLoadScanRoots.removeAll()
-        if !keepingActiveDeferral {
-            isInitialRootLoadScanDeferralActive = false
-        }
-    }
-
-    @MainActor
-    private func removeDeferredInitialRootLoadScanRoot(_ rootPath: String) {
-        let standardizedRootPath = (rootPath as NSString).standardizingPath
-        deferredInitialRootLoadScanRoots.remove(standardizedRootPath)
-    }
-
-    @MainActor
-    private func loadedUserRootFolder(for rootPath: String) -> FolderViewModel? {
-        let standardizedRootPath = (rootPath as NSString).standardizingPath
-        guard rootShellLoadedPaths.contains(standardizedRootPath) else { return nil }
-        return rootFolders.first {
-            !$0.isSystemRoot && $0.standardizedFullPath == standardizedRootPath
-        }
-    }
-
-    @MainActor
-    private func enqueueOrDeferInitialRootLoadScan(for rootFolder: FolderViewModel) {
-        #if DEBUG
-            let enqueueScanStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-        #endif
-        let rootPath = rootFolder.standardizedFullPath
-        guard !rootFolder.isSystemRoot else {
-            #if DEBUG
-                WorkspaceRestorePerfLog.event(
-                    "folderLoad.enqueueScan",
-                    fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(currentWorkspaceID),
-                        "rootName": rootFolder.name,
-                        "outcome": "skipped",
-                        "duration": enqueueScanStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                    ]
-                )
-            #endif
-            return
-        }
-        if isInitialRootLoadScanDeferralActive {
-            deferredInitialRootLoadScanRoots.insert(rootPath)
-            #if DEBUG
-                WorkspaceRestorePerfLog.event(
-                    "folderLoad.enqueueScan",
-                    fields: [
-                        "workspaceID": WorkspaceRestorePerfLog.shortID(currentWorkspaceID),
-                        "rootName": rootFolder.name,
-                        "outcome": "deferred",
-                        "duration": enqueueScanStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                    ]
-                )
-            #endif
-            return
-        }
-        let filesToScan = getFilesRecursively(under: rootFolder)
-        requestScans(
-            forFiles: filesToScan,
-            isInitialRootLoad: true,
-            rootFolderPaths: [rootPath]
-        )
-        #if DEBUG
-            WorkspaceRestorePerfLog.event(
-                "folderLoad.enqueueScan",
-                fields: [
-                    "workspaceID": WorkspaceRestorePerfLog.shortID(currentWorkspaceID),
-                    "rootName": rootFolder.name,
-                    "outcome": "enqueued",
-                    "files": "\(filesToScan.count)",
-                    "duration": enqueueScanStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
-    }
-
-    // New: Request scans for a set of files in bulk with minimal MainActor work
-    @MainActor
-    private func requestScans(
-        forFiles files: [FileViewModel],
-        isInitialRootLoad: Bool = false,
-        rootFolderPaths: [String] = []
-    ) {
-        guard codeScanEnabled else { return }
-
-        let rootPaths = Set(
-            files.map(\.standardizedRootFolderPath) +
-                rootFolderPaths.map { ($0 as NSString).standardizingPath }
-        )
-        // Filter supported files up-front
-        let supported = files.compactMap { f -> FileViewModel? in
-            guard let ext = f.fileExtension, SyntaxManager.isSupportedFileExtension(ext) else { return nil }
-            return f
-        }
-        guard !supported.isEmpty else {
-            guard isInitialRootLoad, !rootPaths.isEmpty else { return }
-            enqueueInitialRootLoadRequests(
-                rootPaths: rootPaths,
-                purgeCachesOnEmptyInitialRequests: true
-            )
-            return
-        }
-
-        if isInitialRootLoad {
-            enqueueInitialRootLoadRequests(rootPaths: rootPaths)
-            return
-        }
-
-        // Cancel any previous enqueue task so only one builder runs at a time
-        let fileIDs = supported.map(\.id)
-        currentAdhocScanEnqueueTask?.cancel()
-        currentAdhocScanEnqueueTask = Task { [weak self] in
-            guard let self else { return }
-            for fileID in fileIDs {
-                guard !Task.isCancelled else { return }
-                do {
-                    try await workspaceFileContextStore.requestCodemapScan(fileID: fileID)
-                } catch {
-                    continue
-                }
-            }
-        }
-    }
-
-    @MainActor
-    private func enqueueReplayScanRequests(forFiles files: [FileViewModel]) {
-        guard codeScanEnabled else { return }
-        let supported = files.compactMap { file -> FileViewModel? in
-            guard let ext = file.fileExtension, SyntaxManager.isSupportedFileExtension(ext) else { return nil }
-            return file
-        }
-        guard !supported.isEmpty else { return }
-        let fileIDs = supported.map(\.id)
-        let taskID = UUID()
-        let task = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                Task { @MainActor [weak self] in
-                    self?.replayScanEnqueueTasks[taskID] = nil
-                }
-            }
-            for fileID in fileIDs {
-                guard !Task.isCancelled else { return }
-                do {
-                    try await workspaceFileContextStore.requestCodemapScan(fileID: fileID)
-                } catch {
-                    continue
-                }
-            }
-        }
-        replayScanEnqueueTasks[taskID] = task
-    }
-
-    @MainActor
-    private func enqueueInitialRootLoadRequests(
-        rootPaths: Set<String>,
-        purgeCachesOnEmptyInitialRequests: Bool = false
-    ) {
-        enqueueInitialRootLoadRequests(
-            rootPaths: rootPaths,
-            rootIDs: nil,
-            purgeCachesOnEmptyInitialRequests: purgeCachesOnEmptyInitialRequests
-        )
-    }
-
-    @MainActor
-    private func enqueueInitialRootLoadRequests(
-        rootRecords: [WorkspaceRootRecord],
-        purgeCachesOnEmptyInitialRequests: Bool = false
-    ) {
-        let currentRootRecords = rootRecords.filter { record in
-            workspaceFileContextRootsByRootKey[record.standardizedFullPath]?.id == record.id
-        }
-        let rootPaths = Set(currentRootRecords.map(\.standardizedFullPath))
-        let rootIDs = currentRootRecords.map(\.id)
-        enqueueInitialRootLoadRequests(
-            rootPaths: rootPaths,
-            rootIDs: rootIDs,
-            purgeCachesOnEmptyInitialRequests: purgeCachesOnEmptyInitialRequests
-        )
-    }
-
-    @MainActor
-    private func enqueueInitialRootLoadRequests(
-        rootPaths: Set<String>,
-        rootIDs: [UUID]?,
-        purgeCachesOnEmptyInitialRequests: Bool
-    ) {
-        guard !rootPaths.isEmpty else { return }
-
-        for root in rootPaths {
-            if let existing = initialRootScanEnqueueTasks[root] {
-                existing.task.cancel()
-                initialRootScanEnqueueTasks[root] = nil
-            }
-        }
-
-        let taskID = UUID()
-        let task = Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-
-            func clearInitialRootTasksIfCurrent() async {
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    for root in rootPaths {
-                        if initialRootScanEnqueueTasks[root]?.id == taskID {
-                            initialRootScanEnqueueTasks[root] = nil
-                        }
-                    }
-                }
-            }
-
-            do {
-                if let rootIDs {
-                    try await workspaceFileContextStore.requestInitialRootCodemapScans(
-                        rootIDs: rootIDs,
-                        purgeCachesOnEmptyInitialRequests: purgeCachesOnEmptyInitialRequests
-                    )
-                } else {
-                    try await workspaceFileContextStore.requestInitialRootCodemapScans(
-                        rootFolderPaths: Array(rootPaths),
-                        purgeCachesOnEmptyInitialRequests: purgeCachesOnEmptyInitialRequests
-                    )
-                }
-            } catch {
-                // Root unloads or file read failures during initial load are non-fatal; future
-                // scans and store updates will reconcile codemap state.
-            }
-
-            await clearInitialRootTasksIfCurrent()
-        }
-
-        let entry = InitialRootEnqueueTask(id: taskID, task: task)
-        for root in rootPaths {
-            initialRootScanEnqueueTasks[root] = entry
-        }
-    }
-
-    private func requestCodeScan(for fileVM: FileViewModel) {
-        guard codeScanEnabled else { return }
-        guard let fileExt = fileVM.fileExtension,
-              SyntaxManager.isSupportedFileExtension(fileExt) else { return }
-
-        let id = fileVM.id
-        let scanTask = Task { [weak self] in
-            guard let self else { return }
-            defer {
-                Task { @MainActor [weak self] in
-                    self?.clearCodeScanTask(id: id)
-                }
-            }
-            guard !Task.isCancelled else { return }
-            do {
-                try await workspaceFileContextStore.requestCodemapScan(fileID: id)
-            } catch {
-                return
-            }
-        }
-
-        codeScanTasks[id] = scanTask
-    }
-
-    @MainActor
-    private func clearCodeScanTask(id: UUID) {
-        codeScanTasks[id] = nil
-    }
-
-    /// Force a codemap scan across all loaded roots through the store-owned scanner.
-    func rescanAllFilesIfLoaded() async {
-        guard codeScanEnabled else { return }
-        currentBatchScanTask?.cancel()
-        currentBatchScanTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                try await workspaceFileContextStore.requestCodemapScansForAllRoots()
-            } catch {
-                return
-            }
-        }
-    }
-
-    @MainActor
-    func cancelCodeMapScans() async {
-        await cancelAllScans()
-    }
-
-    /// Cancel all scanning tasks
-    func cancelAllScans() async {
-        clearDeferredInitialRootLoadScanState(keepingActiveDeferral: isInitialRootLoadScanDeferralActive)
-        // Cancel the batch scan task if one exists
-        currentBatchScanTask?.cancel()
-        currentBatchScanTask = nil
-
-        // Cancel any individual file scan tasks
-        for task in codeScanTasks.values {
-            task.cancel()
-        }
-        codeScanTasks.removeAll()
-
-        // NEW: Cancel the ad-hoc enqueue task if present
-        currentAdhocScanEnqueueTask?.cancel()
-        currentAdhocScanEnqueueTask = nil
-        for task in replayScanEnqueueTasks.values {
-            task.cancel()
-        }
-        replayScanEnqueueTasks.removeAll()
-
-        for entry in initialRootScanEnqueueTasks.values {
-            entry.task.cancel()
-        }
-        initialRootScanEnqueueTasks.removeAll()
-
-        await workspaceFileContextStore.cancelAllCodemapScans()
-        remainingScanCount = 0
-        totalFilesSeen = 0
-    }
-
-    /// Clear all code map caches and triggers a rescan
-    @MainActor
-    func clearCodeMapCaches() async {
-        // Cancel any ongoing scans first
-        await cancelAllScans()
-
-        // Get all root folder paths
-        let rootPaths = rootFolders.map(\.fullPath)
-
-        await workspaceFileContextStore.clearAllCodemapCaches(rootFolders: rootPaths)
-
-        // Clear the in-memory file APIs and reset scan state
-        for file in getAllFileViewModels() {
-            file.setCodeMap(nil)
-        }
-
-        // Reset scan tracking variables
-        remainingScanCount = 0
-        totalFilesSeen = 0
-
-        // Notify that code map needs update
-        codeMapUpdatePublisher.send()
-
-        // Add a small delay to ensure state is properly reset
-        // try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-
-        // Force a rescan by calling rescanAllFilesIfLoaded
-        // This will re-trigger scans for all files if code scanning is enabled
-        await rescanAllFilesIfLoaded()
-    }
-
-    @MainActor
-    func purgeStaleCodeMapCaches(keepingRoots roots: [String]) async {
-        let normalized = Set(roots.map { ($0 as NSString).standardizingPath })
-        await workspaceFileContextStore.purgeStaleCodemapCaches(keepingRootPaths: Array(normalized))
     }
 
     func searchFiles(
@@ -9576,6 +10536,15 @@ extension WorkspaceFilesViewModel {
     struct SearchScopeParseResult {
         let spec: SearchPathFilterSpec
         let issues: [PathResolutionIssue]
+    }
+
+    /// Lexical load identity for configured workspace roots; not filesystem or symlink identity.
+    func workspaceRootIdentity(for input: String) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\0"),
+              !trimmed.lowercased().hasPrefix("file://") else { return nil }
+        let normalized = normalizeUserInputPath(input)
+        return URL(fileURLWithPath: normalized, isDirectory: true).standardizedFileURL.path
     }
 
     func canonicalURL(for path: String, assumingDirectory: Bool = false) -> URL {
@@ -10011,6 +10980,7 @@ extension WorkspaceFilesViewModel {
         // In manual mode, keep codemap files even if selection becomes empty.
         if newFiles.isEmpty {
             if codemapAutoEnabled {
+                invalidateAutomaticCodemapSelection()
                 resetAutoCodemapFiles([])
             }
             // Do not flip codemapAutoEnabled here; explicit flows (clearSelection, tools) decide that.
@@ -10177,48 +11147,131 @@ extension WorkspaceFilesViewModel {
     private func resetAutoCodemapFiles(_ files: [FileViewModel]) {
         autoCodemapFiles = files
         autoCodemapFileIDs = Set(files.map(\.id))
-        // Notify that codemap files changed so token counts can update
-        codeMapUpdatePublisher.send(())
     }
 
     @MainActor
-    func clearAutoCodemapFiles(disableAuto: Bool = true) {
-        guard !autoCodemapFiles.isEmpty else { return }
-        if disableAuto, codemapAutoEnabled {
-            codemapAutoEnabled = false
+    private func resetManualCodemapFiles(_ files: [FileViewModel]) {
+        manualCodemapFiles = files
+        manualCodemapFileIDs = Set(files.map(\.id))
+    }
+
+    #if DEBUG
+        @MainActor
+        func setAutoCodemapFilesForTesting(_ files: [FileViewModel]) {
+            resetAutoCodemapFiles(files)
         }
+
+        @MainActor
+        func waitForAutoCodemapSyncForTesting() async {
+            await autoCodemapSyncTask?.value
+        }
+
+        @MainActor
+        func handleCodemapMarkerReadinessForTesting(
+            _ event: WorkspaceCodemapMarkerReadinessEvent
+        ) {
+            handleCodemapMarkerReadiness(event)
+        }
+
+        @MainActor
+        var automaticCodemapReadinessRetryTaskActiveForTesting: Bool {
+            autoCodemapReadinessRetryTask != nil
+        }
+
+        @MainActor
+        var automaticCodemapSelectionGenerationForTesting: UInt64 {
+            autoCodemapSelectionGeneration
+        }
+
+        @MainActor
+        func armAutomaticCodemapReadinessRetryForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch,
+            fileID: UUID
+        ) {
+            invalidateAutomaticCodemapSelection()
+            autoCodemapReadinessRetryAvailable = true
+            armAutomaticCodemapReadinessRetry(
+                pendingMarkers: [AutomaticCodemapPendingMarker(
+                    rootEpoch: rootEpoch,
+                    fileID: fileID,
+                    requestGeneration: 1
+                )],
+                generation: autoCodemapSelectionGeneration,
+                sourceIDs: visibleSelectedFileIDs()
+            )
+        }
+
+        @MainActor
+        func reconstructAutomaticCodemapTargetsForTesting(
+            receiptTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            revalidatedTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            sourceIDs: [UUID],
+            filesByID: [UUID: FileViewModel]
+        ) -> [FileViewModel]? {
+            reconstructAutomaticCodemapTargets(
+                receiptTargets: receiptTargets,
+                revalidatedTargets: revalidatedTargets,
+                sourceIDs: sourceIDs,
+                filesByID: filesByID
+            )
+        }
+
+        @MainActor
+        func rejectInvalidAutomaticCodemapTargetsForTesting(
+            receiptTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            revalidatedTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+            sourceIDs: [UUID],
+            filesByID: [UUID: FileViewModel]
+        ) -> Bool {
+            guard reconstructAutomaticCodemapTargets(
+                receiptTargets: receiptTargets,
+                revalidatedTargets: revalidatedTargets,
+                sourceIDs: sourceIDs,
+                filesByID: filesByID
+            ) != nil else {
+                rejectAutomaticCodemapPublicationForRetry()
+                return true
+            }
+            return false
+        }
+
+        @MainActor
+        var automaticCodemapReadinessRetryPendingForTesting: Bool {
+            autoCodemapReadinessRetryPending
+        }
+    #endif
+
+    @MainActor
+    func clearAutoCodemapFiles(disableAuto: Bool = true) {
+        if disableAuto {
+            enterManualCodemapMode()
+        }
+        guard !autoCodemapFiles.isEmpty else { return }
         resetAutoCodemapFiles([])
     }
 
     @MainActor
     func flushAutoCodemapSyncNowIfNeeded() async {
-        // Cancel any pending debounced task
         autoCodemapSyncTask?.cancel()
         autoCodemapSyncTask = nil
-        // Only sync when auto mode is enabled
-        if codemapAutoEnabled {
-            // Recompute the auto-codemap set immediately from the store codemap mirror.
-            let allFileAPIs = await workspaceFileContextStore.allCodemapFileAPIs()
-            syncAutoCodemaps(allFileAPIs: allFileAPIs)
-        }
-    }
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = nil
+        guard codemapAutoEnabled else { return }
 
-    @MainActor
-    private func addAutoCodemapFile(_ file: FileViewModel) {
-        if autoCodemapFileIDs.insert(file.id).inserted {
-            autoCodemapFiles.append(file)
-            // Notify that codemap files changed so token counts can update
-            codeMapUpdatePublisher.send(())
+        autoCodemapSelectionGeneration &+= 1
+        autoCodemapReadinessRetryAvailable = true
+        autoCodemapReadinessRetryPending = false
+        autoCodemapPendingMarkers.removeAll()
+        let generation = autoCodemapSelectionGeneration
+        let sourceIDs = visibleSelectedFileIDs()
+        if !autoCodemapFiles.isEmpty {
+            resetAutoCodemapFiles([])
         }
-    }
-
-    @MainActor
-    private func removeAutoCodemapFile(_ file: FileViewModel) {
-        if autoCodemapFileIDs.remove(file.id) != nil {
-            autoCodemapFiles.removeAll { $0.id == file.id }
-            // Notify that codemap files changed so token counts can update
-            codeMapUpdatePublisher.send(())
-        }
+        await resolveAutomaticCodemaps(
+            generation: generation,
+            sourceIDs: sourceIDs,
+            requestPolicy: automaticCodemapSelectionRequestPolicy
+        )
     }
 
     @MainActor
@@ -10227,107 +11280,321 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
+    func isManualCodemapFile(_ file: FileViewModel) -> Bool {
+        manualCodemapFileIDs.contains(file.id)
+    }
+
+    @MainActor
     func enterManualCodemapMode() {
-        if codemapAutoEnabled {
-            // Preserve the current auto-codemap set; just stop auto-syncing.
-            codemapAutoEnabled = false
-            autoCodemapSyncTask?.cancel()
-            autoCodemapSyncTask = nil
-        } else {
-            autoCodemapSyncTask?.cancel()
-            autoCodemapSyncTask = nil
-        }
-    }
-
-    @MainActor
-    func validatedFileAPI(for file: FileViewModel) -> FileAPI? {
-        guard file.hasAcceptedCodeMap, let api = file.fileAPI else { return nil }
-        return api
-    }
-
-    @MainActor
-    func validatedCurrentFileAPIs(from apis: [FileAPI]) -> [FileAPI] {
-        guard !apis.isEmpty else { return [] }
-
-        var seen = Set<String>()
-        var validated: [FileAPI] = []
-        validated.reserveCapacity(apis.count)
-
-        for api in apis {
-            let standardized = standardizedAPIFilePath(api)
-            guard seen.insert(standardized).inserted,
-                  let file = findFileByFullPath(standardized),
-                  let attachedAPI = validatedFileAPI(for: file),
-                  standardizedAPIFilePath(attachedAPI) == standardized
-            else { continue }
-
-            validated.append(attachedAPI)
-        }
-
-        return validated
-    }
-
-    @MainActor
-    private func scheduleAutoCodemapSync() {
-        guard codemapAutoEnabled else { return }
         autoCodemapSyncTask?.cancel()
-        autoCodemapSyncTask = Task(priority: .utility) { [weak self] in
-            // Debounce to coalesce rapid selection churn without blocking the main actor
-            try? await Task.sleep(nanoseconds: 400_000_000) // 400ms debounce
-            guard let self else { return }
-            defer { self.autoCodemapSyncTask = nil }
-            guard !Task.isCancelled else { return }
-            guard codemapAutoEnabled else { return }
-            let allFileAPIs = await workspaceFileContextStore.allCodemapFileAPIs()
-            guard !Task.isCancelled else { return }
-            syncAutoCodemaps(allFileAPIs: allFileAPIs)
+        autoCodemapSyncTask = nil
+        codemapAutoEnabled = false
+        if !autoCodemapFiles.isEmpty {
+            resetAutoCodemapFiles([])
         }
     }
 
     @MainActor
-    private func syncAutoCodemaps(allFileAPIs: [FileAPI]) {
-        guard codemapAutoEnabled else {
+    private func scheduleAutoCodemapSync(readinessTriggered: Bool = false) {
+        guard codemapAutoEnabled else { return }
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = nil
+        if readinessTriggered {
+            guard autoCodemapReadinessRetryAvailable,
+                  autoCodemapReadinessRetryPending
+            else { return }
+            autoCodemapReadinessRetryAvailable = false
+            autoCodemapReadinessRetryPending = false
+            autoCodemapPendingMarkers.removeAll()
+        } else {
+            autoCodemapReadinessRetryAvailable = true
+            autoCodemapReadinessRetryPending = false
+            autoCodemapPendingMarkers.removeAll()
+        }
+        autoCodemapSyncTask?.cancel()
+        autoCodemapSelectionGeneration &+= 1
+        let generation = autoCodemapSelectionGeneration
+        let sourceIDs = visibleSelectedFileIDs()
+        if !autoCodemapFiles.isEmpty {
+            resetAutoCodemapFiles([])
+        }
+        let requestPolicy = readinessTriggered
+            ? automaticCodemapReadinessRetryPolicy
+            : automaticCodemapSelectionRequestPolicy
+        autoCodemapSyncTask = Task(priority: .utility) { [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard let self else { return }
+            defer {
+                if self.autoCodemapSelectionGeneration == generation {
+                    self.autoCodemapSyncTask = nil
+                }
+            }
+            guard !Task.isCancelled else { return }
+            await resolveAutomaticCodemaps(
+                generation: generation,
+                sourceIDs: sourceIDs,
+                requestPolicy: requestPolicy
+            )
+        }
+    }
+
+    @MainActor
+    private func visibleSelectedFileIDs() -> [UUID] {
+        let visibleRootIDs = Set(visibleRootFolders.map(\.id))
+        return selectedFiles
+            .filter { visibleRootIDs.contains($0.rootIdentifier) }
+            .map(\.id)
+    }
+
+    @MainActor
+    private func automaticCodemapSelectionIsCurrent(
+        generation: UInt64,
+        sourceIDs: [UUID]
+    ) -> Bool {
+        !Task.isCancelled &&
+            codemapAutoEnabled &&
+            autoCodemapSelectionGeneration == generation &&
+            visibleSelectedFileIDs() == sourceIDs
+    }
+
+    static func automaticCodemapResultNeedsReadinessRetry(
+        _ result: WorkspaceCodemapAutomaticSelectionResult
+    ) -> Bool {
+        result.status == .partial && result.roots.contains { root in
+            root.issues.contains { issue in
+                if case .targetDemandPending = issue { return true }
+                return false
+            }
+        }
+    }
+
+    @MainActor
+    private func resolveAutomaticCodemaps(
+        generation: UInt64,
+        sourceIDs: [UUID],
+        requestPolicy: WorkspaceCodemapAutomaticSelectionRequestPolicy
+    ) async {
+        guard automaticCodemapSelectionIsCurrent(
+            generation: generation,
+            sourceIDs: sourceIDs
+        ) else { return }
+        guard !sourceIDs.isEmpty else {
             resetAutoCodemapFiles([])
             return
         }
 
-        guard true else {
+        let result: WorkspaceCodemapAutomaticSelectionResult
+        do {
+            result = try await WorkspaceSelectionMutationService(
+                store: workspaceFileContextStore,
+                automaticSelectionPolicy: requestPolicy,
+                automaticSelectionWaiter: automaticCodemapSelectionWaiter
+            ).resolveAutomaticCodemapSelection(
+                sourceFileIDs: sourceIDs,
+                rootScope: .visibleWorkspace
+            )
+        } catch {
+            if automaticCodemapSelectionIsCurrent(
+                generation: generation,
+                sourceIDs: sourceIDs
+            ) {
+                resetAutoCodemapFiles([])
+            }
+            return
+        }
+        guard automaticCodemapSelectionIsCurrent(
+            generation: generation,
+            sourceIDs: sourceIDs
+        ) else { return }
+        switch result.status {
+        case .ok, .partial:
+            break
+        case .pending:
+            resetAutoCodemapFiles([])
+            if autoCodemapReadinessRetryAvailable {
+                await armAutomaticCodemapReadinessRetry(
+                    result: result,
+                    generation: generation,
+                    sourceIDs: sourceIDs
+                )
+            }
+            return
+        case .unavailable:
             resetAutoCodemapFiles([])
             return
         }
-
-        let selectedFilesSnapshot = selectedFiles
-        guard !selectedFilesSnapshot.isEmpty else {
+        guard let receipt = result.receipt else {
             resetAutoCodemapFiles([])
             return
         }
-
-        let selectedPaths = Set(selectedFilesSnapshot.map(\.standardizedFullPath))
-        guard !allFileAPIs.isEmpty else {
-            resetAutoCodemapFiles([])
-            return
-        }
-
-        let referencedPaths = CodeMapExtractor.resolveReferencedFilePaths(
-            from: selectedFilesSnapshot,
-            among: allFileAPIs
+        let receiptTargets = receipt.roots.flatMap(\.targets)
+        guard let materializedFilesByID = await materializeAutomaticCodemapTargets(receiptTargets),
+              automaticCodemapSelectionIsCurrent(
+                  generation: generation,
+                  sourceIDs: sourceIDs
+              )
+        else { return }
+        let revalidation = await workspaceFileContextStore.revalidateAutomaticCodemapSelection(
+            receipt,
+            rootScope: .visibleWorkspace
         )
 
-        if referencedPaths.isEmpty {
-            resetAutoCodemapFiles([])
+        guard automaticCodemapSelectionIsCurrent(
+            generation: generation,
+            sourceIDs: sourceIDs
+        ) else { return }
+        guard let resolvedTargets = reconstructAutomaticCodemapTargets(
+            receiptTargets: receiptTargets,
+            revalidatedTargets: revalidation.validTargets,
+            sourceIDs: sourceIDs,
+            filesByID: materializedFilesByID
+        ) else {
+            rejectAutomaticCodemapPublicationForRetry()
             return
         }
-
-        var unique = Set<UUID>()
-        let resolved = referencedPaths.compactMap { standardizedPath -> FileViewModel? in
-            guard !selectedPaths.contains(standardizedPath),
-                  let vm = fileHierarchyIndex.filesByFullPath[standardizedPath],
-                  unique.insert(vm.id).inserted
-            else { return nil }
-            return vm
+        autoCodemapReadinessRetryAvailable = true
+        autoCodemapReadinessRetryPending = false
+        autoCodemapPendingMarkers.removeAll()
+        resetAutoCodemapFiles(resolvedTargets)
+        if Self.automaticCodemapResultNeedsReadinessRetry(result) {
+            await armAutomaticCodemapReadinessRetry(
+                result: result,
+                generation: generation,
+                sourceIDs: sourceIDs
+            )
         }
+    }
 
-        resetAutoCodemapFiles(resolved)
+    @MainActor
+    private func armAutomaticCodemapReadinessRetry(
+        result: WorkspaceCodemapAutomaticSelectionResult,
+        generation: UInt64,
+        sourceIDs: [UUID]
+    ) async {
+        let pendingSlots = Set(result.roots.flatMap { root in
+            root.issues.compactMap { issue -> WorkspaceCodemapRootScopedFileSlot? in
+                guard case let .targetDemandPending(rootEpoch, fileID) = issue else { return nil }
+                return WorkspaceCodemapRootScopedFileSlot(rootEpoch: rootEpoch, fileID: fileID)
+            }
+        })
+        let identities = await workspaceFileContextStore.codemapAutomaticSelectionSourceIdentities(
+            forFileIDs: pendingSlots.map(\.fileID),
+            rootScope: .visibleWorkspace
+        )
+        guard automaticCodemapSelectionIsCurrent(
+            generation: generation,
+            sourceIDs: sourceIDs
+        ) else { return }
+        let pendingMarkers = Set(identities.compactMap { identity -> AutomaticCodemapPendingMarker? in
+            let slot = WorkspaceCodemapRootScopedFileSlot(
+                rootEpoch: identity.rootEpoch,
+                fileID: identity.fileID
+            )
+            guard pendingSlots.contains(slot) else { return nil }
+            return AutomaticCodemapPendingMarker(
+                rootEpoch: identity.rootEpoch,
+                fileID: identity.fileID,
+                requestGeneration: identity.requestGeneration
+            )
+        })
+        armAutomaticCodemapReadinessRetry(
+            pendingMarkers: pendingMarkers,
+            generation: generation,
+            sourceIDs: sourceIDs
+        )
+    }
+
+    @MainActor
+    private func armAutomaticCodemapReadinessRetry(
+        pendingMarkers: Set<AutomaticCodemapPendingMarker>,
+        generation: UInt64,
+        sourceIDs: [UUID]
+    ) {
+        autoCodemapReadinessRetryPending = true
+        autoCodemapPendingMarkers = pendingMarkers
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = Task(priority: .utility) { [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: automaticCodemapReadinessRetryDelay)
+            } catch {
+                return
+            }
+            guard automaticCodemapSelectionIsCurrent(
+                generation: generation,
+                sourceIDs: sourceIDs
+            ) else { return }
+            autoCodemapReadinessRetryTask = nil
+            scheduleAutoCodemapSync(readinessTriggered: true)
+        }
+    }
+
+    @MainActor
+    private func invalidateAutomaticCodemapSelection() {
+        autoCodemapSyncTask?.cancel()
+        autoCodemapSyncTask = nil
+        autoCodemapReadinessRetryTask?.cancel()
+        autoCodemapReadinessRetryTask = nil
+        autoCodemapSelectionGeneration &+= 1
+        autoCodemapReadinessRetryAvailable = false
+        autoCodemapReadinessRetryPending = false
+        autoCodemapPendingMarkers.removeAll()
+    }
+
+    @MainActor
+    private func materializeAutomaticCodemapTargets(
+        _ targets: [WorkspaceCodemapAutomaticSelectionTarget]
+    ) async -> [UUID: FileViewModel]? {
+        var filesByID = fileHierarchyIndex.filesByID
+        for target in targets {
+            if let existing = filesByID[target.fileID] {
+                guard existing.rootIdentifier == target.rootEpoch.rootID else { return nil }
+                continue
+            }
+            guard let root = visibleRootFolders.first(where: { $0.id == target.rootEpoch.rootID }),
+                  let file = await materializeFileForUserInput(
+                      URL(fileURLWithPath: root.standardizedFullPath)
+                          .appendingPathComponent(target.logicalPath.standardizedRelativePath)
+                          .path
+                  ),
+                  file.id == target.fileID,
+                  file.rootIdentifier == target.rootEpoch.rootID
+            else { return nil }
+            filesByID[file.id] = file
+        }
+        return filesByID
+    }
+
+    @MainActor
+    private func reconstructAutomaticCodemapTargets(
+        receiptTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+        revalidatedTargets: [WorkspaceCodemapAutomaticSelectionTarget],
+        sourceIDs: [UUID],
+        filesByID: [UUID: FileViewModel]
+    ) -> [FileViewModel]? {
+        guard revalidatedTargets == receiptTargets else { return nil }
+
+        let sourceIDSet = Set(sourceIDs)
+        var seenTargetFileIDs = Set<UUID>()
+        var resolvedTargets: [FileViewModel] = []
+        resolvedTargets.reserveCapacity(receiptTargets.count)
+        for target in receiptTargets {
+            guard !sourceIDSet.contains(target.fileID),
+                  seenTargetFileIDs.insert(target.fileID).inserted,
+                  let file = filesByID[target.fileID],
+                  file.rootIdentifier == target.rootEpoch.rootID
+            else { return nil }
+            resolvedTargets.append(file)
+        }
+        return resolvedTargets
+    }
+
+    @MainActor
+    private func rejectAutomaticCodemapPublicationForRetry() {
+        resetAutoCodemapFiles([])
+        autoCodemapReadinessRetryAvailable = true
+        autoCodemapReadinessRetryPending = true
+        autoCodemapPendingMarkers.removeAll()
     }
 
     /// UI/test compatibility snapshot of the current checkbox/slice/codemap mirror.
@@ -10336,7 +11603,6 @@ extension WorkspaceFilesViewModel {
     @MainActor
     func snapshotSelection() -> StoredSelection {
         let selectedPaths = selectedFiles.map(\.standardizedFullPath)
-        let autoPaths = autoCodemapFiles.map(\.standardizedFullPath)
         var slicesByPath: [String: [LineRange]] = [:]
         for file in selectedFiles {
             if let ranges = selectionSlicesByFileID[file.id], !ranges.isEmpty {
@@ -10345,7 +11611,7 @@ extension WorkspaceFilesViewModel {
         }
         return StoredSelection(
             selectedPaths: selectedPaths,
-            autoCodemapPaths: autoPaths,
+            manualCodemapPaths: manualCodemapFiles.map(\.standardizedFullPath),
             slices: slicesByPath,
             codemapAutoEnabled: codemapAutoEnabled
         )
@@ -10424,19 +11690,19 @@ extension WorkspaceFilesViewModel {
     @MainActor
     func applyStoredSelection(_ stored: StoredSelection) async {
         #if DEBUG
-            let applyStoredSelectionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applyStoredSelectionStartMS = restorePerfRecorder.timestampMSIfEnabled()
             var applySelectionSnapshotDuration = "notMeasured"
         #endif
         autoCodemapSyncTask?.cancel()
         codemapAutoEnabled = false
 
         #if DEBUG
-            let applySelectionSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
+            let applySelectionSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
         #endif
         await applySelectionSnapshot(paths: stored.selectedPaths, allowEmpty: true)
         #if DEBUG
-            applySelectionSnapshotDuration = applySelectionSnapshotStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-            WorkspaceRestorePerfLog.event(
+            applySelectionSnapshotDuration = applySelectionSnapshotStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection.selectionSnapshot",
                 fields: [
                     "selectedPaths": "\(stored.selectedPaths.count)",
@@ -10445,12 +11711,26 @@ extension WorkspaceFilesViewModel {
             )
         #endif
 
-        let autoCodemapPaths = standardizedStoredSelectionPaths(stored.autoCodemapPaths)
-        let restoredAutoCodemapLookup = await findFiles(atPaths: autoCodemapPaths, profile: .mcpSelection)
-        let restoredAutoCodemapFiles = autoCodemapPaths.compactMap { path in
-            restoredAutoCodemapLookup[path] ?? fileHierarchyIndex.filesByFullPath[path]
+        resetAutoCodemapFiles([])
+        let manualFilesByPath = await findFiles(
+            atPaths: stored.manualCodemapPaths,
+            profile: .mcpSelection
+        )
+        let selectedIDs = Set(selectedFiles.map(\.id))
+        var manualFilesByFullPath: [String: FileViewModel] = [:]
+        for file in manualFilesByPath.values {
+            manualFilesByFullPath[file.standardizedFullPath] = file
         }
-        resetAutoCodemapFiles(restoredAutoCodemapFiles)
+        var seenManualIDs = Set<UUID>()
+        let orderedManualFiles = stored.manualCodemapPaths.compactMap { path -> FileViewModel? in
+            let standardized = standardizedStoredSelectionPath(path)
+            guard let file = manualFilesByFullPath[standardized],
+                  !selectedIDs.contains(file.id),
+                  seenManualIDs.insert(file.id).inserted
+            else { return nil }
+            return file
+        }
+        resetManualCodemapFiles(orderedManualFiles)
 
         let storedSlicePaths = Array(standardizedStoredSelectionSlices(stored.slices).keys)
         if !storedSlicePaths.isEmpty {
@@ -10463,16 +11743,14 @@ extension WorkspaceFilesViewModel {
             scheduleAutoCodemapSync()
         }
         #if DEBUG
-            WorkspaceRestorePerfLog.event(
+            restorePerfRecorder.event(
                 "selection.applyStoredSelection",
                 fields: [
                     "selectedPaths": "\(stored.selectedPaths.count)",
-                    "autoCodemapPaths": "\(stored.autoCodemapPaths.count)",
                     "sliceFiles": "\(stored.slices.count)",
-                    "restoredAutoCodemapFiles": "\(restoredAutoCodemapFiles.count)",
                     "codemapAutoEnabled": "\(stored.codemapAutoEnabled)",
                     "selectionSnapshotDuration": applySelectionSnapshotDuration,
-                    "duration": applyStoredSelectionStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "duration": applyStoredSelectionStartMS.map { restorePerfRecorder.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
@@ -10492,11 +11770,6 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func setFileAsFullContent(_ file: FileViewModel) {
-        // If switching from codemap to full content, disable auto mode
-        if isAutoCodemapFile(file) {
-            codemapAutoEnabled = false
-        }
-
         performSelectionBatch {
             if !file.isChecked {
                 file.setIsChecked(true)
@@ -10504,51 +11777,41 @@ extension WorkspaceFilesViewModel {
         }
 
         selectionSlicesByFileID.removeValue(forKey: file.id)
-        removeAutoCodemapFile(file)
+        removeCodemapFile(file)
         requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
     }
 
     @MainActor
     func setFileAsCodemap(_ file: FileViewModel) {
-        guard true else { return }
-        // Only allow files with codemap support to be added as codemaps
-        guard file.supportsCodeMap else { return }
-
+        enterManualCodemapMode()
         performSelectionBatch {
             if file.isChecked {
                 file.setIsChecked(false)
             }
         }
-
         selectionSlicesByFileID.removeValue(forKey: file.id)
-        let wasAlreadyCodemap = isAutoCodemapFile(file)
-        if !wasAlreadyCodemap {
-            addAutoCodemapFile(file)
-        }
-        codemapAutoEnabled = false
-        requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
+        guard manualCodemapFileIDs.insert(file.id).inserted else { return }
+        manualCodemapFiles.append(file)
     }
 
     @MainActor
     func removeCodemapFile(_ file: FileViewModel) {
-        removeAutoCodemapFile(file)
+        if isAutoCodemapFile(file) {
+            enterManualCodemapMode()
+        }
+        guard manualCodemapFileIDs.remove(file.id) != nil else { return }
+        manualCodemapFiles.removeAll { $0.id == file.id }
     }
 
     @MainActor
     func removeFileFromAllSelections(_ file: FileViewModel) {
-        // If auto-mode is on and the user is removing an auto-added file,
-        // interpret this as a switch to manual mode.
-        if codemapAutoEnabled, isAutoCodemapFile(file) {
-            codemapAutoEnabled = false
-        }
+        removeCodemapFile(file)
 
         performSelectionBatch {
             // Remove from selected files if present
             if file.isChecked {
                 file.setIsChecked(false)
             }
-            // Remove from auto-codemap files
-            removeAutoCodemapFile(file)
             // Remove any slices for this file
             selectionSlicesByFileID.removeValue(forKey: file.id)
         }
@@ -10809,15 +12072,14 @@ extension WorkspaceFilesViewModel {
     @MainActor
     func openFileForMarkdownLink(_ target: MarkdownFileLinkTarget) async -> Bool {
         if let file = await resolveFileForMarkdownLink(target) {
-            file.openInDefaultApp()
-            return true
+            return await file.openInDefaultApp(using: defaultApplicationOpener)
         }
 
         let standardizedPath = (target.normalizedPath as NSString).standardizingPath
         guard standardizedPath.hasPrefix("/") else { return false }
 
         let fileURL = URL(fileURLWithPath: standardizedPath)
-        return NSWorkspace.shared.open(fileURL)
+        return await defaultApplicationOpener.open(fileURL)
     }
 
     @MainActor
@@ -10898,7 +12160,7 @@ extension WorkspaceFilesViewModel {
         }
 
         markdownPathSearchEntries = entries
-        markdownPathSearchIndex = await PathSearchIndex(paths: entries.map(\.queryPath))
+        markdownPathSearchIndex = await PathSearchIndex.build(paths: entries.map(\.queryPath))
         markdownPathSearchGeneration = generation
     }
 
@@ -11096,84 +12358,20 @@ extension WorkspaceFilesViewModel {
     func applyCodemapOnlySelection(paths: [String]) async {
         guard !paths.isEmpty else { return }
 
-        var filesToScan: [FileViewModel] = []
-        var seen = Set<UUID>()
-        var didResolveAny = false
-
         for raw in paths {
-            var handled = false
             if let file = await resolveFileForUserInput(raw) {
-                handled = true
-                if !didResolveAny {
-                    enterManualCodemapMode()
-                    didResolveAny = true
-                }
-                if seen.insert(file.id).inserted {
-                    if file.fileAPI == nil {
-                        filesToScan.append(file)
-                    }
-                    setFileAsCodemap(file)
-                }
-            } else {
-                let folderResolution = await resolveFilesForFolderInput(raw, rootScope: .visibleWorkspace)
-                if folderResolution.handled {
-                    handled = true
-                    if !didResolveAny {
-                        enterManualCodemapMode()
-                        didResolveAny = true
-                    }
-                }
+                setFileAsCodemap(file)
+                continue
+            }
+            let folderResolution = await resolveFilesForFolderInput(raw, rootScope: .visibleWorkspace)
+            if folderResolution.handled {
                 for file in folderResolution.files {
-                    if seen.insert(file.id).inserted {
-                        if file.fileAPI == nil {
-                            filesToScan.append(file)
-                        }
+                    let fileExtension = (file.name as NSString).pathExtension
+                    if SyntaxManager.supportsCodeMap(fileExtension: fileExtension) {
                         setFileAsCodemap(file)
                     }
                 }
             }
-
-            if !handled {
-                continue
-            }
-        }
-
-        await requestStoreCodemapScans(for: filesToScan)
-    }
-
-    private func requestStoreCodemapScans(for files: [FileViewModel]) async {
-        guard !files.isEmpty else { return }
-        var seen = Set<UUID>()
-        for file in files where seen.insert(file.id).inserted {
-            do {
-                try await workspaceFileContextStore.requestCodemapScan(fileID: file.id)
-            } catch {
-                continue
-            }
-        }
-    }
-}
-
-enum FileManagerError: Error, LocalizedError {
-    case failedToLoadFolder(Error)
-    case failedToLoadFile(Error)
-    case fileSystemServiceNotFound
-    case failedToLoadContent
-    // New: richer, contextual variant used by MCP tools and FS ops
-    case fileSystemServiceNotFoundWithContext(String)
-
-    var errorDescription: String? {
-        switch self {
-        case let .failedToLoadFolder(err):
-            "Failed to load folder: \(err.localizedDescription)"
-        case let .failedToLoadFile(err):
-            "Failed to load file: \(err.localizedDescription)"
-        case .fileSystemServiceNotFound:
-            "No matching workspace folder for the requested path."
-        case .failedToLoadContent:
-            "Failed to load content."
-        case let .fileSystemServiceNotFoundWithContext(context):
-            context
         }
     }
 }
@@ -11267,46 +12465,155 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
-    private func scheduleSliceRebaseForModifiedFile(
-        _ file: FileViewModel,
-        relativePath: String
+    private func registerSliceRebaseTask(
+        fullPath: String,
+        operation: @escaping @MainActor (UUID) async -> Void
     ) {
-        let fullPath = file.standardizedFullPath
-        guard shouldScheduleSliceRebase(for: file, fullPath: fullPath) else { return }
+        let replaced = sliceRebaseTasksByFullPath[fullPath] != nil
         sliceRebaseTasksByFullPath[fullPath]?.cancel()
+        sliceRebaseCommitTasksByFullPath[fullPath]?.cancel()
 
         let taskID = UUID()
         sliceRebaseTaskIDsByFullPath[fullPath] = taskID
+        sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] &+= 1
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordRebaseRegistration(
+                fullPath: fullPath,
+                replaced: replaced,
+                generation: sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
+            )
+        #endif
 
-        let task = Task { [weak self] in
+        let task = Task { @MainActor [weak self] in
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordRebaseTaskStart(fullPath: fullPath)
+            #endif
             defer {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    guard self.sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
+                #if DEBUG
+                    MCPApplyEditsRebaseProbeRecorder.recordRebaseCompletion(
+                        fullPath: fullPath,
+                        cancelled: Task.isCancelled
+                    )
+                #endif
+                if let self,
+                   self.sliceRebaseTaskIDsByFullPath[fullPath] == taskID
+                {
                     self.sliceRebaseTasksByFullPath.removeValue(forKey: fullPath)
                     self.sliceRebaseTaskIDsByFullPath.removeValue(forKey: fullPath)
                 }
             }
+            await operation(taskID)
+        }
+        sliceRebaseTasksByFullPath[fullPath] = task
+    }
+
+    @MainActor
+    private func trustworthySliceRebaseSourceSnapshot(for file: FileViewModel) async -> SliceRebaseSourceSnapshot? {
+        let snapshot = await file.cachedContentSnapshot()
+        guard snapshot.isFresh, let content = snapshot.content else { return nil }
+        return SliceRebaseSourceSnapshot(
+            text: content,
+            modificationTime: snapshot.modificationDate.timeIntervalSince1970
+        )
+    }
+
+    @MainActor
+    private func scheduleSliceRebaseForModifiedFile(
+        _ file: FileViewModel,
+        relativePath: String,
+        sourceSnapshot: SliceRebaseSourceSnapshot?
+    ) {
+        let fullPath = file.standardizedFullPath
+        let shouldSchedule = shouldScheduleSliceRebase(for: file, fullPath: fullPath)
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordRebaseScheduleDecision(
+                fileID: file.id,
+                fullPath: fullPath,
+                relativePath: relativePath,
+                shouldSchedule: shouldSchedule
+            )
+        #endif
+        guard shouldSchedule else { return }
+
+        if sliceRebaseSourceSnapshotByFullPath[fullPath] == nil, let sourceSnapshot {
+            sliceRebaseSourceSnapshotByFullPath[fullPath] = sourceSnapshot
+        }
+
+        registerSliceRebaseTask(fullPath: fullPath) { [weak self, weak file] taskID in
             try? await Task.sleep(nanoseconds: 300_000_000)
-            guard let self else { return }
-            guard !Task.isCancelled else { return }
+            guard let self, let file, !Task.isCancelled else { return }
+            if let commitTask = sliceRebaseCommitTasksByFullPath[fullPath] {
+                await commitTask.value
+            }
+            guard !Task.isCancelled, sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
             let hasSlices = await hasAnySlicesForFile(file)
             guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
+            guard sliceRebaseTaskIDsByFullPath[fullPath] == taskID else {
+                #if DEBUG
+                    MCPApplyEditsRebaseProbeRecorder.recordRebaseStaleExit(fullPath: fullPath)
+                #endif
+                return
+            }
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordRebaseExecution(
+                    fullPath: fullPath,
+                    generation: sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
+                )
+            #endif
             guard hasSlices else {
                 noSlicesKnownRevisionByFullPath[fullPath] = partitionSliceSaveRevision
+                sliceRebaseSourceSnapshotByFullPath.removeValue(forKey: fullPath)
                 return
             }
             noSlicesKnownRevisionByFullPath.removeValue(forKey: fullPath)
+            let retainedSourceSnapshot = sliceRebaseSourceSnapshotByFullPath[fullPath]
+            let registrationGeneration = sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
             await rebaseSlicesForModifiedFile(
                 file,
                 relativePath: relativePath,
-                expectedTaskID: taskID
+                sourceSnapshot: retainedSourceSnapshot,
+                expectedTaskID: taskID,
+                expectedRegistrationGeneration: registrationGeneration
+            )
+        }
+    }
+
+    #if DEBUG
+        @MainActor
+        struct HiddenSessionSliceRebaseDebugSnapshot: Equatable {
+            let handledGeneration: UInt64
+            let registrationGeneration: UInt64
+            let hasPendingTask: Bool
+            let hasSourceSnapshot: Bool
+            let hasLifetimeMapping: Bool
+        }
+
+        func hiddenSessionSliceRebaseDebugSnapshotForTesting(
+            fullPath: String,
+            rootID: UUID,
+            rootLifetimeID: UUID
+        ) -> HiddenSessionSliceRebaseDebugSnapshot {
+            let standardized = StandardizedPath.absolute(fullPath)
+            let key = HiddenSessionRootLifetimeKey(rootID: rootID, rootLifetimeID: rootLifetimeID)
+            return HiddenSessionSliceRebaseDebugSnapshot(
+                handledGeneration: hiddenSessionHandledGenerationByRootLifetime[key] ?? 0,
+                registrationGeneration: sliceRebaseRegistrationGenerationByFullPath[standardized, default: 0],
+                hasPendingTask: sliceRebaseTasksByFullPath[standardized] != nil,
+                hasSourceSnapshot: sliceRebaseSourceSnapshotByFullPath[standardized] != nil,
+                hasLifetimeMapping: hiddenSessionRootLifetimeByPhysicalPath[standardized] == key
             )
         }
 
-        sliceRebaseTasksByFullPath[fullPath] = task
-    }
+        func debugRegisterSliceRebaseTask(
+            fullPath: String,
+            operation: @escaping @MainActor () async -> Void
+        ) {
+            guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath) else { return }
+            registerSliceRebaseTask(fullPath: standardizedFullPath) { _ in
+                await operation()
+            }
+        }
+    #endif
 
     /// Waits for pending slice-rebase tasks that affect currently selected files.
     /// Used by selection/reporting paths so line-range metadata reflects post-edit rebases.
@@ -11316,50 +12623,116 @@ extension WorkspaceFilesViewModel {
         await waitForPendingSliceRebases(affectingFullPaths: selectedFullPaths)
     }
 
-    /// Waits for pending slice-rebase tasks affecting candidate file paths.
-    /// Candidates can be absolute full paths or relative paths.
+    /// Waits for currently pending slice-rebase work, then captures the exact path set whose
+    /// quiescence must be revalidated before authoritative selection verification completes.
     @MainActor
-    func waitForPendingSliceRebases(affectingCandidatePaths candidatePaths: [String]) async {
-        let fullPaths = normalizedFullPathsForSliceRebaseWait(from: candidatePaths)
-        await waitForPendingSliceRebases(affectingFullPaths: fullPaths)
+    func waitForPendingSliceRebasesAndCaptureFence(
+        affectingCandidatePaths candidatePaths: [String]
+    ) async -> WorkspaceSliceRebaseFence {
+        let unresolvedAppliedIndexPaths = await waitForAppliedIndexConsumers(
+            affectingCandidatePaths: candidatePaths
+        )
+        let normalized = normalizedFullPathsForSliceRebaseWait(from: candidatePaths)
+        await waitForPendingSliceRebases(affectingFullPaths: normalized.fullPaths)
+        return WorkspaceSliceRebaseFence(
+            registrationGenerationsByFullPath: Dictionary(uniqueKeysWithValues: normalized.fullPaths.map {
+                ($0, sliceRebaseRegistrationGenerationByFullPath[$0, default: 0])
+            }),
+            unresolvedCandidatePaths: normalized.unresolved.union(unresolvedAppliedIndexPaths)
+        )
+    }
+
+    @MainActor
+    func isSliceRebaseFenceCurrent(_ fence: WorkspaceSliceRebaseFence) -> Bool {
+        guard fence.unresolvedCandidatePaths.isEmpty else { return false }
+        return fence.registrationGenerationsByFullPath.allSatisfy { fullPath, capturedGeneration in
+            sliceRebaseTasksByFullPath[fullPath] == nil
+                && sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] == capturedGeneration
+        }
+    }
+
+    @MainActor
+    private func waitForAppliedIndexConsumers(
+        affectingCandidatePaths candidatePaths: [String]
+    ) async -> Set<String> {
+        var required: [(fullPath: String, state: WorkspaceSliceRebasePathState)] = []
+        for rawPath in candidatePaths {
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("/"),
+                  let state = await workspaceFileContextStore.sliceRebasePathState(fullPath: trimmed),
+                  state.appliedIndexGeneration > 0
+            else { continue }
+            required.append((StandardizedPath.absolute(trimmed), state))
+        }
+        guard !required.isEmpty else { return [] }
+
+        let isCaughtUp: (WorkspaceSliceRebasePathState) -> Bool = { state in
+            switch state.rootKind {
+            case .sessionWorktree:
+                self.hiddenSessionHandledGenerationByRootLifetime[
+                    HiddenSessionRootLifetimeKey(
+                        rootID: state.rootID,
+                        rootLifetimeID: state.rootLifetimeID
+                    ),
+                    default: 0
+                ] >= state.appliedIndexGeneration
+            default:
+                self.appliedIndexProjectionHandledGenerationByRootID[state.rootID, default: 0]
+                    >= state.appliedIndexGeneration
+            }
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline {
+            if required.allSatisfy({ isCaughtUp($0.state) }) { return [] }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return Set(required.compactMap { isCaughtUp($0.state) ? nil : $0.fullPath })
     }
 
     @MainActor
     private func waitForPendingSliceRebases(affectingFullPaths fullPaths: Set<String>) async {
         guard !fullPaths.isEmpty else { return }
-        let pending = sliceRebaseTasksByFullPath.compactMap { path, task -> Task<Void, Never>? in
-            fullPaths.contains(path) ? task : nil
-        }
-        guard !pending.isEmpty else { return }
+        for _ in 0 ..< 3 {
+            let pending = sliceRebaseTasksByFullPath.compactMap { path, task -> Task<Void, Never>? in
+                fullPaths.contains(path) ? task : nil
+            }
+            guard !pending.isEmpty else { return }
 
-        for task in pending {
-            await task.value
+            for task in pending {
+                await task.value
+            }
+            await Task.yield()
         }
     }
 
     @MainActor
-    private func normalizedFullPathsForSliceRebaseWait(from candidatePaths: [String]) -> Set<String> {
-        var result: Set<String> = []
+    private func normalizedFullPathsForSliceRebaseWait(
+        from candidatePaths: [String]
+    ) -> (fullPaths: Set<String>, unresolved: Set<String>) {
+        var fullPaths: Set<String> = []
+        var unresolved: Set<String> = []
         for raw in candidatePaths {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             let standardized = (trimmed as NSString).standardizingPath
 
             if standardized.hasPrefix("/") {
-                result.insert(standardized)
+                fullPaths.insert(standardized)
                 continue
             }
 
             if let file = findFileByRelativePath(standardized) {
-                result.insert(file.standardizedFullPath)
+                fullPaths.insert(file.standardizedFullPath)
                 continue
             }
 
             if let full = findFullPath(for: standardized) {
-                result.insert((full as NSString).standardizingPath)
+                fullPaths.insert((full as NSString).standardizingPath)
+            } else {
+                unresolved.insert(standardized)
             }
         }
-        return result
+        return (fullPaths, unresolved)
     }
 
     @MainActor
@@ -11445,94 +12818,301 @@ extension WorkspaceFilesViewModel {
     private func rebaseSlicesForModifiedFile(
         _ file: FileViewModel,
         relativePath: String,
-        expectedTaskID: UUID
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        expectedTaskID: UUID,
+        expectedRegistrationGeneration: UInt64
     ) async {
         guard let workspaceID = currentWorkspaceID else { return }
 
         let rootKey = file.standardizedRootFolderPath
         let relKey = file.standardizedRelativePath
         let fullPath = file.standardizedFullPath
-        guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
+        guard let workspaceRoot = workspaceFileContextRootsByRootKey[rootKey],
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: workspaceRoot.id,
+                  relativePath: relKey,
+                  fullPath: fullPath,
+                  fileID: file.id,
+                  taskID: expectedTaskID,
+                  registrationGeneration: expectedRegistrationGeneration
+              )
+        else { return }
         let activeScope = try? currentPartitionScope()
-        let fileModificationTime = file.modificationDate.timeIntervalSince1970
 
-        let oldSnapshot = await file.cachedContentSnapshot()
-        let oldText = oldSnapshot.content
-        let loadedNewText: String? = if let workspaceRoot = workspaceFileContextRootsByRootKey[rootKey] {
-            try? await workspaceFileContextStore.readContent(
-                rootID: workspaceRoot.id,
-                relativePath: relativePath
+        let readStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+        let loadedSnapshot = await stableSliceRebaseSnapshot(
+            rootID: workspaceRoot.id,
+            relativePath: relativePath
+        )
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordFullFileRead(
+                fullPath: fullPath,
+                durationMS: ProcessInfo.processInfo.systemUptime * 1000 - readStartedMS
             )
-        } else {
-            nil
-        }
-        let canRebase = (loadedNewText != nil)
-        let newText = loadedNewText ?? ""
+        #endif
+        guard let loadedSnapshot,
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: workspaceRoot.id,
+                  relativePath: relKey,
+                  fullPath: fullPath,
+                  fileID: file.id,
+                  taskID: expectedTaskID,
+                  registrationGeneration: expectedRegistrationGeneration
+              )
+        else { return }
 
-        var activeScopeChanged = false
+        var partitionCommits: [SlicePartitionRebaseCommit] = []
+        var encounteredStalePartition = false
 
         for scope in scopesForSliceRebase(workspaceID: workspaceID) {
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
+            guard await isSliceRebaseCurrent(
+                workspaceID: workspaceID,
+                rootID: workspaceRoot.id,
+                relativePath: relKey,
+                fullPath: fullPath,
+                fileID: file.id,
+                taskID: expectedTaskID,
+                registrationGeneration: expectedRegistrationGeneration
+            ) else { return }
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordPartitionInspection(fullPath: fullPath)
+            #endif
             let data = await selectionSliceCoordinator.loadSlices(forRootPath: rootKey, scope: scope)
             guard let stored = data[relKey], !stored.ranges.isEmpty else { continue }
 
-            let storedRanges = stored.ranges
-            let storedAnchors = stored.anchors
-            let oldTextSnapshot = oldText
-            let newTextSnapshot = newText
-            let canRebaseSnapshot = canRebase
-
-            let computed: (ranges: [LineRange], anchors: [SliceAnchor]?) = await Task.detached(priority: .utility) { [storedRanges, storedAnchors, oldTextSnapshot, newTextSnapshot, canRebaseSnapshot] in
-                if Task.isCancelled {
-                    return (storedRanges, storedAnchors)
-                }
-                let nextRanges: [LineRange]
-                if canRebaseSnapshot {
-                    let result = SliceRebaseEngine.rebase(
-                        oldText: oldTextSnapshot,
-                        newText: newTextSnapshot,
-                        oldRanges: storedRanges,
-                        anchors: storedAnchors
-                    )
-                    nextRanges = result.rebased
-                } else {
-                    nextRanges = []
-                }
-
-                let normalizedRanges = SliceRangeMath.normalize(nextRanges)
-                let nextAnchors: [SliceAnchor]? = {
-                    guard canRebaseSnapshot, !normalizedRanges.isEmpty else { return nil }
-                    if Task.isCancelled { return storedAnchors }
-                    return SliceRebaseEngine.buildAnchors(content: newTextSnapshot, ranges: normalizedRanges)
-                }()
-
-                return (normalizedRanges, nextAnchors)
-            }.value
-
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
-
-            let normalizedRanges = computed.ranges
-            let nextAnchors = computed.anchors
-            if normalizedRanges == storedRanges, nextAnchors == storedAnchors {
+            let oldText = sliceRebaseSourceText(
+                sourceSnapshot: sourceSnapshot,
+                stored: stored,
+                currentText: loadedSnapshot.text
+            )
+            let computed = await Self.computeSliceRebaseConsumer(
+                oldText: oldText,
+                newText: loadedSnapshot.text,
+                stored: stored,
+                fullPath: fullPath,
+                scope: "partition"
+            )
+            guard await isSliceRebaseCurrent(
+                workspaceID: workspaceID,
+                rootID: workspaceRoot.id,
+                relativePath: relKey,
+                fullPath: fullPath,
+                fileID: file.id,
+                taskID: expectedTaskID,
+                registrationGeneration: expectedRegistrationGeneration
+            ) else { return }
+            if computed.isStale {
+                encounteredStalePartition = true
                 continue
             }
+            guard computed.ranges != stored.ranges || computed.anchors != stored.anchors else { continue }
+            partitionCommits.append(SlicePartitionRebaseCommit(
+                scope: scope,
+                ranges: computed.ranges,
+                anchors: computed.anchors,
+                expectedStoredSlices: stored
+            ))
+        }
+
+        await beginSliceRebaseCommit(
+            workspaceID: workspaceID,
+            rootID: workspaceRoot.id,
+            fileID: file.id,
+            taskID: expectedTaskID,
+            registrationGeneration: expectedRegistrationGeneration,
+            fullPath: fullPath,
+            rootKey: rootKey,
+            relativePath: relKey,
+            activeScope: activeScope,
+            partitionCommits: partitionCommits,
+            sourceSnapshot: sourceSnapshot,
+            loadedSnapshot: loadedSnapshot,
+            encounteredStalePartition: encounteredStalePartition
+        )
+    }
+
+    private func sliceRebaseSourceText(
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        stored: PartitionStore.StoredSlices,
+        currentText: String
+    ) -> String {
+        guard let sourceSnapshot else { return currentText }
+        let storedVersionMatches = stored.fileModificationTime.map {
+            abs($0 - sourceSnapshot.modificationTime) <= Self.sliceTimestampTolerance
+        } ?? false
+        return storedVersionMatches ? sourceSnapshot.text : currentText
+    }
+
+    private nonisolated static func computeSliceRebaseConsumer(
+        oldText: String,
+        newText: String,
+        stored: PartitionStore.StoredSlices,
+        fullPath: String,
+        scope: String
+    ) async -> (ranges: [LineRange], anchors: [SliceAnchor]?, isStale: Bool) {
+        await Task.detached(priority: .utility) {
+            if Task.isCancelled {
+                return (stored.ranges, stored.anchors, true)
+            }
+            let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+            let result = SliceRebaseEngine.rebase(
+                oldText: oldText,
+                newText: newText,
+                oldRanges: stored.ranges,
+                anchors: stored.anchors
+            )
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
+                    fullPath: fullPath,
+                    durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
+                    scope: scope
+                )
+            #endif
+            guard !result.isStale else {
+                return (stored.ranges, stored.anchors, true)
+            }
+
+            let normalizedRanges = SliceRangeMath.normalize(result.rebased)
+            let nextAnchors: [SliceAnchor]? = {
+                guard !normalizedRanges.isEmpty else { return nil }
+                if Task.isCancelled { return stored.anchors }
+                return SliceRebaseEngine.buildAnchors(content: newText, ranges: normalizedRanges)
+            }()
+            return (normalizedRanges, nextAnchors, false)
+        }.value
+    }
+
+    private func isSliceRebaseCurrent(
+        workspaceID: UUID,
+        rootID: UUID,
+        relativePath: String,
+        fullPath: String,
+        fileID: UUID,
+        taskID: UUID,
+        registrationGeneration: UInt64
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              currentWorkspaceID == workspaceID,
+              sliceRebaseTaskIDsByFullPath[fullPath] == taskID,
+              sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] == registrationGeneration,
+              findFileByFullPath(fullPath)?.id == fileID,
+              await workspaceFileContextStore.file(rootID: rootID, relativePath: relativePath)?.id == fileID
+        else {
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordRebaseStaleExit(fullPath: fullPath)
+            #endif
+            return false
+        }
+        return true
+    }
+
+    @MainActor
+    private func beginSliceRebaseCommit(
+        workspaceID: UUID,
+        rootID: UUID,
+        fileID: UUID,
+        taskID: UUID,
+        registrationGeneration: UInt64,
+        fullPath: String,
+        rootKey: String,
+        relativePath: String,
+        activeScope: PartitionScope?,
+        partitionCommits: [SlicePartitionRebaseCommit],
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        loadedSnapshot: SliceRebaseSourceSnapshot,
+        encounteredStalePartition: Bool
+    ) async {
+        let commitID = UUID()
+        sliceRebaseCommitIDsByFullPath[fullPath] = commitID
+        let commitTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if sliceRebaseCommitIDsByFullPath[fullPath] == commitID {
+                    sliceRebaseCommitTasksByFullPath.removeValue(forKey: fullPath)
+                    sliceRebaseCommitIDsByFullPath.removeValue(forKey: fullPath)
+                }
+            }
+            await commitSliceRebase(
+                workspaceID: workspaceID,
+                rootID: rootID,
+                fileID: fileID,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration,
+                fullPath: fullPath,
+                rootKey: rootKey,
+                relativePath: relativePath,
+                activeScope: activeScope,
+                partitionCommits: partitionCommits,
+                sourceSnapshot: sourceSnapshot,
+                loadedSnapshot: loadedSnapshot,
+                encounteredStalePartition: encounteredStalePartition
+            )
+        }
+        sliceRebaseCommitTasksByFullPath[fullPath] = commitTask
+        await commitTask.value
+    }
+
+    @MainActor
+    private func commitSliceRebase(
+        workspaceID: UUID,
+        rootID: UUID,
+        fileID: UUID,
+        taskID: UUID,
+        registrationGeneration: UInt64,
+        fullPath: String,
+        rootKey: String,
+        relativePath: String,
+        activeScope: PartitionScope?,
+        partitionCommits: [SlicePartitionRebaseCommit],
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        loadedSnapshot: SliceRebaseSourceSnapshot,
+        encounteredStalePartition: Bool
+    ) async {
+        var activeScopeChanged = false
+        var persistenceSucceeded = true
+
+        for commit in partitionCommits {
+            guard await isSliceRebaseCurrent(
+                workspaceID: workspaceID,
+                rootID: rootID,
+                relativePath: relativePath,
+                fullPath: fullPath,
+                fileID: fileID,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration
+            ) else { return }
             do {
-                let post = try await selectionSliceCoordinator.applyPartitionUpdates(
+                guard let post = try await selectionSliceCoordinator.applyPartitionUpdatesIfCurrent(
                     forRootPath: rootKey,
-                    scope: scope,
+                    scope: commit.scope,
                     updates: [
-                        relKey: PartitionStore.SliceUpdate(
-                            ranges: normalizedRanges,
-                            fileModificationTime: fileModificationTime,
-                            anchors: nextAnchors
+                        relativePath: PartitionStore.SliceUpdate(
+                            ranges: commit.ranges,
+                            fileModificationTime: loadedSnapshot.modificationTime,
+                            anchors: commit.anchors
                         )
                     ],
-                    mode: .setPaths
-                )
-
-                if let activeScope, scope == activeScope {
+                    mode: .setPaths,
+                    expectedCurrent: [relativePath: commit.expectedStoredSlices]
+                ) else {
+                    persistenceSucceeded = false
+                    break
+                }
+                guard await isSliceRebaseCurrent(
+                    workspaceID: workspaceID,
+                    rootID: rootID,
+                    relativePath: relativePath,
+                    fullPath: fullPath,
+                    fileID: fileID,
+                    taskID: taskID,
+                    registrationGeneration: registrationGeneration
+                ) else { return }
+                #if DEBUG
+                    MCPApplyEditsRebaseProbeRecorder.recordPartitionWrite(fullPath: fullPath)
+                #endif
+                if let activeScope, commit.scope == activeScope {
                     activeScopeChanged = true
                     if post.isEmpty {
                         currentSlicesByRoot.removeValue(forKey: rootKey)
@@ -11541,9 +13121,11 @@ extension WorkspaceFilesViewModel {
                     }
                 }
             } catch {
+                persistenceSucceeded = false
                 if Self.isLoggingEnabled {
-                    print("Failed to rebase slices for \(relKey) in scope \(String(describing: scope.tabID)) – \(error)")
+                    print("Failed to rebase slices for \(relativePath) in scope \(String(describing: commit.scope.tabID)) – \(error)")
                 }
+                break
             }
         }
 
@@ -11551,30 +13133,98 @@ extension WorkspaceFilesViewModel {
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
         }
 
-        // Always rebase tab-stored slices when this file has any slices.
-        // Virtual/background tabs can carry slice state in tab selection storage
-        // before partition entries exist for that tab scope.
-        if canRebase {
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
-            await workspaceManager?.rebaseSlicesForFileAcrossTabs(
-                fullPath: fullPath,
-                asyncTransform: { current in
-                    await Task.detached(priority: .utility) { [oldText, newText, current] in
-                        SliceRebaseEngine.rebase(
-                            oldText: oldText,
-                            newText: newText,
-                            oldRanges: current,
-                            anchors: nil
-                        ).rebased
-                    }.value
-                }
+        guard persistenceSucceeded,
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: rootID,
+                  relativePath: relativePath,
+                  fullPath: fullPath,
+                  fileID: fileID,
+                  taskID: taskID,
+                  registrationGeneration: registrationGeneration
+              )
+        else { return }
+
+        let tabOldText = sourceSnapshot?.text ?? loadedSnapshot.text
+        await workspaceManager?.rebaseSlicesForFileAcrossTabs(
+            fullPath: fullPath,
+            asyncTransform: { _, current in
+                await Task.detached(priority: .utility) {
+                    let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+                    let result = SliceRebaseEngine.rebase(
+                        oldText: tabOldText,
+                        newText: loadedSnapshot.text,
+                        oldRanges: current,
+                        anchors: nil
+                    )
+                    #if DEBUG
+                        MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
+                            fullPath: fullPath,
+                            durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
+                            scope: "tab"
+                        )
+                    #endif
+                    return result.isStale ? current : result.rebased
+                }.value
+            }
+        )
+
+        guard persistenceSucceeded,
+              !encounteredStalePartition,
+              sourceSnapshot != nil,
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: rootID,
+                  relativePath: relativePath,
+                  fullPath: fullPath,
+                  fileID: fileID,
+                  taskID: taskID,
+                  registrationGeneration: registrationGeneration
+              )
+        else { return }
+        sliceRebaseSourceSnapshotByFullPath[fullPath] = loadedSnapshot
+    }
+
+    private func stableSliceRebaseSnapshot(
+        rootID: UUID,
+        relativePath: String
+    ) async -> SliceRebaseSourceSnapshot? {
+        for _ in 0 ..< 3 {
+            guard !Task.isCancelled else { return nil }
+            guard let loaded = try? await workspaceFileContextStore.readValidatedContentSnapshot(
+                rootID: rootID,
+                relativePath: relativePath,
+                workloadClass: .contentSearch
+            ), let content = loaded.content
+            else { continue }
+
+            return SliceRebaseSourceSnapshot(
+                text: content,
+                modificationTime: loaded.modificationDate.timeIntervalSince1970
             )
-        } else {
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
-            workspaceManager?.rebaseSlicesForFileAcrossTabs(fullPath: fullPath) { _ in [] }
         }
+        return nil
+    }
+
+    func bindGlobalCodeMapsSetting(_ settings: GlobalSettingsStore) {
+        globalCodeMapsSettingCancellable = settings.$codeMapsGloballyDisabled
+            .removeDuplicates()
+            .sink { [weak self] disabled in
+                guard let self else { return }
+                globalCodeMapsSettingRevision += 1
+                let revision = globalCodeMapsSettingRevision
+                let store = workspaceFileContextStore
+                Task { await store.setCodeMapsGloballyDisabled(disabled, settingsRevision: revision) }
+            }
+    }
+
+    func bindNonGitCodeMapsSetting(_ settings: GlobalSettingsStore) {
+        nonGitCodeMapsSettingCancellable = settings.$nonGitCodeMapsEnabled
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self else { return }
+                Task { await self.workspaceFileContextStore.setNonGitCodeMapsEnabled(enabled) }
+            }
     }
 
     private func subscribeToFileSystemPreferenceChanges() {
@@ -11592,7 +13242,6 @@ extension WorkspaceFilesViewModel {
     @MainActor
     private func syncFileSystemPreferencesFromGlobalSettings() {
         let settings = GlobalSettingsStore.shared.fileSystemSettingsSnapshot()
-        respectGitignore = settings.respectGitignore
         respectRepoIgnore = settings.respectRepoIgnore
         respectCursorignore = settings.respectCursorignore
         enableHierarchicalIgnores = settings.enableHierarchicalIgnores
@@ -11657,6 +13306,18 @@ extension WorkspaceFilesViewModel {
         @MainActor
         func _testBumpPartitionSliceSaveRevision() {
             partitionSliceSaveRevision &+= 1
+        }
+
+        @MainActor
+        func _testLoadSlicesForScope(
+            rootPath: String,
+            scope: PartitionScope,
+            relativePath: String
+        ) async -> PartitionStore.StoredSlices? {
+            await selectionSliceCoordinator.loadSlices(
+                forRootPath: rootPath,
+                scope: scope
+            )[StandardizedPath.relative(relativePath)]
         }
 
         @MainActor

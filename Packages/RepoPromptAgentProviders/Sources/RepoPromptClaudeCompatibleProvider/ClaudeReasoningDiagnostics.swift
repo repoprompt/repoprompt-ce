@@ -6,7 +6,9 @@ enum ClaudeReasoningExtractionFeature {
 
 #if DEBUG
     enum ClaudeReasoningDebugLog {
-        static let fileURL = URL(fileURLWithPath: "/tmp/repoprompt-claude-reasoning-debug.log")
+        static let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent("claude-reasoning-debug.log", isDirectory: false)
         private static let lock = NSLock()
 
         static func emit(_ line: String) {
@@ -20,7 +22,12 @@ enum ClaudeReasoningExtractionFeature {
             let timestamp = ISO8601DateFormatter().string(from: Date())
             let payload = "\(timestamp) \(line)\n"
             guard let data = payload.data(using: .utf8) else { return }
-            if FileManager.default.fileExists(atPath: fileURL.path),
+            let fileManager = FileManager.default
+            try? fileManager.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if fileManager.fileExists(atPath: fileURL.path),
                let handle = try? FileHandle(forWritingTo: fileURL)
             {
                 defer { try? handle.close() }

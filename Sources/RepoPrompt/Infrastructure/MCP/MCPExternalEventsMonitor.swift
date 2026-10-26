@@ -20,6 +20,8 @@ final class MCPExternalEventsMonitor: ObservableObject {
     @Published private(set) var lastConnectedClientProtocolName: String?
 
     private let eventsDirectory: URL
+    private let cleanupOperation: @Sendable (URL) -> Void
+    private var cleanupTask: Task<Void, Never>?
     private var dispatchSource: DispatchSourceFileSystemObject?
     private var directoryFileDescriptor: Int32 = -1
     private var lastSeenFilename: String?
@@ -28,8 +30,12 @@ final class MCPExternalEventsMonitor: ObservableObject {
     private var recentErrors: [(clientName: String?, code: MCPExternalClientEvent.Code, timestamp: Date)] = []
     private let errorTrackingWindow: TimeInterval = 5 * 60 // 5 minutes
 
-    private init() {
-        eventsDirectory = MCPExternalClientEvent.eventsDirectoryURL
+    init(
+        eventsDirectory: URL = MCPExternalClientEvent.eventsDirectoryURL,
+        cleanupOperation: @escaping @Sendable (URL) -> Void = { cleanupOldEvents(in: $0) }
+    ) {
+        self.eventsDirectory = eventsDirectory
+        self.cleanupOperation = cleanupOperation
         setupDirectory()
     }
 
@@ -49,7 +55,7 @@ final class MCPExternalEventsMonitor: ObservableObject {
 
     private func setupDirectory() {
         do {
-            try MCPExternalClientEvent.ensureEventsDirectoryExists()
+            try FileManager.default.createDirectory(at: eventsDirectory, withIntermediateDirectories: true)
         } catch {
             // Directory creation failed - monitor won't work but app should continue
             print("MCPExternalEventsMonitor: Failed to create events directory: \(error)")
@@ -330,10 +336,37 @@ final class MCPExternalEventsMonitor: ObservableObject {
 // MARK: - Event Cleanup
 
 extension MCPExternalEventsMonitor {
-    /// Removes old event files (older than maxAge)
-    func cleanupOldEvents(maxAge: TimeInterval = 7 * 24 * 3600) {
+    /// Called after a window appears, never during view-model composition. The shared
+    /// monitor retains the task even after completion so later windows cannot repeat it.
+    @discardableResult
+    func scheduleCleanupOnce() -> Task<Void, Never> {
+        if let cleanupTask { return cleanupTask }
+        let directory = eventsDirectory
+        let operation = cleanupOperation
+        let task = Task { @MainActor in
+            // Queue housekeeping asynchronously from appearance; this is not a frame-presented fence.
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                DispatchQueue.main.async {
+                    DispatchQueue.global(qos: .utility).async {
+                        operation(directory)
+                        continuation.resume()
+                    }
+                }
+            }
+        }
+        cleanupTask = task
+        return task
+    }
+
+    /// Best-effort pruning with the existing seven-day retention policy. This worker
+    /// captures only the directory and never accesses monitor/UI state.
+    nonisolated static func cleanupOldEvents(
+        in eventsDirectory: URL,
+        maxAge: TimeInterval = 7 * 24 * 3600,
+        now: Date = Date()
+    ) {
         let fileManager = FileManager.default
-        let cutoffDate = Date().addingTimeInterval(-maxAge)
+        let cutoffDate = now.addingTimeInterval(-maxAge)
 
         guard let contents = try? fileManager.contentsOfDirectory(
             at: eventsDirectory,
@@ -344,8 +377,8 @@ extension MCPExternalEventsMonitor {
         }
 
         for fileURL in contents where fileURL.pathExtension == "json" {
-            guard let attrs = try? fileManager.attributesOfItem(atPath: fileURL.path),
-                  let modDate = attrs[.modificationDate] as? Date,
+            guard let values = try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]),
+                  let modDate = values.contentModificationDate,
                   modDate < cutoffDate
             else {
                 continue

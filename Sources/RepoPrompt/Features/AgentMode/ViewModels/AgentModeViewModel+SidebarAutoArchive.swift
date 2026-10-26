@@ -2,62 +2,28 @@ import Foundation
 
 @MainActor
 extension AgentModeViewModel {
-    enum SidebarAutoArchiveReason: String, Equatable {
-        case sessionListReady
-        case sessionIndexChanged
-        case liveSessionSetChanged
-        case runProtectionChanged
-        case mcpProtectionChanged
-        case explicitTest
-    }
-
-    func scheduleSidebarAutoArchiveIfReady(reason: SidebarAutoArchiveReason) {
-        guard sessionListCacheReady else { return }
-        scheduleSidebarAutoArchive(reason: reason)
-    }
-
-    func scheduleSidebarAutoArchive(reason: SidebarAutoArchiveReason) {
-        guard sessionListCacheReady, canRunSidebarAutoArchive, !isApplyingSidebarAutoArchive else { return }
-        sidebarAutoArchiveTask?.cancel()
-        sidebarAutoArchiveTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            guard !Task.isCancelled else { return }
-            await self?.performSidebarAutoArchiveIfNeeded(reason: reason)
+    /// Computes the legacy archive policy as a read-only suggestion. Callers must
+    /// not treat the decision as authorization to mutate tabs or sessions.
+    func sidebarAutoArchiveSuggestion(now: Date = Date()) -> AgentModeSidebarAutoArchivePolicy.Decision {
+        guard ownerValidatedSessionListCacheReady,
+              let promptManager,
+              let workspaceID = workspaceManager?.activeWorkspace?.id,
+              sidebarAutoArchiveOwner(workspaceID: workspaceID) != nil
+        else {
+            return .empty(evaluatedSessionCount: 0)
         }
-    }
 
-    @discardableResult
-    func performSidebarAutoArchiveIfNeeded(
-        reason: SidebarAutoArchiveReason,
-        now: Date = Date()
-    ) async -> Set<UUID> {
-        guard sessionListCacheReady, canRunSidebarAutoArchive, !isApplyingSidebarAutoArchive else { return [] }
-        guard let promptManager, workspaceManager?.activeWorkspace != nil else { return [] }
+        let sidebarRows = sidebarSessions(for: promptManager.currentComposeTabs)
+        guard sidebarRows.count > sidebarAutoArchivePolicy.configuration.baseVisibleSessionLimit else {
+            return .empty(evaluatedSessionCount: sidebarRows.count)
+        }
 
-        let openTabs = promptManager.currentComposeTabs
-        let sidebarRows = sidebarSessions(for: openTabs)
-        guard sidebarRows.count > sidebarAutoArchivePolicy.configuration.baseVisibleSessionLimit else { return [] }
-
-        let protectedTabIDs = sidebarAutoArchiveProtectedTabIDs(for: sidebarRows)
-
-        let decision = sidebarAutoArchivePolicy.decision(
+        return sidebarAutoArchivePolicy.decision(
             for: sidebarRows,
             currentTabID: currentTabID,
-            protectedTabIDs: protectedTabIDs,
+            protectedTabIDs: sidebarAutoArchiveProtectedTabIDs(for: sidebarRows),
             now: now
         )
-        guard !decision.tabIDsToArchive.isEmpty else { return [] }
-
-        isApplyingSidebarAutoArchive = true
-        defer { isApplyingSidebarAutoArchive = false }
-
-        let archivedTabIDs = await promptManager.autoArchiveComposeTabsForSidebarPolicy(
-            withIDs: decision.tabIDsToArchive
-        )
-        if !archivedTabIDs.isEmpty {
-            syncSidebarUIState(refresh: true, reason: .sessionList)
-        }
-        return archivedTabIDs
     }
 
     func sidebarAutoArchiveProtectedTabIDs(for sidebarRows: [SidebarSession]) -> Set<UUID> {
@@ -65,10 +31,12 @@ extension AgentModeViewModel {
         if let currentTabID {
             protectedTabIDs.insert(currentTabID)
         }
+
+        let currentIndex = ownerValidatedSessionIndex
         for row in sidebarRows {
-            let persistedEntry = row.sessionID.flatMap { sessionIndex[$0] }
+            let persistedEntry = row.sessionID.flatMap { currentIndex[$0] }
                 ?? preferredSidebarEntry(for: row.tabID, tabName: row.title)
-            if !isComposeTabEligibleForAutomaticStash(row.tabID)
+            if isComposeTabProtectedFromSidebarArchiveSuggestion(row.tabID)
                 || row.isMCPControlled
                 || persistedEntry?.isMCPOriginated == true
                 || isProtectedPersistedRunState(persistedEntry?.lastRunStateRaw)

@@ -87,8 +87,10 @@ struct AgentProviderPermissionLevelSection: View {
     private func permissionLevelLabel(for providerID: AgentProviderBindingID) -> String {
         switch providerID {
         case .codex, .claude: "Permission Level"
-        case .openCode: "ACP Session Mode"
+        case .openCode, .antigravity: "ACP Session Mode"
         case .cursor: "ACP Auto-Approve"
+        case .grokBuild: "Always-Approve Launch"
+        case .devin: "Permission Mode"
         }
     }
 }
@@ -99,13 +101,8 @@ struct AgentProviderToolsRuntimeDisclosure: View {
     let title: String
     let isExpanded: Bool
     let onToggle: () -> Void
-    let onSetCodexBashToolEnabled: (Bool) -> Void
-    let onSetCodexSearchToolEnabled: (Bool) -> Void
-    let onSetCodexGoalSupportEnabled: (Bool) -> Void
-    let onSetCodexMCPServerEnabled: (_ normalizedName: String, _ enabled: Bool) -> Void
-    let onSetClaudeBashToolEnabled: (Bool) -> Void
-    let onSetClaudeMCPStrictModeEnabled: (Bool) -> Void
-    let onSetClaudeToolSearchEnabled: (Bool) -> Void
+    let onApplyCodexToolSettingMutation: (CodexToolSettingMutation) -> Void
+    let onApplyClaudeToolSettingMutation: (ClaudeToolSettingMutation) -> Void
 
     var body: some View {
         if hasToolOptions {
@@ -130,13 +127,8 @@ struct AgentProviderToolsRuntimeDisclosure: View {
                     AgentProviderToolsRuntimeControls(
                         providerID: providerID,
                         binding: binding,
-                        onSetCodexBashToolEnabled: onSetCodexBashToolEnabled,
-                        onSetCodexSearchToolEnabled: onSetCodexSearchToolEnabled,
-                        onSetCodexGoalSupportEnabled: onSetCodexGoalSupportEnabled,
-                        onSetCodexMCPServerEnabled: onSetCodexMCPServerEnabled,
-                        onSetClaudeBashToolEnabled: onSetClaudeBashToolEnabled,
-                        onSetClaudeMCPStrictModeEnabled: onSetClaudeMCPStrictModeEnabled,
-                        onSetClaudeToolSearchEnabled: onSetClaudeToolSearchEnabled
+                        onApplyCodexToolSettingMutation: onApplyCodexToolSettingMutation,
+                        onApplyClaudeToolSettingMutation: onApplyClaudeToolSettingMutation
                     )
                     .padding(.top, 6)
                     .transition(.opacity)
@@ -149,7 +141,7 @@ struct AgentProviderToolsRuntimeDisclosure: View {
         switch providerID {
         case .codex: binding.codexTools != nil
         case .claude: binding.claudeTools != nil
-        case .openCode, .cursor: false
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin: false
         }
     }
 }
@@ -157,13 +149,8 @@ struct AgentProviderToolsRuntimeDisclosure: View {
 struct AgentProviderToolsRuntimeControls: View {
     let providerID: AgentProviderBindingID
     let binding: AgentProviderControlsBinding
-    let onSetCodexBashToolEnabled: (Bool) -> Void
-    let onSetCodexSearchToolEnabled: (Bool) -> Void
-    let onSetCodexGoalSupportEnabled: (Bool) -> Void
-    let onSetCodexMCPServerEnabled: (_ normalizedName: String, _ enabled: Bool) -> Void
-    let onSetClaudeBashToolEnabled: (Bool) -> Void
-    let onSetClaudeMCPStrictModeEnabled: (Bool) -> Void
-    let onSetClaudeToolSearchEnabled: (Bool) -> Void
+    let onApplyCodexToolSettingMutation: (CodexToolSettingMutation) -> Void
+    let onApplyClaudeToolSettingMutation: (ClaudeToolSettingMutation) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: AgentPermissionSettingsLayout.controlSpacing) {
@@ -172,22 +159,17 @@ struct AgentProviderToolsRuntimeControls: View {
                 if let codexTools = binding.codexTools {
                     CodexProviderToolsRuntimeSection(
                         tools: codexTools,
-                        onSetBashToolEnabled: onSetCodexBashToolEnabled,
-                        onSetSearchToolEnabled: onSetCodexSearchToolEnabled,
-                        onSetGoalSupportEnabled: onSetCodexGoalSupportEnabled,
-                        onSetMCPServerEnabled: onSetCodexMCPServerEnabled
+                        onApplyMutation: onApplyCodexToolSettingMutation
                     )
                 }
             case .claude:
                 if let claudeTools = binding.claudeTools {
                     ClaudeProviderToolsRuntimeSection(
                         tools: claudeTools,
-                        onSetBashToolEnabled: onSetClaudeBashToolEnabled,
-                        onSetMCPStrictModeEnabled: onSetClaudeMCPStrictModeEnabled,
-                        onSetToolSearchEnabled: onSetClaudeToolSearchEnabled
+                        onApplyMutation: onApplyClaudeToolSettingMutation
                     )
                 }
-            case .openCode, .cursor:
+            case .openCode, .cursor, .grokBuild, .antigravity, .devin:
                 EmptyView()
             }
         }
@@ -197,10 +179,7 @@ struct AgentProviderToolsRuntimeControls: View {
 
 struct CodexProviderToolsRuntimeSection: View {
     let tools: CodexToolSettingsBinding
-    let onSetBashToolEnabled: (Bool) -> Void
-    let onSetSearchToolEnabled: (Bool) -> Void
-    let onSetGoalSupportEnabled: (Bool) -> Void
-    let onSetMCPServerEnabled: (_ normalizedName: String, _ enabled: Bool) -> Void
+    let onApplyMutation: (CodexToolSettingMutation) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -212,14 +191,14 @@ struct CodexProviderToolsRuntimeSection: View {
                     title: "Bash",
                     description: "Allow Codex to run shell commands when your permission level allows it.",
                     isOn: tools.bashToolEnabled,
-                    onChange: onSetBashToolEnabled
+                    onChange: { onApplyMutation(.bashTool(enabled: $0)) }
                 )
 
                 ProviderRuntimeToggleRow(
                     title: "Search",
                     description: "Allow Codex to search the project while it works through a task.",
                     isOn: tools.searchToolEnabled,
-                    onChange: onSetSearchToolEnabled
+                    onChange: { onApplyMutation(.searchTool(enabled: $0)) }
                 )
             }
 
@@ -227,9 +206,62 @@ struct CodexProviderToolsRuntimeSection: View {
                 title: "Goals",
                 description: "Codex /goal support is enabled by default so long-running tasks can continue between turns. Turn it off if you do not want RepoPrompt to start Codex with goal support.",
                 isOn: tools.goalSupportEnabled,
-                onChange: onSetGoalSupportEnabled
+                onChange: { onApplyMutation(.goalSupport(enabled: $0)) }
             )
             .hoverTooltip("Controls Codex features.goals for app-server launch and thread config; enabled by default until turned off.")
+
+            ProviderRuntimeToggleRow(
+                title: "Reasoning Summaries",
+                description: "Show Codex app-server reasoning summaries in Agent Mode threads. Off by default; this does not change model reasoning effort or Chat/Oracle behavior.",
+                isOn: tools.reasoningSummariesEnabled,
+                onChange: { onApplyMutation(.reasoningSummaries(enabled: $0)) }
+            )
+            .hoverTooltip("Controls model_reasoning_summary for Codex Agent Mode app-server thread start/resume. Off sends none; on sends auto.")
+
+            ProviderRuntimeToggleRow(
+                title: "Local Memories",
+                description: "Let Codex generate and reuse local memories across Agent Mode chats. Memories are stored under Codex home (normally ~/.codex/memories). Generation may perform model-backed background or startup work and use Codex quota. A new or restarted Codex session may be required.",
+                isOn: tools.memoriesEnabled,
+                onChange: { onApplyMutation(.memories(enabled: $0)) }
+            )
+            .hoverTooltip("Controls Codex memory generation and use for app-server launch and thread start/resume. Off by default.")
+
+            ProviderRuntimeSubsection(title: "Optional Codex Features") {
+                ProviderRuntimeToggleRow(
+                    title: "Computer Use",
+                    description: "Use /computer-use in direct Codex sessions with the installed Computer Use companion. Off by default. Grant Screen Recording and Accessibility permissions in macOS when prompted.",
+                    isOn: tools.computerUseEnabled,
+                    onChange: { onApplyMutation(.computerUse(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "Apps",
+                    description: "Allow Codex to use connected apps.",
+                    isOn: tools.appsEnabled,
+                    onChange: { onApplyMutation(.apps(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "Plugins",
+                    description: "Allow Codex to load installed plugins.",
+                    isOn: tools.pluginsEnabled,
+                    onChange: { onApplyMutation(.plugins(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "MCP Elicitation",
+                    description: "Allow MCP servers to request additional input during a run.",
+                    isOn: tools.mcpElicitationEnabled,
+                    onChange: { onApplyMutation(.mcpElicitation(enabled: $0)) }
+                )
+
+                ProviderRuntimeToggleRow(
+                    title: "Tool Suggestions",
+                    description: "Allow Codex to suggest apps or plugins to install or enable.",
+                    isOn: tools.toolSuggestionsEnabled,
+                    onChange: { onApplyMutation(.toolSuggestions(enabled: $0)) }
+                )
+            }
 
             ProviderRuntimeSubsection(
                 title: "MCP servers",
@@ -250,11 +282,13 @@ struct CodexProviderToolsRuntimeSection: View {
                             badge: isRepoPromptServer ? "Required" : nil,
                             isOn: tools.mcpServerStatesByNormalizedName[normalizedName] ?? isRepoPromptServer,
                             isDisabled: isRepoPromptServer,
-                            onChange: { onSetMCPServerEnabled(entry.normalizedName, $0) }
+                            onChange: {
+                                onApplyMutation(.mcpServer(normalizedName: entry.normalizedName, enabled: $0))
+                            }
                         )
                     }
                 } else {
-                    Text("No MCP servers found in ~/.codex/config.toml.")
+                    Text("No MCP servers found in RepoPrompt's isolated Codex config.")
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
@@ -350,9 +384,7 @@ private struct ProviderRuntimeToggleRow: View {
 
 struct ClaudeProviderToolsRuntimeSection: View {
     let tools: ClaudeToolSettingsBinding
-    let onSetBashToolEnabled: (Bool) -> Void
-    let onSetMCPStrictModeEnabled: (Bool) -> Void
-    let onSetToolSearchEnabled: (Bool) -> Void
+    let onApplyMutation: (ClaudeToolSettingMutation) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: AgentPermissionSettingsLayout.controlSpacing) {
@@ -362,13 +394,13 @@ struct ClaudeProviderToolsRuntimeSection: View {
 
             Toggle("Bash", isOn: Binding(
                 get: { tools.bashToolEnabled },
-                set: { onSetBashToolEnabled($0) }
+                set: { onApplyMutation(.bashTool(enabled: $0)) }
             ))
             .toggleStyle(.switch)
 
             Toggle("RepoPrompt Only (Strict MCP)", isOn: Binding(
                 get: { tools.mcpStrictModeEnabled },
-                set: { onSetMCPStrictModeEnabled($0) }
+                set: { onApplyMutation(.mcpStrictMode(enabled: $0)) }
             ))
             .toggleStyle(.switch)
 
@@ -383,7 +415,7 @@ struct ClaudeProviderToolsRuntimeSection: View {
 
             Toggle("Lazy Tool Loading", isOn: Binding(
                 get: { tools.toolSearchEnabled },
-                set: { onSetToolSearchEnabled($0) }
+                set: { onApplyMutation(.toolSearch(enabled: $0)) }
             ))
             .toggleStyle(.switch)
 

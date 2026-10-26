@@ -1,0 +1,1070 @@
+# Testing RepoPrompt CE
+
+Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coordinated daemon use, style checks, and lifecycle approvals. Use `$rpce-test-quality` when deciding whether coverage is worth adding, retaining, consolidating, or removing.
+
+## Claude status-line compatibility experiment (debug only)
+
+This is an explicit one-process probe, not a replacement quota source or persistent usage cache. It tests whether the installed Claude CLI invokes its documented status-line command during RepoPrompt's native headless run. It makes no independent account HTTP requests and reads no credentials.
+
+Prepare a new private directory (the path must not already exist):
+
+```bash
+python3 Scripts/diagnostics/claude_statusline_probe.py prepare /tmp/rpce-statusline-probe-UNIQUE
+python3 Tests/Diagnostics/test_claude_statusline_probe.py
+make dev-test FILTER=ClaudeStatusLineCompatibilityProbeTests
+```
+
+After separately authorizing and building/launching the debug app, pass `--claude-statusline-probe /tmp/rpce-statusline-probe-UNIQUE/settings.json` as an app launch argument. Only the first new first-party Claude native process claims it; existing processes and compatible backends are not instrumented. Start one ordinary user-requested Claude turn, then inspect `invocations.ndjson` in that private directory. Do not launch synthetic turns just to collect usage. There is no installation into user/project settings: `--settings` supplies only the session's status-line override. The probe deliberately does not run the user's original status-line script.
+
+Records contain receipt time, byte count, sanitized CLI version, and only five-hour/seven-day percentages and reset timestamps. Percentages remain 0–100; omitted values remain unknown. Receipt time and repeated identical values do not establish measurement freshness or account identity. No records feed the usage UI or router. The collector has a two-second timeout, 64 KiB input limit and 256 KiB log cap. Its fixed `RPCE_STATUSLINE_PROBE` stdout sentinel is deliberate: check whether it leaks into the native event stream or affects the turn. Do not ship that sentinel as a production status line.
+
+Managed settings can override the probe. Zero invocations are inconclusive without a known-working authorized interactive control, and results apply only to the tested CLI version/configuration. Keep the output private; remove the temporary directory manually after inspection. The `claimed` marker is intentionally not automatically reset, including after a failed launch.
+
+## Agent admission slow-phase diagnostics
+
+Agent identity admission automatically emits `event=agentAdmission.slow` through the
+`WorkspaceAgentAdmission` OSLog category when a completed admission scope takes at
+least five seconds (including rejection, cancellation, and thrown failure). It uses
+`SuspendingClock`, excluding machine sleep like the coordinator's `DispatchTime`
+uptime measurements. It adds no timers, sleeps, retries, or asynchronous operations.
+It intentionally ships in release (see the [source-layout exception](architecture/source-layout.md#app-visible-diagnostics-retained-in-the-repopromptapp-target)).
+There is no setting to enable and no persisted diagnostic state to clean up.
+
+`workspace=` and `correlation=` use exactly the coordinator's `redactedID` hashes,
+so a slow report can be joined to its queue/acquire/release events without exposing
+raw IDs. `kind=` is one of `fresh_tab`, `existing_tab`, `recovery`, `discard`;
+`outcome=` is `committed`, `rejected`, `cancelled`, or `threw`. Committed means the
+scope accepted its result, not that a provider turn succeeded. Other fields contain
+only fixed phase names, millisecond durations, and counts. Titles, paths, prompt
+text, raw identifiers, and raw errors are never included.
+
+`queue_wait` covers lease acquisition; `refresh` covers canonical snapshot read,
+decode, and reconciliation; `catalog_refresh` separately covers catalog adoption
+awaits (including conflict replay). `save` covers admission persistence and own-save
+waits/convergence; `other` covers remaining lease-held preparation/projection and
+recovery. Durations are exclusive, so nested save waits are not also refresh time.
+`holdMS` aggregates all phases except queue wait. `refreshCount` excludes no-op
+baseline checks and recursive re-entry. `saveAttempts` counts actual persistence
+attempts, including the second attempt on a pre-commit conflict replay, separately
+from save phase entries. Logging happens after releasing this admission's lease;
+a queued successor may already hold the workspace by the time the report emits.
+
+For a future 44-second stall, correlation keys join the phase report to coordinator
+events, while kind/outcome distinguish admission, recovery and discard scopes.
+**MainActor contention is not separable by these phases**: it can inflate any
+phase spanning a suspension, including queue resumption. These are elapsed times,
+not CPU measurements or proof of an underlying cause. A scope that never exits
+still emits no slow report; existing coordinator events remain complementary.
+No threshold enforcement or admission behavior changes are implied.
+
+Deterministic coverage uses an injected clock at the real admission entry points:
+`make dev-test FILTER='WorkspaceAgentAdmissionTimingTests|ConcurrentSameWorkspaceAgentRunAdmissionTests|AgentAdmissionRecoveryTests'`.
+It exercises fresh/existing-tab persistence scopes, the real canonical refresh's
+own-save wait, threshold/outcome/correlation accounting, and emission after lease
+release without wall-clock timing assertions.
+No live launch is required for these tests; capturing a real slow admission still
+requires a separately authorized running-app investigation.
+
+## Quality gate before adding a test
+
+Add a test only when all four answers are concrete:
+
+1. **Contract:** What current behavior must remain true?
+2. **Plausible defect:** What realistic regression would violate it, and what is the impact?
+3. **Lowest faithful layer:** Can deterministic core or provider-package coverage reproduce the risk, or is root SwiftPM integration actually required?
+4. **Observable oracle:** What exact output, state, error, side effect, cleanup, wire format, or bounded performance result distinguishes broken from correct behavior?
+
+Search existing direct and outcome-level coverage first. Prefer a test that fails against known-bad behavior. Do not add invocation-only, no-crash, non-nil-only, source-shape, symbol-presence, constant-restatement, arbitrary-sleep, or coverage-driven tests unless that fact is itself the contract and no stronger oracle exists.
+
+## Choose the lowest faithful layer
+
+- **Isolated core:** deterministic decisions, transformations, parsers, state machines, policy, invariants, and failure semantics.
+- **Provider package:** provider protocol, codec, translation, launch arguments, and model mapping under `Packages/RepoPromptAgentProviders/Tests`.
+- **Root SwiftPM:** module behavior without a GUI, including actors, persistence, fixtures, subprocess adapters, in-process MCP, and deterministic concurrency under `Tests/RepoPromptTests`.
+- **Runtime diagnostics:** assembled-app-only rendering, restoration, routing instrumentation, churn, or resource investigations. Require a bounded scenario, privacy-safe machine-readable evidence, entry point, and cleanup path.
+- **Live/packaged smoke:** real app/MCP wiring, bundle layout, embedded helpers, ownership, signing, provenance, and a few critical journeys.
+- **Structural guard:** last resort when executable behavior, compiler boundaries, lint, or guardrails cannot cheaply enforce a narrow constraint.
+
+Do not use smoke as the only protection for deterministic logic. Without a predeclared acceptance threshold, a benchmark is diagnostics rather than executable contract coverage.
+
+## Add and run root or provider XCTest coverage
+
+- **Root target:** place app-integrated and root-package tests under `Tests/RepoPromptTests` and validate with `make dev-test`.
+- **Provider target:** place provider protocol, codec, translation, launch-argument, or model-mapping tests under `Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests` and validate with `make dev-provider-test`.
+- Keep one coherent contract per method. Labeled tables are appropriate when cases differ only by input, boundary, or expected outcome.
+- Control time, randomness, locale, environment, resources, ordering, and concurrency. Prefer gates, clocks, or continuations over sleeps, and verify meaningful cleanup or ownership.
+
+Focused daemon-coordinated examples:
+
+```bash
+make dev-test FILTER=RepoPromptTests.ExampleTests
+make dev-test FILTER=RepoPromptTests.ExampleTests/testBehavior
+make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests
+make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests/testBehavior
+```
+
+Root `dev-test` jobs build tests in the normal developer environment, then run `swift test --skip-build` in a disposable home and temporary directory using the CI runner's sandbox contract. `FILTER` and `TEST_PRODUCT` are forwarded to that execution; provider-package jobs are unchanged. The sandbox is shared for the local invocation and removed afterward (hosted CI still isolates each suite). Plain `swift test` does not supply this isolation and cannot run the root-authority fixtures safely.
+
+`FILTER` matches suite and method names, never file names. A test file commonly holds several suites named after the contracts they pin, none of them named after the file, so filtering by a filename selects nothing — and a zero-test run exits `0`, reporting `Executed 0 tests, with 0 failures`, which reads as a pass. Check the printed executed count before treating a focused run as evidence; if it is zero, take a real suite name from the file (or `swift test list`) and filter on that.
+
+Use the narrowest relevant filter while iterating. Broaden to the affected target or full suite when the change crosses shared infrastructure, package boundaries, generated surfaces, test harness behavior, or many unrelated suites:
+
+```bash
+make dev-test
+make dev-provider-test
+```
+
+A focused green run is evidence for the named contract, not a substitute for full-suite or CI coverage when the changed boundary is broad. The hosted root-test workflow discovers one current root XCTest population through `swift test list`, counts methods per suite, assigns every discovered suite to one of four deterministic method-count-weighted LPT shards, and executes each suite in its own XCTest process. Root CI has no contract/integration tier split or contributor-maintained registry; provider-package tests remain a separate lane.
+
+## Provider subprocess isolation
+
+Provider CLI launches fail closed in processes hosting the XCTest runtime, including nested
+XCTest runners and release-mode test bundles. Detection does not inspect user arguments or
+inherited XCTest environment variables, so those production inputs cannot cause a refusal.
+**Separate non-XCTest child processes spawned by tests are not guarded.** Such fixtures must
+use synthetic commands or injected provider doubles, never an installed provider CLI.
+
+Inject controller/provider doubles rather than relying on an installed CLI. Intentional fixture-process
+tests can set `allowsProviderProcessLaunchForTesting: true` on their `CLIProcessConfiguration`
+or `ACPAgentSessionController`, or scope a launch/probe with
+`ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true)`. These opt-ins are local
+to the configured instance or task, not a process-global environment switch. Mark a process
+`.tool` only for genuinely non-provider tooling, such as Git worktree operations.
+
+## Oracle settled-response recovery
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| App-backed `ask_oracle` / `oracle_send` with `export_response:true`; `make dev-test FILTER=OracleGroupBoundaryTests` | Optional export failure retains the settled answer and chat IDs with a safe `oracle_export_error`; no automatic paid replay | Pre-settlement validation/send failures still throw. Recover through returned chat IDs. The deterministic fixture is not live filesystem proof. |
+
+## Oracle reconciliation and progress lifetime
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| Reopen an Agent Mode transcript and open a saved `ask_oracle` / `oracle_send` card; `make dev-test FILTER=OracleLaneCoverageTests` | Fresh disk restoration routes to the exact primary chat for both fitting lane digests and summary-budget fallback, while preserving lane coverage | Conflicting or malformed lane identities must not route to another chat or fall back to the latest chat |
+| Complete or fail an Oracle request during progress delivery; `make dev-test FILTER=MCPToolHeartbeatTests` | A gated in-flight heartbeat drains before the tool call returns or rethrows; cancellation preserves the operation's settled result | Cancellation alone does not complete an already-running async progress callback; the deterministic gate is not live transport proof |
+
+The inventory-first reconciliation guidance in `OracleGroupDeliveryContract` showed a paired GPT score gain in the local r02 experiment, but failed its final holdout factual/format gates (more false acceptances) and produced longer answers. Delivery-string tests verify the guidance contract, not reconciliation accuracy.
+
+## Oracle reconciliation settings editor
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| Settings → Agent Models → beneath Oracle roster; background Cua controls labeled `Oracle reconciliation guidance`, `Save Oracle reconciliation guidance`, `Restore default Oracle reconciliation guidance`, `Reload Oracle reconciliation guidance`; `make dev-test FILTER=AgentModelsSettingsViewModelStaleEditTests` | Typing does not write; Save persists only guidance in the selected whole profile; blank/Restore Default removes the override. Dirty drafts survive unrelated refreshed profile edits (including same-page Add Oracle), and Save preserves those edits. Conflict is derived from guidance baseline or actual write-destination mismatch; Reload Current Text discards a conflicting draft. Switching between workspaces using the same global profile does not invalidate a global draft. The whole-profile cache/live guard refuses an uncached edit without retrying that click; after refresh, a new explicit Save succeeds if guidance and destination still match, preserving unrelated edits. Clean drafts follow settings notifications. | Global/workspace routing is authoritative; nil workspace guidance uses the built-in default, not global fieldwise inheritance. The existing Settings persistence banner owns pending-save/recovery warnings. GUI driving requires an authorized matching artifact; VM tests are not GUI proof. |
+| Save guidance, start grouped `ask_oracle` / `oracle_send` or Context Builder plan/question/review, then change settings while discovery/lanes are pending; inspect returned text and optional export; `make dev-test FILTER='OraclePresetExecutionTests\|ContextBuilderOraclePresetTests\|ContextBuilderOracleGroupStateTests\|OracleGuidanceContractTests\|OracleGroupDeliveryContractTests\|OracleGroupBoundaryTests'` | The pending request retains its captured guidance in inline and exported results; a later continuation uses new scoped text without changing the conversation roster/prompt. Absent/blank overrides use unchanged default delivery; an explicit override equal to the default remains metadata. N=1 delivery is unchanged. | Caller-facing policy only: lane prompts and canonical history contain no guidance. Direct headless delivery retains the built-in default. Live provider uploads/paid requests and app lifecycle need separate authorization; deterministic transport hooks prove capture/serialization, not live model behavior. |
+
+## Oracle image delivery
+
+Feature map (app-backed only):
+
+| Reach / drive | Observable proof | Prerequisites / traps |
+| --- | --- | --- |
+| App-backed CE MCP `oracle_send`, or Agent Mode-bound `ask_oracle`, with `images:[{path,title?}]` | Correct description of a pattern absent from filename/title/question; thumbnail visible, saved and restored without original bytes/path; persisted `ask_oracle.images` / `oracle_send.images` redacted; outside-root path rejected with indexed error and no new turn | Already-running matching debug artifact/CLI with verified repository/worktree, commit and dirty-patch provenance (CLI version alone is insufficient), exclusive coordination for the singleton app, loaded authorized fixture root, supported credentials and inspected **entire** Oracle roster. Coordinator approval immediately before uploads/paid prompts; lifecycle approval separately. |
+| Paste/drop an image into an Agent Mode composer (Devin, Codex and Grok receive its path as a text note; `@path` agents already see it), then ask the agent to consult the Oracle | Agent passes the listed attachment path in `ask_oracle.images`; every lane describes the pasted pattern; transcripts keep thumbnails only | Only the owning agent session's own files in the managed `agent_attachments` store are authorized, at their exact path; sibling attachments and other outside-root paths stay rejected. Consumed attachment files are deleted when the turn ends, so only in-flight turn images are reliably available. Same app/approval prerequisites as above. |
+
+Tool discovery and CLI help (`rpce-cli-debug -l` / `-e 'describe oracle_send'`; `describe ask_oracle` on the owning Agent Mode connection) consume the app's tool schema; direct-headless discovery uses the canonical schema and explicitly rejects images. The generated reference is `docs/spec/mcp-domain-canonical-tool-definitions.generated.json`. Neither CLI adds automatic attachment forwarding: the agent must supply `images:[{path,title?}]`.
+
+`make dev-test FILTER='OracleGroupBoundaryTests|OracleImageContractTests|MCPAskOracleWorktreeTests|OracleImageAttachmentLoaderTests'` exercises image loading, start/continuation dispatch, invalid-path rejection, and transcript redaction. The dispatch fixture captures original bytes without a provider call; it is not live image-delivery proof.
+
+Ordinary smoke and packaged initialize/tools-list are **not image-delivery proof**.
+Ordinary CLI connections use `oracle_send`; `ask_oracle` requires an owning Agent Mode session. Both accept images on starts and continuations, and apply the same workspace-root, exact session-attachment, and provider capability checks. Supply a fresh `mode:"chat"`,
+`new_chat:true`, `message`, and nonempty `images` JSON request. Do not include keys,
+raw image bytes or base64. Inspect roster/settings before approval: `model` changes
+only the primary lane; additional Oracle lanes can multiply uploads and cost.
+Use a small generated PNG in a disposable loaded root (neutral filename/title),
+with a simple colored shape/count pattern and a separately recorded expected answer.
+Run this once per approved route; capture command and returned answer/error as
+evidence. A successful RPC alone remains **INCONCLUSIVE**.
+
+Then inspect the resulting preview and saved/restored history through the real app
+(Cua Driver background delivery only). Inspect the disposable session's JSON for
+thumbnail-only storage and redacted tool arguments; retain only sanitized evidence,
+never full prompt/base64 payloads. Submit a second request pointing outside the loaded
+root only with approval; expect indexed loader rejection and no added Oracle turn.
+Unit regressions prove pre-read/pre-dispatch ordering; screenshots cannot prove it.
+Clean up only the created fixtures/session/workspace after evidence capture (use
+`trash` for files); do not stop a visible app. No production profile or keys should be
+copied into fixtures. Direct-headless Oracle rejects images. Originals are this-turn-only;
+continuations do not automatically resend them or use saved thumbnails. Missing
+credentials, unsupported negotiated capabilities or unapproved uploads mean **not run**,
+not PASS.
+
+## Cursor model controls: live verification map
+
+Use conductor for build/health checks (`make dev-build`, `make dev-smoke`); launch/relaunch requires approval. Drive the UI with Cua Driver in background delivery.
+
+| Feature | User / agent path | Observable proof | Prerequisites / traps |
+| --- | --- | --- | --- |
+| Cursor model refresh | Settings → CLI Providers → expand Cursor CLI → Refresh Models | Spinner finishes; result reports models advertised by Cursor, or a retryable error; previous models/selections survive failure | Authenticated `agent acp`. Advertised count is not selectable count: model membership remains release-gated. |
+| Cursor effort pins | Settings → Agent Models (or Models popover) → choose Cursor and an effort-bearing model → effort chip → select advertised choice | Chip reflects choice; reopen surface and inspect persisted model parameters via `agent_manage list_agents`; run applies the advertised config ID / wire value | Models such as Composer may advertise speed only, so no effort chip. Switch models and confirm pins stay per-model. Unsupported saved pins must not be erased by discovery. |
+
+Focused checks: `make dev-test FILTER=Cursor` covers discovery, refresh failure/retry, runtime parameter resolution, per-model persistence, and exact ACP binding. A successful metadata probe alone does not prove the UI or effective inference routing.
+
+## Workspace projection decode diagnostics
+
+This is a bounded, opt-in diagnostic, not a cache or a CI timing gate. It calls
+the production `WorkspaceManagerViewModel.decodeDomainWorkspaceProjection`
+boundary on MainActor, including JSON decoding and both existing compose-tab
+normalization passes. Default decoding, normalization, and persistence are
+unchanged. The harness owns 1, 5, or 20 value consumers; it does not create
+windows, activate workspaces, save documents, or start the app.
+
+### Protocol fixed before measurement
+
+Protocol version: 1. Normalization instrumentation version: 1 (independent of
+the document's schema version). Fixtures contain only generated data with fixed
+UUIDs, timestamps, field order, and text. Counts are usage hypotheses, not
+verified production percentiles. No padding or transcript sidecars are used.
+
+| Workload | Compose/stashed tabs | Selected paths per tab | Presets | Prompt bytes per tab |
+| --- | ---: | ---: | ---: | ---: |
+| ordinary | 2/0 | 20 | 2 | 2048 |
+| busy | 10/5 | 100 | 10 | 8192 |
+| large | 25/20 | 250 | 20 | 16384 |
+
+Tabs include expanded folders and selection slices; presets include selections.
+The harness reports the exact encoded input sizes. Modern fixtures explicitly
+supply IDs and dates. Legacy missing-field normalization generates IDs/dates and
+is tested separately, not silently made deterministic or changed for this run.
+
+For every workload and N = 1, 5, 20, collect all four scenarios (36 cells):
+
+1. `newRevision`: fresh consumers receive revision 1.
+2. `changedDigest`: establish revision 1 outside measurement, then deliver 2.
+3. `dirtySequence`: establish 1, then deliver distinct revisions 2, 3, 4, 5
+   without writing/changing the shared URL or any disk metadata.
+4. `failureCorrection`: establish 1, deliver malformed JSON, then valid revision
+   2 at that same URL. Failed decode leaves the consumer's previous value intact.
+
+The helper accepts bytes rather than authoritative revisions; reported revisions
+are fixture provenance. Failure is injected at this presentation boundary because
+domain metadata validation can reject malformed JSON before it reaches the UI.
+Each delivery finishes synchronously before the next begins: no sleeps, polling,
+wall-clock deadlines, or random schedules. Consumers are serialized by MainActor,
+as the current presentation bridge serializes this synchronous work.
+
+Five warmups per cell precede 30 retained trials, in three blocks of ten. Rotate
+cell order in each block. Fixture construction, encoding, baseline establishment,
+memory reads, correctness assertions, and output serialization are outside timed
+decode intervals. Keep the hardware, toolchain, build, power state, and competing
+load comparable. Never run another build during collection.
+
+Record raw decode attempts/successes/failures, normalization invocations/mutations,
+total and p50/p95 attempt wall time, normalization time (nested, not additive),
+MainActor occupied wall time, and delivery-loop wall time. Current expected counts
+per trial are N/2N decodes/normalizations for the first two scenarios, 4N/8N for
+dirty values, and 2N attempts/N failures/2N normalizations for correction. These
+are diagnostic expectations of the current implementation, not permanent tests
+requiring duplicate work. No timing threshold is asserted by XCTest.
+
+Report cache entries/bytes as zero (there is no projection decode cache), separately
+from peak/settled consumer value counts and serialized-size-equivalent retained
+bytes. The latter is a documented proxy, **not heap allocation accounting**; Swift
+copy-on-write sharing and allocator retention prevent inferring heap use from JSON
+size. Snapshot process RSS, physical footprint, and CPU before/after each scenario
+and after clearing consumers. Process memory peaks are boundary-sampled lower
+bounds, not allocation high-water marks. Memory observation is outside timing.
+The process CPU interval includes correctness checks and counter reads, so it is
+not decoder-only CPU. Diagnostic retained bytes use sample count times the fixed
+sample stride, excluding Array spare capacity and the recorder's lock/object.
+
+Reports contain only numeric provenance, fixed scenario/workload enums, counters,
+and durations. The recorder has a hard 128-attempt capacity, counts dropped
+attempts, has no global registration, and retains no bytes, paths, errors, names,
+document hashes, or user UUIDs. Task-local scopes expire on return/throw. A trial
+with overflow, missing data, count/output mismatches, or nonfinite timing is invalid;
+fail the diagnostic rather than discarding slow/invalid trials. Retain failure
+status and the conductor log; reruns are separate campaigns.
+
+### Decision gate
+
+Evaluate only after completing the matrix:
+
+- Proportional: equivalent decode counts grow with N, and aggregate decode time
+  divided by N times the one-consumer time is between 0.75 and 1.25 at both 5 and
+  20 consumers for the same workload/scenario.
+- Material: on a justified realistic workload, p95 decode/normalization MainActor
+  occupation reaches 16.7 ms per publication, redundant work beyond one decode
+  contributes at least 8 ms, and decoding accounts for at least 25% of complete
+  presentation projection occupation.
+- Both conditions, optimized measurements, and workload realism evidence are
+  required before designing a cache. Duplicate counts alone are insufficient.
+
+This first-stage helper harness deliberately excludes bridge snapshot acquisition,
+digest/self-echo skips, UI application, task queueing, and full window retention.
+Conductor's current root test lane uses Debug. Consequently its report always
+marks the optimization gate `inconclusive`: it cannot establish optimized cost,
+the fraction of complete presentation time, or production workload prevalence.
+Do not compare these Debug numbers against Release responsiveness thresholds.
+Follow-up optimized integration evidence must include those missing boundaries
+before authorizing a shared bounded cache. If either condition is false, do not
+cache; investigate the measured dominant path instead.
+
+### Entry point and cleanup
+
+Run correctness coverage normally:
+
+```sh
+make dev-test FILTER=RepoPromptTests.WorkspaceProjectionDecodeTests
+```
+
+Opt in to the finite diagnostic through the existing conductor scale-test flag:
+
+```sh
+RPCE_RUN_SCALE_TESTS=1 ./conductor test \
+  --filter RepoPromptTests.WorkspaceProjectionDecodeTests/testMeasurementMatrix \
+  --async --request-key issue-1041-decode-matrix
+./conductor job wait --request-key issue-1041-decode-matrix
+```
+
+The harness emits `WORKSPACE_DECODE_MATRIX` JSON records to the conductor log:
+one record per cell, including all 30 trial summaries, and a final decision record.
+This bounds retained evidence without introducing a production export surface or
+another executable. Keep logs outside the repository or in ignored build artifacts;
+never commit raw test/conductor output. The harness clears values and scoped
+recorders at each trial; it makes no preference changes and creates no files.
+Unrelated test-runner output is not a privacy-safe shareable report: extract only
+the typed matrix records. Ordinary test runs skip the diagnostic unless opted in.
+
+## Codemap-sensitive changes
+
+Routine pipeline and integration tests should not await real codemap generation when generation correctness is not the contract. Prefer seams, fakes, synthetic artifacts, or dual-path assertions that accept either pending/not-ready codemap status or ready code-structure output while still proving routing, path shape, and leakage boundaries.
+
+Use the retained deterministic CodeMap tests for local coverage:
+
+```bash
+make dev-test FILTER=CodeMapGoldenTests
+make dev-test FILTER=CodeMapArtifactContainerTests
+```
+
+Run these when changes touch CodeMap generation, syntax parsing, artifact storage, or Tree-sitter support. The packaged-app live codemap projection-demand gate is documented later in this guide.
+
+## Performance and optimization evidence
+
+Define the workload, acceptance threshold, comparable environment, sample count, warmup policy, source-state controls, invalid-sample rules, and retained evidence before measuring. Keep root and provider timings separate unless a derived serial estimate is clearly labeled. Diagnostic and wake-probe runs are lifecycle evidence, not valid timing samples.
+
+Use focused before/after measurements to attribute a change, then exercise the full affected boundary before making repository-wide performance claims. Store durable evidence only when it has continuing review value; otherwise keep raw logs and machine-specific samples local. Do not create a replacement executable registry, method census, append-only repository scoreboard, or mandatory artifact hierarchy merely to track test counts.
+
+## Live Codex Desktop direct-headless worktree routing
+
+Run this release acceptance only from a Codex Desktop task whose repository root is an existing linked worktree and whose RepoPrompt launcher selects `--backend headless` with that exact root in `REPOPROMPT_MCP_WORKING_DIRS`. The canonical checkout must already belong to one saved RepoPrompt CE workspace. This lane validates an installed release candidate; it does not build, install, launch, stop, or relaunch RepoPrompt, create a workspace, or create a worktree.
+
+Record the saved workspace file hash and `git worktree list --porcelain` before starting. In the same Codex task:
+
+1. Call `bind_context` with `op=status`. Require a bound context from the saved canonical workspace, then use `get_file_tree`, `read_file`, and `git status` to prove the task's linked worktree is the physical execution root. A path that exists only in the canonical checkout must remain outside the root fence.
+2. Start two detached `agent_run` sessions with `worktree=@current` and bounded read-only instructions that report a worktree-only marker. Save both returned session IDs and require them to be distinct.
+3. Reconcile both exact session IDs with `agent_run op=wait` and inspect them with `agent_manage op=list_sessions`. Require both terminal snapshots to report the same exact `worktree_root_path`, repository identity, and worktree identity, and require both markers to come from that worktree. Cancel and reconcile any nonterminal session before ending the task. Nested `orchestrate` acceptance belongs to the separate direct-headless workflow/tool-policy change and is not a release gate for this standalone routing change.
+4. Recheck `git worktree list --porcelain`, the saved workspace file hash, and workspace catalog count. Require no added worktree, no changed saved workspace, no temporary workspace, and no durable worktree binding. Repeat once with an explicit different existing selector and require only that session's physical root to change.
+
+The Codex Desktop pre-start app-CLI isolation fallback remains in place through this acceptance and the release that contains the fix. Removing or bypassing it is a separate post-release change after the recorded acceptance passes; a failed or unavailable direct-headless check leaves the fallback unchanged.
+
+## Live large-workspace worktree-startup diagnostic
+
+`Scripts/worktree_startup_live_benchmark.py` is the reusable validation lane for
+large-root and linked-worktree startup. It drives `rpce-cli-debug` and the
+DEBUG-only `worktree_startup_benchmark` diagnostics. It never builds, installs,
+launches, stops, or relaunches RepoPrompt. A fresh-process (cold) run therefore
+requires a separately approved relaunch before invoking the script; label a run
+`cold` only when that boundary is true. An aged run requires the configured
+minimum existing Agent Mode session count and keeps aged and warm samples in
+separate distributions.
+
+This is a runtime diagnostic, not XCTest coverage. It does not replace focused
+behavioral tests or the broader suite validation required by the changed boundary.
+
+### Interactive-readiness iteration 0 campaign
+
+The worktree interactive-readiness campaign uses additive DEBUG diagnostic
+schema 5. Production route behavior is unchanged. Its authoritative iteration-0
+root is the real RepoPrompt CE main checkout in the dedicated
+`RPCE Search Bench Main 20260618` workspace (or a clearly owned equivalent real
+clone), never the active development tab/workspace. Synthetic repositories are
+allowed only by `self-test` and are labeled non-authoritative.
+
+Each route/width/process series is predeclared as exactly one excluded warmup
+plus five retained samples. Keep every valid slow sample and never replace an
+ordinal. The primary value is the app-monotonic interval from
+`bindingTransitionStarted` to the later successful direct `file_search` or
+`read_file` completion. Search/read start concurrently. Report the five raw
+values, p50, nearest-rank p95, and sample CV. CV above 50% requires a distinct
+predeclared confirmation plan with another one-plus-five series; do not pool the
+series, and accept a direction only when both agree.
+
+Primary performance validity is intentionally separate from follow-on
+acceptance. Immediately after concurrent direct search/read, the harness takes
+a correlation-bound diagnostic checkpoint. `primary_performance` requires the
+exact correlation/session/context/invocation/ordinal/build identity, ordered
+root/search/read boundaries, both the recorded concurrent outcome with empty
+mark failures and strict cross-operation interval overlap, successful structured direct probes with logical
+canonical display plus exact physical `worktree_scope`, the frozen committed
+path/blob markers, exactly one unambiguous correlation-bound receipt decision
+at the consumption terminal stage with route-specific creation/coordinator/
+projection/consumption semantics, the exact actual route, no
+fallbacks, and final resource/cleanup proof. Codemap, passive tree, and
+selection are stored under `follow_on_acceptance`. A follow-on failure remains
+campaign-blocking and visible but does not discard a valid primary value.
+Follow-on collection is total: timeout/malformed results are typed, every
+configured operation records exact start/completion mark outcomes, a failed
+start mark cannot be replaced by validator success, selection completes only
+after its selection-get result is recorded, later follow-ons still run, and the
+final diagnostic export is attempted once without retry or ordinal replacement.
+Acceptance validates the exact typed operation and failure inventory plus the
+collection-completed mark. `get_code_structure` keeps its internal 10-second
+deadline; the harness supplies no model-controlled wait field.
+
+Plan and preflight the real root with explicit ownership and dedicated-workspace
+confirmation:
+
+```bash
+OWNER_TOKEN="$(uuidgen)"
+python3 Scripts/worktree_startup_live_benchmark.py create-marker \
+  --root-path /Users/pvncher/Documents/Git/repoprompt-ce-release \
+  --workspace-id '<workspace-uuid>' --root-id '<root-uuid>' \
+  --owner-token "$OWNER_TOKEN" \
+  --confirm-real-repository-benchmark --confirm-dedicated-workspace
+
+python3 Scripts/worktree_startup_live_benchmark.py plan \
+  --workspace-name 'RPCE Search Bench Main 20260618' \
+  --window-id '<window-id>' --workspace-id '<workspace-uuid>' \
+  --context-id '<context-uuid>' --root-id '<root-uuid>' \
+  --root-path /Users/pvncher/Documents/Git/repoprompt-ce-release \
+  --owner-token "$OWNER_TOKEN" --dataset-label rpce-real-readiness-iteration-0 \
+  --asserted-file-count '<exact-git-ls-files-count>' --base-ref HEAD \
+  --search-marker WorkspaceRootSeedPlanner \
+  --read-path Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
+  --read-marker 'import CryptoKit' --invocations-per-series 1 \
+  --confirm-real-repository-benchmark --confirm-dedicated-workspace \
+  --output /tmp/rpce-real-readiness-iteration-0.json
+
+python3 Scripts/worktree_startup_live_benchmark.py preflight \
+  --plan /tmp/rpce-real-readiness-iteration-0.json \
+  --confirm-live-debug-app --confirm-dedicated-workspace
+```
+
+For an offline revalidation of an immutable forced-full one-plus-five artifact,
+persist the exact artifact-file hashes, per-sample checkpoint and source-record
+hashes, harness/validator source hash and version, exact command, sample
+identities, and unchanged warmup/retained raw values:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py revalidate-primary \
+  --plan '<frozen-primary-plan.json>' \
+  --artifact '<forced-full-artifact-directory>' \
+  --output '<primary-revalidation-provenance.json>'
+```
+
+This command is offline and accepts only an exact width-1 forced-full artifact
+with one warmup and five retained ordinals. It fails closed on mixed identities,
+changed raw values, missing hashes, invalid primary checkpoints, resource
+failure, or incomplete cleanup; it does not rewrite the source artifact.
+
+Run width 1 forced-full, then projected. Do not run widths 4/8 or aged until
+width-1 projected has exactly `{"diffSeedServing":1}` and an empty fallback map:
+
+```bash
+for ROUTE in forced-full projected; do
+  python3 Scripts/worktree_startup_live_benchmark.py run \
+    --plan /tmp/rpce-real-readiness-iteration-0.json \
+    --route "$ROUTE" --process-state warm --checkout-kind linked-worktree \
+    --width 1 --invocation 1 --warmups 1 --samples 5 \
+    --confirm-live-debug-app --confirm-process-state \
+    --confirm-dedicated-workspace
+done
+```
+
+Timing evidence comes from the correlation-bound primary checkpoint and direct
+structured tool results, not inference wall time or assistant prose. Session-bound tools
+must keep CE's logical canonical root display while `worktree_scope` proves the
+exact physical binding by worktree ID; never require the displayed root path to
+equal the app-managed worktree path. Schema-v5 samples require every readiness
+boundary, monotonic phase order, duration consistency, attributed passive-tree
+work, and configured marker-publication evidence. The small inference gate
+separately checks exact raw tool-call/result order and forbidden-tool absence.
+Retain root/search/read in `primary_performance`; retain first and warm codemap,
+passive tree, selection, Git/filesystem/planner/lock, and marker evidence in
+`follow_on_acceptance`; retain CPU/RSS/physical-footprint, cleanup, and
+actual-route evidence for both validity decisions. Append iteration results to
+`prompt-exports/optimize-worktree-interactive-readiness-runs.md`.
+
+### Iteration 1 measurement-integrity remediation
+
+Resource receipts publish absolute resident/physical-footprint values and their
+deltas independently on a 0.1 MiB grid. Validation therefore accepts a displayed
+arithmetic discrepancy of exactly 0.1 MiB and rejects 0.2 MiB; all fields must
+remain finite and on that published grid. This tolerance does not weaken CPU,
+availability, sample-count, peak-ordering, or other resource gates.
+
+Every armed start is written to `state.json` before `agent_run.start`. Normal and
+resumed cleanup use the same bounded state machine: status-free
+`manage_worktree list`; exact correlation/control recovery and cooperative abort;
+cancel or terminalize; unbind/release logical ownership; one session-specific
+store-drain proof; physical cleanup; then a second status-free inventory and
+final drain proof. Recovery never requests `include_status`. Missing, expired,
+timed-out, nonzero, or ambiguous evidence sets `manual_cleanup` and preserves the
+physical resource. The DEBUG recovery registry and drain snapshot are bounded
+diagnostic records, not enterprise file-count limits; they return IDs, counts,
+digests, phases, and actor-entry delay, never raw enterprise paths.
+
+After a same-build projected one-plus-five artifact is valid, run one
+non-aggregatable real Agent Mode gate:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py live-inference-gate \
+  --plan /tmp/rpce-real-readiness-iteration-0.json \
+  --projected-artifact '<valid-projected-artifact-directory>' \
+  --confirm-live-debug-app --confirm-owned-resources
+```
+
+The gate fails unless the raw transcript contains exactly one ordered
+`file_search` call/result pair followed by one `read_file` call/result pair, no
+other tool, terminal `completed`, and the fixed sentinel. Spartan transcript
+events prove invocation/order only. Exact same-context direct structured probes
+must independently prove logical root, physical `worktree_scope`, worktree ID,
+path, and content, with exact correlation/session/invocation/ordinal,
+`{"diffSeedServing":1}`, and empty fallbacks. Assistant prose and inference wall
+time are never evidence.
+
+### Dedicated workspace and plan
+
+Use a disposable workspace whose name starts with `RPCE 8E Bench ` or the
+established `RPCE Search Bench ` prefix. Never use
+the active development checkout: the driver rejects its own repository root.
+Create/open a separate disposable root with `rpce-cli-debug`, bind the benchmark
+tab, and record its exact window, workspace, context, and root IDs. A name or
+current selection is not proof of isolation. Create an exclusive root marker
+with a new owner UUID after those stable IDs exist:
+
+```bash
+OWNER_TOKEN="$(uuidgen)"
+python3 Scripts/worktree_startup_live_benchmark.py create-marker \
+  --root-path /absolute/path/to/disposable/large/repository \
+  --workspace-id '<workspace-uuid>' \
+  --root-id '<root-uuid>' \
+  --owner-token "$OWNER_TOKEN" \
+  --confirm-disposable-root
+```
+
+The marker binds its canonical root, workspace UUID, root UUID, owner token,
+disposable purpose, and SHA-256 digest. Preflight/run/smoke/cleanup also resolve
+the workspace by UUID through `manage_workspaces`, require the exact name and
+root membership, and require the planned root to be the sole root before and
+after the campaign. A missing, changed, renamed, system/current-only, or
+operator-named substitute is rejected. Workspace creation, root
+addition/removal, and visible window changes can request app approval; prepare
+the workspace before the campaign.
+
+Write an immutable plan without contacting the app:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py plan \
+  --workspace-name "RPCE 8E Bench 20260625T120000Z" \
+  --window-id 3 \
+  --workspace-id '<workspace-uuid>' \
+  --context-id '<context-uuid>' \
+  --root-id '<root-uuid>' \
+  --root-path /absolute/path/to/large/repository \
+  --owner-token "$OWNER_TOKEN" \
+  --dataset-label rpce-large \
+  --asserted-file-count 100000 \
+  --base-ref HEAD \
+  --search-marker WorkspaceRootSeedPlanner \
+  --read-path Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceRootSeedPlanner.swift \
+  --read-marker WorkspaceRootSeedPlanner \
+  --invocations-per-series 3 \
+  --output /tmp/rpce-worktree-startup-plan.json
+```
+
+`read-path` must name a blob committed in the exact `base-ref`, and that blob
+must contain both `search-marker` and `read-marker`. Plan resolves `base-ref` to
+an immutable commit OID, verifies the blob through that OID, and freezes both
+the commit OID and blob SHA-256. Preflight, run, and smoke re-resolve the symbolic
+ref and reject drift; every app/local worktree start uses the stored OID. The rest of a
+100k/1M pressure fixture may remain untracked in the parent root, but an
+untracked-only marker cannot be inherited by an app-created Git worktree and is
+rejected.
+
+`asserted_file_count` is operator-supplied provenance, not an app measurement.
+The plan freezes the ownership-marker digest; do not recreate or edit the marker
+between cohorts.
+The plan is the sole source of truth for required route/process/checkout/width
+cells and aggregate thresholds. The current interactive-readiness plan freezes
+baseline, forced-full, and projected routes; warm and aged linked-worktree
+process states; widths 1/4/8; a 30% primary improvement gate; and a 10%
+secondary-regression gate. Cold/main-root evidence is recorded separately as
+external provenance. Do not add implicit cold, width-2, 40%, or 5% requirements
+in the runner or aggregate. Correctness scenarios still cover nested inherited
+Agent Mode, selection and `get_code_structure`, exact-root/cross-root negatives,
+non-Git behavior, watcher changes, and ordinary/worktree root churn.
+
+Run schema discovery and exact-scope verification before mutation:
+
+Explicitly enable the DEBUG-only gate for the campaign; the harness verifies it
+but never changes this global setting on the operator's behalf:
+
+```bash
+rpce-cli-debug -w 3 -c app_settings -j \
+  '{"op":"set","key":"agent_mode.worktree_startup_benchmark_diagnostics_enabled","value":true}'
+```
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py preflight \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --confirm-live-debug-app
+```
+
+Preflight rejects a moved symbolic `base-ref`, rechecks the tracked marker blob
+through the stored commit OID, freezes
+SHA-256 hashes for the relevant CLI schemas, and requires the DEBUG benchmark
+token plus `manage_workspaces.remove_folder`. A marker, schema, or scope change
+invalidates the campaign; do not silently substitute IDs.
+Restore the gate to its prior value after all run/smoke cleanup completes.
+
+### Route and concurrency cohorts
+
+Run one route/process/checkout/width series at a time. Every retained series
+uses one excluded warmup and 3–5 normal samples; five is the release-gate
+default. The plan defaults to exactly three invocation artifacts per matrix
+cell. Valid slow samples remain included. A rerun gets a new invocation ID and
+never replaces the old artifact; an unplanned extra invocation makes the
+campaign incomplete rather than supplying replacement samples.
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py run \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --route forced-full \
+  --process-state warm \
+  --checkout-kind linked-worktree \
+  --width 4 \
+  --invocation 1 \
+  --warmups 1 \
+  --samples 5 \
+  --confirm-live-debug-app \
+  --confirm-process-state
+```
+
+Repeat for `baseline`, `forced-full`, and `projected`; process states `cold`,
+`warm`, and `aged`; and widths 1/2/4/8. Automated route samples are always
+app-created `linked-worktree` starts. `baseline` is the ordinary automatic
+full-crawl control.
+`forced-full` forces that safe route. `projected` is valid only when the export
+contains exactly one `diffSeedServing` publication, no `fullCrawl`, and no
+fallback. Observation/full-crawl data is work-attribution evidence, not a
+projected-serving latency sample.
+
+Actual-route accounting is exact: baseline and forced-full each require exactly
+`{"fullCrawl":1}`, projected requires exactly `{"diffSeedServing":1}`, and
+every cohort requires an empty fallback map. Configured route names alone never
+satisfy the gate.
+
+The current DEBUG token does not measure initial main-workspace opening. Capture
+main-checkout cold/warm root-ready/search/read separately from the existing
+restore/readiness diagnostics and retain it beside the campaign; the driver
+does not offer a label-only `main` route that could be mistaken for a real
+measurement. If that evidence is absent, the final decision is `incomplete`,
+never a pass.
+Record reviewed external evidence in the same plan namespace rather than
+putting an unstructured claim in the scoreboard:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py record-evidence \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --scenario cold-main-workspace-open-root-ready \
+  --status pass \
+  --details /tmp/cold-main-sanitized-details.json \
+  --output /tmp/cold-main-evidence.json
+```
+
+Also record `main-checkout-cold-warm-root-search-read`. The other required
+records are `fresh-process-provenance`,
+`aged-process-session-and-thread-inventory`, and
+`host-sleep-and-thermal-validity`. `aggregate --evidence <file>` accepts each
+reviewed record; missing or plan-mismatched evidence keeps the gate incomplete.
+
+Each sample records correlation-scoped:
+
+- p50/p95 materialize-to-root-ready, first-search completion, and first-read
+  completion;
+- first search/read tool duration;
+- configured and actual route plus every fallback reason;
+- Git command count, family, priority, duration, and queue wait;
+- filesystem operation/item/duration counts and codemap attribution;
+- process CPU, average/peak core utilization, peak and retained resident memory,
+  and peak and retained physical footprint;
+- content oracles, receipt ambiguity/eviction, and cleanup state.
+
+Every sample record, diagnostic export, and ordinal has a one-to-one mapping
+to a unique correlation UUID and unique Agent Mode session UUID. Aggregation
+rejects reuse, disagreement between record/export IDs, duplicate ordinals,
+mixed artifact/cohort identities, and extra or missing invocation/sample
+counts. Any attempted sample—including an excluded warmup—with route,
+attribution, or correctness failure invalidates the cohort and campaign; valid
+extras cannot mask it.
+
+### Correctness, watchers, and root churn
+
+Run the smoke lane after route sampling:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py smoke \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --confirm-live-debug-app \
+  --confirm-dedicated-workspace
+```
+
+The smoke lane uses a script-owned app worktree and temporary roots. It checks:
+
+- the active parent makes exactly 20 calls, alternating ten `file_search` and
+  ten `read_file` calls against the tracked marker, then returns exactly
+  `RPCE_ACTIVE_PARENT_OK`. Its transcript rejects Bash/shell/exec, delegation,
+  any other substitute tool, missing/extra/reordered invocations or paired
+  result events, explicitly unsuccessful statuses, or a missing final sentinel.
+  `agent_manage.get_log` intentionally emits spartan self-closing result events,
+  so the harness does not claim unavailable result payload/status proof; terminal
+  `completed` plus the exact sentinel is the available completion evidence;
+- a nested child started from the parent context has the exact parent session
+  and inherited worktree. The child start is an atomic CLI bind+call explicitly
+  routed to the parent context; the child must return a distinct context UUID
+  and exactly the same inherited worktree binding ID/path set as the parent.
+  Its spartan transcript must contain one ordered `file_search` plus `read_file`
+  invocation/result pair, terminal `completed`, and the exact final sentinel;
+- every smoke CLI invocation atomically binds its requested context and records
+  exactly two JSON documents in order—binding, then final raw tool result—and
+  rejects missing, extra, or reordered documents. Validators accept the
+  current successful raw shapes (`content_match_groups`, `display_path`,
+  selection `files[].root_path/path_within_root`, and code-structure
+  `files/issues/summary`) while requiring tool success, the exact bound root,
+  exact requested/returned paths, marker content, and no unexpected cross-root
+  files (same-root related codemaps are permitted);
+- relative result paths require explicit per-file root metadata, a unique root
+  prefix, or a single-root atomic binding. Ambiguous roots—including distinct
+  roots sharing a basename—and otherwise unattributed relative paths fail;
+- selection and explicit/selected `get_code_structure` use runtime root
+  UUID/path/type evidence plus binding and per-file root/path evidence to
+  exclude cross-root/non-Git substitutions;
+- main/worktree/non-Git marker searches do not leak across explicit root filters;
+- non-Git search/read work and the code map returns that root's own current
+  marker content rather than a graph from another root, with exactly one
+  attributed `get_code_structure` work record and zero Git commands;
+- watcher create, edit, rename, and delete converge via bounded polling of
+  successful exact-binding raw search records;
+- before, during, and after every ordinary/linked-worktree add/remove, the
+  parent remains `running` on the identical context and the during-poll overlaps
+  the mutation interval;
+- added roots appear in the exact workspace inventory and pass search/read,
+  selection, and codemap checks; removed roots disappear from inventory and
+  revoke search/read/selection/codemap state;
+- add/remove overlaps at least one in-flight `file_search`, `read_file`,
+  selection, or `get_code_structure` subprocess call, rather than claiming a
+  race from calls that already completed;
+- removed-root search must succeed with zero matches/files searched, selection
+  must omit the removed root, and code structure must succeed with
+  `status:unavailable` plus `path_not_found`; all are checked against an atomic
+  binding that must no longer contain the exact former Git root and an explicit request
+  path under that root. `read_file` currently reports removal as an invalid-params
+  error, so only the exact former path plus the explicit “not inside any loaded
+  folder” rejection is accepted. Generic or mismatched failures are rejected,
+  and the surviving root must still succeed through exact binding/path evidence.
+  The separate non-Git codemap check instead requires the current non-Git root
+  remain present in the binding and serve successful current-marker code-map
+  structure evidence.
+
+The harness records and checks parent and child terminal status, removes only
+roots it added, cancels/waits only sessions it started, and removes registered,
+clean, script-owned worktrees only after every relevant agent is terminal or
+cancelled. Cleanup evidence must include terminal agents, removed secondary
+roots/worktrees, restored route control, unchanged benchmark setting, successful
+diagnostic reset, stopped resource sampling, and restoration to the sole planned
+root. Dirty, nonterminal, missing-identity, or otherwise ambiguous resources are
+preserved for manual cleanup. Resume interrupted cleanup with:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py cleanup \
+  --artifact /tmp/rpce-worktree-startup/v1/<run> \
+  --confirm-live-debug-app \
+  --confirm-owned-resources
+```
+
+Resumed cleanup treats `state.json` resource IDs as selectors, never as ownership
+proof. It does not use `agent_manage.list_sessions`, request per-worktree status,
+or depend on any inventory limit. It first reads the cheap status-free worktree
+inventory, then uses the exact benchmark correlation/control record to recover
+the server-known session, target tab, repository, worktree, branch, head, binding,
+phase, and physical-path digest. Logical unbind/release and a zero-count
+session-specific store-drain snapshot are mandatory before physical deletion.
+The final status-free inventory and drain snapshot must remain clear. Missing or
+ambiguous identity, timeouts, nonterminal agents, shared roots, open watchers,
+queued/applying publications, dirty worktrees, or nonzero drain counts cause no
+physical deletion; the action is reported as manual cleanup.
+
+The DEBUG memory sampler returns an immutable `session_id`, rejects every
+occupied `start` (including requests that contain legacy `reset:true`), refuses
+`reset` while active, and accepts `stop` only for the matching live ID. Normal
+teardown stores and stops that exact ID. Resumed cleanup first proves the live
+`current.session_id` and label match the recorded artifact, then conditionally
+stops that ID; a foreign, missing, failed, or ambiguous session is preserved for
+manual cleanup. A stale state-file flag is not accepted. A proven worktree is
+removed only after all recorded agents are terminal/cancelled.
+
+Raw CLI responses may contain paths or source snippets. Run directories are
+created non-overwriting with mode `0700`; files use `0600`. Review before
+sharing. Summary/scoreboard output must not be treated as privacy-scrubbed raw
+evidence.
+
+### Mandatory live codemap projection-demand gate
+
+`codemap-gate` is the packaged-app release authority for live codemap demand.
+It uses the already-running current DEBUG app, `rpce-cli-debug`, the exact
+dedicated workspace plan above, and real `agent_run` sessions. It never builds,
+launches, stops, or relaunches the app. Prepare lifecycle state separately with
+the approval required by `AGENTS.md`. The planned root must be an owned,
+synthetic or explicitly source-allowlisted Git workspace with at least 5,000
+supported code files; the existing `plan` command's 100,000-file minimum is a
+valid stronger fixture. Each measured directory fixture must remain within the
+gate's 100-file output bound; use the separate overflow fixture for rejection.
+
+Create a private fixture JSON. It must contain at least 20 unique individual
+files and 20 unique directories. Every marker must occur in the exact tracked
+or intentionally synthetic source file named by that entry, and the overflow
+directory must contain at least two listed individual fixtures:
+
+```json
+{
+  "schema_version": 1,
+  "individuals": [
+    {"path": "Sources/Large/A.swift", "marker": "CodemapGateA"}
+  ],
+  "directories": [
+    {
+      "path": "Sources/Large/DirectoryA",
+      "expected_file": "Sources/Large/DirectoryA/Entry.swift",
+      "marker": "CodemapDirectoryGateA"
+    }
+  ],
+  "overflow_directory": "Sources/Large/Overflow",
+  "watcher_directory": ".rpce-codemap-gate"
+}
+```
+
+Use a retained, previously accepted `codemap-gate` `summary.json` from the same
+fixture digest as the baseline, plus a separately reviewed acceptance ledger.
+The ledger is strict JSON and binds the raw summary-file SHA-256, artifact ID,
+and fixture SHA-256; one exact entry must match. Supply the ledger's separately
+reviewed SHA-256 explicitly so a synthetic summary plus synthetic ledger cannot
+self-attest:
+
+```json
+{
+  "schema_version": 1,
+  "kind": "codemap-gate-baseline-ledger",
+  "accepted_summaries": [
+    {
+      "artifact_id": "20260625T000000Z-codemap-gate-example",
+      "summary_sha256": "<sha256-of-the-exact-summary.json-bytes>",
+      "fixture_sha256": "<fixture_sha256-from-summary.json>"
+    }
+  ]
+}
+```
+
+Baseline validation compares the schema, gate, metric, configuration, privacy,
+and fixture-digest inventories, not individual correctness scenario keys, and
+the non-Git checks contribute no performance metric. A previously accepted
+same-fixture baseline therefore stays valid across the non-Git scenario change;
+record the changed scenario set in the run's acceptance notes instead of
+bumping the schema version, loosening thresholds, or self-accepting a baseline
+from the feature run.
+
+The release gate deliberately refuses a missing, hand-written/unaccepted,
+different-fixture, wrong-count, missing-inventory, zero, `NaN`, or infinite
+baseline:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py codemap-gate \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --fixture /tmp/rpce-codemap-gate-fixture.json \
+  --baseline /tmp/rpce-codemap-retained-baseline/summary.json \
+  --baseline-ledger /tmp/rpce-codemap-baseline-ledger.json \
+  --baseline-ledger-sha256 <independently-reviewed-ledger-sha256> \
+  --cold-samples 20 \
+  --warm-samples 40 \
+  --confirm-live-debug-app \
+  --confirm-dedicated-workspace \
+  --confirm-synthetic-allowlisted-source
+```
+
+The printed artifact directory is local raw evidence. It contains the exact
+`rpce-cli-debug` JSON, agent transcript XML, sample NDJSON, state, cleanup,
+resource, fixture, plan, and derived summary files. Directories must remain
+`0700` and files `0600`. The final scan fails closed on credential patterns,
+the developer checkout, unallowlisted home/private paths, or mode drift.
+Only the separate derived `summary.json` shape is shareable: scenario IDs,
+hashed relative identifiers, content/presence hashes, statuses, issue codes,
+counters, and timings. Do not publish raw artifacts.
+
+The command passes only when all of these gates pass:
+
+1. There are exactly the configured counts (minimum 20 cold and 40 warm) for both the
+   individual-file and directory cohorts. Every cold file must first prove
+   absence of its exact codemap `+` marker through a non-demanding tree probe;
+   warm repetitions reuse those same cold fixtures. All requests use the
+   server-owned fixed 10-second readiness deadline. Before live work begins,
+   the harness saves `rpce-cli-debug describe get_code_structure` and fails
+   immediately if the model-facing schema advertises a caller-controlled
+   readiness deadline; no harness or agent request may tune that deadline.
+2. Every successful structure request is exactly `ready`, contains the expected
+   real codemap marker and a content hash at the current logical path, and is
+   followed by an atomically same-context tree request bound to the exact root,
+   requested direct parent, full reconstructed logical file path, `+` marker and
+   `(+ denotes code-map available)` legend. `partial`/`pending` or a
+   readiness-derived subset fails.
+3. One small, fail-fast real `agent_run` probe covers two individual files and
+   two directories, followed by the inherited-worktree child and concurrent
+   ordinary/linked agents; this is not a large inference/stress loop. Raw
+   transcripts prove ordered call/result pairs and forbid caller-controlled
+   readiness limits.
+   Every agent also has exact monotonic timings and structured content/path/tree
+   evidence. If transcript result events are spartan, the harness performs the
+   exact structure/tree probes atomically in that same session context/worktree
+   and records the session-context-binding correlation. Any Bash, shell,
+   exec, command, delegation, substitute encoding, unexpected tool, missing
+   result, reordering, or wrong final sentinel fails. Spartan self-closing agent
+   result events are invocation evidence only and never borrow evidence from an
+   unrelated cohort.
+4. The primary root continues serving structure while a script-owned secondary
+   linked-worktree root is added and removed. A root-targeted DEBUG hold keeps
+   the linked-root agent itself running immediately before removal. After
+   removal, that exact session/context must terminalize or be cancelled and an
+   atomic probe of its old full path must return typed empty revocation with the
+   linked root absent from binding and no primary/cross-root fallback.
+5. Non-Git search/read succeeds and structure maps the root's current on-disk
+   bytes: the scoped engine is present, reports `source_kind:filesystem` and
+   `manifest_mode:not_applicable`, records no manifest write or queued manifest
+   mutation byte, and a subsequent edit replaces the old marker with the new one
+   in the next structure reply. Build/projection/catalog counters are not
+   required to move, because automatic indexing may already have completed and
+   content-addressed reuse can avoid extraction; process absence is proven by
+   the native injected-spawner test, not by this mode text. Watcher
+   create/edit/rename/delete publishes only current structure and markers.
+   Strict directory overflow returns empty `budget`, `attempted:2`, `limit:1`,
+   and zero downstream build/projection/catalog demand.
+6. Every directly timed server `get_code_structure` request in raw CLI evidence
+   terminates within the 10,000 ms server wait plus 500 ms harness allowance;
+   agent calls additionally require ordered paired results and terminal success.
+   The held timeout itself must occur within 10,000 ms ± 500 ms and
+   report `attempted` in that same band with `limit:10000`; these values come
+   from the internal fixed default, never a request field. An immediate mocked
+   timeout fails. The DEBUG-only token-owned hold pauses only future projection
+   batch admission, auto-expires, and must produce an empty typed `timeout` with
+   `readiness_timeout`, issue-level and reply-level retry metadata. Releasing
+   the exact hold followed by retry must produce current `ready` content.
+7. The baseline must have the exact metric, gate, privacy, configuration, and
+   sample inventories; every required p50/p95 is finite and positive, every
+   gate passes, privacy is complete, and the separate acceptance-ledger digest
+   matches. Separate p50/p95 distributions are present for cold/warm individual
+   structure, cold/warm directory structure, tree-marker availability, first
+   search, first read, root readiness, projection queue wait, operation
+   duration, and memory deltas. Root/search/read p95 and warm structure p50/p95
+   may regress no more than 10% from the retained baseline; memory-delta p95
+   uses the same fail-closed 10% ceiling.
+8. No projection budget/resource counter is exceeded, no byte counter
+   saturates, all holds are released or proven expired, only script-owned roots,
+   files, agents, and worktrees are removed, memory sampling is stopped, the
+   benchmark setting is unchanged, and the workspace returns to its sole
+   planned root. Interrupted Git-root removal additionally requires successful
+   live `cleanup_worktree_ownership_evidence`; non-Git removal requires its live
+   artifact/plan/token-bound marker. Cleanup directly proves every recorded
+   session and has no 1,000-session cap.
+
+Any missing raw evidence, missing retry delay, stale path/content/marker,
+privacy leak, non-Git manifest persistence, stale non-Git marker,
+latency/resource regression, nonterminal agent, ambiguous ownership, or
+incomplete cleanup is a hard failure. On an
+interrupted run, use the existing `cleanup` command with the artifact path; it
+releases or proves expiry of recorded codemap holds and removes recorded added
+roots only when its independent ownership checks pass. Temporary non-Git roots
+carry an exclusive artifact/plan/token-bound ownership marker; a mutable
+`state.json` path or basename prefix is never sufficient deletion proof.
+
+### Aggregation, thresholds, and append-only scoreboard
+
+Aggregate offline after collecting every matrix cell and correctness smoke:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py aggregate \
+  --plan /tmp/rpce-worktree-startup-plan.json \
+  --artifact /tmp/rpce-worktree-startup/v1/<run-1> \
+  --artifact /tmp/rpce-worktree-startup/v1/<run-2> \
+  --evidence /tmp/cold-main-evidence.json \
+  --output /tmp/rpce-worktree-startup-aggregate
+```
+
+The aggregate emits `summary.json` and a reviewable
+`scoreboard-section.md`. After reviewing evidence and paths, append—never
+rewrite—the candidate to
+`prompt-exports/optimize-content-addressed-codemaps-runs.md`. The explicit
+automation path is guarded and append-only:
+
+```bash
+python3 Scripts/worktree_startup_live_benchmark.py aggregate \
+  ... \
+  --append-scoreboard prompt-exports/optimize-content-addressed-codemaps-runs.md \
+  --confirm-append-scoreboard
+```
+
+The production-enable gate is all-or-nothing:
+
+1. zero file/folder/search/read/selection/codemap/watcher/root-lifecycle
+   correctness mismatches;
+2. zero eligible projected fallbacks after warmup;
+3. projected p95 improves at least 40% over forced-full for root-ready,
+   first-search, and first-read;
+4. every other latency p95 regresses no more than 5%;
+5. absolute peak/final RSS and physical-footprint growth are each no more than
+   10%, including width 8 and aged-app cohorts; signed deltas are report-only,
+   and missing, zero, negative, or non-finite control baselines fail closed;
+6. artifact IDs, cohort/invocation keys, sample ordinals, correlation UUIDs,
+   and session UUIDs are unique, one-to-one, and cannot mix reruns; planned
+   invocation and sample counts are exact;
+7. every documented CPU/RSS, Git, filesystem, actual-route, and fallback field
+   is present and valid: availability is explicit; counts are nonnegative
+   integers; Git family and priority totals equal command count; filesystem
+   operation/item counts and duration are typed and internally consistent;
+   RSS/physical-footprint absolutes are positive finite values with coherent
+   peaks/deltas; CPU totals, sample count, duration, and average/peak core
+   utilization are finite, ranged, and internally consistent;
+8. teardown evidence is complete: agents terminal, secondary roots/worktrees
+   removed, memory sampling stopped and independently verified, route/settings
+   restored or unchanged, diagnostics reset, and the sole planned root restored.
+
+Missing matrix cells, CPU/physical-footprint data, cold main-root evidence, or
+correctness evidence yields `incomplete`. Any recorded invalid attempt yields
+`fail`; it is never silently excluded from campaign validity. Never infer a gate
+from configured route names, untyped text, generic tool failures, or additional
+valid samples.
+
+Script-only validation, with no app or CLI calls:
+
+```bash
+python3 -m py_compile Scripts/worktree_startup_live_benchmark.py
+python3 Scripts/worktree_startup_live_benchmark.py --help
+python3 Scripts/worktree_startup_live_benchmark.py create-marker --help
+python3 Scripts/worktree_startup_live_benchmark.py self-test
+python3 Scripts/worktree_startup_live_benchmark.py self-test --help
+python3 Scripts/worktree_startup_live_benchmark.py plan --help
+python3 Scripts/worktree_startup_live_benchmark.py record-evidence --help
+python3 Scripts/worktree_startup_live_benchmark.py preflight --help
+python3 Scripts/worktree_startup_live_benchmark.py run --help
+python3 Scripts/worktree_startup_live_benchmark.py smoke --help
+python3 Scripts/worktree_startup_live_benchmark.py codemap-gate --help
+python3 Scripts/worktree_startup_live_benchmark.py aggregate --help
+python3 Scripts/worktree_startup_live_benchmark.py cleanup --help
+```
+
+## Handoff checklist
+
+- Protected contract, plausible defect, chosen layer, and observable oracle.
+- Added/renamed/consolidated/removed exact IDs, including complete `old -> new/removed` mappings.
+- Exact focused and broader validation commands with results appropriate to the changed boundary.
+- Style, guardrail, build, smoke, or packaging evidence when applicable.
+- For performance work: measurement protocol, retained evidence, sample validity, and timing comparison.
+- Any coverage deliberately omitted, removed, moved to diagnostics, or replaced by a guardrail, with justification.

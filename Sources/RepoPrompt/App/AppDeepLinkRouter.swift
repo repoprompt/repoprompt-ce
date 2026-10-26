@@ -1,8 +1,21 @@
 import AppKit
 import Foundation
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class AppDeepLinkRouter {
+    private struct WorkspaceCandidateRepresentation {
+        enum Source {
+            case authority
+            case pendingPersistentPublication(PendingPersistentWorkspacePublication)
+            case ephemeralLiveWindow
+        }
+
+        let workspace: WorkspaceModel
+        let targetWindow: WindowState
+        let source: Source
+    }
+
     static let shared = AppDeepLinkRouter()
 
     private let windowStatesManager: WindowStatesManager
@@ -22,9 +35,9 @@ final class AppDeepLinkRouter {
     func route(url: URL, preferredLegacyWindow: WindowState?) async {
         switch AppDeepLinkRoute.parse(url: url) {
         case let .route(.legacyURL(legacyURL)):
-            routeLegacyURL(legacyURL, preferredWindow: preferredLegacyWindow)
+            await routeLegacyURL(legacyURL, preferredWindow: preferredLegacyWindow)
         case let .route(.agentSession(route)):
-            await routeAgentSession(route)
+            await routeAgentSession(route, sourceURL: url)
         case .invalidScopedRoute:
             NSApp.activate(ignoringOtherApps: true)
         case .unsupported:
@@ -46,15 +59,31 @@ final class AppDeepLinkRouter {
         }
     }
 
+    /// Notification click routing. Unlike in-app `route(agentSession:)`, a click that arrives before any
+    /// window is live (cold launch from the notification, or MCP background mode) queues the route URL;
+    /// `WindowStatesManager.registerWindowState` drains it once a window registers.
     func route(notificationRoute route: AgentSessionDeepLinkRoute?) async {
         guard let route else {
-            NSApp.activate(ignoringOtherApps: true)
+            NSApp?.activate(ignoringOtherApps: true)
             return
         }
-        await routeAgentSession(route)
+        let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        guard !liveWindows.isEmpty else {
+            windowStatesManager.pendingURLs.append(route.url)
+            NSApp?.activate(ignoringOtherApps: true)
+            if MCPBackgroundModeCoordinator.shared.isBackgrounded {
+                MCPBackgroundModeCoordinator.shared.restore()
+            }
+            return
+        }
+        _ = await self.route(agentSession: route)
     }
 
-    private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) {
+    func route(agentSession route: AgentSessionDeepLinkRoute) async -> AgentSessionRouteResult {
+        await routeAgentSession(route, sourceURL: nil)
+    }
+
+    private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) async {
         let targetWindow: WindowState? = if let preferredWindow, !preferredWindow.isClosing {
             preferredWindow
         } else {
@@ -65,28 +94,202 @@ final class AppDeepLinkRouter {
             windowStatesManager.pendingURLs.append(url)
             return
         }
-        targetWindow.handleIncomingURL(url)
+        guard let command = targetWindow.decodeOpenCommand(from: url) else {
+            targetWindow.handleIncomingURL(url)
+            return
+        }
+        await routeOpenCommand(
+            command,
+            sourceURL: url,
+            receivingWindow: targetWindow,
+            attemptedWindowIDs: [targetWindow.windowID]
+        )
     }
 
-    private func legacyTargetWindow(for url: URL) -> WindowState? {
+    private func routeOpenCommand(
+        _ command: AppCommand,
+        sourceURL: URL,
+        receivingWindow: WindowState,
+        attemptedWindowIDs: Set<Int>
+    ) async {
+        guard let folderPath = command.folderPath, !folderPath.isEmpty else {
+            receivingWindow.enqueueCommand(command)
+            return
+        }
+
+        let routingCatalog = await receivingWindow.workspaceManager.workspaceRoutingCatalogSnapshot()
+        let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        guard liveWindows.contains(where: { $0 === receivingWindow }) else {
+            await rerouteOpenCommand(
+                command,
+                sourceURL: sourceURL,
+                attemptedWindowIDs: attemptedWindowIDs
+            )
+            return
+        }
+        guard let routingCatalog else {
+            receivingWindow.enqueueCommand(
+                command,
+                folderRoute: .unresolved(
+                    expectedRoot: WorkspaceRootSetKey(paths: [folderPath])
+                )
+            )
+            return
+        }
+        let expectedRoot = WorkspaceRootSetKey(paths: [folderPath])
+        let admitsEphemeral = command.ephemeral == true || command.persist == false
+        var candidateRepresentations: [UUID: WorkspaceCandidateRepresentation] = [:]
+
+        // Persistent candidates come from one runtime-owned catalog snapshot. An authority-absent
+        // persistent model is visible only while its exact creation task has a retained publication
+        // token; live-window supplementation is otherwise restricted to ephemeral workspaces.
+        for workspace in routingCatalog {
+            candidateRepresentations[workspace.id] = WorkspaceCandidateRepresentation(
+                workspace: workspace,
+                targetWindow: receivingWindow,
+                source: .authority
+            )
+        }
+        for window in liveWindows {
+            for workspace in window.workspaceManager.workspaces
+                where !workspace.isEphemeral && candidateRepresentations[workspace.id] == nil
+            {
+                guard let publication = window.workspaceManager.pendingPersistentWorkspacePublication(
+                    workspaceID: workspace.id,
+                    exactRoot: expectedRoot
+                ) else { continue }
+                candidateRepresentations[workspace.id] = WorkspaceCandidateRepresentation(
+                    workspace: workspace,
+                    targetWindow: window,
+                    source: .pendingPersistentPublication(publication)
+                )
+            }
+            if admitsEphemeral,
+               let activeWorkspace = window.workspaceManager.activeWorkspace,
+               activeWorkspace.isEphemeral,
+               candidateRepresentations[activeWorkspace.id] == nil
+            {
+                candidateRepresentations[activeWorkspace.id] = WorkspaceCandidateRepresentation(
+                    workspace: activeWorkspace,
+                    targetWindow: window,
+                    source: .ephemeralLiveWindow
+                )
+            }
+        }
+
+        let candidates = candidateRepresentations.values.map(\.workspace)
+        guard let winner = WorkspaceFolderOpenResolver.bestEligibleMatch(
+            forFolderPath: folderPath,
+            in: candidates,
+            admittingEphemeral: admitsEphemeral
+        ),
+            let winningRepresentation = candidateRepresentations[winner.id]
+        else {
+            receivingWindow.enqueueCommand(
+                command,
+                folderRoute: .unresolved(
+                    expectedRoot: WorkspaceRootSetKey(paths: [folderPath])
+                )
+            )
+            return
+        }
+
+        let targetWindow: WindowState = if case .pendingPersistentPublication = winningRepresentation.source {
+            winningRepresentation.targetWindow
+        } else if command.focus == true,
+                  let activeWindow = liveWindows.first(where: { window in
+                      guard let activeWorkspace = window.workspaceManager.activeWorkspace,
+                            activeWorkspace.id == winner.id
+                      else { return false }
+                      return WorkspaceFolderOpenResolver.containsExactRoot(
+                          folderPath,
+                          in: activeWorkspace
+                      )
+                  })
+        {
+            activeWindow
+        } else {
+            winningRepresentation.targetWindow
+        }
+
+        guard !targetWindow.isClosing else {
+            await rerouteOpenCommand(
+                command,
+                sourceURL: sourceURL,
+                attemptedWindowIDs: attemptedWindowIDs.union([targetWindow.windowID])
+            )
+            return
+        }
+        let folderRoute: FolderRouteState = switch winningRepresentation.source {
+        case .authority:
+            .authorityExactRoot(expectedRoot: expectedRoot)
+        case let .pendingPersistentPublication(publication):
+            .pendingPersistentPublication(publication)
+        case .ephemeralLiveWindow:
+            .ephemeralLiveWindowSupplement(
+                workspaceID: winner.id,
+                expectedRoot: expectedRoot
+            )
+        }
+        targetWindow.enqueueCommand(command, folderRoute: folderRoute)
+    }
+
+    private func rerouteOpenCommand(
+        _ command: AppCommand,
+        sourceURL: URL,
+        attemptedWindowIDs: Set<Int>
+    ) async {
+        guard let retryWindow = legacyTargetWindow(
+            for: sourceURL,
+            excluding: attemptedWindowIDs
+        ) else {
+            windowStatesManager.pendingURLs.append(sourceURL)
+            return
+        }
+        await routeOpenCommand(
+            command,
+            sourceURL: sourceURL,
+            receivingWindow: retryWindow,
+            attemptedWindowIDs: attemptedWindowIDs.union([retryWindow.windowID])
+        )
+    }
+
+    private func legacyTargetWindow(
+        for url: URL,
+        excluding attemptedWindowIDs: Set<Int> = []
+    ) -> WindowState? {
+        let liveWindows = windowStatesManager.allWindows.filter {
+            !$0.isClosing && !attemptedWindowIDs.contains($0.windowID)
+        }
         switch Self.legacyWindowPreference(for: url) {
         case .earliest:
-            windowStatesManager.allWindows.first
+            return liveWindows.first
         case .latest:
-            windowStatesManager.latestWindowState
+            return liveWindows.last
         }
     }
 
-    private func routeAgentSession(_ route: AgentSessionDeepLinkRoute) async {
-        NSApp.activate(ignoringOtherApps: true)
+    @discardableResult
+    private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, sourceURL: URL?) async -> AgentSessionRouteResult {
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        if let app = NSApp {
+            app.activate(ignoringOtherApps: true)
+        }
+        guard !liveWindows.isEmpty else {
+            if let sourceURL {
+                windowStatesManager.pendingURLs.append(sourceURL)
+            }
+            return .workspaceUnavailable
+        }
         var attemptedWindowIDs = Set<Int>()
+        var latestResult: AgentSessionRouteResult = .workspaceUnavailable
 
         for candidate in Self.agentSessionPreferredExistingWindows(for: route, in: liveWindows) {
             attemptedWindowIDs.insert(candidate.windowID)
             let result = await routeAgentSession(route, on: candidate)
+            latestResult = result
             if result == .routed || !Self.shouldTryNextAgentSessionWindow(after: result) {
-                return
+                return result
             }
         }
 
@@ -94,10 +297,12 @@ final class AppDeepLinkRouter {
             where !attemptedWindowIDs.contains(candidate.windowID)
         {
             let result = await routeAgentSession(route, on: candidate)
+            latestResult = result
             if result == .routed || !Self.shouldTryNextAgentSessionWindow(after: result) {
-                return
+                return result
             }
         }
+        return latestResult
     }
 
     private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, on targetWindow: WindowState) async -> AgentSessionRouteResult {

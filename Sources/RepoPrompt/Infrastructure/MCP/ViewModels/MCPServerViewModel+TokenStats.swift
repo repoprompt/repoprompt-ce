@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 extension MCPServerViewModel {
     nonisolated static func makeTokenStats(
@@ -76,6 +77,441 @@ extension MCPServerViewModel {
                 gitDiff: gitTokens,
                 metadata: otherTokens
             )
+        )
+    }
+}
+
+extension MCPServerViewModel {
+    struct MCPPreparedTokenAccounting {
+        let entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult]
+        let breakdown: TokenComponentBreakdown
+        let tokenAccounting: ToolResultDTOs.TokenAccountingDTO
+        let activePublishedSnapshot: TokenCountingViewModel.PublishedTokenSnapshot?
+    }
+
+    /// Canonical `TokenAccountingDTO.incompleteComponents` values, in stable display order.
+    ///
+    /// - `published_snapshot`: the active tab's published token snapshot is stale/incomplete.
+    /// - `files`: selected file content or per-file token inputs are missing.
+    /// - `codemap_presentation`: requested codemap presentation is pending or retryable.
+    /// - `file_tree`: file-tree tokens require asynchronous virtual-context rendering.
+    /// - `git`: git-review tokens require asynchronous virtual-context rendering.
+    private static let tokenAccountingComponentOrder = [
+        "published_snapshot",
+        "files",
+        "codemap_presentation",
+        "file_tree",
+        "git"
+    ]
+
+    @MainActor
+    func prepareMCPTokenAccounting(
+        context: MCPTabContextSnapshot,
+        effectiveSelection: StoredSelection,
+        collections: SelectionReplyAssembler.SelectionCollections,
+        resolvedContext: PromptContextResolved,
+        lookupContext: WorkspaceLookupContext,
+        presentationActiveContext: Bool,
+        allowActivePublishedSnapshotRefresh: Bool = true,
+        allowVirtualTokenRefresh: Bool = true
+    ) async -> MCPPreparedTokenAccounting {
+        if presentationActiveContext {
+            let publishedOverlay = publishedEntryResultsOverlay(
+                collections: collections,
+                base: [:],
+                describesActiveTab: true
+            )
+            let published = promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
+                for: effectiveSelection,
+                scheduleRefreshIfNeeded: allowActivePublishedSnapshotRefresh
+            )
+            var incompleteComponents = Self.virtualSnapshotIncompleteComponents(
+                collections: collections,
+                reliableFileIDs: publishedOverlay.reliableFileIDs
+            )
+            if !published.isComplete {
+                incompleteComponents.insert("published_snapshot")
+            }
+
+            let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
+            if allowActivePublishedSnapshotRefresh, !incompleteComponents.isEmpty {
+                if incompleteComponents.contains("files") {
+                    promptVM.tokenCountingViewModel.markDirty(.selection)
+                }
+                if incompleteComponents.contains("codemap_presentation") {
+                    promptVM.tokenCountingViewModel.markDirty(.codeMap)
+                }
+                if incompleteComponents.contains("published_snapshot") {
+                    promptVM.tokenCountingViewModel.markDirty()
+                }
+            }
+            let refreshPending = published.refreshPending
+                || (allowActivePublishedSnapshotRefresh && !incompleteComponents.isEmpty)
+            let status = if !incompleteComponents.isEmpty {
+                "incomplete"
+            } else if published.isStale {
+                "stale"
+            } else {
+                "fresh"
+            }
+
+            return MCPPreparedTokenAccounting(
+                entryResultsByFileID: publishedOverlay.entryResultsByFileID,
+                breakdown: .init(
+                    prompt: published.breakdown.prompt,
+                    duplicatePrompt: 0,
+                    instructions: published.breakdown.meta,
+                    fileTree: published.breakdown.fileTree,
+                    gitDiff: published.breakdown.git,
+                    metadata: max(published.breakdown.other - published.codeMapTokens, 0)
+                ),
+                tokenAccounting: .init(
+                    status: status,
+                    source: "active_tab_published",
+                    refreshPending: refreshPending,
+                    incompleteComponents: orderedIncomplete
+                ),
+                activePublishedSnapshot: published
+            )
+        }
+
+        let cachedEvaluation = await cachedPromptEntriesEvaluation(collections: collections)
+        let publishedOverlay = publishedEntryResultsOverlay(
+            collections: collections,
+            base: cachedEvaluation.entryResultsByFileID,
+            describesActiveTab: false
+        )
+        let signature = virtualTokenSignature(
+            context: context,
+            selection: effectiveSelection,
+            resolvedContext: resolvedContext,
+            lookupContext: lookupContext,
+            codeMapUsage: collections.codeMapUsage
+        )
+        if allowVirtualTokenRefresh,
+           let cachedSnapshot = mcpVirtualTokenSnapshotsByTabID[context.tabID]?[signature]
+        {
+            let incompleteComponents = Self.virtualSnapshotIncompleteComponents(
+                collections: collections,
+                reliableFileIDs: Set(cachedSnapshot.entryResultsByFileID.keys)
+            )
+            let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
+            // The virtual-token signature intentionally captures logical selection and prompt
+            // shape, but not file-content, search-catalog, or codemap-authority generations.
+            // Treat every cache hit as a stale lower-bound and refresh in the background so
+            // bound agent tabs cannot permanently report obsolete token totals as fresh.
+            enqueueVirtualTokenRefresh(
+                signature: signature,
+                context: context,
+                effectiveSelection: effectiveSelection,
+                resolvedContext: resolvedContext,
+                collections: collections,
+                lookupContext: lookupContext
+            )
+            return MCPPreparedTokenAccounting(
+                entryResultsByFileID: cachedSnapshot.entryResultsByFileID,
+                breakdown: cachedSnapshot.breakdown,
+                tokenAccounting: .init(
+                    status: "stale",
+                    source: "bound_tab_cache",
+                    refreshPending: true,
+                    incompleteComponents: orderedIncomplete
+                ),
+                activePublishedSnapshot: nil
+            )
+        }
+
+        var incompleteComponents = Self.virtualSnapshotIncompleteComponents(
+            collections: collections,
+            reliableFileIDs: publishedOverlay.reliableFileIDs
+        )
+        if resolvedContext.rendersFileTree {
+            incompleteComponents.insert("file_tree")
+        }
+        if resolvedContext.gitInclusion != .none {
+            incompleteComponents.insert("git")
+        }
+        let orderedIncomplete = Self.orderedIncompleteComponents(incompleteComponents)
+        if allowVirtualTokenRefresh, !incompleteComponents.isEmpty {
+            enqueueVirtualTokenRefresh(
+                signature: signature,
+                context: context,
+                effectiveSelection: effectiveSelection,
+                resolvedContext: resolvedContext,
+                collections: collections,
+                lookupContext: lookupContext
+            )
+        }
+        let selectedInstructionsText = promptVM.metaInstructions(
+            for: resolvedContext,
+            selectedPromptIDsOverride: context.selectedMetaPromptIDs
+        )
+        .map(\.content)
+        .joined(separator: "\n\n")
+        let promptText = resolvedContext.includeUserPrompt ? context.promptText : ""
+        let duplicatePrompt = resolvedContext.includeUserPrompt
+            ? promptVM.duplicateUserInstructionsAtTop
+            : false
+        return MCPPreparedTokenAccounting(
+            entryResultsByFileID: publishedOverlay.entryResultsByFileID,
+            breakdown: TokenCalculationService.calculateComponentBreakdown(
+                promptText: promptText,
+                selectedInstructionsText: selectedInstructionsText,
+                fileTreeText: "",
+                gitDiffText: nil,
+                metadataText: nil,
+                duplicateUserInstructionsAtTop: duplicatePrompt
+            ),
+            tokenAccounting: .init(
+                status: incompleteComponents.isEmpty ? "fresh" : "incomplete",
+                source: "bound_tab_cached_state",
+                refreshPending: allowVirtualTokenRefresh && !incompleteComponents.isEmpty,
+                incompleteComponents: orderedIncomplete
+            ),
+            activePublishedSnapshot: nil
+        )
+    }
+
+    /// Overlays the window token counter's latest published per-file values, which describe the
+    /// active tab. For any other tab, only values that tab can share are borrowed: never slice
+    /// display counts, and full counts only when the active publication measured them.
+    @MainActor
+    private func publishedEntryResultsOverlay(
+        collections: SelectionReplyAssembler.SelectionCollections,
+        base: [UUID: PromptEntriesEvaluation.EntryResult],
+        describesActiveTab: Bool
+    ) -> (
+        entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult],
+        reliableFileIDs: Set<UUID>
+    ) {
+        var entryResults = base
+        var reliableFileIDs = Set<UUID>()
+        let activeEntryMetrics = describesActiveTab
+            ? nil
+            : promptVM.tokenCountingViewModel.latestPublishedTokenSnapshot(
+                for: nil,
+                scheduleRefreshIfNeeded: false
+            ).entryMetricsSnapshot
+        for entry in collections.selected {
+            let renderMode: PromptEntriesEvaluation.RenderMode = entry.ranges?.isEmpty == false ? .slice : .full
+            if renderMode == .slice, !describesActiveTab {
+                if entryResults[entry.file.id]?.renderMode == .slice {
+                    reliableFileIDs.insert(entry.file.id)
+                }
+                continue
+            }
+            // An unmeasured active full count is a placeholder. The entry keeps its own evaluation,
+            // which stays pending when its content is not loaded.
+            if let activeEntryMetrics,
+               !Self.publishedFullCountIsMeasured(
+                   activeEntryMetrics.metricsByStandardizedFullPath[entry.file.standardizedFullPath]
+               )
+            {
+                continue
+            }
+            guard let info = promptVM.tokenCountingViewModel.latestPublishedTokenInfo(
+                forFullPath: entry.file.standardizedFullPath
+            ) else { continue }
+            let existing = entryResults[entry.file.id]
+            let displayTokens = renderMode == .slice ? info.count : info.fullCount
+            entryResults[entry.file.id] = .init(
+                fileID: entry.file.id,
+                renderedDisplayPath: existing?.renderedDisplayPath ?? entry.file.standardizedRelativePath,
+                renderMode: renderMode,
+                displayTokens: displayTokens,
+                fullTokens: info.fullCount,
+                codemapTokens: info.codemapCount,
+                displayLineCount: existing?.displayLineCount
+            )
+            reliableFileIDs.insert(entry.file.id)
+        }
+        for entry in collections.codemap {
+            guard let info = promptVM.tokenCountingViewModel.latestPublishedTokenInfo(
+                forFullPath: entry.file.standardizedFullPath
+            ) else { continue }
+            let existing = entryResults[entry.file.id]
+            entryResults[entry.file.id] = .init(
+                fileID: entry.file.id,
+                renderedDisplayPath: existing?.renderedDisplayPath ?? entry.file.standardizedRelativePath,
+                renderMode: .codemap,
+                displayTokens: info.codemapCount,
+                fullTokens: info.fullCount,
+                codemapTokens: info.codemapCount,
+                displayLineCount: existing?.displayLineCount
+            )
+            reliableFileIDs.insert(entry.file.id)
+        }
+        return (entryResults, reliableFileIDs)
+    }
+
+    /// A published full count is measured only when its publication loaded the file, which full and
+    /// sliced renders record as a line count. Codemap renders never load content, and an unread full
+    /// render records no line count, so their published full counts are placeholders.
+    private static func publishedFullCountIsMeasured(_ metric: PromptContextEntryMetric?) -> Bool {
+        guard let metric else { return false }
+        switch metric.renderMode {
+        case .full, .slice:
+            return metric.includedLineCount != nil
+        case .codemap:
+            return false
+        }
+    }
+
+    private static func orderedIncompleteComponents(
+        _ components: Set<String>
+    ) -> [String]? {
+        let ordered = tokenAccountingComponentOrder.filter(components.contains)
+        return ordered.isEmpty ? nil : ordered
+    }
+
+    private static func hasMissingFileTokenInputs(
+        collections: SelectionReplyAssembler.SelectionCollections,
+        reliableFileIDs: Set<UUID>
+    ) -> Bool {
+        collections.selected.contains { entry in
+            entry.entry.loadedContent == nil && !reliableFileIDs.contains(entry.file.id)
+        }
+    }
+
+    private static func hasPendingCodemapPresentationGaps(
+        collections: SelectionReplyAssembler.SelectionCollections
+    ) -> Bool {
+        SelectionReplyAssembler.hasPendingCodemapPresentationGaps(
+            for: SelectionReplyAssembler.codemapDiagnosticFiles(for: collections),
+            presentation: collections.codemapPresentation,
+            codeMapUsage: collections.codeMapUsage
+        )
+    }
+
+    @MainActor
+    private func cachedPromptEntriesEvaluation(
+        collections: SelectionReplyAssembler.SelectionCollections
+    ) async -> PromptEntriesEvaluation {
+        let entries = collections.selected.map(\.entry) + collections.codemap.map(\.entry)
+        let snapshots = await PromptContextAccountingService().makePromptFileEntrySnapshots(
+            from: entries,
+            codemapPresentation: collections.codemapPresentation,
+            filePathDisplay: promptVM.filePathDisplayOption
+        )
+        return await TokenCalculationService().evaluatePromptEntries(snapshots)
+    }
+
+    @MainActor
+    private func virtualTokenSignature(
+        context: MCPTabContextSnapshot,
+        selection: StoredSelection,
+        resolvedContext: PromptContextResolved,
+        lookupContext: WorkspaceLookupContext,
+        codeMapUsage: CodeMapUsage
+    ) -> MCPVirtualTokenSignature {
+        MCPVirtualTokenSignature(
+            tabID: context.tabID,
+            workspaceID: context.workspaceID,
+            selection: selection,
+            promptText: context.promptText,
+            selectedMetaPromptIDs: context.selectedMetaPromptIDs,
+            codeMapUsage: codeMapUsage.rawValue,
+            includeUserPrompt: resolvedContext.includeUserPrompt,
+            includeMetaPrompts: resolvedContext.includeMetaPrompts,
+            rendersFileTree: resolvedContext.rendersFileTree,
+            fileTreeMode: resolvedContext.effectiveFileTreeMode.rawValue,
+            gitInclusion: resolvedContext.gitInclusion.rawValue,
+            lookupScope: String(describing: lookupContext.rootScope)
+        )
+    }
+
+    @MainActor
+    private func enqueueVirtualTokenRefresh(
+        signature: MCPVirtualTokenSignature,
+        context: MCPTabContextSnapshot,
+        effectiveSelection: StoredSelection,
+        resolvedContext: PromptContextResolved,
+        collections: SelectionReplyAssembler.SelectionCollections,
+        lookupContext: WorkspaceLookupContext
+    ) {
+        if mcpVirtualTokenRefreshTasksByTabID[context.tabID]?[signature] != nil {
+            return
+        }
+        let generation = UUID()
+        mcpVirtualTokenRefreshGenerationByTabID[context.tabID, default: [:]][signature] = generation
+        #if DEBUG
+            mcpVirtualTokenRefreshStartCount += 1
+        #endif
+        mcpVirtualTokenRefreshTasksByTabID[context.tabID, default: [:]][signature] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            #if DEBUG
+                await debugBeforeVirtualTokenRefreshForTesting?()
+            #endif
+            let evaluation = await evaluateVirtualPromptEntries(
+                for: effectiveSelection,
+                codeMapUsage: collections.codeMapUsage,
+                rootScope: lookupContext.rootScope
+            )
+            guard !Task.isCancelled else { return }
+            let breakdown = await buildVirtualTokenBreakdown(
+                for: context,
+                resolvedContext: resolvedContext,
+                selectedFiles: collections.selected.map(\.file),
+                codemapFiles: collections.codemap.map(\.file),
+                lookupContext: lookupContext,
+                codemapPresentation: collections.codemapPresentation
+            )
+            guard !Task.isCancelled,
+                  mcpVirtualTokenRefreshGenerationByTabID[context.tabID]?[signature] == generation
+            else { return }
+            mcpVirtualTokenSnapshotsByTabID[context.tabID, default: [:]][signature] = MCPVirtualTokenSnapshot(
+                signature: signature,
+                entryResultsByFileID: evaluation.entryResultsByFileID,
+                breakdown: breakdown,
+                incompleteComponents: Self.orderedIncompleteComponents(
+                    Self.virtualSnapshotIncompleteComponents(
+                        collections: collections,
+                        reliableFileIDs: Set(evaluation.entryResultsByFileID.keys)
+                    )
+                )
+            )
+            mcpVirtualTokenRefreshTasksByTabID[context.tabID]?[signature] = nil
+            mcpVirtualTokenRefreshGenerationByTabID[context.tabID]?[signature] = nil
+            if mcpVirtualTokenRefreshTasksByTabID[context.tabID]?.isEmpty == true {
+                mcpVirtualTokenRefreshTasksByTabID[context.tabID] = nil
+            }
+            if mcpVirtualTokenRefreshGenerationByTabID[context.tabID]?.isEmpty == true {
+                mcpVirtualTokenRefreshGenerationByTabID[context.tabID] = nil
+            }
+        }
+    }
+
+    private static func virtualSnapshotIncompleteComponents(
+        collections: SelectionReplyAssembler.SelectionCollections,
+        reliableFileIDs: Set<UUID>
+    ) -> Set<String> {
+        var incompleteComponents = Set<String>()
+        if hasMissingFileTokenInputs(
+            collections: collections,
+            reliableFileIDs: reliableFileIDs
+        ) {
+            incompleteComponents.insert("files")
+        }
+        if hasPendingCodemapPresentationGaps(collections: collections) {
+            incompleteComponents.insert("codemap_presentation")
+        }
+        return incompleteComponents
+    }
+
+    nonisolated static func publishedTokenStats(
+        _ snapshot: TokenCountingViewModel.PublishedTokenSnapshot
+    ) -> ToolResultDTOs.TokenStats {
+        let files = snapshot.filesContentTokens + snapshot.codeMapTokens
+        return .init(
+            total: snapshot.breakdown.total,
+            files: files,
+            prompt: snapshot.breakdown.prompt > 0 ? snapshot.breakdown.prompt : nil,
+            fileTree: snapshot.breakdown.fileTree > 0 ? snapshot.breakdown.fileTree : nil,
+            meta: snapshot.breakdown.meta > 0 ? snapshot.breakdown.meta : nil,
+            git: snapshot.breakdown.git > 0 ? snapshot.breakdown.git : nil,
+            other: max(snapshot.breakdown.other - snapshot.codeMapTokens, 0),
+            filesContent: snapshot.filesContentTokens > 0 ? snapshot.filesContentTokens : nil,
+            codemaps: snapshot.codeMapTokens > 0 ? snapshot.codeMapTokens : nil
         )
     }
 }

@@ -127,6 +127,46 @@ import Foundation
             event(name, tabID: tabID, fields: renderedFields)
         }
 
+        enum CodexLifecyclePhase: String, CaseIterable {
+            case runtimeResolution = "runtime_resolution"
+            case provisioning
+            case spawnInitialize = "spawn_initialize"
+            case threadStart = "thread_start"
+            case threadResume = "thread_resume"
+            case turnAcceptance = "turn_acceptance"
+            case shutdown
+        }
+
+        enum CodexLifecycleOutcome: String, CaseIterable {
+            case succeeded
+            case failed
+            case cancelled
+        }
+
+        /// Fixed-field Codex lifecycle timing event. Typed phase/outcome values and numeric generations
+        /// prevent callers from attaching paths, prompts, identifiers, payloads, auth data, or raw errors.
+        static func recordCodexLifecyclePhase(
+            _ phase: CodexLifecyclePhase,
+            outcome: CodexLifecycleOutcome,
+            startMS: Double?,
+            tabID: UUID,
+            transportGeneration: UInt64? = nil
+        ) {
+            var fields = [
+                "phase": phase.rawValue,
+                "outcome": outcome.rawValue
+            ]
+            if let transportGeneration {
+                fields["transportGeneration"] = String(transportGeneration)
+            }
+            durationEvent(
+                "provider.codex.lifecycle.phase",
+                startMS: startMS,
+                tabID: tabID,
+                fields: fields
+            )
+        }
+
         static func counterKey(_ base: String, source: String?) -> String {
             let normalizedSource = source?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -177,6 +217,42 @@ import Foundation
             bufferLock.unlock()
             if osLogEnabled {
                 logger.debug("\(renderedMessage, privacy: .public)")
+            }
+        }
+
+        static func recordConversationReplay(
+            _ metrics: AgentConversationReplayMetrics,
+            startMS: Double?
+        ) {
+            guard isEnabled else { return }
+            var fields: [String: String] = [
+                "mode": metrics.mode.rawValue,
+                "turnCount": String(metrics.turnCount),
+                "examinedRowCount": String(metrics.examinedRowCount),
+                "unboundedOutputUTF8Bytes": String(metrics.unboundedOutputUTF8Bytes),
+                "outputUTF8Bytes": String(metrics.outputUTF8Bytes),
+                "userAuthoredUTF8Bytes": String(metrics.userAuthoredUTF8Bytes),
+                "originalToolArgumentCharacters": String(metrics.originalToolArgumentCharacters),
+                "emittedToolArgumentCharacters": String(metrics.emittedToolArgumentCharacters),
+                "truncatedToolCallCount": String(metrics.truncatedToolCallCount),
+                "omittedRowCount": String(metrics.omittedRowCount),
+                "essentialOverflowUTF8Bytes": String(metrics.essentialOverflowUTF8Bytes),
+                "finalOverBudgetUTF8Bytes": String(metrics.finalOverBudgetUTF8Bytes)
+            ]
+            for category in AgentConversationReplayCategory.allCases {
+                let categoryMetrics = metrics.categories[category] ?? .init()
+                fields["\(category.rawValue).examined"] = String(categoryMetrics.examinedCount)
+                fields["\(category.rawValue).emitted"] = String(categoryMetrics.emittedCount)
+                fields["\(category.rawValue).omitted"] = String(categoryMetrics.omittedCount)
+                fields["\(category.rawValue).unboundedUTF8Bytes"] = String(categoryMetrics.unboundedUTF8Bytes)
+                fields["\(category.rawValue).emittedUTF8Bytes"] = String(categoryMetrics.emittedUTF8Bytes)
+            }
+            durationEvent("conversationReplay.serialize", startMS: startMS, fields: fields)
+            increment("conversationReplay.serialize.\(metrics.mode.rawValue)")
+            increment("conversationReplay.truncatedToolCalls", by: metrics.truncatedToolCallCount)
+            increment("conversationReplay.omittedRows", by: metrics.omittedRowCount)
+            if metrics.essentialOverflowUTF8Bytes > 0 {
+                increment("conversationReplay.essentialOverflow")
             }
         }
 
@@ -350,6 +426,7 @@ import Foundation
                 "structured_event_dropped_count": structuredDropped,
                 "session_snapshot_limit": sessionSnapshotLimit,
                 "pending_sidebar_delete_count": pendingSidebarDeleteCount,
+                "mcp_long_thread_baseline_inventory": MCPAgentLongThreadBaselineInventory.debugSnapshot,
                 "lines": lines,
                 "counters": countersSnapshot,
                 "latest_session_snapshots": sessionSnapshots
