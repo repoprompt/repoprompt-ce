@@ -115,6 +115,7 @@ struct AgentChatOptionsMenuActions {
 private final class AgentChatOptionsMenuItem: NSMenuItem {
     private let handler: () -> Void
 
+    @MainActor
     init(title: String, symbolName: String, shortcutName: KeyboardShortcuts.Name, handler: @escaping () -> Void) {
         self.handler = handler
         super.init(title: title, action: #selector(performHandler(_:)), keyEquivalent: "")
