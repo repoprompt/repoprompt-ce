@@ -2555,10 +2555,13 @@ extension AgentTranscriptRestorationLifecycleTests {
     /// reapplies current bindings; the selection publication is never ignored by tab ID alone.
     func testSameTabSelectionWithoutLiveWorkReappliesCurrentBindings() async throws {
         try await withRealObserverSavedTab { fixture in
+            fixture.viewModel.test_setSidebarIndexBuilders(
+                prioritized: { _ in AgentSessionSidebarBuildResult(entriesBySessionID: [:], preferredSessionIDByTabID: [:]) },
+                stream: { _, _ in AsyncThrowingStream { $0.finish() } }
+            )
+            let savedItem = AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Saved content")
             var saved = AgentSession(id: fixture.sessionID, name: "Saved", savedAt: Date())
-            saved.items = [AgentChatItemPersist(
-                from: AgentChatItem(id: UUID(), timestamp: Date(), kind: .user, text: "Saved content")
-            )]
+            saved.items = [AgentChatItemPersist(from: savedItem)]
             _ = try await AgentSessionDataService.shared.saveAgentSession(saved, for: fixture.workspace)
             fixture.viewModel.setAgentModeActive(true)
             XCTAssertNil(fixture.prompt.activeComposeTabID, "precondition: selection not yet published")
@@ -2566,17 +2569,35 @@ extension AgentTranscriptRestorationLifecycleTests {
             await fixture.gate.waitUntilEntered()
             let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
             let loadTask = try XCTUnwrap(session.persistedLoadTask)
+            let activationGeneration = fixture.viewModel.test_sessionActivationGeneration
+            let binding = session.persistentSessionBindingIdentity
+            // An incidental index resume must not rescue the selection under test.
+            await fixture.viewModel.test_waitForSessionListCacheRefresh()
             await fixture.gate.open()
             await loadTask.value
-            _ = await fixture.completions.waitForFirst(tabID: fixture.tabID)
+            await fixture.completions.wait(tabID: fixture.tabID, generation: activationGeneration)
             XCTAssertTrue(session.hasLoadedPersistedState, "precondition: payload applied, no live work")
+            XCTAssertNil(session.persistedLoadTask)
+            XCTAssertNil(fixture.prompt.activeComposeTabID)
+            XCTAssertEqual(session.items.map(\.id), [savedItem.id])
+            XCTAssertTrue(fixture.viewModel.activeTranscriptPresentation.workingRows.isEmpty, "precondition: selection has not published rows")
             let generationBeforePublication = fixture.viewModel.test_sessionActivationGeneration
 
             await fixture.prompt.switchComposeTab(fixture.tabID)
 
             XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabID, "precondition: real publication")
             XCTAssertGreaterThan(fixture.viewModel.test_sessionActivationGeneration, generationBeforePublication)
-            XCTAssertEqual(fixture.viewModel.ui.transcript.snapshot.panePresentation, .transcript)
+            XCTAssertTrue(fixture.viewModel.sessions[fixture.tabID] === session)
+            XCTAssertEqual(session.persistentSessionBindingIdentity, binding)
+            XCTAssertEqual(fixture.viewModel.activeTranscriptPresentation.workingRows.map(\.id), [savedItem.id])
+            XCTAssertEqual(fixture.viewModel.activeTranscriptPresentation.visibleRows.map(\.id), [savedItem.id])
+            let snapshot = fixture.viewModel.ui.transcript.snapshot
+            XCTAssertEqual(snapshot.panePresentation, .transcript)
+            XCTAssertEqual(snapshot.presentation.workingRows.map(\.id), [savedItem.id])
+            XCTAssertEqual(snapshot.presentation.visibleRows.map(\.text), [savedItem.text])
+            XCTAssertNil(snapshot.activeSessionLoadInProgressTabID)
+            let loadAttempts = await fixture.gate.entries
+            XCTAssertEqual(loadAttempts, 1, "completed hydration is reused")
         }
     }
 }
