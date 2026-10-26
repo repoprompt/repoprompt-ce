@@ -54,7 +54,6 @@ package enum AttachmentFace: Equatable {
 package enum AttachmentStatus: Equatable {
     case ready
     case previewUnavailable
-    case refused(reason: String)
 }
 
 package struct AttachmentPresentation: Equatable {
@@ -65,21 +64,15 @@ package struct AttachmentPresentation: Equatable {
     package let status: AttachmentStatus
     package let accessibilityLabel: String
 
-    package var refusalReason: String? {
-        if case let .refused(reason) = status { reason } else { nil }
-    }
-
     package static let previewUnavailableCaption = "Preview unavailable"
     private static let maxBadgeLength = 6
 
-    /// - Parameters:
-    ///   - preview: Whether a rendered preview exists. `.pending` shows the preview face while one loads.
-    ///   - route: The route the attachment is about to travel, or nil when nothing is about to send.
+    /// Presentation makes no delivery claim: whether a route can carry a file is decided only where
+    /// `AttachmentPlanner.plan` runs, at Oracle send time.
+    /// - Parameter preview: Whether a rendered preview exists. `.pending` shows the preview face while one loads.
     package static func make(
         facts: AttachmentFacts,
-        preview: AttachmentPreviewAvailability,
-        route: AttachmentRoute? = nil,
-        limits: OracleAttachmentLimits = .production
+        preview: AttachmentPreviewAvailability
     ) -> AttachmentPresentation {
         let title = facts.fileName.isEmpty ? fallbackTitle(for: facts.kind) : facts.fileName
         let typeDescription = typeDescription(for: facts)
@@ -106,11 +99,6 @@ package struct AttachmentPresentation: Equatable {
             face = .glyph(glyph(for: facts.kind))
         }
 
-        if let route, let reason = refusal(for: facts, title: title, route: route, limits: limits) {
-            caption = reason
-            status = .refused(reason: reason)
-        }
-
         return AttachmentPresentation(
             face: face,
             title: title,
@@ -124,28 +112,6 @@ package struct AttachmentPresentation: Equatable {
                 status: status
             )
         )
-    }
-
-    private static func refusal(
-        for facts: AttachmentFacts,
-        title: String,
-        route: AttachmentRoute,
-        limits: OracleAttachmentLimits
-    ) -> String? {
-        let capability = AttachmentRouteCapability.capability(for: route)
-        guard let reason = AttachmentPlanner.refusalReason(
-            kind: facts.kind,
-            byteCount: facts.byteCount,
-            capability: capability,
-            limits: limits
-        ) else { return nil }
-        return AttachmentRefusal(
-            index: 0,
-            fileName: title,
-            kind: facts.kind,
-            routeDisplayName: capability.displayName,
-            reason: reason
-        ).reasonText
     }
 
     private static func glyph(for kind: AttachmentKind) -> AttachmentGlyph {
@@ -215,7 +181,6 @@ package struct AttachmentPresentation: Equatable {
         switch status {
         case .ready: break
         case .previewUnavailable: parts.append(previewUnavailableCaption.lowercased())
-        case let .refused(reason): parts.append("cannot be sent: \(reason)")
         }
         return parts.joined(separator: ", ")
     }

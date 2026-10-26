@@ -154,7 +154,7 @@ package enum AttachmentPlanner {
 
     /// Whether a file of `kind` and `byteCount` is refused on a route before any bytes are read, so a
     /// surface that only knows the persisted facts can warn ahead of the request.
-    package static func refusalReason(
+    static func refusalReason(
         kind: AttachmentKind,
         byteCount: Int,
         capability: AttachmentRouteCapability,

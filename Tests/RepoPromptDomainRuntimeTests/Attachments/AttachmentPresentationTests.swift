@@ -7,13 +7,11 @@ final class AttachmentPresentationTests: XCTestCase {
         _ kind: AttachmentKind,
         _ fileName: String,
         byteCount: Int = 2048,
-        preview: AttachmentPreviewAvailability,
-        route: AttachmentRoute? = nil
+        preview: AttachmentPreviewAvailability
     ) -> AttachmentPresentation {
         AttachmentPresentation.make(
             facts: AttachmentFacts(kind: kind, fileName: fileName, byteCount: byteCount),
-            preview: preview,
-            route: route
+            preview: preview
         )
     }
 
@@ -55,22 +53,6 @@ final class AttachmentPresentationTests: XCTestCase {
         XCTAssertEqual(tile.badge, "ZIP")
     }
 
-    func testRefusedFileCarriesTheRefusalReasonOnItsTile() throws {
-        let tile = make(.pdf, "spec.pdf", preview: .available, route: .openAIChat)
-        guard case let .refused(reason) = tile.status else { return XCTFail("expected refusal, got \(tile.status)") }
-        XCTAssertEqual(tile.caption, reason)
-        XCTAssertFalse(reason.isEmpty)
-        XCTAssertTrue(tile.accessibilityLabel.contains(reason))
-    }
-
-    func testRefusalAppearsOnlyForRoutesThatCannotCarryTheKind() {
-        XCTAssertEqual(make(.pdf, "spec.pdf", preview: .available, route: .anthropicMessages).status, .ready)
-        XCTAssertEqual(make(.pdf, "spec.pdf", preview: .available, route: nil).status, .ready)
-        guard case .refused = make(.pdf, "spec.pdf", preview: .available, route: .openAIChat).status else {
-            return XCTFail("OpenAI chat cannot carry a PDF")
-        }
-    }
-
     func testDegenerateFactsNeverProduceABlankTile() {
         for kind in AttachmentKind.allCases {
             let tile = make(kind, "", byteCount: 0, preview: .unavailable)
@@ -90,36 +72,5 @@ final class AttachmentPresentationTests: XCTestCase {
         XCTAssertTrue(AttachmentFacts(kind: .pdf, fileName: "a", byteCount: 1).canHavePreview)
         XCTAssertFalse(AttachmentFacts(kind: .text, fileName: "a", byteCount: 1).canHavePreview)
         XCTAssertFalse(AttachmentFacts(kind: .binary, fileName: "a", byteCount: 1).canHavePreview)
-    }
-
-    func testFactsLevelRefusalMatchesThePlannerForEveryRouteAndKind() {
-        let samples: [(AttachmentKind, OracleAttachment)] = [
-            (.image, AttachmentTestFixtures.attachment(.image(.png, Data([1])), fileName: "a.png")),
-            (.pdf, AttachmentTestFixtures.attachment(.pdf(AttachmentTestFixtures.pdfBytes()), fileName: "a.pdf")),
-            (.text, AttachmentTestFixtures.textAttachment("hello", fileName: "a.txt")),
-            (.binary, AttachmentTestFixtures.attachment(.binary(Data([0, 1])), fileName: "a.bin"))
-        ]
-        for route in AttachmentRoute.allCases {
-            for (kind, attachment) in samples {
-                let planned = AttachmentPlanner.plan(
-                    OracleAttachmentSet([attachment]),
-                    route: route,
-                    limits: .production
-                )
-                let facts = AttachmentFacts(kind: kind, fileName: attachment.fileName, byteCount: attachment.payload.byteCount)
-                let warns: Bool = if case .refused = AttachmentPresentation
-                    .make(facts: facts, preview: .available, route: route).status { true } else { false }
-                let refused: Bool = if case .failure = planned { true } else { false }
-                XCTAssertEqual(warns, refused, "\(route) \(kind)")
-            }
-        }
-    }
-
-    func testOversizeTextIsRefusedOnInlineRoutes() {
-        let limits = OracleAttachmentLimits.production
-        let facts = AttachmentFacts(kind: .text, fileName: "big.log", byteCount: limits.maxInlineTextBytes + 1)
-        guard case .refused = AttachmentPresentation.make(facts: facts, preview: .unavailable, route: .anthropicMessages).status else {
-            return XCTFail("expected oversize refusal")
-        }
     }
 }
