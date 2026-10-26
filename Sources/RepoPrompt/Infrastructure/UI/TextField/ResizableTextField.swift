@@ -73,6 +73,8 @@ final class AttachmentAwareTextView: NSTextView {
     var attachmentPasteHandler: ((NSPasteboard) -> Bool)?
     var enablesAttachmentPasteHandling = false
     var commandReturnHandler: (() -> Bool)?
+    /// Which key press triggers `commandReturnHandler`; `nil` keeps the fixed Command-Return.
+    var commandReturnMatcher: ((NSEvent) -> Bool)?
     var readOnlyReturnHandler: (() -> Void)?
     var beginUserEditingHandler: (() -> Void)?
     private(set) var currentKeyDownEvent: NSEvent?
@@ -92,7 +94,17 @@ final class AttachmentAwareTextView: NSTextView {
         currentKeyDownEvent = event
         defer { currentKeyDownEvent = previousEvent }
         if handleReadOnlyReturn(event) { return }
+        // Remapped bindings without Command never reach performKeyEquivalent.
+        if commandReturnMatcher != nil, isEditable, !hasMarkedText(), let commandReturnHandler,
+           isCommandReturnTrigger(event), event.isARepeat || commandReturnHandler()
+        {
+            return
+        }
         super.keyDown(with: event)
+    }
+
+    func isCommandReturnTrigger(_ event: NSEvent) -> Bool {
+        commandReturnMatcher?(event) ?? Self.isCommandReturn(event)
     }
 
     /// Non-editable NSTextView does not reliably forward insertion commands to its delegate.
@@ -112,7 +124,7 @@ final class AttachmentAwareTextView: NSTextView {
         {
             beginUserEditingHandler?()
         }
-        if Self.isCommandReturn(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
+        if isCommandReturnTrigger(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
            let commandReturnHandler
         {
             if event.isARepeat || commandReturnHandler() { return true }
@@ -297,6 +309,8 @@ struct ResizableTextField: View {
     var onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
+    /// Optional configurable trigger for `onCommandReturn`; `nil` keeps Command-Return.
+    var commandReturnMatcher: ((NSEvent) -> Bool)?
     var onReadOnlyReturn: (() -> Void)?
     /// Explicit, scoped handoff after a transient composer interaction finishes.
     var focusRestoreRequest: UUID?
@@ -366,6 +380,7 @@ struct ResizableTextField: View {
             onBeginUserEditing: onBeginUserEditing,
             onEscape: onEscape,
             onCommandReturn: onCommandReturn,
+            commandReturnMatcher: commandReturnMatcher,
             onReadOnlyReturn: onReadOnlyReturn,
             focusRestoreRequest: focusRestoreRequest,
             nativeEditor: nativeEditor,
@@ -411,6 +426,8 @@ struct CustomTextField: NSViewRepresentable {
     var onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
+    /// Optional configurable trigger for `onCommandReturn`; `nil` keeps Command-Return.
+    var commandReturnMatcher: ((NSEvent) -> Bool)?
     var onReadOnlyReturn: (() -> Void)?
     /// Explicit, scoped handoff after a transient composer interaction finishes.
     var focusRestoreRequest: UUID?
@@ -488,6 +505,7 @@ struct CustomTextField: NSViewRepresentable {
             coordinator?.beginUserEditingIfNeeded(textView: textView)
         }
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
+        textView.commandReturnMatcher = commandReturnMatcher
         textView.readOnlyReturnHandler = onReadOnlyReturn
         textView.attachmentPasteHandler = isReadOnly ? nil : onAttachmentPaste
         textView.enablesAttachmentPasteHandling = !isReadOnly && onAttachmentPaste != nil
@@ -528,6 +546,7 @@ struct CustomTextField: NSViewRepresentable {
         context.coordinator.restoreFocusIfRequested(textView: textView)
         context.coordinator.beginExternalEditIfNeeded()
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
+        textView.commandReturnMatcher = commandReturnMatcher
         textView.readOnlyReturnHandler = onReadOnlyReturn
         textView.attachmentPasteHandler = isReadOnly ? nil : onAttachmentPaste
         textView.enablesAttachmentPasteHandling = !isReadOnly && onAttachmentPaste != nil
@@ -615,6 +634,7 @@ struct CustomTextField: NSViewRepresentable {
         textView.delegate = nil
         textView.attachmentPasteHandler = nil
         textView.commandReturnHandler = nil
+        textView.commandReturnMatcher = nil
         textView.readOnlyReturnHandler = nil
         textView.beginUserEditingHandler = nil
         coordinator.connectedNativeEditor?.detach(textView)
@@ -811,7 +831,9 @@ struct CustomTextField: NSViewRepresentable {
                 let flags = event?.modifierFlags.intersection([.shift, .command, .option, .control]) ?? []
                 if flags == .shift {
                     textView.insertNewline(nil) // Shift+Return → newline
-                } else if flags == .command, let action = parent.onCommandReturn {
+                } else if flags == .command, let action = parent.onCommandReturn,
+                          parent.commandReturnMatcher.map({ matches in event.map(matches) ?? false }) ?? true
+                {
                     if event?.isARepeat == true { return true }
                     return action()
                 } else if flags.isEmpty {

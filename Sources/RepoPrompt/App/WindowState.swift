@@ -1289,6 +1289,47 @@ class WindowState: ObservableObject {
         }
     }
 
+    /// Stops the current session's active run through the same guarded target as the composer
+    /// Stop button. Returns `false` when there is nothing to stop.
+    @discardableResult
+    func stopAgentRunFromShortcut() -> Bool {
+        let viewModel = agentModeViewModel
+        guard viewModel.isAgentModeActive,
+              let target = viewModel.composerRunCancelTarget(tabID: viewModel.currentTabID)
+        else { return false }
+        Task { _ = await viewModel.cancelAgentRun(target: target) }
+        return true
+    }
+
+    /// Moves focus to the current session's composer. Ending the current field's editing first
+    /// matches clicking into the composer; the composer still validates its tab and window.
+    func focusAgentComposerFromShortcut() {
+        let viewModel = agentModeViewModel
+        guard viewModel.isAgentModeActive, let tabID = viewModel.currentTabID, let nsWindow else { return }
+        if nsWindow.firstResponder !== nsWindow { nsWindow.makeFirstResponder(nil) }
+        viewModel.repromptUIStore.requestComposerFocus(tabID: tabID)
+    }
+
+    /// Restores the most recently stashed session, like reopening the last closed tab.
+    func reopenLastStashedAgentSessionFromShortcut() {
+        guard let workspace = workspaceManager.activeWorkspace, !workspace.isSystemWorkspace,
+              agentModeViewModel.canPerformDirectSidebarCommand(workspaceID: workspace.id),
+              let stashed = workspace.stashedTabs.max(by: { $0.stashedAt < $1.stashedAt })
+        else { return }
+        Task { await promptManager.unstashTab(stashed.id) }
+    }
+
+    /// Switches to the next session in sidebar order with an unseen attention badge.
+    func focusNextAttentionAgentSessionFromShortcut() {
+        guard workspaceManager.activeWorkspace?.isSystemWorkspace == false,
+              let tabID = agentModeViewModel.nextAttentionSidebarSessionTabID(
+                  from: promptManager.activeComposeTabID,
+                  in: promptManager.currentComposeTabs
+              )
+        else { return }
+        Task { await promptManager.switchComposeTab(tabID) }
+    }
+
     func requestClose(authorization: WindowCloseAuthorization? = nil) {
         if let authorization {
             closeCoordinator.enqueueAuthorization(authorization)

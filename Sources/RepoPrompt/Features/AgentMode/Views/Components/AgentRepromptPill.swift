@@ -14,6 +14,11 @@ struct AgentRepromptPill: View {
     @State private var showingHowItWorks = false
     /// The composer that opened the disclosure, captured at open time rather than at dismissal.
     @State private var disclosureSourceTabID: UUID?
+    @ObservedObject private var shortcutDisplay = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
+
+    private var rewriteKey: String {
+        shortcutDisplay.localLabel(for: .repromptDraft)
+    }
 
     /// Model availability loads asynchronously after the pill snapshot is first built.
     /// Rebuild the snapshot when it changes so first use does not stay on "Choose a model".
@@ -35,7 +40,7 @@ struct AgentRepromptPill: View {
             }
             if !props.isAvailable { modelChooser }
         }
-        .hoverTooltip(props.unavailableReason ?? "Re-prompt · \(viewModel.repromptMode.displayName). Return rewrites, Return again sends; ⌘Return rewrites again. Model: \(props.modelDisplayName ?? "unavailable").", .top)
+        .hoverTooltip(props.unavailableReason ?? "Re-prompt · \(viewModel.repromptMode.displayName). Return rewrites, Return again sends\(rewriteKey.isEmpty ? "" : "; \(rewriteKey) rewrites again"). Model: \(props.modelDisplayName ?? "unavailable").", .top)
         .accessibilityLabel("Re-prompt")
         .accessibilityValue(props.isOn ? "On" : "Off")
         .contextMenu {
@@ -113,8 +118,11 @@ struct AgentRepromptPill: View {
                     .font(.caption).fixedSize(horizontal: false, vertical: true)
             }
             DisclosureGroup("How it works", isExpanded: $showingHowItWorks) {
-                Text(AgentRepromptDisclosure.howItWorks)
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(AgentRepromptDisclosure.howItWorks(
+                    rewriteKey: rewriteKey,
+                    sendOriginalKey: shortcutDisplay.localLabel(for: .repromptSendOriginal)
+                ))
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             .font(.caption)
             HStack {

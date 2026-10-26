@@ -24,10 +24,15 @@ enum AgentRepromptDisclosure {
         ]
     }
 
-    static let howItWorks = "Send or Return rewrites the message in the composer; press either again to send the visible text. "
-        + "You can keep editing at any time; typing stops the rewrite. Esc restores the original for your next Send, ⌘↩ rewrites again, "
-        + "and ⌘⇧O sends the original immediately. Clarification is optional; an answer may trigger one more rewrite. Send automatically mode "
-        + "(Re-prompt menu) dispatches completed rewrites unless a question or slash-leading text needs review."
+    /// Describes the current, user-configurable Re-prompt bindings (empty when cleared).
+    static func howItWorks(rewriteKey: String, sendOriginalKey: String) -> String {
+        let rewrite = rewriteKey.isEmpty ? "" : ", \(rewriteKey) rewrites again"
+        let original = sendOriginalKey.isEmpty ? "" : ", \(sendOriginalKey) sends the original immediately"
+        return "Send or Return rewrites the message in the composer; press either again to send the visible text. "
+            + "You can keep editing at any time; typing stops the rewrite. Esc restores the original for your next Send\(rewrite)\(original). "
+            + "Clarification is optional; an answer may trigger one more rewrite. Send automatically mode "
+            + "(Re-prompt menu) dispatches completed rewrites unless a question or slash-leading text needs review."
+    }
 }
 
 extension AgentModeViewModel {

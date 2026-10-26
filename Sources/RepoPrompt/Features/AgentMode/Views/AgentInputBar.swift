@@ -785,6 +785,7 @@ struct AgentComposerView: View, Equatable {
                     else { operation.cancel() }
                 },
                 onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
+                commandReturnMatcher: { LocalKeyboardShortcut.matches($0, .repromptDraft) },
                 focusRestoreRequest: composerFocusRestoreRequest,
                 nativeEditor: nativeComposerEditor,
                 nativeEditorIdentity: currentTabID.map { AnyHashable($0) },

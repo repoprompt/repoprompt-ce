@@ -11,6 +11,18 @@ struct AgentRepromptComposerStrip: View {
     @State private var showingOriginal = false
     @State private var confirmingReplacement = false
     @State private var confirmingOriginal = false
+    /// Live assignments: both commands are user-configurable composer-local bindings.
+    @ObservedObject private var shortcutDisplay = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
+
+    private var sendOriginalKey: String {
+        shortcutDisplay.localLabel(for: .repromptSendOriginal)
+    }
+
+    private var rewriteHint: String {
+        let key = shortcutDisplay.localLabel(for: .repromptDraft)
+        guard !key.isEmpty else { return "" }
+        return " · \(key) rewrite"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -20,9 +32,12 @@ struct AgentRepromptComposerStrip: View {
                     HStack(spacing: 6) {
                         Button {
                             if let onSendOriginal { onSendOriginal(presentation.id) } else { operation?.useOriginal() }
-                        } label: { AgentRepromptShortcutLabel(title: "Send original", shortcut: "⌘⇧O") }
-                            .keyboardShortcut("o", modifiers: [.command, .shift])
-                            .hoverTooltip("Send your original text now (⌘⇧O). Return sends the text currently in the composer.", .top)
+                        } label: { AgentRepromptShortcutLabel(title: "Send original", shortcut: sendOriginalKey) }
+                            .localKeyboardShortcut(.repromptSendOriginal)
+                            .hoverTooltip(
+                                "Send your original text now\(sendOriginalKey.isEmpty ? "" : " (\(sendOriginalKey))"). Return sends the text currently in the composer.",
+                                .top
+                            )
                         if presentation.phase != .completed {
                             Button { operation?.cancel() } label: { AgentRepromptShortcutLabel(title: "Cancel", shortcut: "esc") }
                                 .hoverTooltip("Stop rewriting and restore your original (Esc in the composer).", .top)
@@ -46,7 +61,7 @@ struct AgentRepromptComposerStrip: View {
                                 .buttonStyle(.plain).accessibilityLabel("Revert to original")
                                 .hoverTooltip("Revert to original (Esc)", .top)
                             Spacer(minLength: 4)
-                            Text("↩ send · ⌘↩ rewrite · esc revert")
+                            Text("↩ send\(rewriteHint) · esc revert")
                                 .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                         } else {
                             Spacer(minLength: 4)
@@ -116,9 +131,9 @@ struct AgentRepromptShortcutLabel: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            if shortcutFirst { shortcutText }
+            if shortcutFirst, !shortcut.isEmpty { shortcutText }
             Text(title)
-            if !shortcutFirst { shortcutText }
+            if !shortcutFirst, !shortcut.isEmpty { shortcutText }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)

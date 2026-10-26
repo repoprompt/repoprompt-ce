@@ -30,6 +30,13 @@ enum KeyboardShortcutCatalog {
             title: "Current Agent session",
             blurb: "Apply to the current session, just like its titlebar menu. Delete is unassigned by default and always asks for confirmation.",
             bindings: [
+                .init(
+                    id: "session-stop",
+                    title: "Stop current run",
+                    detail: "Same as the composer Stop button. With nothing to stop, ⌘. keeps its usual cancel behavior.",
+                    name: .stopAgentRun
+                ),
+                .init(id: "session-focus-composer", title: "Focus message composer", detail: nil, name: .focusAgentComposer),
                 .init(id: "session-pin", title: "Pin / unpin session", detail: nil, name: .pinAgentSession),
                 .init(id: "session-rename", title: "Rename session", detail: nil, name: .renameAgentSession),
                 .init(id: "session-stash", title: "Stash session", detail: nil, name: .stashAgentSession),
@@ -52,7 +59,33 @@ enum KeyboardShortcutCatalog {
                     name: .toggleContextComposer
                 ),
                 .init(id: "agent-nav-current", title: "Show Agent Session Switcher", detail: "Jump between Agent sessions in the focused window.", name: .showCurrentWindowAgentNavigationHUD),
-                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD)
+                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD),
+                .init(
+                    id: "agent-next-attention",
+                    title: "Next session needing attention",
+                    detail: "Cycle through sessions with an unseen completed, failed, or waiting badge in this window.",
+                    name: .nextAttentionAgentSession
+                ),
+                .init(
+                    id: "agent-reopen-stashed",
+                    title: "Reopen last stashed session",
+                    detail: "Restore the most recently stashed session, including one closed with ⌘W.",
+                    name: .reopenStashedAgentSession
+                )
+            ]
+        ),
+        KeyboardShortcutCatalogSection(
+            id: "composer",
+            title: "Composer",
+            blurb: "Not global: Re-prompt works while the message composer has focus, and Send original only while a Re-prompt is shown. A matching shortcut elsewhere in this list wins.",
+            bindings: [
+                .init(id: "composer-reprompt", title: "Re-prompt draft again", detail: nil, name: .repromptDraft),
+                .init(
+                    id: "composer-send-original",
+                    title: "Send original (during Re-prompt)",
+                    detail: "Sends your original text instead of the rewrite.",
+                    name: .repromptSendOriginal
+                )
             ]
         ),
         KeyboardShortcutCatalogSection(
@@ -73,10 +106,16 @@ enum KeyboardShortcutCatalog {
             blurb: "Adjust prompt and transcript text size globally.",
             bindings: [
                 .init(id: "font-up", title: "Increase font size", detail: nil, name: .increaseFontScale),
-                .init(id: "font-down", title: "Decrease font size", detail: nil, name: .decreaseFontScale)
+                .init(id: "font-down", title: "Decrease font size", detail: nil, name: .decreaseFontScale),
+                .init(id: "font-reset", title: "Reset font size", detail: nil, name: .resetFontScale)
             ]
         )
     ]
+
+    /// Commands that stay registered outside main windows (Settings frontmost, no window open).
+    static var applicationNames: [KeyboardShortcuts.Name] {
+        sections.first { $0.id == "application" }?.bindings.map(\.name) ?? []
+    }
 
     private static var workspaceAndPresetBindings: [KeyboardShortcutCatalogBinding] {
         var rows: [KeyboardShortcutCatalogBinding] = [
