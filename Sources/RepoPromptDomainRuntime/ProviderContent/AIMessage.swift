@@ -36,6 +36,11 @@ package struct AIMessage {
     /// NEW: Full conversation array, user + AI in order
     package let conversationMessages: [ConversationEntry]
 
+    /// The unmodified last user message, captured *before* prompt packaging wraps it in
+    /// `<user_instructions>`. Display titles/previews (e.g. fresh Codex thread names) read
+    /// this so they reflect what the user typed, not the packaged prompt envelope.
+    package let rawLastUserMessage: String
+
     /// Request-scoped provider payload. Never copied into persisted chat messages.
     package var transientImages: [AITransientImage]
 
@@ -125,6 +130,7 @@ package struct AIMessage {
         fileBlocks: [String] = [],
         gitDiff: String? = nil,
         conversationMessages: [ConversationEntry] = [],
+        rawLastUserMessage: String = "",
         transientImages: [AITransientImage] = [],
         temperature: Double?,
         promptSectionsOrder: [PromptSection],
@@ -137,6 +143,7 @@ package struct AIMessage {
         self.fileBlocks = fileBlocks
         self.gitDiff = gitDiff
         self.conversationMessages = conversationMessages
+        self.rawLastUserMessage = rawLastUserMessage
         self.transientImages = transientImages
         self.temperature = temperature
         self.promptSectionsOrder = promptSectionsOrder
@@ -157,6 +164,8 @@ package struct AIMessage {
         conversationMessages = [
             ConversationEntry(role: .user, content: userMessage)
         ]
+        // Raw last user message is the un-wrapped user message itself.
+        rawLastUserMessage = userMessage
         transientImages = []
         // Use library defaults for prompt ordering
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder

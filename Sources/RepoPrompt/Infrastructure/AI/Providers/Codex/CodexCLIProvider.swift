@@ -162,6 +162,7 @@ final class CodexCLIProvider: AIProvider {
         let requestedModelIdentifier = modelIdentifier(for: model)
         let fallbackReasoningEffort = model.defaultReasoningEffort
         let serviceTier = model.codexServiceTier
+        let threadTitle = Self.freshThreadTitle(from: aiMessage)
 
         return AsyncThrowingStream { continuation in
             let streamID = UUID()
@@ -185,6 +186,7 @@ final class CodexCLIProvider: AIProvider {
                         requestedModelIdentifier: requestedModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
+                        threadTitle: threadTitle,
                         requestID: streamID,
                         continuation: continuation
                     )
@@ -338,6 +340,7 @@ final class CodexCLIProvider: AIProvider {
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
+        threadTitle: String,
         requestID: UUID,
         continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
     ) async throws {
@@ -363,6 +366,7 @@ final class CodexCLIProvider: AIProvider {
                         requestedModelIdentifier: activeModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
+                        threadTitle: threadTitle,
                         excludeServers: brokenServers,
                         appServerClient: appServerClient,
                         requestTimeout: defaultRequestTimeout,
@@ -459,6 +463,7 @@ final class CodexCLIProvider: AIProvider {
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
+        threadTitle: String,
         excludeServers: Set<String>,
         appServerClient: CodexAppServerClient?,
         requestTimeout: TimeInterval,
@@ -495,6 +500,11 @@ final class CodexCLIProvider: AIProvider {
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
+                do {
+                    try await controller.setThreadName(threadTitle, threadID: sessionRef.conversationID)
+                } catch {
+                    // Best-effort: a title failure must not break the turn.
+                }
                 let turnReceipt = try await controller.startUserTurn(
                     text: prompt,
                     images: images,
@@ -695,6 +705,7 @@ final class CodexCLIProvider: AIProvider {
                     appServerClient: appServerClient,
                     requestTimeout: requestTimeout
                 )
+                // Untitled: connection-test probe — do not title (synthetic testConnection flow).
                 _ = try await controller.startOrResume(
                     existing: nil,
                     baseInstructions: baseInstructions,
@@ -1089,6 +1100,14 @@ final class CodexCLIProvider: AIProvider {
             sections.append(conversation)
         }
         return sections.filter { !$0.isEmpty }.joined(separator: "\n\n")
+    }
+
+    private static func freshThreadTitle(from aiMessage: AIMessage) -> String {
+        // Source the title from the raw, pre-packaging last user message — not
+        // `conversationMessages`, whose last user entry is wrapped in `<user_instructions>`
+        // by `PromptPackagingService.buildAIMessage` on the production Chat path.
+        let firstLine = aiMessage.rawLastUserMessage.prefix { !$0.isNewline }
+        return AgentSession.validatedName(String(firstLine.prefix(80)))
     }
 
     private func modelIdentifier(for model: AIModel) -> String? {
