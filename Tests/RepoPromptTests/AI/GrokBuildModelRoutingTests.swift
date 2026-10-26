@@ -5,6 +5,16 @@ import RepoPromptShared
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
+private actor OneShotFilteringPolicyWitness {
+    private(set) var queryCount = 0
+
+    func removedNames() -> Set<String> {
+        queryCount += 1
+        // A second policy lookup would allow the custom root again.
+        return queryCount == 1 ? ["GROK_HOME", "GROK_STORAGE_MODE"] : []
+    }
+}
+
 final class GrokBuildModelRoutingTests: XCTestCase {
     override func setUp() {
         super.setUp()
@@ -436,6 +446,45 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: neighbor, encoding: .utf8), "neighbor prompt")
     }
 
+    func testOneShotWithheldGrokHomeUsesOneSnapshotForChildAndCleanup() async throws {
+        let root = try makeOneShotFixtureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let defaultHome = root.appendingPathComponent("home/.grok", isDirectory: true)
+        let neighbor = defaultHome.appendingPathComponent("sessions/neighbor/prompt_history.jsonl")
+        let customNeighbor = root.appendingPathComponent("grok-home/sessions/neighbor/prompt_history.jsonl")
+        try writeOneShotFixture("default neighbor", to: neighbor)
+        try writeOneShotFixture("custom neighbor", to: customNeighbor)
+        let policy = OneShotFilteringPolicyWitness()
+        let provider = try makeSyntheticOneShotProvider(
+            root: root,
+            mode: "success",
+            removedNamesProvider: { provider in
+                XCTAssertEqual(provider, AgentProviderKind.grokBuild.rawValue)
+                return await policy.removedNames()
+            }
+        )
+        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            let stream = try await provider.streamAgentMessage(
+                AgentMessage(systemPrompt: "fixture system", userMessage: "fixture prompt")
+            )
+            for try await _ in stream {}
+        }
+        await provider.dispose()
+
+        let ownedPath = try String(contentsOf: root.appendingPathComponent("session-path"), encoding: .utf8)
+        let requestCWD = try String(contentsOf: root.appendingPathComponent("request-cwd"), encoding: .utf8)
+        let expectedOwned = defaultHome.appendingPathComponent("sessions/\(encodedOneShotCWD(requestCWD))")
+        XCTAssertEqual(ownedPath, expectedOwned.path, "The child must not recover copied ambient GROK_HOME")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: ownedPath), "Cleanup must select the child's filtered storage root")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: requestCWD))
+        XCTAssertEqual(try String(contentsOf: neighbor, encoding: .utf8), "default neighbor")
+        XCTAssertEqual(try String(contentsOf: customNeighbor, encoding: .utf8), "custom neighbor")
+        let queryCount = await policy.queryCount
+        XCTAssertEqual(queryCount, 1, "Do not re-read a changed policy between cleanup capture and child launch")
+        let launchPolicy = try String(contentsOf: root.appendingPathComponent("launch-policy"), encoding: .utf8)
+        XCTAssertTrue(launchPolicy.contains("GROK_STORAGE_MODE=local\n"), "Explicit isolation overrides survive ambient withholding")
+    }
+
     func testOneShotProcessFailureAndTimeoutCleanUpWithoutReplacingError() async throws {
         for mode in ["failure", "timeout"] {
             let root = try makeOneShotFixtureRoot()
@@ -481,7 +530,8 @@ final class GrokBuildModelRoutingTests: XCTestCase {
         root: URL,
         mode: String = "cancel",
         requestTimeout: TimeInterval = 30,
-        modelString: String? = nil
+        modelString: String? = nil,
+        removedNamesProvider: ProviderEnvironmentFiltering.RemovedNamesProvider? = nil
     ) throws -> GrokBuildOneShotHeadlessAgentProvider {
         let executable = root.appendingPathComponent("grok")
         let script = #"""
@@ -511,7 +561,8 @@ final class GrokBuildModelRoutingTests: XCTestCase {
                         printf "%%%s", toupper($i)
                 }
             }')
-        session="$GROK_HOME/sessions/$encoded"
+        grok_home=${GROK_HOME:-$HOME/.grok}
+        session="$grok_home/sessions/$encoded"
         /bin/mkdir -p "$session/session-id/attachments"
         printf '%s' "$cwd" > "$session/.cwd"
         /bin/cat prompt.txt > "$session/prompt_history.jsonl"
@@ -529,12 +580,18 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             exit 7
         fi
         trap 'printf "last write" > "$session/session-id/final-write" && printf "stopped" > "$RPCE_FIXTURE_ROOT/child-stopped"; exit 0' TERM
+        exec 3<> "$RPCE_FIXTURE_ROOT/hold.fifo"
         if [ "$RPCE_FIXTURE_MODE" = cancel ]; then
             printf 'ready\n' > "$RPCE_FIXTURE_ROOT/ready.fifo"
         fi
-        /bin/sleep 60 &
-        wait $!
+        while :; do
+            read -r release <&3
+        done
         """#
+        let holdFIFO = root.appendingPathComponent("hold.fifo")
+        guard mkfifo(holdFIFO.path, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
         try script.write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
         let environment = [
@@ -558,7 +615,8 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             ),
             launchResolver: GrokBuildACPLaunchResolver(environmentProvider: { _ in environment }),
             requestTimeout: requestTimeout,
-            apiKeyProvider: { nil }
+            apiKeyProvider: { nil },
+            removedNamesProvider: removedNamesProvider
         )
     }
 

@@ -8578,10 +8578,108 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 switch duringRun {
                 case "revoke-active": _ = bridge.delegationScopes.revoke(scopeID: granted.id)
                 case "delete-active":
-                    let registry = AgentSessionDeletionRegistry.shared
-                    let token = try registry.beginDurableDeletion(sessionID: targetID)
-                    try FileManager.default.removeItem(at: savedURL)
-                    await registry.didCommitDurableDeletion(token)
+                    // Completed retirement must include the original owned teardown, not just
+                    // terminal publication or watch withdrawal. Hold its real lease cleanup.
+                    let owner = try XCTUnwrap(manager.preparedOversightWindows[targetID])
+                    let session = try XCTUnwrap(targetVM.sessions[targetTab.id])
+                    let ownership = try XCTUnwrap(session.activeRunOwnership)
+                    let original = try XCTUnwrap(session.runAttemptTerminalResources)
+                    guard session.runState.isActive, original.ownership == ownership, !original.isClaimed,
+                          session.claudeController === controller
+                    else { return XCTFail("Deletion requires the original active attempt and unclaimed native resources") }
+                    let release = AgentSessionLinkStopSignal<Void>()
+                    defer { release.finish(()) }
+                    var entered = false
+                    var originalFinished = false
+                    session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
+                        let cleanup = original.claim(for: ownership, terminalState: terminalState)
+                        XCTAssertNotNil(cleanup, "Preserve the original attempt's lease cleanup")
+                        return {
+                            entered = true
+                            await release.value()
+                            await cleanup?()
+                            originalFinished = true
+                        }
+                    }
+                    let installed = try XCTUnwrap(session.runAttemptTerminalResources)
+                    guard installed !== original, installed.ownership == ownership, !installed.isClaimed else {
+                        return XCTFail("The owned cleanup wrapper must actually be installed before deletion")
+                    }
+                    var deletionFinished = false
+                    let deletion = Task { @MainActor in
+                        defer { deletionFinished = true }
+                        let registry = AgentSessionDeletionRegistry.shared
+                        let token = try registry.beginDurableDeletion(sessionID: targetID)
+                        do { try FileManager.default.removeItem(at: savedURL) }
+                        catch { registry.didFailDurableDeletion(token)
+                            throw error
+                        }
+                        await registry.didCommitDurableDeletion(token)
+                        manager.schedulePreparedOversightCleanup()
+                        await manager.preparedOversightCleanupTask?.value
+                    }
+                    @MainActor func drainAfterFailure() async {
+                        release.finish(())
+                        // A cancelled test still needs an uncancelled, bounded cleanup observer.
+                        await Task { @MainActor in
+                            var drainFinished = false
+                            let drain = Task { @MainActor in
+                                defer { withExtendedLifetime(owner) {}
+                                    drainFinished = true
+                                }
+                                _ = await deletion.result
+                                await targetVM.cancelAgentRun(tabID: targetTab.id, completion: .terminalTeardownCompleted, origin: .internalLifecycle)
+                                await manager.preparedOversightCleanupTask?.value
+                            }
+                            do {
+                                try await AsyncTestWait.waitUntil("owned failure cleanup settles", timeout: 5) { drainFinished }
+                                await drain.value
+                                if case let .failure(error) = await deletion.result {
+                                    XCTFail("Deletion failed before retirement: \(error)")
+                                }
+                                XCTAssertTrue(targetVM.sessions[targetTab.id] === session)
+                            } catch {
+                                XCTFail("Owned cleanup remains retained but unjoined after its observation budget: \(error)")
+                            }
+                        }.value
+                    }
+                    let retired = {
+                        bridge.test_activeOverseeWatches == 0 && bridge.delegationScopes.test_activeOverseeContinuationCount == 0
+                            && manager.preparedOversightWindows[targetID] == nil
+                            && manager.retiringPreparedOversightWindows[targetID] == nil
+                    }
+                    do {
+                        try await AsyncTestWait.waitUntil("original attempt cleanup entered", timeout: 5) { entered }
+                        do {
+                            try await AsyncTestWait.waitUntil("retirement cannot finish while cleanup is held", timeout: 5, condition: retired)
+                        } catch is CancellationError { throw CancellationError() }
+                        catch { /* The observation budget alone proves nothing; assert owned state below. */ }
+                        let ownerHeld = manager.preparedOversightWindows[targetID] == nil
+                            && manager.retiringPreparedOversightWindows[targetID] === owner
+                        let resourcesHeld = installed.isClaimed && original.isClaimed && !originalFinished
+                            && session.lastTerminalCommitRevision?.ownership == ownership
+                        XCTAssertTrue(ownerHeld, "The exact owner must remain retiring while original cleanup is held")
+                        XCTAssertTrue(resourcesHeld, "The installed wrapper must hold the claimed original cleanup for this revision")
+                        release.finish(())
+                        try await AsyncTestWait.waitUntil("deletion and actual manager retirement settle", timeout: 5) { deletionFinished }
+                        try await deletion.value
+                        // Observe actual retirement before any failure-only rescue join can run.
+                        let finishedOriginal = originalFinished
+                        let fullyRetired = retired()
+                        let stops = await controller.shutdownCount
+                        XCTAssertTrue(finishedOriginal, "Actual retirement must finish original cleanup before returning")
+                        XCTAssertGreaterThan(stops, 0, "Actual retirement must finish provider shutdown before returning")
+                        XCTAssertTrue(fullyRetired)
+                        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, ownership)
+                        XCTAssertFalse(decisions.contains { $0.contains("target_idle_with_new_activity") })
+                        if !ownerHeld || !resourcesHeld || !finishedOriginal || !fullyRetired || stops == 0 {
+                            await drainAfterFailure()
+                        }
+                    } catch {
+                        await drainAfterFailure()
+                        throw error
+                    }
+                    return
                 case "shutdown-active":
                     manager.setTerminatingForTesting(true)
                     let start = ContinuousClock.now

@@ -13,6 +13,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     private let launchResolver: GrokBuildACPLaunchResolver
     private let requestTimeout: TimeInterval
     private let apiKeyProvider: APIKeyProvider
+    private let removedNamesProvider: ProviderEnvironmentFiltering.RemovedNamesProvider?
     private let activeRuns = ActiveGrokBuildOneShotRunStore()
 
     init(
@@ -21,12 +22,14 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         requestTimeout: TimeInterval = 6000,
         apiKeyProvider: @escaping APIKeyProvider = {
             try await KeyManager().getAPIKey(for: .grok)
-        }
+        },
+        removedNamesProvider: ProviderEnvironmentFiltering.RemovedNamesProvider? = nil
     ) {
         self.config = config
         self.launchResolver = launchResolver
         self.requestTimeout = requestTimeout
         self.apiKeyProvider = apiKeyProvider
+        self.removedNamesProvider = removedNamesProvider
     }
 
     func streamAgentMessage(
@@ -98,10 +101,23 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         }
         try Task.checkCancellation()
 
-        // Freeze the same effective environment the runner uses, including inherited Grok home.
-        let environment = await ProcessEnvironmentBuilder.build(
+        var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if apiKey?.isEmpty != false {
+            apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        try Task.checkCancellation()
+
+        // Resolve once after key retrieval. Cleanup and the child must use this exact
+        // snapshot, even if ambient values or the filtering policy change later.
+        let ambientEnvironment = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(purpose: .cliRunner, overrides: launch.environment)
         ).environment
+        let environment = await ProviderEnvironmentFiltering.filter(
+            ambientEnvironment,
+            for: .grokBuild,
+            explicitOverrides: Self.launchEnvironment(apiKey: apiKey),
+            removedNamesProvider: removedNamesProvider
+        )
         try Task.checkCancellation()
 
         let promptDirectory = FileManager.default.temporaryDirectory
@@ -127,19 +143,14 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 command: launch.command,
                 workingDirectory: promptDirectory.path,
                 environment: environment,
+                // Do not reconstruct withheld ambient names or re-read policy here.
+                environmentFilter: { _, _ in environment },
                 additionalPaths: [],
                 enableDebugLogging: config.enableDebugLogging,
                 resolveCandidates: [(launch.command as NSString).lastPathComponent],
                 shellLookupMode: .disabled
             )
             let runner = CLIProcessRunner(config: processConfig)
-
-            var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if apiKey?.isEmpty != false {
-                apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            let additionalEnvironment = Self.launchEnvironment(apiKey: apiKey)
-            try Task.checkCancellation()
 
             let arguments = GrokBuildOneShotCLIOptions(
                 promptFilePath: promptURL.path,
@@ -154,9 +165,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 result = try await Self.runRequestProcess(
                     runner: runner,
                     arguments: arguments,
-                    timeout: requestTimeout,
-                    additionalEnvironment: additionalEnvironment,
-                    additionalRemovedKeys: environment["GROK_HOME"] == nil ? ["GROK_HOME"] : []
+                    timeout: requestTimeout
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -202,9 +211,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     private static func runRequestProcess(
         runner: CLIProcessRunner,
         arguments: [String],
-        timeout: TimeInterval,
-        additionalEnvironment: [String: String],
-        additionalRemovedKeys: Set<String>
+        timeout: TimeInterval
     ) async throws -> (stdout: Data, stderr: Data, status: Int32, timedOut: Bool) {
         let termination = GrokBuildOneShotProcessTermination()
         let stream = try await runner.runStreaming(
@@ -212,8 +219,6 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
             stdin: nil,
             outputMode: .none,
             timeout: timeout,
-            additionalEnvironment: additionalEnvironment,
-            additionalRemovedKeys: additionalRemovedKeys,
             onProcessTerminated: { _ in await termination.finish() }
         )
         var stdout = Data()

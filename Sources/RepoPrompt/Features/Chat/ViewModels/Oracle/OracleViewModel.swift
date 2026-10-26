@@ -659,6 +659,7 @@ class OracleViewModel: ObservableObject {
 
     /// Store Combine cancellables
     private var cancellables = Set<AnyCancellable>()
+    private var activeComposeTabChangedSubscription: AnyCancellable?
 
     /// Token for tab-close listener (to remove on deinit if needed)
     private var tabCloseListenerToken: UUID?
@@ -1099,6 +1100,12 @@ class OracleViewModel: ObservableObject {
         var workspaceChatSessionCancellationBeforeCleanupForTesting: (@MainActor @Sendable (UUID, UUID?) async -> Void)?
         var workspaceChatSessionDeletionBeforeCommitForTesting: (@MainActor @Sendable (UUID) async -> Void)?
         var workspaceChatSessionLoadBeforePublicationForTesting: (@MainActor @Sendable (UUID, UInt64) async -> Void)?
+        /// Revoke admission before the fixture's first yield; already-enqueued tasks are not cancelled.
+        func disableActiveComposeTabChangedListenerForTesting() {
+            activeComposeTabChangedSubscription?.cancel()
+            activeComposeTabChangedSubscription = nil
+        }
+
         var workspaceChatSessionLoadGenerationForTesting: UInt64 {
             workspaceChatSessionLoadGeneration
         }
@@ -1217,7 +1224,7 @@ class OracleViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        NotificationCenter.default.publisher(for: .activeComposeTabChanged)
+        activeComposeTabChangedSubscription = NotificationCenter.default.publisher(for: .activeComposeTabChanged)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
                 guard let self,
@@ -1228,7 +1235,6 @@ class OracleViewModel: ObservableObject {
                     await self?.handleActiveComposeTabChanged(tabID: tabID)
                 }
             }
-            .store(in: &cancellables)
 
         // Initial value
         updateUpcomingInputTokenText()

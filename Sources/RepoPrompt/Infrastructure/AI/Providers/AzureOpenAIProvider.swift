@@ -42,6 +42,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
     public let extraHeaders: [String: String]?
     public let models: [ModelDescriptor]
     public let defaultModelID: String?
+    public let httpCredentialConsentEndpoint: String?
 
     public init(
         baseURL: URL,
@@ -49,7 +50,8 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         apiVersion: String,
         extraHeaders: [String: String]? = nil,
         models: [ModelDescriptor] = [],
-        defaultModelID: String? = nil
+        defaultModelID: String? = nil,
+        httpCredentialConsentEndpoint: String? = nil
     ) {
         self.baseURL = baseURL
         self.apiKey = apiKey
@@ -57,6 +59,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         self.extraHeaders = extraHeaders
         self.models = models
         self.defaultModelID = defaultModelID
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -66,6 +69,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         case extraHeaders
         case models
         case defaultModelID
+        case httpCredentialConsentEndpoint
         case supportsChatCompletions
         case supportsResponses
     }
@@ -84,6 +88,7 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         extraHeaders = try container.decodeIfPresent([String: String].self, forKey: .extraHeaders)
         models = try container.decodeIfPresent([ModelDescriptor].self, forKey: .models) ?? []
         defaultModelID = try container.decodeIfPresent(String.self, forKey: .defaultModelID)
+        httpCredentialConsentEndpoint = try container.decodeIfPresent(String.self, forKey: .httpCredentialConsentEndpoint)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -94,6 +99,11 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         try container.encodeIfPresent(extraHeaders, forKey: .extraHeaders)
         try container.encode(models, forKey: .models)
         try container.encodeIfPresent(defaultModelID, forKey: .defaultModelID)
+        try container.encodeIfPresent(httpCredentialConsentEndpoint, forKey: .httpCredentialConsentEndpoint)
+    }
+
+    func revokingHTTPConsent() -> AzureOpenAIConfiguration {
+        AzureOpenAIConfiguration(baseURL: baseURL, apiKey: apiKey, apiVersion: apiVersion, extraHeaders: extraHeaders, models: models, defaultModelID: defaultModelID, httpCredentialConsentEndpoint: nil)
     }
 
     var authorization: Authorization {
@@ -171,7 +181,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
             maxTokens: finalMaxTokens
         )
 
-        let response = try await azureService.responseCreate(parameters)
+        let response = try await checkedAzureService().responseCreate(parameters)
         if response.status == .failed {
             let detail = response.error?.message ?? response.incompleteDetails?.reason ?? "Responses API returned a failed status."
             throw AIProviderError.invalidResponse(detail: detail)
@@ -180,11 +190,11 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
     }
 
     func fetchResponse(id: String) async throws -> ResponseModel {
-        try await azureService.responseModel(id: id, parameters: nil)
+        try await checkedAzureService().responseModel(id: id, parameters: nil)
     }
 
     func streamResponse(id: String) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let service = azureService
+        let service = try checkedAzureService()
 
         // Use polling instead of SSE for more reliable background job monitoring
         return AsyncThrowingStream { continuation in
@@ -335,7 +345,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
     }
 
     func cancelResponse(id: String) async throws -> ResponseModel {
-        try await azureService.responseCancel(id: id)
+        try await checkedAzureService().responseCancel(id: id)
     }
 }
 
@@ -365,6 +375,11 @@ final class AzureOpenAIProvider: AIProvider {
 
     init(configuration: AzureOpenAIConfiguration) {
         self.configuration = configuration
+    }
+
+    private func checkedAzureService() throws -> OpenAIService {
+        try ProviderEndpointConsent.validate(configuration.baseURL, apiKey: configuration.apiKey, customHeaders: configuration.extraHeaders ?? [:], consentEndpoint: configuration.httpCredentialConsentEndpoint)
+        return azureService
     }
 
     // MARK: - Helpers
@@ -729,7 +744,7 @@ final class AzureOpenAIProvider: AIProvider {
     }
 
     private func performResponseCompletion(parameters: ModelResponseParameter) async throws -> ResponseModel {
-        let response = try await azureService.responseCreate(parameters)
+        let response = try await checkedAzureService().responseCreate(parameters)
         guard response.status == .completed || response.status == .incomplete else {
             let status = response.status?.rawValue ?? "unknown"
             let detail = response.error?.message ?? "Response status was '\(status)'"
@@ -760,7 +775,7 @@ final class AzureOpenAIProvider: AIProvider {
                     maxTokens: finalMaxTokens,
                     stream: true
                 )
-                let stream = try await azureService.responseCreateStream(parameters)
+                let stream = try await checkedAzureService().responseCreateStream(parameters)
                 return bridgeResponseStream(stream)
             } else {
                 // Use background job + streaming attach for non-streaming Response API models.
@@ -797,7 +812,7 @@ final class AzureOpenAIProvider: AIProvider {
             reasoningEffort: reasoningEffort,
             maxTokens: finalMaxTokens
         )
-        let stream = try await azureService.startStreamedChat(parameters: parameters)
+        let stream = try await checkedAzureService().startStreamedChat(parameters: parameters)
 
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -907,7 +922,7 @@ final class AzureOpenAIProvider: AIProvider {
             reasoningEffort: reasoningEffort,
             maxTokens: finalMaxTokens
         )
-        let response = try await azureService.startChat(parameters: parameters)
+        let response = try await checkedAzureService().startChat(parameters: parameters)
         let choice = response.choices?.first
         let text = choice?.message?.content ?? ""
         let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
@@ -1036,8 +1051,10 @@ extension AzureOpenAIProvider {
     static func discoverDeployments(
         baseURL: URL,
         apiKey: String,
-        apiVersions: [String]
+        apiVersions: [String],
+        httpCredentialConsentEndpoint: String? = nil
     ) async throws -> [AzureOpenAIConfiguration.ModelDescriptor] {
+        try ProviderEndpointConsent.validate(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
         let orderedVersions = apiVersions.reduce(into: [String]()) { acc, version in
             let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, !acc.contains(trimmed) else { return }

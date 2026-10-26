@@ -64,6 +64,7 @@ extension AgentModeViewModel {
     /// rejections each restore exactly once even when restoration events
     /// coalesce in the UI.
     func restoreRejectedManualSubmissionComposerState(
+        repromptedText: String? = nil,
         tabID: UUID,
         session: TabSession,
         draftText: String,
@@ -124,6 +125,48 @@ extension AgentModeViewModel {
             strategy: .replaceAlways,
             operation: operation
         )
+        if let repromptedText {
+            repromptUIStore.recoveries[tabID] = .init(
+                text: repromptedText, originalDraft: draftText, reason: message,
+                draftAtInvalidation: retrieveDraftText(for: tabID)
+            )
+        }
+    }
+
+    /// Withdraws a run's initial user turn that a route-verification refusal kept from ever reaching
+    /// the provider, and puts its text back into an empty composer, so a resend leaves no duplicate
+    /// user row. The Claude-native counterpart of Codex's pre-dispatch rejection rollback.
+    ///
+    /// Narrowed to what it can restore losslessly: a plain-text row (no images, tagged files,
+    /// workflow, or cross-session attribution) followed only by error rows, and an empty composer.
+    /// Anything else keeps the row in the transcript for retry, as before.
+    @discardableResult
+    func restoreRouteRefusedUnsentTurn(
+        session: TabSession,
+        userItemID: UUID,
+        message: String
+    ) -> Bool {
+        let tabID = session.tabID
+        guard sessions[tabID] === session,
+              let index = session.items.firstIndex(where: { $0.id == userItemID })
+        else { return false }
+        let item = session.items[index]
+        guard item.kind == .user,
+              session.items[(index + 1)...].allSatisfy({ $0.kind == .error }),
+              !item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              item.attachments.isEmpty,
+              item.taggedFileAttachments.isEmpty,
+              item.workflow == nil,
+              item.crossSessionAttribution == nil,
+              retrieveDraftText(for: tabID).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return false }
+        guard session.removeItem(at: index) != nil else { return false }
+        session.pendingTurnRuntimeAnchors.removeAll { $0.userItemID == userItemID }
+        session.isDirty = true
+        restoreComposerDraft(tabID: tabID, text: item.text, message: message, strategy: .prependAlways)
+        requestUIRefresh(tabID: tabID, urgent: true)
+        scheduleSave(for: tabID)
+        return true
     }
 
     /// Store an editor draft. Only the caller's applied sequence is acknowledged;
@@ -152,9 +195,23 @@ extension AgentModeViewModel {
 
     private func writeDraftText(for tabID: UUID, _ text: String) {
         let previousStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
+        if !repromptUIStore.hasCancelledDraft(tabID: tabID, text: text) {
+            repromptUIStore.clearCancelledDraft(tabID: tabID)
+        }
         if let session = session(for: tabID, createIfNeeded: false) {
             guard session.draftText != text else { return }
             session.draftText = text
+            if repromptOperation?.sourceTabID == tabID {
+                repromptOperation?.noteUserMutation(text: text, generation: session.draftMutationGeneration)
+            } else if var recovery = repromptUIStore.recoveries[tabID], recovery.bypassesPreparation,
+                      !recovery.draftAtInvalidation.utf8.elementsEqual(text.utf8)
+            {
+                // Editing ends exact-draft authority. Preserve the old alternative without
+                // re-stamping its original/classification onto an unrelated new message.
+                recovery.bypassesPreparation = false
+                recovery.requiresDecision = false
+                repromptUIStore.recoveries[tabID] = recovery
+            }
         } else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
@@ -163,6 +220,7 @@ extension AgentModeViewModel {
                 tabDraftText[tabID] = text
             }
         }
+        invalidateRepromptIfNeeded()
         let nextStagedSlashCommand = stagedSlashCommandProps(tabID: tabID)
         if tabID == currentTabID, previousStagedSlashCommand != nextStagedSlashCommand {
             syncComposerUIState(tabID: tabID)
@@ -221,13 +279,22 @@ extension AgentModeViewModel {
 
     private static var attachmentIntakeTail: Task<Void, Never>?
 
-    /// Imports `urls` as pending attachments. Admission, copy, content probe and identity hash run off
+    #if DEBUG
+        static var attachmentIntakeDidImportForTesting: (@MainActor (UUID) async -> Void)?
+    #endif
+
+    /// Imports `urls` as pending attachments. File admission, copy, content probe and identity hash run off
     /// the main actor, and intakes run one at a time so a second drop dedups against the first. The
     /// returned task finishes once every file has been attached or refused; callers that delete
-    /// temporary sources must wait for it.
+    /// temporary sources must wait for it. UI callers supply a live admission check so a queued or
+    /// completed import cannot publish after the composer changes ownership.
     @discardableResult
-    func attachFiles(tabID: UUID, urls: [URL]) -> Task<Void, Never> {
-        guard !urls.isEmpty else { return Task {} }
+    func attachFiles(
+        tabID: UUID,
+        urls: [URL],
+        admission: @escaping @MainActor () -> Bool = { true }
+    ) -> Task<Void, Never> {
+        guard !urls.isEmpty, admission() else { return Task {} }
         guard let workspaceDirectory = attachmentWorkspaceDirectoryURL() else {
             reportAttachmentFailures(
                 tabID: tabID,
@@ -238,13 +305,30 @@ extension AgentModeViewModel {
 
         let previousIntake = Self.attachmentIntakeTail
         let store = attachmentStore
-        let intake = Task { @MainActor [weak self] in
+        let session = session(for: tabID)
+        let binding = session.persistentSessionBindingIdentity
+        let bindingGeneration = session.bindingTransitionGeneration
+        let intake = Task { @MainActor [weak self, weak session] in
             await previousIntake?.value
-            guard let self else { return }
-            let pending = session(for: tabID).pendingFileAttachments
+            guard let self, let session, admission(), sessions[tabID] === session,
+                  session.persistentSessionBindingIdentity == binding,
+                  session.bindingTransitionGeneration == bindingGeneration,
+                  attachmentWorkspaceDirectoryURL() == workspaceDirectory else { return }
+            let pending = session.pendingFileAttachments
             let outcome = await Task.detached(priority: .userInitiated) {
                 Self.importAttachments(urls: urls, pending: pending, store: store, workspaceDirectory: workspaceDirectory)
             }.value
+            #if DEBUG
+                await Self.attachmentIntakeDidImportForTesting?(tabID)
+            #endif
+            guard admission(), sessions[tabID] === session,
+                  session.persistentSessionBindingIdentity == binding,
+                  session.bindingTransitionGeneration == bindingGeneration,
+                  attachmentWorkspaceDirectoryURL() == workspaceDirectory
+            else {
+                store.clearConsumedLocalFiles(outcome.imported, workspaceDirectory: workspaceDirectory)
+                return
+            }
             commitAttachmentIntake(outcome, tabID: tabID)
         }
         Self.attachmentIntakeTail = intake

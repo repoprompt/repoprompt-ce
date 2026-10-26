@@ -9,6 +9,7 @@ struct AgentAskUserWizardCard: View {
     let onSubmit: () -> Void
     let onSkipAll: () -> Void
     let onUserActivity: () -> Void
+    var showsTimeout = true
 
     @State private var lastActivitySignalAt: Date?
     @State private var activityWorkGate = WorkItemGate()
@@ -103,9 +104,11 @@ struct AgentAskUserWizardCard: View {
 
             Spacer()
 
-            let countdownAnchor = pending.timeoutStartedAt ?? pending.interaction.askedAt
-            TimeoutCountdownView(startedAt: countdownAnchor, timeoutSeconds: pending.interaction.timeoutSeconds)
-                .id(countdownAnchor)
+            if showsTimeout {
+                let countdownAnchor = pending.timeoutStartedAt ?? pending.interaction.askedAt
+                TimeoutCountdownView(startedAt: countdownAnchor, timeoutSeconds: pending.interaction.timeoutSeconds)
+                    .id(countdownAnchor)
+            }
         }
     }
 
@@ -349,7 +352,11 @@ struct AgentAskUserWizardCard: View {
     }
 
     private var activitySignalInterval: TimeInterval {
-        max(0.05, min(1.0, pending.interaction.timeoutSeconds / 3.0))
+        Self.activityInterval(timeoutSeconds: pending.interaction.timeoutSeconds, showsTimeout: showsTimeout)
+    }
+
+    static func activityInterval(timeoutSeconds: TimeInterval, showsTimeout: Bool) -> TimeInterval {
+        showsTimeout ? max(0.05, min(1.0, timeoutSeconds / 3.0)) : 1.0
     }
 
     private func noteUserActivity() {

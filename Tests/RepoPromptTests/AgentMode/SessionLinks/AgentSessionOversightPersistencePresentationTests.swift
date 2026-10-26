@@ -154,6 +154,8 @@ final class AgentSessionOversightPersistencePresentationTests: XCTestCase {
             AgentSessionOversightPersistenceCopy.unreadable,
             AgentSessionOversightPersistenceCopy.quarantined,
             AgentSessionOversightPersistenceCopy.terminalRestorationSummary,
+            AgentSessionOversightPersistenceCopy.deletedRestorationSummary,
+            AgentSessionOversightPersistenceCopy.duplicateWaiting,
             AgentSessionOversightPersistenceCopy.automaticCleanupFailed,
             AgentSessionOversightPersistenceCopy.shutdownBeforeInsert,
             AgentSessionOversightPersistenceCopy.shutdownAfterInsert

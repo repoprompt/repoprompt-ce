@@ -307,6 +307,75 @@ final class AgentAttachmentIntakeTests: XCTestCase {
         XCTAssertEqual(notices, ["Failed to attach table.csv: it is already attached."])
     }
 
+    func testDelayedIntakeRechecksComposerAdmissionBeforePublishingAndCleansRejectedCopies() async throws {
+        for change in ["unchanged", "reprompt", "cleared selection", "different selection", "replaced session", "rebound session", "cycled binding"] {
+            let file = root.appendingPathComponent("delayed.txt")
+            let data = Data("attachment content".utf8)
+            try data.write(to: file)
+            let viewModel = makeViewModel()
+            let tabID = UUID()
+            let session = viewModel.session(for: tabID)
+            let store = AgentRepromptUIStore()
+            let gate = AttachmentIntakePublicationGate()
+            gate.selectedTabID = tabID
+            let storageRoot = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory)
+            let filesBefore = Set((try? FileManager.default.contentsOfDirectory(atPath: storageRoot.path)) ?? [])
+            AgentModeViewModel.attachmentIntakeDidImportForTesting = { importedTabID in
+                guard importedTabID == tabID else { return }
+                await gate.wait()
+            }
+            let task = viewModel.attachFiles(tabID: tabID, urls: [file, root], admission: {
+                store.allowsAttachmentMutation(tabID: tabID, currentTabID: gate.selectedTabID)
+            })
+            addTeardownBlock { @MainActor in
+                gate.release()
+                await task.value
+                AgentModeViewModel.attachmentIntakeDidImportForTesting = nil
+            }
+            try await AsyncTestWait.waitUntil("attachment copied before \(change)", timeout: 3) { gate.entered }
+            let filesAfterCopy = try Set(FileManager.default.contentsOfDirectory(atPath: storageRoot.path))
+            let importedCopies = filesAfterCopy.subtracting(filesBefore)
+            XCTAssertEqual(importedCopies.count, 1, change)
+            XCTAssertTrue(session.pendingFileAttachments.isEmpty, change)
+            XCTAssertTrue(session.items.isEmpty, change)
+
+            switch change {
+            case "reprompt":
+                store.presentation = .init(id: UUID(), sourceTabID: tabID, original: "Draft", modelName: "Model")
+                store.presentation?.phase = .generating
+            case "cleared selection": gate.selectedTabID = nil
+            case "different selection": gate.selectedTabID = UUID()
+            case "replaced session":
+                viewModel.sessions.removeValue(forKey: tabID)
+                _ = viewModel.session(for: tabID)
+            case "rebound session": session.testInstallPersistentSessionBinding(sessionID: UUID())
+            case "cycled binding": session.testInstallPersistentSessionBinding(sessionID: nil)
+            default: break
+            }
+            gate.release()
+            await task.value
+            AgentModeViewModel.attachmentIntakeDidImportForTesting = nil
+
+            let admitted = change == "unchanged"
+            XCTAssertEqual(session.pendingFileAttachments.map(\.fileName), admitted ? ["delayed.txt"] : [], change)
+            XCTAssertEqual(
+                session.items.filter { $0.kind == .error }.map(\.text),
+                admitted ? ["Failed to attach \(root.lastPathComponent): Only files can be attached, not folders."] : [],
+                change
+            )
+            XCTAssertEqual(
+                try Set(FileManager.default.contentsOfDirectory(atPath: storageRoot.path)),
+                admitted ? filesAfterCopy : filesBefore,
+                change
+            )
+            XCTAssertEqual(try Data(contentsOf: file), data, "\(change): the original source belongs to the user")
+            if change == "replaced session" {
+                XCTAssertTrue(viewModel.session(for: tabID).pendingFileAttachments.isEmpty)
+                XCTAssertTrue(viewModel.session(for: tabID).items.isEmpty)
+            }
+        }
+    }
+
     func testDroppedFolderIsRefusedWithAReadableReason() async throws {
         let folder = root.appendingPathComponent("Reports", isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -343,5 +412,25 @@ final class AgentAttachmentIntakeTests: XCTestCase {
                 UnsupportedHeadlessAgentProvider(reason: "attachment intake test")
             }
         )
+    }
+}
+
+@MainActor
+private final class AttachmentIntakePublicationGate {
+    var selectedTabID: UUID?
+    private(set) var entered = false
+    private var released = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        entered = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        released = true
+        continuation?.resume()
+        continuation = nil
     }
 }

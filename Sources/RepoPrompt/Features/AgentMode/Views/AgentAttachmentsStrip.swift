@@ -174,6 +174,7 @@ struct AgentAttachmentsStrip: View, Equatable {
             facts: attachment.facts,
             preview: preview(for: attachment),
             geometry: .strip,
+            labelScale: fontPreset.scaleFactor,
             isDisabled: disabled,
             onDismiss: allowsRemoval ? onRemoveAttachment.map { remove in { remove(attachment.id) } } : nil
         )

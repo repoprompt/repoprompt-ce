@@ -76,6 +76,76 @@ automated usage monitoring; using documented CLI features is not a compliance gu
 identities, credentials and raw terminal output are not logged or sent to diagnostic telemetry. Legacy
 Claude run-event telemetry remains separate and cannot authorize usage collection.
 
+## Agent Mode Re-prompt (model requests, not telemetry)
+
+Re-prompt v2 is off by default and enabled separately in each window. With consent, the first Send
+sends eligible local composer text, rewrite guidance and a bounded manifest (root names and selected
+relative paths) to the resolved **Re-prompt model**, independently of the primary Oracle. Default resolution
+prefers connected native Claude Code / Codex subscriptions, matching the current agent's provider
+when possible, then the other subscription, then configured fast API tiers (Sonnet 5.5,
+GPT-6.1 Sol Low, Gemini 3 Flash), then none. No arbitrary catalog-first or primary Oracle fallback
+is used. Other configured models require an explicit choice. The UI names the concrete model or
+shows a chooser with an actionable unavailable reason when no supported model is connected. The pill refreshes
+when connected models load; a first-use default does not require manual selection. Losing a default after use does not silently switch
+billing routes. Explicit models never fall back. A call freezes its billing route; failure/retry cannot switch it. The provider's retention
+and billing terms apply; do not send secrets you do not want that recipient to receive.
+
+**Include recent chat context** is on by default and persisted in the selected Agent Models
+profile (available in Settings and the pill's right-click menu). Only sessions with at least two prior completed user turns may send excerpts:
+the last up to three prior user bubble texts (the rewritten text when applicable) and each turn's
+final assistant reply, trimmed to approximately 1.5 KiB retaining start and end. The serialized
+excerpt budget is 8 KiB; oldest turns are dropped first. Only post-compaction turns qualify.
+Tool calls/results, thinking, diffs, attachment payloads and system/workflow envelopes are excluded.
+The strip says **with chat context** when excerpts are actually used. Fixed, non-editable framing
+makes history background for vocabulary/intent only: the current message always wins, assistant
+claims are unverified, and corrections/redirections must abandon rather than perpetuate failed
+approaches. Turn history never creates new requirements unless the current message restates them.
+
+Calls are stateless and tool-less: **no Oracle consults, Context Builder, repository file contents,
+git review packaging or selection mutations**. Composer attachments/tagged files are preserved
+locally but their payloads are not sent to the rewriter. Transient Before sending questions are not
+provider-history rows. Substantive answers may cause one refinement from original text plus answers;
+skipping questions does not refine. Versioned disclosure receipts cover the recipient and recent-
+chat exposure. First enable shows a concise recipient, payload, retention/billing and automation summary;
+operating instructions are expandable rather than a blocking wall of text.
+
+The brief streams into the existing composer, read-only during preparation. **Review before
+sending** is the default: successful preparation unlocks editing and Return dispatches the current
+draft without rewriting it again. The opt-in, profile-scoped **Send automatically** mode dispatches
+a successful rewrite through ordinary fresh-claim admission on completion; any clarification questions
+force Review for that turn, even if skipped. Slash-leading generated or edited text also forces
+Review, with a warning that the provider may interpret it as a command; only a deliberate subsequent
+Send can dispatch it. Cmd+Return always prepares for Review (including a
+one-shot when the pill is off), using current edited text or the first original when unchanged.
+The header retains that first original inline. Esc cancels streaming or reverts a completed draft;
+the edited rewrite stays available through undo/recovery. Send original is available immediately as an explicit second Send action through
+fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
+recovery banner. Invalidation (tab/target/settings changes or Stop) also restores the original when
+the composer is still operation-owned. New edits stay intact with explicit Restore original / Keep
+rewrite choices, rather than silently starting another rewrite from generated output. Truncated output
+is recoverable but cannot be sent as a successful preparation.
+Draft text follows ordinary composer draft persistence; clarification/recovery state stays in memory.
+
+Re-prompt uses the selected model's low-effort variant when available, without a separate Auto Effort
+judgment call. The first Return prepares a rewrite; the next Return in that composer explicitly
+sends the current text, including during preparation, with no timing deadline. Late rewrite output
+is cancelled and fenced. Clarifications appear once in a compact, height-bounded scrollable panel
+above the composer (at most one question and three options). Finishing or dismissing clarification
+requests native composer focus restoration only in the key window and only when focus has fallen
+back to a container or a removed control; a live unrelated text field keeps focus. Cmd+Shift+O sends
+the original during preparation. Optional clarification can be skipped with Cmd+Shift+K; Cmd+Option+1–3
+chooses an offered answer. At local send admission, the editor clears immediately and a transient **Sending**
+preview shows the message while routing/session preparation finishes; it is not persisted as a sent transcript turn.
+A blocked or cancelled preparation restores the captured draft above newer typing, retaining its original/rewrite
+recovery. Pending sends lock attachment/workflow controls and offer Cancel/Esc. Successful submission replaces
+the pending preview with the ordinary transcript turn and retires only its captured recovery state.
+Router/implementing-turn Auto Effort speculation starts only after a complete brief, never partial
+tokens, and is discarded on edits or stale policy. These opted-in services may have received the
+complete draft even if it is later undone. Composer edits are never sent back to the rewrite model.
+No implementing turn is sent speculatively. Minimal local automation audits store outcomes and
+reuse/fallback flags, not message text, guidance, excerpts, answers, paths or generated briefs.
+These model calls are independent of **Share crash reports and diagnostics**.
+
 ## What is collected
 
 When active, RepoPrompt can send:

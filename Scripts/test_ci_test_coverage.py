@@ -83,6 +83,32 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(status, 0)
             coverage.verify_shards(TESTS, ['CoreTests'], [json.loads(receipt.read_text())], 1)
 
+    def test_runner_checks_later_suites_after_zero_execution_without_publishing_receipt(self):
+        methods = {
+            'CoreTests.EmptyTests': ['CoreTests.EmptyTests/testOne'],
+            'CoreTests.ExampleTests': TESTS,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            receipt = root / 'shard-1.json'
+            receipt.write_text('{}')
+            output = io.StringIO()
+            with mock.patch.object(runner, 'execute_logged', side_effect=[
+                (0, (FIXTURES / 'zero.txt').read_text()),
+                (0, (FIXTURES / 'pass.txt').read_text()),
+            ]) as execute:
+                status = runner.run_selected_suites(
+                    list(methods), swift_binary='swift', cwd=root,
+                    bundle_selection=runner.BundleSelection(root / 'PackageTests.xctest', {}, ('xctest',)),
+                    sandbox_root=root / 'sandbox', suite_methods=methods,
+                    receipt_path=receipt, output=output)
+            self.assertEqual(status, 1)
+            self.assertEqual(execute.call_count, 2)
+            self.assertEqual([call.args[0][2] for call in execute.call_args_list], list(methods))
+            self.assertFalse(receipt.exists())
+            self.assertEqual(output.getvalue().count('::endgroup::'), 2)
+            self.assertIn('1 of 2 suites failed', output.getvalue())
+
 
 class UnionTests(unittest.TestCase):
     def setUp(self):

@@ -2,6 +2,34 @@
 import XCTest
 
 final class PathSearchIndexRecoveryTests: XCTestCase {
+    func testCandidateFilenamesPreserveComponentBytesAndLegacyDegeneratePaths() {
+        let paths: [(path: String, filename: String?)] = [
+            ("", nil), ("/", nil), ("//", nil), (".", nil), ("..", nil), ("./", nil), ("../", nil),
+            ("a/.", nil), ("a/..", nil), ("/a/../../", nil), ("a//b/", nil), ("a/b///", nil),
+            ("a//..", nil), ("/../..", nil), ("/a//../../", nil), ("a/./../..", nil),
+            ("a%2Fb", "a%2Fb"), ("a%20b", "a%20b"), ("a?b#c", "a?b#c"), ("~", "~"),
+            ("~/file.swift", "file.swift"), ("é/日本語.swift", "日本語.swift"), ("e\u{301}/🦊.swift", "🦊.swift"),
+            ("d/é.swift", "é.swift"), ("d/e\u{301}.swift", "e\u{301}.swift"), ("d/e\u{301}.swift/", nil),
+            ("d/a/\u{301}.swift", "\u{301}.swift"), ("a/line\nbreak.swift", "line\nbreak.swift"),
+            ("a/back\\slash.swift", "back\\slash.swift"), ("/fixture/Sources/File.swift", "File.swift"),
+            ("Sources/Relative.swift", "Relative.swift"), ("d/가.swift", "가.swift"), ("d/각.swift", "각.swift"),
+            ("d/\u{F900}.swift", "\u{F900}.swift"), ("d/\u{2F800}.swift", "\u{2F800}.swift"),
+            ("d/\u{212B}.swift", "\u{212B}.swift"), ("d/a\u{301}\u{327}.swift", "a\u{301}\u{327}.swift")
+        ]
+        let cases = paths.flatMap { entry -> [(key: String, filename: String?)] in
+            [
+                (entry.path, entry.filename),
+                ("Root/" + entry.path + "\n/fixture/" + entry.path, entry.filename),
+                ("Root\n" + entry.path, entry.filename.map { entry.path.contains("/") ? $0 : "Root\n" + $0 })
+            ]
+        }
+        let index = PathSearchIndex(paths: cases.map(\.key))
+        for (offset, entry) in cases.enumerated() {
+            let expected = entry.filename ?? URL(fileURLWithPath: entry.key).lastPathComponent
+            XCTAssertEqual(index.filename(at: offset).map { Array($0.utf8) }, Array(expected.utf8), entry.key.debugDescription)
+        }
+    }
+
     func testSearchMatchesFilenameSubpathTokensAndPublishesDeterministicRankMetadata() async {
         let paths = [
             "/Volumes/Repo/Sources/Zeta/Widget.swift",

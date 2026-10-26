@@ -96,10 +96,6 @@ actor GitStatusActor {
         try await Task.sleep(nanoseconds: 5_000_000_000)
     }
 
-    /// Timestamp of last fetch to throttle network calls
-    private var lastFetchTime: Date?
-    private let fetchThrottleInterval: TimeInterval = 30 // seconds
-
     /// AsyncStream for consumers
     private var statusContinuation: AsyncStream<GitStatusSnapshot>.Continuation?
 
@@ -395,37 +391,6 @@ actor GitStatusActor {
         }.map { (key: $0.key, info: $0.value) }
     }
 
-    // MARK: - Fetch Management
-
-    /// Fetch from remotes if enough time has passed since last fetch
-    /// Returns true if fetch was performed, false if throttled
-    @discardableResult
-    private func fetchIfNeeded(at repoURL: URL) async -> Bool {
-        // Check if we should throttle
-        if let lastFetch = lastFetchTime,
-           Date().timeIntervalSince(lastFetch) < fetchThrottleInterval
-        {
-            return false
-        }
-
-        // Perform fetch
-        do {
-            try await vcsService.fetch(at: repoURL)
-            lastFetchTime = Date()
-            return true
-        } catch {
-            // Fetch failed (maybe no network), but don't block the rest of the operation
-            // Just update timestamp to avoid retrying too frequently
-            lastFetchTime = Date()
-            return false
-        }
-    }
-
-    /// Check if a branch name looks like a remote branch (contains "/")
-    private func isRemoteBranch(_ branchName: String) -> Bool {
-        branchName.contains("/") && branchName != "HEAD"
-    }
-
     // MARK: - Status Refresh
 
     @discardableResult
@@ -505,11 +470,8 @@ actor GitStatusActor {
         let backend = await vcsService.backend(forRepoRoot: repoURL)
         guard !isShutDown else { return nil }
 
-        // Auto-fetch from remotes when popover opens to get latest remote branch refs
-        if trigger == .popoverOpen {
-            await fetchIfNeeded(at: repoURL)
-        }
-        guard !isShutDown else { return nil }
+        // Passive refresh uses existing tracking refs. Fetch remains an
+        // explicit operation: opening a popover must not start transports.
 
         // Compute compare spec (normalize HEAD for jj backend)
         let baseRef = backend.normalizeBaseRef(selectedDiffBranch)
@@ -720,10 +682,7 @@ actor GitStatusActor {
         let repoURL = URL(fileURLWithPath: gitRoot)
         let effectiveBranch = explicitBranch ?? selectedDiffBranch
 
-        // Auto-fetch when comparing against a remote branch to ensure we have latest refs
-        if isRemoteBranch(effectiveBranch) {
-            await fetchIfNeeded(at: repoURL)
-        }
+        // Comparing a remote branch reads the last explicitly fetched refs.
 
         let scope: GitDiffScope = (inclusionMode == .all) ? .all : .selected
         let selectedAbs = (inclusionMode == .selectedFiles) ? selectedAbsolutePaths : []

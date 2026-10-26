@@ -190,6 +190,7 @@ extension AgentModeViewModel {
     }
 
     func syncComposerUIState(tabID: UUID? = nil) {
+        invalidateRepromptIfNeeded()
         #if DEBUG
             test_syncComposerCallCount += 1
         #endif

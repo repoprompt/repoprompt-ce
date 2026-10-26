@@ -32,10 +32,10 @@ struct AttachmentTile: View {
     let facts: AttachmentFacts
     let preview: AttachmentTilePreview
     let geometry: AttachmentTileGeometry
+    let labelScale: CGFloat
     var isDisabled = false
     var onDismiss: (() -> Void)?
 
-    @ObservedObject private var fontScale = FontScaleManager.shared
     @State private var loaded: LoadedPreview
 
     private enum LoadedPreview {
@@ -56,12 +56,14 @@ struct AttachmentTile: View {
         facts: AttachmentFacts,
         preview: AttachmentTilePreview,
         geometry: AttachmentTileGeometry,
+        labelScale: CGFloat = 1,
         isDisabled: Bool = false,
         onDismiss: (() -> Void)? = nil
     ) {
         self.facts = facts
         self.preview = preview
         self.geometry = geometry
+        self.labelScale = labelScale
         self.isDisabled = isDisabled
         self.onDismiss = onDismiss
         _loaded = State(initialValue: Self.immediatePreview(facts: facts, preview: preview))
@@ -69,10 +71,6 @@ struct AttachmentTile: View {
 
     private var presentation: AttachmentPresentation {
         AttachmentPresentation.make(facts: facts, preview: loaded.availability)
-    }
-
-    private var fontPreset: FontScalePreset {
-        fontScale.preset
     }
 
     var body: some View {
@@ -97,11 +95,11 @@ struct AttachmentTile: View {
             faceWithDismiss(presentation)
 
             Text(presentation.title)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                .font(.system(size: 10 * labelScale, weight: .regular, design: .rounded))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .frame(width: fontPreset.scaledMetric(geometry.faceSize.width), alignment: .leading)
+                .frame(width: geometry.faceSize.width * labelScale, alignment: .leading)
         }
         .padding(8)
         .background(Color.secondary.opacity(0.08))

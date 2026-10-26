@@ -20,6 +20,51 @@ Records contain receipt time, byte count, sanitized CLI version, and only five-h
 
 Managed settings can override the probe. Zero invocations are inconclusive without a known-working authorized interactive control, and results apply only to the tested CLI version/configuration. Keep the output private; remove the temporary directory manually after inspection. The `claimed` marker is intentionally not automatically reset, including after a failed launch.
 
+## Agent admission slow-phase diagnostics
+
+Agent identity admission automatically emits `event=agentAdmission.slow` through the
+`WorkspaceAgentAdmission` OSLog category when a completed admission scope takes at
+least five seconds (including rejection, cancellation, and thrown failure). It uses
+`SuspendingClock`, excluding machine sleep like the coordinator's `DispatchTime`
+uptime measurements. It adds no timers, sleeps, retries, or asynchronous operations.
+It intentionally ships in release (see the [source-layout exception](architecture/source-layout.md#app-visible-diagnostics-retained-in-the-repopromptapp-target)).
+There is no setting to enable and no persisted diagnostic state to clean up.
+
+`workspace=` and `correlation=` use exactly the coordinator's `redactedID` hashes,
+so a slow report can be joined to its queue/acquire/release events without exposing
+raw IDs. `kind=` is one of `fresh_tab`, `existing_tab`, `recovery`, `discard`;
+`outcome=` is `committed`, `rejected`, `cancelled`, or `threw`. Committed means the
+scope accepted its result, not that a provider turn succeeded. Other fields contain
+only fixed phase names, millisecond durations, and counts. Titles, paths, prompt
+text, raw identifiers, and raw errors are never included.
+
+`queue_wait` covers lease acquisition; `refresh` covers canonical snapshot read,
+decode, and reconciliation; `catalog_refresh` separately covers catalog adoption
+awaits (including conflict replay). `save` covers admission persistence and own-save
+waits/convergence; `other` covers remaining lease-held preparation/projection and
+recovery. Durations are exclusive, so nested save waits are not also refresh time.
+`holdMS` aggregates all phases except queue wait. `refreshCount` excludes no-op
+baseline checks and recursive re-entry. `saveAttempts` counts actual persistence
+attempts, including the second attempt on a pre-commit conflict replay, separately
+from save phase entries. Logging happens after releasing this admission's lease;
+a queued successor may already hold the workspace by the time the report emits.
+
+For a future 44-second stall, correlation keys join the phase report to coordinator
+events, while kind/outcome distinguish admission, recovery and discard scopes.
+**MainActor contention is not separable by these phases**: it can inflate any
+phase spanning a suspension, including queue resumption. These are elapsed times,
+not CPU measurements or proof of an underlying cause. A scope that never exits
+still emits no slow report; existing coordinator events remain complementary.
+No threshold enforcement or admission behavior changes are implied.
+
+Deterministic coverage uses an injected clock at the real admission entry points:
+`make dev-test FILTER='WorkspaceAgentAdmissionTimingTests|ConcurrentSameWorkspaceAgentRunAdmissionTests|AgentAdmissionRecoveryTests'`.
+It exercises fresh/existing-tab persistence scopes, the real canonical refresh's
+own-save wait, threshold/outcome/correlation accounting, and emission after lease
+release without wall-clock timing assertions.
+No live launch is required for these tests; capturing a real slow admission still
+requires a separately authorized running-app investigation.
+
 ## Quality gate before adding a test
 
 Add a test only when all four answers are concrete:
