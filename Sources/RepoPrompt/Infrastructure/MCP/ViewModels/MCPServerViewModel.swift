@@ -1520,13 +1520,30 @@ final class MCPServerViewModel: ObservableObject {
                 windowID: windowID
             )
         },
-        buildTabSelectionReply: { [weak self] selection, includeBlocks, display, codeMapUsageOverride, lookupContextOverride, reviewGitContextOverride in
+        buildTabSelectionReply: { [weak self] resultTab, resultWorkspaceID, includeBlocks, display, codeMapUsageOverride, lookupContextOverride, reviewGitContextOverride in
             guard let self else { throw MCPError.internalError("Window deallocated while building context_builder selection reply") }
+            // The window token counter describes only the active compose tab. Any other result tab is
+            // accounted from its own prompt, stored prompts, and selection. Lookup and review-git
+            // overrides are always supplied here, so this context selects only the token accounting.
+            let resultTabIsActive = workspaceManager?.activeWorkspaceID == resultWorkspaceID
+                && promptVM.activeComposeTabID == resultTab.id
+            let accountingContext: MCPTabContextSnapshot? = resultTabIsActive ? nil : MCPTabContextSnapshot(
+                tabID: resultTab.id,
+                windowID: windowID,
+                workspaceID: resultWorkspaceID,
+                promptText: resultTab.promptText,
+                selection: resultTab.selection,
+                selectedMetaPromptIDs: resultTab.selectedMetaPromptIDs,
+                tabName: resultTab.name,
+                runID: nil,
+                explicitlyBound: false
+            )
             let reply = await buildTabSelectionReply(
-                from: selection,
+                from: resultTab.selection,
                 includeBlocks: includeBlocks,
                 display: display,
                 codeMapUsageOverride: codeMapUsageOverride,
+                virtualContext: accountingContext,
                 lookupContextOverride: lookupContextOverride,
                 // Context Builder owns the selection authority before rendering: a completed run has
                 // already validated the exact committed snapshot revision, while a cancelled or failed
@@ -1537,7 +1554,7 @@ final class MCPServerViewModel: ObservableObject {
                 reviewGitContextOverride: reviewGitContextOverride
             )
             #if DEBUG
-                contextBuilderSelectionReplyObserverForTesting?(selection, lookupContextOverride, reply)
+                contextBuilderSelectionReplyObserverForTesting?(resultTab.selection, lookupContextOverride, reply)
             #endif
             return reply
         },
@@ -1642,9 +1659,9 @@ final class MCPServerViewModel: ObservableObject {
                 toolName: toolName
             )
         },
-        updateCurrentTabContext: { [weak self] toolName, mutation in
-            guard let self else { throw MCPError.internalError("Window deallocated while updating tab context") }
-            try await updateCurrentTabContext(toolName: toolName, mutation: mutation)
+        updateCurrentTabPrompt: { [weak self] toolName, mutation in
+            guard let self else { throw MCPError.internalError("Window deallocated while updating tab prompt") }
+            return try await updateCurrentTabPrompt(toolName: toolName, mutation: mutation)
         },
         selectedRecordsForCurrentTabContext: { [weak self] metadata, lookupContextOverride in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving selected files") }
@@ -1877,6 +1894,15 @@ final class MCPServerViewModel: ObservableObject {
         persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated in
             guard let self else { return nil }
             return await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
+        },
+        selectCreatedFile: { [weak self] file, resolvedContext, metadata, lookupContext in
+            guard let self else { return "The file was created, but its selection was not confirmed because the window closed." }
+            return await selectCreatedFile(
+                file,
+                resolvedContext: resolvedContext,
+                metadata: metadata,
+                lookupContext: lookupContext
+            )
         },
         makeSelectionHintError: { [weak self] paths, operation, lookupContext in
             guard let self else { return "Window deallocated while resolving selection inputs." }
@@ -6290,7 +6316,9 @@ final class MCPServerViewModel: ObservableObject {
             let coverage = root.coverage
             var rootIssues = root.issues.map { issue in
                 let mapped = codeStructureIssueDTO(issue)
-                guard issue.code == "seed_not_indexed", coverage?.isComplete != true else { return mapped }
+                guard root.executionStop == nil, root.status != .unavailable, !graphInvalid,
+                      issue.code == "seed_not_indexed", coverage?.isComplete != true
+                else { return mapped }
                 return DTO.IssueDTO(
                     code: mapped.code,
                     phase: mapped.phase,
@@ -6340,15 +6368,28 @@ final class MCPServerViewModel: ObservableObject {
             } else {
                 .ok
             }
+            let indexStopReason: String? = if let stop = root.executionStop {
+                stop.reason.rawValue
+            } else if case let .invalid(code, _)? = graphRevalidation {
+                code
+            } else if root.status == .unavailable {
+                rootIssues.first?.code ?? "graph_unavailable"
+            } else {
+                nil
+            }
             rootDTOs.append(DTO.RootDTO(
                 root: root.rootDisplayName,
                 status: status,
                 index: DTO.IndexDTO(
-                    state: coverage?.isComplete == true ? .complete : .indexing,
+                    state: root.executionStop != nil || root.status == .unavailable || graphInvalid
+                        ? .stopped : coverage?.isComplete == true ? .complete : .indexing,
                     indexed: coverage?.classifiedCount ?? 0,
-                    total: coverage?.supportedCount ?? 0
+                    total: coverage?.supportedCount ?? 0,
+                    reason: indexStopReason,
+                    attempted: root.executionStop?.budget.map { Int(clamping: $0.attempted) },
+                    limit: root.executionStop?.budget.map { Int(clamping: $0.limit) }
                 ),
-                updatesPending: (root.updatesPending || revalidationUpdatesPending) ? true : nil,
+                updatesPending: indexStopReason == nil && (root.updatesPending || revalidationUpdatesPending) ? true : nil,
                 seeds: root.seeds.map {
                     DTO.SeedDTO(path: $0.path, state: codeStructureSeedStateDTO($0.state))
                 },
@@ -6922,7 +6963,7 @@ final class MCPServerViewModel: ObservableObject {
         try await requireWorkspaceForTool(MCPWindowToolName.fileActions)
         try Task.checkCancellation()
         let metadata = await captureRequestMetadata()
-        var (resolvedContext, lookupContext) = try await resolveMutationFileToolContext(
+        let (resolvedContext, lookupContext) = try await resolveMutationFileToolContext(
             from: metadata,
             toolName: MCPWindowToolName.fileActions
         )
@@ -6943,6 +6984,7 @@ final class MCPServerViewModel: ObservableObject {
         let shouldSelectCreatedFileInActiveUI = false
         let store = promptVM.workspaceFileContextStore
         let mutationRootMappings = await lookupContext.domainMutationPhysicalRootMappings(store: store)
+        var writtenFile: WorkspaceFileRecord?
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
         try Task.checkCancellation()
         await MCPToolExecutionHandlerPhaseContext.report(.fileActionsCatalogEligibility)
@@ -6967,7 +7009,7 @@ final class MCPServerViewModel: ObservableObject {
                     throw MCPError.invalidParams("content is required for create action")
                 }
                 let policy = (ifExists ?? "error").lowercased()
-                try await writeFile(
+                writtenFile = try await writeFile(
                     path: effectivePath,
                     content: content,
                     overwrite: policy == "overwrite",
@@ -7037,35 +7079,13 @@ final class MCPServerViewModel: ObservableObject {
         }
         if action.lowercased() == "create" {
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection)
-            let baseSelection = resolvedContext.snapshot.selection
-            let addResult = await addStoredSelectionPaths(
-                existing: baseSelection,
-                paths: [effectivePath],
-                rawPaths: [path],
-                mode: "full",
-                lookupRootScope: lookupContext.rootScope
-            )
-            let requestedSelection = addResult.selection
-            if requestedSelection != baseSelection {
-                resolvedContext.snapshot.selection = requestedSelection
-                let verification = await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
-                do {
-                    _ = try MCPSelectionToolProvider.requireCanonicalSelection(
-                        verification,
-                        requested: requestedSelection,
-                        tabID: resolvedContext.snapshot.tabID,
-                        operation: "file_actions create selection update",
-                        recovery: "Retry manage_selection for the same context_id."
-                    )
-                } catch is CancellationError {
-                    acknowledgementWarnings.append(
-                        "The created path selection update was cancelled and was not confirmed."
-                    )
-                } catch {
-                    acknowledgementWarnings.append(
-                        "The file was created, but its selection was not confirmed. \(error)"
-                    )
-                }
+            if let warning = await selectCreatedFile(
+                writtenFile,
+                resolvedContext: resolvedContext,
+                metadata: metadata,
+                lookupContext: lookupContext
+            ) {
+                acknowledgementWarnings.append(warning)
             }
             await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPostMutationSelection, transition: .completed)
         }
@@ -7079,6 +7099,7 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Creates a **new** file, with optional overwrite behavior.
     /// - Parameter overwrite: when true and a file already exists, its content will be replaced.
+    @discardableResult
     private func writeFile(
         path: String,
         content: String,
@@ -7086,7 +7107,7 @@ final class MCPServerViewModel: ObservableObject {
         addToSelection: Bool = true,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
-    ) async throws {
+    ) async throws -> WorkspaceFileRecord? {
         do {
             let store = promptVM.workspaceFileContextStore
             let mutationService = WorkspaceFileMutationService(store: store)
@@ -7098,6 +7119,7 @@ final class MCPServerViewModel: ObservableObject {
             } else {
                 .create(path: path)
             }
+            let receipt = WorkspaceFileEditHost.WriteReceipt()
             let host = WorkspaceFileEditHost(
                 store: store,
                 target: target,
@@ -7105,9 +7127,11 @@ final class MCPServerViewModel: ObservableObject {
                 lookupRootScope: lookupRootScope,
                 createPathResolutionPolicy: .literalPreferredIfStronger,
                 selectCreatedFiles: addToSelection,
-                mutationRootMappings: mutationRootMappings
+                mutationRootMappings: mutationRootMappings,
+                writeReceipt: receipt
             )
             try await host.writeText(path: path, content: content, overwrite: overwrite)
+            return receipt.file
         } catch is CancellationError {
             throw CancellationError()
         } catch FileSystemError.fileAlreadyExists {

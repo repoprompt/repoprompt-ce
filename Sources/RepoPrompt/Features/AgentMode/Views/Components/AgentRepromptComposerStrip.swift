@@ -18,6 +18,15 @@ struct AgentRepromptComposerStrip: View {
                 let operation = viewModel.repromptOperation.flatMap { $0.id == presentation.id ? $0 : nil }
                 TimelineView(.periodic(from: presentation.startedAt, by: 1)) { context in
                     HStack(spacing: 6) {
+                        Button {
+                            if let onSendOriginal { onSendOriginal(presentation.id) } else { operation?.useOriginal() }
+                        } label: { AgentRepromptShortcutLabel(title: "Send original", shortcut: "⌘⇧O") }
+                            .keyboardShortcut("o", modifiers: [.command, .shift])
+                            .hoverTooltip("Send your original text now (⌘⇧O). Return sends the text currently in the composer.", .top)
+                        if presentation.phase != .completed {
+                            Button { operation?.cancel() } label: { AgentRepromptShortcutLabel(title: "Cancel", shortcut: "esc") }
+                                .hoverTooltip("Stop rewriting and restore your original (Esc in the composer).", .top)
+                        }
                         Image(systemName: "wand.and.sparkles")
                         Text("\(presentation.phase == .completed ? "Re-prompted" : "Re-prompting") · \(presentation.modelName)\(presentation.usesChatContext ? " · with chat context" : "")")
                             .lineLimit(1).layoutPriority(1)
@@ -26,29 +35,24 @@ struct AgentRepromptComposerStrip: View {
                         }
                         if presentation.phase == .completed {
                             Button { showingOriginal.toggle() } label: {
-                                Text("Original: \(presentation.original.replacingOccurrences(of: "\n", with: " "))")
-                                    .foregroundStyle(.secondary).strikethrough().lineLimit(1).truncationMode(.tail)
+                                Text(showingOriginal ? "Hide original" : "Show original")
+                                    .foregroundStyle(.secondary).lineLimit(1)
                             }
                             .buttonStyle(.plain)
-                            .hoverTooltip("Expand the original message", .top)
+                            .hoverTooltip(showingOriginal ? "Hide the original message" : "Expand the original message", .top)
                             Button {
                                 if let onUndo { onUndo(presentation.id) } else { operation?.cancel() }
                             } label: { Image(systemName: "arrow.uturn.backward") }
                                 .buttonStyle(.plain).accessibilityLabel("Revert to original")
                                 .hoverTooltip("Revert to original (Esc)", .top)
                             Spacer(minLength: 4)
-                            Text("↩ send · ⌘↩ re-prompt again · esc revert")
+                            Text("↩ send · ⌘↩ rewrite · esc revert")
                                 .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                         } else {
                             Spacer(minLength: 4)
                             if presentation.phase == .failed { Button("Retry") { operation?.retry() } }
-                            if context.date.timeIntervalSince(presentation.startedAt) >= 5 || presentation.phase == .failed {
-                                Button("Send original") {
-                                    if let onSendOriginal { onSendOriginal(presentation.id) } else { operation?.useOriginal() }
-                                }
-                                .hoverTooltip("Explicitly sends the original through a fresh composer claim.", .top)
-                            }
-                            Button("Cancel") { operation?.cancel() }
+                            Text("↩ send current · esc cancel")
+                                .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                         }
                     }
                 }
@@ -104,28 +108,97 @@ struct AgentRepromptComposerStrip: View {
     }
 }
 
+/// A button title with its keyboard shortcut visible, not only in a tooltip.
+struct AgentRepromptShortcutLabel: View {
+    let title: String
+    let shortcut: String
+    var shortcutFirst = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if shortcutFirst { shortcutText }
+            Text(title)
+            if !shortcutFirst { shortcutText }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(title)
+    }
+
+    private var shortcutText: some View {
+        Text(shortcut).font(.caption2.monospaced()).foregroundStyle(.secondary)
+    }
+}
+
 /// Transient presentation, deliberately outside AgentChatItem/provider history and runtime ask_user.
 struct AgentRepromptQuestionsView: View {
     let viewModel: AgentModeViewModel
     @ObservedObject var store: AgentRepromptUIStore
     let tabID: UUID?
+    var onReturnToComposer: () -> Void = {}
+    @State private var contentHeight: CGFloat = 80
 
     var body: some View {
         if store.presentation?.sourceTabID == tabID, store.presentation?.phase == .clarifying,
-           let pending = store.pendingQuestions
+           let pending = store.pendingQuestions, let question = pending.currentQuestion
         {
             let operation = viewModel.repromptOperation
+            let draft = pending.draftsByQuestionID[question.id] ?? AgentAskUserDraft()
             VStack(alignment: .leading, spacing: 6) {
-                Label("Before sending", systemImage: "wand.and.sparkles").font(.headline)
-                AgentAskUserWizardCard(
-                    pending: pending,
-                    onDraftChange: { operation?.updateDraft(questionID: $0, draft: $1) },
-                    onQuestionIndexChange: { operation?.setQuestionIndex($0) },
-                    onSubmit: { operation?.completeQuestions() },
-                    onSkipAll: { operation?.completeQuestions(skipAll: true) },
-                    onUserActivity: {}, showsTimeout: false
-                )
+                HStack {
+                    Button("Keep rewrite") { completeQuestions(operation, skipAll: true) }
+                    Button("Apply answer") { completeQuestions(operation) }
+                        .disabled(!pending.isComplete)
+                    Text("Optional clarification").font(.caption).foregroundStyle(.secondary)
+                }.controlSize(.small)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(question.question).font(.callout).fixedSize(horizontal: false, vertical: true)
+                        ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
+                            Button {
+                                operation?.updateDraft(questionID: question.id, draft: .init(selectedOptionLabels: [option.label], customResponse: draft.customResponse))
+                                completeQuestions(operation)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(option.label)
+                                    if let description = option.description {
+                                        Text(description).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }.frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.vertical, 3)
+                        }
+                        TextField("Or add your own answer", text: Binding(get: { draft.customResponse }, set: { text in
+                            var updated = draft
+                            updated.customResponse = text
+                            updated.skipped = false
+                            operation?.updateDraft(questionID: question.id, draft: updated)
+                        }))
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { completeQuestions(operation) }
+                        Text("Return applies your answer. Return in the composer sends the current draft.")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(GeometryReader { geometry in
+                        Color.clear.onAppear { contentHeight = geometry.size.height }
+                            .onChange(of: geometry.size.height) { _, height in contentHeight = height }
+                    })
+                }
+                .frame(height: min(200, max(80, contentHeight)))
             }
+        }
+    }
+
+    private func completeQuestions(_ operation: AgentRepromptOperation?, skipAll: Bool = false) {
+        guard let operation, viewModel.currentTabID == tabID,
+              store.presentation?.id == operation.id else { return }
+        operation.completeQuestions(skipAll: skipAll)
+        guard operation.phase != .clarifying else { return }
+        Task { @MainActor in
+            await Task.yield()
+            guard viewModel.currentTabID == tabID, viewModel.repromptOperation?.id == operation.id else { return }
+            onReturnToComposer()
         }
     }
 }

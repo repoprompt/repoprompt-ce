@@ -190,7 +190,8 @@ final class AgentModeRunService {
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         var candidateTransferred = false
         defer {
@@ -308,7 +309,8 @@ final class AgentModeRunService {
                 providerControlCommand: providerControlCommand,
                 selfCompactDispatchID: selfCompactDispatchID,
                 stopFence: stopFence,
-                localComposerCandidate: localComposerCandidate
+                localComposerCandidate: localComposerCandidate,
+                initialUserItemID: initialUserItemID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
@@ -372,7 +374,8 @@ final class AgentModeRunService {
         attachments: [AgentImageAttachment],
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
-        targetController: ACPAgentSessionController
+        targetController: ACPAgentSessionController,
+        writeReceipt: ACPAgentSessionController.PromptWriteReceipt? = nil
     ) async -> Bool {
         guard session.operationAdmissionFailureMessage == nil else { return false }
         let selectedAgent = session.selectedAgent
@@ -410,7 +413,8 @@ final class AgentModeRunService {
             runRequest: runRequest,
             targetRunID: targetRunID,
             targetRunAttemptID: targetRunAttemptID,
-            targetController: targetController
+            targetController: targetController,
+            writeReceipt: writeReceipt
         )
         steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(runRequest.modelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
@@ -639,19 +643,33 @@ final class AgentModeRunService {
                     )
                     return
                 }
+                let writeReceipt = ACPAgentSessionController.PromptWriteReceipt()
                 let sent = await submitActiveACPPromptIfSupported(
                     session: session,
                     messageForRun: augmentedSteeringText,
                     attachments: steeringBatch.flatMap(\.attachments),
                     targetRunID: runID,
                     targetRunAttemptID: runAttemptID,
-                    targetController: controller
+                    targetController: controller,
+                    writeReceipt: writeReceipt
                 )
                 if !Task.isCancelled, session.acpSteeringFlushID == flushID,
                    session.acpController === controller,
                    hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
                 {
-                    hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
+                    hooks.providerInput.recordPendingHandoffSendOutcome(session, sent || writeReceipt.wasWritten)
+                }
+                if !sent, writeReceipt.wasWritten {
+                    // The response settles only at turn end. Stop/transport failure can lose it
+                    // after the provider has received the prompt: never restore or requeue that
+                    // text, remove its row, or release a managed idempotency key for retry.
+                    releaseSupersedingProtectionIfUnused()
+                    for item in steeringBatch {
+                        item.managed?.sink.resolve(.unconfirmed(
+                            message: "The ACP prompt was written, but RepoPrompt could not confirm its completion. Read the session before retrying."
+                        ))
+                    }
+                    return
                 }
                 if sent {
                     steeringBatch.forEach { $0.managed?.sink.resolve(.delivered(.steered)) }
@@ -1404,12 +1422,12 @@ final class AgentModeRunService {
         session.acpSteeringFlushTask = nil
         session.acpSteeringFlushID = nil
 
-        // Ordinary stop keeps existing behavior. A cwd-changing cancellation
-        // restores every queued, undelivered draft once without replaying the
-        // already-delivered active prompt.
+        // Stop withdraws all undelivered local queued work, including ACP steering
+        // already moved to a binding-fenced follow-up. Never replay the active prompt
+        // or put managed instructions in the user's composer.
         switch intent {
         case .userStop:
-            restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+            withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
         case .executionLocationChange:
             restoreAllQueuedDraftsForExecutionLocationChange(tabID: tabID, session: session, strategy: .prependAlways)
         case .runtimeShutdown:

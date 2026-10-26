@@ -98,6 +98,71 @@ final class DomainAgentSessionLinkAuthorityTests: XCTestCase {
         return activated.grant
     }
 
+    func testCommitAuthorizationRejectsRevocationAfterAsyncValidationAndRelink() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint()
+        let grant = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorWorktreeBinding, observerEndpoint: observer, targetSessionID: target.sessionID
+        ).get()
+        let issued = await authority.commitAuthorization(for: lease)
+        let authorization = try XCTUnwrap(issued)
+        // Model the MainActor continuation parked after a successful asynchronous validation.
+        let validation = await authority.validate(lease: lease)
+        XCTAssertNil(validation)
+        _ = await authority.revoke(linkID: grant.id, generation: grant.generation, reason: .userRequested)
+        _ = try await activateLink(authority, observer: observer, target: target)
+        var published = false
+        XCTAssertThrowsError(try authorization.withAuthorization { published = true }) { error in
+            XCTAssertEqual(error as? DomainAgentSessionLinkError, .linkRevoked)
+        }
+        XCTAssertFalse(published, "A previously validated lease cannot publish behind revocation or adopt a replacement grant")
+        let successor = try await authority.authorize(
+            operation: .monitorWorktreeBinding, observerEndpoint: observer, targetSessionID: target.sessionID
+        ).get()
+        let successorIssued = await authority.commitAuthorization(for: successor)
+        try XCTUnwrap(successorIssued).withAuthorization { published = true }
+        XCTAssertTrue(published, "The replacement grant remains usable by a fresh operation")
+    }
+
+    func testCommitAuthorizationDoesNotCacheCapabilityElevation() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint()
+        let elevation = DomainAgentSessionLinkCapabilityElevation()
+        await authority.installCapabilityElevation(elevation)
+        elevation.elevate(observer: observer.sessionID)
+        _ = try await activateLink(authority, observer: observer, target: target, capabilities: [.poll])
+        let lease = try await authority.authorize(
+            operation: .monitorWorktreeBinding, observerEndpoint: observer, targetSessionID: target.sessionID
+        ).get()
+        let issued = await authority.commitAuthorization(for: lease)
+        let authorization = try XCTUnwrap(issued)
+        elevation.revokeAll()
+        var published = false
+        XCTAssertThrowsError(try authorization.withAuthorization { published = true }) { error in
+            XCTAssertEqual(error as? DomainAgentSessionLinkError, .capabilityDenied)
+        }
+        XCTAssertFalse(published)
+    }
+
+    func testCommitAuthorizationIsInvalidatedByRuntimeShutdown() async throws {
+        let authority = makeAuthority()
+        let observer = makeEndpoint()
+        let target = makeEndpoint()
+        _ = try await activateLink(authority, observer: observer, target: target)
+        let lease = try await authority.authorize(
+            operation: .monitorWorktreeBinding, observerEndpoint: observer, targetSessionID: target.sessionID
+        ).get()
+        let issued = await authority.commitAuthorization(for: lease)
+        let authorization = try XCTUnwrap(issued)
+        await authority.finishShutdown()
+        var published = false
+        XCTAssertThrowsError(try authorization.withAuthorization { published = true })
+        XCTAssertFalse(published)
+    }
+
     private func pollState(
         _ authority: DomainAgentSessionLinkAuthority,
         observer: DomainAgentSessionLinkEndpointIdentity,

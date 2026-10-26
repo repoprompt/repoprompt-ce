@@ -5,6 +5,7 @@ import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
+import RepoPromptShared
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
@@ -41,7 +42,7 @@ private final class MCPGitRequestContext {
             let standardized = root.standardizedFullPath
             let rootKey = standardized.lowercased()
             guard seenRoots.insert(rootKey).inserted else { continue }
-            guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: standardized)) else { continue }
+            guard let resolved = await vcsService.resolveRepoForRead(at: URL(fileURLWithPath: standardized), authorizedRoots: rootRefs.map { URL(fileURLWithPath: $0.standardizedFullPath) }) else { continue }
             let repo = GitRepoDescriptor(rootURL: resolved.rootURL)
             guard seenRepos.insert(repo.rootPath.lowercased()).inserted else { continue }
             repos.append(repo)
@@ -140,7 +141,7 @@ private final class MCPGitRequestContext {
         let worktreeHead = await (headID(for: repoURL)).map { String($0.prefix(7)) }
         var mainBranch: String?
         var mainHead: String?
-        if let mainRoot {
+        if let mainRoot, GitRepoRootAuthorization.isPathWithinAuthorizedRoots(mainRoot.path, roots: rootRefs.map(\.standardizedFullPath)) {
             mainBranch = await currentBranch(for: mainRoot)
             mainHead = await (headID(for: mainRoot)).map { String($0.prefix(7)) }
         }
@@ -566,6 +567,14 @@ final class MCPGitToolProvider {
             }
         }
 
+        // Explicit external worktree selectors retain the resolver's identity-based grant.
+        // Regardless of selector, reject unrelated metadata before executing any Git read.
+        for repo in repos {
+            guard await vcsService.resolveRepoForRead(at: repo.rootURL, authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) } + [repo.rootURL]) != nil else {
+                throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
+            }
+        }
+
         if let publicationFence = contextBuilderAdmission.publicationFence {
             do {
                 try contextBuilderPolicy.validatePublicationRepositories(
@@ -913,6 +922,7 @@ final class MCPGitToolProvider {
             }
 
             let spec = GitDiffCompareSpec.parse(rawInput)
+            try spec.validateRevisionArgument()
             let resolved = spec.displayString
             let input = (resolved == rawInput) ? nil : rawInput
             return (spec, resolved, input)
@@ -1008,6 +1018,7 @@ final class MCPGitToolProvider {
             guard let ref = args["ref"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !ref.isEmpty else {
                 throw MCPError.invalidParams("ref is required for op: show")
             }
+            try GitRevisionArgument.validate(ref)
             let rawShowDetail = args["detail"]?.stringValue?.lowercased() ?? "summary"
             // For show, "patches" behaves the same as "full" (single commit, no truncation needed)
             let detail = rawShowDetail == "patches" ? "full" : rawShowDetail
@@ -1015,7 +1026,7 @@ final class MCPGitToolProvider {
             let commitInfo = try await showBackend.commitInfo(ref: ref, at: repoURL)
 
             // Get diff for this commit
-            let revspec = "\(ref)^!"
+            let revspec = "\(commitInfo.id)^!"
             let contextLines = args["context_lines"]?.intValue ?? 3
             let detectRenames = args["detect_renames"]?.boolValue ?? false
             let changedFiles = try await showBackend.getChangedFilesStats(

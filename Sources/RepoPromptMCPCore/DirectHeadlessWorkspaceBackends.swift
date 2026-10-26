@@ -548,7 +548,9 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
                 supersetMatches.append(workspace)
             }
         }
-        let matches = exactMatches.isEmpty ? supersetMatches : exactMatches
+        let matches = exactMatches.isEmpty
+            ? supersetMatches
+            : DomainStandaloneScopeCoordinator.deferringRetiredDuplicates(exactMatches)
         guard matches.count == 1, let workspace = matches.first else {
             throw MCPError.invalidParams("working_dirs did not resolve one existing workspace; direct creation is not implicit")
         }

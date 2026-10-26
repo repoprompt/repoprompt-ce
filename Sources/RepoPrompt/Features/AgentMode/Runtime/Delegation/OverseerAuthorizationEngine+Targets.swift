@@ -33,19 +33,25 @@ extension OverseerAuthorizationEngine {
         spawnParentSessionID: () async -> UUID?,
         callerHoldsManageGrant: () async -> Bool
     ) async -> Bool {
+        if authorizesWorktreeBindingWithoutLink(caller: caller, targetSessionID: targetSessionID, spawnParentSessionID: nil) { return true }
+        guard case let .agentSession(callerSessionID) = caller else { return false }
+        if await spawnParentSessionID() == callerSessionID { return true }
+        return await callerHoldsManageGrant()
+    }
+
+    /// Synchronous commit fence for authority independent of a link. Provenance is immutable;
+    /// full access is deliberately read live, even if it short-circuited entry admission.
+    func authorizesWorktreeBindingWithoutLink(
+        caller: DomainAgentSessionCallerIdentity,
+        targetSessionID: UUID,
+        spawnParentSessionID: UUID?
+    ) -> Bool {
         switch caller {
-        case .administrativePrincipal:
-            return true
-        case .unresolvedAgentRun:
-            return false
+        case .administrativePrincipal: true
+        case .unresolvedAgentRun: false
         case let .agentSession(callerSessionID):
-            if callerSessionID == targetSessionID
+            callerSessionID == targetSessionID || spawnParentSessionID == callerSessionID
                 || waivesTargetOwnership(.directChildOrCreatorOwnership, caller: caller, targetSessionID: targetSessionID)
-            {
-                return true
-            }
-            if await spawnParentSessionID() == callerSessionID { return true }
-            return await callerHoldsManageGrant()
         }
     }
 

@@ -3083,7 +3083,10 @@ final class WindowRoutingService: Service {
                         )
                     }
 
-                    await targetWindow.promptManager.closeComposeTab(tab.id)
+                    let callerID = await targetWindow.mcpServer.resolveSpawnParentSessionID(
+                        metadata: invocationContext.metadata, targetWindow: targetWindow
+                    )
+                    await targetWindow.promptManager.closeComposeTab(tab.id, deletionOrigin: .mcpClient(callerID))
 
                     return ManageWorkspacesResponse(action: "close_tab", workspaces: nil, tabs: [summary], status: "ok")
 

@@ -283,6 +283,69 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         }
     }
 
+    func testRefusalReceiptFailurePreservesUnknownSettlementAndReportsOperationID() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-refusal-receipt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+        let storage = container.appendingPathComponent("runtime", isDirectory: true)
+        let fixture = try RuntimeFixture(mode: .app, storage: storage)
+        let journalURL = storage
+            .appendingPathComponent(DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: "m4-test"))
+            .appendingPathComponent("settings/protected-mutation-journal.json")
+        let committedJournalURL = journalURL.appendingPathExtension("committing")
+        let binding = Self.worktreeBinding { _ in
+            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                [physicalRoot.path],
+                rootMappings: [.init(canonicalRoot: canonicalRoot.path, physicalRoot: physicalRoot.path)]
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
+            // Preserve the actual committing receipt, then make durable settlement fail via
+            // real filesystem I/O rather than pretending the refusal was durably recorded.
+            try FileManager.default.moveItem(at: journalURL, to: committedJournalURL)
+            try FileManager.default.createDirectory(at: journalURL, withIntermediateDirectories: false)
+            throw DomainMutationRefusedBeforeEffects(BackendRefusal())
+        }
+        let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+        let context = fixture.context(
+            kind: .runScoped, assurance: .verifiedProcess,
+            authorizedCanonicalRoots: [canonicalRoot.path], ephemeralGrantedToolNames: ["manage_worktree"]
+        )
+        let operationID = "refused-receipt-write-failure"
+        let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+        do {
+            _ = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                settlementState.withLock { $0 = settlement.state }
+            }) {
+                try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                    try await protectedBinding([
+                        "op": .string("create"), "branch": .string("taken"), "operation_id": .string(operationID)
+                    ])
+                }
+            }
+            XCTFail("An unconfirmed refusal receipt must not report completion")
+        } catch let error as MCPError {
+            guard case let .internalError(rawMessage) = error else {
+                return XCTFail("Expected a receipt settlement error, got \(error)")
+            }
+            let message = try XCTUnwrap(rawMessage)
+            XCTAssertTrue(message.contains("No backend effects occurred"), message)
+            XCTAssertTrue(message.contains("durable refusal settlement could not be confirmed"), message)
+            XCTAssertTrue(message.contains(operationID), message)
+            XCTAssertFalse(message.contains(container.path), message)
+        }
+        XCTAssertEqual(settlementState.withLock { $0 }, .unknown)
+        let data = try Data(contentsOf: committedJournalURL)
+        let document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let records = try XCTUnwrap(document["records"] as? [String: [String: Any]])
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.values.first?["status"] as? String, "committing")
+    }
+
     func testBackendFencedWorktreeCreateSettlesPreFenceRefusalAsNotApplied() async throws {
         let container = FileManager.default.temporaryDirectory
             .appendingPathComponent("m4-worktree-refusal-\(UUID().uuidString)", isDirectory: true)
@@ -295,10 +358,10 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
 
         // A deterministic backend refusal before the fence is the backend's own error and not
         // applied; the same refusal after the fence remains indeterminate.
-        for refuseAfterFence in [false, true] {
+        for (refuseAfterFence, provenNoEffects) in [(false, false), (true, false), (true, true)] {
             let fixture = try RuntimeFixture(
                 mode: .app,
-                storage: container.appendingPathComponent("policy-\(refuseAfterFence)", isDirectory: true)
+                storage: container.appendingPathComponent("policy-\(refuseAfterFence)-\(provenNoEffects)", isDirectory: true)
             )
             let binding = Self.worktreeBinding { _ in
                 try await MCPDomainMutationCommitContext.admitPhysicalTargets(
@@ -308,6 +371,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
                 if refuseAfterFence {
                     try await MCPDomainMutationCommitContext.willCommit()
                 }
+                if provenNoEffects { throw DomainMutationRefusedBeforeEffects(BackendRefusal()) }
                 throw BackendRefusal()
             }
             let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
@@ -327,7 +391,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
                     }
                 }
             ) { error in
-                if refuseAfterFence {
+                if refuseAfterFence, !provenNoEffects {
                     guard case .partialSuccessAfterCommit = error as? DomainProtectedMutationError else {
                         return XCTFail("Expected partialSuccessAfterCommit, got \(error)")
                     }
@@ -337,12 +401,12 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             }
             XCTAssertEqual(
                 settlementState.withLock { $0 },
-                refuseAfterFence ? .indeterminateAfterCommit : .notApplied
+                refuseAfterFence && !provenNoEffects ? .indeterminateAfterCommit : .notApplied
             )
             let journal = try await fixture.runtime.mutationJournal.snapshot()
             XCTAssertEqual(
                 journal.recordSnapshots.map(\.status),
-                [refuseAfterFence ? .indeterminateAfterCommit : .failedBeforeCommit]
+                [refuseAfterFence && !provenNoEffects ? .indeterminateAfterCommit : .failedBeforeCommit]
             )
         }
     }

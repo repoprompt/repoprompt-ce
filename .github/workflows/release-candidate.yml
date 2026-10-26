@@ -6,6 +6,14 @@ on:
     branches:
       - main
 
+# Only first-attempt automatic main pushes supersede each other. Explicit
+# dispatches and reruns retain their own groups so a later push or manual request
+# cannot replace those requested builds.
+concurrency:
+  group: >-
+    release-candidate-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' }}
+
 permissions:
   contents: read
 

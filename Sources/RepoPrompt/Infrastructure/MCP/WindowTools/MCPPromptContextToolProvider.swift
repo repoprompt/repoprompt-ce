@@ -161,19 +161,17 @@ final class MCPPromptContextToolProvider {
         case .set:
             guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for set") }
             try await MCPDomainMutationCommitContext.willCommit()
-            try await dependencies.context.updateCurrentTabContext(MCPWindowToolName.prompt) { $0.promptText = text }
-            let context = try await dependencies.execution.requireCurrentTabContext(MCPWindowToolName.prompt)
-            return try Value(simplePromptReply(context.promptText, op: operation.rawValue))
+            let prompt = try await dependencies.context.updateCurrentTabPrompt(MCPWindowToolName.prompt) { $0 = text }
+            return try Value(simplePromptReply(prompt, op: operation.rawValue))
         case .append:
             guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for append") }
             try await MCPDomainMutationCommitContext.willCommit()
-            try await dependencies.context.updateCurrentTabContext(MCPWindowToolName.prompt) { $0.promptText += text }
-            let context = try await dependencies.execution.requireCurrentTabContext(MCPWindowToolName.prompt)
-            return try Value(simplePromptReply(context.promptText, op: operation.rawValue))
+            let prompt = try await dependencies.context.updateCurrentTabPrompt(MCPWindowToolName.prompt) { $0 += text }
+            return try Value(simplePromptReply(prompt, op: operation.rawValue))
         case .clear:
             try await MCPDomainMutationCommitContext.willCommit()
-            try await dependencies.context.updateCurrentTabContext(MCPWindowToolName.prompt) { $0.promptText = "" }
-            return try Value(simplePromptReply("", op: operation.rawValue))
+            let prompt = try await dependencies.context.updateCurrentTabPrompt(MCPWindowToolName.prompt) { $0 = "" }
+            return try Value(simplePromptReply(prompt, op: operation.rawValue))
         case .export:
             return try await exportPrompt(args: args, resolvedContext: resolvedContext, tabContext: tabContext)
         case .selectPreset:

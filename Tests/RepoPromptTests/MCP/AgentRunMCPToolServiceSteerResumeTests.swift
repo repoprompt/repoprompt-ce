@@ -17,6 +17,8 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         session.runState = .running
         viewModel.storeDraftText(for: session.tabID, "Keep my draft")
         let runtime = DelegationScopeRuntime(persistenceMode: .ephemeral, windows: { [window] }, notifyCatalogChanged: { _ in })
+        // Delivery tasks and session observations hold the runtime weakly; the fixture owns it.
+        defer { withExtendedLifetime(runtime) {} }
         runtime.test_suppressDecisionDelivery = false
         let request = try runtime.requestScope(
             requesterSessionID: sessionID, requesterTabID: session.tabID,
@@ -677,6 +679,38 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertEqual(session.items.last { $0.kind == .user }?.text, AgentModeViewModel.mcpResidentTaskFrame("active client task"))
         XCTAssertNil(session.mcpControlContext)
         XCTAssertFalse(session.isMCPOriginated)
+    }
+
+    func testSpawnRefusalHintNamesEligibleExploreTaskRoles() async throws {
+        let window = try await makeWindow()
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = try await makeWorkspaceOwnedSession(in: window, sessionID: sessionID)
+        session.parentSessionID = UUID()
+        _ = try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID, sessionID: sessionID, originatingConnectionID: nil
+        )
+        addTeardownBlock { @MainActor in
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        }
+        let context = try XCTUnwrap(session.mcpControlContext)
+        XCTAssertNil(context.taskLabelKind, "Fixture activates without a task role.")
+
+        XCTAssertThrowsError(try viewModel.mcpValidateAgentRunSpawnAllowed(sourceTabID: session.tabID)) { error in
+            guard let mcpError = error as? MCPError, case let .invalidParams(message) = mcpError else {
+                return XCTFail("Expected invalidParams from the real spawn guard, got: \(error)")
+            }
+            XCTAssertTrue(
+                message?.contains("sub-agents with an engineer, pair, or design task role may start read-only explore children with agent_explore.") == true,
+                "Spawn refusal must name the eligible Explore task roles; got: \(message ?? "missing message")"
+            )
+        }
+
+        session.parentSessionID = nil
+        XCTAssertNoThrow(
+            try viewModel.mcpValidateAgentRunSpawnAllowed(sourceTabID: session.tabID),
+            "A nil-role MCP session without a parent remains allowed to spawn"
+        )
     }
 
     func testLinkedResidentResumeAndExistingTabStartRefuseBeforeActivation() async throws {

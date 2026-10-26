@@ -3133,8 +3133,12 @@ enum AgentTranscriptIO {
     static func latestErrorText(from transcript: AgentTranscript, latestTurnOnly: Bool) -> String? {
         let turns = latestTurnOnly ? transcript.turns.suffix(1) : transcript.turns[...]
         for turn in turns.reversed() {
-            for activity in turn.allActivities.reversed() where activity.itemKind == .error {
-                let trimmed = activity.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let liveErrors = turn.allActivities.reversed().filter { $0.itemKind == .error }
+                .map { ($0.sequenceIndex, $0.text) }
+            let retainedErrors = (turn.summary?.normalizedRecoveryDiagnostics ?? [])
+                .filter { $0.itemKind == .error }.map { ($0.sequenceIndex, $0.text) }
+            for (_, text) in (liveErrors + retainedErrors).sorted(by: { $0.0 > $1.0 }) {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !trimmed.isEmpty {
                     return trimmed
                 }
@@ -6719,7 +6723,7 @@ enum AgentTranscriptProjectionBuilder {
         return rows
     }
 
-    /// Rebuilds the `.system` notice row for a summary-carried recovery diagnostic,
+    /// Rebuilds the original system/error notice kind for a summary-carried diagnostic,
     /// reusing the originating activity's identity so anchors and cutoff handling stay
     /// stable and the notice renders exactly once.
     private static func recoveryDiagnosticRow(
@@ -6728,7 +6732,7 @@ enum AgentTranscriptProjectionBuilder {
         AgentChatItem(
             id: diagnostic.id,
             timestamp: diagnostic.timestamp,
-            kind: .system,
+            kind: diagnostic.itemKind,
             text: diagnostic.text,
             sequenceIndex: diagnostic.sequenceIndex,
             isStreaming: false,
