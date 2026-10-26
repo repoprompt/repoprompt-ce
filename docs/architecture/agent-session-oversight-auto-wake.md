@@ -987,7 +987,10 @@ pay an older already-frozen cutoff, not a newer cache value.
 
 The sixteen-row bound and attention queue are unchanged. Eviction represents debt in existing
 anonymous overflow, never pays a target; overflow acceptance acknowledges only its own watermark.
-Unchanged evicted ordinary coverage is not repeatedly re-enqueued/overflowed. A new ordinary
+Unchanged evicted ordinary coverage is not repeatedly re-enqueued/overflowed, including across
+quiet running/idle cycles: the lane's delivered position records the ordinary watermark its eviction
+already disclosed as overflow, and a quiet close re-represents only coverage beyond it. That record
+never pays; a late exact receipt still pays its frozen cutoff. A new ordinary
 watermark or real new edge changes failure identity; quiet refresh/rebase does not. The existing
 single failure slot holds fingerprint plus producer wake identity. A late W1 may append its canonical
 marker and pay its frozen receipt, but only W2 can clear W2's suppression, even for identical shapes.

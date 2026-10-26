@@ -4,8 +4,27 @@ import Foundation
 import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 import RepoPromptSettingsCore
 import XCTest
+
+/// Fails exactly the first continuity commit with the store's documented retryable admission error.
+private final class OneShotContinuityWriterBusy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+
+    var didFire: Bool {
+        lock.withLock { fired }
+    }
+
+    func beforeCommit() throws {
+        let shouldThrow = lock.withLock {
+            defer { fired = true }
+            return !fired
+        }
+        if shouldThrow { throw OverseerContinuityError.writerBusy }
+    }
+}
 
 /// Cross-window lifecycle bridge: synchronous first-link seeding, activation-time observation
 /// ownership, serialized publication, and eager plus lazy revocation.
@@ -5007,6 +5026,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         )))
     }
 
+    func testAddIsSavedAfterRetryableWriterBusyDefersTheFirstCommit() async throws {
+        let fixture = makeFixture()
+        let gate = OneShotContinuityWriterBusy()
+        let directory = try installLaneIntentStore(fixture, beforeCommit: { try gate.beforeCommit() })
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        let saved = await savedLaneIntents(in: directory)
+        XCTAssertTrue(gate.didFire, "The first commit must have met bounded store admission contention")
+        XCTAssertTrue(saved.contains(AgentSessionOversightIntent(
+            observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID
+        )), "A retryable writerBusy defers the save to the store's own retry; it does not lose the intent")
+    }
+
     func testLinklessPillEndpointCapturedBeforeConsentRejectsSameSessionRebind() async throws {
         let fixture = makeFixture()
         let directory = try installLaneIntentStore(fixture)
@@ -7870,7 +7901,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     @discardableResult
     private func installLaneIntentStore(
         _ fixture: Fixture,
-        mode: AgentSessionOversightPersistenceMode = .enabled
+        mode: AgentSessionOversightPersistenceMode = .enabled,
+        beforeCommit: @escaping @Sendable () throws -> Void = {}
     ) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("lane-bridge-\(UUID().uuidString)", isDirectory: true)
@@ -7881,7 +7913,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             backupsDirectoryURL: directory.appendingPathComponent(
                 AgentSessionOversightIntentStore.backupsDirectoryName, isDirectory: true
             ),
-            mode: mode
+            mode: mode,
+            beforeCommit: beforeCommit
         )
         laneIntentStores[directory] = store
         fixture.bridge.installIntentStore(store)
@@ -7889,7 +7922,9 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     }
 
     private func savedLaneIntents(in directory: URL) async -> [AgentSessionOversightIntent] {
-        await laneIntentStores[directory]?.serializationBarrier()
+        // Durable read-back must follow a retryable save failure into the store's own retry; the
+        // termination barrier alone returns after the current attempt (CI writerBusy contention).
+        await laneIntentStores[directory]?.test_awaitOutboxSettled()
         let restored = AgentSessionOversightIntentStore(
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.backupsDirectoryName),
