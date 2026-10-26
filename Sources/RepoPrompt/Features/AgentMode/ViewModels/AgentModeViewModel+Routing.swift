@@ -578,6 +578,9 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Model-stage picks below this service-reported confidence fall back locally.
+    static let minimumModelRouteConfidence = 0.4
+
     func routeModelThenEffort(
         requestID: UUID,
         text: String,
@@ -602,7 +605,8 @@ extension AgentModeViewModel {
               let builtModels = try? builder.build(
                   snapshot: snapshot,
                   roleDefaults: capturedRoleDefaults ?? agentModelRoleDefaultReferences(),
-                  maximumChoices: registration.capabilities.finiteChoice.maximumChoices
+                  maximumChoices: registration.capabilities.finiteChoice.maximumChoices,
+                  usagePeerClasses: scope == .primarySession ? AgentTaskRoutingCandidateBuilder.primarySessionUsagePeerClasses : nil
               ), !builtModels.isEmpty
         else {
             return StagedTaskRoutingResult(
@@ -649,6 +653,14 @@ extension AgentModeViewModel {
             guard case let .selected(modelKey, evidence) = modelOutcome,
                   let match = models.only(where: { $0.opaqueKey == modelKey })
             else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome, judgmentRequested: true) }
+            // A low-confidence advisory pick is not trusted; keep the local selection instead.
+            if let confidence = evidence?.confidence, confidence < Self.minimumModelRouteConfidence {
+                return StagedTaskRoutingResult(
+                    candidates: models,
+                    outcome: .abstained(reasonCode: "low_confidence", evidence: evidence),
+                    judgmentRequested: true
+                )
+            }
             selectedModel = match
             unbalancedModel = match
             modelEvidence = evidence

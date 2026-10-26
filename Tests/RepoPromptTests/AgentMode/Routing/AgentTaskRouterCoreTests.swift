@@ -292,19 +292,48 @@ final class AgentTaskRoutingCandidateBuilderPolicyTests: XCTestCase {
 
         let candidates = try builder.build(snapshot: snapshot)
 
+        // Strongest-first within each provider so judge position bias and truncation favor capability.
         XCTAssertEqual(candidates.map(\.target.modelRaw), [
-            "gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra",
-            "claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5-5", "claude-fable-5-1"
+            "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-6-luna",
+            "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5"
         ])
         XCTAssertEqual(candidates.map(\.utilityTier), [
-            "gpt-6-luna", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-astra",
-            "claude-haiku", "claude-sonnet", "claude-opus", "claude-fable"
+            "gpt-6-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-6-luna",
+            "claude-opus", "claude-fable", "claude-sonnet", "claude-haiku"
         ])
         XCTAssertFalse(candidates.contains { $0.target.agentRaw == AgentProviderKind.openCode.rawValue })
-        XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-6-luna" }?.descriptor.rubric.contains("Do not choose it merely because the prompt is short") == true)
-        XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-5.6-terra" }?.descriptor.rubric.contains("no preference from its market tier") == true)
-        XCTAssertTrue(candidates.first { $0.target.modelRaw == "gpt-6-sol" }?.descriptor.rubric.contains("missed findings or retries") == true)
+        XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-6-luna" }?.descriptor.rubric.contains("Not suitable for implementation") == true)
+        XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-5.6-terra" }?.descriptor.rubric.contains("previous-generation") == true)
+        XCTAssertTrue(candidates.first { $0.target.modelRaw == "gpt-6-sol" }?.descriptor.rubric.contains("missed findings and retries") == true)
         XCTAssertTrue(candidates.first { $0.utilityTier == "gpt-6-astra" }?.descriptor.rubric.contains("premium price") == true)
+        XCTAssertFalse(candidates.contains { $0.descriptor.rubric.contains("no preference from its market tier") })
+    }
+
+    func testPrimarySessionFloorExcludesLightAndBalancedFamiliesBeforeTruncation() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: false
+        )
+        let builder = candidateBuilder(codexOptions: Self.advertisedCodexOptions)
+        let snapshot = builder.capture(allowedProviders: [.claudeCode, .codexExec], availability: availability)
+
+        let primary = try builder.build(
+            snapshot: snapshot,
+            usagePeerClasses: AgentTaskRoutingCandidateBuilder.primarySessionUsagePeerClasses
+        )
+        XCTAssertEqual(primary.map(\.utilityTier), ["gpt-6-sol", "gpt-6-astra", "claude-opus", "claude-fable"])
+        XCTAssertTrue(primary.allSatisfy { ["strong", "frontier"].contains($0.usagePeerClass) })
+
+        let truncated = try builder.build(
+            snapshot: snapshot,
+            maximumChoices: 2,
+            usagePeerClasses: AgentTaskRoutingCandidateBuilder.primarySessionUsagePeerClasses
+        )
+        XCTAssertEqual(truncated.map(\.utilityTier), ["gpt-6-sol", "gpt-6-astra"], "Excluded tiers must not consume choice capacity")
+
+        let subagent = try builder.build(snapshot: snapshot)
+        XCTAssertTrue(subagent.contains { $0.utilityTier == "gpt-6-luna" }, "Subagent routing keeps the full curated frontier")
     }
 
     func testUnknownFamiliesDoNotEnableAutomaticRouter() {

@@ -545,6 +545,35 @@ extension AgentComposerSubmissionAttemptTests {
         XCTAssertNil(viewModel.modelRouterPillProps().routedModelDisplayName)
     }
 
+    func testLowConfidenceModelRouteKeepsCurrentSelection() async throws {
+        let backend = ComposerRoutingBackend(outcome: .lowConfidenceLast)
+        let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = AgentModel.claudeSonnet.rawValue
+        let baseline = (session.selectedAgent, session.selectedModelRaw)
+        let claim = try routingClaim(viewModel: viewModel, session: session, text: "Investigate a race")
+
+        let result = await viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: "Investigate a race",
+            claim: claim,
+            session: session,
+            destinationTabID: tabID
+        )
+
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(session.selectedAgent, baseline.0)
+        XCTAssertEqual(session.selectedModelRaw, baseline.1)
+        let requests = await backend.requests
+        XCTAssertEqual(requests.map(\.question.name), ["model_route"], "A low-confidence model pick must not proceed to effort routing")
+        let offered = try XCTUnwrap(requests.first).question.choices.map(\.description)
+        let weakModels = ["model: gpt-6-luna", "model: gpt-5.6-terra", "model: haiku", "model: sonnet"]
+        let offersWeakModel = offered.contains { description in weakModels.contains { description.contains($0) } }
+        XCTAssertFalse(offersWeakModel, "Primary sessions must not offer light or balanced models")
+    }
+
     func testLongComposerTaskStillRoutesOnMaskedExcerpt() async throws {
         let backend = ComposerRoutingBackend(outcome: .selectLast)
         let (viewModel, _) = try await makeRoutingViewModel(backend: backend)
@@ -1268,7 +1297,7 @@ private actor ComposerDecisionsClient {
 }
 
 private actor ComposerRoutingBackend: DecisionService {
-    enum Outcome { case selectLast, preferClaude, abstain, abstainEffort, cancelEffort }
+    enum Outcome { case selectLast, preferClaude, abstain, abstainEffort, cancelEffort, lowConfidenceLast }
     nonisolated let id: DecisionServiceID
     nonisolated let displayName: String
     nonisolated let capabilities = DecisionServiceCapabilities.routerTest
@@ -1305,6 +1334,14 @@ private actor ComposerRoutingBackend: DecisionService {
             }?.opaqueKey ?? request.question.choices.last!.opaqueKey, evidence: nil)
         case .abstain:
             .abstained(reasonCode: "ambiguous", evidence: nil)
+        case .lowConfidenceLast:
+            .selected(
+                opaqueKey: request.question.choices[request.question.choices.count - 1].opaqueKey,
+                evidence: .init(
+                    acceptancePolicyVersion: "fake-v1", confidence: 0.2, scores: nil, scoreSemantics: nil,
+                    probabilities: nil, probabilitySemantics: nil, usage: nil
+                )
+            )
         case .cancelEffort:
             request.question.name == "effort_route"
                 ? .cancelled
