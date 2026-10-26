@@ -2470,12 +2470,16 @@ final class SessionAdminStructureTests: XCTestCase {
         let projector: SpawnProvenanceDelegationMembershipProjector
         let names = Names()
 
-        init() {
+        init(useProductionProjector: Bool = false) {
             structure = StructureHost(provenance: provenance)
             worktrees.provenance = provenance
             var projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
             let ownership = ownership
-            projector.ownedUnreleasedWorktreeIDs = { ownership.ownedUnreleasedWorktreeIDs(createdBy: $0) }
+            if useProductionProjector {
+                projector = .production(worktreeOwnership: ownership, source: provenance)
+            } else {
+                projector.ownedUnreleasedWorktreeIDs = { ownership.ownedUnreleasedWorktreeIDs(createdBy: $0) }
+            }
             self.projector = projector
             core = AgentSessionAdministrationCore(scopes: runtime, projector: projector)
             var context = SessionAdminHandlerContext(scopes: runtime, projector: projector)
@@ -3250,6 +3254,121 @@ final class SessionAdminStructureTests: XCTestCase {
         try await assertWorktreeQuotaRefusesUnknownOwnership(blocked: true)
     }
 
+    func testSessionQuotasRemainAvailableBeforeOwnershipBootstrap() async throws {
+        try await assertSessionQuotasWithUnavailableOwnership(blocked: false)
+    }
+
+    func testSessionQuotasRemainAvailableWithBlockedOwnership() async throws {
+        try await assertSessionQuotasWithUnavailableOwnership(blocked: true)
+    }
+
+    private func assertSessionQuotasWithUnavailableOwnership(blocked: Bool) async throws {
+        try await withUnavailableOwnership(blocked: blocked) { fixture in
+            for worktreeLimit: Int? in [nil, 1] {
+                let caller = UUID(), member = UUID()
+                fixture.provenance.add(caller, parent: nil)
+                fixture.provenance.add(member, parent: caller, live: false)
+                let scope = try fixture.grant(caller, guardrails: .init(maxLiveSessions: 2, maxWorktrees: worktreeLimit))
+                guard case let .admitted(admission) = fixture.admit(caller) else {
+                    return XCTFail("A session-only spawn must not need worktree ownership")
+                }
+                XCTAssertEqual(admission.stampScopeID, scope.id, "Core authorization must admit the session operation too")
+                fixture.runtime.release(admission.reservation)
+                guard case .authorized = fixture.core.authorize(.init(
+                    operation: .adminFork, caller: .agentSession(caller), scopeID: scope.id, targetSessionIDs: [member]
+                )) else { return XCTFail("A fork consumes session capacity independently of ownership") }
+                XCTAssertNil(fixture.projector.usageEvidence(of: scope.grant, spawnParentSessionID: caller))
+                for snapshot in [false, true] {
+                    let check: (any DelegationMembershipProjector) -> Void = { projector in
+                        XCTAssertEqual(projector.usageEvidence(
+                            of: scope.grant, spawnParentSessionID: caller, requiresWorktreeAccounting: false
+                        )?.liveSessionCount, 1)
+                        XCTAssertNil(projector.usageEvidence(of: scope.grant, spawnParentSessionID: caller))
+                    }
+                    if snapshot {
+                        fixture.projector.withSynchronousCensus(check)
+                    } else {
+                        fixture.projector.withSynchronousTargets([caller, member], check)
+                    }
+                }
+                fixture.provenance.censusConflicts = [UUID(): []]
+                XCTAssertEqual(fixture.admit(caller), .denied(.usageProofMissing), "Session capacity still needs complete placement")
+                fixture.provenance.censusConflicts = [:]
+                fixture.provenance.add(member, parent: caller)
+                XCTAssertEqual(fixture.admit(caller), .denied(.guardrailExceeded(guardrail: .maxLiveSessions, limit: 2, current: 2)))
+
+                let root = UUID(), child = UUID()
+                fixture.provenance.add(root, parent: nil)
+                fixture.provenance.add(child, parent: root)
+                try fixture.grant(root, guardrails: .init(maxDepth: 1, maxWorktrees: worktreeLimit))
+                guard case let .admitted(shallow) = fixture.admit(root) else { return XCTFail("A spawn within maxDepth must be admitted") }
+                fixture.runtime.release(shallow.reservation)
+                XCTAssertEqual(fixture.admit(child), .denied(.guardrailExceeded(guardrail: .maxDepth, limit: 1, current: 2)))
+            }
+        }
+    }
+
+    func testAdoptionWithoutWorktreeLimitBeforeOwnershipBootstrap() async throws {
+        try await assertAdoptionWithUnavailableOwnership(blocked: false)
+    }
+
+    func testAdoptionWithoutWorktreeLimitWithBlockedOwnership() async throws {
+        try await assertAdoptionWithUnavailableOwnership(blocked: true)
+    }
+
+    private func assertAdoptionWithUnavailableOwnership(blocked: Bool) async throws {
+        try await withUnavailableOwnership(blocked: blocked) { fixture in
+            for sessionLimit: Int? in [nil, 2] {
+                let caller = UUID(), outsider = UUID()
+                fixture.provenance.add(caller, parent: nil)
+                fixture.provenance.add(outsider, parent: nil)
+                let scope = try fixture.grant(caller, guardrails: .init(maxLiveSessions: sessionLimit))
+                let key = "adopt-\(caller)"
+                guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+                    .adminAdopt, caller: caller, targets: [outsider], key: key
+                ) else { return XCTFail("Adoption without a worktree quota must reach its approval card") }
+                XCTAssertFalse(fixture.structure.placements.contains { $0.session == outsider })
+                XCTAssertNotNil(fixture.runtime.confirmations.approve(confirmationID: card.id))
+                let reply = try await fixture.value(
+                    .adminAdopt, caller: caller, targets: [outsider], key: key, confirmation: card.id
+                )
+                XCTAssertEqual(self.items(reply)[outsider.uuidString]?["result"], .string("moved"))
+                XCTAssertEqual(fixture.provenance.sessions[outsider]?.organizationalParentID, caller)
+                XCTAssertEqual(fixture.provenance.sessions[outsider]?.delegationScopeID, scope.id)
+                if sessionLimit != nil {
+                    let extra = UUID()
+                    fixture.provenance.add(extra, parent: nil)
+                    XCTAssertEqual(fixture.runtime.authorization.adoptionQuotaDenial(
+                        scope: scope, moved: [extra], projector: fixture.projector
+                    ), .guardrailExceeded(guardrail: .maxLiveSessions, limit: 2, current: 2))
+                }
+            }
+            let limitedCaller = UUID(), limitedOutsider = UUID()
+            fixture.provenance.add(limitedCaller, parent: nil)
+            fixture.provenance.add(limitedOutsider, parent: nil)
+            let limited = try fixture.grant(limitedCaller, guardrails: .init(maxWorktrees: 1))
+            XCTAssertEqual(fixture.runtime.authorization.adoptionQuotaDenial(
+                scope: limited, moved: [limitedOutsider], projector: fixture.projector
+            ), .usageProofMissing, "Adoption still needs ownership when a worktree quota applies")
+        }
+    }
+
+    private func withUnavailableOwnership(blocked: Bool, _ body: (Fixture) async throws -> Void) async throws {
+        let fixture = Fixture(useProductionProjector: true)
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("session-ownership-readiness-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        if blocked {
+            let database = directory.appendingPathComponent("blocked.sqlite")
+            try FileManager.default.createDirectory(at: database, withIntermediateDirectories: true)
+            await fixture.ownership.bootstrap(fileURL: directory.appendingPathComponent("legacy.json"), backupsDirectoryURL: nil, databaseURL: database)
+            guard case .blocked = fixture.ownership.loadState else { return XCTFail("The directory must block opening the ownership database") }
+        } else {
+            XCTAssertEqual(fixture.ownership.loadState, .unloaded)
+        }
+        try await body(fixture)
+    }
+
     private func assertWorktreeQuotaRefusesUnknownOwnership(blocked: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ownership-readiness-\(UUID())")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -3294,6 +3413,25 @@ final class SessionAdminStructureTests: XCTestCase {
         projector.withSynchronousTargets([caller, target]) { snapshot in
             XCTAssertNil(snapshot.usageEvidence(of: scope.grant, spawnParentSessionID: nil))
         }
+        let nested = try fixture.grant(target, guardrails: .init())
+        guard case let .completed(inherited) = try await core.perform(.init(
+            operation: .adminWorktreeCreate, caller: .agentSession(target), scopeID: nested.id,
+            targetSessionIDs: [target], arguments: ["bind": .bool(false)]
+        )) else { return XCTFail("The unlimited local scope must reach the ancestor accounting check") }
+        XCTAssertEqual(inherited.objectValue?["subreason"], .string("usage_evidence_unavailable"))
+        XCTAssertTrue(fixture.worktrees.created.isEmpty)
+        XCTAssertThrowsError(try fixture.runtime.authorization.admitWorktreeBinding(
+            ["unaccounted"], target: target, scope: nested,
+            census: .init(bound: [:], retainedTargetIDs: [], ownership: ownership), projector: projector
+        )) { error in
+            guard case SessionAdminHostError.usageEvidenceUnavailable = error else { return XCTFail("Unexpected inherited binding refusal: \(error)") }
+        }
+        let joining = UUID()
+        fixture.provenance.add(joining, parent: nil, worktrees: ["joining-worktree"])
+        XCTAssertEqual(DelegationSpawnAdmission.admit(
+            creatorSessionID: caller, target: .unplacedSession(joining), scopes: fixture.runtime,
+            administration: core, projector: projector
+        ), .denied(.usageProofMissing), "Joining an existing worktree must still require ownership accounting")
         if !blocked {
             // Explicit ephemeral bootstrap proves that this process has no durable ownership to load.
             await ownership.bootstrapProduction(mode: .suppressed)

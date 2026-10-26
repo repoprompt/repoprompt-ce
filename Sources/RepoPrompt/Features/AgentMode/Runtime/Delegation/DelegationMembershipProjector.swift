@@ -143,6 +143,12 @@ protocol DelegationMembershipProjector {
     func authorityConflictInAncestry(of sessionID: UUID) -> Bool
     /// Capacity decisions consume this optional proof, never an incomplete numeric projection.
     func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage?
+    /// Without worktree accounting, only the session count and parent depth are capacity evidence.
+    func usageEvidence(
+        of scope: DomainDelegationScopeGrant,
+        spawnParentSessionID: UUID?,
+        requiresWorktreeAccounting: Bool
+    ) -> DomainDelegationScopeUsage?
 }
 
 extension DelegationMembershipProjector {
@@ -156,6 +162,14 @@ extension DelegationMembershipProjector {
 
     func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage? {
         usage(of: scope, spawnParentSessionID: spawnParentSessionID)
+    }
+
+    func usageEvidence(
+        of scope: DomainDelegationScopeGrant,
+        spawnParentSessionID: UUID?,
+        requiresWorktreeAccounting _: Bool
+    ) -> DomainDelegationScopeUsage? {
+        usageEvidence(of: scope, spawnParentSessionID: spawnParentSessionID)
     }
 
     func withSynchronousTargets<Result>(_: Set<UUID>, _ body: (any DelegationMembershipProjector) -> Result) -> Result {
@@ -324,7 +338,15 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     }
 
     func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage? {
-        guard ownershipAccountingReady() else { return nil }
+        usageEvidence(of: scope, spawnParentSessionID: spawnParentSessionID, requiresWorktreeAccounting: true)
+    }
+
+    func usageEvidence(
+        of scope: DomainDelegationScopeGrant,
+        spawnParentSessionID: UUID?,
+        requiresWorktreeAccounting: Bool
+    ) -> DomainDelegationScopeUsage? {
+        guard !requiresWorktreeAccounting || ownershipAccountingReady() else { return nil }
         let census = census()
         guard census.snapshot.hasCompletePlacement(for: scope) else { return nil }
         return Self(source: census, ownedUnreleasedWorktreeIDs: ownedUnreleasedWorktreeIDs, onAncestryLookup: onAncestryLookup)

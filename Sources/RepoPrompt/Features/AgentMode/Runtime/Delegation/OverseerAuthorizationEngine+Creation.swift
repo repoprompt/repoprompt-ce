@@ -74,7 +74,10 @@ extension OverseerAuthorizationEngine {
             for scope in scopes.scopeChain(from: record.id) {
                 scopeIDs.insert(scope.id)
                 guard operation.requiresScopeUsage(for: scope.grant.guardrails) else { continue }
-                guard let evidence = projector.usageEvidence(of: scope.grant, spawnParentSessionID: creator) else {
+                guard let evidence = projector.usageEvidence(
+                    of: scope.grant, spawnParentSessionID: creator,
+                    requiresWorktreeAccounting: operation.scopeGuardrailUse == .worktree
+                ) else {
                     return (.usageProofMissing, scopeIDs)
                 }
                 let projected = scopes.usageIncludingReservations(evidence)
