@@ -1325,6 +1325,7 @@ actor WorkspaceFileContextStore {
     #if DEBUG
         private var rootLoadWillStartHandler: (@Sendable (String) async -> Void)?
         private var rootLoadWillReturnHandlerForTesting: (@Sendable (String, UUID) async -> Void)?
+        private var rootLoadCleanupTaskDidLaunchHandlerForTesting: (@Sendable (Task<Void, Never>) -> Void)?
         private var sessionWorktreeDrainDidEnterLoadFlightWaitHandler: (@Sendable () -> Void)?
         private var sessionWorktreeDrainLoadFlightWaiterCount = 0
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
@@ -2066,6 +2067,13 @@ actor WorkspaceFileContextStore {
 
         func setRootLoadWillReturnHandlerForTesting(_ handler: (@Sendable (String, UUID) async -> Void)?) {
             rootLoadWillReturnHandlerForTesting = handler
+        }
+
+        /// Lifetime fixtures must join this task before dropping the store's final owner.
+        func setRootLoadCleanupTaskDidLaunchHandlerForTesting(
+            _ handler: (@Sendable (Task<Void, Never>) -> Void)?
+        ) {
+            rootLoadCleanupTaskDidLaunchHandlerForTesting = handler
         }
 
         func setSessionWorktreeDrainDidEnterLoadFlightWaitHandler(
@@ -11675,13 +11683,17 @@ actor WorkspaceFileContextStore {
                 token: sessionWorktreeReservationToken
             )
         }
-        Task { [weak self] in
+        let cleanupTask = Task<Void, Never> { [weak self] in
             _ = try? await task.value
             await self?.clearCompletedRootLoadTask(
                 standardizedPath: standardizedPath,
                 expectedFlightID: flightID
             )
         }
+        #if DEBUG
+            rootLoadCleanupTaskDidLaunchHandlerForTesting?(cleanupTask)
+        #endif
+        _ = cleanupTask
         return try await awaitRootLoadTask(
             task,
             standardizedPath: standardizedPath,
