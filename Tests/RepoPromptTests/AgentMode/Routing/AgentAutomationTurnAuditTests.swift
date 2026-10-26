@@ -313,7 +313,7 @@ final class RoutingExecutionMetadataTests: XCTestCase {
         let snapshot = builder.capture(allowedProviders: [.codexExec], availability: available)
         XCTAssertEqual(snapshot.models.map(\.baseModelRaw), [raw, "gpt-6-sol", "gpt-6-luna"])
         XCTAssertTrue(snapshot.contains(.init(agentRaw: AgentProviderKind.codexExec.rawValue, modelRaw: raw, reasoningEffortRaw: nil, modelParameters: [])))
-        XCTAssertEqual(try builder.build(snapshot: snapshot).map(\.target.modelRaw), ["gpt-6-luna", "gpt-6-sol"])
+        XCTAssertEqual(try builder.build(snapshot: snapshot).map(\.target.modelRaw), ["gpt-6-sol", "gpt-6-luna"])
 
         let exactRecord = CodexDynamicModelRecord(
             id: raw, model: raw, displayName: raw, description: "", isDefault: false
@@ -476,7 +476,7 @@ final class RoutingExecutionMetadataTests: XCTestCase {
         let first = try builder.build(snapshot: snapshot, roleDefaults: references, maximumChoices: 4)
         let second = try builder.build(snapshot: snapshot, roleDefaults: references, maximumChoices: 4)
         XCTAssertEqual(first.map(\.target), second.map(\.target))
-        XCTAssertEqual(first.map(\.target.modelRaw), ["gpt-6-luna", "gpt-6-sol", "gpt-6-astra", "claude-sonnet-5"])
+        XCTAssertEqual(first.map(\.target.modelRaw), ["gpt-6-sol", "gpt-6-astra", "gpt-6-luna", "claude-opus-5-5"])
         XCTAssertTrue(try XCTUnwrap(first.first { $0.target.modelRaw == "gpt-6-sol" }).descriptor.targetDescription.contains("Engineer (user-set)"))
         XCTAssertFalse(first.contains { $0.target.agentRaw == AgentProviderKind.openCode.rawValue })
     }
@@ -493,8 +493,8 @@ final class RoutingExecutionMetadataTests: XCTestCase {
             allowedProviders: Set(catalog.keys), availability: available,
             roleDefaults: references, maximumChoices: 4
         )
-        XCTAssertEqual(candidates.map(\.target.modelRaw), ["gpt-6-luna", "gpt-6-sol", "claude-sonnet-5", "claude-opus-5-5"])
-        XCTAssertTrue(candidates.last?.descriptor.targetDescription.contains("Engineer (user-set)") == true)
+        XCTAssertEqual(candidates.map(\.target.modelRaw), ["gpt-6-sol", "gpt-6-luna", "claude-opus-5-5", "claude-sonnet-5"])
+        XCTAssertTrue(candidates.first { $0.target.modelRaw == "claude-opus-5-5" }?.descriptor.targetDescription.contains("Engineer (user-set)") == true)
     }
 
     func testInsufficientServiceCapacityFallsBackBeforeCallingService() {

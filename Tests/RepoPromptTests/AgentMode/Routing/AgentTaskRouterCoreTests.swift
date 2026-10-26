@@ -1632,9 +1632,12 @@ final class RoutingModelProfileResolverTests: XCTestCase {
             claudeCodeAvailable: false, codexAvailable: true, openCodeAvailable: false
         )
         let candidates = try builder.build(allowedProviders: [.codexExec], availability: availability)
-        XCTAssertEqual(candidates.map(\.target.modelRaw), ["gpt-6-luna", "gpt-6-sol"])
-        XCTAssertTrue(candidates[0].descriptor.targetDescription.contains("No audited benchmark or pricing profile"))
-        XCTAssertTrue(candidates[1].descriptor.targetDescription.contains("Exact audited annotation"))
+        // Curated candidates are ordered strongest-first within a provider.
+        XCTAssertEqual(candidates.map(\.target.modelRaw), ["gpt-6-sol", "gpt-6-luna"])
+        let luna = try XCTUnwrap(candidates.first { $0.target.modelRaw == "gpt-6-luna" })
+        let sol = try XCTUnwrap(candidates.first { $0.target.modelRaw == "gpt-6-sol" })
+        XCTAssertTrue(luna.descriptor.targetDescription.contains("No audited benchmark or pricing profile"))
+        XCTAssertTrue(sol.descriptor.targetDescription.contains("Exact audited annotation"))
         XCTAssertFalse(candidates.contains { $0.target.modelRaw == "known" || $0.target.modelRaw == "new-model" })
     }
 
