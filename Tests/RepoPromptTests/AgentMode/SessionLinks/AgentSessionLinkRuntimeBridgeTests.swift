@@ -7888,18 +7888,34 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         return directory
     }
 
-    private func savedLaneIntents(in directory: URL) async -> [AgentSessionOversightIntent] {
-        await laneIntentStores[directory]?.serializationBarrier()
+    private func savedLaneIntents(
+        in directory: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> [AgentSessionOversightIntent] {
+        guard let original = laneIntentStores[directory] else {
+            XCTFail("No installed lane continuity store", file: file, line: line)
+            return []
+        }
+        await original.serializationBarrier()
+        let saveState = await original.saveState
+        let saveDiagnostic = await original.diagnostic
+        XCTAssertEqual(saveState, "saved", "Lane continuity was not saved: \(saveDiagnostic ?? "no diagnostic")", file: file, line: line)
+        let liveIntents = await original.allIntents()
         let restored = AgentSessionOversightIntentStore(
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.backupsDirectoryName),
             mode: .enabled
         )
-        guard case .ready = await restored.loadForLaunch() else {
-            XCTFail("Saved lane continuity did not load")
+        let load = await restored.loadForLaunch()
+        guard case .ready = load else {
+            let loadDiagnostic = await restored.diagnostic
+            XCTFail("Saved lane continuity did not load (\(load)): \(loadDiagnostic ?? "no diagnostic")", file: file, line: line)
             return []
         }
-        return await restored.allIntents()
+        let restoredIntents = await restored.allIntents()
+        XCTAssertEqual(restoredIntents, liveIntents, "Saved lane continuity differs from the original store's live intents", file: file, line: line)
+        return restoredIntents
     }
 
     private func laneRequest(_ fixture: Fixture, key: String = "create-1", message: String? = nil)
