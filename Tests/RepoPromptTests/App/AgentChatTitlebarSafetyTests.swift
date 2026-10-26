@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 import Foundation
+import KeyboardShortcuts
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
@@ -1655,5 +1657,166 @@ private func awaitWindowTitleResolution(
             continuation.resume(returning: window.displayedWindowTitle)
         }
         window.requestWindowTitleUpdate(reason: .explicit)
+    }
+}
+
+@MainActor
+final class KeyboardShortcutCoverageTests: XCTestCase {
+    func testCatalogHasUniqueIdentitiesAndCoversApplicationAndSessionCommands() {
+        let rows = KeyboardShortcutCatalog.sections.flatMap(\.bindings)
+        XCTAssertEqual(Set(rows.map(\.id)).count, rows.count)
+        XCTAssertEqual(Set(rows.map(\.name)).count, rows.count)
+        let names = Set(rows.map(\.name))
+        for name: KeyboardShortcuts.Name in [.newWorkspaceWindow, .showAppSettings, .closeAppWindow, .checkForUpdates, .cmdS, .cmdShiftS] {
+            XCTAssertTrue(names.contains(name))
+        }
+        for action in AgentChatShortcutAction.allCases {
+            XCTAssertTrue(names.contains(action.shortcutName))
+        }
+    }
+
+    func testExistingMenuDefaultsArePreservedAndNewDefaultsDoNotCollide() {
+        XCTAssertEqual(KeyboardShortcuts.Name.newWorkspaceWindow.defaultShortcut, .init(.n, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.showAppSettings.defaultShortcut, .init(.comma, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.closeAppWindow.defaultShortcut, .init(.w, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.checkForUpdates.defaultShortcut, .init(.u, modifiers: [.command, .option]))
+        XCTAssertEqual(KeyboardShortcuts.Name.cmdS.defaultShortcut, .init(.s, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.cmdShiftS.rawValue, "cmdShiftS3")
+        XCTAssertEqual(KeyboardShortcuts.Name.agentNewChat.defaultShortcut, .init(.n, modifiers: [.command, .option]))
+        XCTAssertEqual(KeyboardShortcuts.Name.newComposeTab.defaultShortcut, .init(.t, modifiers: .command))
+        XCTAssertNil(KeyboardShortcuts.Name.deleteAgentSession.defaultShortcut)
+        let defaults = KeyboardShortcutCatalog.sections.flatMap(\.bindings).compactMap(\.name.defaultShortcut)
+        XCTAssertEqual(Set(defaults).count, defaults.count)
+    }
+
+    func testRemapClearAndRestoreAreReflectedInDisplayWithoutReservingMenuKeys() {
+        let name = KeyboardShortcuts.Name.newWorkspaceWindow
+        let original = KeyboardShortcuts.getShortcut(for: name)
+        defer {
+            KeyboardShortcuts.setShortcut(original, for: name)
+            GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        }
+        let remapped = KeyboardShortcuts.Shortcut(.n, modifiers: [.command, .control])
+        KeyboardShortcuts.setShortcut(remapped, for: name)
+        GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        XCTAssertEqual(GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.title("New Window", for: name), "New Window    \(remapped.description)")
+        KeyboardShortcuts.setShortcut(nil, for: name)
+        GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        XCTAssertEqual(GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.title("New Window", for: name), "New Window")
+        KeyboardShortcuts.reset(name)
+        GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        XCTAssertEqual(KeyboardShortcuts.getShortcut(for: name), name.defaultShortcut)
+    }
+
+    func testNewDefaultsYieldToSavedCustomAssignmentsAndPreserveExplicitClears() {
+        let existing = KeyboardShortcuts.Name("shortcut-test-existing-\(UUID())")
+        let raw = "shortcut-test-new-\(UUID())"
+        let shortcut = KeyboardShortcuts.Shortcut(.p, modifiers: [.command, .shift, .control])
+        defer {
+            KeyboardShortcuts.setShortcut(nil, for: existing)
+            KeyboardShortcuts.setShortcut(nil, for: .init(raw))
+            UserDefaults.standard.removeObject(forKey: "KeyboardShortcuts_" + existing.rawValue)
+            UserDefaults.standard.removeObject(forKey: "KeyboardShortcuts_" + raw)
+        }
+        KeyboardShortcuts.setShortcut(shortcut, for: existing)
+        let added = KeyboardShortcuts.Name.sessionAction(raw, default: shortcut)
+        XCTAssertNil(KeyboardShortcuts.getShortcut(for: added))
+        XCTAssertEqual(added.defaultShortcut, shortcut)
+        KeyboardShortcuts.setShortcut(nil, for: existing)
+        let recreated = KeyboardShortcuts.Name.sessionAction(raw, default: shortcut)
+        XCTAssertNil(KeyboardShortcuts.getShortcut(for: recreated), "An explicitly cleared assignment must remain cleared")
+        KeyboardShortcuts.reset(recreated)
+        XCTAssertEqual(KeyboardShortcuts.getShortcut(for: recreated), shortcut)
+    }
+
+    func testDisplayRefreshesAutomaticallyAfterBindingChange() async {
+        let name = KeyboardShortcuts.Name.newWorkspaceWindow
+        let original = KeyboardShortcuts.getShortcut(for: name)
+        let display = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
+        let shortcut = KeyboardShortcuts.Shortcut(.n, modifiers: [.command, .control, .shift])
+        let changed = expectation(description: "Binding display refreshed from defaults notification")
+        let observation = display.$labels.dropFirst().first { $0[name] == shortcut.description }.sink { _ in changed.fulfill() }
+        defer {
+            observation.cancel()
+            KeyboardShortcuts.setShortcut(original, for: name)
+            display.refresh()
+        }
+        KeyboardShortcuts.setShortcut(shortcut, for: name)
+        await fulfillment(of: [changed], timeout: 3)
+    }
+
+    func testAutomaticCloseAdapterOnlyRemovesStandardCloseEquivalent() {
+        let menu = NSMenu()
+        let close = NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        close.keyEquivalentModifierMask = .command
+        let unrelated = NSMenuItem(title: "Other", action: #selector(NSApplication.hide(_:)), keyEquivalent: "w")
+        unrelated.keyEquivalentModifierMask = .command
+        menu.addItem(close)
+        menu.addItem(unrelated)
+        ManagedCloseMenuShortcut.removeAutomaticCloseEquivalent(in: menu)
+        XCTAssertEqual(close.keyEquivalent, "")
+        XCTAssertEqual(close.title, "Close")
+        XCTAssertEqual(close.action, #selector(NSWindow.performClose(_:)))
+        XCTAssertEqual(unrelated.keyEquivalent, "w")
+        // Also reconcile a replacement created by SwiftUI after the first pass.
+        let rebuilt = NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        rebuilt.keyEquivalentModifierMask = .command
+        menu.addItem(rebuilt)
+        ManagedCloseMenuShortcut.removeAutomaticCloseEquivalent(in: menu)
+        XCTAssertEqual(rebuilt.keyEquivalent, "")
+    }
+
+    func testSessionShortcutsForwardExactCapturedTargetsAndRequireCopyIDCapture() {
+        let target = AgentChatOptionsMenuTarget(windowID: 7, workspaceID: UUID(), tabID: UUID(), agentSessionID: UUID(), tabName: "Captured")
+        let capture = AgentSessionCopyIDTarget(windowID: target.windowID, workspaceID: target.workspaceID, tabID: target.tabID, sessionID: target.agentSessionID, persistentBindingGeneration: UUID(), bindingTransitionGeneration: 4)
+        var calls: [String] = []
+        let record: (String, AgentChatOptionsMenuTarget) -> Void = { action, received in
+            XCTAssertEqual(received, target)
+            calls.append(action)
+        }
+        let actions = AgentChatOptionsMenuActions(
+            togglePin: { record("pin", $0) },
+            rename: { record("rename", $0) },
+            stash: { record("stash", $0) },
+            copyHandoffPrompt: { record("handoff", $0) },
+            copySessionID: { XCTAssertEqual($0, capture)
+                calls.append("id")
+            },
+            delete: { record("delete", $0) }
+        )
+        let snapshot = AgentChatOptionsMenuSnapshot(target: target, isPinned: false, copySessionIDTarget: capture)
+        for action in AgentChatShortcutAction.allCases {
+            action.perform(snapshot: snapshot, actions: actions)
+        }
+        XCTAssertEqual(calls, ["pin", "rename", "stash", "handoff", "id", "delete"])
+        AgentChatShortcutAction.copySessionID.perform(snapshot: .init(target: target, isPinned: false), actions: actions)
+        XCTAssertEqual(calls.count, 6)
+    }
+
+    func testSessionMenuKeepsPlainTitlesAndShowsCurrentBindingAsNativeKeyEquivalent() {
+        let originalPin = KeyboardShortcuts.getShortcut(for: .pinAgentSession)
+        let originalDelete = KeyboardShortcuts.getShortcut(for: .deleteAgentSession)
+        defer {
+            KeyboardShortcuts.setShortcut(originalPin, for: .pinAgentSession)
+            KeyboardShortcuts.setShortcut(originalDelete, for: .deleteAgentSession)
+        }
+        let remapped = KeyboardShortcuts.Shortcut(.p, modifiers: [.command, .control])
+        KeyboardShortcuts.setShortcut(remapped, for: .pinAgentSession)
+        KeyboardShortcuts.setShortcut(nil, for: .deleteAgentSession)
+        let target = AgentChatOptionsMenuTarget(windowID: 7, workspaceID: UUID(), tabID: UUID(), agentSessionID: UUID(), tabName: "Captured")
+        let noop: (AgentChatOptionsMenuTarget) -> Void = { _ in }
+        let menu = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: .init(target: target, isPinned: false),
+            actions: .init(togglePin: noop, rename: noop, stash: noop, copyHandoffPrompt: noop, copySessionID: { _ in }, delete: noop)
+        )
+
+        // Titles stay the plain action names; the binding lives only in the key equivalent.
+        XCTAssertEqual(menu.items.map(\.title), ["Pin", "Rename", "Stash", "Handoff", "", "Delete"])
+        XCTAssertTrue(menu.items.allSatisfy { $0.attributedTitle == nil })
+        XCTAssertEqual(menu.items[0].keyEquivalent, remapped.nsMenuItemKeyEquivalent)
+        XCTAssertEqual(menu.items[0].keyEquivalentModifierMask, [.command, .control])
+        // An unassigned action shows no key equivalent.
+        XCTAssertEqual(menu.items[5].keyEquivalent, "")
+        XCTAssertEqual(menu.items[5].keyEquivalentModifierMask, [])
     }
 }

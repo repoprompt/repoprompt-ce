@@ -29,6 +29,7 @@ import XCTest
                 let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
                 let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
                 XCTAssertEqual(Set(manager.workspaces.map(\.id)), [Fixture.defaultID])
+                XCTAssertFalse(manager.hasAcceptedDomainCatalogForRestoration)
                 var preparations = 0
                 bridge.catalogPreparationDidFinishForTesting = { wasOnMainThread in
                     XCTAssertFalse(wasOnMainThread)
@@ -40,9 +41,11 @@ import XCTest
                 XCTAssertEqual(accepted.catalogReceipt?.kind, .full)
                 XCTAssertEqual(accepted.catalogReceipt?.completeness, .complete)
                 XCTAssertEqual(Set(manager.workspaces.map(\.id)), Fixture.standardIDs)
+                XCTAssertTrue(manager.hasAcceptedDomainCatalogForRestoration)
+                XCTAssertTrue(manager.isWorkspaceAvailableForWindowRestoration(Fixture.requestedID))
                 XCTAssertNil(manager.workspaceChooserPresentation.failure)
                 XCTAssertEqual(preparations, 1, "local witness changes must not discard immutable canonical decodes")
-                XCTAssertEqual(try f.legacyIDs(), [Fixture.defaultID], "catalog readiness must come from the authority, not an index rewrite")
+                XCTAssertEqual(try f.legacyIDs(), [Fixture.defaultID], "restoration readiness must come from the authority, not an index rewrite")
             }
         }
 
@@ -1283,6 +1286,366 @@ import XCTest
         }
 
         // MARK: 6. Queued restore after startup
+
+        func testQueuedRestoreWaitsForAcceptedCatalogAfterInitializationWithRecoveryTwinInStaleIndex() async throws {
+            var recovery = Fixture.model(id: Fixture.namesakeID, name: "Z requested")
+            recovery.consolidatedIntoWorkspaceID = Fixture.requestedID
+            let seeds = Fixture.standardSeeds + [recovery]
+            try await Fixture.run(seeds: seeds) { f in
+                let system = try XCTUnwrap(seeds.first { $0.isSystemWorkspace })
+                try f.writeLegacyIndex([system, recovery])
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                let hold = f.holdInitialResolution(manager)
+                await window.joinDomainWorkspaceBridgeForTesting()
+                XCTAssertNil(manager.workspace(withID: Fixture.requestedID))
+                XCTAssertNotNil(manager.workspace(withID: recovery.id))
+
+                let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
+                let restored = Signal("catalog-gated restore completion")
+                window.applyWindowRestoreEntry(entry) { restored.fire() }
+                hold.gate.release()
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                await manager.awaitInitialized()
+                try await f.acknowledgeWindowObservers(window)
+                XCTAssertTrue(manager.isInitialized)
+                XCTAssertFalse(manager.hasAcceptedDomainCatalogForRestoration)
+                XCTAssertTrue(window.hasPendingRestoreEntryForTesting)
+                XCTAssertEqual(restored.count, 0)
+                XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
+
+                window.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(window)
+                try await f.wait(restored)
+                try await f.acknowledgeWindowObservers(window)
+                XCTAssertEqual(restored.count, 1)
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
+                XCTAssertFalse(window.hasPendingRestoreEntryForTesting)
+                XCTAssertNil(window.protectedRestoreEntryForTesting)
+                XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+                XCTAssertEqual(try f.legacyIDs(), [system.id, recovery.id])
+            }
+        }
+
+        /// A registered window whose catalog fails before acceptance must not hold the run-wide
+        /// restore persistence gate, while its saved identity stays protected and still restores
+        /// if a catalog is later accepted. The gate mirrors `WindowStatesManager`'s completion.
+        func testCatalogFailureReleasesRestorePersistenceGateButKeepsIdentityWaiting() async throws {
+            try await Fixture.run { f in
+                let failed = f.makeWindow()
+                let failedManager = failed.workspaceManager
+                let hold = f.holdInitialResolution(failedManager)
+                let healthy = f.makeWindow()
+                await failed.joinDomainWorkspaceBridgeForTesting()
+                hold.gate.release()
+                await failedManager.awaitInitialWorkspaceActivationCompletion()
+                await failedManager.awaitInitialized()
+                await healthy.workspaceManager.awaitInitialWorkspaceActivationCompletion()
+                await healthy.workspaceManager.awaitInitialized()
+                try await f.awaitCatalogProjection(healthy)
+                XCTAssertFalse(failedManager.hasAcceptedDomainCatalogForRestoration)
+
+                var gate = WindowSessionRestorePersistenceGate()
+                gate.beginRestoreSessionLoad()
+                gate.finishRestoreSessionLoad(pendingEntryCount: 2)
+                let failedDone = Signal("failed catalog releases its restore obligation")
+                let healthyDone = Signal("healthy restore completion")
+                for (window, done) in [(failed, failedDone), (healthy, healthyDone)] {
+                    let windowID = window.windowID
+                    gate.consumePendingRestoreEntry()
+                    gate.beginRestoringWindow(windowID)
+                    let target = window === failed ? Fixture.requestedID : Fixture.aardvarkID
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: target, window: window)) {
+                        gate.finishRestoringWindow(windowID)
+                        done.fire()
+                    }
+                }
+                try await f.wait(healthyDone)
+                XCTAssertEqual(healthy.workspaceManager.activeWorkspaceID, Fixture.aardvarkID)
+                XCTAssertFalse(gate.shouldPersistNow(reason: "unrelated session change"))
+                XCTAssertEqual(failedDone.count, 0, "an unresolved catalog still waits")
+
+                let catalog = await f.runtime.workspaceStore.snapshot()
+                XCTAssertTrue(failedManager.reportDomainCatalogFailure(
+                    .catalogChangedDuringRefresh, snapshot: catalog, attempt: failedManager.beginDomainCatalogAttempt()
+                ))
+                try await f.wait(failedDone)
+                try await f.acknowledgeWindowObservers(failed)
+                XCTAssertFalse(gate.isRestoreInProgress, "a failed catalog cannot hold session persistence for the run")
+                XCTAssertEqual(gate.takeFlushableDeferredReason(), "unrelated session change")
+                XCTAssertTrue(gate.shouldPersistNow(reason: "termination"))
+                XCTAssertTrue(failed.hasPendingRestoreEntryForTesting, "failure releases the obligation, not the entry")
+                XCTAssertEqual(failed.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID)
+                XCTAssertEqual(failed.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
+                XCTAssertNotEqual(failedManager.activeWorkspaceID, Fixture.requestedID)
+                XCTAssertNil(failedManager.pendingWorkspaceSwitchBlockedNotice, "failure is not reported as absence")
+
+                let switched = Signal("recovered catalog dispatches the waiting restore")
+                let observation = failedManager.$activeWorkspaceID.sink { id in
+                    if id == Fixture.requestedID { switched.fire() }
+                }
+                failed.restartDomainWorkspaceProjectionForTesting()
+                try await f.awaitCatalogProjection(failed)
+                try await f.wait(switched)
+                observation.cancel()
+                try await f.acknowledgeWindowObservers(failed)
+                XCTAssertFalse(failed.hasPendingRestoreEntryForTesting)
+                XCTAssertNil(failed.protectedRestoreEntryForTesting)
+                XCTAssertEqual(failedDone.count, 1, "the released completion is never invoked again")
+                XCTAssertEqual(healthyDone.count, 1)
+            }
+        }
+
+        /// A reconciliation fence raised after a dispatch is enqueued, but before its task runs, is
+        /// temporary unreadiness rather than absence: the entry waits for the next acceptance.
+        func testReconciliationFenceBetweenEnqueueAndDispatchKeepsRestorePending() async throws {
+            try await Fixture.run { f in
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                await manager.awaitInitialized()
+                try await f.awaitCatalogProjection(window)
+                XCTAssertTrue(manager.hasAcceptedDomainCatalogForRestoration)
+                let base = await f.runtime.workspaceStore.snapshot()
+                let models = try f.decoded(base)
+
+                let restored = Signal("fenced restore completion")
+                window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.requestedID, window: window)) {
+                    restored.fire()
+                }
+                XCTAssertTrue(window.hasPendingRestoreEntryForTesting, "enqueueing a dispatch does not claim it")
+                // No suspension between enqueue and the fence: the dispatch task has not run yet.
+                manager.replaceWorkspacesFromUnacceptedImport(models)
+                XCTAssertFalse(manager.hasAcceptedDomainCatalogForRestoration)
+                try await f.acknowledgeWindowObservers(window)
+                XCTAssertEqual(restored.count, 0)
+                XCTAssertTrue(window.hasPendingRestoreEntryForTesting)
+                XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice, "no premature unavailable notice")
+
+                XCTAssertNotNil(manager.applyDomainWorkspaceCatalog(
+                    base, projection: .full(models), preferredActiveWorkspaceID: nil, rootMapPolicy: .snapshotMetadata
+                ).receipt)
+                try await f.wait(restored)
+                try await f.acknowledgeWindowObservers(window)
+                XCTAssertEqual(restored.count, 1)
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.requestedID)
+                XCTAssertFalse(window.hasPendingRestoreEntryForTesting)
+                XCTAssertNil(window.protectedRestoreEntryForTesting)
+                XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+            }
+        }
+
+        func testQueuedRestoreRechecksPendingAcceptanceBeforeTaskStarts() async throws {
+            for closes in [false, true] {
+                try await Fixture.run { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    await window.joinDomainWorkspaceBridgeForTesting()
+                    window.restartDomainWorkspaceProjectionForTesting()
+                    try await f.awaitCatalogProjection(window)
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    await manager.awaitInitialized()
+                    var completions = 0
+                    window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.requestedID, window: window)) {
+                        completions += 1
+                    }
+                    XCTAssertTrue(window.hasPendingRestoreEntryForTesting, "enqueue must not consume the acceptance")
+                    let newest = Signal("newest acceptance or close")
+                    if closes {
+                        window.beginClose()
+                        newest.fire()
+                    } else {
+                        window.applyWindowRestoreEntry(f.restoreEntry(for: Fixture.aardvarkID, window: window)) {
+                            newest.fire()
+                        }
+                    }
+                    XCTAssertEqual(completions, 1)
+                    try await f.wait(newest)
+                    try await f.acknowledgeWindowObservers(window)
+                    XCTAssertEqual(completions, 1)
+                    XCTAssertNotEqual(manager.activeWorkspaceID, Fixture.requestedID)
+                    if !closes { XCTAssertEqual(manager.activeWorkspaceID, Fixture.aardvarkID) }
+                }
+            }
+        }
+
+        func testMissingSavedWorkspaceIDNeverSubstitutesMatchingPathOrName() async throws {
+            for matchesPath in [false, true] {
+                for isRecovery in [false, true] {
+                    var twin = Fixture.model(id: Fixture.namesakeID, name: "Saved project")
+                    twin.consolidatedIntoWorkspaceID = isRecovery ? Fixture.requestedID : nil
+                    let system = Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)
+                    try await Fixture.run(seeds: [system, twin], beforeRuntimeStart: { f in
+                        let root = f.base.appendingPathComponent("repo", isDirectory: true)
+                        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                        var rootedTwin = twin
+                        rootedTwin.repoPaths = [root.path]
+                        try f.writeDocument(rootedTwin)
+                    }) { f in
+                        let window = f.makeWindow()
+                        let manager = window.workspaceManager
+                        await manager.awaitInitialWorkspaceActivationCompletion()
+                        await manager.awaitInitialized()
+                        try await f.awaitCatalogProjection(window)
+                        XCTAssertNil(manager.workspace(withID: Fixture.requestedID))
+                        XCTAssertNotNil(manager.workspace(withID: twin.id))
+
+                        let entry = f.restoreEntry(
+                            for: Fixture.requestedID, window: window,
+                            workspaceName: matchesPath ? "Previous project name" : twin.name,
+                            primaryRepoPath: matchesPath ? f.base.appendingPathComponent("repo").path : nil
+                        )
+                        let restored = Signal("missing identity restore completion")
+                        window.applyWindowRestoreEntry(entry) { restored.fire() }
+                        try await f.wait(restored)
+                        try await f.acknowledgeWindowObservers(window)
+
+                        XCTAssertEqual(restored.count, 1)
+                        XCTAssertEqual(manager.activeWorkspaceID, system.id)
+                        XCTAssertFalse(window.hasPendingRestoreEntryForTesting)
+                        XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, entry.workspaceID)
+                        let captured = try XCTUnwrap(window.sessionCaptureCandidate().entry)
+                        XCTAssertEqual(captured.workspaceID, entry.workspaceID)
+                        XCTAssertEqual(captured.workspaceName, entry.workspaceName)
+                        XCTAssertEqual(captured.primaryRepoPath, entry.primaryRepoPath)
+                        let issue = try XCTUnwrap(manager.domainWorkspaceAuthorityIssue)
+                        XCTAssertEqual(issue.operation, "window_restore")
+                        XCTAssertEqual(issue.workspaceID, entry.workspaceID)
+                        XCTAssertFalse(try XCTUnwrap(issue.diagnostic).isEmpty)
+                        let notice = try XCTUnwrap(manager.pendingWorkspaceSwitchBlockedNotice)
+                        XCTAssertTrue(try notice.message.contains(XCTUnwrap(entry.workspaceName)))
+                        XCTAssertTrue(notice.message.contains(Fixture.requestedID.uuidString))
+                    }
+                }
+            }
+        }
+
+        func testUnavailableSavedWorkspaceIDReportsFailureAndPreservesRestoreEntry() async throws {
+            try await Fixture.run(unavailableSeedIDs: [Fixture.requestedID]) { f in
+                let window = f.makeWindow()
+                let manager = window.workspaceManager
+                await manager.awaitInitialWorkspaceActivationCompletion()
+                await manager.awaitInitialized()
+                try await f.awaitCatalogProjection(window)
+                XCTAssertTrue(manager.hasAcceptedDomainCatalogForRestoration)
+                XCTAssertFalse(manager.isWorkspaceAvailableForWindowRestoration(Fixture.requestedID))
+                let entry = f.restoreEntry(for: Fixture.requestedID, window: window)
+                let restored = Signal("unavailable identity restore completion")
+                window.applyWindowRestoreEntry(entry) { restored.fire() }
+                try await f.wait(restored)
+                try await f.acknowledgeWindowObservers(window)
+
+                XCTAssertEqual(restored.count, 1)
+                XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
+                XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, Fixture.requestedID)
+                XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, Fixture.requestedID)
+                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "window_restore")
+                XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.workspaceID, Fixture.requestedID)
+                let notice = try XCTUnwrap(manager.pendingWorkspaceSwitchBlockedNotice)
+                XCTAssertTrue(notice.message.contains(Fixture.requestedID.uuidString))
+            }
+        }
+
+        func testSystemRestorePreservesMissingIdentityAndReleasesSuccessfulIdentity() async throws {
+            for exists in [false, true] {
+                try await Fixture.run { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    await manager.awaitInitialized()
+                    try await f.awaitCatalogProjection(window)
+                    let systemID = exists ? Fixture.defaultID : UUID()
+                    let entry = f.restoreEntry(
+                        for: systemID, window: window, workspaceName: "Default", isSystemWorkspace: true
+                    )
+                    let restored = Signal("System identity restore completion")
+                    window.applyWindowRestoreEntry(entry) { restored.fire() }
+                    XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, systemID)
+                    try await f.wait(restored)
+                    try await f.acknowledgeWindowObservers(window)
+
+                    XCTAssertEqual(restored.count, 1)
+                    XCTAssertEqual(manager.activeWorkspaceID, Fixture.defaultID)
+                    XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceID, systemID)
+                    if exists {
+                        XCTAssertNil(window.protectedRestoreEntryForTesting)
+                        XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+                    } else {
+                        XCTAssertEqual(window.protectedRestoreEntryForTesting?.workspaceID, systemID)
+                        XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "window_restore")
+                        let notice = try XCTUnwrap(manager.pendingWorkspaceSwitchBlockedNotice)
+                        XCTAssertTrue(notice.message.contains(systemID.uuidString))
+                    }
+                }
+            }
+        }
+
+        func testRestoreExcludesRecoveryCopiesAndAmbiguousLegacyMatches() async throws {
+            enum Scenario: CaseIterable {
+                case legacyUnique, legacyAmbiguous, legacyPathUnique, legacyPathAmbiguous, legacyRecoveryOnly, savedRecoveryID
+            }
+            for scenario in Scenario.allCases {
+                let system = Fixture.model(id: Fixture.defaultID, name: "Default", isSystem: true)
+                let live = Fixture.model(id: Fixture.requestedID, name: "Shared project")
+                let matchesPath = scenario == .legacyPathUnique || scenario == .legacyPathAmbiguous
+                let isAmbiguous = scenario == .legacyAmbiguous || scenario == .legacyPathAmbiguous
+                var twin = Fixture.model(
+                    id: Fixture.namesakeID,
+                    name: scenario == .legacyPathAmbiguous ? "Other project at the same root" : live.name
+                )
+                twin.consolidatedIntoWorkspaceID = isAmbiguous ? nil : live.id
+                let candidates = scenario == .legacyRecoveryOnly ? [twin] : [twin, live]
+                try await Fixture.run(seeds: [system] + candidates, beforeRuntimeStart: { f in
+                    guard matchesPath else { return }
+                    let root = f.base.appendingPathComponent("repo", isDirectory: true)
+                    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                    for var candidate in candidates {
+                        candidate.repoPaths = [root.path]
+                        try f.writeDocument(candidate)
+                    }
+                }) { f in
+                    let window = f.makeWindow()
+                    let manager = window.workspaceManager
+                    await manager.awaitInitialWorkspaceActivationCompletion()
+                    await manager.awaitInitialized()
+                    try await f.awaitCatalogProjection(window)
+                    let entry = f.restoreEntry(
+                        for: scenario == .savedRecoveryID ? twin.id : nil,
+                        window: window, workspaceName: live.name,
+                        primaryRepoPath: matchesPath ? f.base.appendingPathComponent("repo").path : nil
+                    )
+                    let restored = Signal("legacy or recovery identity restore completion")
+                    window.applyWindowRestoreEntry(entry) { restored.fire() }
+                    try await f.wait(restored)
+                    try await f.acknowledgeWindowObservers(window)
+
+                    XCTAssertEqual(restored.count, 1)
+                    if scenario == .legacyUnique || scenario == .legacyPathUnique {
+                        XCTAssertEqual(manager.activeWorkspaceID, live.id)
+                        XCTAssertNil(window.protectedRestoreEntryForTesting)
+                        XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+                    } else {
+                        XCTAssertEqual(manager.activeWorkspaceID, system.id)
+                        let protected = try XCTUnwrap(window.protectedRestoreEntryForTesting)
+                        XCTAssertEqual(protected.workspaceID, entry.workspaceID)
+                        XCTAssertEqual(protected.workspaceName, entry.workspaceName)
+                        XCTAssertEqual(window.sessionCaptureCandidate().entry?.workspaceName, entry.workspaceName)
+                        XCTAssertEqual(manager.domainWorkspaceAuthorityIssue?.operation, "window_restore")
+                        let notice = try XCTUnwrap(manager.pendingWorkspaceSwitchBlockedNotice)
+                        XCTAssertTrue(notice.message.contains(live.name))
+                    }
+                }
+            }
+        }
+
+        func testLegacyManagerRestorationDoesNotWaitForDomainCatalog() async throws {
+            try await Fixture.run { f in
+                let manager = f.makeManager(withAuthority: false)
+                await manager.awaitInitialized()
+                XCTAssertTrue(manager.hasAcceptedDomainCatalogForRestoration)
+                XCTAssertTrue(manager.isWorkspaceAvailableForWindowRestoration(Fixture.requestedID))
+            }
+        }
 
         func testQueuedRestoreRunsAfterInitialSelectionAttemptCompletes() async throws {
             for failsStartup in [false, true] {
@@ -6595,15 +6958,19 @@ import XCTest
             return model
         }
 
-        func restoreEntry(for workspaceID: UUID, window: WindowState) -> WindowSessionEntry {
-            let seed = seeds.first { $0.id == workspaceID }
+        func restoreEntry(
+            for workspaceID: UUID?, window: WindowState,
+            workspaceName: String? = nil, primaryRepoPath: String? = nil,
+            isSystemWorkspace: Bool? = nil
+        ) -> WindowSessionEntry {
+            let seed = workspaceID.flatMap { id in seeds.first { $0.id == id } }
             return WindowSessionEntry(
                 windowKind: window.kind,
                 workspaceID: workspaceID,
-                workspaceName: seed?.name,
-                isSystemWorkspace: seed?.isSystemWorkspace ?? false,
+                workspaceName: workspaceName ?? seed?.name,
+                isSystemWorkspace: isSystemWorkspace ?? seed?.isSystemWorkspace ?? false,
                 isEphemeral: false,
-                primaryRepoPath: nil,
+                primaryRepoPath: primaryRepoPath,
                 lastFocused: true,
                 workspaceInstanceNumber: nil
             )
@@ -6869,6 +7236,27 @@ final class WindowRestoreLifetimeTests: XCTestCase {
         XCTAssertNil(lifetime.takePendingForDispatch())
     }
 
+    func testReleasedCompletionKeepsEntryPendingAndRunsOnce() throws {
+        var lifetime = WindowRestoreLifetime()
+        let requested = entry()
+        var completions = 0
+        _ = lifetime.accept(requested) { completions += 1 }
+
+        lifetime.releasePendingCompletion()?()
+        XCTAssertEqual(completions, 1)
+        XCTAssertTrue(lifetime.hasPendingEntry, "Releasing the obligation does not end execution")
+        XCTAssertEqual(lifetime.protectedEntry?.workspaceID, requested.workspaceID)
+        XCTAssertNil(lifetime.releasePendingCompletion())
+
+        let dispatch = try XCTUnwrap(lifetime.takePendingForDispatch())
+        XCTAssertEqual(dispatch.entry.workspaceID, requested.workspaceID)
+        XCTAssertNil(dispatch.completion, "A released completion is never invoked again")
+        _ = lifetime.accept(requested) { completions += 1 }
+        lifetime.releasePendingCompletion()?()
+        XCTAssertNil(lifetime.retirePending())
+        XCTAssertEqual(completions, 2)
+    }
+
     func testDispatchOwnsItsCompletionAcrossNewerAcceptance() throws {
         var lifetime = WindowRestoreLifetime()
         var log: [String] = []
@@ -6891,8 +7279,9 @@ final class WindowRestoreLifetimeTests: XCTestCase {
         displaced?()
         XCTAssertEqual(log, ["displaced"])
 
-        _ = lifetime.accept(entry(isSystem: true), completion: nil)
-        XCTAssertNil(lifetime.protectedEntry, "A System-intended acceptance needs no protection")
+        let system = entry(isSystem: true)
+        _ = lifetime.accept(system, completion: nil)
+        XCTAssertEqual(lifetime.protectedEntry?.workspaceID, system.workspaceID, "A saved System identity stays protected until it is restored")
     }
 
     func testSelectionPublishedBeforeAcceptanceCannotReleaseIt() {

@@ -75,6 +75,7 @@ struct RepoPromptSwiftUIApp: App {
         // Do not initialize the settings-backed property before the state boundary
         // check (stored-property default initializers run before this init body).
         _fontScale = StateObject(wrappedValue: FontScaleManager.shared)
+        _shortcutDisplay = ObservedObject(wrappedValue: GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay)
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
@@ -142,6 +143,7 @@ struct RepoPromptSwiftUIApp: App {
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
     @StateObject private var fontScale: FontScaleManager
+    @ObservedObject private var shortcutDisplay: KeyboardShortcutBindingDisplay
 
     // MARK: - Body
 
@@ -174,28 +176,27 @@ struct RepoPromptSwiftUIApp: App {
         .commands {
             UpdateMenu(sparkleManager: appDelegate.sparkleManager)
 
+            // Replace SwiftUI's automatic Cmd-N; otherwise it keeps reserving the key after a remap.
+            CommandGroup(replacing: .newItem) {
+                Button(shortcutDisplay.title("New Workspace Window", for: .newWorkspaceWindow)) {
+                    AppWindowOpener.shared.requestMainWindowFromDock()
+                }
+            }
+
             // macOS standard "Settings…" (⌘,) menu item
             CommandGroup(replacing: .appSettings) {
-                Button("Settings…") {
-                    // Identify the currently focused window (or fall back to latest)
-                    if let target = windowStatesManager
-                        .allWindows.first(where: { $0.isCurrentlyFocused })
-                        ?? windowStatesManager.latestWindowState
-                    {
-                        SettingsWindowCoordinator.shared.open(windowState: target)
-                    }
+                Button(shortcutDisplay.title("Settings…", for: .showAppSettings)) {
+                    GlobalKeyboardShortcutsCoordinator.shared.openSettings()
                 }
-                .keyboardShortcut(",", modifiers: .command)
             }
 
             // ➜ New File-menu commands (Save Workspace / Exit Workspace)
             WorkspaceCommands(windowStatesManager: windowStatesManager)
 
             CommandGroup(before: .saveItem) {
-                Button("Close Window") {
+                Button(shortcutDisplay.title("Close Window", for: .closeAppWindow)) {
                     NSApplication.shared.keyWindow?.performClose(nil)
                 }
-                .keyboardShortcut("w", modifiers: [.command, .shift])
             }
 
             CommandGroup(replacing: .help) {

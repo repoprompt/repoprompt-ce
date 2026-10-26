@@ -15,6 +15,30 @@ import SwiftUI
 enum KeyboardShortcutCatalog {
     static let sections: [KeyboardShortcutCatalogSection] = [
         KeyboardShortcutCatalogSection(
+            id: "application",
+            title: "Application",
+            blurb: "Clear or change New Workspace Window to free ⌘N for New Agent chat or New Agent session tab.",
+            bindings: [
+                .init(id: "new-window", title: "New workspace window", detail: nil, name: .newWorkspaceWindow),
+                .init(id: "settings", title: "Settings", detail: nil, name: .showAppSettings),
+                .init(id: "close-window", title: "Close window", detail: nil, name: .closeAppWindow),
+                .init(id: "updates", title: "Check for updates / install available update", detail: nil, name: .checkForUpdates)
+            ]
+        ),
+        KeyboardShortcutCatalogSection(
+            id: "current-session",
+            title: "Current Agent session",
+            blurb: "Apply to the current session, just like its titlebar menu. Delete is unassigned by default and always asks for confirmation.",
+            bindings: [
+                .init(id: "session-pin", title: "Pin / unpin session", detail: nil, name: .pinAgentSession),
+                .init(id: "session-rename", title: "Rename session", detail: nil, name: .renameAgentSession),
+                .init(id: "session-stash", title: "Stash session", detail: nil, name: .stashAgentSession),
+                .init(id: "session-handoff", title: "Copy handoff prompt", detail: nil, name: .handoffAgentSession),
+                .init(id: "session-copy-id", title: "Copy session ID", detail: nil, name: .copyAgentSessionID),
+                .init(id: "session-delete", title: "Delete session…", detail: nil, name: .deleteAgentSession)
+            ]
+        ),
+        KeyboardShortcutCatalogSection(
             id: "agent-layout",
             title: "Agent & layout",
             blurb: "Agent shortcuts apply when a real workspace is open. New chat matches the titlebar New Session button.",
@@ -143,7 +167,7 @@ struct KeyboardShortcutsSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 SettingSection(
                     title: "Keyboard Shortcuts",
-                    description: "Customize global hotkeys. Bindings are stored per-app; conflicts with the menu bar or other apps may prevent shortcuts from firing."
+                    description: "Customize shortcuts used while RepoPrompt is active. Clear a binding before assigning its keys to another action. Session and workspace actions require a focused main window; standard text editing and dialog keys remain native."
                 ) {
                     SettingToggle(
                         title: "Enable keyboard shortcuts",

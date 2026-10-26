@@ -51,6 +51,15 @@ struct WindowContentView: View {
                 StartupPhaseLog.mark(.windowAppeared, window: windowState.windowID)
                 windowStatesManager.registerWindowState(windowState)
                 MCPExternalEventsMonitor.shared.scheduleCleanupOnce()
+                GlobalKeyboardShortcutsCoordinator.shared.closeMenuShortcut.reconcile()
+
+                GlobalKeyboardShortcutsCoordinator.shared.installUpdateAction { [sparkleManager] in
+                    if sparkleManager.availableUpdate != nil {
+                        sparkleManager.performAvailableUpdateAction()
+                    } else if sparkleManager.canInitiateUpdateCheck {
+                        sparkleManager.checkForUpdates()
+                    }
+                }
 
                 // Install the openWindow action into AppWindowOpener for programmatic window creation
                 AppWindowOpener.shared.install {

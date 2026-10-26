@@ -3,10 +3,14 @@ import Carbon.HIToolbox
 import Foundation
 import KeyboardShortcuts
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 
 @MainActor
 final class GlobalKeyboardShortcutsCoordinator {
     static let shared = GlobalKeyboardShortcutsCoordinator()
+
+    lazy var bindingDisplay = KeyboardShortcutBindingDisplay()
+    let closeMenuShortcut = ManagedCloseMenuShortcut()
 
     private var didRegisterHandlers = false
 
@@ -16,6 +20,7 @@ final class GlobalKeyboardShortcutsCoordinator {
         guard !didRegisterHandlers else { return }
         didRegisterHandlers = true
 
+        registerApplicationShortcuts()
         registerPresetShortcuts()
         registerWorkspaceShortcuts()
         registerComposeTabShortcuts()
@@ -23,11 +28,28 @@ final class GlobalKeyboardShortcutsCoordinator {
         registerAgentShortcuts()
     }
 
+    /// Callback guards cannot yield an intercepted Carbon event back to AppKit.
+    /// Unregister window-only bindings outside main windows so native dialog/editor keys work.
+    func updateRegistrationContext(hasEligibleMainWindow: Bool) {
+        guard didRegisterHandlers else { return }
+        let names = KeyboardShortcutCatalog.sections.filter { $0.id != "application" }.flatMap(\.bindings).map(\.name)
+            .filter { $0 != .closeComposeTab }
+        if hasEligibleMainWindow {
+            KeyboardShortcuts.enable(names)
+        } else {
+            KeyboardShortcuts.disable(names)
+        }
+    }
+
     // MARK: - Registration helpers
 
     private func register(_ name: KeyboardShortcuts.Name, action: @escaping @MainActor () -> Void) {
         KeyboardShortcuts.onKeyDown(for: name) {
             Task { @MainActor in
+                guard NSApplication.shared.isActive,
+                      !WindowStatesManager.shared.isTerminating,
+                      GlobalSettingsStore.shared.enableKeyboardShortcuts()
+                else { return }
                 action()
             }
         }
@@ -45,7 +67,12 @@ final class GlobalKeyboardShortcutsCoordinator {
 
     private func guardedFocusedWindowState() -> WindowState? {
         guard NSApplication.shared.isActive else { return nil }
-        guard let win = focusedWindowState(), win.isCurrentlyFocused else { return nil }
+        guard NSApplication.shared.modalWindow == nil,
+              let keyWindow = NSApplication.shared.keyWindow,
+              keyWindow.attachedSheet == nil,
+              let win = WindowStatesManager.shared.allWindows.first(where: { $0.nsWindow === keyWindow }),
+              !win.isClosing
+        else { return nil }
         return win
     }
 
@@ -53,8 +80,32 @@ final class GlobalKeyboardShortcutsCoordinator {
     /// before our SwiftUI focus flag has updated. Route to the front/latest
     /// RepoPrompt window so the first press still opens the HUD.
     private func guardedHUDWindowState() -> WindowState? {
-        guard NSApplication.shared.isActive else { return nil }
+        guard NSApplication.shared.isActive,
+              GlobalSettingsStore.shared.enableKeyboardShortcuts(),
+              NSApplication.shared.modalWindow == nil
+        else { return nil }
+        if NSApplication.shared.keyWindow != nil { return guardedFocusedWindowState() }
         return focusedOrLatestWindowState()
+    }
+
+    // MARK: - Application
+
+    private var updateAction: (@MainActor () -> Void)?
+
+    func installUpdateAction(_ action: @escaping @MainActor () -> Void) {
+        updateAction = action
+    }
+
+    func openSettings() {
+        guard let win = focusedOrLatestWindowState() else { return }
+        SettingsWindowCoordinator.shared.open(windowState: win)
+    }
+
+    private func registerApplicationShortcuts() {
+        register(.newWorkspaceWindow) { AppWindowOpener.shared.requestMainWindowFromDock() }
+        register(.showAppSettings) { [weak self] in self?.openSettings() }
+        register(.closeAppWindow) { NSApplication.shared.keyWindow?.performClose(nil) }
+        register(.checkForUpdates) { [weak self] in self?.updateAction?() }
     }
 
     // MARK: - Presets
@@ -94,11 +145,7 @@ final class GlobalKeyboardShortcutsCoordinator {
 
     private func saveAndExitWorkspace() {
         guard let win = guardedFocusedWindowState() else { return }
-        guard let fallback = win.workspaceManager.workspaces.first(where: { $0.isSystemWorkspace }) else { return }
-        Task {
-            win.workspaceManager.pollAndSaveState()
-            _ = await win.workspaceManager.requestWorkspaceSwitch(to: fallback)
-        }
+        Task { await win.workspaceManager.saveAndExitToFallback() }
     }
 
     private func saveCurrentPresetOrPromptCreate() {
@@ -148,8 +195,16 @@ final class GlobalKeyboardShortcutsCoordinator {
     }
 
     private func closeComposeTab() {
-        guard let win = guardedFocusedWindowState() else { return }
-        win.closeActiveComposeTabFromShortcut()
+        if let win = guardedFocusedWindowState() {
+            win.closeActiveComposeTabFromShortcut()
+        } else if NSApplication.shared.modalWindow == nil,
+                  let keyWindow = NSApplication.shared.keyWindow,
+                  keyWindow.attachedSheet == nil,
+                  !WindowStatesManager.shared.allWindows.contains(where: { $0.nsWindow === keyWindow })
+        {
+            // Preserve standard Close in Settings/auxiliary windows without a second Cmd-W binding.
+            keyWindow.performClose(nil)
+        }
     }
 
     private func focusAdjacentComposeTab(forward: Bool) {
@@ -206,13 +261,24 @@ final class GlobalKeyboardShortcutsCoordinator {
     // MARK: - Font scale
 
     private func registerFontScaleShortcuts() {
-        register(.increaseFontScale) { FontScaleManager.shared.increase() }
-        register(.decreaseFontScale) { FontScaleManager.shared.decrease() }
+        register(.increaseFontScale) { [weak self] in
+            guard self?.guardedFocusedWindowState() != nil else { return }
+            FontScaleManager.shared.increase()
+        }
+        register(.decreaseFontScale) { [weak self] in
+            guard self?.guardedFocusedWindowState() != nil else { return }
+            FontScaleManager.shared.decrease()
+        }
     }
 
     // MARK: - Agent
 
     private func registerAgentShortcuts() {
+        for action in AgentChatShortcutAction.allCases {
+            register(action.shortcutName) { [weak self] in
+                self?.guardedFocusedWindowState()?.performAgentChatShortcut(action)
+            }
+        }
         register(.agentNewChat) { [weak self] in self?.startNewAgentSessionFromShortcut() }
         register(.toggleNavigationSidebar) { [weak self] in self?.toggleNavigationSidebarFromShortcut() }
         register(.toggleContextComposer) { [weak self] in self?.toggleContextComposerFromShortcut() }
