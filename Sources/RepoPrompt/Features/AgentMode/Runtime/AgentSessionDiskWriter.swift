@@ -2,29 +2,44 @@ import Foundation
 import RepoPromptShared
 
 actor AgentSessionDiskWriter {
+    struct Receipt {
+        let sequence: UInt64
+        let observedFileSize: Int64
+        let observedFileModificationDate: Date?
+    }
+
+    private struct Write {
+        let sequence: UInt64
+        let data: Data
+    }
+
     private struct PendingWrite {
-        var pendingData: Data?
+        var pendingWrite: Write?
         var isWriting: Bool
-        var waiters: [CheckedContinuation<Void, Error>]
+        var waiters: [(sequence: UInt64, continuation: CheckedContinuation<Receipt?, Error>)]
     }
 
     private var pendingByURL: [URL: PendingWrite] = [:]
     private var idleWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
+    private var sequence: UInt64 = 0
 
     #if DEBUG
         private var beforeWriteHook: (@Sendable (URL) async -> Void)?
     #endif
 
-    func enqueueAndWait(data: Data, url: URL) async throws {
+    /// Only the final committed submission receives publication authority; coalesced callers get nil.
+    func enqueueAndWait(data: Data, url: URL) async throws -> Receipt? {
         let url = url.standardizedFileURL
-        try await withCheckedThrowingContinuation { continuation in
+        sequence += 1
+        let write = Write(sequence: sequence, data: data)
+        return try await withCheckedThrowingContinuation { continuation in
             var pending = pendingByURL[url] ?? PendingWrite(
-                pendingData: nil,
+                pendingWrite: nil,
                 isWriting: false,
                 waiters: []
             )
-            pending.pendingData = data
-            pending.waiters.append(continuation)
+            pending.pendingWrite = write
+            pending.waiters.append((write.sequence, continuation))
             let shouldStartWriter = !pending.isWriting
             pending.isWriting = true
             pendingByURL[url] = pending
@@ -32,6 +47,17 @@ actor AgentSessionDiskWriter {
                 Task { await self.drainWrites(for: url) }
             }
         }
+    }
+
+    /// A decoded snapshot may publish metadata only while it still describes the current bytes.
+    /// Pending writers fail closed; checking and capturing the signature never suspend this owner.
+    func metadataReceiptIfUnchanged(data: Data, url: URL) -> Receipt? {
+        let url = url.standardizedFileURL
+        guard pendingByURL[url] == nil,
+              let current = try? Data(contentsOf: url, options: .mappedIfSafe), current == data
+        else { return nil }
+        sequence += 1
+        return Self.receipt(sequence: sequence, data: data, url: url)
     }
 
     func waitUntilIdle(for url: URL) async {
@@ -77,21 +103,36 @@ actor AgentSessionDiskWriter {
         func test_setBeforeWriteHook(_ hook: (@Sendable (URL) async -> Void)?) {
             beforeWriteHook = hook
         }
+
+        func test_pendingWriteCount(for url: URL) -> Int {
+            pendingByURL[url.standardizedFileURL]?.waiters.count ?? 0
+        }
     #endif
+
+    private static func receipt(sequence: UInt64, data: Data, url: URL) -> Receipt {
+        let values = try? URL(fileURLWithPath: url.path).resourceValues(forKeys: [.contentModificationDateKey])
+        return Receipt(
+            sequence: sequence, observedFileSize: Int64(data.count),
+            observedFileModificationDate: values?.contentModificationDate
+        )
+    }
 
     private func drainWrites(for url: URL) async {
         var lastError: Error?
+        var lastReceipt: Receipt?
         while true {
             guard var pending = pendingByURL[url] else { return }
-            guard let data = pending.pendingData else {
+            guard let write = pending.pendingWrite else {
                 pending.isWriting = false
                 let waiters = pending.waiters
                 pendingByURL.removeValue(forKey: url)
                 for waiter in waiters {
                     if let lastError {
-                        waiter.resume(throwing: lastError)
+                        waiter.continuation.resume(throwing: lastError)
                     } else {
-                        waiter.resume(returning: ())
+                        waiter.continuation.resume(
+                            returning: lastReceipt?.sequence == waiter.sequence ? lastReceipt : nil
+                        )
                     }
                 }
                 let idleWaiters = idleWaitersByURL.removeValue(forKey: url) ?? []
@@ -100,7 +141,7 @@ actor AgentSessionDiskWriter {
                 }
                 return
             }
-            pending.pendingData = nil
+            pending.pendingWrite = nil
             pendingByURL[url] = pending
 
             #if DEBUG
@@ -109,19 +150,20 @@ actor AgentSessionDiskWriter {
                 }
             #endif
 
-            let writeResult: Result<Void, Error> = await Task.detached(priority: .utility) {
+            let writeResult: Result<Receipt, Error> = await Task.detached(priority: .utility) {
                 do {
                     try AppProfileLocations.current.validateMetadataFile(url)
-                    try data.write(to: url, options: .atomic)
-                    return .success(())
+                    try write.data.write(to: url, options: .atomic)
+                    return .success(Self.receipt(sequence: write.sequence, data: write.data, url: url))
                 } catch {
                     return .failure(error)
                 }
             }.value
 
             switch writeResult {
-            case .success:
+            case let .success(receipt):
                 lastError = nil
+                lastReceipt = receipt
             case let .failure(error):
                 lastError = error
             }

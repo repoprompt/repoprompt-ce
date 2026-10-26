@@ -725,6 +725,7 @@ extension AgentModeViewModel {
         case fresh
         case resumed
         case resumeFellBackToFresh
+        case resumeTimedOut
     }
 
     /// Exact provider reference known to exceed the resume frame budget in this session.

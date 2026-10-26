@@ -100,7 +100,8 @@ enum MCPAppPhysicalCapabilityAdapters {
         _ windowID: Int
     ) throws -> Void
     typealias BuildTabSelectionReply = @MainActor @Sendable (
-        _ selection: StoredSelection,
+        _ resultTab: ComposeTabState,
+        _ resultWorkspaceID: UUID,
         _ includeBlocks: Bool,
         _ display: FilePathDisplay,
         _ codeMapUsageOverride: CodeMapUsage?,

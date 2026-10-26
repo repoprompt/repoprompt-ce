@@ -116,6 +116,7 @@ import XCTest
             paddedConfiguration: Bool = false,
             rootNames: [String] = ["A", "B"],
             configuration: (([String]) -> [String])? = nil,
+            readmeContent: String = "fixture",
             _ body: (WorkspaceAuthorityRootTestFixture) async throws -> Void
         ) async throws {
             // Must precede every shared settings, sidecar, key, and store access.
@@ -123,7 +124,10 @@ import XCTest
             let fixture = WorkspaceAuthorityRootTestFixture(sandbox: sandbox, rootNames: rootNames)
             do {
                 try await fixture.perform("real-authority fixture setup") {
-                    try await fixture.setUp(paddedConfiguration: paddedConfiguration, configuration: configuration, sandbox: sandbox)
+                    try await fixture.setUp(
+                        paddedConfiguration: paddedConfiguration, configuration: configuration,
+                        readmeContent: readmeContent, sandbox: sandbox
+                    )
                 }
                 try await body(fixture)
                 await fixture.shutdown()
@@ -133,7 +137,12 @@ import XCTest
             }
         }
 
-        private func setUp(paddedConfiguration: Bool, configuration: (([String]) -> [String])?, sandbox: URL) async throws {
+        private func setUp(
+            paddedConfiguration: Bool,
+            configuration: (([String]) -> [String])?,
+            readmeContent: String,
+            sandbox: URL
+        ) async throws {
             try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
             previousStoragePreference = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
             changedStoragePreference = true
@@ -148,7 +157,8 @@ import XCTest
             for path in rootPaths {
                 let root = URL(fileURLWithPath: path, isDirectory: true)
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-                try "fixture".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+                // Written before any window scans the root, so every store indexes this exact content.
+                try readmeContent.write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
             }
             let tabID = UUID()
             let configured = configuration?(rootPaths) ?? rootPaths.enumerated().map { index, path in

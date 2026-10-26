@@ -2981,7 +2981,7 @@ func printUsage() {
     USAGE:
         __RPCE_CLI__ -e '<command>'           Run a command
         __RPCE_CLI__ -e '<cmd1> && <cmd2>'    Chain commands
-        __RPCE_CLI__ -w <id> -e '<command>'   Target specific window
+        __RPCE_CLI__ -w <id> -e '<command>'   Bind window's active tab, then run
         __RPCE_CLI__ -w <id> -t <tab> -e ...  Target window and tab
 
     EXAMPLES:
@@ -3116,7 +3116,7 @@ func printUsage() {
           windows                                      List windows, tabs, and context_id values
           bind_context op=status                       Show current binding
           bind_context op=bind context_id=<uuid>       Bind a specific compose context
-          bind_context op=bind window_id=<id>          Bind a window without pinning a tab
+          bind_context op=bind window_id=<id>          Bind the window's active tab (sticky; later tab switches don't move it)
 
         manage_workspaces (workspace, ws) - Manage workspaces/tab lifecycle
           workspace list                               List visible workspaces
@@ -3186,7 +3186,8 @@ func printUsage() {
 
     OPTIONS:
         -e, --exec <cmd>       Execute command(s)
-        -w, --window <id>      Target window ID
+        -w, --window <id>      Use the window's active tab: -e/-i bind it at startup;
+                               -c targets it for that call only (no bind)
         -t, --tab <name>       Resolve/bind a tab by name or UUID at startup
         --context-id <uuid>    Bind directly to a canonical context
         --working-dir <path>   Explicit bind_context working_dirs selector (repeatable)
@@ -3207,12 +3208,11 @@ func printUsage() {
         With one window: -w is optional. With multiple: bind or disambiguate explicitly.
 
         __RPCE_CLI__ -e 'windows'                          List windows, tabs, and context_id values
-        __RPCE_CLI__ -w <id> -e 'context'                  Bind a window for this invocation
+        __RPCE_CLI__ -w <id> -e 'context'                  Bind the window's active tab for this invocation
         __RPCE_CLI__ --context-id <uuid> -e 'context'      Bind a compose context directly
         __RPCE_CLI__ -w <id> -t <tab-or-uuid> -e 'context' Resolve/bind a tab in one step
 
-        Prefer --context-id for compose-context targeting.
-        Use -w only when you want window scope without a tab pin.
+        Prefer --context-id when the exact tab matters (for example, other sessions share the window).
 
     MORE HELP:
         --help-interactive     REPL mode for exploration
@@ -3251,15 +3251,15 @@ func printInteractiveUsage() {
 
     USAGE:
         __RPCE_CLI__ -i                  Start REPL
-        __RPCE_CLI__ -i -w <id>          Start with window pre-selected
+        __RPCE_CLI__ -i -w <id>          Start bound to the window's active tab
 
     Interactive mode provides a shell-like REPL for exploring the RepoPrompt
     workspace and calling tools. Commands use natural syntax instead of JSON.
 
     IMPORTANT: When multiple windows are open, you must select a window:
-        __RPCE_CLI__ -i -w <id>          Pre-select window at startup
+        __RPCE_CLI__ -i -w <id>          Bind the window's active tab at startup
         windows                    List available windows (inside REPL)
-        use <id>                   Select window for session (inside REPL)
+        use <id>                   Bind that window's active tab (inside REPL)
 
     REPL COMMANDS:
         read ~/code/main.swift              Read a file
@@ -3374,7 +3374,7 @@ func printScriptingUsage() {
         __RPCE_CLI__ -e 'workspace switch "MyProject" && select set src/ && context --all > "~/out.md"'
 
     EXEC OPTIONS:
-        -w, --window <id>        Bind a window at startup (disambiguate when needed)
+        -w, --window <id>        Bind the window's active tab at startup (disambiguate when needed)
         -t, --tab <name>         Resolve/bind a tab by name or UUID at startup
         --json, -j <arg>         JSON args: inline, @file, @-, or path.json
         --wait-for-server <s>    Wait up to N seconds for server
@@ -3386,7 +3386,7 @@ func printScriptingUsage() {
         --launch-app             Launch RepoPrompt app
 
     MULTI-WINDOW NOTE:
-        Scripts should bind explicitly with -w and/or --context-id for deterministic behavior.
+        Scripts should bind explicitly. --context-id (or -t) pins an exact tab; -w binds whichever tab is active at startup.
 
         Example:
         __RPCE_CLI__ -w 1 -t MyTab -e 'select set src/ && context > out.md'
@@ -3424,7 +3424,8 @@ func printAdvancedUsage() {
     HIDDEN ROUTING PARAMETERS:
         These parameters can be passed to any tool call for explicit routing:
 
-        _windowID    Target a specific window (by ID from bind_context / windows)
+        _windowID    Use that window's active tab for this call (ID from bind_context / windows);
+                     on a bound connection it must agree with the binding
         context_id   Target a specific compose context (UUID from bind_context / windows)
         _tabID       Legacy low-level tab routing override (advanced/manual control)
 
@@ -3439,8 +3440,12 @@ func printAdvancedUsage() {
           like -w, -t, and --context-id apply an explicit bind_context bind for
           that invocation before your command chain runs.
 
+        - Single-shot calls (-c): -t and --context-id bind the same way; -w alone
+          does not bind and targets the window's active tab for that call only.
+
         CRITICAL FOR AI AGENTS:
-          When multiple windows exist, prefer --context-id for compose-context work.
+          Prefer --context-id when the exact tab matters, for example with multiple
+          windows or other sessions in the same window.
 
           Example workflow:
           __RPCE_CLI__ -e 'windows'                    # Discover windows and context_id values

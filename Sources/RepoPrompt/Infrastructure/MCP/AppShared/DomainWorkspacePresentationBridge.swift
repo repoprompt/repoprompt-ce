@@ -739,7 +739,8 @@ final class DomainWorkspacePresentationBridge {
     }
 
     /// Only an already-accepted catalog with exact qualified document descendants can hand off.
-    /// Preserve the suspended attempt's failure witnesses: a newer report must not be cleared.
+    /// Preserve the suspended attempt's failure/authority witnesses: a newer report must not be
+    /// cleared, and a covering reconciliation cannot bless stale point-observed health.
     private func acceptCoveredCatalogMetadata(
         _ snapshot: DomainWorkspaceCatalogSnapshot,
         attempt: DomainCatalogAttempt,
@@ -754,7 +755,8 @@ final class DomainWorkspacePresentationBridge {
         let handoff = DomainCatalogAttempt(
             generation: manager.beginDomainCatalogAttempt().generation,
             failureWitness: attempt.failureWitness,
-            projectionIssueWitness: attempt.projectionIssueWitness
+            projectionIssueWitness: attempt.projectionIssueWitness,
+            authorityHealthGeneration: attempt.authorityHealthGeneration
         )
         guard case let .accepted(receipt) = manager.applyDomainWorkspaceCatalog(
             snapshot,
@@ -785,8 +787,10 @@ final class DomainWorkspacePresentationBridge {
               let workspaceID = event.workspaceID,
               projectedModels[workspaceID] != nil,
               let baselineGeneration = acceptedReconciliationGeneration,
-              workspaceManager?.admitsDomainSelfEcho(baselineGeneration: baselineGeneration) == true
+              let manager = workspaceManager,
+              manager.admitsDomainSelfEcho(baselineGeneration: baselineGeneration)
         else { return false }
+        let authorityHealthGeneration = manager.domainAuthorityHealthGeneration
         guard let workspace = await client.canonicalWorkspaceSnapshot(workspaceID),
               workspace.health.acceptsMutations
         else { return false }
@@ -800,11 +804,12 @@ final class DomainWorkspacePresentationBridge {
             catalogRevision: event.catalogRevision,
             publicationSequence: event.sequence,
             baselineGeneration: baselineGeneration,
+            authorityHealthGeneration: authorityHealthGeneration,
             operationID: event.operationID,
             eventRevisions: event.revisions
         ) == true else { return false }
         guard subscriptionRunID == ownerRunID, !Task.isCancelled,
-              let manager = workspaceManager, !manager.isPreparingForWindowClose,
+              !manager.isPreparingForWindowClose,
               let generation = manager.adoptedFullDocumentGeneration(
                   workspaceID: workspaceID, contentDigest: workspace.document.contentDigest
               ),

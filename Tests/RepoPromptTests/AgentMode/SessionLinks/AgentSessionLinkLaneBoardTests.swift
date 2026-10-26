@@ -89,38 +89,42 @@ final class AgentSessionLinkLaneBoardTests: XCTestCase {
     }
 
     func testFailedTerminalCommitRetainsStampedReasonAfterProviderClearsRunID() {
-        let tabID = UUID()
-        let session = AgentModeViewModel.TabSession(tabID: tabID)
-        let runID = UUID()
-        session.installRunID(runID)
-        let ownership = AgentRunOwnership(
-            binding: AgentRunBindingIdentity(tabID: tabID, persistentSessionID: nil)
-        )
-        XCTAssertTrue(session.runLifecycle.beginTerminalCommit())
-        session.runLifecycle.stageTerminalRevision(AgentRunTerminalCommitRevision(
-            commitID: UUID(),
-            ownership: ownership,
-            terminalState: .failed,
-            failureReason: .timeout,
-            expectedRunID: runID,
-            sourceItemsRevision: 0,
-            assistantDeltaFlushGeneration: 0,
-            providerDrainGeneration: 0,
-            mcpPublicationEnvelope: nil,
-            successorKind: nil,
-            providerSuccessorID: nil
-        ))
-        session.runState = .failed
-        XCTAssertTrue(session.clearRunID(ifCurrent: runID))
-        session.runLifecycle.completeTerminalCommit()
-        XCTAssertNil(session.runID)
-        XCTAssertNotNil(session.lastTerminalCommitRevision)
-        let observed = snapshot(for: session, candidate: candidate(tabID: tabID))
-        XCTAssertEqual(observed.board.runOutcome, .failed)
-        XCTAssertEqual(observed.board.failureReason, .timeout)
+        for reason in [DomainAgentRunSnapshot.FailureReason.timeout, .resumeTimedOut] {
+            let tabID = UUID()
+            let session = AgentModeViewModel.TabSession(tabID: tabID)
+            let runID = UUID()
+            session.installRunID(runID)
+            let ownership = AgentRunOwnership(
+                binding: AgentRunBindingIdentity(tabID: tabID, persistentSessionID: nil)
+            )
+            XCTAssertTrue(session.runLifecycle.beginTerminalCommit())
+            session.runLifecycle.stageTerminalRevision(AgentRunTerminalCommitRevision(
+                commitID: UUID(),
+                ownership: ownership,
+                terminalState: .failed,
+                failureReason: reason,
+                expectedRunID: runID,
+                sourceItemsRevision: 0,
+                assistantDeltaFlushGeneration: 0,
+                providerDrainGeneration: 0,
+                mcpPublicationEnvelope: nil,
+                successorKind: nil,
+                providerSuccessorID: nil
+            ))
+            session.runState = .failed
+            XCTAssertTrue(session.clearRunID(ifCurrent: runID))
+            session.runLifecycle.completeTerminalCommit()
+            XCTAssertNil(session.runID)
+            XCTAssertNotNil(session.lastTerminalCommitRevision)
+            let observed = snapshot(for: session, candidate: candidate(tabID: tabID))
+            XCTAssertEqual(observed.board.runOutcome, .failed)
+            XCTAssertEqual(observed.board.failureReason?.rawValue, reason.rawValue)
+            let wire = AgentSessionLinkResponseRenderer.laneBoardValue(observed.board).objectValue
+            XCTAssertEqual(wire?["failure_reason"]?.stringValue, reason.rawValue)
 
-        session.runState = .completed
-        XCTAssertNil(snapshot(for: session, candidate: candidate(tabID: tabID)).board.failureReason)
+            session.runState = .completed
+            XCTAssertNil(snapshot(for: session, candidate: candidate(tabID: tabID)).board.failureReason)
+        }
     }
 
     func testEveryNamedReadinessConditionProducesItsOwnBlocker() {
