@@ -195,7 +195,7 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         for toolName in ["ask_oracle", "oracle_send"] {
             let cases: [(argument: String, expected: DirectHeadlessOracleAdapter.AdapterError)] = [
                 (OracleAttachmentContract.argumentName, .unsupportedAttachments),
-                (OracleAttachmentContract.retiredArgumentName, .retiredImagesArgument(toolName: toolName))
+                (OracleAttachmentContract.legacyImagesArgumentName, .unsupportedAttachments)
             ]
             for (argument, expected) in cases {
                 do {
@@ -211,9 +211,6 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
                     XCTFail("Expected \(argument) rejection on the direct headless backend")
                 } catch {
                     XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, expected)
-                    if case .retiredImagesArgument = expected {
-                        XCTAssertTrue(error.localizedDescription.contains("`attachments"), error.localizedDescription)
-                    }
                 }
             }
         }

@@ -520,7 +520,7 @@ extension OracleViewModel {
     }
 
     static func validateRawAttachmentDispatchInvariant(_ args: [String: Value]) throws {
-        guard args[OracleAttachmentContract.argumentName] == nil else {
+        guard OracleAttachmentContract.redactedArgumentKeys.allSatisfy({ args[$0] == nil }) else {
             throw ChatToolError.internalError(
                 "Raw ask_oracle attachment arguments must be consumed before Oracle dispatch."
             )

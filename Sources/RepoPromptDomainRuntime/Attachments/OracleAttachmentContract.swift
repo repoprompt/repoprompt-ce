@@ -6,20 +6,34 @@ package enum OracleAttachmentContract {
     package static let pathField = "path"
     package static let titleField = "title"
 
-    /// The argument this contract replaced. It is rejected by name and never translated, and it stays
-    /// in `redactedArgumentKeys` for good: a rejected call is still persisted, so dropping it from the
-    /// strip set would write the caller's filesystem paths into the transcript.
-    package static let retiredArgumentName = "images"
+    /// The argument this contract replaced, shipped in v1.6.0. It stays accepted as a deprecated,
+    /// unadvertised alias so released skills and workflows keep working, but it is bounded to its old
+    /// meaning: every item must be a PNG, JPEG, GIF or WebP image (`OracleAttachmentRequest.imageOnly`).
+    /// It stays in `redactedArgumentKeys` so its filesystem paths are never written to a transcript.
+    package static let legacyImagesArgumentName = "images"
 
-    package static let redactedArgumentKeys: Set<String> = [argumentName, retiredArgumentName]
+    package static let redactedArgumentKeys: Set<String> = [argumentName, legacyImagesArgumentName]
 
     package static let oracleToolNames = [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend]
 
     private static let itemFields: Set = [pathField, titleField]
     private static let bytesPerMiB = 1_048_576
 
-    package static func retiredArgumentMessage(toolName: String) -> String {
-        "\(toolName) no longer accepts `\(retiredArgumentName)`. Pass `\(argumentName): [{\(pathField), \(titleField)?}]` instead; it takes images, PDFs, and text files."
+    /// Parses the Oracle file arguments from a tool call: `attachments`, or the deprecated image-only
+    /// `images` alias. Passing both is ambiguous and rejected rather than merged.
+    package static func parseArguments(
+        _ args: [String: Value],
+        limits: OracleAttachmentLimits = .production
+    ) throws -> [OracleAttachmentRequest] {
+        if let legacy = args[legacyImagesArgumentName] {
+            guard args[argumentName] == nil else {
+                throw MCPError.invalidParams(
+                    "Pass `\(argumentName)` or the deprecated `\(legacyImagesArgumentName)`, not both. Prefer `\(argumentName)`."
+                )
+            }
+            return try parse(legacy, limits: limits, label: legacyImagesArgumentName, imageOnly: true)
+        }
+        return try parse(args[argumentName], limits: limits)
     }
 
     package static func headlessUnsupportedMessage() -> String {
@@ -28,18 +42,20 @@ package enum OracleAttachmentContract {
 
     package static func parse(
         _ value: Value?,
-        limits: OracleAttachmentLimits = .production
+        limits: OracleAttachmentLimits = .production,
+        label argumentLabel: String = argumentName,
+        imageOnly: Bool = false
     ) throws -> [OracleAttachmentRequest] {
         guard let value else { return [] }
         guard case let .array(items) = value else {
-            throw MCPError.invalidParams("\(argumentName) must be an array of objects.")
+            throw MCPError.invalidParams("\(argumentLabel) must be an array of objects.")
         }
         guard !items.isEmpty else { return [] }
         guard items.count <= limits.maxCount else {
-            throw MCPError.invalidParams("\(argumentName) supports at most \(limits.maxCount) items.")
+            throw MCPError.invalidParams("\(argumentLabel) supports at most \(limits.maxCount) items.")
         }
         return try items.enumerated().map { index, item in
-            let label = "\(argumentName)[\(index)]"
+            let label = "\(argumentLabel)[\(index)]"
             guard case let .object(object) = item else {
                 throw MCPError.invalidParams("\(label) must be an object.")
             }
@@ -68,7 +84,7 @@ package enum OracleAttachmentContract {
             } else {
                 title = nil
             }
-            return OracleAttachmentRequest(index: index, path: rawPath, title: title)
+            return OracleAttachmentRequest(index: index, path: rawPath, title: title, imageOnly: imageOnly)
         }
     }
 

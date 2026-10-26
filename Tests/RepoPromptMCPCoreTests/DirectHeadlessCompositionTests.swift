@@ -158,7 +158,7 @@ final class DirectHeadlessCompositionTests: XCTestCase {
             let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
             let schema = try XCTUnwrap(definition.inputSchema.objectValue)
             let properties = try XCTUnwrap(schema["properties"]?.objectValue)
-            XCTAssertNil(properties[OracleAttachmentContract.retiredArgumentName], toolName)
+            XCTAssertNil(properties[OracleAttachmentContract.legacyImagesArgumentName], toolName)
             let attachments = try XCTUnwrap(properties[OracleAttachmentContract.argumentName]?.objectValue, toolName)
             XCTAssertEqual(attachments["type"], .string("array"))
             XCTAssertEqual(attachments["maxItems"], .int(OracleAttachmentLimits.production.maxCount))

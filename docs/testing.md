@@ -168,7 +168,7 @@ Tool discovery and CLI help (`rpce-cli-debug -l` / `-e 'describe oracle_send'`; 
 
 Ordinary smoke and packaged initialize/tools-list are **not image-delivery proof**.
 Ordinary CLI connections use `oracle_send`; `ask_oracle` requires an owning Agent Mode session. Both accept images on starts and continuations, and apply the same workspace-root, exact session-attachment, and provider capability checks. Supply a fresh `mode:"chat"`,
-`new_chat:true`, `message`, and nonempty `images` JSON request. Do not include keys,
+`new_chat:true`, `message`, and nonempty `attachments` JSON request (the deprecated image-only `images` alias is also accepted). Do not include keys,
 raw image bytes or base64. Inspect roster/settings before approval: `model` changes
 only the primary lane; additional Oracle lanes can multiply uploads and cost.
 Use a small generated PNG in a disposable loaded root (neutral filename/title),

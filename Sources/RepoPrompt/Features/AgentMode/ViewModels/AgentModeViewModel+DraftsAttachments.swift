@@ -329,7 +329,7 @@ extension AgentModeViewModel {
                 store.clearConsumedLocalFiles(outcome.imported, workspaceDirectory: workspaceDirectory)
                 return
             }
-            commitAttachmentIntake(outcome, tabID: tabID)
+            commitAttachmentIntake(outcome, to: session)
         }
         Self.attachmentIntakeTail = intake
         return intake
@@ -338,28 +338,37 @@ extension AgentModeViewModel {
     func reportAttachmentFailures(tabID: UUID, _ failures: [AgentAttachmentFailure]) {
         reportAttachmentFailures(
             tabID: tabID,
-            messages: failures.map { "Failed to attach \($0.fileName): \($0.reason)" }
+            messages: failures.map(Self.attachmentFailureMessage)
         )
+    }
+
+    private static func attachmentFailureMessage(_ failure: AgentAttachmentFailure) -> String {
+        "Failed to attach \(failure.fileName): \(failure.reason)"
     }
 
     private func reportAttachmentFailures(tabID: UUID, messages: [String]) {
         guard !messages.isEmpty else { return }
-        let session = session(for: tabID)
+        appendAttachmentFailures(messages, to: session(for: tabID))
+    }
+
+    private func appendAttachmentFailures(_ messages: [String], to session: TabSession) {
+        guard !messages.isEmpty else { return }
         for message in messages {
             session.appendItem(AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex))
         }
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        scheduleSave(for: session)
     }
 
-    private func commitAttachmentIntake(_ outcome: AgentAttachmentIntakeOutcome, tabID: UUID) {
-        reportAttachmentFailures(tabID: tabID, outcome.failures)
+    /// Publishes into the exact session the admission fence just revalidated; it never looks the tab up
+    /// again, so it cannot create or reach a replacement runtime.
+    private func commitAttachmentIntake(_ outcome: AgentAttachmentIntakeOutcome, to session: TabSession) {
+        appendAttachmentFailures(outcome.failures.map(Self.attachmentFailureMessage), to: session)
         guard !outcome.imported.isEmpty else { return }
-        let session = session(for: tabID)
         session.pendingFileAttachments.append(contentsOf: outcome.imported)
         session.isDirty = true
         updateBindingsFromSession(session)
-        scheduleSave(for: tabID)
+        scheduleSave(for: session)
     }
 
     private nonisolated static func importAttachments(

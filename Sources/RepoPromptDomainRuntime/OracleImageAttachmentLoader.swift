@@ -6,11 +6,15 @@ package struct OracleAttachmentRequest: Equatable {
     package let index: Int
     package let path: String
     package let title: String?
+    /// Set for the deprecated `images` alias: the file must be a PNG, JPEG, GIF or WebP image, exactly
+    /// as v1.6.0's `images` contract required, so the alias never widens what an old caller can send.
+    package let imageOnly: Bool
 
-    package init(index: Int, path: String, title: String?) {
+    package init(index: Int, path: String, title: String?, imageOnly: Bool = false) {
         self.index = index
         self.path = path
         self.title = title
+        self.imageOnly = imageOnly
     }
 }
 
@@ -160,6 +164,7 @@ package enum OracleAttachmentLoadError: Error, LocalizedError, Equatable {
     case changedWhileReading(index: Int)
     case extensionMismatch(index: Int, fileName: String, detected: String)
     case imageNormalizationFailed(index: Int, AttachmentClassificationError)
+    case legacyImagesRequiresImage(index: Int)
 
     package var errorDescription: String? {
         switch self {
@@ -185,6 +190,10 @@ package enum OracleAttachmentLoadError: Error, LocalizedError, Equatable {
             "attachments[\(index)] \(fileName): the file extension does not match its content, which is \(detected)."
         case let .imageNormalizationFailed(index, error):
             "attachments[\(index)] \(error.errorDescription ?? "image conversion failed")"
+        case let .legacyImagesRequiresImage(index):
+            "\(OracleAttachmentContract.legacyImagesArgumentName)[\(index)] is not a supported PNG, JPEG, WebP, or GIF file. "
+                + "The deprecated `\(OracleAttachmentContract.legacyImagesArgumentName)` argument takes only those images; "
+                + "pass other files in `\(OracleAttachmentContract.argumentName)`."
         }
     }
 }
@@ -405,6 +414,11 @@ package struct OracleAttachmentLoader {
 
             let fileName = (item.resolution.physicalFilePath as NSString).lastPathComponent
             let sniffedImage = AttachmentClassifier.sniffImage(of: data)
+            if item.request.imageOnly {
+                guard case .native = sniffedImage else {
+                    throw OracleAttachmentLoadError.legacyImagesRequiresImage(index: item.request.index)
+                }
+            }
             if let sniffedImage {
                 try validateExtension(
                     fileName: fileName,

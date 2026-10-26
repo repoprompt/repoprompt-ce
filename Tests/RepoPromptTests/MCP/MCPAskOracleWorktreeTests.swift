@@ -345,6 +345,39 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         XCTAssertEqual(images.map(\.title), ["Image 1", "Image 2", "Image 3", "Image 4"])
     }
 
+    func testImageOnlyLegacyRequestsLoadClassicImagesAndRefuseEverythingElse() throws {
+        let images = try [("one.png", Self.pngData), ("two.webp", Self.webpData)].enumerated().map { index, fixture in
+            let url = testRoot.appendingPathComponent(fixture.0)
+            try fixture.1.write(to: url)
+            return OracleAttachmentRequest(index: index, path: url.path, title: nil, imageOnly: true)
+        }
+        let loaded = try OracleAttachmentLoader().load(
+            requests: images,
+            authority: authority(logical: testRoot, physical: testRoot)
+        )
+        XCTAssertEqual(loaded.map(\.bytes), [Self.pngData, Self.webpData])
+
+        let refused: [(String, Data)] = [
+            ("notes.txt", Data("plain text".utf8)),
+            ("report.pdf", Data("%PDF-1.4\n%%EOF\n".utf8))
+        ]
+        for (name, data) in refused {
+            let url = testRoot.appendingPathComponent(name)
+            try data.write(to: url)
+            // The same file is accepted through `attachments`; only the legacy alias is image-bounded.
+            XCTAssertNoThrow(try OracleAttachmentLoader().load(
+                requests: [.init(index: 0, path: url.path, title: nil)],
+                authority: authority(logical: testRoot, physical: testRoot)
+            ), name)
+            XCTAssertThrowsError(try OracleAttachmentLoader().load(
+                requests: [.init(index: 1, path: url.path, title: nil, imageOnly: true)],
+                authority: authority(logical: testRoot, physical: testRoot)
+            )) { error in
+                XCTAssertEqual(error as? OracleAttachmentLoadError, .legacyImagesRequiresImage(index: 1), name)
+            }
+        }
+    }
+
     func testLogicalPathReadsBoundPhysicalWorktreeFile() throws {
         let logicalRoot = testRoot.appendingPathComponent("logical", isDirectory: true)
         let physicalRoot = testRoot.appendingPathComponent("worktree", isDirectory: true)

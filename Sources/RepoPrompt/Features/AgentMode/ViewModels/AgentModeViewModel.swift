@@ -20997,7 +20997,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec, .grokBuild, .devin:
             // These transports deliver pixels natively but no file path, so the agent could not
-            // otherwise name the image in ask_oracle `images`.
+            // otherwise name the file in ask_oracle `attachments`.
             return renderAttachmentPathNote(text: text, attachments: attachments)
         }
     }

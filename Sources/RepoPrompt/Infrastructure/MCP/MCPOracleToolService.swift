@@ -120,7 +120,7 @@ struct MCPOracleToolService {
     func executeAskOracle(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
         try Self.validateOracleArguments(toolName: MCPWindowToolName.askOracle, args: args)
         try validateCommonOracleArgs(args)
-        let attachmentRequests = try OracleAttachmentContract.parse(args[OracleAttachmentContract.argumentName])
+        let attachmentRequests = try OracleAttachmentContract.parseArguments(args)
 
         guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
@@ -301,7 +301,7 @@ struct MCPOracleToolService {
     func executeOracleSend(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
         try Self.validateOracleArguments(toolName: MCPWindowToolName.oracleSend, args: args)
         try validateCommonOracleArgs(args)
-        let attachmentRequests = try OracleAttachmentContract.parse(args[OracleAttachmentContract.argumentName])
+        let attachmentRequests = try OracleAttachmentContract.parseArguments(args)
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         let exportResponse = try parseExportResponseFlag(args)
@@ -383,7 +383,9 @@ struct MCPOracleToolService {
 
         var chatArgs = args
         chatArgs.removeValue(forKey: "export_response")
-        chatArgs.removeValue(forKey: OracleAttachmentContract.argumentName)
+        for key in OracleAttachmentContract.redactedArgumentKeys {
+            chatArgs.removeValue(forKey: key)
+        }
 
         let capturedTabContext = tabContext
         let capturedChatArgs = chatArgs
@@ -471,12 +473,15 @@ struct MCPOracleToolService {
         "message", "mode", "chat_id", "new_chat", "model", OracleAttachmentContract.argumentName, "export_response"
     ]
 
+    /// The deprecated `images` alias is accepted but deliberately not listed, so the error steers
+    /// callers to `attachments`.
+    private static let acceptedOracleArgumentNames = Set(oracleArgumentNames + [
+        OracleAttachmentContract.legacyImagesArgumentName
+    ])
+
     private static func validateOracleArguments(toolName: String, args: [String: Value]) throws {
-        guard args[OracleAttachmentContract.retiredArgumentName] == nil else {
-            throw MCPError.invalidParams(OracleAttachmentContract.retiredArgumentMessage(toolName: toolName))
-        }
         let unsupported = args.keys
-            .filter { !$0.hasPrefix("_") && !oracleArgumentNames.contains($0) }
+            .filter { !$0.hasPrefix("_") && !acceptedOracleArgumentNames.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(

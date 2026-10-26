@@ -75,8 +75,11 @@ preview; a file that cannot be rendered yields no preview rather than a failure.
 
 - The MCP argument is `attachments: [{ path, title? }]` on `ask_oracle` and `oracle_send`, owned by
   `OracleAttachmentContract`, which also derives both schema copies and their prose from the
-  capability table and the limits. The retired `images` argument is rejected by name, with no alias.
-  Both keys stay in the persisted-argument redaction set, because a rejected call is still persisted.
+  capability table and the limits. The v1.6.0 `images` argument remains a deprecated, unadvertised
+  alias bounded to its released meaning: every item must be a native PNG, JPEG, GIF or WebP image
+  (`OracleAttachmentRequest.imageOnly`), any other file is refused with a pointer to `attachments`,
+  and passing both keys is rejected. The direct headless backend rejects both, as v1.6.0 did. Both
+  keys stay in the persisted-argument redaction set, because a rejected call is still persisted.
 - Oracle chat history persists attachments under the JSON key `imageAttachments`, mapped through
   `CodingKeys`. Agent Mode transcripts use `attachments`. Rows written before kind existed decode as
   images.
