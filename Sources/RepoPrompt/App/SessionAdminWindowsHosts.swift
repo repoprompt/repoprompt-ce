@@ -627,10 +627,9 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         return removed.map(\.worktreeID)
     }
 
-    /// Authority is evaluated synchronously right before the transition and again at its
-    /// `beforeCommit` fence, after its preparation suspensions, so a revocation or a membership change
-    /// that lands before the fence aborts it. As with `manage_worktree`, the transition may still await
-    /// recovery handoff and provider-context invalidation after the fence, before it publishes.
+    /// Scope authority stays live through every preparation/retirement suspension, including root
+    /// ownership installation, until the binding is published. Admission still runs once, at the
+    /// original pre-commit fence; post-publication persistence does not reauthorize a committed bind.
     private func transition(
         _ desired: [AgentSessionWorktreeBinding],
         owner: AgentSessionCarrierResolver.RuntimeOwner,
@@ -638,15 +637,36 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         admitBindings: @escaping @MainActor () throws -> Void = {},
         bindingsCommitted: @escaping @MainActor () -> Void = {}
     ) async throws {
-        let sessionID = owner.location.sessionID
-        let viewModel = owner.location.window.agentModeViewModel
-        guard isStillAuthorized(), SessionAdminWindows.isCurrent(owner) else { throw SessionAdminHostError.authorityEnded }
+        try await transition(
+            desired, sessionID: owner.location.sessionID, viewModel: owner.location.window.agentModeViewModel,
+            isStillAuthorized: { isStillAuthorized() && SessionAdminWindows.isCurrent(owner) },
+            admitBindings: admitBindings, bindingsCommitted: bindingsCommitted
+        )
+    }
+
+    /// Shared production transition seam: scope and exact carrier checks remain one live predicate.
+    func transition(
+        _ desired: [AgentSessionWorktreeBinding],
+        sessionID: UUID,
+        viewModel: AgentModeViewModel,
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        admitBindings: @escaping @MainActor () throws -> Void = {},
+        bindingsCommitted: @escaping @MainActor () -> Void = {}
+    ) async throws {
+        guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
         do {
             _ = try await viewModel.transitionWorktreeBindings(
                 desired, forSessionID: sessionID, intent: .externalManagement,
                 beforeCommit: {
-                    guard isStillAuthorized(), SessionAdminWindows.isCurrent(owner) else { throw SessionAdminHostError.authorityEnded }
+                    guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
                     try admitBindings()
+                },
+                revalidateAuthority: {
+                    guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+                },
+                commitAuthority: {
+                    guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+                    try $0()
                 },
                 afterCommit: bindingsCommitted
             )

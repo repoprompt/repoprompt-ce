@@ -283,6 +283,17 @@ package actor DomainMutationJournal {
         }
     }
 
+    /// A backend may reserve its durable commit fence and then synchronously refuse authority
+    /// before any effect. Only that explicitly proven refusal can settle a committing ticket here.
+    package func finishRefusedBeforeEffects(_ ticket: DomainMutationJournalTicket) async throws {
+        try await transition(ticket, now: Date()) { record in
+            guard record.status == .admitted || record.status == .committing else {
+                throw DomainMutationJournalError.ownershipLost(record.operationID)
+            }
+            return record.updating(status: .failedBeforeCommit, now: Date())
+        }
+    }
+
     package func finishBeforeCommit(
         _ ticket: DomainMutationJournalTicket,
         cancelled: Bool,
@@ -477,10 +488,23 @@ package struct DomainMutationCommitController {
     }
 }
 
+package struct DomainMutationRefusedBeforeEffects: LocalizedError {
+    package let underlying: Error
+    package init(_ underlying: Error) {
+        self.underlying = underlying
+    }
+
+    package var errorDescription: String? {
+        underlying.localizedDescription
+    }
+}
+
 package enum MCPDomainMutationCommitContext {
     // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
     package static let controllerTaskLocal = BoxedTaskLocal<DomainMutationCommitController?>(nil)
-    package static var controller: DomainMutationCommitController? { controllerTaskLocal.get() }
+    package static var controller: DomainMutationCommitController? {
+        controllerTaskLocal.get()
+    }
 
     package static func admitPhysicalTargets(
         _ paths: [String],

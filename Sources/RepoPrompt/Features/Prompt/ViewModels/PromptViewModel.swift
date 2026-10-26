@@ -2429,6 +2429,8 @@ class PromptViewModel: ObservableObject {
         var clipboardCommitCompletionForTesting: ((Bool) -> Void)?
     #endif
 
+    private var initialModelRefreshTask: Task<Void, Never>?
+
     init(
         fileManager: WorkspaceFilesViewModel,
         aiQueriesService: AIQueriesService? = nil,
@@ -2462,8 +2464,9 @@ class PromptViewModel: ObservableObject {
         updateFileTree()
 
         if refreshAvailableModelsOnInit {
-            Task {
-                await self.refreshAvailableModels()
+            initialModelRefreshTask = Task { [weak self] in
+                guard let self else { return }
+                await refreshAvailableModels()
             }
         }
 
@@ -2614,6 +2617,10 @@ class PromptViewModel: ObservableObject {
 
         // Observe git diff inclusion mode changes
         gitViewModel.$gitDiffInclusionMode
+            // Workspace settings sync can reassign the current mode while a save is
+            // being prepared. Only a changed mode may invalidate that capture.
+            // Keep the initial value as the comparison baseline before dropping it.
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -3293,12 +3300,19 @@ class PromptViewModel: ObservableObject {
             )
         }
 
+        let timing = manager.makeAgentAdmissionTiming()
         return try await manager.withAgentSessionAdmission(
             workspaceID: expectedWorkspaceID,
             admissionID: UUID(),
-            refreshCanonicalState: true
+            refreshCanonicalState: true,
+            kind: .freshTab,
+            classifyOutcome: { (result: DurableBackgroundComposeTabCreationResult) in
+                if case .created = result { return .committed }
+                return .rejected
+            },
+            timing: timing
         ) {
-            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID) {
+            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID, timing: timing) {
                 return .rejected(
                     AgentAdmissionPersistenceReceipt(outcome: rejection, commitEvidence: .none),
                     .workspacePersistenceRejected
@@ -3387,7 +3401,9 @@ class PromptViewModel: ObservableObject {
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
 
-            let receipt = await manager.persistAgentAdmission(provisionalIdentity)
+            timing.begin(.save)
+            let receipt = await manager.persistAgentAdmission(provisionalIdentity, timing: timing)
+            timing.end()
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
                 receipt: receipt
@@ -3589,7 +3605,14 @@ class PromptViewModel: ObservableObject {
                 do {
                     outcome = try await manager.withAgentSessionAdmission(
                         workspaceID: identity.workspaceID,
-                        admissionID: UUID()
+                        admissionID: UUID(),
+                        kind: .recovery,
+                        classifyOutcome: { result in
+                            switch result {
+                            case .recovered, .alreadyRecovered, .localOnly: .committed
+                            default: .rejected
+                            }
+                        }
                     ) {
                         await manager.recoverProvisionalAgentAdmission(identity)
                     }
@@ -4181,12 +4204,15 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func closeComposeTab(
         _ id: UUID,
+        deletionOrigin: AgentSessionDeletionOrigin = .current,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) async -> ComposeTabMutationReport {
-        await removeComposeTabs(
-            withIDs: [id],
-            isMutationContextCurrent: isMutationContextCurrent
-        )
+        await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
+            await removeComposeTabs(
+                withIDs: [id],
+                isMutationContextCurrent: isMutationContextCurrent
+            )
+        }
     }
 
     @MainActor
@@ -6853,6 +6879,16 @@ class PromptViewModel: ObservableObject {
 
     // MARK: - Model and Settings Management
 
+    /// Stop this prompt's constructor-owned refresh; the owner joins it before teardown completes.
+    func cancelInitialModelRefreshForWindowClose() {
+        initialModelRefreshTask?.cancel()
+    }
+
+    func awaitInitialModelRefreshCompletion() async {
+        await initialModelRefreshTask?.value
+        initialModelRefreshTask = nil
+    }
+
     @MainActor
     func refreshAvailableModels() async {
         await apiSettingsViewModel?.loadStoredData {
@@ -7096,6 +7132,7 @@ class PromptViewModel: ObservableObject {
     }
 
     deinit {
+        initialModelRefreshTask?.cancel()
         activeTabApplyTask?.cancel()
         cancellables.removeAll()
         /*

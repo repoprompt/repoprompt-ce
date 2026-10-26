@@ -2,6 +2,28 @@
 
 RepoPrompt CE can create Git worktrees for MCP tools and Agent Mode. For app-managed worktrees, you can ask RepoPrompt to copy selected local files that are useful for development but should not be committed.
 
+## Revoking a linked lane's worktree authority
+
+A `manage_worktree` bind, select, unbind, or create-and-bind that relies on an overseer's
+Manage link retains that exact link lease. Removing the link or Manage capability, replacing
+its generation, or changing either endpoint incarnation before binding publication refuses
+the change; a replacement link does not revive the in-flight operation. Authority is checked
+after preparation waits, provider handoff/retirement, and root ownership installation.
+The final synchronous publication shares an authority-owned, per-grant revocation fence with
+unlink and shutdown, closing the gap between an async lease-check reply and binding publication.
+`session_admin` binding transitions likewise retain their original scope authority through publication.
+
+If revocation happens after provider retirement, the old binding remains and a transcript
+recovery note explains that the next message restarts its provider at the old location. If a
+worktree was already created, it is **kept on disk, unbound**: `manage_worktree create` returns
+the created descriptor and a binding-failed warning. Cleanup is manual; revocation never deletes
+a worktree. The target transcript also names the orphan and its path, and inventory records it
+as released for human cleanup; refused binds do not persist the requested visual identity.
+Before retirement, refusal restores the pre-existing handoff instead of injecting a spurious
+restart transcript. Same-root presentation changes never release a running provider's roots,
+even when HEAD changed. A still-live Manage link continues to authorize an operation if full
+access is disabled mid-transition. A binding already published before revocation is not rolled back.
+
 ## Copy-on-write checkouts on APFS
 
 RepoPrompt automatically attempts APFS copy-on-write cloning for app-managed worktrees created by Agent Mode or `manage_worktree create`. When the new worktree starts from exactly the same tree as a clean source checkout on the same APFS volume, RepoPrompt uses `git worktree add --no-checkout` and fills its tracked files with APFS clones. Cloned files share disk blocks with the source until either copy is modified, so the new worktree initially uses almost no additional space for tracked files. You do not need to pass a special creation flag. If checkout speed matters more than disk space, `manage_worktree create` accepts `clone_tracked_checkout=false` to use Git checkout instead. Local benchmarks found that cloning saved nearly all private tracked-file bytes but took longer to create the worktree.

@@ -152,6 +152,7 @@ conductor-selftest:
 	python3 Scripts/test_modularization_index_graph.py
 	python3 Scripts/test_conductor_job_timings.py
 	python3 Scripts/test_conductor_job_phases.py
+	python3 Scripts/test_conductor_cache_retry.py
 	python3 Scripts/test_conductor_heavy_admission.py
 	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
@@ -162,6 +163,11 @@ ci-app-test-runner-selftest:
 	python3 Scripts/test_ci_resolve_packages.py
 
 release-selftest:
+	python3 -B Scripts/test_tip_history.py
+	python3 -B Scripts/test_tip_history_admission.py
+	python3 -B Scripts/test_tip_history_seed.py
+	python3 -B Scripts/test_tip_release_history_hooks.py
+	python3 -B Scripts/tip_history.py lint-fragments --root .
 	python3 Scripts/test_release_tooling.py
 	python3 Scripts/test_publish_tip_release.py
 	python3 Scripts/test_codex_runtime_artifact.py

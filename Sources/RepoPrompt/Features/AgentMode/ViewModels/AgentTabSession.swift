@@ -306,6 +306,17 @@ final class AgentTabSession: ObservableObject {
 
     var worktreeBindingTransitionInProgress: Bool = false
 
+    /// Runtime-only: an execution-worktree change this session requested for itself from its own
+    /// live turn, applied at that turn's completed terminal boundary and then continued
+    /// automatically. Owned by `AgentModeViewModel+SelfWorktreeRelocation`.
+    var pendingSelfWorktreeRelocation: AgentSelfWorktreeRelocation? {
+        didSet {
+            if oldValue != pendingSelfWorktreeRelocation {
+                noteMonitorObservationInputsChanged()
+            }
+        }
+    }
+
     /// Wait/question state
     @Published var waitingPrompt: String? = nil {
         didSet { noteMonitorObservationInputsChanged() }
@@ -546,6 +557,7 @@ final class AgentTabSession: ObservableObject {
         let createdAt: Date
         /// Claude turn completions protected by this accepted steering instruction.
         var supersedingProtectedTurnIDs: Set<UUID> = []
+        var skipsSlashExpansion = false
     }
 
     var pendingClaudeSteeringInstructions: [ClaudeSteeringInstruction] = [] {
@@ -613,6 +625,7 @@ final class AgentTabSession: ObservableObject {
         let optimisticUserItemID: UUID?
         let createdAt: Date
         var managed: ACPSteeringManagedContext?
+        var skipsSlashExpansion = false
     }
 
     /// Lifecycle disposal withdraws only rows from the exact binding that accepted the steer.
@@ -1334,6 +1347,9 @@ final class AgentTabSession: ObservableObject {
     var codexNeedsReconnect: Bool = false
     var codexNativeStartupDisposition: AgentModeViewModel.CodexNativeStartupDisposition?
     var codexResumeTimeoutState: AgentModeViewModel.CodexResumeTimeoutState = .init()
+    // Like resume timeout accounting, this is session-scoped. A changed reference can resume;
+    // repeated attempts against the same oversized reference must not spawn another process.
+    var codexOversizedResumeTarget: AgentModeViewModel.CodexOversizedResumeTarget?
     var codexToolPreferencesGeneration: Int = 0
     var codexController: (any CodexSessionControlling)? {
         didSet {
@@ -1983,6 +1999,7 @@ final class AgentTabSession: ObservableObject {
         codexAnonymousActiveTurn = nil
         codexRoutingObservedTurnID = nil
         codexPendingSteerLifecycleReconciliation = nil
+        codexNativeStartupDisposition = nil
         var turnEpoch: AgentRunTurnEpoch?
         if var context = mcpControlContext {
             turnEpoch = context.preparedEpoch ?? context.currentEpoch
@@ -2294,7 +2311,8 @@ final class AgentTabSession: ObservableObject {
 
     private enum SourceItemPayloadUpdate {
         case rebuildFromSource
-        case preserveForRetentionCompaction
+        case preserveSurvivingPayloads
+        case preserveUnchangedRows
     }
 
     /// How a committed source-items change treats the retained local-input index's identity.
@@ -2321,6 +2339,11 @@ final class AgentTabSession: ObservableObject {
     ) {
         let repair = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
         let repairedItems = repair.items
+        let previousItemsByID: [UUID: AgentChatItem]? = if case .preserveUnchangedRows = payloadUpdate {
+            Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        } else {
+            nil
+        }
         switch localInputIdentity {
         case .invalidate:
             invalidateLocalInputStructure()
@@ -2343,6 +2366,13 @@ final class AgentTabSession: ObservableObject {
         items = repairedItems
         suppressSourceItemsChanged = false
         rebuildSourceItemDerivedState(payloadUpdate: payloadUpdate)
+        if let previousItemsByID {
+            // Unchanged summary rows cannot reconstruct their retained raw result. Re-inspect
+            // only changed/new rows, after ID repair and live-ID pruning, before notifying.
+            for item in items where previousItemsByID[item.id] != item {
+                refreshEphemeralPayload(for: item)
+            }
+        }
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         if case let .notify(mutation) = dispatch {
@@ -2389,6 +2419,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             repair.items,
             dispatch: .notify(.structural),
+            payloadUpdate: .preserveUnchangedRows,
             diagnosticContext: "\(diagnosticContext).commit"
         )
         return true
@@ -2410,7 +2441,7 @@ final class AgentTabSession: ObservableObject {
                 ),
                 liveItemIDs: liveItemIDs
             )
-        case .preserveForRetentionCompaction:
+        case .preserveSurvivingPayloads, .preserveUnchangedRows:
             replaceEphemeralToolResultPayloadMap(ephemeralToolResultPayloadByItemID, liveItemIDs: liveItemIDs)
         }
         rebuildToolCorrelationIndexes()
@@ -2665,6 +2696,7 @@ final class AgentTabSession: ObservableObject {
         commitSourceItems(
             updatedItems,
             dispatch: .notify(mutation),
+            payloadUpdate: .preserveUnchangedRows,
             localInputIdentity: .batchDiff,
             diagnosticContext: "mutateItemsBatch"
         )
@@ -2687,14 +2719,28 @@ final class AgentTabSession: ObservableObject {
     }
 
     func setItemsSilently(_ items: [AgentChatItem], reason: SilentItemReplacementReason) {
-        setItemsSilently(items, reason: reason, payloadUpdate: .rebuildFromSource)
+        let payloadUpdate: SourceItemPayloadUpdate = switch reason {
+        case .retentionCompaction:
+            .preserveSurvivingPayloads
+        case .pendingToolFinalizationRepair, .codexCommandStatusReconciliation:
+            .preserveUnchangedRows
+        case .persistedSessionHydration, .routeActivation, .clearedChat, .stressHarnessReset, .testOverride:
+            .rebuildFromSource
+        }
+        setItemsSilently(items, reason: reason, payloadUpdate: payloadUpdate)
     }
 
     /// Reconcile compacted source items without re-inspecting payloads that the session already owns.
     /// Unlike hydration or ordinary replacement, surviving payloads and their revisions stay intact.
     /// Pruning uses repaired live IDs; a rekeyed duplicate never inherits another item's raw payload.
     func setItemsSilentlyForRetentionCompaction(_ items: [AgentChatItem]) {
-        setItemsSilently(items, reason: .retentionCompaction, payloadUpdate: .preserveForRetentionCompaction)
+        setItemsSilently(items, reason: .retentionCompaction)
+    }
+
+    /// Repair pending rows without discarding payloads owned by unchanged completed cards.
+    /// Changed results are re-inspected so a terminal fallback cannot retain stale running output.
+    func setItemsSilentlyForPendingToolFinalizationRepair(_ items: [AgentChatItem]) {
+        setItemsSilently(items, reason: .pendingToolFinalizationRepair)
     }
 
     private func setItemsSilently(

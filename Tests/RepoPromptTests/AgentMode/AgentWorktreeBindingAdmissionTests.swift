@@ -429,6 +429,314 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
+    func testRealManageLinkRevokedDuringProviderTeardownDoesNotPublishBinding() async throws {
+        let target = try await durableFixture()
+        let observer = try await durableFixture(windowID: -992)
+        defer { target.git.cleanup()
+            observer.git.cleanup()
+        }
+        let original = target.session.worktreeBindings
+        for node in [target, observer] {
+            node.session.selectedAgent = .claudeCode
+            let workspaceID = try XCTUnwrap(node.manager.activeWorkspaceID)
+            XCTAssertTrue(node.manager.compareAndSetActiveAgentSessionID(
+                expected: nil, replacement: node.sessionID, forTabID: node.session.tabID, inWorkspaceID: workspaceID
+            ))
+        }
+        let host = LiveWindowEndpointHost()
+        host.register(target.viewModel, windowID: -991)
+        host.register(observer.viewModel, windowID: -992)
+        let bridge = AgentSessionLinkRuntimeBridge(
+            authority: DomainAgentSessionLinkAuthority(identity: .init(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date())),
+            host: host, toolAdvertisementInvalidator: { _ in }
+        )
+        let outcome = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString)
+        guard case .added = outcome else { return XCTFail("Expected Manage link, got \(outcome)") }
+        let endpoint = try XCTUnwrap(host.agentSessionLinkCandidates().first { $0.sessionID == observer.sessionID }).domainEndpoint
+        guard case let .success(authorized) = await bridge.authorizeTarget(
+            operation: .monitorWorktreeBinding, observerEndpoint: endpoint, targetSessionID: target.sessionID
+        ) else { return XCTFail("Expected live Manage authority") }
+        let proof = await MCPWorktreeToolProvider.sessionLinkManageGrant(
+            observerEndpoint: endpoint, targetSessionID: target.sessionID, bridge: bridge
+        )
+        let grant = try XCTUnwrap(proof)
+        let observerID = observer.sessionID, targetID = target.sessionID
+        target.session.claudeController = WorktreeTeardownNativeController {
+            let stopped = await bridge.stopMonitorLink(
+                observerSessionID: observerID, targetSessionID: targetID,
+                linkID: authorized.lease.linkID, generation: authorized.lease.linkGeneration
+            )
+            XCTAssertEqual(stopped, .stopped)
+        }
+        target.viewModel.test_setAgentSessionSaver { _, _, _ in target.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            _ = try await target.viewModel.transitionWorktreeBindings(
+                [], forSessionID: target.sessionID, intent: .externalManagement,
+                revalidateAuthority: grant.revalidate, commitAuthority: grant.commit
+            )
+            XCTFail("Unlink during teardown must prevent publication")
+        } catch {}
+        XCTAssertEqual(target.session.worktreeBindings, original)
+        XCTAssertNil(target.session.claudeController, "The refusal must happen after the fake teardown, not during initial admission")
+    }
+
+    func testSessionAdminScopeRevokedDuringProviderTeardownPreservesTypedRefusal() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let scopes = DelegationScopeRuntime(persistenceMode: .ephemeral, notifyCatalogChanged: { _ in })
+        scopes.isGlobalAutoApproveEnabled = { false }
+        let grantee = UUID()
+        let request = try scopes.requestScope(
+            requesterSessionID: grantee, requesterTabID: nil, kind: .session(targetSessionID: fixture.sessionID),
+            capabilities: DomainDelegationScopeCapability.fullPreset, guardrails: .init(), reason: nil, idempotencyKey: nil
+        ).get()
+        let scope = try scopes.approve(requestID: request.id).get()
+        fixture.session.claudeController = WorktreeTeardownNativeController {
+            _ = await MainActor.run { scopes.revoke(scopeID: scope.id) }
+        }
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            try await SessionAdminWindowsWorktreeHost().transition(
+                [], sessionID: fixture.sessionID, viewModel: fixture.viewModel,
+                isStillAuthorized: { scopes.hasLiveScope(grantedTo: grantee) }
+            )
+            XCTFail("Revoked scope must refuse publication")
+        } catch SessionAdminHostError.authorityEnded {
+            // The handler maps this exact cause to scope_revoked, not bind_failed.
+        } catch {
+            XCTFail("Lost scope-revocation cause: \(error)")
+        }
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertNil(fixture.session.claudeController)
+        XCTAssertNotNil(fixture.session.pendingHandoff.payload)
+    }
+
+    func testSameRootRefusalDoesNotResurrectHandoffDeliveredDuringTransition() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label")
+        fixture.session.pendingHandoff = .init(payload: "handoff P", createdAt: Date())
+        let native = MonitorFakeNativeController()
+        fixture.session.claudeController = native
+        var saved: AgentSession?
+        fixture.viewModel.test_setAgentSessionSaver { value, _, _ in
+            saved = value
+            return fixture.git.sandbox.appendingPathComponent("session.json")
+        }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+                beforeCommit: {
+                    // The transition is suspended while another MainActor task sends. Use the
+                    // provider-facing prepend and accepted-send consumption used by the runner.
+                    try await Task { @MainActor in
+                        XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+                        let text = fixture.viewModel.prependPendingHandoffIfNeeded("message", session: fixture.session)
+                        _ = try await native.sendUserMessage(text)
+                        fixture.session.pendingHandoff.clearAfterSend()
+                    }.value
+                    throw MCPError.invalidParams("Refused after concurrent send")
+                }
+            )
+            XCTFail("The presentation change must be refused")
+        } catch {}
+        let sent = await native.sentMessages
+        XCTAssertEqual(sent, ["handoff P\n\nmessage"])
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertNil(fixture.session.pendingHandoff.payload, "A delivered handoff must not be resurrected by an unrelated rollback")
+        XCTAssertNil(saved?.pendingHandoffPayload, "Rollback must not force-save the already-delivered payload")
+        XCTAssertEqual(fixture.viewModel.prependPendingHandoffIfNeeded("next", session: fixture.session), "next")
+    }
+
+    func testSameRootRefusalDoesNotRestageHandoffAfterConcurrentCancelRun() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label")
+        fixture.session.selectedAgent = .claudeCode
+        fixture.session.installRunID(UUID())
+        fixture.session.runState = .running
+        fixture.session.pendingHandoff = .init(payload: "handoff P", createdAt: Date(), isStagedForSend: true)
+        let (events, continuation) = AsyncStream<Void>.makeStream()
+        let runner = Task { @MainActor in
+            for await _ in events {}
+            // Model the runner's recordPendingHandoffSendOutcome(false) cancellation cleanup.
+            if Task.isCancelled { fixture.session.pendingHandoff.isStagedForSend = false }
+        }
+        fixture.session.agentTask = runner
+        defer { runner.cancel()
+            continuation.finish()
+        }
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+                beforeCommit: {
+                    await fixture.viewModel.cancelAgentRun(tabID: fixture.session.tabID, completion: .terminalTeardownCompleted)
+                    await runner.value
+                    XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend, "The cancelled runner must unstage the undelivered handoff")
+                    throw MCPError.invalidParams("Refused after concurrent cancellation")
+                }
+            )
+            XCTFail("The presentation change must be refused")
+        } catch {}
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertEqual(fixture.session.pendingHandoff.payload, "handoff P")
+        XCTAssertFalse(fixture.session.pendingHandoff.isStagedForSend, "Rollback must not undo cancelRun's unstage")
+        XCTAssertEqual(fixture.viewModel.prependPendingHandoffIfNeeded("next", session: fixture.session), "handoff P\n\nnext")
+    }
+
+    func testRefusalDoesNotOverwriteNewerHandoffAfterTransitionStaging() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let newer = AgentModeViewModel.PendingHandoffState(payload: "newer handoff", createdAt: Date())
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement,
+                revalidateAuthority: {
+                    if fixture.session.pendingHandoff.hasPayload {
+                        fixture.session.pendingHandoff = newer
+                        throw SessionAdminHostError.authorityEnded
+                    }
+                }
+            )
+            XCTFail("The transition must be refused after staging")
+        } catch {}
+        XCTAssertEqual(fixture.session.pendingHandoff, newer, "Rollback only owns its exact staged value")
+    }
+
+    func testRefusalAfterHandoffStagingRestoresOriginalHandoffBeforeRetirement() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.pendingHandoff
+        let native = MonitorFakeNativeController()
+        fixture.session.claudeController = native
+        var saved: AgentSession?
+        fixture.viewModel.test_setAgentSessionSaver { value, _, _ in
+            saved = value
+            return fixture.git.sandbox.appendingPathComponent("session.json")
+        }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [], forSessionID: fixture.sessionID, intent: .externalManagement,
+                revalidateAuthority: {
+                    if fixture.session.pendingHandoff != original { throw SessionAdminHostError.authorityEnded }
+                }
+            )
+            XCTFail("Staged handoff must not survive a pre-retirement refusal")
+        } catch {}
+        XCTAssertEqual(fixture.session.pendingHandoff, original)
+        XCTAssertEqual(saved?.pendingHandoffPayload, original.payload)
+        XCTAssertTrue(fixture.session.claudeController === native)
+        let shutdowns = await native.shutdownCount
+        XCTAssertEqual(shutdowns, 0)
+    }
+
+    func testRevokedAuthorityDuringProviderTeardownDoesNotPublishBinding() async throws {
+        for unbind in [true, false] {
+            let fixture = try await durableFixture()
+            defer { fixture.git.cleanup() }
+            let original = fixture.session.worktreeBindings
+            let next = try makeNextBinding(fixture)
+            let grant = WorktreeTestManageGrant()
+            fixture.session.claudeController = WorktreeTeardownNativeController {
+                await grant.revoke()
+            }
+            fixture.viewModel.test_setAgentSessionSaver { _, _, _ in
+                fixture.git.sandbox.appendingPathComponent("session.json")
+            }
+            do {
+                _ = try await fixture.viewModel.transitionWorktreeBindings(
+                    unbind ? [] : [next], forSessionID: fixture.sessionID, intent: .externalManagement,
+                    beforeCommit: { try await grant.validate() },
+                    revalidateAuthority: { try await grant.validate() }
+                )
+                XCTFail("Revocation during the awaited teardown must refuse the binding change")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("revoked"), error.localizedDescription)
+            }
+            XCTAssertEqual(fixture.session.worktreeBindings, original)
+            XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+            XCTAssertFalse(fixture.session.worktreeBindingTransitionInProgress)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: next.worktreeRootPath), "A created but unbound worktree stays available for manual cleanup")
+        }
+    }
+
+    func testPublicationFenceRefusalReleasesInstalledDestinationOwnership() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let next = try makeNextBinding(fixture)
+        fixture.session.claudeController = MonitorFakeNativeController()
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        var fences = 0
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [next], forSessionID: fixture.sessionID, intent: .externalManagement,
+                commitAuthority: { body in
+                    fences += 1
+                    if fences == 3 { throw MCPError.invalidParams("Manage grant revoked at publication") }
+                    try body()
+                }
+            )
+            XCTFail("The final publication fence must refuse a revoked grant")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("revoked at publication"), error.localizedDescription)
+        }
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertNotNil(fixture.session.pendingHandoff.payload)
+        XCTAssertTrue(fixture.session.items.contains { $0.text.contains("previous execution binding is unchanged") })
+        let store = fixture.prompt.workspaceFileContextStore
+        let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        XCTAssertEqual(ownership.installedOwnerCount, 0, "The refused destination must not remain installed")
+        XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        let recovered = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(sessionID: fixture.sessionID, bindings: original)
+        XCTAssertNotNil(recovered, "The unchanged old binding can rebuild its released projection")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: next.worktreeRootPath))
+    }
+
+    func testPublicationRefusalPreservesReusedRootsOfAnActiveProvider() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let original = fixture.session.worktreeBindings
+        let presentation = Self.copyBinding(original[0], visualLabel: "Refused label", head: "changed-head")
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        let native = MonitorFakeNativeController()
+        await native.setTurnInFlight(true)
+        fixture.session.claudeController = native
+        fixture.session.runState = .running
+        defer {
+            fixture.session.runState = .idle
+            fixture.session.claudeController = nil
+        }
+        do {
+            _ = try await fixture.viewModel.transitionWorktreeBindings(
+                [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+                commitAuthority: { _ in throw MCPError.invalidParams("Manage grant revoked") }
+            )
+            XCTFail("The final fence must refuse the presentation change")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("revoked"), error.localizedDescription)
+        }
+        XCTAssertEqual(fixture.session.worktreeBindings, original)
+        XCTAssertTrue(fixture.session.claudeController === native)
+        XCTAssertEqual(fixture.session.runState, .running)
+        let ownership = await fixture.prompt.workspaceFileContextStore.sessionWorktreeOwnershipDebugSnapshotForTesting()
+        XCTAssertEqual(ownership.installedOwnerCount, 1, "Reused old roots still belong to the active provider")
+        XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        let shutdowns = await native.shutdownCount
+        XCTAssertEqual(shutdowns, 0)
+        _ = try await fixture.viewModel.transitionWorktreeBindings(
+            [presentation], forSessionID: fixture.sessionID, intent: .externalManagement,
+            beforeCommit: { fixture.session.runState = .idle }
+        )
+        XCTAssertEqual(fixture.session.worktreeBindings, [presentation], "Authorized same-root edits survive a run-state change")
+        XCTAssertTrue(fixture.session.claudeController === native)
+    }
+
     func testLogicalRootLookupAndUnbindAgreeAcrossSymlinkAlias() async throws {
         let fixture = try await durableFixture()
         defer { fixture.git.cleanup() }
@@ -483,6 +791,284 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         XCTAssertEqual(before, after)
     }
 
+    // MARK: - Self relocation from a live turn
+
+    func testSelfRelocationFromLiveTurnSchedulesWithoutTouchingRunningProvider() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let turn = try await liveSelfTurn(fixture)
+        let original = fixture.session.worktreeBindings
+        let next = try makeNextBinding(fixture)
+        var recorded = false
+        let scheduled = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+            [next], forSessionID: fixture.sessionID,
+            originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID,
+            beforeRecord: { recorded = true }
+        )
+        let pending = try XCTUnwrap(scheduled, "A self switch from the live turn must be deferred, not rejected")
+        XCTAssertTrue(recorded)
+        XCTAssertEqual(pending.phase, .scheduled)
+        XCTAssertEqual(fixture.session.pendingSelfWorktreeRelocation, pending)
+        XCTAssertEqual(fixture.session.worktreeBindings, original, "The running turn keeps its execution roots")
+        XCTAssertEqual(fixture.session.runState, .running)
+        XCTAssertTrue(fixture.session.claudeController === turn.native)
+        let shutdownCount = await turn.native.shutdownCount
+        XCTAssertEqual(shutdownCount, 0)
+    }
+
+    func testSelfRelocationAppliesAtCompletedTerminalAndContinuesInNewLocation() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let turn = try await liveSelfTurn(fixture)
+        let next = try makeNextBinding(fixture)
+        _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+            [next], forSessionID: fixture.sessionID,
+            originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
+        )
+        fixture.viewModel.test_setAgentSessionSaver { _, _, _ in fixture.git.sandbox.appendingPathComponent("session.json") }
+        let continued = expectation(description: "automatic continuation")
+        var continuation: (bindings: [AgentSessionWorktreeBinding], handoffStaged: Bool, reserved: Bool, message: String)?
+        fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { session, message in
+            continuation = (
+                session.worktreeBindings, session.pendingHandoff.payload != nil,
+                session.mcpFollowUpRunPending, message
+            )
+            continued.fulfill()
+        }
+        await endTurn(fixture, turn, state: .completed)
+        fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+            session: fixture.session, revision: revision(turn, state: .completed),
+            publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+        )
+        await fulfillment(of: [continued], timeout: 10)
+        let started = try XCTUnwrap(continuation)
+        XCTAssertEqual(started.bindings, [next], "The continuation starts only after the binding is published")
+        XCTAssertTrue(started.handoffStaged, "The fresh provider in the new cwd receives the conversation handoff")
+        XCTAssertTrue(started.reserved, "The next turn stays reserved from binding publication until the continuation starts")
+
+        XCTAssertTrue(started.message.contains(next.worktreeRootPath))
+        XCTAssertEqual(fixture.session.worktreeBindings, [next])
+        XCTAssertNil(fixture.session.pendingSelfWorktreeRelocation)
+        XCTAssertNil(fixture.session.claudeController, "The old-root provider is retired, never rerouted")
+        XCTAssertFalse(fixture.session.isChangingExecutionLocation)
+        // The test starter does not start a run, so the reservation must not leak.
+        for _ in 0 ..< 200 where fixture.session.mcpFollowUpRunPending {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
+        XCTAssertTrue(fixture.session.items.contains { $0.kind == .system && $0.text.contains("Execution worktree switched") })
+        let shutdownCount = await turn.native.shutdownCount
+        XCTAssertEqual(shutdownCount, 1)
+    }
+
+    func testStoppedFailedOrSucceededOriginTurnDropsSelfRelocationVisibly() async throws {
+        let cases: [(AgentSessionRunState, AgentRunEpochTransitionKind?, String)] = [
+            (.cancelled, nil, "stopped"),
+            (.failed, nil, "failed"),
+            (.completed, .relatedFollowUp, "queued input")
+        ]
+        for (state, successor, reason) in cases {
+            let fixture = try await durableFixture()
+            defer { fixture.git.cleanup() }
+            let turn = try await liveSelfTurn(fixture)
+            let original = fixture.session.worktreeBindings
+            _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+                [makeNextBinding(fixture)], forSessionID: fixture.sessionID,
+                originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
+            )
+            fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { _, _ in
+                XCTFail("A dropped switch must not start a continuation (\(state))")
+            }
+            await endTurn(fixture, turn, state: state)
+            fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+                session: fixture.session, revision: revision(turn, state: state, successor: successor),
+                publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+            )
+            XCTAssertNil(fixture.session.pendingSelfWorktreeRelocation, "\(state)")
+            XCTAssertEqual(fixture.session.worktreeBindings, original)
+            XCTAssertTrue(
+                fixture.session.items.contains { $0.kind == .system && $0.text.contains(reason) },
+                "The dropped switch is visible in the transcript (\(state))"
+            )
+        }
+    }
+
+    func testExplicitStopBeforeOrAfterBoundaryHookCancelsSwitchAndContinuation() async throws {
+        for stopBeforeHook in [true, false] {
+            let fixture = try await durableFixture()
+            defer { fixture.git.cleanup() }
+            let turn = try await liveSelfTurn(fixture)
+            let original = fixture.session.worktreeBindings
+            _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+                [makeNextBinding(fixture)], forSessionID: fixture.sessionID,
+                originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
+            )
+            fixture.viewModel.test_selfWorktreeRelocationContinuationStarter = { _, _ in
+                XCTFail("Stop must withdraw the continuation")
+            }
+            await endTurn(fixture, turn, state: .completed)
+            // Before: Stop lands while the barrier awaits publication. After: the apply task has
+            // not run yet. Either way the fence captured at scheduling withdraws the switch.
+            if stopBeforeHook { fixture.session.stopState.invalidateQueuedDeliveries() }
+            fixture.viewModel.selfWorktreeRelocationTerminalSettled(
+                session: fixture.session, revision: revision(turn, state: .completed),
+                publication: .accepted(successorEpoch: nil), teardownSettled: { true }
+            )
+            if !stopBeforeHook { fixture.session.stopState.invalidateQueuedDeliveries() }
+            for _ in 0 ..< 200 where fixture.session.pendingSelfWorktreeRelocation != nil {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertNil(fixture.session.pendingSelfWorktreeRelocation)
+            XCTAssertEqual(fixture.session.worktreeBindings, original)
+            XCTAssertTrue(fixture.session.claudeController === turn.native)
+            XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
+            XCTAssertTrue(fixture.session.items.contains { $0.kind == .system && $0.text.contains("cancelled by Stop") })
+        }
+    }
+
+    func testSelfRelocationIsNotDeferredForStaleOriginOrPresentationOnlyChange() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        let turn = try await liveSelfTurn(fixture)
+        let staleAttempt = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+            [makeNextBinding(fixture)], forSessionID: fixture.sessionID,
+            originRunID: turn.runID, originRunAttemptID: UUID()
+        )
+        XCTAssertNil(staleAttempt, "Only the exact live origin attempt may defer; others keep the active-run rejection")
+        let visualOnly = Self.copyBinding(fixture.session.worktreeBindings[0], visualLabel: "Presentation only")
+        let presentation = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+            [visualOnly], forSessionID: fixture.sessionID,
+            originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
+        )
+        XCTAssertNil(presentation, "Presentation-only changes apply immediately through the ordinary transition")
+        XCTAssertNil(fixture.session.pendingSelfWorktreeRelocation)
+    }
+
+    func testSecondSelfRequestInSameTurnIsRefusedAndFirstPendingSwitchIsPreserved() async throws {
+        let fixture = try await durableFixture()
+        defer { fixture.git.cleanup() }
+        // Two logical roots: A (the fixture's primary) and B, both currently in the same checkout.
+        let rootA = fixture.session.worktreeBindings[0]
+        let rootB = Self.copyBinding(rootA, id: "secondary", logicalRootPath: "/tmp/second-project")
+        fixture.session.worktreeBindings = [rootA, rootB]
+        let turn = try await liveSelfTurn(fixture)
+        let next = try makeNextBinding(fixture)
+        let movedA = [next, rootB]
+        let first = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+            movedA, forSessionID: fixture.sessionID,
+            originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID
+        )
+        let pending = try XCTUnwrap(first)
+
+        let movedB = [rootA, Self.copyBinding(next, id: rootB.id, logicalRootPath: rootB.logicalRootPath)]
+        let followUps: [(String, [AgentSessionWorktreeBinding])] = [
+            ("other logical root", movedB),
+            ("same root repeated", movedA),
+            ("return to current bindings", [rootA, rootB])
+        ]
+        for (label, desired) in followUps {
+            var committed = false
+            do {
+                _ = try await fixture.viewModel.scheduleSelfWorktreeRelocation(
+                    desired, forSessionID: fixture.sessionID,
+                    originRunID: turn.runID, originRunAttemptID: turn.ownership.attemptID,
+                    beforeRecord: { committed = true }
+                )
+                XCTFail("A second self request in the same turn must be refused (\(label))")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("Only one switch is allowed per turn"), "\(label): \(error)")
+                XCTAssertTrue(error.localizedDescription.contains(pending.id.uuidString), label)
+                XCTAssertFalse(committed, "Refused before the mutation fence (\(label))")
+            }
+            XCTAssertEqual(fixture.session.pendingSelfWorktreeRelocation, pending, "First switch unchanged (\(label))")
+        }
+
+        // The provider's no-op and presentation-only paths use the same owner guard before committing.
+        XCTAssertThrowsError(try fixture.viewModel.requireNoPendingSelfWorktreeRelocation(
+            forSessionID: fixture.sessionID, originRunAttemptID: turn.ownership.attemptID
+        ))
+        XCTAssertNoThrow(try fixture.viewModel.requireNoPendingSelfWorktreeRelocation(
+            forSessionID: fixture.sessionID, originRunAttemptID: UUID()
+        ), "Only the turn that scheduled the switch is limited")
+        XCTAssertEqual(fixture.session.pendingSelfWorktreeRelocation?.desiredBindings, movedA)
+        XCTAssertEqual(fixture.session.worktreeBindings, [rootA, rootB], "Nothing applies before the turn ends")
+    }
+
+    func testPendingApplicationIsReportedInReplyAndFormattedOutput() throws {
+        let relocation = AgentSelfWorktreeRelocation(
+            id: UUID(), originRunID: UUID(), originRunAttemptID: UUID(),
+            previousBindings: [], desiredBindings: [],
+            stopFence: AgentRunStartStopFence(session: AgentModeViewModel.TabSession(tabID: UUID()))
+        )
+        let reply = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "select", pendingApplication: MCPWorktreeToolProvider.pendingApplicationDTO(relocation)
+        )
+        let value = try Value(reply)
+        let pending = try XCTUnwrap(value.objectValue?["pending_application"]?.objectValue)
+        XCTAssertEqual(pending["state"]?.stringValue, "scheduled")
+        XCTAssertEqual(pending["applies_after"]?.stringValue, "current_turn_completes")
+        XCTAssertEqual(pending["continuation"]?.stringValue, "automatic")
+        let text = ToolOutputFormatter.formatManageWorktree(args: [:], value: value).compactMap {
+            if case let .text(text, _, _) = $0 { return text }
+            return nil
+        }.joined()
+        XCTAssertTrue(text.contains("Pending Switch"))
+        XCTAssertTrue(text.contains(relocation.id.uuidString))
+    }
+
+    private struct LiveSelfTurn {
+        let runID: UUID
+        let ownership: AgentRunOwnership
+        let native: MonitorFakeNativeController
+    }
+
+    private func liveSelfTurn(_ fixture: DurableFixture) async throws -> LiveSelfTurn {
+        let native = MonitorFakeNativeController()
+        await native.setTurnInFlight(true)
+        fixture.session.claudeController = native
+        fixture.session.providerSessionID = "origin-provider-session"
+        let runID = UUID()
+        fixture.session.installRunID(runID)
+        let ownership = fixture.session.beginRunAttempt(source: "self-relocation-test")
+        fixture.session.runState = .running
+        return LiveSelfTurn(runID: runID, ownership: ownership, native: native)
+    }
+
+    private func endTurn(_ fixture: DurableFixture, _ turn: LiveSelfTurn, state: AgentSessionRunState) async {
+        await turn.native.setTurnInFlight(false)
+        fixture.session.runState = state
+        _ = fixture.session.endRunAttempt(ifCurrent: turn.ownership, source: "self-relocation-test")
+    }
+
+    private func revision(
+        _ turn: LiveSelfTurn,
+        state: AgentSessionRunState,
+        successor: AgentRunEpochTransitionKind? = nil
+    ) -> AgentRunTerminalCommitRevision {
+        AgentRunTerminalCommitRevision(
+            commitID: UUID(), ownership: turn.ownership, terminalState: state,
+            failureReason: nil, expectedRunID: turn.runID, sourceItemsRevision: 0,
+            assistantDeltaFlushGeneration: 0, providerDrainGeneration: 0,
+            mcpPublicationEnvelope: nil, successorKind: successor, providerSuccessorID: nil
+        )
+    }
+
+    private func makeNextBinding(_ fixture: DurableFixture) throws -> AgentSessionWorktreeBinding {
+        let old = fixture.session.worktreeBindings[0]
+        let target = fixture.git.sandbox.appendingPathComponent("physical-next")
+        if !FileManager.default.fileExists(atPath: target.path) {
+            try fixture.git.runGit(["worktree", "add", "--detach", target.path, "HEAD"], at: URL(fileURLWithPath: old.logicalRootPath))
+        }
+        let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: target))
+        return AgentSessionWorktreeBinding(
+            id: old.id, repositoryID: identity.repository.repositoryID,
+            repoKey: identity.repository.repoKey, logicalRootPath: old.logicalRootPath,
+            logicalRootName: old.logicalRootName, worktreeID: identity.worktreeID,
+            worktreeRootPath: target.path, commonGitDir: identity.repository.commonGitDir,
+            isMainWorktree: false, source: "test"
+        )
+    }
+
     private struct DurableFixture {
         let git: ReviewGitRepositoryFixture
         let prompt: PromptViewModel
@@ -492,7 +1078,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let sessionID: UUID
     }
 
-    private func durableFixture() async throws -> DurableFixture {
+    private func durableFixture(windowID: Int = -991) async throws -> DurableFixture {
         let git = try ReviewGitRepositoryFixture(name: "DurableWorktreeSwitch")
         let logical = try git.makeRepository(named: "logical", files: ["README.md": "fixture\n"])
         let physical = git.sandbox.appendingPathComponent("physical")
@@ -511,7 +1097,7 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         let manager = WorkspaceManagerViewModel(
             fileManager: files, promptViewModel: prompt, performInitialWorkspaceActivation: false
         )
-        let (viewModel, session, sessionID) = fixture(workspacePath: logical.path)
+        let (viewModel, session, sessionID) = fixture(workspacePath: logical.path, windowID: windowID)
         let workspace = WorkspaceModel(
             name: "Worktree switch", repoPaths: [logical.path], ephemeralFlag: true,
             composeTabs: [ComposeTabState(id: session.tabID)], activeComposeTabID: session.tabID
@@ -545,14 +1131,15 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         _ binding: AgentSessionWorktreeBinding,
         id: String? = nil,
         logicalRootPath: String? = nil,
-        visualLabel: String? = nil
+        visualLabel: String? = nil,
+        head: String? = nil
     ) -> AgentSessionWorktreeBinding {
         .init(
             id: id ?? binding.id, repositoryID: binding.repositoryID,
             repoKey: binding.repoKey, logicalRootPath: logicalRootPath ?? binding.logicalRootPath,
             logicalRootName: binding.logicalRootName, worktreeID: binding.worktreeID,
             worktreeRootPath: binding.worktreeRootPath, commonGitDir: binding.commonGitDir,
-            isMainWorktree: binding.isMainWorktree, visualLabel: visualLabel ?? binding.visualLabel,
+            isMainWorktree: binding.isMainWorktree, head: head ?? binding.head, visualLabel: visualLabel ?? binding.visualLabel,
             boundAt: binding.boundAt, source: binding.source
         )
     }
@@ -572,9 +1159,9 @@ final class AgentWorktreeBindingAdmissionTests: XCTestCase {
         }
     }
 
-    private func fixture(workspacePath: String = "/tmp/logical-worktree-admission") -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
+    private func fixture(workspacePath: String = "/tmp/logical-worktree-admission", windowID: Int = -991) -> (AgentModeViewModel, AgentModeViewModel.TabSession, UUID) {
         let viewModel = AgentModeViewModel(
-            testWindowID: -991,
+            testWindowID: windowID,
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Admission tests must not start a provider")
@@ -621,6 +1208,18 @@ private final class WorktreeProbeCodexController: CodexSessionControllerPassiveS
     }
 
     func shutdown() async {}
+}
+
+private actor WorktreeTestManageGrant {
+    private var live = true
+
+    func revoke() {
+        live = false
+    }
+
+    func validate() throws {
+        guard live else { throw MCPError.invalidParams("Manage grant revoked") }
+    }
 }
 
 private actor WorktreeTeardownNativeController: NativeAgentRuntimeControlling {

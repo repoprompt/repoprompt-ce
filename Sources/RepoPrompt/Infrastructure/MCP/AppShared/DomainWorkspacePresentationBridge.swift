@@ -719,6 +719,13 @@ final class DomainWorkspacePresentationBridge {
             guard isCurrentRun(runID) else { return }
             rejection = await project(refetched, attempt: refetchAttempt, runID: runID, allowCoveredMetadata: true)
             resolved = refetched
+            // A covering reconciliation can also win during the FINAL decode suspension.
+            // Complete its metadata handoff synchronously; no third read/decode or retry budget.
+            if rejection == .superseded,
+               acceptCoveredCatalogMetadata(refetched, attempt: refetchAttempt, runID: runID)
+            {
+                rejection = nil
+            }
             // Budget exhausted: a visible, retryable failure rather than permanent loading.
             if needsCurrentSnapshot(rejection, refetched), workspaceManager?.coversDomainCatalog(refetched) == false {
                 workspaceManager?.reportDomainCatalogFailure(
@@ -729,6 +736,41 @@ final class DomainWorkspacePresentationBridge {
         if let rejection {
             didRejectProjection(runID: runID, publicationSequence: resolved.publicationSequence, reason: rejection)
         }
+    }
+
+    /// Only an already-accepted catalog with exact qualified document descendants can hand off.
+    /// Preserve the suspended attempt's failure/authority witnesses: a newer report must not be
+    /// cleared, and a covering reconciliation cannot bless stale point-observed health.
+    private func acceptCoveredCatalogMetadata(
+        _ snapshot: DomainWorkspaceCatalogSnapshot,
+        attempt: DomainCatalogAttempt,
+        runID: UUID
+    ) -> Bool {
+        guard isCurrentRun(runID), let manager = workspaceManager,
+              manager.domainCatalogReconciliationGeneration > 0,
+              !manager.requiresFullCatalogReconciliation,
+              manager.coversDomainCatalog(snapshot),
+              snapshot.workspaces.allSatisfy({ manager.qualifiedDomainWorkspaceDescendant($0) != nil })
+        else { return false }
+        let handoff = DomainCatalogAttempt(
+            generation: manager.beginDomainCatalogAttempt().generation,
+            failureWitness: attempt.failureWitness,
+            projectionIssueWitness: attempt.projectionIssueWitness,
+            authorityHealthGeneration: attempt.authorityHealthGeneration
+        )
+        guard case let .accepted(receipt) = manager.applyDomainWorkspaceCatalog(
+            snapshot,
+            projection: .metadata(baselineGeneration: manager.domainCatalogReconciliationGeneration),
+            preferredActiveWorkspaceID: nil,
+            rootMapPolicy: .snapshotMetadata,
+            attempt: handoff
+        ), isCurrentRun(runID) else { return false }
+        let digests = Dictionary(uniqueKeysWithValues: snapshot.workspaces.map {
+            ($0.document.workspaceID, $0.document.contentDigest)
+        })
+        cacheAcceptedModels(snapshot.workspaces, availableModelIDs: Set(digests.keys))
+        commitAccepted(receipt, digests: digests, runID: runID)
+        return true
     }
 
     /// A proven own document submission or already-adopted document may refresh bookkeeping from
@@ -745,8 +787,10 @@ final class DomainWorkspacePresentationBridge {
               let workspaceID = event.workspaceID,
               projectedModels[workspaceID] != nil,
               let baselineGeneration = acceptedReconciliationGeneration,
-              workspaceManager?.admitsDomainSelfEcho(baselineGeneration: baselineGeneration) == true
+              let manager = workspaceManager,
+              manager.admitsDomainSelfEcho(baselineGeneration: baselineGeneration)
         else { return false }
+        let authorityHealthGeneration = manager.domainAuthorityHealthGeneration
         guard let workspace = await client.canonicalWorkspaceSnapshot(workspaceID),
               workspace.health.acceptsMutations
         else { return false }
@@ -760,11 +804,12 @@ final class DomainWorkspacePresentationBridge {
             catalogRevision: event.catalogRevision,
             publicationSequence: event.sequence,
             baselineGeneration: baselineGeneration,
+            authorityHealthGeneration: authorityHealthGeneration,
             operationID: event.operationID,
             eventRevisions: event.revisions
         ) == true else { return false }
         guard subscriptionRunID == ownerRunID, !Task.isCancelled,
-              let manager = workspaceManager, !manager.isPreparingForWindowClose,
+              !manager.isPreparingForWindowClose,
               let generation = manager.adoptedFullDocumentGeneration(
                   workspaceID: workspaceID, contentDigest: workspace.document.contentDigest
               ),
@@ -864,10 +909,20 @@ final class DomainWorkspacePresentationBridge {
         var nextModels: [UUID: WorkspaceModel] = [:]
         while true {
             guard isCurrentRun(runID) else { return .cancelled }
-            if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
-            #if DEBUG
-                let preparationWitness = manager.catalogPreparationWitness
-            #endif
+            if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) {
+                return rejection
+            }
+            // Point outcomes can advance working/saved revisions without changing catalog
+            // revision. That is real authority supersession, unlike a local edit or adoption
+            // of this same snapshot, and still needs the existing bounded refetch.
+            let preparationWitness = manager.catalogPreparationWitness
+            if records.contains(where: { record in
+                guard let current = preparationWitness.revisions[record.document.workspaceID] else { return false }
+                return record.revisions.workingRevision < current.workingRevision
+                    || record.revisions.savedRevision < current.savedRevision
+            }) {
+                return .superseded
+            }
             let canReuseCachedModels = cacheIsTrusted
                 && baselineGeneration == manager.domainCatalogReconciliationGeneration
                 && !manager.requiresFullCatalogReconciliation
@@ -892,14 +947,18 @@ final class DomainWorkspacePresentationBridge {
                     }
                 }
             }
-            if recordsToDecode.isEmpty { break }
+            if recordsToDecode.isEmpty {
+                break
+            }
             do {
                 let prepared = try await WorkspaceFileDecodeCache.shared.documentPreparation.decode(recordsToDecode)
                 #if DEBUG
                     await catalogPreparationDidFinishForTesting?(prepared.wasOnMainThread)
                 #endif
                 guard isCurrentRun(runID) else { return .cancelled }
-                if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) { return rejection }
+                if let rejection = manager.catalogReadRejection(snapshot, attempt: attempt) {
+                    return rejection
+                }
                 #if DEBUG
                     if manager.catalogPreparationWitness != preparationWitness {
                         AgentModePerfDiagnostics.increment("workspace.prepare.projectionReplanned")

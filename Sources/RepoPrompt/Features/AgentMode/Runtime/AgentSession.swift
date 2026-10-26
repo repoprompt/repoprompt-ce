@@ -42,6 +42,8 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     let promptTokens: Int
     let completionTokens: Int
     let contextUsedTokens: Int?
+    /// A zero-cost boundary record: older occupancy cannot describe the compacted context.
+    let contextCompacted: Bool
     let estimatedUserInputTokens: Int
     let estimatedToolInputTokens: Int
     let estimatedToolOutputTokens: Int
@@ -53,6 +55,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         promptTokens: Int,
         completionTokens: Int,
         contextUsedTokens: Int? = nil,
+        contextCompacted: Bool = false,
         estimatedUserInputTokens: Int = 0,
         estimatedToolInputTokens: Int = 0,
         estimatedToolOutputTokens: Int = 0,
@@ -62,6 +65,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         self.turnID = turnID
         self.promptTokens = max(0, promptTokens)
         self.completionTokens = max(0, completionTokens)
+        self.contextCompacted = contextCompacted
         if let contextUsedTokens {
             let normalized = max(0, contextUsedTokens)
             self.contextUsedTokens = normalized > 0 ? normalized : nil
@@ -99,6 +103,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         case promptTokens
         case completionTokens
         case contextUsedTokens
+        case contextCompacted
         case estimatedUserInputTokens
         case estimatedToolInputTokens
         case estimatedToolOutputTokens
@@ -111,6 +116,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         turnID = try container.decodeIfPresent(UUID.self, forKey: .turnID)
         promptTokens = try max(0, container.decode(Int.self, forKey: .promptTokens))
         completionTokens = try max(0, container.decode(Int.self, forKey: .completionTokens))
+        contextCompacted = try container.decodeIfPresent(Bool.self, forKey: .contextCompacted) ?? false
         if let decodedContext = try container.decodeIfPresent(Int.self, forKey: .contextUsedTokens) {
             let normalized = max(0, decodedContext)
             contextUsedTokens = normalized > 0 ? normalized : nil
@@ -130,6 +136,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
         try container.encode(promptTokens, forKey: .promptTokens)
         try container.encode(completionTokens, forKey: .completionTokens)
         try container.encodeIfPresent(contextUsedTokens, forKey: .contextUsedTokens)
+        if contextCompacted { try container.encode(true, forKey: .contextCompacted) }
         try container.encode(estimatedUserInputTokens, forKey: .estimatedUserInputTokens)
         try container.encode(estimatedToolInputTokens, forKey: .estimatedToolInputTokens)
         try container.encode(estimatedToolOutputTokens, forKey: .estimatedToolOutputTokens)

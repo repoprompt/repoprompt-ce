@@ -131,6 +131,8 @@ package struct AIStreamResult {
     /// Provider-specific session ID for resuming conversations (e.g., Claude CLI session_id)
     package let providerSessionID: String?
     package let stopReason: String?
+    /// Positive reported capacity. On turn finalization, zero explicitly withdraws a prior
+    /// capacity; nil makes no new window claim. Zero is a signal, not a zero-token capacity.
     package let modelContextWindow: Int?
     /// Best-effort estimate of input-side context used for the turn (e.g. Claude input + cache tokens)
     package let contextUsedTokens: Int?

@@ -39,10 +39,37 @@ final class ProviderUsageBalancingPrimitivesTests: XCTestCase {
         XCTAssertTrue(ProviderUsageBalancePolicy.preferPeer(base: ahead, peer: behind, strategy: .evenPace))
         XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: ahead, peer: behind, strategy: .nearLimits))
         XCTAssertTrue(ProviderUsageBalancePolicy.reading(reading(1, duration: week, age: 1800), now: instant).known)
-        XCTAssertFalse(ProviderUsageBalancePolicy.reading(reading(1, duration: week, age: 3601), now: instant).known)
+        XCTAssertTrue(ProviderUsageBalancePolicy.reading(reading(1, duration: week, age: 6 * 3600), now: instant).known)
+        XCTAssertFalse(ProviderUsageBalancePolicy.reading(reading(1, duration: week, age: 6 * 3600 + 1), now: instant).known)
         let expiring = ProviderUsageBalancePolicy.reading(reading(70, duration: week, resetIn: 36000), now: instant)
         XCTAssertTrue(ProviderUsageBalancePolicy.preferPeer(base: behind, peer: expiring, strategy: .expiringQuota))
-        XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: behind, peer: expiring, strategy: .evenPace))
+        XCTAssertTrue(ProviderUsageBalancePolicy.preferPeer(base: behind, peer: expiring, strategy: .evenPace), "30% left with ten hours to reset is spare allowance about to expire")
+        XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: expiring, peer: behind, strategy: .evenPace))
+    }
+
+    /// Regression: Claude 32% used resetting in ~37h vs Codex 6% used resetting in ~6 days. The old
+    /// used/elapsed metric scored both ~0.4 and never moved work off Codex, so Claude allowance expired.
+    func testEvenPaceMovesWorkToPlanWhoseSpareAllowanceExpiresSooner() {
+        let week: TimeInterval = 604_800
+        let claude = ProviderUsageBalancePolicy.reading(reading(32, duration: week, resetIn: 37.3 * 3600), now: instant)
+        let codex = ProviderUsageBalancePolicy.reading(reading(6, duration: week, resetIn: 143 * 3600), now: instant)
+        XCTAssertEqual(claude.weeklySparePace ?? 0, 0.68 / (37.3 / 168), accuracy: 0.001)
+        for strategy in [ProviderUsageBalancePolicy.Strategy.evenPace, .expiringQuota] {
+            XCTAssertTrue(ProviderUsageBalancePolicy.preferPeer(base: codex, peer: claude, strategy: strategy), "\(strategy)")
+            XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: claude, peer: codex, strategy: strategy), "\(strategy)")
+        }
+        XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: codex, peer: claude, strategy: .nearLimits))
+    }
+
+    func testEvenPaceDoesNotTreatAFreshlyResetPlanAsBehind() {
+        let week: TimeInterval = 604_800
+        let midWeekUnderused = ProviderUsageBalancePolicy.reading(reading(20, duration: week, resetIn: week / 2), now: instant)
+        let justReset = ProviderUsageBalancePolicy.reading(reading(0, duration: week, resetIn: week - 600), now: instant)
+        XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: midWeekUnderused, peer: justReset, strategy: .evenPace))
+        XCTAssertTrue(ProviderUsageBalancePolicy.preferPeer(base: justReset, peer: midWeekUnderused, strategy: .evenPace))
+        let onPace = ProviderUsageBalancePolicy.reading(reading(50, duration: week, resetIn: week / 2), now: instant)
+        XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: justReset, peer: onPace, strategy: .evenPace), "two plans spending evenly stay put")
+        XCTAssertFalse(ProviderUsageBalancePolicy.preferPeer(base: onPace, peer: justReset, strategy: .evenPace))
     }
 
     func testEvenPaceNaturallyAdaptsToDifferentPlanCapacities() {
