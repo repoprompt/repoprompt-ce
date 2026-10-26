@@ -786,6 +786,31 @@ private final class ExecutionCounter: @unchecked Sendable {
             }
         }
 
+        func testAlwaysAllowCannotPersistForClosedAnonymousConnectionOrExitedProcess() async throws {
+            for (hasPrincipal, connectionIsValid) in [(false, false), (true, false), (true, true)] {
+                let suite = "MCPConnectionAdmissionTests.\(UUID().uuidString)"
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let process = AdmissionLiveness()
+                let controller = ServerController(
+                    installNetworkCallbacks: false, approvalDefaults: defaults,
+                    strictConnectionApprovalEnabled: { false }, processIsCurrent: { _ in process.isLive }
+                )
+                let events = AdmissionEvents()
+                await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+                await controller.test_requestApproval(
+                    clientID: "external-test-client", principal: hasPrincipal ? principal() : nil,
+                    validate: { connectionIsValid },
+                    approve: { events.decide("allowed") }, deny: { events.decide("denied") }
+                )
+                let generation = try XCTUnwrap(events.generations.first)
+                process.close()
+                await controller.resolvePendingApproval(allow: true, generation: generation, alwaysAllow: true)
+                XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients") ?? [], [])
+                XCTAssertEqual(events.decisions, ["denied"])
+            }
+        }
+
         func testOneTimeApprovalDoesNotTransferToSameNamePeerOrStaleResponse() async {
             let controller = ServerController(installNetworkCallbacks: false)
             let events = AdmissionEvents()
@@ -1019,10 +1044,20 @@ private final class ExecutionCounter: @unchecked Sendable {
             try await exerciseDecisionAfterSocketCloses(allow: false)
         }
 
-        private func exerciseDecisionAfterSocketCloses(allow: Bool) async throws {
+        func testAlwaysAllowSurvivesSocketCloseBeforeClickAndControllerRestart() async throws {
+            try await exerciseDecisionAfterSocketCloses(allow: true, strict: false, alwaysAllow: true)
+        }
+
+        private func exerciseDecisionAfterSocketCloses(
+            allow: Bool, strict: Bool = true, alwaysAllow: Bool = false
+        ) async throws {
+            let suite = "MCPConnectionApprovalTransportTests.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
             let network = ServerNetworkManager()
             let controller = ServerController(
-                networkManager: network, installNetworkCallbacks: false, strictConnectionApprovalEnabled: { true }
+                networkManager: network, installNetworkCallbacks: false,
+                approvalDefaults: defaults, strictConnectionApprovalEnabled: { strict }
             )
             let autoApprove = await controller.getAutoApproveAllClients()
             XCTAssertFalse(autoApprove, "This regression must exercise manual approval, not the global bypass")
@@ -1054,7 +1089,7 @@ private final class ExecutionCounter: @unchecked Sendable {
             await first.close()
             let firstIsLive = await network.isConnectionLiveForApproval(first.id)
             XCTAssertFalse(firstIsLive)
-            await controller.resolvePendingApproval(allow: allow, generation: generation)
+            await controller.resolvePendingApproval(allow: allow, generation: generation, alwaysAllow: alwaysAllow)
             initialize.cancel()
             _ = await initialize.result
             let removed = await network.debugDirectAdmissionStateForTesting(connectionID: first.id)
@@ -1084,6 +1119,32 @@ private final class ExecutionCounter: @unchecked Sendable {
             await second.close()
             await controller.setApprovalCallback { _, _, _ in }
             await network.stop()
+
+            let shouldPersist = allow && alwaysAllow && !strict
+            XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients") ?? [], shouldPersist ? ["external-test-client"] : [])
+            guard shouldPersist else { return }
+
+            let restartedNetwork = ServerNetworkManager()
+            let restartedController = ServerController(
+                networkManager: restartedNetwork, installNetworkCallbacks: false,
+                approvalDefaults: defaults, strictConnectionApprovalEnabled: { strict }
+            )
+            await restartedController.setApprovalCallback { [weak restartedController] _, generation, _ in
+                events.prompt(generation)
+                XCTFail("Always Allow after socket closure must survive controller recreation")
+                await restartedController?.resolvePendingApproval(allow: false, generation: generation)
+            }
+            let reconnected = try await makeConnection(network: restartedNetwork, controller: restartedController)
+            do {
+                _ = try await reconnected.client.connect(transport: reconnected.transport)
+                XCTAssertEqual(events.generations.count, 1)
+            } catch {
+                await reconnected.close()
+                await restartedNetwork.stop()
+                throw error
+            }
+            await reconnected.close()
+            await restartedNetwork.stop()
         }
 
         private func makeConnection(

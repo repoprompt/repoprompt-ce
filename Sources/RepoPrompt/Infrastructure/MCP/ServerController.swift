@@ -820,8 +820,11 @@ final actor ServerController: ObservableObject {
         }
 
         rememberDecision(for: request, allow: allow)
-        if allow, valid, request.principal.map(processIsCurrent) ?? true {
-            if alwaysAllow, !strictApproval { addAlwaysAllowed(clientID: request.clientID) }
+        let principalIsCurrent = request.principal.map(processIsCurrent)
+        if allow, alwaysAllow, !strictApproval, principalIsCurrent ?? valid {
+            addAlwaysAllowed(clientID: request.clientID)
+        }
+        if allow, valid, principalIsCurrent ?? true {
             request.approve()
         } else {
             request.deny()
