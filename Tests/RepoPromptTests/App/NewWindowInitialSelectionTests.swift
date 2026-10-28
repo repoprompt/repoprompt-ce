@@ -2820,13 +2820,37 @@ import XCTest
             }
         }
 
+        func testCatalogBaselineCatchUpAcceptsSelfEchoWithoutRecertifyingMembership() async throws {
+            try await Fixture.run { f in
+                let (window, manager, _, _) = await f.makeWindowWithHeldInitialProjection()
+                window.restartDomainWorkspaceProjectionForTesting()
+                let baseline = try await f.awaitCatalogProjection(window)
+                var edited = try XCTUnwrap(manager.workspace(withID: Fixture.aardvarkID))
+                edited.currentPromptText = "Owned edit after the accepted catalog"
+                let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == edited.id })
+                manager.workspaces[index] = edited
+                _ = try await manager.saveWorkspaceToFileAsync(edited)
+
+                let caughtUp = try await f.awaitCaughtUpWithCatalogBaseline(window)
+                XCTAssertEqual(caughtUp.application, .selfEchoBaseline)
+                XCTAssertNil(caughtUp.catalogReceipt, "An owned echo is not a catalog certification")
+                XCTAssertGreaterThan(caughtUp.publicationSequence, baseline.publicationSequence)
+                XCTAssertEqual(f.projectionState(for: window).catalogCheckpoint, baseline)
+                XCTAssertEqual(manager.domainCatalogReconciliationGeneration, baseline.catalogReceipt?.reconciliationGeneration)
+            }
+        }
+
         func testBridgeStaleCatalogRejectionAdvancesNoCacheOrCheckpoint() async throws {
             try await Fixture.run { f in
                 let window = f.makeWindow()
                 let manager = window.workspaceManager
                 await manager.awaitInitialWorkspaceActivationCompletion()
                 await manager.awaitInitialized()
-                let initialCheckpoint = try await f.awaitCatalogProjection(window)
+                // Startup may have advanced the current checkpoint with an owned self-echo.
+                // Require current catch-up AND the accepted catalog baseline, not a new catalog
+                // receipt through the echo's sequence. No new membership has been published yet.
+                try await f.awaitCaughtUpWithCatalogBaseline(window)
+                let initialCheckpoint = try XCTUnwrap(f.projectionState(for: window).catalogCheckpoint)
                 let initial = try XCTUnwrap(initialCheckpoint.catalogReceipt)
                 XCTAssertEqual(initial.completeness, .complete)
                 let events = f.recordProjectionEvents(window)
@@ -2852,6 +2876,7 @@ import XCTest
                     publicationSequence: afterStale.publicationSequence, reason: .staleCatalogRevision
                 )))
                 XCTAssertNil(manager.workspace(withID: stale.id))
+                XCTAssertEqual(f.projectionState(for: window).catalogCheckpoint, initialCheckpoint)
 
                 let current = try await f.commitWorkspace(named: "Current D", window: window)
                 let accepted = try XCTUnwrap(events.catalogCheckpoints.last?.catalogReceipt)

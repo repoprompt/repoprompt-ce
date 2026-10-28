@@ -159,12 +159,6 @@ private actor MCPConnectionStopRace {
 typealias MCPResponseDeliverySnapshot = RepoPromptDomainRuntime.MCPDomainResponseDeliverySnapshot
 
 typealias MCPProgressDeliveryResult = RepoPromptDomainRuntime.MCPProgressDeliveryResult
-typealias MCPRequestProgressState = RepoPromptDomainRuntime.MCPRequestProgressState
-
-enum MCPRequestProgressContext {
-    case domain(MCPDomainRequestProgressHandle)
-    case direct(MCPRequestProgressState)
-}
 
 /// The server-error payload delivered to each outstanding JSON-RPC request before an
 /// accepted connection is closed for an unresponsive tool execution.
@@ -2615,8 +2609,8 @@ actor ServerNetworkManager {
         currentConnectionIDTaskLocal.get()
     }
 
-    static let currentProgressStateTaskLocal = BoxedTaskLocal<MCPRequestProgressContext?>(nil)
-    static var currentProgressState: MCPRequestProgressContext? {
+    static let currentProgressStateTaskLocal = BoxedTaskLocal<MCPDomainRequestProgressHandle?>(nil)
+    static var currentProgressState: MCPDomainRequestProgressHandle? {
         currentProgressStateTaskLocal.get()
     }
 
@@ -4175,41 +4169,13 @@ actor ServerNetworkManager {
     nonisolated static func withConnectionID<T>(
         _ connectionID: UUID?,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-        progressState: MCPRequestProgressState? = nil,
-        operation: () async throws -> T
-    ) async rethrows -> T {
-        try await withConnectionID(
-            connectionID,
-            lifecycleCorrelation: lifecycleCorrelation,
-            progressContext: progressState.map(MCPRequestProgressContext.direct),
-            operation: operation
-        )
-    }
-
-    nonisolated static func withConnectionID<T>(
-        _ connectionID: UUID?,
-        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
-        progressHandle: MCPDomainRequestProgressHandle?,
-        operation: () async throws -> T
-    ) async rethrows -> T {
-        try await withConnectionID(
-            connectionID,
-            lifecycleCorrelation: lifecycleCorrelation,
-            progressContext: progressHandle.map(MCPRequestProgressContext.domain),
-            operation: operation
-        )
-    }
-
-    private nonisolated static func withConnectionID<T>(
-        _ connectionID: UUID?,
-        lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
-        progressContext: MCPRequestProgressContext?,
+        progressHandle: MCPDomainRequestProgressHandle? = nil,
         operation: () async throws -> T
     ) async rethrows -> T {
         // Nested window-tool dispatches re-establish the connection TaskLocal.
         // Preserve an already-authorized request progress state unless the caller
         // supplies a new one for a new top-level request.
-        let effectiveProgressState = progressContext
+        let effectiveProgressState = progressHandle
             ?? (connectionID == currentConnectionID ? currentProgressState : nil)
         return try await currentProgressStateTaskLocal.withValue(effectiveProgressState) {
             #if DEBUG || EDIT_FLOW_PERF
@@ -12256,19 +12222,11 @@ actor ServerNetworkManager {
         #endif
         guard let mgr = connections[connectionID] else { return }
         if let standardProgressState {
-            switch standardProgressState {
-            case let .domain(handle):
-                await domainHost.sendRequestProgress(
-                    handle,
-                    through: mgr,
-                    message: "\(tool) [\(stage)]: \(message)"
-                )
-            case let .direct(state):
-                await state.send(
-                    through: mgr,
-                    message: "\(tool) [\(stage)]: \(message)"
-                )
-            }
+            await domainHost.sendRequestProgress(
+                standardProgressState,
+                through: mgr,
+                message: "\(tool) [\(stage)]: \(message)"
+            )
         } else if supportsRepoPromptControl {
             await mgr.sendProgress(tool: tool, kind: kind, stage: stage, message: message)
         }

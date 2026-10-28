@@ -1312,3 +1312,334 @@ separately owned reliability source was modified.
 
 
 **2026-10-13 upstream validation reconciliation.** Unmodified upstream `39b496ab26a39002cdabe90fce8794d9c2355107` contains 333 files with the exact App-test import counted by the ratchet, against a recorded limit of 332. The Ultrafast contribution adds coverage to existing suites and introduces no new App-importing test file. Align only `tests_testable_import_app_files` to the existing 333-file tree; counts above 333 still fail, and every other baseline and policy stays unchanged. Update the stale sidebar builder and self-compact reservation test calls to the current interfaces without removing assertions. These prerequisite repairs are kept separate from the Ultrafast implementation for review.
+
+## M6 / #1403 — Stage 0 implementation checkpoint (2026-10-18)
+
+Base: `a1368cbbf16565834740a3199964adb19519a9d4`, branch
+`wt/1401-milestone-1`. This is a partial implementing checkpoint, **not** M6
+completion or permission to treat the #1402 readiness gate as passed.
+
+### Existing owners and selected retirement
+
+| Boundary | Existing owner | Preserved invariant |
+| --- | --- | --- |
+| App MCP ingress | `ServerNetworkManager` → `MCPDomainHost.invoke` | Captured invocation and exact route ownership remain independent of tool arguments |
+| Service composition | `MCPServerViewModel` and its SessionAdmin extension | Caller endpoints come from installed run routing, not caller-supplied identity |
+| Administration | Bridge-owned production administration core/front door | Single authorization engine, canonical writer selection and durable-effect receipts remain intact |
+| Link/cursor authority | `DomainAgentSessionLinkAuthority` | Bare cursors select only exact authorized outbound targets; successors remain opaque |
+| Transcript filtering | `AgentTranscriptIO` + `AgentTranscriptImportPolicy` | Active refresh/import path retains pending-question and hidden-tool filtering |
+
+Retired `AgentModeViewModel.shouldDisplayInTranscript` and its sole-use
+`isAskUserToolName` helper: **32 lines removed, zero successor lines**. Both were
+private and had no live callers; the wrapper's diagnostic/alternate question-name
+route was unreachable. The active `refreshDerivedTranscriptState` path continues
+to construct the live-session import policy and consume `AgentTranscriptIO`.
+No state, subscriptions, schemas, leases, consent checks, cancellation owners or
+persistence fences were removed. This bounded dead-route retirement does not
+claim that other manager/bridge state is redundant.
+
+### Executable contract work
+
+- Added `AgentSessionLinkToolServiceTests.testActivatedTwoLaneJourneyReplaysBareCursorsAndRetiresOwnedLanes`.
+  It assembles the real tool services, bridge, authority and temporary intent
+  store with the existing controlled endpoint host. It activates Overseer,
+  creates two explore lanes without a workspace selector, acknowledges first-task
+  `LANE_OK` delivery, replays returned bare wait handles and successors, retires
+  both lanes and checks live/durable intent and waiter cleanup without changing
+  the foreground workspace/tab. The host does not execute a provider; this is
+  **not** packaged ingress or real-provider completion evidence.
+- Strengthened `testCursorOnlyWaitRejectsForeignAndUnknownHandlesWithExecutableRecovery`:
+  each returned list call now supplies the target for a fresh poll and two waits
+  using actual returned handles. No earlier target identity or reconstructed
+  target/cursor record completes the recovery.
+- Reuse the existing production organizer group-order recovery/no-op tests and
+  real temporary-Git unopened model/effort, bind/release and conflicting-writer
+  suites; do not duplicate those effect-level assertions in the controlled host.
+
+### Validation status
+
+- Local Oracle diff review: no actionable findings; not the milestone's pinned
+  independent review at push.
+- Test ticket `1f88d989-c888-4210-b1ec-acb3a5ffaa57`: timed out at the
+  one-hour job limit after 21m 31s of global wait, near the end of compilation;
+  no passing test receipt. Rerun `a3b4e4bd-ec17-403d-a50d-ab69d9420165`
+  (`issue1401-stage0-contract-v2`) completed successfully, exit 0: **126 tests,
+  zero failures** (98 link-tool service, 19 production organizer, 4 real-Git
+  worktree recovery, 5 canonical transcript). Heavy admission took 22ms;
+  execution including build/post-test work took 21m 25s, and the selected tests
+  themselves took 42.18s. Auxiliary module bundles executed zero matching tests
+  and are not additional coverage. This is controlled-host/app-service coverage,
+  not packaged-process or real-provider proof.
+- Lint ticket `dd21c72b-8174-423c-a522-f32b3e9dcb0c`: failed, exit 70,
+  after 31m 55s. SwiftFormat timed out in redundantPublic/wrapArguments rules
+  across six files, including unchanged source/test files. This is not a pass
+  or evidence that SwiftLint ran.
+- Earlier test ticket `4ac2b6e2-d741-4356-9875-83f3ffe527b6`: canceled before
+  global heavy admission; no tests executed.
+- Pinned formatter installed via successful ticket
+  `ba1b3fd0-ef64-40a4-99f6-6b9b4ef48117`. Broad format ticket
+  `94841811-4ed4-4649-b2b2-12487ed0f240` was canceled; inspection showed only the
+  intended source/test files changed. Scoped formatting subsequently reported a
+  `wrapArguments` timeout on the giant existing AgentModeViewModel file; this is
+  **not** a passing style receipt.
+
+Still required before C3 extraction: complete assembled production-ingress
+coverage and Stage 0 validation, reconcile exact source/test claims and dependency
+closure, then perform audited moves and app-free module/test validation. No files
+have moved, no module/ratchet limits changed, and no live app action occurred.
+
+### Batch integration checkpoint (2026-10-25)
+
+Integrated current main `a7c3c892ef17fe91596cdd88a16a72436e2f6c27` without
+rewriting the published checkpoint history. The independent engineer review found
+no demonstrated production regression and identified two test-oracle gaps, both
+corrected in the existing two-lane journey:
+
+- Record each first task's actual destination and match the two returned lane IDs,
+  rather than accepting two identical messages sent to an unspecified destination.
+- Join the temporary intent store's writer and open a fresh reader before and after
+  retirement. Require both exact observer/target pairs to be durable first, then
+  require neither pair to restore after cleanup. Empty bridge inventory alone is
+  not proof that a durable store was installed or that its rows were removed.
+
+Also applied the shared test-only admission-fixture repair from
+`65c4fdea53b41e35b9edc3c1333eeb2828702d35`: join root loading and the foreground
+badge callback before measuring Git-mode save invalidations. The exact retry
+allowance and durable-save assertions remain enforced; no #1310 feature code was
+included.
+
+- Separate pair cleanup and a local Oracle diff review found no further actionable
+  findings. These checkpoint reviews are **not** the final pinned M6 review.
+- Coordinated formatter `664e3cc1-e143-4ce8-abe9-88139cf93b0c`: PASS, exit 0,
+  no additional formatting changes. Coordinated strict lint
+  `ea9224d6-dcac-47c2-9c2d-68aa0fdc43af`: PASS, exit 0, zero formatting drift.
+- Coordinated focused tests `ad04aaff-0374-4fae-a1b1-6f0ec2e58dee`: PASS, exit 0,
+  **260 tests, zero failures**: 98 link-tool service, 27 same-workspace admission,
+  103 initial-window selection, 23 production-organizer journey, four real-Git
+  worktree recovery and five canonical transcript tests. Auxiliary bundles ran
+  zero matching tests and are not extra coverage. Execution including build and
+  post-test work took 15m 14s; selected tests took 49.32s; heavy admission took 11ms.
+- Coordinated app product build `7f525a87-ed6c-4169-acbf-c261616368da`: PASS,
+  exit 0, 13.2s execution with 10ms heavy admission. This builds the product but
+  does not package or launch it and does not establish live-ingress behavior.
+- An earlier attempt executed no tests because the sandbox prevented conductor's
+  required process-identity check. Its lint run passed formatting but could not
+  write SwiftLint's cache. Both were retried through the same coordinated lanes
+  after restarting only this worktree's idle daemon with the required permissions;
+  neither failed attempt is counted as passing evidence.
+
+This remains a **partial Stage 0 checkpoint**, not M6 readiness. Production-ingress
+and remaining adversarial/effect coverage, C3 app-free extraction, move/access/index
+and edit-to-test evidence, final milestone review, and broader product/release/live
+validation remain outstanding. No roadmap/readiness issue is closed, no module or
+ratchet limit is raised, and no visible app is launched, stopped or replaced.
+
+### Stage 0 host/service readiness checkpoint (2026-10-28)
+
+Normally merged pinned main `c47a23d61b2970625772e0b900252da9b3a2064f` into
+existing M6 lineage `c92605d21c6fe4fb0196316e73523fc3865fe5e4`, producing
+`33d00d600373f169b296467de36eaba0c242bb84`. Primary checkout untouched.
+
+Selected existing journeys now enter the real canonical registry/domain host,
+then the existing service, authorization engine, production organizer/configuration/
+worktree owners or link bridge/authority. The small test-only host helper owns its
+temporary runtime and verifies invocation/resource cleanup. Exact returned bare
+cursors and successors, ordinary/preview group-order recovery, zero-change
+satisfaction, unopened model/effort writes, real temporary-Git bind/release,
+conflicting writers, committed-save versus late-authority change and pre-publication
+save rejection retain effect-level assertions without foreground changes.
+
+Preserved only the remaining +19 FrontDoor and +41 first-save-test hunks from local
+`6b02b155da4f1c059c398c572563c10afaaed1ed`; other handler/scope-test progress was
+already upstream. Repaired the inherited first-save oracle against current main's
+structured `.admissionRejected` evidence, retaining all no-publication/save/provider
+assertions. Preview recovery intentionally preserves `preview: true`; the separate
+ordinary returned call proves `state_satisfied: true`, `changed_count: 0`.
+
+- **PASS:** seven exact focused tests, zero failures; conductor
+  `b7dcda37-47af-43dc-a829-f4863ecac49c`, request
+  `runtime-contract-20261028-host-first-v3`, exit 0. One link-tool journey,
+  two organizer journeys, three worktree/configuration journeys, one first-save
+  rejection. Selected tests 117.017s; build 209.95s; job execution 487.720s;
+  heavy admission 0.106s. Auxiliary zero-match bundles are not coverage.
+  Tested parent is `33d00d600373f169b296467de36eaba0c242bb84`; six-Swift-file
+  binary-diff SHA-256 `f58c6e243b1238d958dcdd857e9ffc5302c585aa0eb6e77621925ab20bd187d6`.
+- Earlier `9adfdd8d-ff2e-4267-ae9a-bf31ac52f627` timed out at 3600s after a
+  3375.75s cold build and partial execution. `a9ba2f96-b4ee-4081-beeb-a7dad5326b1f`
+  failed exit 1: seven tests, two failed test methods (ten oracle assertions).
+  Neither is passing evidence; v3 corrects the typed-error/preview oracles.
+- Scoped pinned SwiftFormat and strict SwiftLint passed for changed files.
+  Whole-tree combined lint `04fb6848-0241-402d-8416-b9dd6d0d49cb` **FAILED**
+  exit 70 after 14m53s: `redundantEquatable` timed out in unchanged
+  `WorkspaceCodemapLiveOverlayModels.swift`. No SwiftLint phase/pass is claimed
+  for this job. Missing-tool and canceled attempts are not passes. A separate
+  worktree's earlier timeout was followed by a passing format-check, so a
+  deterministic source defect is not established. No formatter policy was
+  weakened; repository-wide style is **NOT_PASSED**, not landing-ready.
+- One local Oracle review found a setup-error host-cleanup gap, fixed by covering
+  post-start temporary-directory setup with the existing asynchronous cleanup.
+  This is not the final independent milestone review.
+
+Evidence tier: **in-process host + real service/engine effects with controlled
+endpoint resolution**. It does not execute transport early/pre-admission policy,
+app binder or real bootstrap route-proof issuance. `LANE_OK` still acknowledges
+controlled-host task delivery, not a provider response. The existing discovery
+socket fixture's default admission is debug-only; a subsequent serialized-transport
+journey must explicitly use production Agent admission. Packaged/live/vendor
+validation is **NOT_RUN**; no app lifecycle or GitHub write occurred.
+
+The existing 32-line dead transcript-filter retirement remains intact, with
+`AgentTranscriptIO` / `AgentTranscriptImportPolicy` surviving; this phase adds no
+broader VM/bridge retirement and does not certify M6/M10. No extraction or ratchet
+change is included, and no readiness issue is closed.
+
+### Stage 0 serialized admission checkpoint (2026-10-28)
+
+The existing discovery fixture now explicitly exercises production Agent admission,
+real socket frames, app tool registration and bootstrap proof for the observer.
+Two controlled native controllers produce actual assistant replies through the
+runtime; they are not vendor processes or packaged/live evidence. The fixture
+enters the ordinary active Agent Mode lifecycle and records foreground workspace,
+tab and draft before activation; it asserts those remain unchanged through the
+journey. It does not establish UI-free or inactive-presentation behavior.
+
+The journey executes returned bare cursors and successors, unknown-cursor recovery,
+real scope request, exact group-order recovery with zero-change satisfaction, scope
+release and lane retirement. The existing foreign/unknown cursor recovery now also
+passes through the canonical domain host; malformed handles remain separate.
+
+- **PASS:** conductor `8d7ab6be-f18c-496f-b848-00394b3d3f33`, request
+  `runtime-contract-20261028-cohesive-formatted`, exit 0, **11 matched and passed**;
+  selected tests 24.932s, build 79.29s, execution 3m01s, global wait 1m37s.
+  This includes the serialized journey, existing discovery route fence, both cursor
+  cases and the seven host/first-save contracts. Tested HEAD is
+  `348bf52c2da0a88c3e3575f22c099448ed16936d` plus two-test-file binary diff
+  SHA-256 `ab03d885a93aa0acb37b2db5e6941822abb52a5488a615c25f9abab21e899ddd`.
+  Logs are in the conductor jobs directory under the ticket UUID.
+- Earlier single journey `bf14f022-8179-4ed3-9f97-4abfb9f36065` passed exit 0,
+  1 matched, before scoped formatting. Earlier failed diagnostics are not passes.
+  Scoped pinned SwiftFormat exit 0, one of two files formatted; scoped strict
+  SwiftLint exit 0, zero violations. Whole-tree combined style remains NOT_PASSED
+  as recorded above; packaged/live/vendor tiers remain NOT_RUN.
+- Focused review found missing persistent fixture cleanup and a permissive changed-
+  cursor oracle. The fixture now deletes its canonical workspace and owned directory
+  on success or failure, and requires changed then timeout on successor replay.
+  Conductor `e527fb45-35c8-4db6-9d7c-233269593612`, request
+  `runtime-contract-20261028-review-fixes-v3`, exit 0, 1 matched and passed in
+  19.458s, build 56.59s, execution 2m07s, global wait 9.5s. Final two-test-file
+  binary diff SHA-256 `5767dc7e25b4b64ec68228562535c3d835c2fa782f880a1672528519620771ed`.
+  The earlier review-fix compile failure and owned-root rejection were corrected,
+  not counted as passes. Final scoped format lint and strict SwiftLint both exit 0,
+  zero drift/violations. The 11-test receipt above predates these focused changes.
+- Readiness investigation found the fixture's inactive Agent Mode left the ordinary
+  workspace-switch fence set, blocking the composer despite an idle public snapshot.
+  Real fixture activation resolves this case without changing production behavior.
+  The coupling of inactive presentation to that fence remains an unresolved M9/M10
+  runtime-ownership finding; neither inactive safety nor no-foreground workspace
+  admission is claimed. Temporary production diagnostics were removed.
+
+This is a bounded partial Stage 0 checkpoint, not #1402 or M6 completion. The
+32-line inherited dead-route retirement and surviving transcript owner are unchanged;
+no new production responsibility, extraction, or ratchet is claimed.
+
+### Stage 0 — request-progress authority retirement
+
+The app-owned direct `MCPRequestProgressState` route and its context enum, alias,
+forwarding overloads and direct send branch are retired. `MCPDomainHost` and its
+request progress handle remain the sole standard-progress authority; the boxed
+TaskLocal, same-connection inheritance, explicit override, connection separation,
+lifecycle correlation and RepoPrompt CLI control fallback remain. This slice changes
+`MCPConnectionManager.swift` by +9/-51 (60 combined lines), with no new state or
+owner. It does not retire filesystem transport or broader runtime responsibilities.
+
+Conductor `ff56b17c-e86e-45a9-aeb3-f467107e9446`, request
+`runtime-contract-20261028-progress-final`, passed exit 0, nine matched and passed:
+six connection-removal/progress tests and three TaskLocal layout guards. The three
+new tests exercise manager-to-host delivery and control fallback, canonical-handle
+nested inheritance/override/separation, and independently settled and terminal
+handle suppression followed by successor-generation delivery. Tested parent
+`b3fd63f3d8c3a946cfe2d5d47eb507410772c83f` plus two-file diff SHA-256
+`34e7db92fcec135af149036be058a56ed91c98a205697a91133b9567086990c7`.
+A DEBUG-only host getter now validates the complete handle and exposes the existing
+actor only for its quiescence test barrier; it adds no shipping state or authority.
+The tests capture each actor before finish/cancel, wait for its own worker after
+negative sends, and reject a forged handle. Final conductor
+`7891afb2-3c03-4e9c-8d0b-c3204bd81517`, request
+`runtime-contract-20261028-progress-quiescence`, passed exit 0, **13 matched and
+passed**: six progress/removal tests, three TaskLocal guards, four domain response
+delivery tests. Parent `b3fd63f3d8c3a946cfe2d5d47eb507410772c83f` plus three-Swift-file
+diff SHA-256 `d93a1958684425d5c080cbda0306b44ff2744bfc1cf6724819ed630881cf83f7`;
+execution 9m18s, global wait 16ms. The DEBUG observation adds 10 source lines;
+combined production delta is +19/-51, with no new shipping route or state.
+
+Scoped strict SwiftLint with `--no-cache` passed; pinned SwiftFormat 0.61.1
+reports nine pre-existing host-file diagnostics, independently reproduced on the
+exact HEAD baseline (`/tmp/runtime-contract-20261028-host-baseline-format.log`).
+The manager and test file passed pinned formatting. Whole-tree combined style remains
+NOT_PASSED as above. Live, packaged and vendor provider evidence remains NOT_RUN.
+
+The serialized acceptance fixture establishes no tool-requested workspace
+selection or unrelated focus/draft change only for an already active caller workspace.
+It does not establish inactive-presentation safety or UI-free execution. A minimal
+missing counterexample is an authorized observer captured for workspace A while its
+window has nil or unrelated workspace B active: exercise explicit and omitted
+workspace selection and assert the exact captured observer/workspace route without
+fallback, focus changes or fabricated success. Existing destination resolution draws
+from active window workspaces, so this remains a separate windowless/foreground
+gate, not a demonstrated passing case or a claim about #1408 completion.
+
+### Stage 0 — no-selection and adversarial current-head receipt
+
+At parent `8946c2bdf364042d1466e8dba0a5ab083e1da12f` plus test diff SHA-256
+`3912ed88773a30439a4f7d47be3a685a3e264715ddbb8174d1fdfb84d9d4d206`, the
+existing serialized production-admission journey asserts its caller's `WindowState`
+has no attached `NSWindow` before and after tool calls. Setup explicitly routes an
+active workspace; the journey does not select another workspace or tab, alter its
+foreground draft, or hydrate/change the persisted unopened sentinel's session and
+draft. It still exercises two returned lane IDs, controlled assistant replies,
+returned bare cursors and successors, and exact group-order recovery. This is a
+real socket observer/binder/bootstrap with controlled lane providers, not a
+packaged/vendor/live or generally windowless runtime claim.
+
+- `630fa54a-5a6e-436b-8576-b25a81306e0a`, request
+  `runtime-contract-20261028-no-selection-sentinel`: exit 0, **1/1** matched,
+  `AgentSessionLinkLiveDiscoveryTests.testActivatedTwoLaneContractUsesProductionAgentAdmissionAndReturnedCalls`,
+  41.513s test, 6m40s execution.
+- `821faaa1-3a10-4fa7-9803-ce436fa961b7`, request
+  `runtime-contract-20261028-adversarial-final`: exit 0, **10/10** matched,
+  1m58s execution. Its exact passing cases and evidence are:
+  - `AgentSessionLaneFirstSaveTests.testAuthorityRevisionConflictBeforeLanePublicationLeavesNoLaneOrProvider`,
+    `testFailedFirstSaveKeepsTheLaneForRecoveryWithoutLinkProof`, and
+    `testRebindDuringHydrationDoesNotMarkReplacementAsCreatorOwned`: actual app
+    destination/save fixtures show no prepublication allocation/provider on conflict,
+    retained unproven recovery on failed first save, and no ownership for a rebound
+    replacement.
+  - `AgentSessionLinkToolServiceTests.testActivatedLaneBasisIsFencedAtClaimCapSaveInsertReserveSeedAndActivation`
+    and `testActivatedLaneCancelledCallerStillCommitsFirstTaskOnceAndReplayJoinsReceipt`:
+    controlled bridge fixture rejects changed activation at each named fence and
+    preserves one committed first task across caller cancellation/replay.
+  - `SessionAdminInFlightIdempotencyTests.testCancelledCreationReleasesReservationWithoutCachingAnEffect`:
+    controlled worktree host proves no precommit effect and successful fresh retry.
+  - `SessionAdminInventoryReadTests.testFullAccessOffAfterLinkRevalidatesConsentBeforeDelivery`:
+    loaded-window bridge fixture returns partial `scope_revoked` with stable replay
+    after access changes between link and dispatch.
+  - `SessionAdminWorktreeRecoveryTests.testCompetingBoundWritersCannotMutateConfigurationOrCreateWorktree`,
+    `testUnopenedLaneModelAndEffortUseItsWriterDespiteEarlierWorkspaceReplica`, and
+    `testExistingCheckoutRecoveryReplaysThroughToolBindAndRelease`: canonical-host
+    fixtures prove competing writers fail closed, unopened model/effort persistence
+    leaves the replica unhydrated, and a real temporary Git checkout's returned bind
+    recovery is replayed and released without deleting the checkout.
+- The organizer cases were unmatched by the first selector (file name was mistaken
+  for suite name) and are **not** counted in its ten. Corrected ticket
+  `4977b03e-3eaf-4884-b362-19a4924008fe`, request
+  `runtime-contract-20261028-organizer-final`, passed exit 0, **2/2**, 1m34s:
+  `SessionAdminProductionOrganizerJourneyTests.testReorderGroupsMCPRecoveryAndApplyUseOneWriterForAgreeingReplicas`
+  replays the exact zero-change and preview recovery across agreeing replicas;
+  `testReorderGroupsReportsCommittedSaveWhenAuthorityOrReplicaIdentityChangesDuringSave`
+  returns a partial committed-effect receipt after scope/identity changes at the
+  real save suspension, without pretending the durable edit was rolled back. Both
+  use canonical host fixtures, not serialized or live provider evidence.
+
+Scoped pinned SwiftFormat 0.61.1 and strict no-cache SwiftLint both passed for the
+changed test file. Whole-tree style remains NOT_PASSED as previously recorded;
+full integration, packaged, real vendor and live app gates remain for integration.

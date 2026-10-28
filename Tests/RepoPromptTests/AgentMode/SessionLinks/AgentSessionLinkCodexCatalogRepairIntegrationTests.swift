@@ -561,6 +561,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        func testActivatedTwoLaneContractUsesProductionAgentAdmissionAndReturnedCalls() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { _ in
+                try await self.exerciseLiveDiscovery(activate: true, contractJourney: true)
+            }
+        }
+
         func testBecomeOverseerRefreshesExactAgentRouteWithoutGrantDuringHeldTurn() async throws {
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery(activate: true)
@@ -596,13 +602,200 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
+        /// Serialized app ingress and native event consumption with controlled providers.
+        /// Socket approval/full-access inputs are explicit test grants, never inferred from a reply.
+        private func exerciseTwoLaneContract(
+            connection: PersistentMCPTestEndpoint, window: WindowState, observerID: UUID,
+            controllers: @escaping @MainActor () -> [UUID: MonitorFakeNativeController]
+        ) async throws {
+            let settings = GlobalSettingsStore.shared
+            let originalProfile = settings.globalAgentModelsProfile()
+            defer {
+                settings.setGlobalAgentModelsProfile(originalProfile, contextBuilderWriteIntent: .preserveExistingOwnership)
+                AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+            }
+            var profile = originalProfile
+            profile.mcpAgentRoleOverrides = ["explore": "claudeCode:sonnet:high"]
+            profile.mcpAgentRoleModelParameters = [:]
+            settings.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
+            window.apiSettingsViewModel.isClaudeCodeConnected = true
+            try await AsyncTestWait.waitUntil("contract model availability") { window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
+            AgentAdvertisedModelCatalog.shared.record([
+                AgentModelOption(rawValue: "sonnet:high", displayName: "Contract model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+
+            @MainActor func call(_ tool: String, _ arguments: [String: Any]) async throws -> [String: Any] {
+                // _rawJSON controls response presentation, not service arguments.
+                var wire = arguments
+                wire["_rawJSON"] = true
+                let response = try await connection.callTool(name: tool, arguments: wire, timeoutSeconds: 30)
+                let result = try XCTUnwrap(try MCPExportWatchdogIntegrationTests.responseObject(from: response)["result"] as? [String: Any])
+                XCTAssertNotEqual(result["isError"] as? Bool, true, response.rawJSON)
+                let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+                let text = content.compactMap { $0["text"] as? String }.joined()
+                return try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any], response.rawJSON)
+            }
+            let vm = window.agentModeViewModel
+            let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+            let foregroundTab = window.promptManager.activeComposeTabID
+            let foregroundDraft = window.promptManager.promptText
+            XCTAssertNil(window.nsWindow, "The routed caller has no attached presentation window")
+            let sentinel = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first { $0.name == "Unopened contract sentinel" })
+            XCTAssertNil(vm.sessions[sentinel.id], "The unrelated sentinel must start unhydrated")
+            var laneIDs: [String] = []
+            var laneTabs: [UUID] = []
+            var nativeControllers: [MonitorFakeNativeController] = []
+            for index in 0 ..< 2 {
+                let created = try await call(MCPWindowToolName.agentSessionLink, [
+                    "op": "create_lane", "role": "explore", "idempotency_key": "wire-contract-\(index)",
+                    "message": "Return exactly LANE_OK."
+                ])
+                XCTAssertEqual(created["result"] as? String, "created")
+                XCTAssertTrue(["delivered", "queued"].contains(created["first_task"] as? String ?? ""))
+                let id = try XCTUnwrap(created["session_id"] as? String)
+                let sessionID = try XCTUnwrap(UUID(uuidString: id))
+                let tab = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first { $0.activeAgentSessionID == sessionID })
+                laneIDs.append(id)
+                laneTabs.append(tab.id)
+                try await AsyncTestWait.waitUntil("one exact lane receives its first task", timeout: 25) {
+                    guard let controller = controllers()[tab.id] else { return false }
+                    return await controller.sentCount == 1
+                }
+                let controller = try XCTUnwrap(controllers()[tab.id])
+                let sent = await controller.sentMessages
+                XCTAssertEqual(sent.count, 1)
+                XCTAssertTrue(sent[0].contains("Return exactly LANE_OK."))
+                XCTAssertTrue(sent[0].contains("user_delegated_management"))
+                nativeControllers.append(controller)
+            }
+            XCTAssertEqual(Set(laneIDs).count, 2)
+            let initial = try await call(MCPWindowToolName.agentSessionLink, ["op": "poll", "session_ids": laneIDs])
+            var rows = try XCTUnwrap(initial["targets"] as? [[String: Any]])
+            XCTAssertEqual(rows.compactMap { $0["session_id"] as? String }, laneIDs)
+            XCTAssertEqual(rows.compactMap { ($0["snapshot"] as? [String: Any])?["status"] as? String }, ["running", "running"])
+            for controller in nativeControllers {
+                await controller.completeLastTurn(text: "LANE_OK")
+            }
+            // The controlled lane providers have no socket peers. Their real bootstrap lease
+            // must settle before the runner consumes the buffered native events.
+            try await AsyncTestWait.waitUntil("both native replies settle through the production runner", timeout: 25) {
+                laneTabs.allSatisfy { vm.sessions[$0]?.runState.isActive == false }
+            }
+            for (timeout, expectedResult) in [(5, "changed"), (0, "timeout")] {
+                let handles = try rows.map { try XCTUnwrap($0["wait_cursor"] as? String) }
+                let waited = try await call(MCPWindowToolName.agentSessionLink, [
+                    "op": "wait", "cursors": handles, "until": "change", "timeout_seconds": timeout
+                ])
+                XCTAssertEqual(waited["result"] as? String, expectedResult)
+                rows = try XCTUnwrap(waited["targets"] as? [[String: Any]])
+                XCTAssertEqual(rows.compactMap { $0["session_id"] as? String }, laneIDs)
+                XCTAssertEqual(rows.compactMap { ($0["snapshot"] as? [String: Any])?["status"] as? String }, ["idle", "idle"])
+            }
+            for id in laneIDs {
+                let transcript = try await call(MCPWindowToolName.agentSessionLink, ["op": "read", "session_id": id])
+                let items = try XCTUnwrap(transcript["items"] as? [[String: Any]])
+                XCTAssertTrue(items.contains {
+                    $0["role"] as? String == "assistant" && ($0["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) == "LANE_OK"
+                }, "Assignment delivery is not proof of the controlled provider's assistant reply")
+            }
+
+            let expired = try await call(MCPWindowToolName.agentSessionLink, ["op": "wait", "cursors": ["w_contract_unissued"], "timeout_seconds": 0])
+            XCTAssertEqual(expired["result"] as? String, "cursor_expired")
+            let next = try XCTUnwrap(expired["next_call"] as? [String: Any])
+            XCTAssertEqual(next["tool"] as? String, MCPWindowToolName.agentSessionLink)
+            let listed = try await call(MCPWindowToolName.agentSessionLink, XCTUnwrap(next["arguments"] as? [String: Any]))
+            let returnedItems = try XCTUnwrap(listed["items"] as? [[String: Any]])
+            let recoveredID = try XCTUnwrap(returnedItems.first?["session_id"] as? String)
+            let fresh = try await call(MCPWindowToolName.agentSessionLink, ["op": "poll", "session_id": recoveredID])
+            var recoveredCursor = try XCTUnwrap(fresh["wait_cursor"] as? String)
+            for _ in 0 ..< 2 {
+                let waited = try await call(MCPWindowToolName.agentSessionLink, ["op": "wait", "cursors": [recoveredCursor], "timeout_seconds": 0])
+                XCTAssertTrue(["changed", "timeout"].contains(waited["result"] as? String ?? ""))
+                let targets = try XCTUnwrap(waited["targets"] as? [[String: Any]])
+                XCTAssertEqual(targets.compactMap { $0["session_id"] as? String }, [recoveredID])
+                recoveredCursor = try XCTUnwrap(targets.first?["wait_cursor"] as? String)
+            }
+            let scope = try await call(MCPWindowToolName.sessionAdmin, [
+                "op": "request_scope", "kind": "workspace", "workspace": workspaceID.uuidString,
+                "capabilities": ["observe", "organize"]
+            ])
+            XCTAssertEqual(scope["result"] as? String, "granted")
+            let scopeID = try XCTUnwrap(scope["scope_id"] as? String)
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            vm.test_refreshSessionListCache(for: activeWorkspace)
+            await vm.test_waitForSessionListCacheRefresh()
+            for (id, group) in zip(laneIDs, ["Alpha", "Beta"]) {
+                let grouped = try await call(MCPWindowToolName.sessionAdmin, ["op": "set_group", "targets": [id], "group": group])
+                XCTAssertEqual(grouped["result"] as? String, "applied")
+            }
+            let discovery = try await call(MCPWindowToolName.sessionAdmin, ["op": "reorder_groups", "workspace": workspaceID.uuidString])
+            XCTAssertEqual(discovery["result"] as? String, "order_required")
+            XCTAssertEqual(discovery["current_groups"] as? [String], ["Alpha", "Beta"])
+            let reorder = try XCTUnwrap(discovery["next_call"] as? [String: Any])
+            XCTAssertEqual(reorder["tool"] as? String, MCPWindowToolName.sessionAdmin)
+            let satisfied = try await call(MCPWindowToolName.sessionAdmin, XCTUnwrap(reorder["arguments"] as? [String: Any]))
+            XCTAssertEqual(satisfied["result"] as? String, "applied")
+            XCTAssertEqual(satisfied["state_satisfied"] as? Bool, true)
+            XCTAssertEqual(satisfied["changed_count"] as? Int, 0)
+            let cleared = try await call(MCPWindowToolName.sessionAdmin, ["op": "set_group", "targets": laneIDs, "group": ""])
+            XCTAssertEqual(cleared["changed_count"] as? Int, 2)
+            for id in laneIDs {
+                let retired = try await call(MCPWindowToolName.agentSessionLink, ["op": "retire_lane", "session_id": id])
+                XCTAssertEqual(retired["result"] as? String, "retired")
+            }
+            let active = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            XCTAssertTrue(laneTabs.allSatisfy { id in active.stashedTabs.contains { $0.tab.id == id } })
+            XCTAssertTrue(laneTabs.allSatisfy { id in !active.composeTabs.contains { $0.id == id } })
+            let released = try await call(MCPWindowToolName.sessionAdmin, ["op": "release_scope", "scope_id": scopeID])
+            XCTAssertEqual(released["result"] as? String, "released")
+            let remaining = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: observerID)
+            XCTAssertTrue(remaining.items.isEmpty)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(window.promptManager.activeComposeTabID, foregroundTab)
+            XCTAssertEqual(window.promptManager.promptText, foregroundDraft)
+            XCTAssertNil(window.nsWindow, "The tool journey must not attach a presentation window")
+            let finalSentinel = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == sentinel.id })
+            XCTAssertEqual(finalSentinel.name, sentinel.name)
+            XCTAssertEqual(finalSentinel.promptText, sentinel.promptText)
+            XCTAssertEqual(finalSentinel.activeAgentSessionID, sentinel.activeAgentSessionID)
+            XCTAssertNil(vm.sessions[sentinel.id], "The unrelated sentinel must remain unhydrated")
+        }
+
         private func exerciseLiveDiscovery(
             activate: Bool = false, inbound: Bool = false, originalQualificationFamilyABA: Bool = false,
-            proofMutation: ProofMutation? = nil
+            proofMutation: ProofMutation? = nil, contractJourney: Bool = false
         ) async throws {
+            let originalFullAccess = OverseerGlobalAutoApprove.isEnabled
+            if contractJourney { OverseerGlobalAutoApprove.isEnabled = { true } }
+            defer { OverseerGlobalAutoApprove.isEnabled = originalFullAccess }
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
             let manager = ServerNetworkManager.shared
-            let window = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+            var laneControllers: [UUID: MonitorFakeNativeController] = [:]
+            let window = if contractJourney {
+                WindowState(
+                    agentModeViewModelFactory: { windowID, prompt, workspaceManager, server in
+                        let vm = AgentModeViewModel(
+                            testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                            codexControllerFactory: { _, _, _, _, _, _ in fatalError("Contract must not launch Codex") },
+                            claudeControllerFactory: { _, tabID, _, _ in
+                                let controller = MonitorFakeNativeController()
+                                laneControllers[tabID] = controller
+                                return controller
+                            },
+                            mcpServerEnabler: { true }, testMCPServer: server,
+                            testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                        )
+                        vm.promptManager = prompt
+                        vm.workspaceManager = workspaceManager
+                        vm.test_setupObservers()
+                        return vm
+                    },
+                    contextBuilderProviderFactory: { _, _, _, _ in fatalError("No Context Builder in this contract") },
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+            } else {
+                WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+            }
             WindowStatesManager.shared.registerWindowState(window)
             WindowStatesManager.shared.attachAgentSessionLinkBridge()
             let bridge = AgentSessionLinkRuntimeBridge.shared
@@ -620,6 +813,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             var unrelatedTransport: PersistentMCPTestEndpoint?
             var catalogDisabledForTesting = false
             var delayedCatalog: Task<Set<String>, Error>?
+            var contractWorkspaceID: UUID?
+            var contractStorageDirectory: URL?
             let registration = try await AppDomainRuntimeComposition.shared.register(window.mcpServer.windowMCPToolCatalogService)
             let cleanup: @MainActor () async -> Void = {
                 await manager.debugSetAfterExpectedCatalogSurfaceForTesting(nil)
@@ -633,6 +828,10 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if catalogDisabledForTesting { await manager.setEnabled(true) }
                 if let grant { await bridge.revokeLink(linkID: grant.linkID, generation: grant.generation) }
                 await provider.shutdown()
+                for controller in laneControllers.values {
+                    await controller.shutdown()
+                }
+                if contractJourney { await manager.clearExpectedAgentPID(getpid(), for: AgentProviderKind.claudeMCPClientID, runID: runID) }
                 if let unrelatedTransport {
                     unrelatedTransport.client.close()
                     await unrelatedTransport.connectionManager.stop()
@@ -650,6 +849,18 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 await manager.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: window.windowID, runID: runID)
                 await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
                 await window.tearDown()
+                if let contractWorkspaceID {
+                    let client = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID)
+                    let deleted = await client.delete(workspaceID: contractWorkspaceID, expectedCatalogRevision: nil, expectedWorkspaceRevision: nil)
+                    XCTAssertEqual(deleted.disposition, .applied, "Fixture-owned canonical workspace must be deleted")
+                }
+                if let contractStorageDirectory, FileManager.default.fileExists(atPath: contractStorageDirectory.path) {
+                    do {
+                        try FileManager.default.removeItem(at: contractStorageDirectory)
+                    } catch {
+                        XCTFail("Fixture storage cleanup failed: \(error)")
+                    }
+                }
                 await AppDomainRuntimeComposition.shared.unregister(registration.handle)
                 WindowStatesManager.shared.unregisterWindowState(window)
             }
@@ -660,11 +871,20 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let observerID = UUID()
                 let targetID = UUID()
                 var workspace = WorkspaceModel(name: "Live discovery", repoPaths: [])
-                workspace.isEphemeral = true
+                workspace.isEphemeral = !contractJourney
+                if contractJourney {
+                    contractStorageDirectory = window.workspaceManager.workspaceFileURL(for: workspace).deletingLastPathComponent()
+                }
                 workspace.composeTabs = [
                     ComposeTabState(id: observerTab, name: "User-created planning chat", activeAgentSessionID: observerID),
                     ComposeTabState(id: targetTab, name: "Harmless idle target", activeAgentSessionID: targetID)
                 ]
+                if contractJourney {
+                    workspace.composeTabs.append(ComposeTabState(
+                        name: "Unopened contract sentinel", activeAgentSessionID: UUID(),
+                        promptText: "Unrelated sentinel draft"
+                    ))
+                }
                 workspace.activeComposeTabID = observerTab
                 // Restoration must earn both runtime readiness and owner-valid placement metadata.
                 // A fabricated loaded latch has no index row until an unrelated debounced save wins.
@@ -676,13 +896,47 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     )
                     _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
                 }
-                window.workspaceManager.workspaces.append(workspace)
+                if contractJourney {
+                    let client = DomainWorkspaceAuthorityClient(store: AppDomainRuntimeComposition.shared.runtime.workspaceStore, windowID: window.windowID)
+                    let created = try await client.create(workspace, fileURL: window.workspaceManager.workspaceFileURL(for: workspace))
+                    guard created.disposition == .applied else {
+                        throw MCPError.internalError("Contract workspace creation failed: \(created)")
+                    }
+                    contractWorkspaceID = workspace.id
+                    let presentation = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
+                    let refreshed = await presentation.refreshForAgentAdmission()
+                    XCTAssertTrue(refreshed)
+                } else {
+                    window.workspaceManager.workspaces.append(workspace)
+                }
                 let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
-                XCTAssertTrue(switched.didSwitch)
+                guard switched.didSwitch else {
+                    throw MCPError.internalError("Contract workspace switch failed")
+                }
                 window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
                 let vm = window.agentModeViewModel
+                let initialWorkspaceID = window.workspaceManager.activeWorkspaceID
+                let initialTabID = window.promptManager.activeComposeTabID
+                let initialDraft = window.promptManager.promptText
+                if contractJourney {
+                    XCTAssertNil(window.nsWindow, "Fixture setup routes a workspace without attaching an NSWindow")
+                    // The observer represents an already-active Agent Mode session. Enter through
+                    // the real UI lifecycle and wait for its ordinary workspace-switch fence.
+                    vm.setAgentModeActive(true)
+                    try await AsyncTestWait.waitUntil("Agent Mode workspace restoration settles") {
+                        !vm.workspaceSwitchInFlight
+                    }
+                    await vm.test_waitForSessionListCacheRefresh()
+                    XCTAssertEqual(window.workspaceManager.activeWorkspaceID, initialWorkspaceID)
+                    XCTAssertEqual(window.promptManager.activeComposeTabID, initialTabID)
+                    XCTAssertEqual(window.promptManager.promptText, initialDraft)
+                }
                 let observer = await vm.ensureSessionReady(tabID: observerTab, reconnectActiveProviders: false)
                 let target = await vm.ensureSessionReady(tabID: targetTab, reconnectActiveProviders: false)
+                if contractJourney {
+                    try vm.test_refreshSessionListCache(for: XCTUnwrap(window.workspaceManager.activeWorkspace))
+                    await vm.test_waitForSessionListCacheRefresh()
+                }
                 for (session, expectedID) in [(observer, observerID), (target, targetID)] {
                     XCTAssertEqual(session.activeAgentSessionID, expectedID)
                     XCTAssertEqual(session.selectedAgent, .claudeCode)
@@ -711,6 +965,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 observer.installRunID(runID)
                 observer.claudeController = provider
                 observer.runState = .running
+                if contractJourney { _ = observer.beginRunAttempt(source: "serialized-contract-observer") }
                 // Install the ordinary restricted Agent policy BEFORE initialize/tools/list. This
                 // transport is never an external unrestricted caller that is converted after the fact.
                 await manager.installClientConnectionPolicy(
@@ -721,9 +976,13 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     taskLabelKind: nil, allowsAgentExternalControlTools: false
                 )
                 await manager.setEnabled(true)
+                if contractJourney {
+                    await manager.registerExpectedAgentPID(getpid(), for: AgentProviderKind.claudeMCPClientID, runID: runID)
+                }
                 let connection = try await PersistentMCPTestEndpoint.make(
                     label: "held-provider", networkManager: manager,
-                    clientName: AgentProviderKind.claudeMCPClientID, requiredToolNames: [MCPWindowToolName.readFile]
+                    clientName: AgentProviderKind.claudeMCPClientID, useProductionAgentAdmission: contractJourney,
+                    requiredToolNames: [MCPWindowToolName.readFile]
                 )
                 transport = connection
                 await provider.attach(connection)
@@ -731,7 +990,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let heldTurn = await provider.heldTurnSnapshot
                 XCTAssertEqual(heldTurn.activeTurnID, turnID)
                 let before = try await provider.listTools()
-                XCTAssertEqual(before.contains(MCPWindowToolName.agentSessionLink), inbound)
+                XCTAssertEqual(before.contains(MCPWindowToolName.agentSessionLink), inbound || contractJourney)
                 XCTAssertTrue(before.contains(MCPWindowToolName.becomeOverseer), "Inbound discovery requests no additional authority")
                 let beforeDefinitions = try await provider.definitions(wireCaptureName: inbound ? "inbound-before" : (activate ? "activation-before" : "grant-before"))
                 try DiscoveryArtifactCapture.write(beforeDefinitions, name: inbound ? "inbound-before" : (activate ? "activation-before" : "grant-before"))
@@ -748,6 +1007,28 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(route.connectionID, connection.connectionID)
                 XCTAssertEqual(route.observerEndpoint, endpoint)
                 XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], connection.connectionID)
+
+                if contractJourney {
+                    let activation = try await connection.callTool(name: MCPWindowToolName.becomeOverseer, arguments: [:])
+                    let activated = try XCTUnwrap(try MCPExportWatchdogIntegrationTests.responseObject(from: activation)["result"] as? [String: Any])
+                    XCTAssertNotEqual(activated["isError"] as? Bool, true, activation.rawJSON)
+                    XCTAssertNotNil(observer.oversight.overseerActivation)
+                    let noLinks = await authority.links(forObserver: observerID)
+                    XCTAssertTrue(noLinks.items.isEmpty, "Bootstrap grants no target authority")
+                    let refreshed = try await provider.listTools()
+                    XCTAssertTrue(refreshed.contains(MCPWindowToolName.agentSessionLink))
+                    try await exerciseTwoLaneContract(
+                        connection: connection, window: window, observerID: observerID,
+                        controllers: { laneControllers }
+                    )
+                    XCTAssertEqual(window.workspaceManager.activeWorkspaceID, initialWorkspaceID)
+                    XCTAssertEqual(window.promptManager.activeComposeTabID, initialTabID)
+                    XCTAssertEqual(window.promptManager.promptText, initialDraft)
+                    let finalTurn = await provider.heldTurnSnapshot
+                    XCTAssertEqual(finalTurn, heldTurn)
+                    await cleanup()
+                    return
+                }
 
                 if originalQualificationFamilyABA || proofMutation != nil {
                     let registered = expectation(description: "Exact observed proof registered before async qualification")
