@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import OSLog
+import RepoPromptAIContracts
 import RepoPromptInstrumentation
 
 enum AgentConversationReplayMode: String, Equatable {

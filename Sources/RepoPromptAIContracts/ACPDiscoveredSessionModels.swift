@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptAIContracts
 
 package struct ACPDiscoveredSessionModels: Equatable {
     package let options: [AgentModelOption]

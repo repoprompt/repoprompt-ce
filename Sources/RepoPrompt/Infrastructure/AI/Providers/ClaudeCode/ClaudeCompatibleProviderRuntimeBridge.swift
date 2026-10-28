@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptClaudeCompatibleProvider
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota

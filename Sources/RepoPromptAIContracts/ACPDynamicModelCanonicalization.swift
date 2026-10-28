@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptAIContracts
 
 package struct ACPDynamicModelRecord: Codable, Hashable {
     package let rawValue: String

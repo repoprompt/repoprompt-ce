@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptAIContracts
 import RepoPromptProcess
 import SwiftUI
 

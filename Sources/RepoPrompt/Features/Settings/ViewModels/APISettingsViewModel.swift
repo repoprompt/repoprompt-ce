@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptAIContracts
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore

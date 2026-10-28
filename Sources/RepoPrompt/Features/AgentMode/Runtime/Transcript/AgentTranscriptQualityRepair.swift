@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 enum AgentTranscriptQualityRepair {
     enum Context: Equatable {

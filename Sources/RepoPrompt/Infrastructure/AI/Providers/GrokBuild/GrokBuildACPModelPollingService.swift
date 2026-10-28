@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 protocol GrokBuildACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels?

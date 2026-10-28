@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 extension CodexIntegrationConfiguration.ServerEntry: Equatable {
     static func == (

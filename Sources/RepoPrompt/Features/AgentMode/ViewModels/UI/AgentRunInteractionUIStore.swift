@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptInstrumentation
 
 struct AgentRunInteractionUISnapshot: Equatable {

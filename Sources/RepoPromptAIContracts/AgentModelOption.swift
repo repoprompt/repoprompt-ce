@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptAIContracts
 
 /// Provenance for a synthesized reasoning-effort variant option: the base model raw and the
 /// effort it encodes. Present only on variant options — bases and plain models leave it nil,

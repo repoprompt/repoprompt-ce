@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import RepoPromptAIContracts
 
 /// Summary DTO consumed by Agent Permissions settings surfaces to render a capability
 /// row for each CLI provider.

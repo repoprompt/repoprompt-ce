@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 protocol AntigravityACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels?

@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptAIContracts
 import RepoPromptInstrumentation
 
 /// Identifies the type of headless agent run.

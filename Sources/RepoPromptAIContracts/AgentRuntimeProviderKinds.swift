@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptAIContracts
 
 package enum ClaudeCodeRuntimeVariant: String {
     case standard

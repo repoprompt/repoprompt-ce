@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 struct ClaudeAgentToolPreferences {
     enum AgentModePromptDelivery: String, CaseIterable {

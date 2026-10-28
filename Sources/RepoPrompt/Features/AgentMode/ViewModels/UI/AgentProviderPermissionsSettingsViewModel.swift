@@ -7,6 +7,7 @@
 
 import Combine
 import Foundation
+import RepoPromptAIContracts
 
 @MainActor
 final class AgentProviderPermissionsSettingsViewModel: ObservableObject {

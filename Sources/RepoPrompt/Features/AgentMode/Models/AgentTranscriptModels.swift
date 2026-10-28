@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptFileSystem
 
 public enum AgentTranscriptRetentionTier: String, Codable, Sendable, CaseIterable {

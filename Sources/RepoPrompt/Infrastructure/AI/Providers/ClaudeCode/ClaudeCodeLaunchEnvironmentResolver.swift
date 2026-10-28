@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Core facade for GLM/Z.ai Claude-compatible helpers.
 ///

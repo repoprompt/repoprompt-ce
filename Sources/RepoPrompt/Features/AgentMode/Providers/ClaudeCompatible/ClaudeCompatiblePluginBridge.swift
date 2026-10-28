@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Agent Mode facade for Claude-compatible provider package DTOs.
 ///

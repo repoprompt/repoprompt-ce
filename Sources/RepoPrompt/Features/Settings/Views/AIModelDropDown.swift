@@ -1,3 +1,4 @@
+import RepoPromptAIContracts
 import SwiftUI
 
 struct AIModelDropdown: View {

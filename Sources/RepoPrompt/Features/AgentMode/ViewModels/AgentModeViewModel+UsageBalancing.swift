@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 extension AgentModeViewModel {
     /// A fresh task uses the visible model as its starting choice when Jev is disabled/unavailable.
