@@ -115,6 +115,7 @@ import XCTest
             ], service: service)
             let object = try XCTUnwrap(created.objectValue)
             XCTAssertEqual(object["status"]?.stringValue, "unapproved")
+            XCTAssertEqual(object["authority"]?.objectValue?["maximum_total_evaluations"], .int(6))
             let id = try XCTUnwrap(object["experiment_id"]?.stringValue)
             let digest = try XCTUnwrap(object["authority_digest"]?.stringValue)
 
@@ -144,6 +145,12 @@ import XCTest
             XCTAssertEqual(object["operations"]?.arrayValue?.count, 7)
             let prompts = try XCTUnwrap(object["prompts"]?.arrayValue)
             XCTAssertEqual(prompts.compactMap { $0.objectValue?["prompt_id"]?.stringValue }, BuiltInPromptID.allCases.map(\.rawValue))
+            let plan = try XCTUnwrap(prompts.first { $0.objectValue?["prompt_id"]?.stringValue == "oracle-plan" }?.objectValue)
+            XCTAssertEqual(plan["suite"]?.objectValue?["suite_id"]?.stringValue, "unit-suite", "Discovery must use the same registry as creation")
+            let review = try XCTUnwrap(prompts.first { $0.objectValue?["prompt_id"]?.stringValue == "oracle-review" }?.objectValue)
+            XCTAssertEqual(review["suite"], .null)
+            XCTAssertNotNil(review["suite_unavailable"]?.stringValue)
+            XCTAssertEqual(object["scope"]?.objectValue?["project_prompts"], .bool(false))
             XCTAssertEqual(object["defaults"]?.objectValue?["execution_target"]?.stringValue, "engineer")
             XCTAssertEqual(object["defaults"]?.objectValue?["reflection_target"]?.stringValue, "design")
         }

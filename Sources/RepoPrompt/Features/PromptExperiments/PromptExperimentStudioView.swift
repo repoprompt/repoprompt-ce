@@ -14,6 +14,7 @@
         var showsCloseButton = true
         @Environment(\.dismiss) private var dismiss
         @State private var selectedExperimentID: UUID?
+        @State private var showsCreateExperiment = false
 
         private var sortedExperiments: [PromptExperiment] {
             service.experiments.sorted { $0.updatedAt > $1.updatedAt }
@@ -75,17 +76,28 @@
                     ContentUnavailableView {
                         Label("No Prompt Experiment Selected", systemImage: "flask")
                     } description: {
-                        Text("Experiments are created with the Prompt Experiment workflow or the prompt_experiment MCP tool. Approval happens here or on the in-session card.")
+                        Text("Choose a built-in prompt and connected models, compare candidates on saved examples, then review the evidence and source diff.")
+                    } actions: {
+                        Button("New Experiment") { showsCreateExperiment = true }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!service.isLoaded || service.loadError != nil)
                     }
                 }
             }
             .frame(minWidth: 920, minHeight: 650)
             .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("New Experiment", systemImage: "plus") { showsCreateExperiment = true }
+                        .disabled(!service.isLoaded || service.loadError != nil)
+                }
                 if showsCloseButton {
                     ToolbarItem(placement: .cancellationAction) {
                         Button("Close") { dismiss() }
                     }
                 }
+            }
+            .sheet(isPresented: $showsCreateExperiment) {
+                PromptExperimentCreateView(service: service) { selectedExperimentID = $0 }
             }
             .task {
                 await service.load()
@@ -154,7 +166,7 @@
                     if experiment.status == .awaitingApproval {
                         PromptExperimentApprovalRequestCallout(experiment: experiment)
                     }
-                    GroupBox(experiment.status == .awaitingApproval ? "Requested authority" : "Approved authority") {
+                    GroupBox(experiment.isApproved ? "Approved experiment" : "Experiment to review") {
                         PromptExperimentAuthorityPanel(experiment: experiment)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -261,10 +273,10 @@
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Approval requested").font(.headline)
                     if let requestedAt = experiment.approvalRequest?.requestedAt {
-                        Text("Requested \(requestedAt.formatted(date: .abbreviated, time: .standard)) by an agent or MCP client.")
+                        Text("Requested \(requestedAt.formatted(date: .abbreviated, time: .standard)).")
                             .font(.caption)
                     }
-                    Text("Review the requested authority below, then approve up to \(experiment.authority.maxEvaluations) evaluations or decline under Approval and runs.")
+                    Text("Review the experiment below, then approve \(experiment.authority.approvalBudgetSummary) or decline under Approval and runs.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)

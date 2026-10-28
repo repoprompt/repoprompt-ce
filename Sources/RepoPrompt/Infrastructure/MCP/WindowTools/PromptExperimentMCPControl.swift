@@ -287,13 +287,12 @@
         static func targetsValue(service: PromptExperimentService) async -> Value {
             await service.load()
             let defaults = service.targetDefaults()
-            let prompts: [Value] = BuiltInPromptID.allCases.map { id in
-                var value: [String: Value] = ["prompt_id": .string(id.rawValue)]
-                if let resource = try? AppDomainRuntimeComposition.shared.builtInPromptRegistry.resource(id) {
-                    value["resource_sha256"] = .string(resource.sha256)
+            let prompts: [Value] = service.promptOptions().map { option in
+                var value: [String: Value] = ["prompt_id": .string(option.id)]
+                if let resourceSHA256 = option.resourceSHA256 {
+                    value["resource_sha256"] = .string(resourceSHA256)
                 }
-                do {
-                    let suite = try PromptSuiteLoader.load(promptID: id)
+                if let suite = option.suite {
                     value["suite"] = .object([
                         "suite_id": .string(suite.suiteID),
                         "suite_sha256": .string(suite.suiteSHA256),
@@ -307,14 +306,20 @@
                         )),
                         "budget_guide": budgetGuide(cases: suite.cases, minibatch: PromptExperimentGEPASettings().reflectionMinibatchSize)
                     ])
-                } catch {
+                } else {
                     value["suite"] = .null
-                    value["suite_unavailable"] = .string(error.localizedDescription)
+                    value["suite_unavailable"] = .string(option.unavailableReason ?? "The prompt suite is unavailable.")
                 }
                 return .object(value)
             }
             return .object([
                 "operations": .array(PromptExperimentOperation.allCases.map { .string($0.rawValue) }),
+                "scope": .object([
+                    "built_in_prompts": .bool(true),
+                    "project_prompts": .bool(false),
+                    "tool_using_agents": .bool(false),
+                    "dspy_programs": .bool(false)
+                ]),
                 "prompts": .array(prompts),
                 "targets": .array(service.availableTargets().map(targetValue)),
                 "defaults": .object([
@@ -331,7 +336,8 @@
                 ]),
                 "notes": .array([
                     "Experiments optimize a built-in prompt against its checked-in suite. Targets must be prompt-only (no tools).",
-                    "request_approval shows a native card (in Agent Mode) and a pending entry in Window ▸ Prompt Experiments… (⌥⌘E); only the user can approve. Approval covers the whole max_evaluations cap and starts the first run.",
+                    "New Experiment in Window ▸ Prompt Experiments… (⌥⌘E) creates a draft without an agent. request_approval shows a native review; only the user can approve. Approval covers max_evaluations plus the separate calibration_evaluations and starts the first run. Evaluation counts are not model-call or dollar caps.",
+                    "Project prompts, the Engineer agent prompt, and arbitrary DSPy programs are not supported by this prompt-only lab.",
                     "run resumes an approved experiment within its remaining cap. Changing any authority field creates a new experiment that needs its own approval.",
                     "status_or_wait with experiment_id blocks until the approval or run state changes, or timeout_seconds elapses.",
                     "propose_patch selects a retained candidate from a completed run; only native UI can apply or reject its source diff."
@@ -451,6 +457,7 @@
                     "judge_target": authority.targets.judge.map(targetValue) ?? .null,
                     "max_evaluations": .int(authority.maxEvaluations),
                     "calibration_evaluations": .int(authority.calibrationEvaluations),
+                    "maximum_total_evaluations": .int(authority.maximumTotalEvaluations),
                     "reflection_minibatch_size": .int(settings.reflectionMinibatchSize),
                     "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
                     "prompt_character_ceiling_ratio": .double(settings.promptCharacterCeilingRatio),

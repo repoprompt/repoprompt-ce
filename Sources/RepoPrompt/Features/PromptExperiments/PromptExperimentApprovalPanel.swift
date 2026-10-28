@@ -14,8 +14,11 @@
                 field("Execution model", authority.targets.execution.displayName)
                 field("Reflection model", authority.targets.reflection.displayName)
                 field("Judge", authority.targets.judge?.displayName ?? "Exact match (no judge model)")
-                field("Evaluation cap", "\(authority.maxEvaluations) total · \(experiment.admissionsUsed) used · \(experiment.remainingEvaluations) remaining")
+                field("Maximum work", authority.approvalBudgetSummary)
+                field("Search cap", "\(authority.maxEvaluations) · \(experiment.admissionsUsed) used · \(experiment.remainingEvaluations) remaining")
                 field("Calibration", "up to \(authority.calibrationEvaluations) more for the seed baseline (held-out + \(settings.noiseFloorReplicates) noise-floor pass\(settings.noiseFloorReplicates == 1 ? "" : "es")) · \(experiment.calibrationAdmissionsUsed) used · none when the cross-experiment cache already has it")
+                Text("An evaluation may call both the target and a judge. Reflection, repairs and retries add model calls; these counts are not a model-call or dollar cap.")
+                    .font(.caption).foregroundStyle(.secondary)
                 field("GEPA", "minibatch \(settings.reflectionMinibatchSize) · \(settings.candidateSelectionStrategy) · merge \(settings.useMerge ? "on" : "off") · provider retries \(settings.maxProviderRetries) · judge repairs 1 per evaluation · seed \(settings.randomSeed)")
                 field("Objectives", "quality first, then brevity (prompt and answer length) · proposals ≤ \(String(format: "%.2f", settings.promptCharacterCeilingRatio))× the edited prompt\(settings.maxPromptCharacters.map { " and ≤ \($0) chars" } ?? "")")
                 field("Authority digest", String(experiment.authorityDigest.prefix(24)))
@@ -42,11 +45,21 @@
             } else if noise.withinNoise {
                 ("Within noise — not a demonstrated improvement", "exclamationmark.triangle", .orange)
             } else {
-                ("Beyond noise", "checkmark.seal", .green)
+                ("Exceeds observed baseline spread", "chart.bar", .secondary)
             }
-            Label(title, systemImage: symbol)
-                .font(.caption.bold())
-                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 3) {
+                Label(title, systemImage: symbol)
+                    .font(.caption.bold())
+                    .foregroundStyle(color)
+                if noise.measured, !noise.bestIsBaseline {
+                    Text("Exploratory comparison with a small number of baseline repeats; this is not a statistical confidence test.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                if let delta = noise.heldOutMeanDelta, delta < 0 {
+                    Label("Held-out performance regressed", systemImage: "exclamationmark.triangle")
+                        .font(.caption.bold()).foregroundStyle(.orange)
+                }
+            }
         }
     }
 
@@ -63,7 +76,7 @@
                 switch experiment.status {
                 case .awaitingApproval:
                     Toggle(
-                        "I reviewed this exact authority and approve up to \(experiment.authority.maxEvaluations) evaluations",
+                        "I reviewed this experiment and approve \(experiment.authority.approvalBudgetSummary)",
                         isOn: Binding(
                             get: { acknowledgedDigest == experiment.authorityDigest },
                             set: { acknowledgedDigest = $0 ? experiment.authorityDigest : nil }
@@ -92,8 +105,14 @@
                     }
                     .disabled(isWorking)
                 case .unapproved:
-                    Text("Not approved. The agent or MCP client must request approval before this card can approve it.")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Button("Review for approval") {
+                        perform {
+                            _ = try await service.requestApproval(
+                                experimentID: experiment.id, expectedAuthorityDigest: experiment.authorityDigest
+                            )
+                        }
+                    }
+                    .disabled(isWorking)
                 case .budgetExhausted:
                     Text("The approved cap is used up. A new experiment is needed for more evaluations.")
                         .font(.caption).foregroundStyle(.secondary)

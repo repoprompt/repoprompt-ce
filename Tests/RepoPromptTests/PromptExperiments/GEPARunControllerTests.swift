@@ -504,6 +504,53 @@ import XCTest
 
         // MARK: Resolution and rendering
 
+        func testResolutionRejectsPreviouslyApprovedJudgeUsingTheReflectionModelAtAnotherEffort() throws {
+            let registry = try PromptExperimentTestFixtures.makeRegistry(
+                root: makeRoot(), judgeRubric: PromptExperimentTestFixtures.checklistRubric
+            )
+            let original = try PromptExperimentTestFixtures.makeExperiment(registry: registry)
+            let reflection = PromptExperimentResolvedTarget(
+                role: "design", agentRaw: AgentProviderKind.claudeCode.rawValue,
+                modelRaw: "reflect-model:high", displayName: "Reflect High"
+            )
+
+            func approved(judgeModel: String) throws -> PromptExperiment {
+                var experiment = original
+                let authority = original.authority
+                experiment.authority = PromptExperimentAuthority(
+                    promptID: authority.promptID,
+                    promptResourceSHA256: authority.promptResourceSHA256,
+                    suiteID: authority.suiteID,
+                    suiteSHA256: authority.suiteSHA256,
+                    rubricSHA256: authority.rubricSHA256,
+                    targets: .init(
+                        execution: authority.targets.execution,
+                        reflection: reflection,
+                        judge: .init(
+                            role: "pair", agentRaw: AgentProviderKind.claudeCode.rawValue,
+                            modelRaw: judgeModel, displayName: "Judge"
+                        )
+                    ),
+                    settings: authority.settings,
+                    maxEvaluations: authority.maxEvaluations,
+                    calibrationEvaluations: authority.calibrationEvaluations,
+                    pythonSealValue: authority.pythonSealValue,
+                    gepaRevision: authority.gepaRevision
+                )
+                experiment.authorityDigest = try experiment.authority.digest()
+                experiment.approval = .init(authorityDigest: experiment.authorityDigest, approvedAt: original.createdAt)
+                return experiment
+            }
+
+            let sameModel = try approved(judgeModel: "REFLECT-MODEL:medium")
+            XCTAssertTrue(sameModel.isApproved)
+            XCTAssertNotEqual(sameModel.authority.targets.judge?.canonicalSelectionID, reflection.canonicalSelectionID)
+            XCTAssertThrowsError(try GEPARunController.resolveExecution(sameModel, registry: registry)) { error in
+                XCTAssertTrue(error.localizedDescription.contains("same underlying model"), error.localizedDescription)
+            }
+            XCTAssertNoThrow(try GEPARunController.resolveExecution(approved(judgeModel: "judge-model:medium"), registry: registry))
+        }
+
         func testResolutionRejectsCapsBelowTheMinimumAndInterruptedRunsAreSettledAsSpent() async throws {
             let (experiment, registry) = try makeExperiment()
             var small = experiment
@@ -654,7 +701,7 @@ import XCTest
             XCTAssertTrue(noisy.withinNoise, "+0.125 does not exceed the 0.2 seed spread")
             XCTAssertEqual(noisy.improvedBeyondNoise, 0)
             XCTAssertEqual(noisy.heldOut.map(\.exampleID), ["h1"])
-            XCTAssertTrue(noisy.summary.contains("within noise: not a demonstrated improvement"), noisy.summary)
+            XCTAssertTrue(noisy.summary.contains("within observed spread: not a demonstrated improvement"), noisy.summary)
             XCTAssertTrue(noisy.summary.contains("Held-out \u{0394} +0.100 (0 of 1 case beyond the spread)"), noisy.summary)
 
             let clear = try XCTUnwrap(PromptExperimentNoiseFloor.compute(
@@ -667,7 +714,8 @@ import XCTest
             ))
             XCTAssertFalse(clear.withinNoise)
             XCTAssertEqual(clear.improvedBeyondNoise, 2)
-            XCTAssertTrue(clear.summary.hasSuffix("beyond noise."), clear.summary)
+            XCTAssertTrue(clear.summary.contains("exceeds observed baseline spread."), clear.summary)
+            XCTAssertTrue(clear.summary.hasSuffix("not a statistical confidence test."), clear.summary)
 
             let unmeasured = try XCTUnwrap(PromptExperimentNoiseFloor.compute(
                 validationCases: PromptExperimentBudgetLedger.validationPassCases(Self.noiseCases),

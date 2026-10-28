@@ -173,6 +173,11 @@
             guard (suite.grader.kind == .modelJudge) == (authority.targets.judge != nil) else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The judge target does not match the suite grader.")
             }
+            if let judge = authority.targets.judge,
+               judge.judgmentModelIdentity == authority.targets.reflection.judgmentModelIdentity
+            {
+                throw PromptExperimentAuthorityError.targetUnavailable("The approved judge and reflection targets use the same underlying model. Different effort levels do not make an independent judge; create a new experiment with a different judge model.")
+            }
             let minimum = PromptExperimentBudgetLedger.minimumApprovableEvaluations(
                 cases: suite.cases,
                 reflectionMinibatchSize: authority.settings.reflectionMinibatchSize

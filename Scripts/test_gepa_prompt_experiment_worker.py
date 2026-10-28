@@ -358,6 +358,30 @@ class ReflectionPromptTests(unittest.TestCase):
         self.assertEqual(full_iteration_cost(minibatch=3, training=1, validation=0), 3)
 
 
+class WorkerReadinessTests(unittest.TestCase):
+    def test_real_worker_preflight_is_independent_of_cwd_and_never_requests_host_calls(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="RPCE Worker Ready ") as temporary:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-B", str(WORKER), "--preflight"],
+                cwd=temporary,
+                env={"HOME": temporary, "PATH": "/usr/bin:/bin", "TMPDIR": temporary},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        messages = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0], {
+            "protocol_version": 2,
+            "type": "ready",
+            "python_version": list(sys.version_info[:3]),
+            "gepa_version": "0.1.4",
+            "upstream_revision": "0632cdb5dcc052e690eab439e1b4a7e3e9cfe407",
+        })
+
+
 class GEPAWorkerRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -460,6 +484,34 @@ class GEPAWorkerRunTests(unittest.TestCase):
         self.assertEqual(host.reflections, 0)
         self.assertEqual(host.search_admitted, 1)
         self.assertTrue(result["stopped_before_unfinishable_iteration"])
+
+    def test_perfect_training_replays_stop_without_reflection_or_a_score_threshold(self) -> None:
+        # The app defaults to skip_perfect_score=True and stop_at_score=None. A perfect
+        # training minibatch skips reflection even when validation is imperfect; once its
+        # parent outcomes are cached, neither paid evaluations nor reflections can end the
+        # loop. The iteration bound must still return the saved incumbent and held-out score.
+        host = FakeHost(
+            reflect=always("unexpected proposal"),
+            score=lambda c, p: 0.5 if p["split"] == "validation" else 1.0,
+            search_cap=12,
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, examples=self.BUDGET_EXAMPLES,
+            held_out=[{"id": "h1", "split": "hidden_test"}],
+            search_max_evaluations=12, stop_at_score=None, skip_perfect_score=True,
+            max_messages=100,
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(result["stop_reason"], "iteration_limit")
+        self.assertTrue(result["iteration_limit_reached"])
+        self.assertEqual(result["iterations_started"], 12)
+        self.assertEqual(host.reflections, 0)
+        self.assertGreater(host.replays, 0)
+        self.assertEqual(host.search_admitted, 3, "only the seed's distinct development cases cost evaluations")
+        self.assertEqual(host.budget_refusals, 0)
+        self.assertEqual(result["best_candidate_index"], 0)
+        self.assertEqual(result["best_score"], 0.5, "a perfect training minibatch is not a validation win")
+        self.assertEqual(result["held_out"]["best"]["scores"], {"h1": 1.0})
 
     def test_host_budget_refusal_still_stops_cleanly_with_incumbent(self) -> None:
         # Without remaining counts the stopper cannot see the ceiling; the ledger's hard

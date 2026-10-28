@@ -528,6 +528,58 @@ def acquire(args: argparse.Namespace, manifest: dict) -> None:
         print(f"OK: assembled Prompt Experiment runtime: {destination}")
 
 
+def verify_worker_resource(source: Path, worker: Path) -> None:
+    """Reject incomplete or stale packages before signing/launching the debug app."""
+    for path in (source, worker):
+        if not path.is_file() or path.is_symlink():
+            raise ContractError(f"Expected a regular GEPA worker resource: {path}")
+    source_bytes = source.read_bytes()
+    if worker.read_bytes() != source_bytes:
+        raise ContractError("Packaged GEPA worker differs from the checked-in worker")
+    try:
+        compile(source_bytes, str(worker), "exec")
+    except (SyntaxError, ValueError) as error:
+        raise ContractError("Packaged GEPA worker is not valid Python") from error
+
+
+def verify_worker(args: argparse.Namespace, manifest: dict) -> None:
+    worker = Path(args.worker).absolute()
+    verify_worker_resource(Path(args.source_worker).absolute(), worker)
+    bundle = Path(args.runtime_bundle).resolve()
+    for target in selected_targets(args.arch):
+        if target != host_architecture():
+            continue
+        executable = bundle / target / "python" / "bin" / "python3.11"
+        with tempfile.TemporaryDirectory(prefix="RPCE Worker Preflight With Spaces ") as temporary:
+            root = Path(temporary)
+            home, scratch = root / "home", root / "tmp"
+            home.mkdir()
+            scratch.mkdir()
+            completed = subprocess.run(
+                [str(executable), "-I", "-B", "-u", str(worker), "--preflight"],
+                cwd=root,
+                env={"HOME": str(home), "PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+                stdin=subprocess.DEVNULL,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+        try:
+            ready = json.loads(completed.stdout)
+        except (TypeError, ValueError) as error:
+            raise ContractError("Packaged GEPA worker did not return a readiness response") from error
+        expected = {
+            "protocol_version": 2,
+            "type": "ready",
+            "python_version": [int(part) for part in manifest["python"]["version"].split(".")],
+            "gepa_version": manifest["gepa"]["version"],
+            "upstream_revision": manifest["gepa"]["revision"],
+        }
+        if completed.returncode != 0 or ready != expected:
+            raise ContractError("Packaged GEPA worker does not match its pinned runtime/protocol")
+    print(f"OK: verified packaged GEPA worker (no model calls): {worker}")
+
+
 def stage_bundle(args: argparse.Namespace, manifest: dict) -> None:
     cache = Path(args.cache_root).resolve()
     bundle = Path(args.bundle).resolve()
@@ -598,6 +650,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--allow-signed-macho", action="store_true")
     verify_parser.add_argument("--signed-team-identifier")
 
+    worker_parser = subparsers.add_parser("verify-worker")
+    worker_parser.add_argument("--arch", default="host")
+    worker_parser.add_argument("--source-worker", required=True)
+    worker_parser.add_argument("--worker", required=True)
+    worker_parser.add_argument("--runtime-bundle", required=True)
+
     paths_parser = subparsers.add_parser("mach-o-paths")
     paths_parser.add_argument("--arch", default="host")
     paths_parser.add_argument("--bundle", required=True)
@@ -618,6 +676,8 @@ def main() -> None:
         stage_bundle(args, manifest)
     elif args.command == "verify-bundle":
         verify_bundle(args, manifest)
+    elif args.command == "verify-worker":
+        verify_worker(args, manifest)
     elif args.command == "mach-o-paths":
         macho_paths(args, manifest)
     else:
@@ -627,6 +687,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (ContractError, OSError, subprocess.CalledProcessError, tarfile.TarError) as error:
+    except (ContractError, OSError, subprocess.SubprocessError, tarfile.TarError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         raise SystemExit(1)

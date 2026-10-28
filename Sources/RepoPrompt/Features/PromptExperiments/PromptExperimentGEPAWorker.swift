@@ -242,7 +242,7 @@
         struct Terminal: Codable, Equatable {
             let engine: String
             let upstreamRevision: String
-            /// `completed` or `budget_exhausted`.
+            /// `completed`, `budget_exhausted`, or `iteration_limit` (replays made no progress).
             let stopReason: String
             /// False when the budget ran out before GEPA saved any state; no winner exists.
             let hasIncumbent: Bool
@@ -411,31 +411,74 @@
         private var didRequestCancellation = false
 
         static func resolveWorkerURL() throws -> URL {
-            if let override = ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_WORKER"], !override.isEmpty {
-                return URL(fileURLWithPath: override)
+            try resolveWorkerURL(
+                resourcesDirectory: Bundle.main.resourceURL,
+                sourceFileURL: URL(fileURLWithPath: #filePath),
+                isPackagedApp: Bundle.main.bundleURL.pathExtension == "app",
+                override: ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_WORKER"]
+            )
+        }
+
+        static func resolveWorkerURL(
+            resourcesDirectory: URL?,
+            sourceFileURL: URL,
+            isPackagedApp: Bool,
+            override: String? = nil
+        ) throws -> URL {
+            if let override = override?.trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
+                let worker = URL(fileURLWithPath: override).standardizedFileURL
+                guard isReadableWorker(at: worker) else {
+                    throw WorkerError.unavailable("The explicit developer GEPA worker override is not a readable file.")
+                }
+                return worker
             }
-            if let resource = Bundle.main.resourceURL?
+
+            if let resource = resourcesDirectory?
                 .appendingPathComponent("PromptExperiments/gepa_worker.py"),
-                FileManager.default.fileExists(atPath: resource.path)
+                isReadableWorker(at: resource)
             {
                 return resource
             }
-            let sourceTree = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("AppResources/PromptExperiments/gepa_worker.py")
-            guard FileManager.default.fileExists(atPath: sourceTree.path) else {
-                throw WorkerError.unavailable("The packaged GEPA worker resource is unavailable.")
+
+            // A packaged app must use its own worker. Falling back to an arbitrary checkout
+            // hides an incomplete package and can pair stale code with the pinned runtime.
+            guard !isPackagedApp else {
+                throw WorkerError.unavailable("The packaged GEPA worker is missing or unreadable. Rebuild the debug app before starting an experiment.")
             }
-            return sourceTree
+            // Unbundled SwiftPM/test launches must not depend on Finder's or the caller's cwd.
+            // <repo>/Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentGEPAWorker.swift
+            var repositoryRoot = sourceFileURL
+            for _ in 0 ..< 5 {
+                repositoryRoot.deleteLastPathComponent()
+            }
+            let source = repositoryRoot.appendingPathComponent("AppResources/PromptExperiments/gepa_worker.py")
+            guard isReadableWorker(at: source) else {
+                throw WorkerError.unavailable("The development GEPA worker is unavailable. Build the packaged debug app or configure an explicit developer worker override.")
+            }
+            return source
+        }
+
+        private static func isReadableWorker(at url: URL) -> Bool {
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                && !isDirectory.boolValue
+                && FileManager.default.isReadableFile(atPath: url.path)
         }
 
         static let pythonVersion = "3.11.16"
         private static let bundledSchemePrefix = "bundle://PromptExperimentPython/"
 
         static var bundledRuntimeAvailable: Bool {
-            (try? resolvePythonExecutable(sealedValue: bundledPythonSealValue())) != nil
+            (try? resolveWorkerURL()) != nil
+                && (try? resolvePythonExecutable(sealedValue: bundledPythonSealValue())) != nil
         }
 
         static var runtimeStatus: String {
+            do {
+                _ = try resolveWorkerURL()
+            } catch {
+                return error.localizedDescription
+            }
             if ProcessInfo.processInfo.environment["REPOPROMPT_GEPA_PYTHON"]?.isEmpty == false {
                 return configuredPythonExecutable() == nil
                     ? "The explicit developer interpreter override is unavailable."
@@ -531,22 +574,7 @@
 
         static func preflight(pythonExecutable: String) async throws {
             let workerURL = try resolveWorkerURL()
-            let expectedRevision = PromptExperimentGEPAConfiguration.pinnedRevision
-            let expectedVersion = PromptExperimentGEPAConfiguration.packageVersion
             let executable = try resolvePythonExecutable(sealedValue: pythonExecutable)
-            let script = """
-            import importlib.metadata, json, sys
-            assert sys.version_info[:3] == (3, 11, 16), f'Python version mismatch: {sys.version}'
-            d=importlib.metadata.distribution('gepa')
-            direct=d.read_text('direct_url.json')
-            revision=(json.loads(direct).get('vcs_info',{}).get('commit_id') if direct else None)
-            requires=d.requires or []
-            assert importlib.metadata.version('gepa') == '\(expectedVersion)', 'GEPA version mismatch'
-            assert revision == '\(expectedRevision)', 'GEPA git revision mismatch or unavailable'
-            assert requires == [], f'Unexpected GEPA runtime dependencies: {requires}'
-            from gepa.optimize_anything import optimize_anything
-            from gepa.oa.budget import BudgetExhausted
-            """
             try await Task.detached(priority: .utility) {
                 guard FileManager.default.isReadableFile(atPath: workerURL.path) else {
                     throw WorkerError.unavailable("The packaged GEPA worker is unreadable.")
@@ -560,7 +588,7 @@
                 let process = Process()
                 let output = Pipe()
                 process.executableURL = executable
-                process.arguments = ["-I", "-B", "-u", "-c", script]
+                process.arguments = ["-I", "-B", "-u", workerURL.path, "--preflight"]
                 process.environment = workerEnvironment(home: home, temporaryDirectory: temporary)
                 process.standardInput = FileHandle.nullDevice
                 process.standardOutput = output
@@ -568,11 +596,21 @@
                 try process.run()
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                guard process.terminationStatus == 0 else {
-                    let message = String(data: data, encoding: .utf8) ?? "unknown preflight failure"
-                    throw WorkerError.unavailable("Bundled GEPA preflight failed without making a model call: \(message)")
-                }
+                try validatePreflightResponse(data, terminationStatus: process.terminationStatus)
             }.value
+        }
+
+        static func validatePreflightResponse(_ data: Data, terminationStatus: Int32) throws {
+            guard terminationStatus == 0,
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["type"] as? String == "ready",
+                  object["protocol_version"] as? Int == GEPAWorkerProtocol.version,
+                  object["python_version"] as? [Int] == pythonVersion.split(separator: ".").compactMap({ Int($0) }),
+                  object["gepa_version"] as? String == PromptExperimentGEPAConfiguration.packageVersion,
+                  object["upstream_revision"] as? String == PromptExperimentGEPAConfiguration.pinnedRevision
+            else {
+                throw WorkerError.unavailable("The GEPA worker did not pass its readiness check. Rebuild the debug app to restore its matching worker and Python runtime; no model calls were made.")
+            }
         }
 
         func cancel() {

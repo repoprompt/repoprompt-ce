@@ -79,6 +79,13 @@
         var canonicalSelectionID: String {
             AgentModelSelectionID(agentRaw: agentRaw, modelRaw: modelRaw).rawValue
         }
+
+        /// Effort is an execution setting, not an independent judge. Keep the full
+        /// selection ID for authority/cache identity, but compare underlying models here.
+        var judgmentModelIdentity: String {
+            let model = ClaudeModelSpecifier(raw: modelRaw).baseModel ?? modelRaw
+            return "\(agentRaw.lowercased()):\(model.lowercased())"
+        }
     }
 
     struct PromptExperimentTargets: Codable, Equatable {
@@ -315,6 +322,8 @@
                 stoppedBeforeUnfinishableIteration == true
                     ? " Stopped before an iteration the remaining budget could not finish; the reported best is GEPA's saved incumbent."
                     : " Stopped at the approved evaluation budget; the reported best is GEPA's saved incumbent."
+            } else if stopReason == "iteration_limit" {
+                " Stopped at the iteration limit; perfect-score skips or cached replays can leave evaluations unused. The reported best is GEPA's saved incumbent."
             } else {
                 ""
             }

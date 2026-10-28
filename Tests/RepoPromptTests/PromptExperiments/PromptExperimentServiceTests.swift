@@ -277,6 +277,69 @@ import XCTest
             XCTAssertEqual(experiment.authorityDigest, try experiment.authority.digest())
         }
 
+        func testNativeSetupUsesTheServiceRegistryAndNeverSpends() async throws {
+            let harness = try makeHarness()
+            let options = harness.service.promptOptions()
+            let plan = try XCTUnwrap(options.first { $0.promptID == .oraclePlan })
+            XCTAssertEqual(plan.suite?.suiteID, "unit-suite")
+            XCTAssertEqual(plan.resourceSHA256, try harness.registry.resource(.oraclePlan).sha256)
+            XCTAssertNil(plan.unavailableReason)
+            for option in options where option.promptID != .oraclePlan {
+                XCTAssertNil(option.suite, "An unavailable resource must not be offered as runnable")
+                XCTAssertNotNil(option.unavailableReason)
+            }
+            let draft = try await harness.service.createOrUpdate(PromptExperimentCreateRequest(
+                title: "Native small experiment", promptID: plan.id, maxEvaluations: 25
+            ))
+            XCTAssertEqual(draft.status, .unapproved)
+            XCTAssertNil(draft.approvalRequest)
+            XCTAssertNil(draft.approval)
+            XCTAssertTrue(harness.runtime.submitted.isEmpty)
+            XCTAssertEqual(draft.authority.maximumTotalEvaluations, 27)
+            XCTAssertEqual(draft.authority.approvalBudgetSummary, "up to 27 evaluations (25 search + 2 calibration)")
+        }
+
+        func testJudgeCannotDifferFromReflectionOnlyByEffort() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root, judgeRubric: PromptExperimentTestFixtures.checklistRubric)
+            let reflection = PromptExperimentResolvedTarget(
+                role: "design", agentRaw: AgentProviderKind.claudeCode.rawValue,
+                modelRaw: "shared-model:high", displayName: "Shared High"
+            )
+            let sameModelJudge = PromptExperimentResolvedTarget(
+                role: "pair", agentRaw: AgentProviderKind.claudeCode.rawValue,
+                modelRaw: "shared-model:medium", displayName: "Shared Medium"
+            )
+            let execution = PromptExperimentTestFixtures.execution
+            let runtime = FakeRuntime(root: root)
+            let service = PromptExperimentService(
+                store: PromptExperimentStore(rootURL: root.appendingPathComponent("store", isDirectory: true)),
+                runtime: runtime, registry: registry,
+                resolveTarget: { selector in
+                    switch selector {
+                    case "design": reflection
+                    case "pair": sameModelJudge
+                    default: execution
+                    }
+                },
+                availableTargets: { [execution, reflection, sameModelJudge] },
+                pythonSealValue: { "test-python" }
+            )
+            XCTAssertNotEqual(reflection.canonicalSelectionID, sameModelJudge.canonicalSelectionID)
+            XCTAssertEqual(reflection.judgmentModelIdentity, sameModelJudge.judgmentModelIdentity)
+            XCTAssertEqual(service.targetDefaults().judge, execution, "Default selection must skip effort variants of the reflector")
+            do {
+                _ = try await service.createOrUpdate(PromptExperimentCreateRequest(
+                    promptID: "oracle-plan", judgeTarget: "pair", maxEvaluations: 4
+                ))
+                XCTFail("Effort variants must not be treated as independent judges")
+            } catch let PromptExperimentAuthorityError.validation(fields) {
+                XCTAssertEqual(fields.map(\.field), ["judge_target"])
+            }
+            XCTAssertTrue(service.experiments.isEmpty)
+            XCTAssertTrue(runtime.submitted.isEmpty)
+        }
+
         // MARK: Approval
 
         func testRequestNeverApprovesAndOnlyNativeApproveRecordsOneApproval() async throws {

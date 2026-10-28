@@ -20,6 +20,9 @@ Budget contract (pinned GEPA 0.1.4 / 0632cdb5):
   reads the host ledger's remaining search admissions (sent with every evaluation reply)
   and never starts an iteration it could not finish (a full iteration costs
   2 * minibatch + |valset| when the child is accepted).
+- Iterations are also bounded by the search cap, independently of paid evaluations and
+  reflection calls. Perfect-score minibatches skip reflection and replay for free; they
+  must still terminate when no proposal can be made.
 - `raise_on_exception` stays True: with False, upstream `EvaluatorWrapper`
   converts *any* evaluator exception, including `BudgetExhausted`, into a 0.0
   score. Candidate-level failures are scored replies from the host, not exceptions.
@@ -371,6 +374,8 @@ def verify_gepa() -> None:
             "GEPA must be installed from the approved pinned git revision; "
             f"expected {EXPECTED_GEPA_REVISION}, found {revision or 'unavailable'}"
         )
+    if importlib.metadata.distribution("gepa").requires:
+        raise InfrastructureFailure("The bundled host-callback GEPA package must remain dependency-free")
 
 
 def candidate_text(value: Any) -> str:
@@ -435,6 +440,8 @@ class RunState:
         self.search_remaining = search_remaining
         self.stopped_before_unfinishable_iteration = False
         self.reflection_limit_reached = False
+        self.iteration_limit_reached = False
+        self.iterations_started = 0
         self.skipped_identical_proposals = 0
         self.skipped_repeated_proposals = 0
         self.ceiling_repairs = 0
@@ -510,7 +517,8 @@ def build_callbacks(state: RunState) -> list[Any]:
 class LedgerBudgetStopper:
     """GEPA stop callback (checked only at iteration boundaries): stop when the host
     ledger's remaining search admissions cannot pay for a whole iteration, so no
-    iteration is abandoned mid-way with its accepted child lost."""
+    iteration is abandoned mid-way with its accepted child lost. Bound iterations too:
+    a perfect minibatch can skip reflection and replay without spending either budget."""
 
     def __init__(self, state: RunState, iteration_cost: int, max_reflections: int) -> None:
         self.state = state
@@ -519,6 +527,10 @@ class LedgerBudgetStopper:
         # replays spends nothing, so the admission count alone cannot bound the loop. A real
         # iteration spends at least one admission, so the search cap bounds useful reflections.
         self.max_reflections = max_reflections
+        # GEPA calls the stopper once at each loop boundary. Count every admitted iteration,
+        # including perfect-score skips that never invoke the reflection model. Use the same
+        # conservative bound as reflection rather than introducing another user setting.
+        self.max_iterations = max_reflections
 
     def __call__(self, gepa_state: Any) -> bool:
         remaining = self.state.search_remaining
@@ -529,6 +541,10 @@ class LedgerBudgetStopper:
         if self.state.reflection_calls >= self.max_reflections:
             self.state.reflection_limit_reached = True
             return True
+        if self.state.iterations_started >= self.max_iterations:
+            self.state.iteration_limit_reached = True
+            return True
+        self.state.iterations_started += 1
         return False
 
 
@@ -569,6 +585,30 @@ def held_out_baseline_from(value: Any, held_out_ids: list[str]) -> dict[str, Any
     except InfrastructureFailure:
         return None
     return {"scores": per_example, "average": sum(per_example.values()) / len(per_example)}
+
+
+def runtime_preflight() -> int:
+    """Load the actual worker and runtime without reading stdin or making host calls.
+
+    Both app admission and packaging use this entry point, so a working interpreter
+    alone cannot report readiness when its worker is missing, stale or unimportable.
+    The host checks the reported Python version against its approved runtime pin.
+    """
+    try:
+        verify_gepa()
+        from gepa.oa.budget import BudgetExhausted  # noqa: F401
+        from gepa.optimize_anything import OptimizeAnythingConfig, optimize_anything  # noqa: F401
+
+        emit({
+            "type": "ready",
+            "python_version": list(sys.version_info[:3]),
+            "gepa_version": EXPECTED_GEPA_VERSION,
+            "upstream_revision": EXPECTED_GEPA_REVISION,
+        })
+        return 0
+    except BaseException as error:
+        emit_failure(error)
+        return 2
 
 
 def main() -> int:
@@ -855,6 +895,8 @@ def main() -> int:
         oa_budget = result.metadata.get("budget") if isinstance(result.metadata, dict) else None
         oa_exhausted = isinstance(oa_budget, dict) and bool(oa_budget.get("exhausted"))
         stop_reason = "budget_exhausted" if state.budget_exhausted or oa_exhausted else "completed"
+        if state.iteration_limit_reached:
+            stop_reason = "iteration_limit"
         # Without gepa_state.bin, upstream falls back to the eval server's per-example
         # argmax; that is not a GEPA incumbent, so no winner is reported.
         has_incumbent = (run_dir / "gepa_state.bin").is_file()
@@ -948,6 +990,8 @@ def main() -> int:
                 "iteration_cost": iteration_cost,
                 "stopped_before_unfinishable_iteration": state.stopped_before_unfinishable_iteration,
                 "reflection_limit_reached": state.reflection_limit_reached,
+                "iteration_limit_reached": state.iteration_limit_reached,
+                "iterations_started": state.iterations_started,
                 "proposer_usage": (
                     f"reflection_calls={state.reflection_calls},prompt_tokens={state.prompt_tokens},"
                     f"completion_tokens={state.completion_tokens},reported_callbacks={state.usage_reported},"
@@ -969,4 +1013,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(runtime_preflight() if sys.argv[1:] == ["--preflight"] else main())

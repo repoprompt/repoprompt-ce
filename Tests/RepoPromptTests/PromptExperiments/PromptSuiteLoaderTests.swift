@@ -65,13 +65,38 @@ final class PromptSuiteLoaderTests: XCTestCase {
         )
     }
 
-    func testEveryCheckedInSuiteValidates() throws {
+    func testEveryRegisteredPromptHasAUsableCheckedInSuite() throws {
         for id in BuiltInPromptID.allCases {
-            let directory = try AppDomainRuntimeComposition.shared.builtInPromptRegistry.directory(for: id)
-            guard FileManager.default.fileExists(atPath: directory.appendingPathComponent(PromptSuite.fileName).path) else {
-                continue
+            // Missing suites used to be skipped here, allowing the target picker to list
+            // three prompts that could never start an experiment.
+            let suite = try PromptSuiteLoader.load(promptID: id)
+            XCTAssertEqual(suite.promptID, id)
+            XCTAssertEqual(suite.promptVariant, .builtIn)
+            XCTAssertNotNil(suite.grader.rubric, id.rawValue)
+            for split in PromptSuiteSplit.allCases {
+                XCTAssertFalse(suite.cases(in: split).isEmpty, "\(id.rawValue): \(split.rawValue)")
             }
-            XCTAssertNoThrow(try PromptSuiteLoader.load(promptID: id), id.rawValue)
+        }
+    }
+
+    func testNewStarterSuitesHaveFrozenContextAndHostOnlyReferences() throws {
+        for id in [BuiltInPromptID.oracleReview, .oracleChat, .oracleChatNoRoots] {
+            let suite = try PromptSuiteLoader.load(promptID: id)
+            XCTAssertEqual(suite.cases(in: .training).count, 3)
+            XCTAssertEqual(suite.cases(in: .validation).count, 2)
+            XCTAssertEqual(suite.cases(in: .hiddenTest).count, 1)
+            for example in suite.cases {
+                let reference = try XCTUnwrap(example.expectedOutput, "\(id.rawValue): \(example.id)")
+                XCTAssertFalse(reference.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if id == .oracleChatNoRoots {
+                    XCTAssertNil(example.context, "no-roots cases must not implicitly supply a repository")
+                } else {
+                    XCTAssertFalse(example.context?.files.isEmpty ?? true, "\(id.rawValue): \(example.id)")
+                }
+                #if DEBUG
+                    XCTAssertFalse(example.packagedUserMessage.contains(reference), "references are only sent to the judge")
+                #endif
+            }
         }
     }
 
