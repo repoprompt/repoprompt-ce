@@ -3111,11 +3111,12 @@ actor WorkspaceFileContextStore {
     private var staticPathMatchSnapshotsByScope: [WorkspaceLookupRootScope: StaticPathMatchSnapshotCacheEntry] = [:]
     private var nextStaticPathMatchSnapshotAccessSequence: UInt64 = 0
     private let storeBackedSearchLane: StoreBackedWorkspaceSearchLane
-    private let rootReusableSnapshotCoordinator = WorkspaceRootReusableSnapshotCoordinator.shared
-    private let rootMaterializationHintEvaluator = WorkspaceRootMaterializationHintEvaluator.shared
-    private let rootSeedPlanner = WorkspaceRootSeedPlanner.shared
-    private let workspaceStateAuthority = GitWorkspaceStateAuthority.shared
-    private let worktreeSeedGitService = GitService()
+    private let rootReusableSnapshotCoordinator: WorkspaceRootReusableSnapshotCoordinator
+    private let rootMaterializationHintEvaluator: WorkspaceRootMaterializationHintEvaluator
+    private let rootSeedPlanner: WorkspaceRootSeedPlanner
+    private let workspaceStateAuthority: GitWorkspaceStateAuthority
+    private let worktreeSeedGitService: any WorkspaceGitClient
+    private let fileSystemFactory: WorkspaceFileSystemServiceFactory
     private let searchDecodedContentCache = WorkspaceSearchDecodedContentCache()
     private let interactiveReadCache = WorkspaceInteractiveReadCache()
     private let searchContentSchedulerOwnerID = UUID()
@@ -3361,16 +3362,15 @@ actor WorkspaceFileContextStore {
 
     #if DEBUG
         init(
+            host: WorkspaceFileContextHost,
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
             startupFeatureFlags: WorktreeStartupFeatureFlags = .standaloneOperationalDefault(),
             enableCatalogShardShadowValidation: Bool = true,
-            codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
-                try CodeMapArtifactRuntime.processWide()
-            },
+            codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory,
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
-            codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
+            codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe,
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = true,
             codeMapsGloballyDisabled: Bool = false,
@@ -3402,6 +3402,12 @@ actor WorkspaceFileContextStore {
             restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
             perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
+            rootReusableSnapshotCoordinator = host.rootReusableSnapshotCoordinator
+            rootMaterializationHintEvaluator = host.rootMaterializationHintEvaluator
+            rootSeedPlanner = host.rootSeedPlanner
+            workspaceStateAuthority = host.workspaceStateAuthority
+            worktreeSeedGitService = host.worktreeSeedGitService
+            fileSystemFactory = host.fileSystemFactory
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
             self.unloadTerminationPolicy = unloadTerminationPolicy
@@ -3441,14 +3447,13 @@ actor WorkspaceFileContextStore {
         }
     #else
         init(
+            host: WorkspaceFileContextHost,
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
             startupFeatureFlags: WorktreeStartupFeatureFlags = .standaloneOperationalDefault(),
-            codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
-                try CodeMapArtifactRuntime.processWide()
-            },
+            codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory,
             codemapLocalGitClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
-            codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe = .production(),
+            codemapGitEligibilityProbe: WorkspaceCodemapGitEligibilityProbe,
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = false,
             codeMapsGloballyDisabled: Bool = false,
@@ -3479,6 +3484,12 @@ actor WorkspaceFileContextStore {
             restorePerfRecorder: any WorkspaceRestorePerfRecording = NoopWorkspaceRestorePerfRecorder(),
             perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
+            rootReusableSnapshotCoordinator = host.rootReusableSnapshotCoordinator
+            rootMaterializationHintEvaluator = host.rootMaterializationHintEvaluator
+            rootSeedPlanner = host.rootSeedPlanner
+            workspaceStateAuthority = host.workspaceStateAuthority
+            worktreeSeedGitService = host.worktreeSeedGitService
+            fileSystemFactory = host.fileSystemFactory
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.unloadTerminationPolicy = unloadTerminationPolicy
             self.startupFeatureFlags = startupFeatureFlags
@@ -3867,7 +3878,7 @@ actor WorkspaceFileContextStore {
         await failedService.stopWatchingForChanges()
         try Task.checkCancellation()
 
-        let replacement = try await FileSystemService(
+        let replacement = try await fileSystemFactory(
             path: rootPath,
             respectRepoIgnore: configuration.respectRepoIgnore,
             respectCursorignore: configuration.respectCursorignore,
@@ -4340,7 +4351,7 @@ actor WorkspaceFileContextStore {
 
         let service: FileSystemService
         do {
-            service = try await FileSystemService(
+            service = try await fileSystemFactory(
                 path: standardizedPath,
                 respectRepoIgnore: true,
                 respectCursorignore: true,
@@ -5287,7 +5298,9 @@ actor WorkspaceFileContextStore {
                 baseTreeOID: baseSnapshot.treeOID,
                 targetTreeOID: replacementSnapshot.treeOID,
                 in: replacement.targetLayout,
-                prefix: replacement.repositoryRelativeRootPrefix
+                prefix: replacement.repositoryRelativeRootPrefix,
+                limits: .delta,
+                priority: .rootBootstrap
             )
             guard let target = targetedAuthorityReconcileTarget(
                 from: deltas,
@@ -11822,7 +11835,7 @@ actor WorkspaceFileContextStore {
         } else {
             WorkspaceRootRecord(name: rootURL.lastPathComponent, fullPath: rootURL.path, isSystemRoot: isSystemRoot)
         }
-        let service = try await FileSystemService(
+        let service = try await fileSystemFactory(
             path: root.fullPath,
             respectRepoIgnore: respectRepoIgnore,
             respectCursorignore: respectCursorignore,

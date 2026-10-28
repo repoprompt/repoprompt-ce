@@ -81,7 +81,7 @@ private actor WorkspaceRootSeedAuthorityFenceResource:
     }
 
     nonisolated let initialFence: GitWorkspacePendingInitializationAuthorityFence
-    private let gitService: GitService
+    private let gitService: any WorkspaceGitClient
     private let authority: GitWorkspaceStateAuthority
     private var fence: GitWorkspacePendingInitializationAuthorityFence?
     private var transition: Transition?
@@ -89,7 +89,7 @@ private actor WorkspaceRootSeedAuthorityFenceResource:
 
     init(
         fence: GitWorkspacePendingInitializationAuthorityFence,
-        gitService: GitService,
+        gitService: any WorkspaceGitClient,
         authority: GitWorkspaceStateAuthority
     ) {
         initialFence = fence
@@ -239,8 +239,6 @@ private actor WorkspaceRootSeedAuthorityFenceResource:
 }
 
 actor WorkspaceRootSeedPlanner {
-    static let shared = WorkspaceRootSeedPlanner()
-
     private enum PlanningFailure: Error {
         case fallback(WorkspaceRootSeedFallbackReason)
     }
@@ -280,7 +278,7 @@ actor WorkspaceRootSeedPlanner {
         let objectID: Data
     }
 
-    private let gitService: GitService
+    private let gitService: any WorkspaceGitClient
     private let authority: GitWorkspaceStateAuthority
     private let flightCoordinator: WorkspaceRootTargetEvidenceCoordinator
     private let namespaceResourcePolicy: WorkspaceRootNamespaceManifestResourcePolicy
@@ -288,8 +286,8 @@ actor WorkspaceRootSeedPlanner {
     private let planResourcePolicy: WorkspaceRootTargetSeedPlanResourcePolicy
 
     init(
-        gitService: GitService = GitService(),
-        authority: GitWorkspaceStateAuthority = .shared,
+        gitService: any WorkspaceGitClient,
+        authority: GitWorkspaceStateAuthority,
         flightCoordinator: WorkspaceRootTargetEvidenceCoordinator = .shared,
         namespaceResourcePolicy: WorkspaceRootNamespaceManifestResourcePolicy = .default,
         evidenceResourcePolicy: GitTargetEvidenceResourcePolicy = .default,
@@ -503,7 +501,10 @@ actor WorkspaceRootSeedPlanner {
             attemptID: attemptID,
             suppliedCreationCutProvenanceBytes: provenance,
             store: evidenceStore,
-            evidenceResourcePolicy: evidenceResourcePolicy
+            evidenceResourcePolicy: evidenceResourcePolicy,
+            spoolResourcePolicy: .default,
+            pathPolicy: .init(),
+            priority: .rootBootstrap
         )
         #if DEBUG
             benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds
@@ -522,7 +523,10 @@ actor WorkspaceRootSeedPlanner {
             attemptID: attemptID,
             suppliedCreationCutProvenanceBytes: provenance,
             store: evidenceStore,
-            evidenceResourcePolicy: evidenceResourcePolicy
+            evidenceResourcePolicy: evidenceResourcePolicy,
+            spoolResourcePolicy: .default,
+            pathPolicy: .init(),
+            priority: .rootBootstrap
         )
         #if DEBUG
             benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds
@@ -541,7 +545,12 @@ actor WorkspaceRootSeedPlanner {
             attemptID: attemptID,
             suppliedCreationCutProvenanceBytes: provenance,
             store: evidenceStore,
-            evidenceResourcePolicy: evidenceResourcePolicy
+            includeUntracked: true,
+            includeIgnored: true,
+            evidenceResourcePolicy: evidenceResourcePolicy,
+            spoolResourcePolicy: .default,
+            pathPolicy: .init(),
+            priority: .rootBootstrap
         )
         #if DEBUG
             benchmarkPhaseFinished = DispatchTime.now().uptimeNanoseconds

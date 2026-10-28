@@ -129,6 +129,24 @@ enum FilePathDisplay: String, CaseIterable {
 typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSessionWorktreeBinding
 
 #if DEBUG
+    enum WorkspacePreparationReason: String, CaseIterable, Equatable {
+        case absent
+        case bypassed
+        case rootIdentityChanged = "root_identity_changed"
+        case authorityGenerationChanged = "authority_generation_changed"
+        case watermarkAdvanced = "watermark_advanced"
+        case coverageLost = "coverage_lost"
+        case monitorUnavailable = "monitor_unavailable"
+        case controlOrTopologyEvent = "control_or_topology_event"
+        case monitorGap = "monitor_gap"
+        case replacement
+        case capacityEviction = "capacity_eviction"
+        case staleCurrentness = "stale_currentness"
+        case fallback
+        case failure
+        case cancellation
+    }
+
     protocol WorkspacePreparationSpan: Sendable {
         func end()
     }
@@ -136,6 +154,7 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
     protocol WorkspacePreparationRecording: Sendable {
         func beginPhase(_ phase: WorkspacePreparationPhase) -> any WorkspacePreparationSpan
         func increment(_ counter: WorkspacePreparationCounter, by amount: UInt64)
+        func recordPreparationReason(_ reason: WorkspacePreparationReason)
     }
 
     extension WorkspacePreparationRecording {

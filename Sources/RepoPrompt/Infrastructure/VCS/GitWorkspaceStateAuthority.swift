@@ -343,7 +343,7 @@ actor GitWorkspaceStateAuthority {
         collector: @escaping @Sendable () async throws -> GitPrefixControlCollectedEvidence
     ) async throws -> GitPrefixControlCollectedEvidence {
         #if DEBUG
-            let recorder = WorktreeStartupPreparationInstrumentation.currentRecorder
+            let recorder = WorkspacePreparationInstrumentation.currentRecorder
         #endif
         let validatedCollector: @Sendable () async throws -> GitPrefixControlCollectedEvidence = {
             let evidence = try await collector()
@@ -359,13 +359,13 @@ actor GitWorkspaceStateAuthority {
             prefixControlPhysicalScanCount &+= 1
             #if DEBUG
                 recorder?.increment(.prefixCacheBypasses)
-                recorder?.recordReason(.bypassed)
+                recorder?.recordPreparationReason(.bypassed)
             #endif
             return try await validatedCollector()
         }
 
         #if DEBUG
-            let lookupSpan = recorder?.begin(.prefixControlCacheLookup)
+            let lookupSpan = recorder?.beginPhase(.prefixControlCacheLookup)
         #endif
 
         let repositoryKey = GitWorkspaceAuthorityRepositoryKey(layout: layout)
@@ -394,7 +394,7 @@ actor GitWorkspaceStateAuthority {
         for replacedKey in replacedRootEntryKeys {
             #if DEBUG
                 recorder?.increment(.prefixCacheInvalidations)
-                recorder?.recordReason(.rootIdentityChanged)
+                recorder?.recordPreparationReason(.rootIdentityChanged)
             #endif
             await removePrefixControlCacheEntry(replacedKey, invalidated: true)
         }
@@ -406,7 +406,7 @@ actor GitWorkspaceStateAuthority {
         }
         for replacedKey in replacedRootPendingKeys {
             #if DEBUG
-                recorder?.recordReason(.rootIdentityChanged)
+                recorder?.recordPreparationReason(.rootIdentityChanged)
             #endif
             await cancelPendingPrefixControlAdmission(replacedKey, invalidated: true)
         }
@@ -442,15 +442,15 @@ actor GitWorkspaceStateAuthority {
             #if DEBUG
                 recorder?.increment(.prefixCacheInvalidations)
                 if currentRootIdentity != rootIdentity {
-                    recorder?.recordReason(.rootIdentityChanged)
+                    recorder?.recordPreparationReason(.rootIdentityChanged)
                 } else if metadataMonitor.acceptedWatermark(for: repositoryKey)
                     != expectedCurrentness.acceptedWatermark
                 {
-                    recorder?.recordReason(.watermarkAdvanced)
+                    recorder?.recordPreparationReason(.watermarkAdvanced)
                 } else if !coverageCurrent {
-                    recorder?.recordReason(.coverageLost)
+                    recorder?.recordPreparationReason(.coverageLost)
                 } else {
-                    recorder?.recordReason(.authorityGenerationChanged)
+                    recorder?.recordPreparationReason(.authorityGenerationChanged)
                 }
             #endif
             await removePrefixControlCacheEntry(key, invalidated: true)
@@ -459,7 +459,7 @@ actor GitWorkspaceStateAuthority {
         if let pending = pendingPrefixControlAdmissions[key] {
             if pending.isCancelled {
                 #if DEBUG
-                    recorder?.recordReason(.fallback)
+                    recorder?.recordPreparationReason(.fallback)
                     lookupSpan?.end()
                 #endif
                 throw GitPrefixControlEvidenceCacheError.resourceAdmission
@@ -487,7 +487,7 @@ actor GitWorkspaceStateAuthority {
                 return evidence
             }
             #if DEBUG
-                recorder?.recordReason(.staleCurrentness)
+                recorder?.recordPreparationReason(.staleCurrentness)
                 lookupSpan?.end()
             #endif
             await cancelPendingPrefixControlAdmission(key, invalidated: true)
@@ -497,7 +497,7 @@ actor GitWorkspaceStateAuthority {
         if let pending = pendingUncachedPrefixControlFlights[key] {
             if pending.isCancelled {
                 #if DEBUG
-                    recorder?.recordReason(.fallback)
+                    recorder?.recordPreparationReason(.fallback)
                     lookupSpan?.end()
                 #endif
                 throw GitPrefixControlEvidenceCacheError.resourceAdmission
@@ -524,7 +524,7 @@ actor GitWorkspaceStateAuthority {
         prefixControlCacheMissCount &+= 1
         #if DEBUG
             recorder?.increment(.prefixCacheMisses)
-            recorder?.recordReason(.absent)
+            recorder?.recordPreparationReason(.absent)
             lookupSpan?.end()
         #endif
         let observationToken: GitWorkspaceMetadataMonitor.RetainToken
@@ -542,7 +542,7 @@ actor GitWorkspaceStateAuthority {
             // unavailable or ambiguous coverage setup.
             prefixControlPhysicalScanCount &+= 1
             #if DEBUG
-                recorder?.recordReason(.monitorUnavailable)
+                recorder?.recordPreparationReason(.monitorUnavailable)
             #endif
             return try await validatedCollector()
         }
@@ -553,7 +553,7 @@ actor GitWorkspaceStateAuthority {
         else {
             await metadataMonitor.release(observationToken)
             #if DEBUG
-                recorder?.recordReason(.staleCurrentness)
+                recorder?.recordPreparationReason(.staleCurrentness)
             #endif
             throw GitPrefixControlEvidenceCacheError.invalidatedDuringCollection
         }
@@ -574,7 +574,7 @@ actor GitWorkspaceStateAuthority {
         else {
             await metadataMonitor.release(observationToken)
             #if DEBUG
-                recorder?.recordReason(.fallback)
+                recorder?.recordPreparationReason(.fallback)
             #endif
             return try await startOrJoinBoundedUncachedPrefixControlFlight(
                 key: key,
@@ -687,8 +687,8 @@ actor GitWorkspaceStateAuthority {
             if let pending { await metadataMonitor.release(pending.observationToken) }
         case let .success(evidence):
             #if DEBUG
-                let admissionSpan = WorktreeStartupPreparationInstrumentation.currentRecorder?
-                    .begin(.prefixControlCacheAdmit)
+                let admissionSpan = WorkspacePreparationInstrumentation.currentRecorder?
+                    .beginPhase(.prefixControlCacheAdmit)
                 defer { admissionSpan?.end() }
             #endif
             guard Self.prefixControlEvidenceIsValid(evidence) else {
@@ -698,7 +698,7 @@ actor GitWorkspaceStateAuthority {
                 }
                 if let pending { await metadataMonitor.release(pending.observationToken) }
                 #if DEBUG
-                    WorktreeStartupPreparationInstrumentation.currentRecorder?.recordReason(.failure)
+                    WorkspacePreparationInstrumentation.currentRecorder?.recordPreparationReason(.failure)
                 #endif
                 return
             }
@@ -725,10 +725,10 @@ actor GitWorkspaceStateAuthority {
                 }
                 if let removed { await metadataMonitor.release(removed.observationToken) }
                 #if DEBUG
-                    WorktreeStartupPreparationInstrumentation.currentRecorder?
+                    WorkspacePreparationInstrumentation.currentRecorder?
                         .increment(.prefixCacheInvalidations)
-                    WorktreeStartupPreparationInstrumentation.currentRecorder?
-                        .recordReason(.staleCurrentness)
+                    WorkspacePreparationInstrumentation.currentRecorder?
+                        .recordPreparationReason(.staleCurrentness)
                 #endif
                 return
             }
@@ -757,7 +757,7 @@ actor GitWorkspaceStateAuthority {
             prefixControlCacheArtifactBytes += artifactBytes
             prefixControlCacheAdmissionCount &+= 1
             #if DEBUG
-                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                WorkspacePreparationInstrumentation.currentRecorder?
                     .increment(.prefixCacheAdmissions)
             #endif
             await evictPrefixControlCacheIfNeeded()
@@ -773,7 +773,7 @@ actor GitWorkspaceStateAuthority {
         if let pending = pendingUncachedPrefixControlFlights[key], !pending.isCancelled {
             prefixControlCacheCoalescedWaiterCount &+= 1
             #if DEBUG
-                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                WorkspacePreparationInstrumentation.currentRecorder?
                     .increment(.prefixCacheCoalesces)
             #endif
             return try await waitForPendingUncachedPrefixControlFlight(key: key, flightID: pending.id)
@@ -1649,7 +1649,7 @@ actor GitWorkspaceStateAuthority {
         if invalidated {
             prefixControlCacheInvalidationCount &+= 1
             #if DEBUG
-                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                WorkspacePreparationInstrumentation.currentRecorder?
                     .increment(.prefixCacheInvalidations)
             #endif
         }
@@ -1725,10 +1725,10 @@ actor GitWorkspaceStateAuthority {
             }) else { break }
             prefixControlCacheEvictionCount &+= 1
             #if DEBUG
-                WorktreeStartupPreparationInstrumentation.currentRecorder?
+                WorkspacePreparationInstrumentation.currentRecorder?
                     .increment(.prefixCacheEvictions)
-                WorktreeStartupPreparationInstrumentation.currentRecorder?
-                    .recordReason(.capacityEviction)
+                WorkspacePreparationInstrumentation.currentRecorder?
+                    .recordPreparationReason(.capacityEviction)
             #endif
             await removePrefixControlCacheEntry(candidate.key, invalidated: false)
         }

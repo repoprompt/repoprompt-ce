@@ -61,7 +61,7 @@ struct GitBlobSourceMaterializationClient {
     let size: @Sendable (GitRepositoryLayout, GitBlobOID) async throws -> UInt64
     let bytes: @Sendable (GitRepositoryLayout, GitBlobOID, Int) async throws -> Data
 
-    init(gitService: GitService) {
+    init(gitService: any WorkspaceGitClient) {
         size = { try await gitService.gitBlobObjectSize(in: $0, oid: $1) }
         bytes = { try await gitService.gitBlobObjectBytes(in: $0, oid: $1, expectedByteCount: $2) }
     }
@@ -81,7 +81,7 @@ struct GitBlobSourceMaterializationService {
     private let oidForBytes: @Sendable (Data, GitObjectFormat) -> GitBlobOID
 
     init(
-        gitService: GitService = GitService(),
+        gitService: any WorkspaceGitClient,
         policy: GitBlobSourceMaterializationPolicy = .default
     ) {
         client = GitBlobSourceMaterializationClient(gitService: gitService)

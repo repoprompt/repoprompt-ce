@@ -78,10 +78,6 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         try bindingEngineProvider.engine(for: self)
     }
 
-    static func processWide() throws -> CodeMapArtifactRuntime {
-        try processWideProvider.runtime()
-    }
-
     static func processWideRootURL(
         applicationSupportRootURL: URL,
         buildFlavor: MCPFilesystemIdentity.BuildFlavor
@@ -93,6 +89,7 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
     }
 
     static func makeProcessWideProvider(
+        bindingServicesFactory: @escaping @Sendable (Data) -> WorkspaceCodemapBindingEngineServices,
         identity: MCPFilesystemIdentity,
         applicationSupportRootURL: URL,
         namespaceSaltProvider: @escaping @Sendable (URL, MCPFilesystemIdentity) throws -> Data = { rootURL, identity in
@@ -129,9 +126,7 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
                     let namespaceSalt = try namespaceSaltProvider(rootURL, identity)
                     let engine = WorkspaceCodemapBindingEngine(
                         runtime: runtime,
-                        capabilityService: WorkspaceCodemapRootCapabilityService(
-                            namespaceSalt: namespaceSalt
-                        ),
+                        services: bindingServicesFactory(namespaceSalt),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
                         catalogClient: registry.makeBindingCatalogClient(),
                         globalCodeMapsDisabled: globalCodeMapsDisabled

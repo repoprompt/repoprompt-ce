@@ -36,14 +36,14 @@ actor GitBlobIdentityService {
         case repositoryProbeFailed
     }
 
-    private let gitService: GitService
+    private let gitService: any WorkspaceGitClient
     private let hooks: GitBlobIdentityServiceHooks
     private var eligibleOpportunityCount: UInt64 = 0
     private var digestMatchCount: UInt64 = 0
     private var digestMismatchCount: UInt64 = 0
 
     init(
-        gitService: GitService = GitService(),
+        gitService: any WorkspaceGitClient,
         hooks: GitBlobIdentityServiceHooks = .none
     ) {
         self.gitService = gitService

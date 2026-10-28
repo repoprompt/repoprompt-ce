@@ -3,14 +3,12 @@ import RepoPromptInstrumentation
 import RepoPromptVCS
 
 actor WorkspaceRootMaterializationHintEvaluator {
-    static let shared = WorkspaceRootMaterializationHintEvaluator()
-
-    private let gitService: GitService
+    private let gitService: any WorkspaceGitClient
     private let authority: GitWorkspaceStateAuthority
 
     init(
-        gitService: GitService = GitService(),
-        authority: GitWorkspaceStateAuthority = .shared
+        gitService: any WorkspaceGitClient,
+        authority: GitWorkspaceStateAuthority
     ) {
         self.gitService = gitService
         self.authority = authority

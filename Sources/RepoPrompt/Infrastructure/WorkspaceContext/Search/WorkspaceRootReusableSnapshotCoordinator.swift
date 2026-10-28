@@ -90,17 +90,15 @@ actor WorkspaceRootReusableSnapshotCoordinator {
         case failed(ObservationFailure)
     }
 
-    static let shared = WorkspaceRootReusableSnapshotCoordinator()
-
-    private let gitService: GitService
+    private let gitService: any WorkspaceGitClient
     private let authority: GitWorkspaceStateAuthority
     #if DEBUG
         private var preparedAdmissionHandlerForTesting: (@Sendable () async -> Void)?
     #endif
 
     init(
-        gitService: GitService = GitService(),
-        authority: GitWorkspaceStateAuthority = .shared
+        gitService: any WorkspaceGitClient,
+        authority: GitWorkspaceStateAuthority
     ) {
         self.gitService = gitService
         self.authority = authority
@@ -205,6 +203,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 return try await gitService.workspaceAuthoritySnapshot(
                     in: layout,
                     prefix: prefix,
+                    priority: .rootBootstrap,
                     cacheMode: prefixControlEvidenceCacheMode
                 )
             }()
@@ -290,6 +289,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 return try await gitService.workspaceAuthoritySnapshot(
                     in: layout,
                     prefix: prefix,
+                    priority: .rootBootstrap,
                     cacheMode: prefixControlEvidenceCacheMode
                 )
             }()
@@ -344,7 +344,9 @@ actor WorkspaceRootReusableSnapshotCoordinator {
                 return try await gitService.spoolLoadedRootTreeInventory(
                     captured.snapshot.treeOID,
                     in: layout,
-                    prefix: prefix
+                    prefix: prefix,
+                    resourcePolicy: .default,
+                    priority: .rootBootstrap
                 )
             }()
             if let failure = await Self.currentnessFailure(

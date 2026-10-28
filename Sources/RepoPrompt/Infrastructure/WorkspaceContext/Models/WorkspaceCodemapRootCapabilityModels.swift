@@ -191,7 +191,7 @@ enum WorkspaceCodemapGitEligibilityPreflightResult: Equatable {
 struct WorkspaceCodemapGitEligibilityProbe {
     let resolve: @Sendable (URL) async -> WorkspaceCodemapGitEligibilityPreflightResult
 
-    static func production(gitService: GitService = GitService()) -> Self {
+    static func production(gitService: any WorkspaceGitClient) -> Self {
         Self { rootURL in
             await WorkspaceCodemapRootCapabilityService.eligibilityPreflight(
                 gitService: gitService,

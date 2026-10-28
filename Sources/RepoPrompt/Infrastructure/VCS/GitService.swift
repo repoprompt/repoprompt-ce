@@ -26,20 +26,6 @@ extension GitDiffCompareSpec {
     }
 }
 
-enum GitPrefixControlEvidenceCacheMode {
-    case automatic
-    case bypassReadAndAdmission
-}
-
-struct GitLoadedRootTreeInventorySpool: @unchecked Sendable {
-    static let commandFormat = "git-ls-tree-recursive-full-tree-z-v1"
-
-    let rawOutput: GitRawOutputSpoolLease
-    let stdoutSHA256: Data
-    let treeOID: GitObjectID
-    let rootPrefix: GitRepositoryRelativeRootPrefix
-}
-
 protocol GitPrefixControlCandidateSource: AnyObject {
     func nextCandidate() throws -> URL?
     func skipDescendants()
@@ -108,7 +94,7 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
 
 /// Async Git helper for fetching repository information
 /// Based on the macOS 14+ Swift Git integration guide
-actor GitService {
+actor GitService: WorkspaceGitClient {
     private struct UntrackedStatsKey: Hashable {
         let root: String
         let path: String

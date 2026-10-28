@@ -105,6 +105,12 @@ struct WorkspaceCodemapManifestFIFO<Element> {
     }
 }
 
+struct WorkspaceCodemapBindingEngineServices {
+    let capability: WorkspaceCodemapRootCapabilityService
+    let identity: GitBlobIdentityService
+    let materialization: GitBlobSourceMaterializationService
+}
+
 actor WorkspaceCodemapBindingEngine {
     private enum GraphIndexPublicationDisposition {
         case accepted(WorkspaceCodemapGraphIndexProgress)
@@ -809,9 +815,7 @@ actor WorkspaceCodemapBindingEngine {
 
     init(
         runtime: CodeMapArtifactRuntime,
-        capabilityService: WorkspaceCodemapRootCapabilityService,
-        identityService: GitBlobIdentityService = GitBlobIdentityService(),
-        materializationService: GitBlobSourceMaterializationService = GitBlobSourceMaterializationService(),
+        services: WorkspaceCodemapBindingEngineServices,
         sourceReader: WorkspaceCodemapValidatedSourceReaderClient,
         catalogClient: WorkspaceCodemapBindingCatalogClient = .unavailable,
         overlay: WorkspaceCodemapLiveOverlay = WorkspaceCodemapLiveOverlay(),
@@ -832,9 +836,9 @@ actor WorkspaceCodemapBindingEngine {
         }
     ) {
         self.runtime = runtime
-        self.capabilityService = capabilityService
-        self.identityService = identityService
-        self.materializationService = materializationService
+        capabilityService = services.capability
+        identityService = services.identity
+        materializationService = services.materialization
         self.sourceReader = sourceReader
         self.catalogClient = catalogClient
         self.overlay = overlay

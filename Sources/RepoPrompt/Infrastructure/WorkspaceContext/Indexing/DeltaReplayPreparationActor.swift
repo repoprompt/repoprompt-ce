@@ -10,7 +10,7 @@ enum RepoFileReplayPerf {
         typealias State = OSSignpostIntervalState
         static let signposter = OSSignposter(subsystem: "com.repoprompt.workspace", category: "file-replay")
         static var isEnabled: Bool {
-            UserDefaults.standard.bool(forKey: "enableRepoFileReplaySignposts")
+            FileSystemRuntimeHooks.current.preferenceEnabled("enableRepoFileReplaySignposts")
         }
 
         static func begin(_ name: StaticString) -> State? {

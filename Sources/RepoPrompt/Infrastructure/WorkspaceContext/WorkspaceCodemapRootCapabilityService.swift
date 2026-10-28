@@ -427,7 +427,7 @@ actor WorkspaceCodemapRootCapabilityService {
         case transient(WorkspaceCodemapRootTransientUnavailableReason)
     }
 
-    private let gitService: GitService
+    private let gitService: any WorkspaceGitClient
     private let namespaceSalt: Data
     private let hooks: WorkspaceCodemapRootCapabilityServiceHooks
     private let localClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe
@@ -453,7 +453,7 @@ actor WorkspaceCodemapRootCapabilityService {
     #endif
 
     init(
-        gitService: GitService = GitService(),
+        gitService: any WorkspaceGitClient,
         namespaceSalt: Data,
         hooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,
         localClassificationProbe: WorkspaceCodemapLocalGitClassificationProbe = .production,
@@ -470,7 +470,7 @@ actor WorkspaceCodemapRootCapabilityService {
     }
 
     nonisolated static func eligibilityPreflight(
-        gitService: GitService,
+        gitService: any WorkspaceGitClient,
         loadedRootURL: URL
     ) async -> WorkspaceCodemapGitEligibilityPreflightResult {
         let loadedRoot = loadedRootURL.standardizedFileURL
@@ -501,7 +501,7 @@ actor WorkspaceCodemapRootCapabilityService {
                 .terminalUnavailable(.invalidLayout)
             }
         } catch {
-            return .transientUnavailable(transientReason(for: error))
+            return .transientUnavailable(transientReason(for: error, gitService: gitService))
         }
     }
 
@@ -1299,7 +1299,7 @@ actor WorkspaceCodemapRootCapabilityService {
                     ? .cancelled
                     : .captureFailed(
                         phase: capturePhase,
-                        reason: Self.transientReason(for: error)
+                        reason: Self.transientReason(for: error, gitService: gitService)
                     )
             )
             return unavailable
@@ -1452,7 +1452,7 @@ actor WorkspaceCodemapRootCapabilityService {
                     ? .cancelled
                     : .captureFailed(
                         phase: .postRepository,
-                        reason: Self.transientReason(for: error)
+                        reason: Self.transientReason(for: error, gitService: gitService)
                     )
             )
             return unavailable
@@ -1708,7 +1708,7 @@ actor WorkspaceCodemapRootCapabilityService {
             }
             repositoryRoot = resolved.standardizedFileURL
         } catch {
-            return .transient(Self.transientReason(for: error))
+            return .transient(Self.transientReason(for: error, gitService: gitService))
         }
 
         guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repositoryRoot) else {
@@ -1788,7 +1788,7 @@ actor WorkspaceCodemapRootCapabilityService {
                 return .terminal(.unsupportedObjectFormat)
             }
         } catch {
-            return .transient(Self.transientReason(for: error))
+            return .transient(Self.transientReason(for: error, gitService: gitService))
         }
     }
 
@@ -1977,7 +1977,10 @@ actor WorkspaceCodemapRootCapabilityService {
         case authorityFileTooLarge
     }
 
-    private static func transientReason(for error: Error) -> WorkspaceCodemapRootTransientUnavailableReason {
+    private static func transientReason(
+        for error: Error,
+        gitService: any WorkspaceGitClient
+    ) -> WorkspaceCodemapRootTransientUnavailableReason {
         if error is CancellationError { return .runtimeUnavailable }
         let nsError = error as NSError
         if nsError.domain == NSPOSIXErrorDomain,
@@ -1985,7 +1988,7 @@ actor WorkspaceCodemapRootCapabilityService {
         {
             return .permissionFailure
         }
-        if error is GitService.GitError { return .gitProcessUnavailable }
+        if gitService.isGitProcessError(error) { return .gitProcessUnavailable }
         if let captureError = error as? CapabilityCaptureError {
             switch captureError {
             case .layoutChanged: return .repositoryChanging
