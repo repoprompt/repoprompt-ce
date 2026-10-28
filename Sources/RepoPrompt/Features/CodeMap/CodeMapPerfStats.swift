@@ -554,46 +554,46 @@ enum CodeMapPerfRuntime {
         package let queueWaitMilliseconds: [UInt64]
     }
 
-    struct CodemapManifestWriterTaskSnapshot: Equatable {
-        let writerID: UUID
-        let namespaceDigest: String
-        var rootEpoch: WorkspaceCodemapRootEpoch?
-        var batchID: UUID?
-        var origin: String?
-        var phase: String
-        let taskStartedUptimeNanoseconds: UInt64
-        var batchStartedUptimeNanoseconds: UInt64?
-        var phaseStartedUptimeNanoseconds: UInt64
+    package struct CodemapManifestWriterTaskSnapshot: Equatable {
+        package let writerID: UUID
+        package let namespaceDigest: String
+        package var rootEpoch: WorkspaceCodemapRootEpoch?
+        package var batchID: UUID?
+        package var origin: String?
+        package var phase: String
+        package let taskStartedUptimeNanoseconds: UInt64
+        package var batchStartedUptimeNanoseconds: UInt64?
+        package var phaseStartedUptimeNanoseconds: UInt64
     }
 
-    struct CodemapManifestWriterQueueSnapshot: Equatable {
-        let namespaceDigest: String
-        let queuedItemCount: Int
-        let deferredTailItemCount: Int
-        let deferredHeadWaitingItemCount: Int
-        let inFlightItemCount: Int
-        let retryPending: Bool
+    package struct CodemapManifestWriterQueueSnapshot: Equatable {
+        package let namespaceDigest: String
+        package let queuedItemCount: Int
+        package let deferredTailItemCount: Int
+        package let deferredHeadWaitingItemCount: Int
+        package let inFlightItemCount: Int
+        package let retryPending: Bool
     }
 
-    struct CodemapManifestWriterActivitySnapshot: Equatable {
-        let engineInstanceID: UUID
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let sampledUptimeNanoseconds: UInt64
-        let liveTaskCount: Int
-        let namespaceCount: Int
-        let accountingComplete: Bool
-        let quiescenceConfirmed: Bool
-        let omittedLiveTaskCount: Int
-        let tasks: [CodemapManifestWriterTaskSnapshot]
-        let namespaces: [CodemapManifestWriterQueueSnapshot]
-        let omittedNamespaceCount: Int
+    package struct CodemapManifestWriterActivitySnapshot: Equatable {
+        package let engineInstanceID: UUID
+        package let rootEpoch: WorkspaceCodemapRootEpoch
+        package let sampledUptimeNanoseconds: UInt64
+        package let liveTaskCount: Int
+        package let namespaceCount: Int
+        package let accountingComplete: Bool
+        package let quiescenceConfirmed: Bool
+        package let omittedLiveTaskCount: Int
+        package let tasks: [CodemapManifestWriterTaskSnapshot]
+        package let namespaces: [CodemapManifestWriterQueueSnapshot]
+        package let omittedNamespaceCount: Int
     }
 
     package struct CodemapGraphStatusManifestSnapshot: Equatable {
         package let failureCounts: [WorkspaceCodemapManifestFailureReason: UInt64]
         package let lastFailure: WorkspaceCodemapManifestFailureDiagnostic?
         package let measurements: WorkspaceCodemapManifestMeasurementSnapshot
-        var writerActivity: CodemapManifestWriterActivitySnapshot?
+        package var writerActivity: CodemapManifestWriterActivitySnapshot?
     }
 
     package struct CodemapGraphStatusRootSnapshot: Equatable {

@@ -6,6 +6,12 @@ package enum WorkspaceLogicalRootIdentity {
         package let physicalRootID: UUID
         package let rootEpoch: WorkspaceCodemapRootEpoch
         package let preferredName: String
+
+        package init(physicalRootID: UUID, rootEpoch: WorkspaceCodemapRootEpoch, preferredName: String) {
+            self.physicalRootID = physicalRootID
+            self.rootEpoch = rootEpoch
+            self.preferredName = preferredName
+        }
     }
 
     static func relativePath(

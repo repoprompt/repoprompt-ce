@@ -191,7 +191,8 @@ package struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 
 package actor WorkspaceFileContextStore {
     private let restorePerfRecorder: any WorkspaceRestorePerfRecording
-    package let perfRecorder: any AgentModePerfRecording
+    /// Immutable, Sendable per-store dependency; synchronous callers do not access actor state.
+    package nonisolated let perfRecorder: any AgentModePerfRecording
 
     enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
         case rootInventoryAndSearchReady

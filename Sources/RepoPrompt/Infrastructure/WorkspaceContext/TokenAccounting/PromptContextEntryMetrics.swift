@@ -67,7 +67,7 @@ package struct PromptContextEntryMetricsSnapshot: Equatable {
     /// never recomputes this denominator when it rejects a conflicting per-file index record.
     package let totalSelectedDisplayTokens: Int
     let metricsByFileID: [UUID: PromptContextEntryMetric]
-    let metricsByStandardizedFullPath: [String: PromptContextEntryMetric]
+    package let metricsByStandardizedFullPath: [String: PromptContextEntryMetric]
 
     package static let empty = PromptContextEntryMetricsSnapshot(
         totalSelectedDisplayTokens: 0,

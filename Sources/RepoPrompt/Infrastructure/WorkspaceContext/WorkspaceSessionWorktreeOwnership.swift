@@ -70,11 +70,11 @@ struct WorkspaceRootSeedShadowPreparation {
     let planHandle: WorkspaceRootTargetSeedPlanHandle
 }
 
-struct WorkspaceSessionWorktreeOwnershipPreparation {
+package struct WorkspaceSessionWorktreeOwnershipPreparation {
     package let token: WorkspaceSessionWorktreeOwnershipToken
     let bindingFingerprint: String
     let roots: [WorkspaceSessionWorktreeOwnedRoot]
-    let reusesInstalledOwnership: Bool
+    package let reusesInstalledOwnership: Bool
     let materializationHintObservationsByPhysicalRootPath: [
         String: WorkspaceRootMaterializationHintObservation
     ]

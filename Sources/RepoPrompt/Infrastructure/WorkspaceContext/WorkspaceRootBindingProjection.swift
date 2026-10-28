@@ -403,7 +403,7 @@ package struct WorkspaceSelectedFilesDiagnostics {
 
 package struct WorkspaceRootBindingProjection: Equatable {
     package let sessionID: UUID
-    let replacementsByLogicalRootPath: [String: BoundRoot]
+    package let replacementsByLogicalRootPath: [String: BoundRoot]
     private let visibleLogicalRoots: [WorkspaceRootRef]
     private let lookupPhysicalRootPaths: Set<String>
 
@@ -750,7 +750,7 @@ package struct WorkspaceRootBindingProjectionPreparation {
     let bindings: [WorkspaceSessionWorktreeBinding]
     let visibleRoots: [WorkspaceRootRef]
     let logicalRootsByPath: [String: WorkspaceRootRef]
-    let ownership: WorkspaceSessionWorktreeOwnershipPreparation
+    package let ownership: WorkspaceSessionWorktreeOwnershipPreparation
     let startupContext: WorktreeStartupContext?
 }
 
@@ -983,7 +983,7 @@ package struct WorkspaceRootBindingProjectionMaterializer {
         await store.abortSessionWorktreeOwnership(preparation.ownership)
     }
 
-    func release(ifOwnedBy token: WorkspaceSessionWorktreeOwnershipToken) async {
+    package func release(ifOwnedBy token: WorkspaceSessionWorktreeOwnershipToken) async {
         _ = await store.releaseSessionWorktreeOwnership(ifOwnedBy: token)
     }
 

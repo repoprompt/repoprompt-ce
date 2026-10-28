@@ -214,6 +214,18 @@ package struct WorkspaceRootCatalogSnapshot: Equatable {
     /// Loaded primary roots, ordered to match `configuredRootPaths`.
     package let primaryRoots: [WorkspaceRootRef]
 
+    package init(
+        ticket: WorkspaceSearchReadinessTicket,
+        workspaceID: UUID,
+        configuredRootPaths: [String],
+        primaryRoots: [WorkspaceRootRef]
+    ) {
+        self.ticket = ticket
+        self.workspaceID = workspaceID
+        self.configuredRootPaths = configuredRootPaths
+        self.primaryRoots = primaryRoots
+    }
+
     /// A workspace that declares no roots at all. Distinct from a workspace whose roots
     /// have not been hydrated yet, which never produces a snapshot.
     package var isGenuinelyRootless: Bool {
