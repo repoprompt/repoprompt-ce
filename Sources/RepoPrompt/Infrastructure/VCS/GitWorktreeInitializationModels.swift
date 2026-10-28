@@ -299,6 +299,26 @@ package struct GitWorkspacePendingInitializationAuthorityFence: Equatable {
     package let additionalAuthorityPaths: [URL]
     package let revalidationUsed: Bool
 
+    package init(
+        snapshot: GitWorkspaceAuthoritySnapshot,
+        lease: GitWorkspaceAuthorityLease,
+        metadataObservationToken: GitWorkspaceMetadataMonitor.RetainToken,
+        acceptedMetadataWatermark: UInt64,
+        targetLayout: GitRepositoryLayout,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
+        additionalAuthorityPaths: [URL],
+        revalidationUsed: Bool
+    ) {
+        self.snapshot = snapshot
+        self.lease = lease
+        self.metadataObservationToken = metadataObservationToken
+        self.acceptedMetadataWatermark = acceptedMetadataWatermark
+        self.targetLayout = targetLayout
+        self.repositoryRelativeRootPrefix = repositoryRelativeRootPrefix
+        self.additionalAuthorityPaths = additionalAuthorityPaths
+        self.revalidationUsed = revalidationUsed
+    }
+
     package var repositoryKey: GitWorkspaceAuthorityRepositoryKey {
         lease.repositoryKey
     }
