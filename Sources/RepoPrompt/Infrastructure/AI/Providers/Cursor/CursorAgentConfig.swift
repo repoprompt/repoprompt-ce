@@ -16,7 +16,7 @@ struct CursorAgentConfig {
     let includeRepoPromptMCPServer: Bool
     let cleanupProjectMCPApproval: Bool
     let sessionModeID: String?
-    let modelOverrides: [CursorAIModelCatalog.ModelSpecifier.Override]
+    let modelOverrides: [CursorModelOverride]
 
     var commandName: String {
         switch commandSelection {
@@ -29,13 +29,13 @@ struct CursorAgentConfig {
 
     init(
         commandName: String? = nil,
-        additionalPathHints: [String] = CLIPathHints.cursor,
+        additionalPathHints: [String] = CLILaunchProfiles.cursorProviderSpecificPaths,
         enableDebugLogging: Bool = false,
         modelString: String? = nil,
         includeRepoPromptMCPServer: Bool = true,
         cleanupProjectMCPApproval: Bool = true,
         sessionModeID: String? = nil,
-        modelOverrides: [CursorAIModelCatalog.ModelSpecifier.Override] = []
+        modelOverrides: [CursorModelOverride] = []
     ) {
         commandSelection = commandName.map(CursorAgentCommandSelection.exact) ?? .automatic
         self.additionalPathHints = additionalPathHints

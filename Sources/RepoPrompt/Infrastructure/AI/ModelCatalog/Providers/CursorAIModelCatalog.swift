@@ -45,10 +45,7 @@ enum CursorAIModelCatalog {
     }
 
     struct ModelSpecifier {
-        struct Override {
-            let configID: String
-            let valueRaw: String
-        }
+        typealias Override = CursorModelOverride
 
         let baseModelRaw: String
         let overrides: [Override]

@@ -3,20 +3,6 @@ import RepoPromptAIContracts
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
-enum ACPSupportResult: Equatable {
-    case supported
-    case unsupported(reason: String)
-
-    var reason: String? {
-        switch self {
-        case .supported:
-            nil
-        case let .unsupported(reason):
-            reason
-        }
-    }
-}
-
 /// Describes whether an ACP session identifier is known to be safe for a future
 /// `session/load`.
 enum ACPLoadSessionIDConfidence: Equatable {
