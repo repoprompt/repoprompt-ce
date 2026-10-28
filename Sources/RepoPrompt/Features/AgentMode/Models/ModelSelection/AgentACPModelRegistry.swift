@@ -1,14 +1,28 @@
 import Foundation
 import RepoPromptAIContracts
 
-final class AgentACPModelRegistry {
-    struct Dependencies {
-        let loadAll: @Sendable () -> [ACPProviderID: ACPDiscoveredSessionModels]
-        let load: (ACPProviderID) -> ACPDiscoveredSessionModels?
-        let save: (ACPDiscoveredSessionModels, ACPProviderID) -> Void
-        let remove: (ACPProviderID) -> Void
+package final class AgentACPModelRegistry {
+    package struct Dependencies {
+        package let loadAll: @Sendable () -> [ACPProviderID: ACPDiscoveredSessionModels]
+        package let load: (ACPProviderID) -> ACPDiscoveredSessionModels?
+        package let save: (ACPDiscoveredSessionModels, ACPProviderID) -> Void
+        package let remove: (ACPProviderID) -> Void
         /// Synchronous; must not re-enter this registry or wait for another thread to do so.
-        let invalidate: (AgentProviderKind) -> Void
+        package let invalidate: (AgentProviderKind) -> Void
+
+        package init(
+            loadAll: @escaping @Sendable () -> [ACPProviderID: ACPDiscoveredSessionModels],
+            load: @escaping (ACPProviderID) -> ACPDiscoveredSessionModels?,
+            save: @escaping (ACPDiscoveredSessionModels, ACPProviderID) -> Void,
+            remove: @escaping (ACPProviderID) -> Void,
+            invalidate: @escaping (AgentProviderKind) -> Void
+        ) {
+            self.loadAll = loadAll
+            self.load = load
+            self.save = save
+            self.remove = remove
+            self.invalidate = invalidate
+        }
     }
 
     private let dependencies: Dependencies
@@ -25,7 +39,7 @@ final class AgentACPModelRegistry {
     private var didWarmStandardStore = false
     private var standardStoreWarmGeneration: UInt64 = 0
 
-    init(dependencies: Dependencies) {
+    package init(dependencies: Dependencies) {
         self.dependencies = dependencies
     }
 
@@ -37,7 +51,7 @@ final class AgentACPModelRegistry {
     }
 
     @discardableResult
-    func updateDiscoveredModels(
+    package func updateDiscoveredModels(
         _ snapshot: ACPDiscoveredSessionModels,
         for providerID: ACPProviderID
     ) -> Bool {
@@ -77,19 +91,19 @@ final class AgentACPModelRegistry {
         }
     }
 
-    func currentSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
+    package func currentSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
         preconditionNotInvalidating()
         lock.lock()
         defer { lock.unlock() }
         return liveSnapshotsByProvider[providerID]
     }
 
-    func resolvedSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
+    package func resolvedSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
         preconditionNotInvalidating()
         return snapshotFromMemory(for: providerID)
     }
 
-    func currentDevinCatalog() -> DevinModelCatalog {
+    package func currentDevinCatalog() -> DevinModelCatalog {
         preconditionNotInvalidating()
         return lock.withLock { devinCatalog }
     }
@@ -102,7 +116,7 @@ final class AgentACPModelRegistry {
         devinCatalogSnapshot = snapshot
     }
 
-    func warmStandardStoreIfNeeded(beforeCompleting: (@Sendable () async -> Void)? = nil) async {
+    package func warmStandardStoreIfNeeded(beforeCompleting: (@Sendable () async -> Void)? = nil) async {
         preconditionNotInvalidating()
         let plan: StandardStoreWarmPlan? = lock.withLock {
             guard !didWarmStandardStore else { return nil }
@@ -147,12 +161,12 @@ final class AgentACPModelRegistry {
     }
 
     /// Reads saved data when memory is empty, without installing it or changing warm state.
-    func resolvedSnapshotIncludingStandardStore(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
+    package func resolvedSnapshotIncludingStandardStore(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
         preconditionNotInvalidating()
         return snapshotFromMemory(for: providerID) ?? dependencies.load(providerID)
     }
 
-    func resolvedSnapshotAfterWarmingStandardStore(
+    package func resolvedSnapshotAfterWarmingStandardStore(
         for providerID: ACPProviderID
     ) async -> ACPDiscoveredSessionModels? {
         preconditionNotInvalidating()
@@ -170,8 +184,7 @@ final class AgentACPModelRegistry {
     }
 
     #if DEBUG
-        @_spi(TestSupport)
-        public func test_reset(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
+        package func test_reset(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
             preconditionNotInvalidating()
             invalidateAdvertisedModels(for: providerID)
             beforeClearingMemory?()
@@ -190,8 +203,7 @@ final class AgentACPModelRegistry {
             invalidateAdvertisedModels(for: providerID)
         }
 
-        @_spi(TestSupport)
-        public func test_clearMemoryPreservingStore(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
+        package func test_clearMemoryPreservingStore(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
             preconditionNotInvalidating()
             invalidateAdvertisedModels(for: providerID)
             beforeClearingMemory?()
@@ -209,14 +221,12 @@ final class AgentACPModelRegistry {
             invalidateAdvertisedModels(for: providerID)
         }
 
-        @_spi(TestSupport)
-        public func test_warmStandardStore() async {
+        package func test_warmStandardStore() async {
             preconditionNotInvalidating()
             await warmStandardStoreIfNeeded()
         }
 
-        @_spi(TestSupport)
-        public func test_snapshot(providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
+        package func test_snapshot(providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
             preconditionNotInvalidating()
             return resolvedSnapshot(for: providerID)
         }

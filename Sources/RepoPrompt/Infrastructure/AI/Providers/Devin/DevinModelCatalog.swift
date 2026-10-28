@@ -7,30 +7,30 @@ import RepoPromptAIContracts
 /// rejects effort-encoded IDs as `model` values, while the one-shot `devin -p --model` accepts
 /// them and has no effort flag. One ID therefore names a model+effort on every surface; only
 /// the ACP controller splits it into (advertised model, `thought_level` choice).
-struct DevinModelCatalog {
-    struct Thinking: Equatable {
-        let configID: String
-        let choiceRaw: String
+package struct DevinModelCatalog {
+    package struct Thinking: Equatable {
+        package let configID: String
+        package let choiceRaw: String
     }
 
-    struct Entry: Equatable {
+    package struct Entry: Equatable {
         /// Selectable ID and full label (`GPT-6 Sol · High`).
-        let option: AgentModelOption
-        let familyID: String
-        let familyDisplayName: String
+        package let option: AgentModelOption
+        package let familyID: String
+        package let familyDisplayName: String
         /// Submenu leaf title; nil for a model with no encoded effort.
-        let effortDisplayName: String?
+        package let effortDisplayName: String?
         /// Model ID Devin ACP advertises for this family.
-        let advertisedModelRaw: String
+        package let advertisedModelRaw: String
         /// Thinking choice to apply after selecting `advertisedModelRaw`; nil = model only.
-        let thinking: Thinking?
+        package let thinking: Thinking?
     }
 
-    struct MenuGroup: Equatable {
-        let displayName: String
-        let entries: [Entry]
+    package struct MenuGroup: Equatable {
+        package let displayName: String
+        package let entries: [Entry]
 
-        var rendersAsSubmenu: Bool {
+        package var rendersAsSubmenu: Bool {
             entries.contains { $0.effortDisplayName != nil }
         }
     }
@@ -47,12 +47,12 @@ struct DevinModelCatalog {
         private static let expansionCountLock = NSLock()
         private static var expansionCount = 0
 
-        static var test_expansionCount: Int {
+        package static var test_expansionCount: Int {
             expansionCountLock.withLock { expansionCount }
         }
     #endif
 
-    init(snapshot: ACPDiscoveredSessionModels?) {
+    package init(snapshot: ACPDiscoveredSessionModels?) {
         #if DEBUG
             Self.expansionCountLock.withLock { Self.expansionCount += 1 }
         #endif
@@ -103,13 +103,13 @@ struct DevinModelCatalog {
         entriesByNormalizedRaw = Dictionary(entries.map { (Self.normalized($0.option.rawValue), $0) }) { first, _ in first }
     }
 
-    func entry(matching raw: String) -> Entry? {
+    package func entry(matching raw: String) -> Entry? {
         entriesByNormalizedRaw[Self.normalized(raw)]
     }
 
     /// Family → effort groups for `options`, in first-appearance order. Options the catalog
     /// does not know stay direct items.
-    func menuGroups(for options: [AgentModelOption]) -> [MenuGroup] {
+    package func menuGroups(for options: [AgentModelOption]) -> [MenuGroup] {
         var groups: [(key: String, displayName: String, entries: [Entry])] = []
         var indexByKey: [String: Int] = [:]
         for option in options {
