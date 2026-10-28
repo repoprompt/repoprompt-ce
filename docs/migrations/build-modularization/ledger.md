@@ -1541,3 +1541,49 @@ passes through the canonical domain host; malformed handles remain separate.
 This is a bounded partial Stage 0 checkpoint, not #1402 or M6 completion. The
 32-line inherited dead-route retirement and surviving transcript owner are unchanged;
 no new production responsibility, extraction, or ratchet is claimed.
+
+### Stage 0 — request-progress authority retirement
+
+The app-owned direct `MCPRequestProgressState` route and its context enum, alias,
+forwarding overloads and direct send branch are retired. `MCPDomainHost` and its
+request progress handle remain the sole standard-progress authority; the boxed
+TaskLocal, same-connection inheritance, explicit override, connection separation,
+lifecycle correlation and RepoPrompt CLI control fallback remain. This slice changes
+`MCPConnectionManager.swift` by +9/-51 (60 combined lines), with no new state or
+owner. It does not retire filesystem transport or broader runtime responsibilities.
+
+Conductor `ff56b17c-e86e-45a9-aeb3-f467107e9446`, request
+`runtime-contract-20261028-progress-final`, passed exit 0, nine matched and passed:
+six connection-removal/progress tests and three TaskLocal layout guards. The three
+new tests exercise manager-to-host delivery and control fallback, canonical-handle
+nested inheritance/override/separation, and independently settled and terminal
+handle suppression followed by successor-generation delivery. Tested parent
+`b3fd63f3d8c3a946cfe2d5d47eb507410772c83f` plus two-file diff SHA-256
+`34e7db92fcec135af149036be058a56ed91c98a205697a91133b9567086990c7`.
+A DEBUG-only host getter now validates the complete handle and exposes the existing
+actor only for its quiescence test barrier; it adds no shipping state or authority.
+The tests capture each actor before finish/cancel, wait for its own worker after
+negative sends, and reject a forged handle. Final conductor
+`7891afb2-3c03-4e9c-8d0b-c3204bd81517`, request
+`runtime-contract-20261028-progress-quiescence`, passed exit 0, **13 matched and
+passed**: six progress/removal tests, three TaskLocal guards, four domain response
+delivery tests. Parent `b3fd63f3d8c3a946cfe2d5d47eb507410772c83f` plus three-Swift-file
+diff SHA-256 `d93a1958684425d5c080cbda0306b44ff2744bfc1cf6724819ed630881cf83f7`;
+execution 9m18s, global wait 16ms. The DEBUG observation adds 10 source lines;
+combined production delta is +19/-51, with no new shipping route or state.
+
+Scoped strict SwiftLint with `--no-cache` passed; pinned SwiftFormat 0.61.1
+reports nine pre-existing host-file diagnostics, independently reproduced on the
+exact HEAD baseline (`/tmp/runtime-contract-20261028-host-baseline-format.log`).
+The manager and test file passed pinned formatting. Whole-tree combined style remains
+NOT_PASSED as above. Live, packaged and vendor provider evidence remains NOT_RUN.
+
+The serialized acceptance fixture establishes no tool-requested workspace
+selection or unrelated focus/draft change only for an already active caller workspace.
+It does not establish inactive-presentation safety or UI-free execution. A minimal
+missing counterexample is an authorized observer captured for workspace A while its
+window has nil or unrelated workspace B active: exercise explicit and omitted
+workspace selection and assert the exact captured observer/workspace route without
+fallback, focus changes or fabricated success. Existing destination resolution draws
+from active window workspaces, so this remains a separate windowless/foreground
+gate, not a demonstrated passing case or a claim about #1408 completion.
