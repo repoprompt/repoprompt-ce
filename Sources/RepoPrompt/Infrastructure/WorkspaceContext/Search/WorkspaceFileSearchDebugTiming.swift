@@ -666,7 +666,7 @@
     package enum WorkspaceFileSearchDebugContext {
         @TaskLocal static var collector: WorkspaceFileSearchPhaseCollector?
         @TaskLocal static var catalogBuildObserver: WorkspaceFileSearchCatalogBuildObserver?
-        @TaskLocal static var coldStartCollector: WorkspaceFileSearchColdStartCollector?
+        @TaskLocal package static var coldStartCollector: WorkspaceFileSearchColdStartCollector?
     }
 
     enum WorkspaceFileSearchDebugTiming {
