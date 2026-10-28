@@ -1,9 +1,10 @@
 import Foundation
-@testable import RepoPromptApp
 import RepoPromptCodeMapCore
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptPersistence
+@testable import RepoPromptWorkspaceContext
+@testable import RepoPromptWorkspaceContextTestSupport
 import XCTest
 
 final class WorkspaceCodemapGraphFoundationModelTests: XCTestCase {

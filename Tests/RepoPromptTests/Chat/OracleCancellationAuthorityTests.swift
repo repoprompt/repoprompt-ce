@@ -4,6 +4,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 @MainActor

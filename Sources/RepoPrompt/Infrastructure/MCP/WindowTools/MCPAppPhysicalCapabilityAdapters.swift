@@ -3,6 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 /// Explicit app-process physical capability adapters used by domain-owned tool bindings.

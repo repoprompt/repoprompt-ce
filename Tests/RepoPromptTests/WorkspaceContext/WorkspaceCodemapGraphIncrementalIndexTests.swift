@@ -4,6 +4,8 @@ import RepoPromptCodeMapCore
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptPersistence
+@testable import RepoPromptWorkspaceContext
+@testable import RepoPromptWorkspaceContextTestSupport
 import XCTest
 
 /// Regression coverage for #1082: graph-index publication and graph commits must scale with the

@@ -5,6 +5,7 @@ import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 #if DEBUG

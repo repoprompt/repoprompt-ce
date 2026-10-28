@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptWorkspaceCore
 #if os(macOS)

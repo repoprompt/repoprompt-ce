@@ -4,6 +4,7 @@ import MCP
 import Ontology
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 /// An unsatisfied prerequisite rejects discovery without rolling back earlier selection or binding effects.

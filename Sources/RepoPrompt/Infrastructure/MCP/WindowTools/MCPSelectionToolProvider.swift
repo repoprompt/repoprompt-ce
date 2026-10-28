@@ -5,6 +5,7 @@ import Ontology
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 @MainActor
 final class MCPSelectionToolProvider: MCPAppToolProviding {

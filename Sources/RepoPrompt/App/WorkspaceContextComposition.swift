@@ -4,6 +4,7 @@ import RepoPromptInstrumentation
 import RepoPromptPersistence
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 extension CodeMapArtifactRuntime {

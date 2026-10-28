@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG

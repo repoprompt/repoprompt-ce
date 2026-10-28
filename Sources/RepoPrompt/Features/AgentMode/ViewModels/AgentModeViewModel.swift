@@ -9,6 +9,7 @@ import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 

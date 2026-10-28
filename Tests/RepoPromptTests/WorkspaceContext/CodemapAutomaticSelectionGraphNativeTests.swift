@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptPersistence
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {

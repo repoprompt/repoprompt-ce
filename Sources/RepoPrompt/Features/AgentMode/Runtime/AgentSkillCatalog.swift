@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 struct AgentSkillDefinition: Equatable, Hashable, Identifiable {
     /// Describes where a skill was discovered for prompt labels and stable source buckets.

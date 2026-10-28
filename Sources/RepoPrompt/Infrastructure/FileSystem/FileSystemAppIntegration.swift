@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 #if DEBUG
     private struct AppFileSystemReadAttribution: FileSystemReadAttribution {

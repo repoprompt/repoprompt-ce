@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import RepoPromptFileSystem
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 struct WorkspaceRootCreationFSEvent: Equatable {
     let path: String

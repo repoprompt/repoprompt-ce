@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 extension MCPServerViewModel {
     @MainActor

@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptFileSystem
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class FileSystemLivenessCorrectionTests: XCTestCase {

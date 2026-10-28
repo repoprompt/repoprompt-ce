@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptInstrumentation
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 #if DEBUG
     import CryptoKit
 #endif

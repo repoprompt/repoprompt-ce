@@ -1,5 +1,5 @@
-@testable import RepoPromptApp
 import RepoPromptFileSystem
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 

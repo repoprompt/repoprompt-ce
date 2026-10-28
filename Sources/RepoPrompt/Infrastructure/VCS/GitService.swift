@@ -9,6 +9,7 @@ import RepoPromptPersistence
 import RepoPromptProcess
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 extension GitDiffCompareSpec {

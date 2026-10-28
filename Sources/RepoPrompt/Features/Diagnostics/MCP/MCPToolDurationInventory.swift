@@ -3,6 +3,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 
 #if DEBUG
     /// Payload-free inventory of the server-wide Codex timeout and the independent

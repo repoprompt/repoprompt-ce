@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 /// Default Git repository for calls that do not identify one: the session's sole applicable worktree

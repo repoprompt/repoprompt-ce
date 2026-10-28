@@ -1,5 +1,6 @@
 import Dispatch
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 
 /// Owns ordered publisher-to-store ingress synchronously at the Combine sink boundary.

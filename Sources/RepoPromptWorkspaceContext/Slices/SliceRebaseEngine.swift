@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 
 package enum SliceRebaseEngine {

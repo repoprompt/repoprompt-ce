@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptC
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptRegexCore
 import RepoPromptWorkspaceCore

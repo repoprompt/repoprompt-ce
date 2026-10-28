@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 
 /// Workspace decoding and selection authority remain app-owned. The injected
 /// filesystem actor only serializes writes using this existing policy.

@@ -36,6 +36,9 @@ required_dirs=(
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
   "Sources/RepoPromptDomainRuntime"
+  "Sources/RepoPromptWorkspaceContext"
+  "Tests/RepoPromptWorkspaceContextTests"
+  "Tests/RepoPromptWorkspaceContextTestSupport"
   "Tests/RepoPromptTests"
   "Tests/RepoPromptWorkspaceCoreTests"
   "Tests/RepoPromptDomainRuntimeTests"
@@ -76,6 +79,20 @@ shared_mcp_required_files=(
 for file in "${shared_mcp_required_files[@]}"; do
   if [[ ! -f "$file" ]]; then
     fail "required shared MCP file missing: $file"
+  fi
+done
+
+# WorkspaceContext owns context/search/codemap orchestration, not app composition.
+print_matches \
+  "RepoPromptWorkspaceContext imports app/UI ownership" \
+  grep -R -n -E '^(@testable[[:space:]]+)?import[[:space:]]+(RepoPromptApp|AppKit|SwiftUI)([[:space:]]|$)' Sources/RepoPromptWorkspaceContext Tests/RepoPromptWorkspaceContextTests Tests/RepoPromptWorkspaceContextTestSupport --include='*.swift'
+print_matches \
+  "RepoPromptWorkspaceContext reads app-global preferences or bundle identity" \
+  grep -R -n -E 'UserDefaults[.]standard|Bundle[.]main' Sources/RepoPromptWorkspaceContext --include='*.swift'
+for retired in Sources/RepoPrompt/Infrastructure/WorkspaceContext Sources/RepoPrompt/Features/Search Sources/RepoPrompt/Features/CodeMap; do
+  if [[ -d "$retired" ]]; then
+    print_matches "WorkspaceContext implementation remains in retired app family: $retired" \
+      find "$retired" -type f -name '*.swift' -print
   fi
 done
 

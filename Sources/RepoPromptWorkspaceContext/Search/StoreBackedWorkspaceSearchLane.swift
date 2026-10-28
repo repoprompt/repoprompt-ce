@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 enum BroadSearchAdmissionClass: String {
     case unscopedContent

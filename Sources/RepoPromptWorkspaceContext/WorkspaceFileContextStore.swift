@@ -3,6 +3,7 @@ import CoreServices
 import Dispatch
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptInstrumentation

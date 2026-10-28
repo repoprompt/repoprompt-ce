@@ -1,4 +1,4 @@
-@testable import RepoPromptApp
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class PathSearchIndexRecoveryTests: XCTestCase {

@@ -3,6 +3,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG

@@ -3,6 +3,7 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptPersistence
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class WorkspaceCodemapRootCapabilityServiceTests: XCTestCase {

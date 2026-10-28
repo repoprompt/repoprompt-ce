@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 
 /// Raised when an Oracle prompt would omit explicitly selected full/slice file contents.
 struct PromptSelectedFileContentUnavailableError: LocalizedError, Equatable {

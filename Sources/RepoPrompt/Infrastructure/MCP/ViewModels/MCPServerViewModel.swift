@@ -1,5 +1,6 @@
 import RepoPromptFileSystem
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 //
 //  MCPServerViewModel.swift

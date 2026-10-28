@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import KeyboardShortcuts
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 // MARK: - Context Pill

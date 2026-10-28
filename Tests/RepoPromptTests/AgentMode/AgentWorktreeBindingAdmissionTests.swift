@@ -4,6 +4,7 @@ import MCP
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 

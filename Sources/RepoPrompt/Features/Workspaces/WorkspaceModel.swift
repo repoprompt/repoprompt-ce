@@ -3,6 +3,7 @@ import OSLog
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 struct WorkspaceDuplicateGroupSummary: Identifiable, Equatable {
     struct DuplicateWorkspaceRow: Identifiable, Equatable {

@@ -7,6 +7,7 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import RepoPromptRegexCore
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 @MainActor

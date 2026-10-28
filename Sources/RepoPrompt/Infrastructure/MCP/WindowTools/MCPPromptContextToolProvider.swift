@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 @MainActor

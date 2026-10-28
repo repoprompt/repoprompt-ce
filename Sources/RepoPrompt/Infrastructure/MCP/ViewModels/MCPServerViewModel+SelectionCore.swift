@@ -3,6 +3,7 @@ import MCP
 import RepoPromptFileSystem
 import RepoPromptFoundation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 extension MCPServerViewModel {
