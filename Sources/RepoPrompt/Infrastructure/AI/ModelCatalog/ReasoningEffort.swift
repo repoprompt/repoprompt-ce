@@ -10,9 +10,9 @@ public enum CodexReasoningEffort: String, CaseIterable, Codable, Sendable {
     case max
     case ultra
 
-    static let displayOrder: [CodexReasoningEffort] = [.none, .minimal, .low, .medium, .high, .xhigh, .max, .ultra]
+    package static let displayOrder: [CodexReasoningEffort] = [.none, .minimal, .low, .medium, .high, .xhigh, .max, .ultra]
 
-    static func parse(_ raw: String?) -> CodexReasoningEffort? {
+    package static func parse(_ raw: String?) -> CodexReasoningEffort? {
         let normalized = raw?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -39,7 +39,7 @@ public enum CodexReasoningEffort: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    var displayName: String {
+    package var displayName: String {
         switch self {
         case .none:
             "None"

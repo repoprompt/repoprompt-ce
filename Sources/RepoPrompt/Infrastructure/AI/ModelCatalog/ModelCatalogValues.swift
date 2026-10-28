@@ -2,9 +2,9 @@ import Foundation
 
 /// Speed capabilities published by the signed-in Codex model catalog.
 package struct CodexModelServiceTier: Codable, Hashable {
-    let id: String
-    let name: String
-    let description: String
+    package let id: String
+    package let name: String
+    package let description: String
 
     package init(id: String, name: String, description: String) {
         self.id = id
@@ -13,15 +13,15 @@ package struct CodexModelServiceTier: Codable, Hashable {
     }
 }
 
-enum CodexModelIdentity {
-    static func key(_ raw: String) -> String {
+package enum CodexModelIdentity {
+    package static func key(_ raw: String) -> String {
         raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 }
 
 package struct CodexDynamicReasoningRecord: Codable, Hashable {
-    let reasoningEffort: String
-    let description: String
+    package let reasoningEffort: String
+    package let description: String
 
     package init(reasoningEffort: String, description: String) {
         self.reasoningEffort = reasoningEffort
@@ -29,17 +29,17 @@ package struct CodexDynamicReasoningRecord: Codable, Hashable {
     }
 }
 
-struct CodexDynamicModelRecord: Codable, Hashable {
-    let id: String
-    let model: String
-    let displayName: String
-    let description: String
-    let isDefault: Bool
-    let supportedReasoningEfforts: [CodexDynamicReasoningRecord]
-    let defaultReasoningEffort: String?
-    let serviceTiers: [CodexModelServiceTier]
+package struct CodexDynamicModelRecord: Codable, Hashable {
+    package let id: String
+    package let model: String
+    package let displayName: String
+    package let description: String
+    package let isDefault: Bool
+    package let supportedReasoningEfforts: [CodexDynamicReasoningRecord]
+    package let defaultReasoningEffort: String?
+    package let serviceTiers: [CodexModelServiceTier]
 
-    init(
+    package init(
         id: String,
         model: String,
         displayName: String,
@@ -70,7 +70,7 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         case serviceTiers
     }
 
-    init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         model = try container.decode(String.self, forKey: .model)
@@ -83,18 +83,18 @@ struct CodexDynamicModelRecord: Codable, Hashable {
     }
 }
 
-struct CodexDynamicModelOption: Hashable {
-    let id: String
-    let displayName: String
-    let description: String
-    let isDefault: Bool
-    let baseID: String
-    let reasoningEffort: CodexReasoningEffort?
-    let supportedReasoningEffortRawValues: [String]
-    let defaultReasoningEffortRawValue: String?
-    let defaultReasoningEffort: CodexReasoningEffort?
+package struct CodexDynamicModelOption: Hashable {
+    package let id: String
+    package let displayName: String
+    package let description: String
+    package let isDefault: Bool
+    package let baseID: String
+    package let reasoningEffort: CodexReasoningEffort?
+    package let supportedReasoningEffortRawValues: [String]
+    package let defaultReasoningEffortRawValue: String?
+    package let defaultReasoningEffort: CodexReasoningEffort?
 
-    init(
+    package init(
         id: String,
         displayName: String,
         description: String,

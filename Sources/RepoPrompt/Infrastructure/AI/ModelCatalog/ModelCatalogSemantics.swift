@@ -1,7 +1,7 @@
 import Foundation
 
-enum ModelPickerStringOrdering {
-    static func compare(
+package enum ModelPickerStringOrdering {
+    package static func compare(
         _ lhs: String,
         _ rhs: String,
         caseInsensitiveASCII: Bool
@@ -20,7 +20,7 @@ enum ModelPickerStringOrdering {
         )
     }
 
-    static func precedes(
+    package static func precedes(
         _ lhs: String,
         _ rhs: String,
         caseInsensitiveASCII: Bool = true
@@ -51,16 +51,16 @@ enum ModelPickerStringOrdering {
 }
 
 /// Shared string-only model ordering and labels. No provider construction or persisted lookup.
-enum ModelCatalogSemantics {
-    struct Metadata {
-        let family: String
-        let versionComponents: [Int]
-        let suffix: String
-        let reasoningEffort: CodexReasoningEffort?
-        let displayName: String
-        let tieBreaker: String
+package enum ModelCatalogSemantics {
+    package struct Metadata {
+        package let family: String
+        package let versionComponents: [Int]
+        package let suffix: String
+        package let reasoningEffort: CodexReasoningEffort?
+        package let displayName: String
+        package let tieBreaker: String
 
-        init(family: String, versionComponents: [Int], suffix: String, reasoningEffort: CodexReasoningEffort?, displayName: String, tieBreaker: String) {
+        package init(family: String, versionComponents: [Int], suffix: String, reasoningEffort: CodexReasoningEffort?, displayName: String, tieBreaker: String) {
             self.family = family
             self.versionComponents = versionComponents
             self.suffix = suffix
@@ -70,13 +70,13 @@ enum ModelCatalogSemantics {
         }
     }
 
-    static func codexBaseModelPrecedes(_ lhs: String, _ rhs: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {
+    package static func codexBaseModelPrecedes(_ lhs: String, _ rhs: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {
         let leftMetadata = metadata(identifier: lhs, fallbackDisplayName: lhs, reasoningEffort: nil, catalogRecords: catalogRecords)
         let rightMetadata = metadata(identifier: rhs, fallbackDisplayName: rhs, reasoningEffort: nil, catalogRecords: catalogRecords)
         return precedes(leftMetadata, rightMetadata)
     }
 
-    static func codexPreviewDisplayAlias(for raw: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String? {
+    package static func codexPreviewDisplayAlias(for raw: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
@@ -107,7 +107,7 @@ enum ModelCatalogSemantics {
         return label
     }
 
-    static func stripCodexReasoningSuffix(from label: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
+    package static func stripCodexReasoningSuffix(from label: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
 
@@ -125,7 +125,7 @@ enum ModelCatalogSemantics {
         return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func precedes(_ lhs: Metadata, _ rhs: Metadata) -> Bool {
+    package static func precedes(_ lhs: Metadata, _ rhs: Metadata) -> Bool {
         let familyComparison = ModelPickerStringOrdering.compare(lhs.family, rhs.family, caseInsensitiveASCII: true)
         if familyComparison != .orderedSame {
             return familyComparison == .orderedAscending
@@ -155,7 +155,7 @@ enum ModelCatalogSemantics {
         return ModelPickerStringOrdering.precedes(lhs.tieBreaker, rhs.tieBreaker)
     }
 
-    static func metadata(
+    package static func metadata(
         identifier: String,
         fallbackDisplayName: String,
         reasoningEffort: CodexReasoningEffort?,
@@ -191,12 +191,12 @@ enum ModelCatalogSemantics {
         return .orderedSame
     }
 
-    static func reasoningSortRank(_ effort: CodexReasoningEffort?) -> Int {
+    package static func reasoningSortRank(_ effort: CodexReasoningEffort?) -> Int {
         guard let effort else { return -1 }
         return CodexReasoningEffort.displayOrder.firstIndex(of: effort) ?? Int.max
     }
 
-    static func reasoningEffort(in text: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> CodexReasoningEffort? {
+    package static func reasoningEffort(in text: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> CodexReasoningEffort? {
         codexSpecifierFromSemanticLabel(text, catalogRecords: catalogRecords).reasoningEffort
     }
 
@@ -233,14 +233,14 @@ enum ModelCatalogSemantics {
         return candidates
     }
 
-    static func normalizedCodexBaseLabel(_ label: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
+    package static func normalizedCodexBaseLabel(_ label: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
         let withoutPrefix = label
             .replacingOccurrences(of: "CLI·", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return stripCodexReasoningSuffix(from: withoutPrefix, catalogRecords: catalogRecords)
     }
 
-    static func humanizedCodexBaseModel(_ raw: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
+    package static func humanizedCodexBaseModel(_ raw: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
         if let alias = codexPreviewDisplayAlias(for: raw, catalogRecords: catalogRecords) {
             return alias
         }

@@ -1,13 +1,13 @@
 import Foundation
 
-enum CodexServiceTierVariantCatalog {
-    static let ultrafastServiceTier = "ultrafast"
-    static let knownServiceTiers = [fastServiceTier, ultrafastServiceTier]
-    static let fastServiceTier = "fast"
-    static let fastCostWarningText = "Fast service tier uses your usage limits about 2× faster."
+package enum CodexServiceTierVariantCatalog {
+    package static let ultrafastServiceTier = "ultrafast"
+    package static let knownServiceTiers = [fastServiceTier, ultrafastServiceTier]
+    package static let fastServiceTier = "fast"
+    package static let fastCostWarningText = "Fast service tier uses your usage limits about 2× faster."
 
     /// An explicitly empty structured list wins over deprecated tier IDs.
-    static func advertisedTiers(from entry: [String: Any]) -> [CodexModelServiceTier] {
+    package static func advertisedTiers(from entry: [String: Any]) -> [CodexModelServiceTier] {
         if let tiers = entry["serviceTiers"] as? [[String: Any]] {
             return tiers.compactMap { tier in
                 guard let id = tier["id"] as? String, !id.isEmpty else { return nil }
@@ -22,7 +22,7 @@ enum CodexServiceTierVariantCatalog {
         }
     }
 
-    static func isFastEligible(baseModelID: String) -> Bool {
+    package static func isFastEligible(baseModelID: String) -> Bool {
         guard let version = gptVersion(from: baseModelID) else { return false }
         return version.major > 5 || (version.major == 5 && version.minor >= 3)
     }
@@ -53,7 +53,7 @@ enum CodexServiceTierVariantCatalog {
         return (major, minor)
     }
 
-    static func isFastVariant(rawModel: String?, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {
+    package static func isFastVariant(rawModel: String?, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {
         let specifier = CodexModelSpecifier(raw: rawModel, catalogRecords: catalogRecords)
         guard let baseModel = specifier.baseModel else { return false }
         return supportedServiceTier(
@@ -62,7 +62,7 @@ enum CodexServiceTierVariantCatalog {
         ) == fastServiceTier
     }
 
-    static func serviceTierAwareBaseID(for rawModel: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
+    package static func serviceTierAwareBaseID(for rawModel: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
         let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let specifier = CodexModelSpecifier(raw: trimmed, catalogRecords: catalogRecords)
         var baseID = (specifier.baseModel ?? trimmed).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -75,7 +75,7 @@ enum CodexServiceTierVariantCatalog {
         return baseID
     }
 
-    static func supportedServiceTier(baseModelID: String, serviceTier: String?) -> String? {
+    package static func supportedServiceTier(baseModelID: String, serviceTier: String?) -> String? {
         guard let serviceTier else { return nil }
         let normalizedTier = serviceTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalizedTier == ultrafastServiceTier {
@@ -86,7 +86,7 @@ enum CodexServiceTierVariantCatalog {
         return normalizedTier
     }
 
-    static func fastVariantID(
+    package static func fastVariantID(
         baseModelID: String,
         reasoningEffort: CodexReasoningEffort?,
         catalogRecords: () -> [CodexDynamicModelRecord]

@@ -1,13 +1,13 @@
 import Foundation
 
-struct CodexModelSpecifier: Equatable {
-    typealias ReasoningEffort = CodexReasoningEffort
+package struct CodexModelSpecifier: Equatable {
+    package typealias ReasoningEffort = CodexReasoningEffort
 
-    let baseModel: String?
-    let reasoningEffort: ReasoningEffort?
-    let serviceTier: String?
+    package let baseModel: String?
+    package let reasoningEffort: ReasoningEffort?
+    package let serviceTier: String?
 
-    init(baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String? = nil) {
+    package init(baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String? = nil) {
         let normalizedBase = baseModel?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let normalizedBase, !normalizedBase.isEmpty, CodexModelIdentity.key(normalizedBase) != "default" {
             self.baseModel = normalizedBase
@@ -18,12 +18,12 @@ struct CodexModelSpecifier: Equatable {
         self.serviceTier = self.baseModel == nil ? nil : serviceTier
     }
 
-    init(raw: String?, catalogRecords: () -> [CodexDynamicModelRecord]) {
+    package init(raw: String?, catalogRecords: () -> [CodexDynamicModelRecord]) {
         let parts = Self.splitLegacyModelID(raw, catalogRecords: catalogRecords)
         self.init(baseModel: parts.baseModel, reasoningEffort: parts.reasoningEffort, serviceTier: parts.serviceTier)
     }
 
-    static func splitLegacyModelID(
+    package static func splitLegacyModelID(
         _ raw: String?,
         catalogRecords: () -> [CodexDynamicModelRecord]
     ) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
@@ -150,30 +150,30 @@ struct CodexModelSpecifier: Equatable {
         return base
     }
 
-    var cliModelArgs: [String] {
+    package var cliModelArgs: [String] {
         guard let baseModel else { return [] }
         return ["--model", baseModel]
     }
 
-    var cliReasoningConfigArgs: [String] {
+    package var cliReasoningConfigArgs: [String] {
         guard let reasoningEffort else { return [] }
         return ["-c", "model_reasoning_effort=\(reasoningEffort.rawValue)"]
     }
 
-    var cliServiceTierConfigArgs: [String] {
+    package var cliServiceTierConfigArgs: [String] {
         guard let supportedServiceTier else { return [] }
         return ["-c", "service_tier=\(supportedServiceTier)"]
     }
 
-    var appServerModelParam: String? {
+    package var appServerModelParam: String? {
         baseModel
     }
 
-    var appServerEffortParam: String? {
+    package var appServerEffortParam: String? {
         reasoningEffort?.rawValue
     }
 
-    var appServerServiceTierParam: String? {
+    package var appServerServiceTierParam: String? {
         supportedServiceTier
     }
 

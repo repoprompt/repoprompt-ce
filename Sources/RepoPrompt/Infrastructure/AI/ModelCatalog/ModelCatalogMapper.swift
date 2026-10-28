@@ -1,14 +1,14 @@
 import Foundation
 
 /// Shared record interpretation; catalog lookup is supplied by the consumer, never global here.
-enum CodexDynamicModelMapper {
+package enum CodexDynamicModelMapper {
     private struct EffortEntry {
         let effort: CodexReasoningEffort
         let description: String
         let isDefault: Bool
     }
 
-    static func options(from records: [CodexDynamicModelRecord], catalogRecords: () -> [CodexDynamicModelRecord]) -> [CodexDynamicModelOption] {
+    package static func options(from records: [CodexDynamicModelRecord], catalogRecords: () -> [CodexDynamicModelRecord]) -> [CodexDynamicModelOption] {
         var options: [CodexDynamicModelOption] = []
         var seen = Set<String>()
         let advertisedIDs = Set(records.map { CodexModelIdentity.key($0.id) }.filter { !$0.isEmpty })
@@ -96,7 +96,7 @@ enum CodexDynamicModelMapper {
         return options.sorted { optionPrecedes($0, $1, catalogRecords: catalogRecords) }
     }
 
-    static func optionPrecedes(_ lhs: CodexDynamicModelOption, _ rhs: CodexDynamicModelOption, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {
+    package static func optionPrecedes(_ lhs: CodexDynamicModelOption, _ rhs: CodexDynamicModelOption, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {
         if lhs.isDefault != rhs.isDefault {
             return lhs.isDefault && !rhs.isDefault
         }
@@ -121,7 +121,7 @@ enum CodexDynamicModelMapper {
         return normalizedOptionID(lhs.id) < normalizedOptionID(rhs.id)
     }
 
-    static func displayName(forModelID id: String, records: [CodexDynamicModelRecord], catalogRecords: () -> [CodexDynamicModelRecord]) -> String? {
+    package static func displayName(forModelID id: String, records: [CodexDynamicModelRecord], catalogRecords: () -> [CodexDynamicModelRecord]) -> String? {
         let lookupID = CodexModelIdentity.key(id)
         guard !lookupID.isEmpty else { return nil }
 
