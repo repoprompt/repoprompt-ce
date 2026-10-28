@@ -2,56 +2,6 @@ import Foundation
 import SwiftAnthropic
 import SwiftOpenAI
 
-enum ModelPickerStringOrdering {
-    static func compare(
-        _ lhs: String,
-        _ rhs: String,
-        caseInsensitiveASCII: Bool
-    ) -> ComparisonResult {
-        let foldedComparison = compareScalars(
-            lhs.unicodeScalars.map { foldedScalarValue($0.value, caseInsensitiveASCII: caseInsensitiveASCII) },
-            rhs.unicodeScalars.map { foldedScalarValue($0.value, caseInsensitiveASCII: caseInsensitiveASCII) }
-        )
-        if foldedComparison != .orderedSame || !caseInsensitiveASCII {
-            return foldedComparison
-        }
-
-        return compareScalars(
-            lhs.unicodeScalars.map(\.value),
-            rhs.unicodeScalars.map(\.value)
-        )
-    }
-
-    static func precedes(
-        _ lhs: String,
-        _ rhs: String,
-        caseInsensitiveASCII: Bool = true
-    ) -> Bool {
-        compare(lhs, rhs, caseInsensitiveASCII: caseInsensitiveASCII) == .orderedAscending
-    }
-
-    private static func foldedScalarValue(
-        _ value: UInt32,
-        caseInsensitiveASCII: Bool
-    ) -> UInt32 {
-        guard caseInsensitiveASCII, value >= 65, value <= 90 else { return value }
-        return value + 32
-    }
-
-    private static func compareScalars(
-        _ lhs: [UInt32],
-        _ rhs: [UInt32]
-    ) -> ComparisonResult {
-        let count = min(lhs.count, rhs.count)
-        for index in 0 ..< count {
-            if lhs[index] == rhs[index] { continue }
-            return lhs[index] < rhs[index] ? .orderedAscending : .orderedDescending
-        }
-        if lhs.count == rhs.count { return .orderedSame }
-        return lhs.count < rhs.count ? .orderedAscending : .orderedDescending
-    }
-}
-
 public enum AIModel: Equatable, Hashable {
     /// OpenAI Models
     case gpt41
@@ -1639,18 +1589,9 @@ public enum AIModel: Equatable, Hashable {
         let groups: [ClaudeCodePickerMenuGroup]
     }
 
-    private struct SemanticSortMetadata {
-        let family: String
-        let versionComponents: [Int]
-        let suffix: String
-        let reasoningEffort: CodexReasoningEffort?
-        let displayName: String
-        let tieBreaker: String
-    }
-
     static func sortedForPicker(_ models: [AIModel]) -> [AIModel] {
-        var metadataCache: [AIModel: SemanticSortMetadata] = [:]
-        func metadata(for model: AIModel) -> SemanticSortMetadata {
+        var metadataCache: [AIModel: ModelCatalogSemantics.Metadata] = [:]
+        func metadata(for model: AIModel) -> ModelCatalogSemantics.Metadata {
             if let cached = metadataCache[model] {
                 return cached
             }
@@ -1686,7 +1627,7 @@ public enum AIModel: Equatable, Hashable {
                     rhsKey: claudeCodeSortKey(for: rhs), rhs: rhs
                 )
             }
-            return semanticMetadataPrecedes(metadata(for: lhs), metadata(for: rhs))
+            return ModelCatalogSemantics.precedes(metadata(for: lhs), metadata(for: rhs))
         }
     }
 
@@ -1789,8 +1730,8 @@ public enum AIModel: Equatable, Hashable {
         return grouped.values.compactMap { groupEntries in
             guard let representative = groupEntries.first else { return nil }
             let sortedModels = groupEntries.sorted { lhs, rhs in
-                let leftRank = reasoningSortRank(lhs.reasoningEffort)
-                let rightRank = reasoningSortRank(rhs.reasoningEffort)
+                let leftRank = ModelCatalogSemantics.reasoningSortRank(lhs.reasoningEffort)
+                let rightRank = ModelCatalogSemantics.reasoningSortRank(rhs.reasoningEffort)
                 if leftRank != rightRank {
                     return leftRank < rightRank
                 }
@@ -1810,9 +1751,7 @@ public enum AIModel: Equatable, Hashable {
     }
 
     static func codexBaseModelPrecedes(_ lhs: String, _ rhs: String) -> Bool {
-        let leftMetadata = semanticSortMetadata(identifier: lhs, fallbackDisplayName: lhs, reasoningEffort: nil)
-        let rightMetadata = semanticSortMetadata(identifier: rhs, fallbackDisplayName: rhs, reasoningEffort: nil)
-        return semanticMetadataPrecedes(leftMetadata, rightMetadata)
+        ModelCatalogSemantics.codexBaseModelPrecedes(lhs, rhs, catalogRecords: { CodexDynamicModelStore.load() })
     }
 
     static func codexBaseDisplayName(for baseModelID: String, fallbackDisplayName: String) -> String {
@@ -1832,102 +1771,32 @@ public enum AIModel: Equatable, Hashable {
     }
 
     static func codexPreviewDisplayAlias(for raw: String) -> String? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        let specifier = CodexModelSpecifier(raw: trimmed)
-        let base = specifier.baseModel ?? trimmed
-        let normalizedBase = normalizedSemanticText(base)
-        let canonicalBase: String
-        switch normalizedBase {
-        case "gpt-5.6", "gpt-5.6-sol":
-            canonicalBase = "GPT-5.6 Sol"
-        case "gpt-5.6-terra":
-            canonicalBase = "GPT-5.6 Terra"
-        case "gpt-5.6-luna":
-            canonicalBase = "GPT-5.6 Luna"
-        case "gpt-5.5":
-            canonicalBase = "GPT-5.5"
-        default:
-            return nil
-        }
-
-        var label = canonicalBase
-        if let serviceTier = specifier.serviceTier {
-            label += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier ? " Fast" : " \(serviceTier.capitalized)"
-        }
-        if let reasoningEffort = specifier.reasoningEffort {
-            label += " \(reasoningEffort.displayName)"
-        }
-        return label
+        ModelCatalogSemantics.codexPreviewDisplayAlias(for: raw, catalogRecords: { CodexDynamicModelStore.load() })
     }
 
     static func stripCodexReasoningSuffix(from label: String) -> String {
-        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return trimmed }
-
-        let specifier = codexSpecifierFromSemanticLabel(trimmed)
-        guard specifier.reasoningEffort != nil, let baseModel = specifier.baseModel else {
-            return trimmed
-        }
-
-        var stripped = humanizedCodexBaseModel(baseModel)
-        if let serviceTier = specifier.serviceTier {
-            stripped += serviceTier == CodexServiceTierVariantCatalog.fastServiceTier
-                ? " Fast"
-                : " \(serviceTier.capitalized)"
-        }
-        return stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        ModelCatalogSemantics.stripCodexReasoningSuffix(from: label, catalogRecords: { CodexDynamicModelStore.load() })
     }
 
     private static func semanticModelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
         let leftMetadata = semanticSortMetadata(for: lhs)
         let rightMetadata = semanticSortMetadata(for: rhs)
-        return semanticMetadataPrecedes(leftMetadata, rightMetadata)
+        return ModelCatalogSemantics.precedes(leftMetadata, rightMetadata)
     }
 
-    private static func semanticMetadataPrecedes(_ lhs: SemanticSortMetadata, _ rhs: SemanticSortMetadata) -> Bool {
-        let familyComparison = ModelPickerStringOrdering.compare(lhs.family, rhs.family, caseInsensitiveASCII: true)
-        if familyComparison != .orderedSame {
-            return familyComparison == .orderedAscending
-        }
-
-        let versionComparison = compareVersionComponents(lhs.versionComponents, rhs.versionComponents)
-        if versionComparison != .orderedSame {
-            return versionComparison == .orderedDescending
-        }
-
-        let leftReasoningRank = reasoningSortRank(lhs.reasoningEffort)
-        let rightReasoningRank = reasoningSortRank(rhs.reasoningEffort)
-        if leftReasoningRank != rightReasoningRank {
-            return leftReasoningRank < rightReasoningRank
-        }
-
-        let suffixComparison = ModelPickerStringOrdering.compare(lhs.suffix, rhs.suffix, caseInsensitiveASCII: true)
-        if suffixComparison != .orderedSame {
-            return suffixComparison == .orderedAscending
-        }
-
-        let displayComparison = ModelPickerStringOrdering.compare(lhs.displayName, rhs.displayName, caseInsensitiveASCII: true)
-        if displayComparison != .orderedSame {
-            return displayComparison == .orderedAscending
-        }
-
-        return ModelPickerStringOrdering.precedes(lhs.tieBreaker, rhs.tieBreaker)
-    }
-
-    private static func semanticSortMetadata(for model: AIModel) -> SemanticSortMetadata {
+    private static func semanticSortMetadata(for model: AIModel) -> ModelCatalogSemantics.Metadata {
         let identifier = model.providerType == .codex ? codexBaseModelID(for: model) : model.modelName
         let reasoningEffort = codexReasoningEffort(for: model)
             ?? reasoningEffort(in: model.modelName)
             ?? reasoningEffort(in: model.displayName)
-        let metadata = semanticSortMetadata(
+        let metadata = ModelCatalogSemantics.metadata(
             identifier: identifier,
             fallbackDisplayName: model.displayName,
-            reasoningEffort: reasoningEffort
+            reasoningEffort: reasoningEffort,
+            catalogRecords: { CodexDynamicModelStore.load() }
         )
 
-        return SemanticSortMetadata(
+        return ModelCatalogSemantics.Metadata(
             family: metadata.family,
             versionComponents: metadata.versionComponents,
             suffix: metadata.suffix,
@@ -1935,46 +1804,6 @@ public enum AIModel: Equatable, Hashable {
             displayName: metadata.displayName,
             tieBreaker: model.rawValue
         )
-    }
-
-    private static func semanticSortMetadata(
-        identifier: String,
-        fallbackDisplayName: String,
-        reasoningEffort: CodexReasoningEffort?
-    ) -> SemanticSortMetadata {
-        let semanticSource = codexPreviewDisplayAlias(for: identifier) ?? (identifier.isEmpty ? fallbackDisplayName : identifier)
-        let normalizedIdentifier = normalizedSemanticText(semanticSource)
-        let family = semanticFamily(in: normalizedIdentifier)
-        let versionComponents = semanticVersionComponents(in: normalizedIdentifier)
-        let suffix = semanticSuffix(in: normalizedIdentifier)
-
-        return SemanticSortMetadata(
-            family: family,
-            versionComponents: versionComponents,
-            suffix: suffix,
-            reasoningEffort: reasoningEffort,
-            displayName: fallbackDisplayName,
-            tieBreaker: identifier
-        )
-    }
-
-    private static func compareVersionComponents(_ lhs: [Int], _ rhs: [Int]) -> ComparisonResult {
-        guard !lhs.isEmpty || !rhs.isEmpty else { return .orderedSame }
-
-        let maxCount = max(lhs.count, rhs.count)
-        for index in 0 ..< maxCount {
-            let leftValue = index < lhs.count ? lhs[index] : -1
-            let rightValue = index < rhs.count ? rhs[index] : -1
-            if leftValue == rightValue { continue }
-            return leftValue < rightValue ? .orderedAscending : .orderedDescending
-        }
-
-        return .orderedSame
-    }
-
-    private static func reasoningSortRank(_ effort: CodexReasoningEffort?) -> Int {
-        guard let effort else { return -1 }
-        return CodexReasoningEffort.displayOrder.firstIndex(of: effort) ?? Int.max
     }
 
     private static func codexBaseModelID(for model: AIModel) -> String {
@@ -1995,156 +1824,15 @@ public enum AIModel: Equatable, Hashable {
     }
 
     private static func reasoningEffort(in text: String) -> CodexReasoningEffort? {
-        codexSpecifierFromSemanticLabel(text).reasoningEffort
-    }
-
-    private static func codexSpecifierFromSemanticLabel(_ text: String) -> CodexModelSpecifier {
-        let parseableText = text
-            .replacingOccurrences(of: "CLI·", with: "")
-            .replacingOccurrences(of: "(", with: " ")
-            .replacingOccurrences(of: ")", with: " ")
-        let normalized = normalizedSemanticText(parseableText)
-        let candidates = codexSpecifierCandidates(fromNormalizedSemanticText: normalized)
-        for candidate in candidates {
-            let specifier = CodexModelSpecifier(raw: candidate)
-            if specifier.reasoningEffort != nil {
-                return specifier
-            }
-        }
-        return CodexModelSpecifier(raw: normalized)
-    }
-
-    private static func codexSpecifierCandidates(fromNormalizedSemanticText normalized: String) -> [String] {
-        guard !normalized.isEmpty else { return [normalized] }
-
-        var candidates: [String] = []
-        func appendAlias(suffix: String, replacement: String) {
-            guard normalized.hasSuffix(suffix) else { return }
-            let base = String(normalized.dropLast(suffix.count))
-            guard !base.isEmpty else { return }
-            candidates.append("\(base)\(replacement)")
-        }
-
-        appendAlias(suffix: "-x-high", replacement: "-xhigh")
-        appendAlias(suffix: "-med", replacement: "-medium")
-        candidates.append(normalized)
-        return candidates
+        ModelCatalogSemantics.reasoningEffort(in: text, catalogRecords: { CodexDynamicModelStore.load() })
     }
 
     private static func normalizedCodexBaseLabel(_ label: String) -> String {
-        let withoutPrefix = label
-            .replacingOccurrences(of: "CLI·", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return stripCodexReasoningSuffix(from: withoutPrefix)
+        ModelCatalogSemantics.normalizedCodexBaseLabel(label, catalogRecords: { CodexDynamicModelStore.load() })
     }
 
     private static func humanizedCodexBaseModel(_ raw: String) -> String {
-        if let alias = codexPreviewDisplayAlias(for: raw) {
-            return alias
-        }
-
-        let tokens = raw.split { character in
-            character == "_" || character == "-" || character == "/" || character.isWhitespace
-        }
-        guard !tokens.isEmpty else { return raw }
-
-        var formatted: [String] = []
-        formatted.reserveCapacity(tokens.count)
-        for token in tokens {
-            let value = String(token)
-            let formattedToken = formatCodexLabelToken(value)
-            if isVersionToken(value), formatted.last == "GPT" {
-                formatted[formatted.count - 1] = "GPT-\(formattedToken)"
-            } else {
-                formatted.append(formattedToken)
-            }
-        }
-        return formatted.joined(separator: " ")
-    }
-
-    private static func formatCodexLabelToken(_ value: String) -> String {
-        let lower = value.lowercased()
-        if lower == "gpt" { return "GPT" }
-        if lower == "codex" { return "Codex" }
-        if lower == "xhigh" { return "XHigh" }
-        if isVersionToken(value) { return value }
-        return lower.capitalized
-    }
-
-    private static func isVersionToken(_ value: String) -> Bool {
-        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
-        guard !parts.isEmpty else { return false }
-        return parts.allSatisfy { part in
-            !part.isEmpty && part.allSatisfy(\.isNumber)
-        }
-    }
-
-    private static func normalizedSemanticText(_ text: String) -> String {
-        var output = ""
-        var previousWasSeparator = false
-        for character in text.lowercased() {
-            if character == "·" || character == "_" || character.isWhitespace {
-                if !previousWasSeparator {
-                    output.append("-")
-                    previousWasSeparator = true
-                }
-            } else {
-                output.append(character)
-                previousWasSeparator = false
-            }
-        }
-        return output.trimmingCharacters(in: CharacterSet(charactersIn: "- /"))
-    }
-
-    private static func semanticFamily(in text: String) -> String {
-        guard let firstNumberIndex = text.firstIndex(where: { $0.isNumber }) else {
-            return text
-        }
-
-        let prefix = text[..<firstNumberIndex]
-            .trimmingCharacters(in: CharacterSet(charactersIn: "- /"))
-        return prefix.isEmpty ? text : String(prefix)
-    }
-
-    private static func semanticVersionComponents(in text: String) -> [Int] {
-        guard let firstNumberIndex = text.firstIndex(where: { $0.isNumber }) else {
-            return []
-        }
-
-        var cursor = firstNumberIndex
-        var versionString = ""
-        while cursor < text.endIndex {
-            let character = text[cursor]
-            if character.isNumber || character == "." {
-                versionString.append(character)
-                cursor = text.index(after: cursor)
-                continue
-            }
-            break
-        }
-
-        return versionString
-            .split(separator: ".")
-            .compactMap { Int($0) }
-    }
-
-    private static func semanticSuffix(in text: String) -> String {
-        guard let firstNumberIndex = text.firstIndex(where: { $0.isNumber }) else {
-            return text
-        }
-
-        var cursor = firstNumberIndex
-        while cursor < text.endIndex {
-            let character = text[cursor]
-            if character.isNumber || character == "." {
-                cursor = text.index(after: cursor)
-                continue
-            }
-            break
-        }
-
-        return text[cursor...]
-            .trimmingCharacters(in: CharacterSet(charactersIn: "- /"))
+        ModelCatalogSemantics.humanizedCodexBaseModel(raw, catalogRecords: { CodexDynamicModelStore.load() })
     }
 
     static func allModels() -> [AIModel] {

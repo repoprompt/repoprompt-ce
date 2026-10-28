@@ -220,6 +220,43 @@ final class CodexDiscoveredEffortTests: XCTestCase {
         XCTAssertNil(base.appServerEffortParam)
     }
 
+    func testCatalogLookupRemainsLazyAtConvenienceAndInterpretationBoundaries() {
+        var lookupCount = 0
+        func lookup() -> [CodexDynamicModelRecord] {
+            lookupCount += 1
+            return [record("gpt-future-max", efforts: ["high"])]
+        }
+
+        for raw in [nil, "", "  ", " default "] as [String?] {
+            XCTAssertNil(CodexModelSpecifier(raw: raw, discoveredRecords: lookup()).baseModel)
+            XCTAssertNil(CodexModelSpecifier(raw: raw, catalogRecords: lookup).baseModel)
+        }
+        XCTAssertNil(CodexServiceTierVariantCatalog.fastVariantID(baseModelID: "", reasoningEffort: .max, discoveredRecords: lookup()))
+        XCTAssertEqual(CodexServiceTierVariantCatalog.fastVariantID(baseModelID: "gpt-5.6", reasoningEffort: nil, discoveredRecords: lookup()), "gpt-5.6-fast")
+        XCTAssertEqual(lookupCount, 0)
+
+        let exact = CodexModelSpecifier(raw: "gpt-future-max", discoveredRecords: lookup())
+        XCTAssertEqual(exact.baseModel, "gpt-future-max")
+        XCTAssertNil(exact.reasoningEffort)
+        XCTAssertGreaterThan(lookupCount, 0)
+    }
+
+    func testExplicitCatalogContextReachesMapperLabelsAndServiceTierInterpretation() {
+        let exact = record("gpt-5.6-max", efforts: [])
+        // Mapping records and interpretation context are intentionally distinct: the old app
+        // entrypoint uses persisted discovery for interpretation, not the mapped input itself.
+        let withoutExact = CodexDynamicModelMapper.options(from: [exact], catalogRecords: { [] })
+        let withExact = CodexDynamicModelMapper.options(from: [exact], catalogRecords: { [exact] })
+        XCTAssertEqual(withoutExact.first?.displayName, "GPT-5.6 Sol Max")
+        XCTAssertEqual(withExact.first?.displayName, "GPT-5.6 Max")
+        XCTAssertEqual(CodexDynamicModelMapper.displayName(forModelID: exact.id, records: [exact], catalogRecords: { [exact] }), "GPT-5.6 Max")
+
+        let tierID = record("gpt-5.6-fast-max", efforts: [])
+        XCTAssertEqual(CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: tierID.id, catalogRecords: { [] }), "gpt-5.6-fast")
+        XCTAssertEqual(CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: tierID.id, catalogRecords: { [tierID] }), tierID.id)
+        XCTAssertNil(CodexServiceTierVariantCatalog.fastVariantID(baseModelID: "gpt-5.6", reasoningEffort: .max, catalogRecords: { [tierID] }))
+    }
+
     private func record(_ id: String, efforts: [String], defaultEffort: String? = nil) -> CodexDynamicModelRecord {
         CodexDynamicModelRecord(
             id: id, model: id, displayName: id, description: "", isDefault: false,

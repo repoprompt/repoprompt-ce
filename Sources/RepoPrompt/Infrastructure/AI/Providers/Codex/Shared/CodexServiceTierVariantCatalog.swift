@@ -1,12 +1,5 @@
 import Foundation
 
-/// Speed capabilities published by the signed-in Codex model catalog.
-struct CodexModelServiceTier: Codable, Hashable {
-    let id: String
-    let name: String
-    let description: String
-}
-
 enum CodexServiceTierVariantCatalog {
     static let ultrafastServiceTier = "ultrafast"
     static let knownServiceTiers = [fastServiceTier, ultrafastServiceTier]
@@ -60,8 +53,8 @@ enum CodexServiceTierVariantCatalog {
         return (major, minor)
     }
 
-    static func isFastVariant(rawModel: String?) -> Bool {
-        let specifier = CodexModelSpecifier(raw: rawModel)
+    static func isFastVariant(rawModel: String?, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {
+        let specifier = CodexModelSpecifier(raw: rawModel, catalogRecords: catalogRecords)
         guard let baseModel = specifier.baseModel else { return false }
         return supportedServiceTier(
             baseModelID: baseModel,
@@ -69,9 +62,9 @@ enum CodexServiceTierVariantCatalog {
         ) == fastServiceTier
     }
 
-    static func serviceTierAwareBaseID(for rawModel: String) -> String {
+    static func serviceTierAwareBaseID(for rawModel: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> String {
         let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        let specifier = CodexModelSpecifier(raw: trimmed)
+        let specifier = CodexModelSpecifier(raw: trimmed, catalogRecords: catalogRecords)
         var baseID = (specifier.baseModel ?? trimmed).trimmingCharacters(in: .whitespacesAndNewlines)
         if let tier = supportedServiceTier(
             baseModelID: baseID,
@@ -96,7 +89,7 @@ enum CodexServiceTierVariantCatalog {
     static func fastVariantID(
         baseModelID: String,
         reasoningEffort: CodexReasoningEffort?,
-        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+        catalogRecords: () -> [CodexDynamicModelRecord]
     ) -> String? {
         let baseModelID = baseModelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !baseModelID.isEmpty, isFastEligible(baseModelID: baseModelID) else { return nil }
@@ -104,7 +97,7 @@ enum CodexServiceTierVariantCatalog {
             let variantID = "\(baseModelID)-\(fastServiceTier)-\(reasoningEffort.rawValue)"
             // Exact discovered model IDs take precedence during extended-effort parsing.
             if [CodexReasoningEffort.max, .ultra].contains(reasoningEffort),
-               discoveredRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(variantID) })
+               catalogRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(variantID) })
             {
                 return nil
             }

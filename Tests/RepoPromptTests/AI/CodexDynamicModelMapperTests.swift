@@ -21,7 +21,9 @@ final class CodexDynamicModelMapperTests: XCTestCase {
         options.append(option(id: "future-model-alpha", base: "future-model", name: "Shared", effort: .high))
         options.append(option(id: "future-model-beta", base: "future-model", name: "shared", effort: .high))
         options.append(option(id: "FUTURE-MODEL-ALPHA", base: "FUTURE-MODEL", name: "SHARED", effort: .high))
-        let precedes = CodexDynamicModelMapper.optionPrecedes
+        let precedes: (CodexDynamicModelOption, CodexDynamicModelOption) -> Bool = {
+            CodexDynamicModelMapper.optionPrecedes($0, $1, catalogRecords: { [] })
+        }
         let equivalent = { (lhs: CodexDynamicModelOption, rhs: CodexDynamicModelOption) in
             !precedes(lhs, rhs) && !precedes(rhs, lhs)
         }
@@ -48,12 +50,12 @@ final class CodexDynamicModelMapperTests: XCTestCase {
         let options = CodexDynamicModelMapper.options(from: [
             record(id: "gpt-5.2", isDefault: true, efforts: ["low", "high"], defaultEffort: "high"),
             record(id: "gpt-5.4", efforts: ["low"], defaultEffort: "low")
-        ])
+        ], catalogRecords: { [] })
 
         // Previously: 5.2-low < 5.2-high (effort), 5.2-high < 5.4-low
         // (default), and 5.4-low < 5.2-low (base version).
         XCTAssertEqual(options.map(\.id), ["gpt-5.2-high", "gpt-5.4-low", "gpt-5.2-low"])
-        XCTAssertTrue(CodexDynamicModelMapper.optionPrecedes(options[0], options[2]))
+        XCTAssertTrue(CodexDynamicModelMapper.optionPrecedes(options[0], options[2], catalogRecords: { [] }))
     }
 
     func testEqualDisplayNamesUseNormalizedOptionIdentity() {
@@ -62,7 +64,7 @@ final class CodexDynamicModelMapperTests: XCTestCase {
 
         XCTAssertEqual(alpha.displayName.localizedCaseInsensitiveCompare(beta.displayName), .orderedSame)
         for input in [[alpha, beta], [beta, alpha]] {
-            XCTAssertEqual(input.sorted(by: CodexDynamicModelMapper.optionPrecedes).map(\.id), [alpha.id, beta.id])
+            XCTAssertEqual(input.sorted { CodexDynamicModelMapper.optionPrecedes($0, $1, catalogRecords: { [] }) }.map(\.id), [alpha.id, beta.id])
         }
     }
 
@@ -73,9 +75,9 @@ final class CodexDynamicModelMapperTests: XCTestCase {
             record(id: "future-b", displayName: "Shared"),
             record(id: "future-a", displayName: "shared")
         ]
-        let expected = CodexDynamicModelMapper.options(from: records)
+        let expected = CodexDynamicModelMapper.options(from: records, catalogRecords: { [] })
         for permutation in permutations(records) {
-            XCTAssertEqual(CodexDynamicModelMapper.options(from: permutation), expected)
+            XCTAssertEqual(CodexDynamicModelMapper.options(from: permutation, catalogRecords: { [] }), expected)
         }
     }
 

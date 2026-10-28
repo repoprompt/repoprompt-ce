@@ -18,14 +18,14 @@ struct CodexModelSpecifier: Equatable {
         self.serviceTier = self.baseModel == nil ? nil : serviceTier
     }
 
-    init(raw: String?, discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()) {
-        let parts = Self.splitLegacyModelID(raw, discoveredRecords: discoveredRecords())
+    init(raw: String?, catalogRecords: () -> [CodexDynamicModelRecord]) {
+        let parts = Self.splitLegacyModelID(raw, catalogRecords: catalogRecords)
         self.init(baseModel: parts.baseModel, reasoningEffort: parts.reasoningEffort, serviceTier: parts.serviceTier)
     }
 
     static func splitLegacyModelID(
         _ raw: String?,
-        discoveredRecords: @autoclosure () -> [CodexDynamicModelRecord] = CodexDynamicModelStore.load()
+        catalogRecords: () -> [CodexDynamicModelRecord]
     ) -> (baseModel: String?, reasoningEffort: ReasoningEffort?, serviceTier: String?) {
         guard
             let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -37,7 +37,7 @@ struct CodexModelSpecifier: Equatable {
 
         // A provider-advertised exact ID is a model, even when its name ends in a
         // familiar effort token. Only synthesized variants may be decomposed.
-        if discoveredRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(raw) }) {
+        if catalogRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(raw) }) {
             return (raw, nil, nil)
         }
 
@@ -67,7 +67,7 @@ struct CodexModelSpecifier: Equatable {
                 candidateEffort,
                 forBaseCandidate: candidate,
                 rawModel: raw,
-                records: discoveredRecords()
+                records: catalogRecords()
             ) {
                 base = candidate
                 effort = candidateEffort
