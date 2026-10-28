@@ -1,6 +1,19 @@
 import Foundation
 import RepoPromptAIContracts
 
+extension AgentACPModelRegistry.Dependencies {
+    /// Construct operations without touching the store or advertised catalog until invoked.
+    static var app: Self {
+        Self(
+            loadAll: { ACPDynamicModelStore.loadAll() },
+            load: { ACPDynamicModelStore.load(providerID: $0) },
+            save: { ACPDynamicModelStore.save($0, for: $1) },
+            remove: { ACPDynamicModelStore.remove(providerID: $0) },
+            invalidate: { AgentAdvertisedModelCatalog.shared.invalidate($0) }
+        )
+    }
+}
+
 /// App convenience boundaries retain the existing lazy persisted-catalog lookup.
 /// The interpretation owners accept that lookup explicitly and never read app storage.
 extension CodexModelSpecifier {

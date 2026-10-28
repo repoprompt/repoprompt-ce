@@ -2,8 +2,19 @@ import Foundation
 import RepoPromptSettingsCore
 
 final class AgentACPModelRegistry {
-    static let shared = AgentACPModelRegistry()
+    static let shared = AgentACPModelRegistry(dependencies: .app)
 
+    struct Dependencies {
+        let loadAll: @Sendable () -> [ACPProviderID: ACPDiscoveredSessionModels]
+        let load: (ACPProviderID) -> ACPDiscoveredSessionModels?
+        let save: (ACPDiscoveredSessionModels, ACPProviderID) -> Void
+        let remove: (ACPProviderID) -> Void
+        /// Synchronous; must not re-enter this registry or wait for another thread to do so.
+        let invalidate: (AgentProviderKind) -> Void
+    }
+
+    private let dependencies: Dependencies
+    private let invalidationThreadKey = "AgentACPModelRegistry.invalidation.\(UUID().uuidString)"
     private let lock = NSLock()
     private var liveSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
     private var liveSignaturesByProvider: [ACPProviderID: ACPDynamicProviderRecord] = [:]
@@ -16,13 +27,23 @@ final class AgentACPModelRegistry {
     private var didWarmStandardStore = false
     private var standardStoreWarmGeneration: UInt64 = 0
 
-    private init() {}
+    init(dependencies: Dependencies) {
+        self.dependencies = dependencies
+    }
+
+    private func preconditionNotInvalidating() {
+        precondition(
+            Thread.current.threadDictionary[invalidationThreadKey] == nil,
+            "AgentACPModelRegistry invalidator must not synchronously re-enter the same registry"
+        )
+    }
 
     @discardableResult
     func updateDiscoveredModels(
         _ snapshot: ACPDiscoveredSessionModels,
         for providerID: ACPProviderID
     ) -> Bool {
+        preconditionNotInvalidating()
         guard let providerRecord = ACPDynamicModelStore.canonicalProviderRecord(
             from: snapshot,
             providerID: providerID
@@ -44,28 +65,35 @@ final class AgentACPModelRegistry {
 
         guard didChange else { return false }
         invalidateAdvertisedModels(for: providerID)
-        ACPDynamicModelStore.save(normalizedSnapshot, for: providerID)
+        dependencies.save(normalizedSnapshot, providerID)
         return true
     }
 
     private func invalidateAdvertisedModels(for providerID: ACPProviderID) {
         for agent in AgentProviderKind.allCases where agent.acpProviderID == providerID {
-            AgentAdvertisedModelCatalog.shared.invalidate(agent)
+            preconditionNotInvalidating()
+            let threadState = Thread.current.threadDictionary
+            threadState[invalidationThreadKey] = true
+            defer { threadState.removeObject(forKey: invalidationThreadKey) }
+            dependencies.invalidate(agent)
         }
     }
 
     func currentSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
+        preconditionNotInvalidating()
         lock.lock()
         defer { lock.unlock() }
         return liveSnapshotsByProvider[providerID]
     }
 
     func resolvedSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
-        snapshotFromMemory(for: providerID)
+        preconditionNotInvalidating()
+        return snapshotFromMemory(for: providerID)
     }
 
     func currentDevinCatalog() -> DevinModelCatalog {
-        lock.withLock { devinCatalog }
+        preconditionNotInvalidating()
+        return lock.withLock { devinCatalog }
     }
 
     /// Caller holds `lock`. Build and publication are atomic with snapshot mutation.
@@ -77,6 +105,7 @@ final class AgentACPModelRegistry {
     }
 
     func warmStandardStoreIfNeeded(beforeCompleting: (@Sendable () async -> Void)? = nil) async {
+        preconditionNotInvalidating()
         let plan: StandardStoreWarmPlan? = lock.withLock {
             guard !didWarmStandardStore else { return nil }
 
@@ -84,8 +113,9 @@ final class AgentACPModelRegistry {
             if let existing = standardStoreWarmTask {
                 task = existing
             } else {
+                let loadAll = dependencies.loadAll
                 let newTask = Task.detached(priority: .utility) {
-                    ACPDynamicModelStore.loadAll()
+                    loadAll()
                 }
                 standardStoreWarmTask = newTask
                 task = newTask
@@ -120,12 +150,14 @@ final class AgentACPModelRegistry {
 
     /// Reads saved data when memory is empty, without installing it or changing warm state.
     func resolvedSnapshotIncludingStandardStore(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
-        snapshotFromMemory(for: providerID) ?? ACPDynamicModelStore.load(providerID: providerID)
+        preconditionNotInvalidating()
+        return snapshotFromMemory(for: providerID) ?? dependencies.load(providerID)
     }
 
     func resolvedSnapshotAfterWarmingStandardStore(
         for providerID: ACPProviderID
     ) async -> ACPDiscoveredSessionModels? {
+        preconditionNotInvalidating()
         if let snapshot = snapshotFromMemory(for: providerID) {
             return snapshot
         }
@@ -142,6 +174,7 @@ final class AgentACPModelRegistry {
     #if DEBUG
         @_spi(TestSupport)
         public func test_reset(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
+            preconditionNotInvalidating()
             invalidateAdvertisedModels(for: providerID)
             beforeClearingMemory?()
             lock.lock()
@@ -154,13 +187,14 @@ final class AgentACPModelRegistry {
             didWarmStandardStore = false
             standardStoreWarmGeneration &+= 1
             lock.unlock()
-            ACPDynamicModelStore.remove(providerID: providerID)
+            dependencies.remove(providerID)
             // Fence producers that read the old snapshot after the first invalidation.
             invalidateAdvertisedModels(for: providerID)
         }
 
         @_spi(TestSupport)
         public func test_clearMemoryPreservingStore(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
+            preconditionNotInvalidating()
             invalidateAdvertisedModels(for: providerID)
             beforeClearingMemory?()
             lock.lock()
@@ -179,12 +213,14 @@ final class AgentACPModelRegistry {
 
         @_spi(TestSupport)
         public func test_warmStandardStore() async {
+            preconditionNotInvalidating()
             await warmStandardStoreIfNeeded()
         }
 
         @_spi(TestSupport)
         public func test_snapshot(providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
-            resolvedSnapshot(for: providerID)
+            preconditionNotInvalidating()
+            return resolvedSnapshot(for: providerID)
         }
     #endif
 }
