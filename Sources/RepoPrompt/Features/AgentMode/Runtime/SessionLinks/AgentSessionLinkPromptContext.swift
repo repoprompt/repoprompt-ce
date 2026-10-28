@@ -547,19 +547,26 @@ struct AgentSessionLinkPromptRenderRequest {
     /// How much lane-update trust guidance this render owes, decided by the store from the last
     /// revision this observer physically accepted in this provider context.
     let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode
+    /// Initial idle-follow-up routine qualification, never a copy-emission switch on its own.
+    let routineQuietCheckIn: Bool
+    let providerContext: AgentSessionLinkPromptProviderContext
 
     init(
         membershipKind: AgentSessionLinkPromptSupplementKind?,
         inventory: AgentSessionLinkPromptInventory,
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
         toolReference: String = MCPWindowToolName.agentSessionLink,
-        laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode = .full
+        laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode = .full,
+        routineQuietCheckIn: Bool = false,
+        providerContext: AgentSessionLinkPromptProviderContext = .unselected
     ) {
         self.membershipKind = membershipKind
         self.inventory = inventory
         self.passiveNotices = passiveNotices
         self.toolReference = toolReference
         self.laneGuidanceMode = laneGuidanceMode
+        self.routineQuietCheckIn = routineQuietCheckIn
+        self.providerContext = providerContext
     }
 }
 
@@ -709,6 +716,34 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     /// The exact observer incarnation this claim was rendered for. Acceptance never transfers its
     /// inventory or passive receipt to a successor incarnation.
     var observerEndpoint: DomainAgentSessionLinkEndpointIdentity?
+    /// Frozen from the initial route and the ACTUALLY rendered batch. Codex qualifies without copy.
+    let routineQuietCheckIn: Bool
+
+    init(
+        observerSessionID: UUID,
+        dispatchID: AgentSessionLinkPromptDispatchID,
+        epochToken: AgentSessionLinkPromptEpochToken,
+        membership: MembershipComponent? = nil,
+        passiveQueue: PassiveQueueFingerprint? = nil,
+        passive: PassiveStatusComponent? = nil,
+        laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode? = nil,
+        inventoryGuidanceRevision: UInt64? = nil,
+        fragment: String,
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity? = nil,
+        routineQuietCheckIn: Bool = false
+    ) {
+        self.observerSessionID = observerSessionID
+        self.dispatchID = dispatchID
+        self.epochToken = epochToken
+        self.membership = membership
+        self.passiveQueue = passiveQueue
+        self.passive = passive
+        self.laneGuidanceMode = laneGuidanceMode
+        self.inventoryGuidanceRevision = inventoryGuidanceRevision
+        self.fragment = fragment
+        self.observerEndpoint = observerEndpoint
+        self.routineQuietCheckIn = routineQuietCheckIn
+    }
 
     // MARK: Membership readers
 
@@ -793,6 +828,7 @@ struct AgentSessionLinkDispatchContext: Equatable {
 }
 
 struct AgentSessionLinkDecoratedProviderText {
+    var quietMarkerProducerLifetime: AgentQuietMarkerProducerLifetime?
     var dispatchContext: AgentSessionLinkDispatchContext?
     let text: String
     /// Acknowledge at this dispatch's own physical-acceptance signal, and only then.
@@ -1020,13 +1056,15 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         /// guidance is re-owed in full, and vice versa.
         let laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?
         let inventoryGuidanceRevision: UInt64?
+        let routineQuietCheckIn: Bool
 
         init(
             membershipKind: AgentSessionLinkPromptSupplementKind?,
             inventory: AgentSessionLinkPromptInventory,
             passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot?,
             laneGuidanceMode: AgentSessionLinkPrompts.LaneGuidanceMode?,
-            inventoryGuidanceRevision: UInt64?
+            inventoryGuidanceRevision: UInt64?,
+            routineQuietCheckIn: Bool
         ) {
             membershipRevision = membershipKind == nil ? nil : inventory.linkSetRevision
             self.membershipKind = membershipKind
@@ -1038,6 +1076,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             }
             self.laneGuidanceMode = laneGuidanceMode
             self.inventoryGuidanceRevision = inventoryGuidanceRevision
+            self.routineQuietCheckIn = routineQuietCheckIn
         }
 
         init(_ claim: AgentSessionLinkOutboundPromptClaim) {
@@ -1046,6 +1085,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             passiveQueue = claim.passiveQueue
             laneGuidanceMode = claim.laneGuidanceMode
             inventoryGuidanceRevision = claim.inventoryGuidanceRevision
+            routineQuietCheckIn = claim.routineQuietCheckIn
         }
     }
 
@@ -1090,6 +1130,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
         locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
         allowsClaimlessAutoWake: Bool = false,
+        routineQuietCheckIn: Bool = false,
         decorateLocalInputs: (AgentSessionLinkPromptRenderResult) -> AgentSessionLinkLocalInputDecoration? = { _ in nil },
         inventoryGuidanceRevision: UInt64 = AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
@@ -1151,13 +1192,17 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             state.lastAcceptedLaneGuidanceRevision == AgentSessionLinkPrompts
                 .currentLaneGuidanceRevision ? .reminder : .full
         }
+        let routineQuietCheckIn = routineQuietCheckIn && dispatchID.autoWakeID != nil
+            && AgentSessionLinkPrompts.supportsQuietCheckIn(epoch.providerContext)
         let fingerprint = ClaimFingerprint(
             membershipKind: membershipKind,
             inventory: inventory,
             passiveNotices: passiveBatch,
             laneGuidanceMode: laneGuidanceMode,
-            inventoryGuidanceRevision: membershipKind == .inventory ? inventoryGuidanceRevision : nil
+            inventoryGuidanceRevision: membershipKind == .inventory ? inventoryGuidanceRevision : nil,
+            routineQuietCheckIn: routineQuietCheckIn
         )
+
         if let existing = state.pending[dispatchID], ClaimFingerprint(existing) == fingerprint {
             state.recordPossibleDelivery(of: existing)
             return .claimed(existing)
@@ -1175,7 +1220,9 @@ final class AgentSessionLinkOutboundPromptClaimStore {
                 inventory: inventory,
                 passiveNotices: passiveBatch,
                 toolReference: epoch.toolReference,
-                laneGuidanceMode: laneGuidanceMode ?? .full
+                laneGuidanceMode: laneGuidanceMode ?? .full,
+                routineQuietCheckIn: routineQuietCheckIn,
+                providerContext: epoch.providerContext
             ))
             state.renderedFingerprint = fingerprint
             state.renderedResult = rendered
@@ -1186,6 +1233,18 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             // and leave the lane batch owed.
             state.removePending(dispatchID)
             return .requiredLaneBatchUnavailable
+        }
+
+        let effectiveRoutineQuietCheckIn = routineQuietCheckIn && rendered.passiveBatch?.attentionRequests.isEmpty == true
+        let reuseFingerprint = ClaimFingerprint(
+            membershipKind: membershipKind, inventory: inventory, passiveNotices: passiveBatch,
+            laneGuidanceMode: laneGuidanceMode,
+            inventoryGuidanceRevision: fingerprint.inventoryGuidanceRevision,
+            routineQuietCheckIn: effectiveRoutineQuietCheckIn
+        )
+        if let existing = state.pending[dispatchID], ClaimFingerprint(existing) == reuseFingerprint {
+            state.recordPossibleDelivery(of: existing)
+            return .claimed(existing)
         }
 
         // The renderer is the authority on visible membership: the receipt names exactly its chosen
@@ -1232,7 +1291,8 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             laneGuidanceMode: laneGuidanceMode,
             inventoryGuidanceRevision: fingerprint.inventoryGuidanceRevision,
             fragment: rendered.fragment,
-            observerEndpoint: epoch.endpoint
+            observerEndpoint: epoch.endpoint,
+            routineQuietCheckIn: effectiveRoutineQuietCheckIn
         )
         claim.localInput = decorateLocalInputs(rendered)
         state.setPending(claim)
@@ -1258,6 +1318,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
         passiveNotices: AgentSessionLinkPassiveStatusNotices.Snapshot? = nil,
         locationLabelsByReference: [DomainAgentSessionLinkReference: String] = [:],
         inventoryGuidanceRevision: UInt64 = AgentSessionLinkPrompts.currentInventoryGuidanceRevision,
+        routineQuietCheckIn: Bool = false,
         render: (AgentSessionLinkPromptRenderRequest) -> AgentSessionLinkPromptRenderResult
     ) -> AgentSessionLinkOutboundPromptClaim? {
         claimOutcome(
@@ -1266,6 +1327,7 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             inventory: inventory,
             passiveNotices: passiveNotices,
             locationLabelsByReference: locationLabelsByReference,
+            routineQuietCheckIn: routineQuietCheckIn,
             inventoryGuidanceRevision: inventoryGuidanceRevision,
             render: render
         ).claim

@@ -172,7 +172,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
         let (deploymentID, descriptor) = try deploymentInfo(for: model)
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: deploymentID, descriptor: descriptor)
         let finalMaxTokens = resolvedMaxTokens(for: baseModel, override: maxTokens)
-        let parameters = buildBackgroundResponseParameters(
+        let parameters = try buildBackgroundResponseParameters(
             for: message,
             model: model,
             deploymentID: deploymentID,
@@ -531,6 +531,8 @@ final class AzureOpenAIProvider: AIProvider {
             (.gpt5CodexMed, "medium")
         case .gpt5CodexLow:
             (.gpt5CodexMed, "low")
+        case .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax:
+            (.gpt61Terra, model.defaultReasoningEffort)
         case .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax:
             (.gpt61Sol, model.defaultReasoningEffort)
         case .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax:
@@ -560,6 +562,7 @@ final class AzureOpenAIProvider: AIProvider {
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
              .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax,
              .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
              .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
@@ -592,9 +595,9 @@ final class AzureOpenAIProvider: AIProvider {
         baseModel: AIModel?,
         reasoningEffort: String?,
         maxTokens: Int?
-    ) -> ChatCompletionParameters {
+    ) throws -> ChatCompletionParameters {
         let embedSystemPrompt = baseModel == .o1Mini || baseModel == .o1Preview
-        var params = ChatCompletionParameters(
+        var params = try ChatCompletionParameters(
             messages: message.openAIChatMessages(embedSystemPrompt: embedSystemPrompt),
             model: .custom(deploymentID)
         )
@@ -637,11 +640,11 @@ final class AzureOpenAIProvider: AIProvider {
         reasoningEffort: String?,
         maxTokens: Int?,
         stream: Bool
-    ) -> ModelResponseParameter {
+    ) throws -> ModelResponseParameter {
         Self.debug("Building response parameters for model: \(model), deploymentID: \(deploymentID)")
         Self.debug("Base model: \(baseModel?.rawValue ?? "nil")")
         Self.debug("Reasoning effort: \(reasoningEffort ?? "nil")")
-        var parameters = ModelResponseParameter(
+        var parameters = try ModelResponseParameter(
             input: message.openAIResponsesInput(),
             model: SwiftOpenAI.Model.custom(deploymentID)
         )
@@ -673,8 +676,8 @@ final class AzureOpenAIProvider: AIProvider {
         baseModel: AIModel?,
         reasoningEffort: String?,
         maxTokens: Int?
-    ) -> ModelResponseParameter {
-        var parameters = buildResponseParameters(
+    ) throws -> ModelResponseParameter {
+        var parameters = try buildResponseParameters(
             for: message,
             model: model,
             deploymentID: deploymentID,
@@ -766,7 +769,7 @@ final class AzureOpenAIProvider: AIProvider {
         if useResponses {
             if streamingSupported {
                 // Real streaming via SSE (responseCreateStream)
-                let parameters = buildResponseParameters(
+                let parameters = try buildResponseParameters(
                     for: aiMessage,
                     model: model,
                     deploymentID: deploymentID,
@@ -804,7 +807,7 @@ final class AzureOpenAIProvider: AIProvider {
             }
         }
 
-        let parameters = buildChatParameters(
+        let parameters = try buildChatParameters(
             for: aiMessage,
             model: model,
             deploymentID: deploymentID,
@@ -874,7 +877,7 @@ final class AzureOpenAIProvider: AIProvider {
         let finalMaxTokens = resolvedMaxTokens(for: baseModel, override: maxTokens)
 
         if shouldUseResponsesAPI(descriptor: descriptor, baseModel: baseModel) {
-            let parameters = buildResponseParameters(
+            let parameters = try buildResponseParameters(
                 for: aiMessage,
                 model: model,
                 deploymentID: deploymentID,
@@ -914,7 +917,7 @@ final class AzureOpenAIProvider: AIProvider {
             }
         }
 
-        let parameters = buildChatParameters(
+        let parameters = try buildChatParameters(
             for: aiMessage,
             model: model,
             deploymentID: deploymentID,

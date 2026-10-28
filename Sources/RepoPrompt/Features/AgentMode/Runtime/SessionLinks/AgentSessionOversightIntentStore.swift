@@ -576,4 +576,14 @@ actor AgentSessionOversightIntentStore {
     func serializationBarrier() async {
         await saving?.value
     }
+
+    #if DEBUG
+        /// Read-only test observation seam: the store's own task currently responsible for queued
+        /// operations — the in-flight drain, or, while operations remain queued after a retryable
+        /// failure, the scheduled retry. `nil` when nothing is queued or no attempt is scheduled.
+        /// Starts, retries, and mutates nothing; `serializationBarrier` semantics are unchanged.
+        var test_outboxProgressTask: Task<Void, Never>? {
+            saving ?? (pending.isEmpty ? nil : retry)
+        }
+    #endif
 }

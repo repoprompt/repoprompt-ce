@@ -52,16 +52,31 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     /// Live Manage-grant proof from the session-link authority, revalidated against both endpoints.
     static func sessionLinkManageGrant(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        targetSessionID: UUID
-    ) async -> Bool {
-        if case .success = await AgentSessionLinkRuntimeBridge.shared.authorizeTarget(
+        targetSessionID: UUID,
+        bridge: AgentSessionLinkRuntimeBridge? = nil
+    ) async -> AgentSessionTargetOperationGuard.WorktreeBindingAuthority? {
+        let bridge = bridge ?? .shared
+        if case let .success(target) = await bridge.authorizeTarget(
             operation: .monitorWorktreeBinding,
             observerEndpoint: observerEndpoint,
-            targetSessionID: targetSessionID
+            targetSessionID: targetSessionID,
+            allowLinkEstablishment: false
         ) {
-            return true
+            let lease = target.lease
+            guard let authorization = await bridge.managementCommitAuthorization(for: lease) else { return nil }
+            return .init(revalidate: {
+                guard await bridge.managementLeaseIsStillAuthorized(lease) else {
+                    throw AgentSessionTargetOperationGuard.denialError(sessionID: targetSessionID)
+                }
+            }, commit: { body in
+                do {
+                    try bridge.withManagementCommitAuthorization(authorization, commit: body)
+                } catch is DomainAgentSessionLinkError {
+                    throw AgentSessionTargetOperationGuard.denialError(sessionID: targetSessionID)
+                }
+            })
         }
-        return false
+        return nil
     }
 
     func buildTools() -> [Tool] {
@@ -83,7 +98,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             - `worktree`: Worktree selector (`@current`, `@main`, `@branch:<name>`, name, branch, path, or `@id:<worktree_id>`).
             - `worktree_id`: Durable worktree ID alternative to `worktree`.
             - `target`: Merge preview target selector; defaults to `@main`.
-            - `target_worktree_id`: Durable merge target ID alternative to `target`.
+            - `target_worktree_id`: Durable merge target ID alternative to `target`.\(MCPDefaultRepositoryElectionCopy.manageWorktreeSection)
 
             **Session binding and merge source**:
             - `bind` and `select` persist a binding for one Agent session. Destination changes require an idle provider with no queued work or pending interactions; they restart/handoff the runtime, never reroute an active turn.
@@ -116,7 +131,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             inputSchema: .object(
                 properties: [
                     "op": .string(description: "Operation", enum: ["list", "show", "create", "bind", "select", "unbind", "preview", "apply", "status", "continue", "abort"]),
-                    "repo_root": .string(description: "Optional loaded root path/name or repo/worktree specifier. Defaults to the first loaded Git repo."),
+                    "repo_root": .string(description: MCPDefaultRepositoryElectionCopy.manageWorktreeRepoRootProperty),
                     "repo_key": .string(description: "Optional repository key alternative to repo_root."),
                     "worktree": .string(description: "Worktree selector: @current, @main, @branch:<name>, branch/name/path, or @id:<worktree_id>."),
                     "worktree_id": .string(description: "Durable worktree ID alternative to worktree. Mutually exclusive with worktree."),
@@ -193,7 +208,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func executeList(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
+        let discovery = try await captureDiscovery(invocationContext: invocationContext)
+        let context = try await requireRepository(args: args, discovery: discovery)
         let allWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
         // Stale (git-prunable) worktrees have a gitdir pointing to a non-existent location and are
         // not usable checkouts. Exclude them so a model never discovers/selects one; binding to a
@@ -251,12 +267,13 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func executeShow(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
-        let worktree = try await resolveWorktree(
+        let discovery = try await captureDiscovery(invocationContext: invocationContext)
+        // Without a repository argument an identifying worktree selects its own repository; an omitted
+        // worktree means `@current` of the elected default.
+        let (worktree, context) = try await resolveWorktree(
             args: args,
-            repo: context.repo,
-            allRepos: context.allRepos,
-            visibleRoots: context.visibleRoots,
+            discovery: discovery,
+            repository: resolveExplicitRepository(args: args, discovery: discovery),
             requireExplicit: false
         )
         if parseBool(args["persist_visuals"]) == true {
@@ -279,7 +296,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func executeCreate(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
-        let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
+        let discovery = try await captureDiscovery(invocationContext: invocationContext)
+        let context = try await requireRepository(args: args, discovery: discovery)
         let bindAfterCreate = parseBool(args["bind"]) ?? false
         let bindingRequest = bindAfterCreate ? try await resolveBindingRequest(args: args, invocationContext: invocationContext) : nil
         let sessionID = bindingRequest?.sessionID
@@ -351,44 +369,103 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         )
         // Commit at the backend's final fence: deterministic Git refusals (existing branch,
         // unresolvable base, occupied destination) settle before it as not-applied.
-        let createResult = try await vcsService.createGitWorktreeWithResult(
-            request: plan.createRequest,
-            at: context.repo.rootURL,
-            beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
-        )
+        let createResult: GitWorktreeCreateResult
+        do {
+            createResult = try await vcsService.createGitWorktreeWithResult(
+                request: plan.createRequest,
+                at: context.repo.rootURL,
+                beforeCommit: { [self] in
+                    if let bindingRequest {
+                        try await commitBindingMutation(bindingRequest.authority)
+                    } else {
+                        try await MCPDomainMutationCommitContext.willCommit()
+                    }
+                }
+            )
+        } catch let error as GitService.GitError where error.worktreeCreateFailure != nil {
+            // Keep the logical root legible beside the checkout Git ran in; every other failure passes through.
+            let checkout = context.repo.rootURL.standardizedFileURL.path
+            guard GitRepoRootAuthorization.canonicalPath(logicalRootPath) != GitRepoRootAuthorization.canonicalPath(checkout) else {
+                throw error
+            }
+            throw error.naming(workspaceRoot: logicalRootPath, servedBy: checkout)
+        }
         let created = createResult.descriptor
-        let identity = try persistOrResolveVisualIdentity(
-            for: created,
-            args: args,
-            persist: true
-        )
+        let identity = try bindingRequest == nil
+            ? persistOrResolveVisualIdentity(for: created, args: args, persist: true)
+            : plannedVisualIdentity(for: created, args: args)
         let createdDTO = try await worktreeDTO(created, visualIdentity: identity, includeStatus: parseBool(args["include_status"]) ?? false)
 
         var bindingDTO: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?
         var previousDTO: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?
         var pendingDTO: ToolResultDTOs.ManageWorktreeReplyDTO.PendingApplicationDTO?
         var bindingWarning: String?
-        if let sessionID {
+        if let bindingRequest {
             do {
                 let bindingResult = try await applyBinding(
-                    sessionID: sessionID,
+                    sessionID: bindingRequest.sessionID,
                     worktree: created,
                     context: context,
                     visualIdentity: identity,
                     args: args,
                     source: "manage_worktree.create",
-                    invocation: bindingRequest?.invocation
+                    invocation: bindingRequest.invocation,
+                    authority: bindingRequest.authority,
+                    persistsVisualIdentity: true
                 )
                 bindingDTO = bindingResult.binding
                 previousDTO = bindingResult.previous
                 pendingDTO = bindingResult.pending.map(Self.pendingApplicationDTO)
             } catch {
-                bindingWarning = "Worktree was created, but session binding failed: \(error.localizedDescription)"
+                var currentBindings: [AgentSessionWorktreeBinding]?
+                do {
+                    // This is a fresh target observation, not the failed transition's receipt.
+                    // A revoked caller must not acquire newer binding state through error handling.
+                    try await bindingRequest.authority.revalidate()
+                    try bindingRequest.authority.commit {
+                        currentBindings = try dependencies.execution.requireTargetWindow().agentModeViewModel
+                            .worktreeBindingState(forAgentSessionID: bindingRequest.sessionID).bindings
+                    }
+                } catch {
+                    // Unavailable authority/state remains unknown; never infer an unbound orphan.
+                }
+                let viewModel = (try? dependencies.execution.requireTargetWindow())?.agentModeViewModel
+                let applied = currentBindings?.first {
+                    $0.repositoryID == created.repository.repositoryID && $0.worktreeID == created.worktreeID
+                }
+                let warning: String
+                if let applied {
+                    bindingDTO = self.bindingDTO(applied)
+                    warning = "Worktree was created and its session binding is currently applied, but completion or persistence could not be confirmed: \(error.localizedDescription) Inspect the session and worktree at \(created.path) before retrying."
+                } else if currentBindings != nil {
+                    warning = "Worktree was created, but session binding failed: \(error.localizedDescription) The created worktree is kept at \(created.path); cleanup is manual."
+                } else {
+                    warning = "Worktree was created, but the session binding's current state could not be confirmed: \(error.localizedDescription) Inspect the session and worktree at \(created.path) before retrying or cleanup."
+                }
+                bindingWarning = warning
+                if let viewModel,
+                   let owner = try? viewModel.authoritativeLiveSession(for: bindingRequest.sessionID)
+                {
+                    owner.appendItem(.system(warning, sequenceIndex: owner.nextSequenceIndex))
+                    owner.isDirty = true
+                    viewModel.syncTranscriptUIState()
+                    viewModel.scheduleSave(for: owner)
+                }
+                if currentBindings != nil, applied == nil {
+                    AgentSessionLinkRuntimeBridge.shared.worktreeOwnership.markReleased([
+                        AgentSessionWorktreeBinding(
+                            id: UUID().uuidString, repositoryID: created.repository.repositoryID,
+                            repoKey: created.repository.repoKey, logicalRootPath: context.repo.rootURL.path,
+                            logicalRootName: context.repo.rootURL.lastPathComponent, worktreeID: created.worktreeID,
+                            worktreeRootPath: created.path, branch: created.branch, source: "manage_worktree.create.refused"
+                        ).summary
+                    ], bySessionID: bindingRequest.sessionID, at: Date())
+                }
             }
         }
 
         let includeCopyWarning = createResult.includeCopyResult?.warningText
-        let fallbackBindingWarning = bindAfterCreate && bindingDTO == nil
+        let fallbackBindingWarning = bindAfterCreate && bindingDTO == nil && bindingWarning == nil
             ? "Worktree created but no session binding was applied."
             : nil
         let warning = combinedWarnings([includeCopyWarning, bindingWarning, fallbackBindingWarning])
@@ -412,12 +489,11 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         try requireNoPendingSelfRelocation(
             sessionID: sessionID, agentModeVM: dependencies.execution.requireTargetWindow().agentModeViewModel
         )
-        let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
-        let worktree = try await resolveWorktree(
+        let discovery = try await captureDiscovery(invocationContext: invocationContext)
+        let (worktree, context) = try await resolveWorktree(
             args: args,
-            repo: context.repo,
-            allRepos: context.allRepos,
-            visibleRoots: context.visibleRoots,
+            discovery: discovery,
+            repository: resolveExplicitRepository(args: args, discovery: discovery),
             requireExplicit: true
         )
         try validateLiveSession(sessionID, in: dependencies.execution.requireTargetWindow())
@@ -438,6 +514,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             args: args,
             source: op == .select ? "manage_worktree.select" : "manage_worktree.bind",
             invocation: bindingRequest.invocation,
+            authority: bindingRequest.authority,
             persistsVisualIdentity: true
         )
         let dto = try await worktreeDTO(worktree, visualIdentity: identity, includeStatus: parseBool(args["include_status"]) ?? false)
@@ -461,20 +538,19 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         let existing = agentModeVM.worktreeBindings(forAgentSessionID: sessionID)
         let removeAll = parseBool(args["all"]) ?? false
 
-        let remaining: [AgentSessionWorktreeBinding]
-        let removed: [AgentSessionWorktreeBinding]
+        let remaining: [WorkspaceSessionWorktreeBinding]
+        let removed: [WorkspaceSessionWorktreeBinding]
         let authorizationRoots: [String]
         if removeAll {
             remaining = []
             removed = existing
             authorizationRoots = existing.map(\.logicalRootPath)
         } else if hasWorktreeSelector(args) {
-            let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
-            let worktree = try await resolveWorktree(
+            let discovery = try await captureDiscovery(invocationContext: invocationContext)
+            let (worktree, context) = try await resolveWorktree(
                 args: args,
-                repo: context.repo,
-                allRepos: context.allRepos,
-                visibleRoots: context.visibleRoots,
+                discovery: discovery,
+                repository: resolveExplicitRepository(args: args, discovery: discovery),
                 requireExplicit: true
             )
             removed = existing.filter { $0.worktreeID == worktree.worktreeID }
@@ -482,7 +558,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             let logicalRoot = try await logicalRoot(for: context)
             authorizationRoots = removed.isEmpty ? [logicalRoot.standardizedFullPath] : removed.map(\.logicalRootPath)
         } else {
-            let context = try await resolveRepositoryContext(args: args, invocationContext: invocationContext)
+            let discovery = try await captureDiscovery(invocationContext: invocationContext)
+            let context = try await requireRepository(args: args, discovery: discovery)
             let logicalRoot = try await logicalRoot(for: context)
             let normalized = GitRepoRootAuthorization.canonicalPath(logicalRoot.standardizedFullPath)
             removed = existing.filter { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) == normalized }
@@ -500,13 +577,14 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 sessionID: sessionID,
                 agentModeVM: agentModeVM,
                 invocation: bindingRequest.invocation,
-                beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
+                authority: bindingRequest.authority,
+                beforeCommit: { [self] in try await commitBindingMutation(bindingRequest.authority) }
             )
         } else {
             // A successful authorized no-op still owns an applied journal receipt.
             // Do not transition or retire the provider merely to settle that receipt.
             try requireNoPendingSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
-            try await MCPDomainMutationCommitContext.willCommit()
+            try await commitBindingMutation(bindingRequest.authority)
         }
 
         return ToolResultDTOs.ManageWorktreeReplyDTO(
@@ -528,6 +606,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         args: [String: Value],
         source: String,
         invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?,
+        authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority,
         persistsVisualIdentity: Bool = false
     ) async throws -> (
         binding: ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO?,
@@ -552,11 +631,12 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                     sessionID: sessionID,
                     agentModeVM: agentModeVM,
                     invocation: invocation,
-                    beforeCommit: { try await MCPDomainMutationCommitContext.willCommit() }
+                    authority: authority,
+                    beforeCommit: { [self] in try await commitBindingMutation(authority) }
                 )
             } else {
                 try requireNoPendingSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
-                try await MCPDomainMutationCommitContext.willCommit()
+                try await commitBindingMutation(authority)
             }
             return (nil, previous.map(bindingDTO), pending)
         }
@@ -570,7 +650,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         {
             try requireNoPendingSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
             if persistsVisualIdentity {
-                try await MCPDomainMutationCommitContext.willCommit()
+                try await commitBindingMutation(authority)
+                try commitPresentationAuthority(authority)
                 try Self.persistPlannedVisualIdentity(
                     visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
                 )
@@ -578,7 +659,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             return (bindingDTO(previous), nil, nil)
         }
 
-        let binding = AgentSessionWorktreeBinding(
+        let binding = WorkspaceSessionWorktreeBinding(
             id: previous?.id ?? UUID().uuidString,
             repositoryID: worktree.repository.repositoryID,
             repoKey: worktree.repository.repoKey,
@@ -605,7 +686,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         // the running provider and its frozen execution authority.
         if desiredBindings == existing, persistsVisualIdentity {
             try requireNoPendingSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
-            try await MCPDomainMutationCommitContext.willCommit()
+            try await commitBindingMutation(authority)
+            try commitPresentationAuthority(authority)
             try Self.persistPlannedVisualIdentity(
                 visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
             )
@@ -616,17 +698,34 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             sessionID: sessionID,
             agentModeVM: agentModeVM,
             invocation: invocation,
-            beforeCommit: {
-                try await MCPDomainMutationCommitContext.willCommit()
-                if persistsVisualIdentity {
-                    try Self.persistPlannedVisualIdentity(
-                        visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
-                    )
-                }
+            authority: authority,
+            beforeCommit: { [self] in
+                try await commitBindingMutation(authority)
             }
         )
+        if persistsVisualIdentity {
+            try Self.persistPlannedVisualIdentity(
+                visualIdentity, repositoryID: worktree.repository.repositoryID, worktreeID: worktree.worktreeID
+            )
+        }
         let previousDTO = previous.flatMap { $0.worktreeID == binding.worktreeID ? nil : bindingDTO($0) }
         return (bindingDTO(binding), previousDTO, pending)
+    }
+
+    private func commitPresentationAuthority(_ authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority) throws {
+        do { try authority.commit {} } catch { throw DomainMutationRefusedBeforeEffects(error) }
+    }
+
+    /// The mutation journal may suspend too; never carry an entry-only permission across it.
+    private func commitBindingMutation(_ authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority) async throws {
+        try await authority.revalidate()
+        try await MCPDomainMutationCommitContext.willCommit()
+        do {
+            try await authority.revalidate()
+            try authority.commit {}
+        } catch {
+            throw DomainMutationRefusedBeforeEffects(error)
+        }
     }
 
     // MARK: - Self relocation
@@ -642,10 +741,11 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     /// running turn cannot change cwd, so tools are never rerouted beneath it; the switch and an
     /// automatic continuation turn follow the boundary instead.
     private func transitionOrScheduleBindings(
-        _ desiredBindings: [AgentSessionWorktreeBinding],
+        _ desiredBindings: [WorkspaceSessionWorktreeBinding],
         sessionID: UUID,
         agentModeVM: AgentModeViewModel,
         invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?,
+        authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority,
         beforeCommit: @escaping @MainActor () async throws -> Void
     ) async throws -> AgentSelfWorktreeRelocation? {
         if let origin = selfRunOrigin(for: sessionID),
@@ -668,7 +768,9 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 // A concurrent request from the same turn may have scheduled while this one prepared.
                 try requireNoPendingSelfRelocation(sessionID: sessionID, agentModeVM: agentModeVM)
                 try await beforeCommit()
-            }
+            },
+            revalidateAuthority: authority.revalidate,
+            commitAuthority: authority.commit
         )
         return nil
     }
@@ -701,8 +803,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     static func bindingForLogicalRoot(
-        _ bindings: [AgentSessionWorktreeBinding], logicalRootPath: String
-    ) -> AgentSessionWorktreeBinding? {
+        _ bindings: [WorkspaceSessionWorktreeBinding], logicalRootPath: String
+    ) -> WorkspaceSessionWorktreeBinding? {
         let logicalPath = GitRepoRootAuthorization.canonicalPath(logicalRootPath)
         return bindings.first { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) == logicalPath }
     }
@@ -731,10 +833,10 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     /// Selecting the logical checkout is the inverse of this root's binding, not an
     /// ownership conversion of an arbitrary folder that happens to be visible.
     static func bindingsReturningToLogicalCheckout(
-        _ existing: [AgentSessionWorktreeBinding],
+        _ existing: [WorkspaceSessionWorktreeBinding],
         logicalRootPath: String,
         selectedWorktreePath: String
-    ) -> [AgentSessionWorktreeBinding]? {
+    ) -> [WorkspaceSessionWorktreeBinding]? {
         let logicalPath = GitRepoRootAuthorization.canonicalPath(logicalRootPath)
         guard GitRepoRootAuthorization.canonicalPath(selectedWorktreePath) == logicalPath else { return nil }
         return existing.filter { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) != logicalPath }
@@ -767,6 +869,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     private struct BindingRequest {
         let sessionID: UUID
         let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity?
+        let authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority
     }
 
     private func resolveBindingRequest(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> BindingRequest {
@@ -795,10 +898,11 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         guard let sessionID = explicitSessionID ?? resolved?.snapshot.activeAgentSessionID else {
             throw MCPError.invalidParams("session_id is required because current MCP routing does not resolve an active Agent session.")
         }
+        let authority: AgentSessionTargetOperationGuard.WorktreeBindingAuthority
         if let explicitSessionID {
             // A caller-supplied session UUID is a target reference, not authority over that session.
             let targetWindow = try dependencies.execution.requireTargetWindow()
-            try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
+            authority = try await AgentSessionTargetOperationGuard.requireWorktreeBindingAuthority(
                 targetSessionID: explicitSessionID,
                 metadata: metadata,
                 targetWindow: targetWindow,
@@ -813,6 +917,8 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
                 },
                 hasManageGrant: hasManageGrant
             )
+        } else {
+            authority = .init(revalidate: {})
         }
 
         let invocation: AgentModeViewModel.WorktreeBindingMutationInvocationIdentity? = if metadata.runPurpose == .agentModeRun,
@@ -833,88 +939,230 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         } else {
             nil
         }
-        return BindingRequest(sessionID: sessionID, invocation: invocation)
+        return BindingRequest(sessionID: sessionID, invocation: invocation, authority: authority)
     }
 
     // MARK: - Repository and worktree resolution
 
+    /// One capture per operation: discovery roots, the lookup they came from, and the election authority.
+    private struct DiscoveryContext {
+        let metadata: MCPRequestMetadata
+        let election: WorkspaceDefaultGitRepositoryElection.Snapshot
+        let allRepos: [GitRepoDescriptor]
+        let visibleRoots: [WorkspaceRootRef]
+        let lookupContext: WorkspaceLookupContext
+    }
+
+    /// A real selected repository and the logical root its binding mutations are attributed to.
     private struct RepositoryContext {
         let repo: GitRepoDescriptor
         let allRepos: [GitRepoDescriptor]
         let visibleRoots: [WorkspaceRootRef]
         let lookupContext: WorkspaceLookupContext
         let explicitLogicalRoot: WorkspaceRootRef?
+
+        init(repo: GitRepoDescriptor, logicalRoot: WorkspaceRootRef?, discovery: DiscoveryContext) {
+            self.repo = repo
+            allRepos = discovery.allRepos
+            visibleRoots = discovery.visibleRoots
+            lookupContext = discovery.lookupContext
+            explicitLogicalRoot = logicalRoot
+        }
     }
 
-    private func resolveRepositoryContext(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> RepositoryContext {
-        guard dependencies.context.workspaceManager?.activeWorkspace != nil else {
+    private func captureDiscovery(invocationContext: ToolInvocationContext) async throws -> DiscoveryContext {
+        guard let workspaceManager = dependencies.context.workspaceManager,
+              let activeWorkspace = workspaceManager.activeWorkspace
+        else {
             throw MCPError.invalidParams("No active workspace in this window. Load a workspace before using manage_worktree.")
         }
-
         let metadata = invocationContext.metadata
         let lookupContext = await dependencies.selection.resolveFileToolLookupContext(metadata)
-        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
-        let allRepos = try await discoverAllGitRepos(rootScope: lookupContext.rootScope)
-        let defaultRepo = try await resolveDefaultGitRepo(rootScope: lookupContext.rootScope)
-        let repo: GitRepoDescriptor
-        var explicitLogicalRoot: WorkspaceRootRef?
-
-        if let repoKey = trimmedString(args["repo_key"]) {
-            guard let match = allRepos.first(where: { $0.repoKey == repoKey }) else {
-                throw MCPError.invalidParams("repo_key not found: \(repoKey). Available: \(allRepos.map(\.repoKey).joined(separator: ", "))")
-            }
-            repo = match
-        } else if let rawRepoRoot = trimmedString(args["repo_root"]) {
-            if !rawRepoRoot.hasPrefix("@") {
-                explicitLogicalRoot = explicitLogicalRootRef(for: rawRepoRoot, visibleRoots: visibleRoots, lookupContext: lookupContext)
-            }
-            let token = rawRepoRoot.hasPrefix("@") ? rawRepoRoot : lookupContext.translateInputPath(rawRepoRoot)
-            do {
-                repo = try await resolver.resolveRepoRootToken(
-                    token,
-                    allRepos: allRepos,
-                    visibleRoots: visibleRoots,
-                    defaultRepo: defaultRepo
-                )
-            } catch let error as GitRepoTargetResolverError {
-                throw MCPError.invalidParams(error.message)
-            }
+        // Captured after the lookup, whose resolution may hydrate the session's bindings; election refuses
+        // when the two disagree.
+        let routed = try? dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.manageWorktree)
+        // PRIMARY comes from the routed workspace; only an unrouted call uses the window's active one,
+        // exactly as its lookup does.
+        let workspace: WorkspaceModel? = if let workspaceID = routed?.snapshot.workspaceID {
+            workspaceManager.workspaces.first { $0.id == workspaceID }
         } else {
-            repo = defaultRepo
+            activeWorkspace
         }
-
-        return RepositoryContext(repo: repo, allRepos: allRepos, visibleRoots: visibleRoots, lookupContext: lookupContext, explicitLogicalRoot: explicitLogicalRoot)
+        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let allRepos = await discoverGitRepos(in: visibleRoots)
+        return DiscoveryContext(
+            metadata: metadata,
+            election: .init(
+                workspaceID: workspace?.id,
+                declaredRepoPaths: workspace?.repoPaths ?? [],
+                bindingSource: WorkspaceDefaultGitRepositoryElection.Snapshot.bindingSource(
+                    routed: routed,
+                    runPurpose: metadata.runPurpose
+                ),
+                lookupContext: lookupContext,
+                lookupRoots: visibleRoots
+            ),
+            allRepos: allRepos,
+            visibleRoots: visibleRoots,
+            lookupContext: lookupContext
+        )
     }
 
-    private func resolveWorktree(
-        args: [String: Value],
+    private func authorizedRepositoryContext(
         repo: GitRepoDescriptor,
-        allRepos: [GitRepoDescriptor],
-        visibleRoots: [WorkspaceRootRef],
-        requireExplicit: Bool
-    ) async throws -> GitWorktreeDescriptor {
-        let selector = worktreeSelector(from: args)
-        if requireExplicit, selector == nil {
-            throw MCPError.invalidParams("worktree or worktree_id is required for this operation.")
+        logicalRoot: WorkspaceRootRef?,
+        discovery: DiscoveryContext
+    ) async throws -> RepositoryContext {
+        guard await vcsService.resolveRepoForRead(
+            at: repo.rootURL,
+            authorizedRoots: discovery.visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) } + [repo.rootURL]
+        ) != nil else {
+            throw MCPError.invalidParams("Repository metadata is not authorized for this worktree request.")
         }
+        return RepositoryContext(repo: repo, logicalRoot: logicalRoot, discovery: discovery)
+    }
+
+    /// The repository named by `repo_key` or `repo_root`, or nil when neither is present. Only a relative
+    /// `repo_root` (bare `@main`, `@current`, `@wt`) elects; it stays attributed to the elected logical root.
+    private func resolveExplicitRepository(args: [String: Value], discovery: DiscoveryContext) async throws -> RepositoryContext? {
+        if let repoKey = trimmedString(args["repo_key"]) {
+            guard let match = discovery.allRepos.first(where: { $0.repoKey == repoKey }) else {
+                throw MCPError.invalidParams("repo_key not found: \(repoKey). Available: \(discovery.allRepos.map(\.repoKey).joined(separator: ", "))")
+            }
+            return try await authorizedRepositoryContext(repo: match, logicalRoot: nil, discovery: discovery)
+        }
+        guard let rawRepoRoot = trimmedString(args["repo_root"]) else { return nil }
+        let explicitLogicalRoot = rawRepoRoot.hasPrefix("@")
+            ? nil
+            : explicitLogicalRootRef(for: rawRepoRoot, visibleRoots: discovery.visibleRoots, lookupContext: discovery.lookupContext)
+        let token = rawRepoRoot.hasPrefix("@") ? rawRepoRoot : discovery.lookupContext.translateInputPath(rawRepoRoot)
         do {
-            return try await resolver.resolveWorktree(
-                selector: selector,
-                repo: repo,
-                allRepos: allRepos,
-                authorizedRoots: visibleRoots
-            )
+            do {
+                let repo = try await resolver.resolveRepoRootToken(
+                    token,
+                    allRepos: discovery.allRepos,
+                    visibleRoots: discovery.visibleRoots,
+                    defaultRepo: nil
+                )
+                return try await authorizedRepositoryContext(repo: repo, logicalRoot: explicitLogicalRoot, discovery: discovery)
+            } catch is GitRepoTargetResolver.DefaultRepositoryRequired {
+                let selection = try await electDefaultRepository(discovery)
+                let repo = try await resolver.resolveRepoRootToken(
+                    token,
+                    allRepos: discovery.allRepos,
+                    visibleRoots: discovery.visibleRoots,
+                    defaultRepo: selection.repository
+                )
+                return try await authorizedRepositoryContext(repo: repo, logicalRoot: explicitLogicalRoot ?? selection.logicalRoot, discovery: discovery)
+            }
         } catch let error as GitRepoTargetResolverError {
             throw MCPError.invalidParams(error.message)
         }
     }
 
-    private func discoverAllGitRepos(rootScope: WorkspaceLookupRootScope) async throws -> [GitRepoDescriptor] {
-        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
+    /// The explicit repository, else the elected default.
+    private func requireRepository(args: [String: Value], discovery: DiscoveryContext) async throws -> RepositoryContext {
+        if let explicit = try await resolveExplicitRepository(args: args, discovery: discovery) {
+            return explicit
+        }
+        let selection = try await electDefaultRepository(discovery)
+        return try await authorizedRepositoryContext(repo: selection.repository, logicalRoot: selection.logicalRoot, discovery: discovery)
+    }
+
+    /// Resolves the worktree selector against an explicit repository when one was given. Otherwise an
+    /// identifying selector (`@id:`, `@branch:`, name/branch/path) searches the discovered repositories and
+    /// selects its own repository; a relative one (omitted, `@current`, `@main`, `@wt`) uses the elected default.
+    private func resolveWorktree(
+        args: [String: Value],
+        discovery: DiscoveryContext,
+        repository: RepositoryContext?,
+        requireExplicit: Bool
+    ) async throws -> (worktree: GitWorktreeDescriptor, context: RepositoryContext) {
+        let selector = worktreeSelector(from: args)
+        if requireExplicit, selector == nil {
+            throw MCPError.invalidParams("worktree or worktree_id is required for this operation.")
+        }
+        do {
+            if let repository {
+                let worktree = try await resolver.resolveWorktree(
+                    selector: selector,
+                    repo: repository.repo,
+                    allRepos: discovery.allRepos,
+                    authorizedRoots: discovery.visibleRoots
+                )
+                return (worktree, repository)
+            }
+            do {
+                let worktree = try await resolver.resolveWorktree(
+                    selector: selector,
+                    repo: nil,
+                    allRepos: discovery.allRepos,
+                    authorizedRoots: discovery.visibleRoots
+                )
+                return try await (worktree, owningRepository(of: worktree, discovery: discovery))
+            } catch is GitRepoTargetResolver.DefaultRepositoryRequired {
+                let selection = try await electDefaultRepository(discovery)
+                let context = try await authorizedRepositoryContext(repo: selection.repository, logicalRoot: selection.logicalRoot, discovery: discovery)
+                let worktree = try await resolver.resolveWorktree(
+                    selector: selector,
+                    repo: selection.repository,
+                    allRepos: discovery.allRepos,
+                    authorizedRoots: discovery.visibleRoots
+                )
+                return (worktree, context)
+            }
+        } catch let error as GitRepoTargetResolverError {
+            throw MCPError.invalidParams(error.message)
+        }
+    }
+
+    /// The discovered checkout of an identified worktree's own repository, matched by identity rather than
+    /// discovery position: the worktree itself when it is a visible root, else the one loaded checkout of its
+    /// repository. Several loaded checkouts of that repository are ambiguous; never pick by load order.
+    private func owningRepository(of worktree: GitWorktreeDescriptor, discovery: DiscoveryContext) async throws -> RepositoryContext {
+        let worktreePath = GitRepoRootAuthorization.canonicalPath(worktree.path)
+        if let exact = discovery.allRepos.first(where: { GitRepoRootAuthorization.canonicalPath($0.rootPath) == worktreePath }) {
+            return try await authorizedRepositoryContext(repo: exact, logicalRoot: nil, discovery: discovery)
+        }
+        let owners = discovery.allRepos.filter {
+            $0.worktreeIdentity?.repository.repositoryID == worktree.repository.repositoryID
+        }
+        guard let owner = owners.first else {
+            throw MCPError.invalidParams("Worktree \(worktree.path) does not belong to a repository attached to a visible workspace root.")
+        }
+        guard owners.count == 1 else {
+            throw MCPError.invalidParams(
+                "Worktree \(worktree.path) belongs to a repository with \(owners.count) loaded checkouts (\(owners.map(\.rootPath).joined(separator: ", "))). Pass repo_root to choose the workspace root it belongs to."
+            )
+        }
+        return try await authorizedRepositoryContext(repo: owner, logicalRoot: nil, discovery: discovery)
+    }
+
+    private func electDefaultRepository(_ discovery: DiscoveryContext) async throws -> WorkspaceDefaultGitRepositoryElection.Selection {
+        do {
+            let selection = try await WorkspaceDefaultGitRepositoryElection(vcsService: vcsService).elect(in: discovery.election)
+            // Fail a superseded attempt rather than retarget it.
+            let currentWorkspace = discovery.election.workspaceID.flatMap { id in
+                dependencies.context.workspaceManager?.workspaces.first { $0.id == id }
+            }
+            let currentSource = WorkspaceDefaultGitRepositoryElection.Snapshot.bindingSource(
+                routed: try? dependencies.context.resolveTabContextSnapshot(discovery.metadata, MCPWindowToolName.manageWorktree),
+                runPurpose: discovery.metadata.runPurpose
+            )
+            guard discovery.election.isCurrent(declaredRepoPaths: currentWorkspace?.repoPaths, bindingSource: currentSource) else {
+                throw WorkspaceDefaultGitRepositoryElection.Failure.superseded
+            }
+            return selection
+        } catch let failure as WorkspaceDefaultGitRepositoryElection.Failure {
+            throw MCPError.invalidParams(failure.localizedDescription)
+        }
+    }
+
+    private func discoverGitRepos(in visibleRoots: [WorkspaceRootRef]) async -> [GitRepoDescriptor] {
         var repos: [GitRepoDescriptor] = []
         var seen = Set<String>()
         for root in visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
+            if let resolved = await vcsService.resolveRepoForRead(at: URL(fileURLWithPath: root.standardizedFullPath), authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }) {
                 let descriptor = GitRepoDescriptor(rootURL: resolved.rootURL)
                 let key = descriptor.rootPath.lowercased()
                 if seen.insert(key).inserted {
@@ -923,16 +1171,6 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
             }
         }
         return repos
-    }
-
-    private func resolveDefaultGitRepo(rootScope: WorkspaceLookupRootScope) async throws -> GitRepoDescriptor {
-        let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
-        for root in visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
-                return GitRepoDescriptor(rootURL: resolved.rootURL)
-            }
-        }
-        throw MCPError.invalidParams("No Git repository found in loaded roots.")
     }
 
     private func explicitLogicalRootRef(
@@ -975,8 +1213,11 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         context: RepositoryContext
     ) async throws -> WorkspaceRootRef {
         for root in context.visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)),
-               GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path) == GitRepoRootAuthorization.canonicalPath(repo.rootPath)
+            if let resolved = await vcsService.resolveRepoForRead(
+                at: URL(fileURLWithPath: root.standardizedFullPath),
+                authorizedRoots: context.visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) }
+            ),
+                GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path) == GitRepoRootAuthorization.canonicalPath(repo.rootPath)
             {
                 return Self.logicalRootRef(projecting: root, lookupContext: context.lookupContext)
             }
@@ -1129,7 +1370,7 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
         )
     }
 
-    private func bindingDTO(_ binding: AgentSessionWorktreeBinding) -> ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO {
+    private func bindingDTO(_ binding: WorkspaceSessionWorktreeBinding) -> ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO {
         ToolResultDTOs.ManageWorktreeReplyDTO.BindingDTO(
             id: binding.id,
             repositoryID: binding.repositoryID,
@@ -1262,8 +1503,12 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
     }
 
     private func fallbackLabel(for worktree: GitWorktreeDescriptor) -> String? {
-        if let name = worktree.name, !name.isEmpty { return name }
-        if let branch = worktree.branch, !branch.isEmpty { return branch }
+        if let name = worktree.name, !name.isEmpty {
+            return name
+        }
+        if let branch = worktree.branch, !branch.isEmpty {
+            return branch
+        }
         return worktree.isMain ? "main" : nil
     }
 
@@ -1280,9 +1525,15 @@ final class MCPWorktreeToolProvider: MCPAppToolProviding {
 
     private func parseOptionalInteger(_ value: Value?, name: String) throws -> Int? {
         guard let value else { return nil }
-        if case .null = value { return nil }
-        if let integer = value.intValue { return integer }
-        if let raw = trimmedString(value), let integer = Int(raw) { return integer }
+        if case .null = value {
+            return nil
+        }
+        if let integer = value.intValue {
+            return integer
+        }
+        if let raw = trimmedString(value), let integer = Int(raw) {
+            return integer
+        }
         throw MCPError.invalidParams("`\(name)` must be an integer.")
     }
 

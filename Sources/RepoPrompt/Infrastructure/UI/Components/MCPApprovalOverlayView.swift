@@ -5,12 +5,15 @@
 //  Created by RepoPrompt MCP integration
 //
 
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// A full-screen takeover overlay for MCP client approval requests.
 /// Presents a modern, polished UI that blocks interaction until the user responds.
 struct MCPApprovalOverlayView: View {
     @EnvironmentObject private var server: MCPServerViewModel
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @State private var alwaysAllow = true
     @State private var isAnimating = false
     @State private var isResolving = false
     @State private var pulseScale: CGFloat = 1.0
@@ -157,6 +160,14 @@ struct MCPApprovalOverlayView: View {
             // Client info card
             clientInfoCard
 
+            if offersAlwaysAllow {
+                Toggle("Always allow this client", isOn: $alwaysAllow)
+                    .toggleStyle(.switch)
+                Text("Skip approval for future connections, including after RepoPrompt restarts. This trusts the client's self-reported name.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
             if let executablePath {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Requesting process (observed locally)")
@@ -164,7 +175,7 @@ struct MCPApprovalOverlayView: View {
                     Text(executablePath)
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
-                    Text("Allow Session covers this running process, including reconnects and other client names it uses. Deny suppresses its requests for one minute. Choices reset when RepoPrompt quits.")
+                    Text("Allow Session covers this running process, including reconnects and other client names it uses. Deny suppresses its requests for one minute. Session choices reset when RepoPrompt quits; Always Allow, when selected, is saved.")
                         .font(.caption)
                 }
                 .foregroundColor(.secondary)
@@ -256,7 +267,7 @@ struct MCPApprovalOverlayView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 12, weight: .semibold))
-                    Text(executablePath == nil ? "Allow Once" : "Allow Session")
+                    Text(offersAlwaysAllow && alwaysAllow ? "Always Allow" : (executablePath == nil ? "Allow Once" : "Allow Session"))
                         .font(.subheadline.weight(.medium))
                 }
                 .frame(maxWidth: .infinity)
@@ -271,15 +282,27 @@ struct MCPApprovalOverlayView: View {
 
     // MARK: - Actions
 
+    /// Name-based persistence is offered only in default mode and never for reserved CLI names.
+    private var offersAlwaysAllow: Bool {
+        !globalSettings.mcpStrictConnectionApproval()
+            && ServerController.canSaveAlwaysAllowed(clientName: clientID)
+    }
+
     private func allow() async {
         guard !isResolving else { return }
         isResolving = true
+        // Capture what the user saw when clicking; a mode change during the
+        // animation must not turn a session grant into a saved one.
+        let persist = offersAlwaysAllow && alwaysAllow
         withAnimation(.easeInOut(duration: 0.2)) {
             isAnimating = false
         }
         // Small delay for animation
         try? await Task.sleep(nanoseconds: 150_000_000)
-        await server.resolveApproval(allow: true, generation: generation)
+        await server.resolveApproval(
+            allow: true, generation: generation,
+            alwaysAllow: persist
+        )
     }
 
     private func deny() async {

@@ -10,6 +10,7 @@ import Darwin
 import Foundation
 import Logging
 import OSLog
+import RepoPromptSettingsCore
 import RepoPromptShared
 import SwiftUI
 
@@ -38,10 +39,16 @@ final actor ServerController: ObservableObject {
     private var pendingConnectionID: String?
     weak var mcpService: MCPService?
 
-    /// Legacy display-name records are retained for inspection/removal only.
-    /// Initialize metadata is not a verified principal and never grants admission.
+    /// Default ("Always allow") mode deliberately trusts self-reported names, as before #1346.
+    /// Strict mode ignores both this persisted list and the built-in set.
     private static let alwaysAllowedKey = "mcp.alwaysAllowedClients"
-    private var alwaysAllowedClients: Set<String> = ServerController.loadLegacyClientNames()
+    private static let defaultAlwaysAllowedClients: Set<String> = [
+        "claude-code", "codex-mcp-client", "gemini-cli-mcp-client",
+        "opencode", "cursor", "cursor-mcp-client", "claude-ai"
+    ]
+    private var alwaysAllowedClients: Set<String>
+    private let approvalDefaults: UserDefaults
+    private let strictConnectionApprovalEnabled: @Sendable () async -> Bool
 
     /// –––––  Private implementation helpers  –––––
     private enum DesiredTransportState: Equatable {
@@ -117,12 +124,20 @@ final actor ServerController: ObservableObject {
         },
         beforeTransportActivationOperation: @escaping @Sendable () async throws -> Void = {},
         installNetworkCallbacks: Bool = true,
+        approvalDefaults: UserDefaults = .standard,
+        strictConnectionApprovalEnabled: @escaping @Sendable () async -> Bool = {
+            await MainActor.run { GlobalSettingsStore.shared.mcpStrictConnectionApproval() }
+        },
         monotonicNow: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         processIsCurrent: @escaping @Sendable (MCPApprovalProcessIdentity) -> Bool = {
             MCPApprovalProcessIdentity.read(pid: $0.pid) == $0
         }
     ) {
         self.networkManager = networkManager
+        self.approvalDefaults = approvalDefaults
+        alwaysAllowedClients = Self.loadLegacyClientNames(defaults: approvalDefaults)
+            .filter { !Self.isRepoPromptCLIClientName($0) }
+        self.strictConnectionApprovalEnabled = strictConnectionApprovalEnabled
         self.monotonicNow = monotonicNow
         self.processIsCurrent = processIsCurrent
         self.globalRegistrationOperation = globalRegistrationOperation
@@ -178,7 +193,8 @@ final actor ServerController: ObservableObject {
             return false
         }
 
-        // Global auto-approve: skip UI for all new clients
+        // The explicit global bypass applies in both approval modes; strict mode
+        // only disables name-based grants (built-in and saved client names).
         if autoApproveAllClients {
             serverControllerDebugLog("Auto-approving '\(clientName)' (global auto-approve enabled)")
             if let service = mcpService {
@@ -210,6 +226,12 @@ final actor ServerController: ObservableObject {
             return true
         } else if isRepoCLI {
             log.warning("RepoPrompt CLI name matched but executable path verification failed for connectionID=\(connectionID)")
+        }
+
+        if await !strictConnectionApprovalEnabled(), isClientAlwaysAllowed(clientName) {
+            serverControllerDebugLog("Auto-approving '\(clientName)' (always-allowed client name)")
+            await mcpService?.clientConnectedSuccessfully(name: clientName)
+            return true
         }
 
         // Reconnect consent belongs to an OS-observed process lifetime, never
@@ -283,17 +305,34 @@ final actor ServerController: ObservableObject {
 
     // MARK: – Allow-list helpers –
 
-    /// Compatibility surface for the dashboard: no display name is inherently trusted.
-    static func isBuiltInAlwaysAllowedClient(_: String) -> Bool {
-        false
+    static func isBuiltInAlwaysAllowedClient(_ clientID: String) -> Bool {
+        !isRepoPromptCLIClientName(clientID)
+            && defaultAlwaysAllowedClients.contains { MCPClientIdentity.matches($0, clientID) }
+    }
+
+    private func isClientAlwaysAllowed(_ clientID: String) -> Bool {
+        // RepoPrompt CLI names must still pass bundled executable verification.
+        guard !Self.isRepoPromptCLIClientName(clientID) else { return false }
+        if Self.isBuiltInAlwaysAllowedClient(clientID) { return true }
+        return alwaysAllowedClients.contains { MCPClientIdentity.matches($0, clientID) }
+    }
+
+    /// RepoPrompt CLI names are reserved for verified bundled helpers and are never saved.
+    static func canSaveAlwaysAllowed(clientName: String) -> Bool {
+        !isRepoPromptCLIClientName(clientName)
+    }
+
+    private func addAlwaysAllowed(clientID: String) {
+        guard Self.canSaveAlwaysAllowed(clientName: clientID), !isClientAlwaysAllowed(clientID) else { return }
+        alwaysAllowedClients.insert(clientID)
+        approvalDefaults.set(Array(alwaysAllowedClients).sorted(), forKey: Self.alwaysAllowedKey)
     }
 
     static func loadLegacyClientNames(defaults: UserDefaults = .standard) -> Set<String> {
         Set(defaults.stringArray(forKey: alwaysAllowedKey) ?? [])
     }
 
-    /// Only the existing kernel-observed bundled-executable check may authorize a
-    /// named client automatically. Saved names deliberately do not enter this policy.
+    /// Verified bundled-helper admission is independent of the selected approval mode.
     static func canAutomaticallyApprove(clientName: String, bundledCLI verified: Bool) -> Bool {
         isRepoPromptCLIClientName(clientName) && verified
     }
@@ -362,7 +401,7 @@ final actor ServerController: ObservableObject {
     func alwaysAllowedClientIDs() -> [String] {
         var seen = Set<String>()
         var values: [String] = []
-        for clientID in alwaysAllowedClients.sorted() {
+        for clientID in alwaysAllowedClients.union(Self.defaultAlwaysAllowedClients).sorted() {
             let dedupeKey = MCPClientIdentity.storageKey(clientID) ?? clientID
             guard seen.insert(dedupeKey).inserted else { continue }
             values.append(clientID)
@@ -372,11 +411,13 @@ final actor ServerController: ObservableObject {
 
     /// Add or remove a client from the persistent allow-list
     func setAlwaysAllowed(clientID: String, allowed: Bool) async {
-        // Name-only standing approvals are no longer supported. Keep old records
-        // unchanged unless the user explicitly removes a displayed record.
-        if !allowed {
-            alwaysAllowedClients.remove(clientID)
-            UserDefaults.standard.set(
+        if allowed {
+            guard await !strictConnectionApprovalEnabled() else { return }
+            addAlwaysAllowed(clientID: clientID)
+        } else {
+            guard !Self.isBuiltInAlwaysAllowedClient(clientID) else { return }
+            alwaysAllowedClients = alwaysAllowedClients.filter { !MCPClientIdentity.matches($0, clientID) }
+            approvalDefaults.set(
                 Array(alwaysAllowedClients),
                 forKey: Self.alwaysAllowedKey
             )
@@ -390,8 +431,8 @@ final actor ServerController: ObservableObject {
 
     /// Whether to auto-approve all new clients without user confirmation
     private var autoApproveAllClients: Bool {
-        get { UserDefaults.standard.bool(forKey: Self.autoApproveAllClientsKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.autoApproveAllClientsKey) }
+        get { approvalDefaults.bool(forKey: Self.autoApproveAllClientsKey) }
+        set { approvalDefaults.set(newValue, forKey: Self.autoApproveAllClientsKey) }
     }
 
     func getAutoApproveAllClients() -> Bool {
@@ -710,6 +751,10 @@ final actor ServerController: ObservableObject {
                 request.deny()
                 continue
             }
+            if await !strictConnectionApprovalEnabled(), isClientAlwaysAllowed(request.clientID) {
+                if await request.validate() { request.approve() } else { request.deny() }
+                continue
+            }
             if await resolveSessionDecision(request) { continue }
             await beginApprovalRequest(request)
         }
@@ -751,7 +796,7 @@ final actor ServerController: ObservableObject {
     }
 
     /// Called by MCPService when the UI has made a decision.
-    func resolvePendingApproval(allow: Bool, generation: UInt64) async {
+    func resolvePendingApproval(allow: Bool, generation: UInt64, alwaysAllow: Bool = false) async {
         guard generation == approvalGeneration,
               let request = currentApproval else { return }
         // Validate this connection independently of consent for its displayed
@@ -759,6 +804,7 @@ final actor ServerController: ObservableObject {
         // open; that must not discard a decision for a still-running launcher.
         // Awaiting process observation may race timeout or another window's response.
         let valid = await request.validate()
+        let strictApproval = await strictConnectionApprovalEnabled()
         guard generation == approvalGeneration, currentApproval != nil else { return }
         let resolvedClientID = pendingConnectionID
         approvalTimeoutTask?.cancel()
@@ -774,13 +820,17 @@ final actor ServerController: ObservableObject {
         }
 
         rememberDecision(for: request, allow: allow)
-        if allow, valid, request.principal.map(processIsCurrent) ?? true {
+        let principalIsCurrent = request.principal.map(processIsCurrent)
+        if allow, alwaysAllow, !strictApproval, principalIsCurrent ?? valid {
+            addAlwaysAllowed(clientID: request.clientID)
+        }
+        if allow, valid, principalIsCurrent ?? true {
             request.approve()
         } else {
             request.deny()
         }
 
-        // Queue entries recheck process-session policy, never display-name policy.
+        // Queue entries recheck the current mode's saved-name and process-session policy.
         if let clientID = resolvedClientID {
             activeApprovalDialogs.remove(clientID)
         }

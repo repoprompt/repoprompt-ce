@@ -208,6 +208,54 @@ import XCTest
                 )
             )
         }
+
+        func testOracleOwnerRefusalNamesTheRunLimitOnlyForTheCallersOwnAgentSession() {
+            let sessionID = UUID()
+            let runID = UUID()
+            let earlierRun = ChatSession(agentModeSessionID: sessionID, agentModeRunID: UUID())
+            let sessionOnlyStamp = ChatSession(agentModeSessionID: sessionID)
+            let otherSession = ChatSession(agentModeSessionID: UUID(), agentModeRunID: runID)
+            let generic = "Chat with ID 'c1' belongs to a different Agent Mode owner"
+
+            for chat in [earlierRun, sessionOnlyStamp] {
+                XCTAssertFalse(
+                    OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+                        chat,
+                        agentModeSessionID: sessionID,
+                        agentModeRunID: runID
+                    )
+                )
+                let message = OracleViewModel.oracleOwnerRefusalMessage(
+                    chatID: "c1",
+                    session: chat,
+                    agentModeSessionID: sessionID
+                )
+                XCTAssertTrue(
+                    message.hasPrefix("Chat with ID 'c1' belongs to this Agent session but not to its current run."),
+                    message
+                )
+                XCTAssertTrue(message.contains("Start a new Oracle chat (new_chat: true)"), message)
+            }
+            XCTAssertEqual(
+                OracleViewModel.oracleOwnerRefusalMessage(chatID: "c1", session: otherSession, agentModeSessionID: sessionID),
+                generic
+            )
+            XCTAssertEqual(
+                OracleViewModel.oracleOwnerRefusalMessage(chatID: "c1", session: earlierRun, agentModeSessionID: nil),
+                generic
+            )
+
+            XCTAssertEqual(
+                OracleViewModel.oracleChatLogNoEligibleChatMessage(agentModeSessionID: nil, agentModeRunID: nil),
+                "No chats found in the current tab"
+            )
+            let scoped = OracleViewModel.oracleChatLogNoEligibleChatMessage(
+                agentModeSessionID: sessionID,
+                agentModeRunID: runID
+            )
+            XCTAssertTrue(scoped.hasPrefix("No Oracle chats from this Agent session's current run"), scoped)
+            XCTAssertTrue(scoped.contains("oracle_chat_log cannot read chats from an earlier run"), scoped)
+        }
     }
 #endif
 
@@ -246,7 +294,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
                     try FileManager.default.createSymbolicLink(at: substituted, withDestinationURL: target)
                 }
             )) { error in
-                XCTAssertEqual(error as? OracleImageLoadError, .unsafePath(index: 0))
+                XCTAssertEqual(error as? OracleAttachmentLoadError, .unsafePath(index: 0))
             }
         }
     }
@@ -267,7 +315,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             index: 0
         )
         XCTAssertEqual(privateCapture.rootIdentity, projection.rootIdentity)
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [.init(index: 0, path: image.path, title: nil)],
             authority: OracleImageWorkspaceAuthority(roots: [projection])
         )
@@ -275,7 +323,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
     }
 
     func testLoadsClassicFormatsAndPreservesOrderWithoutPaths() throws {
-        let fixtures: [(String, Data, AIImageMediaType)] = [
+        let fixtures: [(String, Data, ImageMediaType)] = [
             ("one.png", Self.pngData, .png),
             ("two.JPG", Self.jpegData, .jpeg),
             ("three.gif", Self.gifData, .gif),
@@ -284,17 +332,50 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         let requests = try fixtures.enumerated().map { index, fixture in
             let url = testRoot.appendingPathComponent(fixture.0)
             try fixture.1.write(to: url)
-            return OracleImageRequest(index: index, path: url.path, title: "Image \(index + 1)")
+            return OracleAttachmentRequest(index: index, path: url.path, title: "Image \(index + 1)")
         }
 
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: requests,
             authority: authority(logical: testRoot, physical: testRoot)
         )
 
-        XCTAssertEqual(images.map(\.mediaType), fixtures.map(\.2))
+        XCTAssertEqual(images.map(\.imageMediaType), fixtures.map { Optional($0.2) })
         XCTAssertEqual(images.map(\.bytes), fixtures.map(\.1))
         XCTAssertEqual(images.map(\.title), ["Image 1", "Image 2", "Image 3", "Image 4"])
+    }
+
+    func testImageOnlyLegacyRequestsLoadClassicImagesAndRefuseEverythingElse() throws {
+        let images = try [("one.png", Self.pngData), ("two.webp", Self.webpData)].enumerated().map { index, fixture in
+            let url = testRoot.appendingPathComponent(fixture.0)
+            try fixture.1.write(to: url)
+            return OracleAttachmentRequest(index: index, path: url.path, title: nil, imageOnly: true)
+        }
+        let loaded = try OracleAttachmentLoader().load(
+            requests: images,
+            authority: authority(logical: testRoot, physical: testRoot)
+        )
+        XCTAssertEqual(loaded.map(\.bytes), [Self.pngData, Self.webpData])
+
+        let refused: [(String, Data)] = [
+            ("notes.txt", Data("plain text".utf8)),
+            ("report.pdf", Data("%PDF-1.4\n%%EOF\n".utf8))
+        ]
+        for (name, data) in refused {
+            let url = testRoot.appendingPathComponent(name)
+            try data.write(to: url)
+            // The same file is accepted through `attachments`; only the legacy alias is image-bounded.
+            XCTAssertNoThrow(try OracleAttachmentLoader().load(
+                requests: [.init(index: 0, path: url.path, title: nil)],
+                authority: authority(logical: testRoot, physical: testRoot)
+            ), name)
+            XCTAssertThrowsError(try OracleAttachmentLoader().load(
+                requests: [.init(index: 1, path: url.path, title: nil, imageOnly: true)],
+                authority: authority(logical: testRoot, physical: testRoot)
+            )) { error in
+                XCTAssertEqual(error as? OracleAttachmentLoadError, .legacyImagesRequiresImage(index: 1), name)
+            }
+        }
     }
 
     func testLogicalPathReadsBoundPhysicalWorktreeFile() throws {
@@ -305,7 +386,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         try Data("not an image".utf8).write(to: logicalRoot.appendingPathComponent("asset.png"))
         try Self.pngData.write(to: physicalRoot.appendingPathComponent("asset.png"))
 
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [.init(
                 index: 0,
                 path: logicalRoot.appendingPathComponent("asset.png").path,
@@ -333,7 +414,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             linkURL.path
         ]
         for path in cases {
-            XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+            XCTAssertThrowsError(try OracleAttachmentLoader().load(
                 requests: [.init(index: 0, path: path, title: nil)],
                 authority: authority(logical: testRoot, physical: testRoot)
             )) { error in
@@ -352,7 +433,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         let trustedRoot = testRoot.appendingPathComponent("trusted-root", isDirectory: true)
         try FileManager.default.createSymbolicLink(at: trustedRoot, withDestinationURL: actualRoot)
         let pinnedAuthority = try authority(logical: trustedRoot, physical: trustedRoot)
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [.init(
                 index: 0,
                 path: trustedRoot.appendingPathComponent("image.gif").path,
@@ -368,7 +449,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         try retargetedData.write(to: retargetedRoot.appendingPathComponent("image.gif"))
         try FileManager.default.removeItem(at: trustedRoot)
         try FileManager.default.createSymbolicLink(at: trustedRoot, withDestinationURL: retargetedRoot)
-        let pinnedImages = try OracleImageAttachmentLoader().load(
+        let pinnedImages = try OracleAttachmentLoader().load(
             requests: [.init(
                 index: 0,
                 path: trustedRoot.appendingPathComponent("image.gif").path,
@@ -385,7 +466,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             at: actualRoot.appendingPathComponent("linked-directory", isDirectory: true),
             withDestinationURL: realDirectory
         )
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(
                 index: 0,
                 path: trustedRoot.appendingPathComponent("linked-directory/nested.gif").path,
@@ -393,8 +474,8 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             )],
             authority: pinnedAuthority
         )) { error in
-            guard let loadError = error as? OracleImageLoadError else {
-                return XCTFail("Expected OracleImageLoadError, got \(error)")
+            guard let loadError = error as? OracleAttachmentLoadError else {
+                return XCTFail("Expected OracleAttachmentLoadError, got \(error)")
             }
             XCTAssertTrue(
                 loadError == .unsafePath(index: 0)
@@ -408,7 +489,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         try Self.gifData.write(to: imageURL)
         let authority = try authority(logical: testRoot, physical: testRoot)
         let started = DispatchSemaphore(value: 0)
-        let loader = OracleImageAttachmentLoader(afterFirstRead: { _ in
+        let loader = OracleAttachmentLoader(afterFirstRead: { _ in
             started.signal()
             let deadline = Date().addingTimeInterval(2)
             while !Task.isCancelled, Date() < deadline {
@@ -420,7 +501,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             throw CancellationError()
         })
         let task = Task {
-            try await OracleImageAttachmentLoader.loadDetached(
+            try await OracleAttachmentLoader.loadDetached(
                 requests: [.init(index: 0, path: imageURL.path, title: nil)],
                 authority: authority,
                 loader: loader
@@ -445,41 +526,51 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         try Self.gifData.write(to: firstURL)
         try Self.gifData.write(to: secondURL)
 
-        let requests: [OracleImageRequest] = [
+        let requests: [OracleAttachmentRequest] = [
             .init(index: 0, path: firstURL.path, title: nil),
             .init(index: 1, path: secondURL.path, title: nil)
         ]
-        let images = try OracleImageAttachmentLoader(
+        let images = try OracleAttachmentLoader(
             limits: .init(
                 maxCount: requests.count,
-                maxBytesPerImage: Self.gifData.count,
-                maxTotalBytes: Self.gifData.count * 2
+                maxBytesPerFile: Self.gifData.count,
+                maxTotalBytes: Self.gifData.count * 2,
+                maxTitleLength: 200,
+                maxInlineTextBytes: 1024
             )
         ).load(
             requests: requests,
             authority: authority(logical: testRoot, physical: testRoot)
         )
         XCTAssertEqual(images.map(\.bytes), [Self.gifData, Self.gifData])
-        XCTAssertEqual(images.map(\.mediaType), [.gif, .gif])
+        XCTAssertEqual(images.map(\.imageMediaType), [.gif, .gif])
 
-        XCTAssertThrowsError(try OracleImageAttachmentLoader(
-            limits: .init(maxCount: 10, maxBytesPerImage: Self.gifData.count - 1, maxTotalBytes: 100),
+        XCTAssertThrowsError(try OracleAttachmentLoader(
+            limits: .init(
+                maxCount: 10,
+                maxBytesPerFile: Self.gifData.count - 1,
+                maxTotalBytes: 100,
+                maxTitleLength: 200,
+                maxInlineTextBytes: 1024
+            ),
             afterFirstRead: { _ in XCTFail("Oversized image must be rejected before reading bytes") }
         ).load(
             requests: [.init(index: 0, path: firstURL.path, title: nil)],
             authority: authority(logical: testRoot, physical: testRoot)
         )) { error in
             XCTAssertEqual(
-                error as? OracleImageLoadError,
+                error as? OracleAttachmentLoadError,
                 .tooLarge(index: 0, maximumBytes: Self.gifData.count - 1)
             )
         }
 
-        XCTAssertThrowsError(try OracleImageAttachmentLoader(
+        XCTAssertThrowsError(try OracleAttachmentLoader(
             limits: .init(
                 maxCount: 10,
-                maxBytesPerImage: Self.gifData.count,
-                maxTotalBytes: Self.gifData.count * 2 - 1
+                maxBytesPerFile: Self.gifData.count,
+                maxTotalBytes: Self.gifData.count * 2 - 1,
+                maxTitleLength: 200,
+                maxInlineTextBytes: 1024
             ),
             afterFirstRead: { _ in XCTFail("Oversized aggregate must be rejected before reading any image bytes") }
         ).load(
@@ -490,7 +581,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             authority: authority(logical: testRoot, physical: testRoot)
         )) { error in
             XCTAssertEqual(
-                error as? OracleImageLoadError,
+                error as? OracleAttachmentLoadError,
                 .totalTooLarge(maximumBytes: Self.gifData.count * 2 - 1)
             )
         }
@@ -504,14 +595,14 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         let truncatedJPEGURL = testRoot.appendingPathComponent("truncated.jpg")
         try Self.jpegData.dropLast(2).write(to: truncatedJPEGURL)
 
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [
                 .init(index: 0, path: paddedJPEGURL.path, title: nil),
                 .init(index: 1, path: truncatedJPEGURL.path, title: nil)
             ],
             authority: authority(logical: testRoot, physical: testRoot)
         )
-        XCTAssertEqual(images.map(\.mediaType), [.jpeg, .jpeg])
+        XCTAssertEqual(images.map(\.imageMediaType), [.jpeg, .jpeg])
         XCTAssertEqual(images[0].bytes, Self.jpegData + Data([0x00, 0x00, 0xAA]))
     }
 
@@ -520,17 +611,17 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         let pngURL = testRoot.appendingPathComponent("pixel.png")
         try Self.realPNGData.write(to: pngURL)
 
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [.init(index: 0, path: pngURL.path, title: nil)],
             authority: authority(logical: testRoot, physical: testRoot)
         )
-        XCTAssertEqual(images.first?.mediaType, .png)
+        XCTAssertEqual(images.first?.imageMediaType, .png)
         XCTAssertEqual(images.first?.bytes, Self.realPNGData)
     }
 
     func testDeriveAuthorityIsolatesUnavailableRootsPerImage() throws {
         let missingRoot = testRoot.appendingPathComponent("missing-root", isDirectory: true)
-        let authority = try OracleImageAttachmentLoader.deriveAuthority(rootSpecs: [
+        let authority = try OracleAttachmentLoader.deriveAuthority(rootSpecs: [
             OracleImageRootSpec(
                 physicalRootPath: testRoot.path,
                 logicalRootPaths: [testRoot.path]
@@ -545,14 +636,14 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
 
         let imageURL = testRoot.appendingPathComponent("image.png")
         try Self.pngData.write(to: imageURL)
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [.init(index: 0, path: imageURL.path, title: nil)],
             authority: authority
         )
         XCTAssertEqual(images.first?.bytes, Self.pngData)
 
         // A path under the unavailable root fails closed with an accurate per-image error.
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(
                 index: 7,
                 path: missingRoot.appendingPathComponent("image.png").path,
@@ -560,14 +651,14 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             )],
             authority: authority
         )) { error in
-            XCTAssertEqual(error as? OracleImageLoadError, .missingOrUnreadable(index: 7))
+            XCTAssertEqual(error as? OracleAttachmentLoadError, .missingOrUnreadable(index: 7))
         }
         // Unrelated paths still fail as outside authority.
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(index: 3, path: "/nonexistent-outside/image.png", title: nil)],
             authority: authority
         )) { error in
-            XCTAssertEqual(error as? OracleImageLoadError, .outsideAuthority(index: 3))
+            XCTAssertEqual(error as? OracleAttachmentLoadError, .outsideAuthority(index: 3))
         }
     }
 
@@ -580,7 +671,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         try Self.pngData.write(to: nestedLogical.appendingPathComponent("diagram.png"))
         let missingPhysical = testRoot.appendingPathComponent("missing-worktree", isDirectory: true)
 
-        let authority = try OracleImageAttachmentLoader.deriveAuthority(rootSpecs: [
+        let authority = try OracleAttachmentLoader.deriveAuthority(rootSpecs: [
             OracleImageRootSpec(
                 physicalRootPath: testRoot.path,
                 logicalRootPaths: [testRoot.path]
@@ -593,7 +684,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         XCTAssertEqual(authority.roots.count, 1)
         XCTAssertEqual(authority.unavailableRoots.count, 1)
 
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(
                 index: 4,
                 path: nestedLogical.appendingPathComponent("diagram.png").path,
@@ -601,7 +692,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
             )],
             authority: authority
         )) { error in
-            XCTAssertEqual(error as? OracleImageLoadError, .missingOrUnreadable(index: 4))
+            XCTAssertEqual(error as? OracleAttachmentLoadError, .missingOrUnreadable(index: 4))
         }
     }
 
@@ -609,7 +700,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         // An available root and a failed binding claim the same logical prefix. The conflict
         // is ambiguous, so the request fails rather than trusting the available root.
         let missingPhysical = testRoot.appendingPathComponent("missing-worktree", isDirectory: true)
-        let authority = try OracleImageAttachmentLoader.deriveAuthority(rootSpecs: [
+        let authority = try OracleAttachmentLoader.deriveAuthority(rootSpecs: [
             OracleImageRootSpec(
                 physicalRootPath: testRoot.path,
                 logicalRootPaths: [testRoot.path]
@@ -624,38 +715,74 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
 
         let imageURL = testRoot.appendingPathComponent("image.png")
         try Self.pngData.write(to: imageURL)
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(index: 2, path: imageURL.path, title: nil)],
             authority: authority
         )) { error in
-            XCTAssertEqual(error as? OracleImageLoadError, .missingOrUnreadable(index: 2))
+            XCTAssertEqual(error as? OracleAttachmentLoadError, .missingOrUnreadable(index: 2))
+        }
+    }
+
+    func testLoadsPDFAndTextAsTheirOwnKindsAndKeepsImageNamedNonImagesAsErrors() throws {
+        let pdfURL = testRoot.appendingPathComponent("report.pdf")
+        let pdfBytes = Data("%PDF-1.4\n1 0 obj\n<< >>\nendobj\n%%EOF\n".utf8)
+        try pdfBytes.write(to: pdfURL)
+        let csvURL = testRoot.appendingPathComponent("data.csv")
+        try Data("a,b\n1,2\n".utf8).write(to: csvURL)
+        let blobURL = testRoot.appendingPathComponent("blob.dat")
+        try Data([0x00, 0x01, 0x02, 0xFF]).write(to: blobURL)
+
+        let loaded = try OracleAttachmentLoader().load(
+            requests: [
+                .init(index: 0, path: pdfURL.path, title: nil),
+                .init(index: 1, path: csvURL.path, title: "Table"),
+                .init(index: 2, path: blobURL.path, title: nil)
+            ],
+            authority: authority(logical: testRoot, physical: testRoot)
+        )
+        XCTAssertEqual(loaded.map(\.payload.kind), [.pdf, .text, .binary])
+        XCTAssertEqual(loaded.map(\.fileName), ["report.pdf", "data.csv", "blob.dat"])
+        XCTAssertEqual(loaded[0].bytes, pdfBytes)
+        XCTAssertEqual(loaded[1].title, "Table")
+
+        let fakeImageURL = testRoot.appendingPathComponent("notes.png")
+        try Data("plain text, not a picture".utf8).write(to: fakeImageURL)
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
+            requests: [.init(index: 0, path: fakeImageURL.path, title: nil)],
+            authority: authority(logical: testRoot, physical: testRoot)
+        )) { error in
+            XCTAssertEqual(
+                error as? OracleAttachmentLoadError,
+                .extensionMismatch(index: 0, fileName: "notes.png", detected: "text")
+            )
+            XCTAssertTrue(error.localizedDescription.contains("notes.png"))
         }
     }
 
     func testRejectsExtensionMismatchAndFileReplacementDuringRead() throws {
         let mismatchURL = testRoot.appendingPathComponent("wrong.jpg")
         try Self.pngData.write(to: mismatchURL)
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(index: 0, path: mismatchURL.path, title: nil)],
             authority: authority(logical: testRoot, physical: testRoot)
         )) { error in
             XCTAssertEqual(
-                error as? OracleImageLoadError,
-                .extensionMismatch(index: 0, mediaType: .png)
+                error as? OracleAttachmentLoadError,
+                .extensionMismatch(index: 0, fileName: "wrong.jpg", detected: "image/png")
             )
         }
 
         let changingURL = testRoot.appendingPathComponent("changing.gif")
         try Self.gifData.write(to: changingURL)
         let replacement = Data(Array("GIF87a".utf8) + [2, 0, 1, 0])
-        let loader = OracleImageAttachmentLoader(afterFirstRead: { _ in
+        let loader = OracleAttachmentLoader(afterFirstRead: { _ in
             try replacement.write(to: changingURL, options: .atomic)
         })
         XCTAssertThrowsError(try loader.load(
             requests: [.init(index: 0, path: changingURL.path, title: nil)],
             authority: authority(logical: testRoot, physical: testRoot)
         )) { error in
-            XCTAssertEqual(error as? OracleImageLoadError, .changedWhileReading(index: 0))
+            XCTAssertEqual(error as? OracleAttachmentLoadError, .changedWhileReading(index: 0))
         }
     }
 
@@ -685,7 +812,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         XCTAssertEqual(firstProjection.rootIdentity, secondProjection.rootIdentity)
         XCTAssertEqual(firstProjection.resolvedPhysicalRootPath, secondProjection.resolvedPhysicalRootPath)
 
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [
                 .init(index: 0, path: firstAlias.appendingPathComponent("image.gif").path, title: nil),
                 .init(index: 1, path: secondAlias.appendingPathComponent("image.gif").path, title: nil),
@@ -712,12 +839,12 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         try Self.gifData.write(to: sibling)
         try Self.pngData.write(to: outside)
 
-        let authority = try OracleImageAttachmentLoader.deriveAuthority(
+        let authority = try OracleAttachmentLoader.deriveAuthority(
             rootSpecs: [OracleImageRootSpec(physicalRootPath: workspaceRoot.path, logicalRootPaths: [workspaceRoot.path])],
             sessionAttachmentPaths: [attached.path]
         )
 
-        let images = try OracleImageAttachmentLoader().load(
+        let images = try OracleAttachmentLoader().load(
             requests: [.init(index: 0, path: attached.path, title: nil)],
             authority: authority
         )
@@ -726,7 +853,7 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         // The temp directory is reached through /var -> /private/var; both spellings name the file.
         let resolvedAttached = attached.resolvingSymlinksInPath().path
         XCTAssertEqual(
-            try OracleImageAttachmentLoader().load(
+            try OracleAttachmentLoader().load(
                 requests: [.init(index: 0, path: resolvedAttached, title: nil)],
                 authority: authority
             ).map(\.bytes),
@@ -735,22 +862,22 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
 
         // Neither another file in the same managed store nor an arbitrary outside path is authorized.
         for (index, url) in [sibling, outside].enumerated() {
-            XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+            XCTAssertThrowsError(try OracleAttachmentLoader().load(
                 requests: [.init(index: index, path: url.path, title: nil)],
                 authority: authority
             )) { error in
-                XCTAssertEqual(error as? OracleImageLoadError, .outsideAuthority(index: index))
+                XCTAssertEqual(error as? OracleAttachmentLoadError, .outsideAuthority(index: index))
             }
         }
         // Without the session allowance, the attached file itself is outside authority too.
-        let rootsOnly = try OracleImageAttachmentLoader.deriveAuthority(rootSpecs: [
+        let rootsOnly = try OracleAttachmentLoader.deriveAuthority(rootSpecs: [
             OracleImageRootSpec(physicalRootPath: workspaceRoot.path, logicalRootPaths: [workspaceRoot.path])
         ])
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(index: 0, path: attached.path, title: nil)],
             authority: rootsOnly
         )) { error in
-            XCTAssertEqual(error as? OracleImageLoadError, .outsideAuthority(index: 0))
+            XCTAssertEqual(error as? OracleAttachmentLoadError, .outsideAuthority(index: 0))
         }
     }
 
@@ -762,11 +889,11 @@ final class OracleImageAttachmentLoaderTests: XCTestCase {
         try Self.pngData.write(to: target)
         try FileManager.default.createSymbolicLink(at: attached, withDestinationURL: target)
 
-        let authority = try OracleImageAttachmentLoader.deriveAuthority(
+        let authority = try OracleAttachmentLoader.deriveAuthority(
             rootSpecs: [],
             sessionAttachmentPaths: [attached.path]
         )
-        XCTAssertThrowsError(try OracleImageAttachmentLoader().load(
+        XCTAssertThrowsError(try OracleAttachmentLoader().load(
             requests: [.init(index: 0, path: attached.path, title: nil)],
             authority: authority
         ))

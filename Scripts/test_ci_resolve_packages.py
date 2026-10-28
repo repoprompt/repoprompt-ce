@@ -2,7 +2,9 @@
 import contextlib
 import io
 import os
+import selectors
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,151 @@ from pathlib import Path
 import unittest
 from unittest import mock
 import ci_resolve_packages as resolver
+import ci_process_session as process_session
+
+
+class ResolutionCancellationTests(unittest.TestCase):
+    def assert_process_stopped(self, pid):
+        result = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+        self.assertFalse(result.stderr, 'process inspection must succeed: ' + result.stderr)
+        self.assertTrue(result.returncode != 0 or result.stdout.strip().startswith('Z'), result.stdout)
+
+    def run_owned_attempt(self, *, initial_signal=None, cleanup_signal=None,
+                         launch_gate=False, timeout_cleanup=False):
+        with tempfile.TemporaryDirectory() as temporary:
+            control, barrier = socket.socketpair()
+            control.settimeout(5)
+            source = '''
+import os, signal
+reader, writer = os.pipe()
+if os.fork() == 0:
+    os.close(reader)
+    os.setpgrp()
+    print('descendant=' + str(os.getpid()), flush=True)
+    os.close(1)
+    os.close(2)
+    os.write(writer, b'R')
+    os.close(writer)
+    while True: signal.pause()
+os.close(writer)
+os.read(reader, 1)
+os.close(reader)
+print('leader=' + str(os.getpid()), flush=True)
+os.close(1)
+os.close(2)
+''' + ('while True: signal.pause()\n' if initial_signal is not None or timeout_cleanup else 'os._exit(0)\n')
+            wrapper = f'''
+import ci_resolve_packages as resolver, ci_process_session, signal, socket
+from pathlib import Path
+before = {{sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}}
+if {launch_gate!r}:
+    barrier = socket.socket(fileno={barrier.fileno()})
+    launch = resolver.subprocess.Popen
+    def gated_launch(*args, **kwargs):
+        resolver.subprocess.Popen = launch
+        process = launch(*args, **kwargs)
+        barrier.sendall(b'R')
+        barrier.recv(1)
+        return process
+    resolver.subprocess.Popen = gated_launch
+if {cleanup_signal is not None!r}:
+    barrier = socket.socket(fileno={barrier.fileno()})
+    inventory = ci_process_session.session_process_groups
+    def gated_inventory(session_id):
+        ci_process_session.session_process_groups = inventory
+        barrier.sendall(b'R')
+        barrier.recv(1)
+        return inventory(session_id)
+    ci_process_session.session_process_groups = gated_inventory
+def run(_command, **kwargs):
+    return resolver.run_resolution({[sys.executable, '-u', '-c', source]!r}, **kwargs)
+def forbid_retry(_seconds):
+    raise AssertionError('a cancelled or successful attempt must not retry')
+try:
+    raise SystemExit(resolver.resolve(Path({temporary!r}), run=run, sleep=forbid_retry,
+                                     timeout={1 if timeout_cleanup else 300}))
+finally:
+    assert before == {{sig: signal.getsignal(sig) for sig in before}}, 'signal handlers must be restored'
+'''
+            process = subprocess.Popen(
+                [sys.executable, '-u', '-c', wrapper], cwd=Path(__file__).resolve().parent,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=(barrier.fileno(),),
+            )
+            barrier.close()
+            pids = {}
+            try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    observed = b''
+                    deadline = time.monotonic() + 5
+                    while len(pids) < 2:
+                        self.assertGreater(deadline, time.monotonic(), observed)
+                        for key, _ in selector.select(max(0, deadline - time.monotonic())):
+                            observed += os.read(key.fd, 65536)
+                        for line in observed.splitlines():
+                            if line.startswith((b'leader=', b'descendant=')) and line + b'\n' in observed:
+                                name, raw_pid = line.split(b'=')
+                                pids[name] = int(raw_pid)
+                if launch_gate:
+                    self.assertEqual(control.recv(1), b'R')
+                if initial_signal is not None:
+                    os.kill(process.pid, initial_signal)
+                if launch_gate:
+                    control.sendall(b'G')
+                if cleanup_signal is not None:
+                    self.assertEqual(control.recv(1), b'R')
+                    os.kill(process.pid, cleanup_signal)
+                    control.sendall(b'G')
+                output, _ = process.communicate(timeout=10)
+                expected = (-signal.SIGINT if initial_signal == signal.SIGINT else
+                            128 + initial_signal if initial_signal is not None else
+                            128 + cleanup_signal if cleanup_signal is not None else 0)
+                self.assertEqual(process.returncode, expected, observed + output)
+                self.assertNotIn(b'Dependency resolution attempt 2/', observed + output)
+                for pid in pids.values():
+                    self.assert_process_stopped(pid)
+            finally:
+                control.close()
+                if process.poll() is None:
+                    process.kill()
+                # A red regression must still stop only its exact owned fixture groups.
+                for pid in pids.values():
+                    try:
+                        if os.getsid(pid) == pids.get(b'leader'):
+                            os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.communicate(timeout=5)
+
+    def test_cancelled_attempt_stops_its_session_without_retry(self):
+        for initial in (signal.SIGTERM, signal.SIGINT):
+            for repeated in (None, signal.SIGINT if initial == signal.SIGTERM else signal.SIGTERM):
+                with self.subTest(initial=initial, repeated=repeated):
+                    self.run_owned_attempt(initial_signal=initial, cleanup_signal=repeated)
+
+    def test_successful_attempt_drains_children_and_honors_cancellation_during_cleanup(self):
+        for cancellation in (None, signal.SIGTERM, signal.SIGINT):
+            with self.subTest(cancellation=cancellation):
+                self.run_owned_attempt(cleanup_signal=cancellation)
+
+    def test_cancellation_while_launch_is_handing_back_ownership_stops_the_attempt(self):
+        for cancellation in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(cancellation=cancellation):
+                self.run_owned_attempt(initial_signal=cancellation, launch_gate=True)
+
+    def test_cancellation_during_timeout_cleanup_aborts_without_retry(self):
+        for cancellation in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(cancellation=cancellation):
+                self.run_owned_attempt(cleanup_signal=cancellation, timeout_cleanup=True)
+
+    def test_failed_spawn_restores_handlers_and_preserves_the_error(self):
+        before = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+        with mock.patch.object(resolver.subprocess, 'Popen', side_effect=FileNotFoundError('missing resolver')), \
+                mock.patch.object(resolver, 'terminate_resolution') as cleanup:
+            with self.assertRaisesRegex(FileNotFoundError, 'missing resolver'):
+                resolver.run_resolution(['missing'], cwd=None, check=False, timeout=1)
+        self.assertEqual(before, {sig: signal.getsignal(sig) for sig in before})
+        cleanup.assert_not_called()
 
 
 class ResolutionTests(unittest.TestCase):
@@ -94,9 +241,20 @@ class ResolutionTests(unittest.TestCase):
 
     def test_process_inventory_failure_cannot_be_treated_as_a_retryable_timeout(self):
         process = mock.Mock(pid=123)
-        with mock.patch.object(resolver, 'session_process_groups', side_effect=RuntimeError('inventory failed')):
+        with mock.patch.object(process_session, 'session_process_groups', side_effect=RuntimeError('inventory failed')):
             with self.assertRaisesRegex(RuntimeError, 'inventory failed'):
                 resolver.terminate_resolution(process)
+
+    def test_empty_group_permission_error_requires_a_confirmed_empty_inventory(self):
+        with mock.patch.object(process_session, 'session_process_groups', side_effect=[{456}, set()]), \
+                mock.patch.object(process_session.os, 'killpg', side_effect=PermissionError):
+            process_session.signal_session(123, signal.SIGKILL)
+
+    def test_live_group_permission_error_cannot_be_treated_as_successful_cleanup(self):
+        with mock.patch.object(process_session, 'session_process_groups', return_value={456}), \
+                mock.patch.object(process_session.os, 'killpg', side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                process_session.signal_session(123, signal.SIGKILL)
 
     def test_slow_inventory_does_not_consume_signal_grace_period(self):
         process = mock.Mock(pid=123)
@@ -122,10 +280,10 @@ class ResolutionTests(unittest.TestCase):
             nonlocal clock
             clock += seconds
 
-        with mock.patch.object(resolver, 'session_process_groups', side_effect=inventory), \
-                mock.patch.object(resolver.os, 'killpg', side_effect=send_signal) as signals, \
-                mock.patch.object(resolver.time, 'monotonic', side_effect=lambda: clock), \
-                mock.patch.object(resolver.time, 'sleep', side_effect=sleep):
+        with mock.patch.object(process_session, 'session_process_groups', side_effect=inventory), \
+                mock.patch.object(process_session.os, 'killpg', side_effect=send_signal) as signals, \
+                mock.patch.object(process_session.time, 'monotonic', side_effect=lambda: clock), \
+                mock.patch.object(process_session.time, 'sleep', side_effect=sleep):
             resolver.terminate_resolution(process)
 
         signals.assert_any_call(456, signal.SIGTERM)

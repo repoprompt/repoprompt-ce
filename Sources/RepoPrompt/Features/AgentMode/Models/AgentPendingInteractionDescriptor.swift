@@ -30,6 +30,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
     let detail: String?
     let approvalKind: AgentApprovalKind?
     let supportsPlainApprove: Bool
+    let supportsDecline: Bool
     /// Exact command an approval would authorize (approvals only).
     let command: String?
     /// Provider tool name when the approval names one (Claude `can_use_tool`), e.g. `Bash`.
@@ -49,6 +50,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
         detail: String?,
         approvalKind: AgentApprovalKind? = nil,
         supportsPlainApprove: Bool = true,
+        supportsDecline: Bool = true,
         command: String? = nil,
         toolName: String? = nil,
         questionID: String? = nil,
@@ -64,6 +66,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
         self.detail = detail
         self.approvalKind = approvalKind
         self.supportsPlainApprove = supportsPlainApprove
+        self.supportsDecline = supportsDecline
         self.command = command
         self.toolName = toolName
         self.questionID = questionID
@@ -79,6 +82,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
             detail: detail,
             approvalKind: approvalKind,
             supportsPlainApprove: supportsPlainApprove,
+            supportsDecline: supportsDecline,
             command: command,
             toolName: toolName,
             questionID: questionID,
@@ -98,6 +102,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
         detail: String?,
         approvalKind: AgentApprovalKind?,
         supportsPlainApprove: Bool = true,
+        supportsDecline: Bool = true,
         command: String?,
         toolName: String?,
         questionID: String?,
@@ -125,6 +130,7 @@ struct AgentPendingInteractionDescriptor: Equatable {
             isSecret ? "1" : "0"
         ]
         if !supportsPlainApprove { fields.append("plain-approve-unavailable") }
+        if !supportsDecline { fields.append("decline-unavailable") }
         let digest = SHA256.hash(data: Data(fields.joined(separator: separator).utf8))
         return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
     }
@@ -172,6 +178,7 @@ extension AgentPendingInteractionDescriptor {
                 detail: command ?? nonEmpty(approval.reason) ?? nonEmpty(approval.grantRoot),
                 approvalKind: approval.kind,
                 supportsPlainApprove: approval.supportsPlainApprove,
+                supportsDecline: approval.allows(.decline),
                 command: command,
                 toolName: toolName
             )

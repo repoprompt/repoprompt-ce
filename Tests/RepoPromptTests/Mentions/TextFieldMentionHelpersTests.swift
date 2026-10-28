@@ -15,7 +15,7 @@ final class TextFieldMentionHelpersTests: XCTestCase {
             relativePath: "Sources/Second.swift",
             kind: .file
         )
-        let textView = ImageAwareTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+        let textView = AttachmentAwareTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
         textView.string = "@s"
         textView.setSelectedRange(NSRange(location: 2, length: 0))
         let helper = FileTagMentionHelper()
@@ -296,8 +296,8 @@ final class TextFieldMentionHelpersTests: XCTestCase {
         XCTAssertEqual(replacement.requestCount, 1)
     }
 
-    private static func makeSlashTriggerTextView() -> ImageAwareTextView {
-        let textView = ImageAwareTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
+    private static func makeSlashTriggerTextView() -> AttachmentAwareTextView {
+        let textView = AttachmentAwareTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 80))
         textView.string = "/de"
         textView.setSelectedRange(NSRange(location: 3, length: 0))
         return textView

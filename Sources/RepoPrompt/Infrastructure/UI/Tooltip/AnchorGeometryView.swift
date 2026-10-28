@@ -8,7 +8,7 @@ import AppKit
 import SwiftUI
 
 struct AnchorGeometryView: NSViewRepresentable {
-    typealias UpdateCallback = (_ frameInWindow: NSRect, _ window: NSWindow?) -> Void
+    typealias UpdateCallback = (_ frameInWindow: NSRect, _ window: NSWindow?, _ trackingView: NSView) -> Void
 
     /// Bump this value to force `updateNSView` → `scheduleReport()` even when the view's
     /// own layout doesn't change (e.g. when inside a SwiftUI ScrollView where scrolling
@@ -60,6 +60,17 @@ struct AnchorGeometryView: NSViewRepresentable {
             scheduleReport()
         }
 
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            // Invalidate the old anchor synchronously, before a delayed show can
+            // run. Geometry itself remains deferred to avoid layout re-entry.
+            if window !== newWindow {
+                lastWindow = nil
+                lastFrameInWindow = .null
+                callback(.zero, nil, self)
+            }
+            super.viewWillMove(toWindow: newWindow)
+        }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             scheduleReport()
@@ -90,7 +101,7 @@ struct AnchorGeometryView: NSViewRepresentable {
 
             lastWindow = win
             lastFrameInWindow = frameInWin
-            callback(frameInWin, win)
+            callback(frameInWin, win, self)
         }
 
         private func deviceEpsilon(in window: NSWindow) -> CGFloat {

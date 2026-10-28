@@ -117,13 +117,16 @@ import XCTest
             XCTAssertEqual(fixture.rebindRecorder.count, 0)
         }
 
-        func testOracleSendLoadsImagesForStartsAndContinuationsOnOrdinaryAndAgentConnections() async throws {
+        func testOracleSendLoadsAttachmentsForStartsAndContinuationsOnOrdinaryAndAgentConnections() async throws {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).resolvingSymlinksInPath()
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
             let bytes = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
             let imageURL = root.appendingPathComponent("fixture.png")
             try bytes.write(to: imageURL)
+            let csvBytes = Data("name,count\nwidget,3\n".utf8)
+            let csvURL = root.appendingPathComponent("fixture.csv")
+            try csvBytes.write(to: csvURL)
 
             for purpose in [MCPRunPurpose.unknown, .agentModeRun] {
                 for route: [String: Value] in [["new_chat": .bool(true)], ["chat_id": .string("existing-chat")], [:]] {
@@ -134,28 +137,34 @@ import XCTest
                     addTeardownBlock { await store.unloadRoot(id: loaded.id) }
                     var args = route
                     args["message"] = .string("inspect")
-                    args["images"] = .array([.object(["path": .string(imageURL.path), "title": .string("Fixture")])])
+                    args[OracleAttachmentContract.argumentName] = .array([
+                        .object(["path": .string(imageURL.path), "title": .string("Fixture")]),
+                        .object(["path": .string(csvURL.path)])
+                    ])
 
                     _ = try await fixture.service.executeOracleSend(args: args, invocationContext: fixture.invocationContext)
 
                     XCTAssertEqual(fixture.sendRecorder.calls.count, 1)
                     let sent = try XCTUnwrap(fixture.sendRecorder.calls.first)
-                    XCTAssertNil(sent["images"], "Raw attachment paths must be consumed before dispatch")
+                    XCTAssertNil(
+                        sent[OracleAttachmentContract.argumentName],
+                        "Raw attachment paths must be consumed before dispatch"
+                    )
                     XCTAssertEqual(sent["new_chat"], route["new_chat"])
                     XCTAssertEqual(sent["chat_id"], route["chat_id"])
-                    XCTAssertEqual(fixture.sendRecorder.images.first?.map(\.bytes), [bytes])
+                    XCTAssertEqual(fixture.sendRecorder.images.first?.map(\.bytes), [bytes, csvBytes])
                 }
             }
         }
 
-        func testOracleSendRejectsInvalidImagesBeforeDispatch() async throws {
+        func testOracleSendRejectsInvalidAttachmentsBeforeDispatch() async throws {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).resolvingSymlinksInPath()
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
             let outsidePath = root.deletingLastPathComponent().appendingPathComponent("outside-image.png").path
-            for (images, expectedError): (Value, String) in [
-                (.string("invalid"), "images must be an array"),
-                (.array([.object(["path": .string(outsidePath)])]), "images[0].path is outside the current workspace roots")
+            for (attachments, expectedError): (Value, String) in [
+                (.string("invalid"), "attachments must be an array"),
+                (.array([.object(["path": .string(outsidePath)])]), "attachments[0].path is outside the current workspace roots")
             ] {
                 let fixture = makeOracleSendFixture(stopAfterRoute: false)
                 defer { fixture.cleanup() }
@@ -164,14 +173,87 @@ import XCTest
                 addTeardownBlock { await store.unloadRoot(id: loaded.id) }
                 do {
                     _ = try await fixture.service.executeOracleSend(args: [
-                        "message": .string("inspect"), "new_chat": .bool(true), "images": images
+                        "message": .string("inspect"), "new_chat": .bool(true),
+                        OracleAttachmentContract.argumentName: attachments
                     ], invocationContext: fixture.invocationContext)
-                    XCTFail("Expected image validation failure")
+                    XCTFail("Expected attachment validation failure")
                 } catch {
                     XCTAssertTrue(error.localizedDescription.contains(expectedError), error.localizedDescription)
                 }
                 XCTAssertTrue(fixture.sendRecorder.calls.isEmpty)
             }
+        }
+
+        func testDeprecatedImagesAliasDeliversImagesButStaysImageOnly() async throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).resolvingSymlinksInPath()
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let bytes = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="))
+            let imageURL = root.appendingPathComponent("fixture.png")
+            try bytes.write(to: imageURL)
+            let csvURL = root.appendingPathComponent("fixture.csv")
+            try Data("name,count\nwidget,3\n".utf8).write(to: csvURL)
+            let legacy = OracleAttachmentContract.legacyImagesArgumentName
+
+            // Released v1.6.0 callers keep working: an image passed in `images` is delivered.
+            for purpose in [MCPRunPurpose.unknown, .agentModeRun] {
+                let fixture = makeOracleSendFixture(stopAfterRoute: false, connectionID: UUID(), livePurpose: purpose)
+                defer { fixture.cleanup() }
+                let store = fixture.window.promptManager.workspaceFileContextStore
+                let loaded = try await store.loadRoot(path: root.path, kind: .primaryWorkspace)
+                addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+
+                _ = try await fixture.service.executeOracleSend(args: [
+                    "message": .string("inspect"), "new_chat": .bool(true),
+                    legacy: .array([.object(["path": .string(imageURL.path), "title": .string("Fixture")])])
+                ], invocationContext: fixture.invocationContext)
+
+                let sent = try XCTUnwrap(fixture.sendRecorder.calls.first)
+                XCTAssertNil(sent[legacy], "Raw legacy image paths must be consumed before dispatch")
+                XCTAssertEqual(fixture.sendRecorder.images.first?.map(\.bytes), [bytes])
+            }
+
+            // The alias never widens past its released meaning: a non-image is refused before dispatch.
+            do {
+                let fixture = makeOracleSendFixture(stopAfterRoute: false)
+                defer { fixture.cleanup() }
+                let store = fixture.window.promptManager.workspaceFileContextStore
+                let loaded = try await store.loadRoot(path: root.path, kind: .primaryWorkspace)
+                addTeardownBlock { await store.unloadRoot(id: loaded.id) }
+                do {
+                    _ = try await fixture.service.executeOracleSend(args: [
+                        "message": .string("inspect"), "new_chat": .bool(true),
+                        legacy: .array([.object(["path": .string(csvURL.path)])])
+                    ], invocationContext: fixture.invocationContext)
+                    XCTFail("The deprecated images alias must refuse a non-image")
+                } catch {
+                    let message = error.localizedDescription
+                    XCTAssertTrue(message.contains("images[0] is not a supported PNG, JPEG, WebP, or GIF file"), message)
+                    XCTAssertTrue(message.contains("`attachments`"), message)
+                }
+                XCTAssertTrue(fixture.sendRecorder.calls.isEmpty)
+            }
+
+            // Passing both keys is ambiguous and rejected on both Oracle tools.
+            let fixture = makeOracleSendFixture(stopAfterRoute: false, connectionID: UUID(), livePurpose: .agentModeRun)
+            defer { fixture.cleanup() }
+            let both: [String: Value] = [
+                "message": .string("inspect"),
+                OracleAttachmentContract.argumentName: .array([.object(["path": .string(imageURL.path)])]),
+                legacy: .array([.object(["path": .string(imageURL.path)])])
+            ]
+            for (toolName, run) in [
+                (MCPWindowToolName.oracleSend, { try await fixture.service.executeOracleSend(args: both, invocationContext: fixture.invocationContext) }),
+                (MCPWindowToolName.askOracle, { try await fixture.service.executeAskOracle(args: both, invocationContext: fixture.invocationContext) })
+            ] {
+                do {
+                    _ = try await run()
+                    XCTFail("\(toolName) must reject attachments combined with images")
+                } catch {
+                    XCTAssertTrue(error.localizedDescription.contains("not both"), error.localizedDescription)
+                }
+            }
+            XCTAssertTrue(fixture.sendRecorder.calls.isEmpty)
         }
 
         func testAgentModeOracleSendDoesNotCompatibilityRebind() async {
@@ -569,7 +651,7 @@ import XCTest
                 sendStageProgress: { _, _, _, _ in },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
                 sendChat: { args, _, context in
-                    sendRecorder.record(args, images: context?.transientImages ?? [])
+                    sendRecorder.record(args, images: context?.attachments ?? [])
                     return settledReply ?? [
                         "chat_id": .string("selected-chat"),
                         "response": .string("response")
@@ -737,9 +819,9 @@ import XCTest
     @MainActor
     private final class OracleSendArgsRecorder {
         private(set) var calls: [[String: Value]] = []
-        private(set) var images: [[AITransientImage]] = []
+        private(set) var images: [[OracleAttachment]] = []
 
-        func record(_ args: [String: Value], images: [AITransientImage]) {
+        func record(_ args: [String: Value], images: [OracleAttachment]) {
             calls.append(args)
             self.images.append(images)
         }
@@ -789,108 +871,130 @@ import XCTest
 #endif
 
 @MainActor
-final class OracleImageContractTests: XCTestCase {
+final class OracleAttachmentContractTests: XCTestCase {
     func testParserAcceptsOnlyBoundedPathAndOptionalTitleObjects() throws {
-        XCTAssertEqual(try MCPOracleToolService.parseOracleImageRequests(nil), [])
-        XCTAssertEqual(try MCPOracleToolService.parseOracleImageRequests(.array([])), [])
+        XCTAssertEqual(try OracleAttachmentContract.parse(nil), [])
+        XCTAssertEqual(try OracleAttachmentContract.parse(.array([])), [])
 
-        let parsed = try MCPOracleToolService.parseOracleImageRequests(.array([
+        let parsed = try OracleAttachmentContract.parse(.array([
             .object([
                 "path": .string("  /workspace/diagram.png  "),
                 "title": .string("  Architecture  ")
             ]),
-            .object(["path": .string("/workspace/photo.jpg")])
+            .object(["path": .string("/workspace/photo.jpg")]),
+            .object(["path": .string("/workspace/data.csv"), "title": .string("   ")])
         ]))
 
         XCTAssertEqual(parsed, [
             .init(index: 0, path: "  /workspace/diagram.png  ", title: "Architecture"),
-            .init(index: 1, path: "/workspace/photo.jpg", title: nil)
+            .init(index: 1, path: "/workspace/photo.jpg", title: nil),
+            .init(index: 2, path: "/workspace/data.csv", title: nil)
         ])
     }
 
     func testParserRejectsOversizedAndExpandedAttachmentShapes() {
-        XCTAssertThrowsError(try MCPOracleToolService.parseOracleImageRequests(.array([
+        let limits = OracleAttachmentLimits.production
+        XCTAssertThrowsError(try OracleAttachmentContract.parse(.array([
             .object(["path": .string("/workspace/image.png"), "_meta": .string("ignored")])
         ])))
-        XCTAssertThrowsError(try MCPOracleToolService.parseOracleImageRequests(.array(
-            (0 ... 10).map { .object(["path": .string("/workspace/\($0).png")]) }
+        XCTAssertThrowsError(try OracleAttachmentContract.parse(.array(
+            (0 ... limits.maxCount).map { .object(["path": .string("/workspace/\($0).png")]) }
         )))
-        XCTAssertThrowsError(try MCPOracleToolService.parseOracleImageRequests(.array([
+        XCTAssertThrowsError(try OracleAttachmentContract.parse(.array([
             .object([
                 "path": .string("/workspace/image.png"),
                 "url": .string("https://example.com/image.png")
             ])
         ])))
-        XCTAssertThrowsError(try MCPOracleToolService.parseOracleImageRequests(.array([
+        XCTAssertThrowsError(try OracleAttachmentContract.parse(.array([
             .object([
                 "path": .string("/workspace/image.png"),
-                "title": .string(String(repeating: "x", count: 201))
+                "title": .string(String(repeating: "x", count: limits.maxTitleLength + 1))
             ])
         ])))
     }
 
-    func testOracleSendImageDocumentationIsProviderNeutralAndMatchesLimits() throws {
-        XCTAssertEqual(OracleImageAttachmentLimits.production.maxCount, 10)
-        XCTAssertEqual(OracleImageAttachmentLimits.production.maxBytesPerImage, 20 * 1024 * 1024)
-        XCTAssertEqual(OracleImageAttachmentLimits.production.maxTotalBytes, 50 * 1024 * 1024)
-        let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "oracle_send"))
-        let schema = try XCTUnwrap(canonical.inputSchema.objectValue)
-        let properties = try XCTUnwrap(schema["properties"]?.objectValue)
-        let canonicalArgument = try XCTUnwrap(properties["images"]?.objectValue?["description"]?.stringValue)
-        let headlessDisclaimer = " Requires the app backend; the direct headless backend rejects `images`."
-        XCTAssertEqual(canonicalArgument, MCPOracleToolProvider.oracleImagesArgumentDescription + headlessDisclaimer)
-        XCTAssertTrue(canonical.description.contains(MCPOracleToolProvider.oracleImageUsageDescription + headlessDisclaimer))
+    func testArgumentParserMarksOnlyTheDeprecatedImagesAliasImageOnly() throws {
+        let item: Value = .array([.object(["path": .string("/workspace/image.png"), "title": .string("Shot")])])
+        let current = try OracleAttachmentContract.parseArguments([OracleAttachmentContract.argumentName: item])
+        XCTAssertEqual(current, [OracleAttachmentRequest(index: 0, path: "/workspace/image.png", title: "Shot")])
+        XCTAssertEqual(current.map(\.imageOnly), [false])
 
-        let documentation = [
-            MCPOracleToolProvider.oracleImageUsageDescription,
-            MCPOracleToolProvider.oracleImagesArgumentDescription
-        ].joined(separator: " ")
-
-        XCTAssertFalse(documentation.lowercased().contains("anthropic"))
-        XCTAssertTrue(documentation.contains("10 images"))
-        XCTAssertTrue(documentation.contains("20 MiB each"))
-        XCTAssertTrue(documentation.contains("50 MiB total"))
-        for description in [
-            MCPOracleToolProvider.oracleImageUsageDescription,
-            MCPOracleToolProvider.oracleImagesArgumentDescription
-        ] {
-            XCTAssertTrue(description.contains("raw attachment-file bytes before provider encoding"))
-            XCTAssertTrue(description.contains("provider or model may impose additional restrictions"))
-            XCTAssertTrue(description.contains("do not guarantee full-request or model-context fit"))
+        let legacy = try OracleAttachmentContract.parseArguments([OracleAttachmentContract.legacyImagesArgumentName: item])
+        XCTAssertEqual(legacy.map(\.imageOnly), [true])
+        XCTAssertEqual(legacy.map(\.path), ["/workspace/image.png"])
+        XCTAssertThrowsError(try OracleAttachmentContract.parseArguments([
+            OracleAttachmentContract.legacyImagesArgumentName: .string("invalid")
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("images must be an array"), error.localizedDescription)
         }
-        let usage = MCPOracleToolProvider.oracleImageUsageDescription
-        XCTAssertTrue(usage.contains("additional to pre-send text estimates and Context Builder text-selection budgets"))
-        XCTAssertTrue(usage.contains("Originals, not transcript thumbnails, are sent to each Oracle lane"))
-        XCTAssertTrue(usage.contains("group fan-out multiplies image usage/cost, not any one request's attachment cap"))
-        XCTAssertTrue(usage.contains("Provider-reported input totals may already include image usage"))
-        XCTAssertTrue(usage.contains("this-turn-only"))
-        XCTAssertTrue(usage.contains("continuations do not automatically reattach prior images or send saved thumbnails"))
-        XCTAssertTrue(documentation.contains("PNG"))
-        XCTAssertTrue(documentation.lowercased().contains("rejected"))
-
-        // Images the user attached to the agent session are accepted at their exact path, so every
-        // surface (app tool, canonical/headless definition, path field) must say so.
-        for description in [
-            MCPOracleToolProvider.oracleImageUsageDescription,
-            MCPOracleToolProvider.oracleImagesArgumentDescription
-        ] {
-            XCTAssertTrue(description.contains("image the user attached to this agent session"))
-            XCTAssertTrue(description.contains("sibling attachments"))
-            XCTAssertTrue(description.contains("arbitrary"))
-        }
-        let items = try XCTUnwrap(properties["images"]?.objectValue?["items"]?.objectValue)
-        let pathDescription = try XCTUnwrap(
-            items["properties"]?.objectValue?["path"]?.objectValue?["description"]?.stringValue
-        )
-        XCTAssertTrue(pathDescription.contains("image attached to this agent session"))
+        XCTAssertTrue(try OracleAttachmentContract.parseArguments([:]).isEmpty)
     }
 
-    func testRawImagesAtOracleDispatchAreAnInternalInvariantFailure() {
-        XCTAssertNoThrow(try OracleViewModel.validateRawImageDispatchInvariant([
+    func testEverySchemaCopyRendersFromTheContract() throws {
+        let contract = OracleAttachmentContract.self
+
+        let appSchema = try JSONDecoder().decode(
+            Value.self,
+            from: JSONEncoder().encode(MCPOracleToolProvider.oracleAttachmentsSchema)
+        )
+        XCTAssertEqual(appSchema, contract.schemaProperty())
+        XCTAssertEqual(MCPOracleToolProvider.oracleAttachmentsUsageDescription, contract.usageDescription())
+
+        for toolName in contract.oracleToolNames {
+            let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: toolName))
+            let properties = try XCTUnwrap(canonical.inputSchema.objectValue?["properties"]?.objectValue)
+            XCTAssertEqual(properties[contract.argumentName], contract.schemaProperty(headlessLimitation: true), toolName)
+            XCTAssertNil(properties[contract.legacyImagesArgumentName], toolName)
+            XCTAssertTrue(
+                canonical.description.contains(contract.usageDescription() + contract.headlessLimitationNote),
+                toolName
+            )
+        }
+    }
+
+    func testAdvertisedLimitsFollowTheLimitsPassedToTheContract() throws {
+        let limits = OracleAttachmentLimits(
+            maxCount: 3,
+            maxBytesPerFile: 2 * 1_048_576,
+            maxTotalBytes: 5 * 1_048_576,
+            maxTitleLength: 7,
+            maxInlineTextBytes: 4096
+        )
+        let property = try XCTUnwrap(OracleAttachmentContract.schemaProperty(limits: limits).objectValue)
+        XCTAssertEqual(property["maxItems"], .int(3))
+        let title = try XCTUnwrap(
+            property["items"]?.objectValue?["properties"]?.objectValue?["title"]?.objectValue
+        )
+        XCTAssertEqual(title["maxLength"], .int(7))
+        let description = try XCTUnwrap(property["description"]?.stringValue)
+        for figure in ["3 files", "2 MiB each", "5 MiB total", "4 KiB"] {
+            XCTAssertTrue(description.contains(figure), figure)
+        }
+    }
+
+    func testProseOnlyClaimsDeliveriesTheCapabilityTableMakes() {
+        let capabilities = AttachmentRoute.allCases.map { AttachmentRouteCapability.capability(for: $0) }
+        let description = OracleAttachmentContract.usageDescription()
+
+        XCTAssertTrue(capabilities.contains { $0.pdf == .nativeDocument })
+        XCTAssertTrue(capabilities.contains { $0.pdf == .unsupported })
+        XCTAssertTrue(description.contains("PDFs are sent as documents only where"))
+        XCTAssertFalse(description.contains("PDFs are sent as documents."))
+
+        XCTAssertTrue(capabilities.allSatisfy { $0.binary == .unsupported })
+        XCTAssertFalse(description.contains("other binary files"))
+    }
+
+    func testRawAttachmentsAtOracleDispatchAreAnInternalInvariantFailure() {
+        XCTAssertNoThrow(try OracleViewModel.validateRawAttachmentDispatchInvariant([
             "message": .string("inspect")
         ]))
-        XCTAssertThrowsError(try OracleViewModel.validateRawImageDispatchInvariant([
-            "images": .array([.object(["path": .string("/workspace/image.png")])])
+        XCTAssertThrowsError(try OracleViewModel.validateRawAttachmentDispatchInvariant([
+            OracleAttachmentContract.legacyImagesArgumentName: .array([.object(["path": .string("/workspace/image.png")])])
+        ]))
+        XCTAssertThrowsError(try OracleViewModel.validateRawAttachmentDispatchInvariant([
+            "attachments": .array([.object(["path": .string("/workspace/image.png")])])
         ])) { error in
             guard let toolError = error as? ChatToolError else {
                 return XCTFail("Expected ChatToolError, got \(error)")
@@ -917,6 +1021,21 @@ final class OracleImageContractTests: XCTestCase {
         XCTAssertEqual(unrelated.toolArgsJSON, raw)
     }
 
+    func testRejectedCallPersistsNoPathOrTitleFromEitherKey() throws {
+        let raw = #"{"message":"inspect","attachments":[{"path":"/Users/secret-a.csv","title":"TitleA"}],"images":[{"path":"/Users/secret-b.png","title":"TitleB"}]}"#
+        for toolName in ["ask_oracle", "mcp__RepoPromptCE__oracle_send"] {
+            let item = AgentChatItem.toolCall(name: toolName, argsJSON: raw)
+            let persisted = try String(decoding: JSONEncoder().encode(item), as: UTF8.self)
+            let stored = try XCTUnwrap(item.toolArgsJSON)
+            for text in [stored, persisted] {
+                XCTAssertTrue(text.contains("inspect"), toolName)
+                for leaked in ["secret-a", "secret-b", "TitleA", "TitleB"] {
+                    XCTAssertFalse(text.contains(leaked), "\(toolName) leaked \(leaked)")
+                }
+            }
+        }
+    }
+
     func testMalformedOracleArgumentsFailClosed() {
         // Every malformed or truncated ask_oracle payload fails closed — a partial prefix
         // might yet grow an "images" key, and an impossible prefix may already carry one.
@@ -931,6 +1050,8 @@ final class OracleImageContractTests: XCTestCase {
             #"{"\u0069mages":[{"path":"/Users/secret.png""#,
             #"{"i\u006Dages":[{"path":"/Users/secret.png""#,
             #"{"message":"x" "images":[{"path":"/Users/secret.png""#,
+            #"{"attachments":[{"path":"/Users/secret.csv""#,
+            #"{"attach\u006dents":[{"path":"/Users/secret.csv""#,
             #"{"message":"x" "ima"#,
             #"{"message":1 "images""#,
             #"{"message":"x"}{"images":[]"#,
@@ -1279,8 +1400,8 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         ]))
     }
 
-    func testGroupedFollowUpHintIsNeutralAndSingleLaneHintIsUnchanged() {
-        let continuation = "Continue this plan conversation with ask_oracle(chat_id: \"chat-0\", new_chat: false)"
+    func testGroupedFollowUpHintIsNeutralAndSingleLaneHintIsContinuationOnly() {
+        let continuation = "Continue this plan conversation with ask_oracle(chat_id: \"chat-0\", new_chat: false). In Agent Mode, continuation requires the run that created this chat; after that run changes, start a new chat instead."
         for count in [nil, 1] as [Int?] {
             XCTAssertEqual(
                 MCPContextBuilderToolProvider.generatedResponseFollowUpHint(modeLabel: "plan", chatID: "chat-0", oracleCount: count),

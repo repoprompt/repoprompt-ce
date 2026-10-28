@@ -263,6 +263,7 @@ extension AgentModeViewModel {
             let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
             return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
         }
+        liveSession.noteAcceptedTaskInput()
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
         let userItem = AgentChatItem.user(
             displayText,

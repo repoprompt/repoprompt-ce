@@ -57,74 +57,6 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable {
     }
 }
 
-/// Oracle image attachment limits shared by the app loader, advertised MCP
-/// schemas, and the canonical catalog projection.
-package struct OracleImageAttachmentLimits: Equatable {
-    package let maxCount: Int
-    package let maxBytesPerImage: Int
-    package let maxTotalBytes: Int
-
-    package init(maxCount: Int, maxBytesPerImage: Int, maxTotalBytes: Int) {
-        self.maxCount = maxCount
-        self.maxBytesPerImage = maxBytesPerImage
-        self.maxTotalBytes = maxTotalBytes
-    }
-
-    package static let production = OracleImageAttachmentLimits(
-        maxCount: 10,
-        maxBytesPerImage: 20 * 1024 * 1024,
-        maxTotalBytes: 50 * 1024 * 1024
-    )
-}
-
-package enum AIImageMediaType: String, Equatable, Sendable {
-    case png = "image/png"
-    case jpeg = "image/jpeg"
-    case gif = "image/gif"
-    case webp = "image/webp"
-}
-
-/// Request-scoped Oracle image data. Deliberately non-Codable and path-free.
-package struct AITransientImage: Equatable, Sendable {
-    package let bytes: Data
-    package let mediaType: AIImageMediaType
-    package let title: String?
-
-    package init(bytes: Data, mediaType: AIImageMediaType, title: String?) {
-        self.bytes = bytes
-        self.mediaType = mediaType
-        self.title = title
-    }
-
-    package var base64Payload: String {
-        bytes.base64EncodedString()
-    }
-
-    package var openAIDataURL: String {
-        "data:\(mediaType.rawValue);base64,\(base64Payload)"
-    }
-
-    package var normalizedTitle: String? {
-        guard let title else { return nil }
-        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    /// Provider-agnostic caption line emitted as a text part before each image part.
-    package var titleAnnotation: String? {
-        normalizedTitle.map { "Image title: \($0)" }
-    }
-
-    package var preferredFileExtension: String {
-        switch mediaType {
-        case .png: "png"
-        case .jpeg: "jpg"
-        case .gif: "gif"
-        case .webp: "webp"
-        }
-    }
-}
-
 /// Product limits and canonical settings keys. Lane identity itself remains unbounded.
 package enum OracleRosterContract {
     package static let minimumCount = 1
@@ -998,15 +930,15 @@ package struct OracleTurnRecord: Codable, Equatable {
 
     package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            id: try container.decode(OracleTurnID.self, forKey: .id),
-            input: try container.decode(OracleInput.self, forKey: .input),
-            state: try container.decode(OracleTurnState.self, forKey: .state),
-            startedAt: try container.decode(Date.self, forKey: .startedAt),
-            finishedAt: try container.decodeIfPresent(Date.self, forKey: .finishedAt),
-            status: try container.decodeIfPresent(OracleGroupStatus.self, forKey: .status),
-            warnings: try container.decodeIfPresent([OracleGroupWarning].self, forKey: .warnings) ?? [],
-            results: try container.decode([OracleLaneResult].self, forKey: .results)
+        try self.init(
+            id: container.decode(OracleTurnID.self, forKey: .id),
+            input: container.decode(OracleInput.self, forKey: .input),
+            state: container.decode(OracleTurnState.self, forKey: .state),
+            startedAt: container.decode(Date.self, forKey: .startedAt),
+            finishedAt: container.decodeIfPresent(Date.self, forKey: .finishedAt),
+            status: container.decodeIfPresent(OracleGroupStatus.self, forKey: .status),
+            warnings: container.decodeIfPresent([OracleGroupWarning].self, forKey: .warnings) ?? [],
+            results: container.decode([OracleLaneResult].self, forKey: .results)
         )
     }
 }

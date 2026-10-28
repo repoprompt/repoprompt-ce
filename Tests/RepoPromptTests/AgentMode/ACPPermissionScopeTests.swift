@@ -117,108 +117,138 @@ final class ACPPermissionScopeTests: XCTestCase {
         }
     }
 
-    /// Issue #1243: model-controlled `rawInput` arguments and host-rendered titles must not
-    /// grant RepoPrompt provenance at the ACP permission boundary.
-    func testRepoPromptAutoApprovalIgnoresArgumentAndTitleProvenance() async throws {
-        let manualCases: [(String, String)] = [
-            ("rawInput server/name", #"{"toolCallId": "tool-1", "title": "Shell command", "kind": "execute", "rawInput": {"command": "./untrusted-script", "server": "RepoPromptCE", "name": "git"}}"#),
-            ("rawInput server only", #"{"toolCallId": "tool-1", "title": "Shell command", "kind": "execute", "rawInput": {"command": "./untrusted-script", "server_name": "RepoPromptCE"}}"#),
-            ("rawInput qualified name", #"{"toolCallId": "tool-1", "title": "Shell command", "kind": "execute", "rawInput": {"command": "x", "tool_name": "mcp__RepoPromptCE__git"}}"#),
-            ("file-path title", #"{"toolCallId": "tool-1", "title": "git (RepoPromptCE MCP Server)", "kind": "edit", "rawInput": {"filePath": "git (RepoPromptCE MCP Server)"}}"#),
-            ("server label title", #"{"toolCallId": "tool-1", "title": "RepoPromptCE: git", "kind": "execute"}"#),
-            ("foreign server", #"{"toolCallId": "tool-1", "title": "git", "kind": "other", "server": "OtherServer"}"#),
-            ("filename-derived prefixed title", #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__git", "kind": "edit", "rawInput": {"filePath": "mcp__RepoPromptCE__git"}}"#),
-            ("command-derived prefixed title", #"{"toolCallId": "tool-1", "title": "RepoPromptCE_read_file", "kind": "execute", "rawInput": {"command": "RepoPromptCE_read_file"}}"#),
-            ("prefixed nested name on read", #"{"toolCallId": "tool-1", "title": "notes.txt", "name": "mcp__RepoPromptCE__read_file", "kind": "read"}"#)
+    func testUnattestedRepoPromptLabelsAlwaysRequireManualApproval() async throws {
+        let toolCalls = [
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"RepoPromptCE_read_file"}"#,
+            #"{"toolCallId":"tool-1","name":"mcp__RepoPromptCE__git","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"git","server":"RepoPromptCE","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","server":"OtherServer","kind":"other"}"#,
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","kind":"edit"}"#,
+            #"{"toolCallId":"tool-1","title":"Shell","kind":"execute","rawInput":{"server":"RepoPromptCE","name":"git"}}"#,
+            #"{"toolCallId":"tool-1","title":"mcp__RepoPromptCE__git","_meta":{"cognition.ai/toolName":"mcp__OtherServer__git"}}"#,
+            #"{"toolCallId":"tool-1","title":"Calling git","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#,
+            #"{"toolCallId":"tool-1","name":"mcp__RepoPromptCE__git","server":"RepoPromptCE","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__unknown_tool"}}"#,
+            #"{"toolCallId":"tool-1","title":"git (RepoPromptCE MCP Server)","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__foreign__git"}}"#
         ]
-        for (label, toolCall) in manualCases {
-            let result = try await autoApprovalOutcome(toolCallJSON: toolCall)
-            XCTAssertTrue(result.approvalRequested, label)
-            XCTAssertEqual(result.outcome["optionId"], "reject_once", label)
-        }
-
-        for (label, toolCall) in [
-            ("prefixed title", #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#),
-            ("OpenCode MCP title", #"{"toolCallId": "tool-1", "title": "RepoPromptCE_read_file", "kind": "other"}"#),
-            ("prefixed title without kind", #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file"}"#),
-            ("server field", #"{"toolCallId": "tool-1", "title": "read_file", "kind": "other", "server": "RepoPromptCE"}"#)
-        ] {
-            let result = try await autoApprovalOutcome(toolCallJSON: toolCall)
-            XCTAssertFalse(result.approvalRequested, label)
-            XCTAssertEqual(result.outcome["optionId"], "allow_once", label)
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
+            for toolCall in toolCalls {
+                let result = try await autoApprovalOutcome(toolCallJSON: toolCall, providerID: providerID)
+                XCTAssertTrue(result.approvalRequested, "\(providerID): \(toolCall)")
+                XCTAssertEqual(result.outcome["optionId"], "reject_once")
+            }
         }
     }
 
-    func testGrokRepoPromptAutoApprovalRequiresGenuineOneTimeOption() async throws {
-        let toolCall = #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#
-        let cases: [(name: String, options: [[String: String]], expectedOptionID: String?)] = [
-            ("genuine one-time option", [
-                ["optionId": "allow-once", "kind": "allow_once"]
-            ], "allow-once"),
-            ("one-time ID with persistent kind alongside genuine option", [
-                ["optionId": "allow-once", "kind": "allow_always"],
-                ["optionId": "opaque-once", "kind": "allow_once"]
-            ], "opaque-once"),
-            ("persistent ID with one-time kind alongside genuine option", [
-                ["optionId": "always-allow", "kind": "allow_once"],
-                ["optionId": "opaque-once", "kind": "allow_once"]
-            ], "opaque-once"),
-            ("one-time ID with persistent kind only", [
-                ["optionId": "allow-once", "kind": "allow_always"]
-            ], nil),
-            ("persistent ID with one-time kind only", [
-                ["optionId": "always-allow", "kind": "allow_once"]
-            ], nil),
-            ("session grant and denylisted option only", [
-                ["optionId": "allow-edits-session", "kind": "allow_always"],
-                ["optionId": "enable-always-approve", "kind": "allow_once"]
-            ], nil)
+    func testAutomaticSelectionsRequireGenuineOneTimeOptions() async throws {
+        let toolCall = #"{"toolCallId":"tool-1","_meta":{"cognition.ai/toolName":"mcp__RepoPromptCE__git"}}"#
+        let invalidOptions = [
+            ["optionId": "allow_once", "kind": "allow_always"],
+            ["optionId": "always", "kind": "allow_once"],
+            ["optionId": "allow_session", "kind": "allow_once"],
+            ["optionId": "allow_global", "kind": "allow_once"],
+            ["optionId": "allow_persistent", "kind": "allow_once"],
+            ["optionId": "enable-always-approve", "kind": "allow_once"]
         ]
-        // Exercise every row before asserting so a red run reports both unsafe selection paths.
-        var mismatches: [String] = []
-        for testCase in cases {
+        // Cursor's explicit user full-access setting is the remaining automatic path.
+        for option in invalidOptions {
+            // Mixed fixtures use distinct wire IDs; the exact allow_once mislabel is
+            // covered alone rather than treating duplicate option IDs as valid consent.
+            let availabilityCases = option["optionId"] == "allow_once" ? [false] : [false, true]
+            for genuineOptionAvailable in availabilityCases {
+                var options = [option]
+                if genuineOptionAvailable { options.append(["optionId": "allow_once", "kind": "allow_once"]) }
+                options.append(["optionId": "reject_once", "kind": "reject_once"])
+                let result = try await autoApprovalOutcome(
+                    toolCallJSON: toolCall, providerID: .cursor, options: options,
+                    fullAccess: true
+                )
+                XCTAssertEqual(result.approvalRequested, !genuineOptionAvailable, "\(option)")
+                XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "allow_once" : "reject_once")
+            }
+        }
+    }
+
+    func testPendingCursorFullAccessUsesOnlyGenuineOneTimeOptions() async throws {
+        let invalidOptions = [
+            ["optionId": "allow_always", "kind": "allow_always"],
+            ["optionId": "allow_once", "kind": "allow_always"],
+            ["optionId": "always", "kind": "allow_once"],
+            ["optionId": "allow_session", "kind": "allow_once"],
+            ["optionId": "allow_global", "kind": "allow_once"],
+            ["optionId": "allow_persistent", "kind": "allow_once"]
+        ]
+        for option in invalidOptions {
+            for genuineOptionAvailable in [false, true] {
+                var options = [option]
+                if genuineOptionAvailable { options.append(["optionId": "opaque-once", "kind": "allow_once"]) }
+                options.append(["optionId": "reject_once", "kind": "reject_once"])
+                let result = try await autoApprovalOutcome(
+                    toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                    providerID: .cursor, options: options, pendingFullAccess: true,
+                    expectedPendingAutoApproval: genuineOptionAvailable
+                )
+                XCTAssertTrue(result.approvalRequested, "The prompt must first surface with full access disabled")
+                XCTAssertEqual(result.outcome["optionId"], genuineOptionAvailable ? "opaque-once" : "reject_once", "\(option)")
+            }
+        }
+    }
+
+    func testPendingCursorFullAccessResolvesApprovalUUIDForTypedWireIDs() async throws {
+        for wireIDJSON in [#""7""#, "7"] {
             let result = try await autoApprovalOutcome(
-                toolCallJSON: toolCall, providerID: .grokBuild,
-                options: testCase.options + [["optionId": "reject_once", "kind": "reject_once"]]
+                toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                providerID: .cursor, options: [
+                    ["optionId": "allow_always", "kind": "allow_always"],
+                    ["optionId": "allow_once", "kind": "allow_once"],
+                    ["optionId": "reject_once", "kind": "reject_once"]
+                ], pendingFullAccess: true, expectedPendingAutoApproval: true, wireIDJSON: wireIDJSON
             )
-            let expectedApprovalRequested = testCase.expectedOptionID == nil
-            let expectedOptionID = testCase.expectedOptionID ?? "reject_once"
-            if result.approvalRequested != expectedApprovalRequested {
-                mismatches.append("\(testCase.name): approvalRequested=\(result.approvalRequested), expected=\(expectedApprovalRequested)")
-            }
-            if result.outcome["outcome"] != "selected" {
-                mismatches.append("\(testCase.name): outcome=\(result.outcome["outcome"] ?? "missing"), expected=selected")
-            }
-            if result.outcome["optionId"] != expectedOptionID {
-                mismatches.append("\(testCase.name): optionId=\(result.outcome["optionId"] ?? "missing"), expected=\(expectedOptionID)")
-            }
-        }
-        XCTAssertTrue(mismatches.isEmpty, mismatches.joined(separator: "\n"))
-    }
-
-    func testOtherProvidersRepoPromptAutoApprovalIsUnchanged() async throws {
-        let toolCall = #"{"toolCallId": "tool-1", "title": "mcp__RepoPromptCE__read_file", "kind": "other"}"#
-        let options = [
-            ["optionId": "always", "kind": "allow_always"],
-            ["optionId": "allow_once", "kind": "allow_once"],
-            ["optionId": "reject_once", "kind": "reject_once"]
-        ]
-        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .devin] {
-            let result = try await autoApprovalOutcome(toolCallJSON: toolCall, providerID: providerID, options: options)
-            XCTAssertFalse(result.approvalRequested, "\(providerID)")
-            XCTAssertEqual(result.outcome["outcome"], "selected", "\(providerID)")
-            XCTAssertEqual(result.outcome["optionId"], providerID == .devin ? "allow_once" : "always", "\(providerID)")
+            XCTAssertTrue(result.approvalRequested, wireIDJSON)
+            XCTAssertEqual(result.outcome["optionId"], "allow_once", wireIDJSON)
         }
     }
 
-    /// Declines any surfaced approval, distinguishing manual approval from automatic selection.
+    func testPendingFullAccessRequiresCurrentFlagAndSupportedProvider() async throws {
+        for providerID: ACPProviderID in [.openCode, .cursor, .antigravity, .grokBuild, .devin] {
+            for enabled in [false, true] {
+                let expectedSelection = providerID == .cursor && enabled
+                let result = try await autoApprovalOutcome(
+                    toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                    providerID: providerID, pendingFullAccess: enabled, expectedPendingAutoApproval: expectedSelection
+                )
+                XCTAssertTrue(result.approvalRequested)
+                XCTAssertEqual(result.outcome["optionId"], expectedSelection ? "allow_once" : "reject_once", "\(providerID): \(enabled)")
+            }
+        }
+        // Full-access automation must not rewrite an explicit manual session choice.
+        for decision: AgentApprovalDecision in [.acceptForSession, .acceptWithExecpolicyAmendment("remember")] {
+            let result = try await autoApprovalOutcome(
+                toolCallJSON: #"{"toolCallId":"tool-1","title":"Test tool","kind":"execute"}"#,
+                providerID: .cursor, options: [
+                    ["optionId": "allow_always", "kind": "allow_always"],
+                    ["optionId": "allow_once", "kind": "allow_once"],
+                    ["optionId": "reject_once", "kind": "reject_once"]
+                ], pendingFullAccess: false, manualDecision: decision
+            )
+            XCTAssertEqual(result.outcome["optionId"], "allow_always")
+        }
+    }
+
+    /// Responds through the real controller/transport, distinguishing automatic selection
+    /// from surfaced prompts. A manual response after refused automation proves it stayed pending.
     private func autoApprovalOutcome(
         toolCallJSON: String,
         providerID: ACPProviderID = .openCode,
         options: [[String: String]] = [
             ["optionId": "allow_once", "kind": "allow_once", "name": "Allow"],
             ["optionId": "reject_once", "kind": "reject_once", "name": "Decline"]
-        ]
+        ],
+        fullAccess: Bool = false,
+        pendingFullAccess: Bool? = nil,
+        expectedPendingAutoApproval: Bool = false,
+        manualDecision: AgentApprovalDecision = .decline,
+        wireIDJSON: String = #""permission-1""#
     ) async throws -> (approvalRequested: Bool, outcome: [String: String]) {
         let optionsJSON = try String(decoding: JSONSerialization.data(withJSONObject: options), as: UTF8.self)
         let directory = try makeTestDirectory(name: "ACPAutoApprovalProvenance")
@@ -231,6 +261,7 @@ final class ACPPermissionScopeTests: XCTestCase {
         def send(message):
             print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
         prompt_id = None
+        permission_id = json.loads(r'\#(wireIDJSON)')
         for line in sys.stdin:
             request = json.loads(line)
             method = request.get("method")
@@ -240,13 +271,13 @@ final class ACPPermissionScopeTests: XCTestCase {
                 send({"id": request["id"], "result": {"sessionId": "test-session"}})
             elif method == "session/prompt":
                 prompt_id = request["id"]
-                send({"id": "permission-1", "method": "session/request_permission", "params": {
+                send({"id": permission_id, "method": "session/request_permission", "params": {
                     "sessionId": "test-session", "toolCall": json.loads(r'\#(toolCallJSON)'),
                     "options": json.loads(r'\#(optionsJSON)')
                 }})
-            elif request.get("id") == "permission-1":
-                with open(r"\#(record.path)", "w", encoding="utf-8") as output:
-                    json.dump(request["result"]["outcome"], output)
+            elif type(request.get("id")) is type(permission_id) and request.get("id") == permission_id:
+                with open(r"\#(record.path)", "a", encoding="utf-8") as output:
+                    output.write(json.dumps(request["result"]["outcome"]) + "\n")
                 send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
         """#
         try script.write(to: executable, atomically: true, encoding: .utf8)
@@ -263,16 +294,39 @@ final class ACPPermissionScopeTests: XCTestCase {
             resumeSessionID: nil, attachments: [], taskLabelKind: nil
         )
         let controller = try ACPAgentSessionController(
-            provider: ScriptedScopeProvider(providerID: providerID, executable: executable.path), runRequest: request,
+            provider: ScriptedScopeProvider(
+                providerID: providerID, executable: executable.path
+            ), runRequest: request,
             allowsProviderProcessLaunchForTesting: true
         )
         do {
             _ = try await controller.bootstrap()
+            await controller.setAutoApproveAllToolPermissions(fullAccess)
             let events = await controller.events
             let consumer = Task { () -> Bool in
                 for await event in events {
                     if case let .approvalRequested(approval) = event {
-                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: .decline)
+                        if let pendingFullAccess {
+                            XCTAssertNotNil(UUID(uuidString: approval.requestID.displayValue), "Approval identity is not the provider's wire ID")
+                            // Revoke a previously enabled flag too: the response must use
+                            // current actor-owned state, not the caller's activation snapshot.
+                            await controller.setAutoApproveAllToolPermissions(true)
+                            await controller.setAutoApproveAllToolPermissions(pendingFullAccess)
+                            for wireID in ["permission-1", "7", "s:permission-1", "s:7", "i:7"] {
+                                let wireIDSubmitted = await controller.respondToPendingPermissionRequestForFullAccess(id: wireID)
+                                XCTAssertFalse(wireIDSubmitted, "Wire identities must not authorize an approval incarnation")
+                            }
+                            let wrongIDSubmitted = await controller.respondToPendingPermissionRequestForFullAccess(id: "not-the-pending-request")
+                            XCTAssertFalse(wrongIDSubmitted)
+                            let submitted = await controller.respondToPendingPermissionRequestForFullAccess(id: approval.requestID.displayValue)
+                            XCTAssertEqual(submitted, expectedPendingAutoApproval)
+                            if submitted {
+                                let submittedAgain = await controller.respondToPendingPermissionRequestForFullAccess(id: approval.requestID.displayValue)
+                                XCTAssertFalse(submittedAgain, "A consumed approval UUID must not send a second response")
+                                return true
+                            }
+                        }
+                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: manualDecision)
                         return true
                     }
                 }
@@ -281,7 +335,10 @@ final class ACPPermissionScopeTests: XCTestCase {
             try await controller.prompt(AgentMessage(userMessage: "Run"), request: request)
             await controller.shutdown()
             let approvalRequested = await consumer.value
-            let outcome = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+            let responses = try String(contentsOf: record, encoding: .utf8).split(separator: "\n")
+            XCTAssertEqual(responses.count, 1, "Exactly one wire response: refused automation must not send or consume the prompt")
+            let response = try XCTUnwrap(responses.first)
+            let outcome = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.utf8)) as? [String: String])
             return (approvalRequested, outcome)
         } catch {
             await controller.shutdown()
@@ -643,7 +700,6 @@ final class ACPPermissionIdentityTests: XCTestCase {
 private struct ScriptedScopeProvider: ACPAgentProvider {
     let providerID: ACPProviderID
     let executable: String
-
     func support(for _: ACPRunRequest) async -> ACPSupportResult {
         .supported
     }
@@ -881,6 +937,358 @@ final class ACPApprovalAvailabilityTests: XCTestCase {
             requestID: .acp("permission"), method: "session/request_permission", kind: .commandExecution,
             threadID: "thread", turnID: "turn", itemID: "item", command: "ls",
             plainApproveAvailable: available, sessionApprovalScope: sessionApprovalScope
+        )
+    }
+}
+
+@MainActor
+final class CodexApprovalChoiceTests: XCTestCase {
+    private static let plainCommand = #"{"threadId":"thread","turnId":"turn","itemId":"cmd-b","command":"git status","availableDecisions":["accept","cancel"]}"#
+    private static let amendmentCommand = #"{"threadId":"thread","turnId":"turn","itemId":"cmd-a","command":"git status","proposedExecpolicyAmendment":["git","status"],"availableDecisions":["accept",{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","status"]}},"cancel"]}"#
+
+    func testAdvertisedDecisionsBoundMCPOptions() async throws {
+        let context = try await makeContext()
+        for (json, expected) in [
+            (Self.plainCommand, ["accept", "cancel"]),
+            (Self.amendmentCommand, ["accept", "accept_with_amendment", "cancel"])
+        ] {
+            try install(parsedRequest(json), in: context)
+            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpPendingInteraction(for: context.session))
+            XCTAssertEqual(interaction.options.map(\.label), expected, "MCP options must equal availableDecisions: \(json)")
+        }
+    }
+
+    func testUnadvertisedMCPResponsesAreRejected() async throws {
+        let context = try await makeContext()
+        let viewModel = context.window.agentModeViewModel
+        for (json, rejected, accepted) in [
+            (Self.plainCommand, [("accept_for_session", nil), ("accept_with_amendment", #"["git","status"]"#)], [("accept", nil), ("cancel", nil)]),
+            (Self.amendmentCommand, [("accept_with_amendment", #"["git"]"#), ("accept_with_amendment", "not-json")], [("accept", nil), ("cancel", nil), ("accept_with_amendment", #"["git","status"]"#)])
+        ] as [(String, [(String, String?)], [(String, String?)])] {
+            let request = try parsedRequest(json)
+            install(request, in: context)
+            for (response, amendment) in accepted {
+                XCTAssertNoThrow(try viewModel.mcpPendingInteractionResolution(
+                    for: context.session, kind: .approval, interactionID: request.id, payload: payload(response, amendment)
+                ), "Advertised \(response) \(amendment ?? "") must still resolve: \(json)")
+            }
+            for (response, amendment) in rejected {
+                XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                    for: context.session, kind: .approval, interactionID: request.id, payload: payload(response, amendment)
+                ), "Unadvertised \(response) \(amendment ?? "") must be rejected: \(json)") { error in
+                    guard let mcpError = error as? MCPError, case .invalidParams = mcpError else {
+                        return XCTFail("Expected MCPError.invalidParams for \(response), got \(error)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testTopLevelAdvertisedDecisionsFailClosedAndPreserveLegacy() throws {
+        let decisions: [AgentApprovalDecision] = [.accept, .acceptForSession, .acceptWithExecpolicyAmendment(#"["git","status"]"#), .decline, .cancel]
+        let cases: [(String, String?, [Bool])] = [
+            ("absent", nil, [true, true, true, true, true]),
+            ("null", "null", [true, true, true, true, true]),
+            ("empty", "[]", [false, false, false, false, false]),
+            ("nonarray", "42", [false, false, false, false, false]),
+            ("writeStdin", #"["accept","cancel"]"#, [true, false, false, false, true]),
+            ("network", #"["accept","acceptForSession",{"applyNetworkPolicyAmendment":{"network_policy_amendment":{"host":"example.test","action":"allow"}}},"future",false,"cancel"]"#, [true, true, false, false, true]),
+            ("decline only", #"["decline"]"#, [false, false, false, true, false]),
+            ("malformed entries", #"[{},["accept"],17,{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":[]}}]"#, [false, false, false, false, false])
+        ]
+        for (label, encoded, expected) in cases {
+            var params: [String: Any] = ["threadId": "thread", "command": "git status", "kind": "writeStdin"]
+            // Neither a nested list nor a nested legacy grant may override the top-level authority.
+            params["nested"] = ["availableDecisions": ["acceptForSession"]]
+            if let encoded {
+                params["availableDecisions"] = try JSONSerialization.jsonObject(with: Data(encoded.utf8), options: .fragmentsAllowed)
+            }
+            let request = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
+                requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+                activeThreadID: "thread", currentTurnID: "turn"
+            ))
+            XCTAssertEqual(request.availableDecisions == nil, encoded == nil || encoded == "null", label)
+            XCTAssertEqual(decisions.map { request.allows($0) }, expected, label)
+            XCTAssertEqual(request.supportsPlainApprove, expected[0], label)
+            XCTAssertEqual(request.supportsAlwaysAllow, expected[1], label)
+            for (index, decision) in decisions.enumerated() {
+                let result = CodexAgentModeCoordinator.buildApprovalResult(decision: decision, request: request)
+                XCTAssertEqual(result != nil, expected[index], "\(label): \(decision)")
+                if expected[index], index != 2 {
+                    XCTAssertEqual(result?["decision"] as? String, ["accept", "acceptForSession", "", "decline", "cancel"][index], label)
+                }
+            }
+        }
+    }
+
+    func testAdvertisedAmendmentsRequireExactDecodedTokens() async throws {
+        let context = try await makeContext()
+        let viewModel = context.window.agentModeViewModel
+        let session = context.session
+        session.selectedAgent = .codexExec
+        let composed = #"["printf","%s","caf\u00e9"]"#
+        let decomposed = #"["printf","%s","cafe\u0301"]"#
+        let examples: [(advertised: String, denied: String, equivalent: String, expected: [String])] = [
+            (composed, decomposed, " [ \"printf\", \"%s\", \"caf\u{E9}\" ] ", ["printf", "%s", "caf\u{E9}"]),
+            (decomposed, composed, " [ \"printf\", \"%s\", \"cafe\u{301}\" ] ", ["printf", "%s", "cafe\u{301}"])
+        ]
+        let sent = expectation(description: "Only exact decoded amendments reach the controller")
+        sent.expectedFulfillmentCount = examples.count
+        let controller = ApprovalRecordingController(sent: sent)
+        session.codexController = controller
+        let requests = try examples.enumerated().map { index, example in
+            try parsedRequest(#"{"threadId":"thread","itemId":"unicode-\#(index)","command":"printf","availableDecisions":[{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":\#(example.advertised)}}]}"#)
+        }
+        for (request, example) in zip(requests, examples) {
+            install(request, in: context)
+            let denied = AgentApprovalDecision.acceptWithExecpolicyAmendment(example.denied)
+            XCTAssertFalse(request.allows(denied))
+            XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                for: session, kind: .approval, interactionID: request.id, payload: payload("accept_with_amendment", example.denied)
+            ))
+            XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(.approval(request: request, decision: denied), to: session))
+            XCTAssertEqual(session.pendingApproval?.id, request.id)
+            XCTAssertEqual(session.runState, .waitingForApproval)
+        }
+        XCTAssertTrue(controller.recorder.events.isEmpty)
+
+        func amendmentBytes(_ result: [String: Any]) throws -> [[UInt8]] {
+            let object = try XCTUnwrap(result["decision"] as? [String: [String: [String]]])
+            let tokens = try XCTUnwrap(object["acceptWithExecpolicyAmendment"]?["execpolicy_amendment"])
+            return tokens.map { Array($0.utf8) }
+        }
+        for (request, example) in zip(requests, examples) {
+            install(request, in: context)
+            let decision = AgentApprovalDecision.acceptWithExecpolicyAmendment(example.equivalent)
+            XCTAssertTrue(request.allows(decision), "JSON escapes and whitespace must not change token identity")
+            let resolution = try viewModel.mcpPendingInteractionResolution(
+                for: session, kind: .approval, interactionID: request.id, payload: payload("accept_with_amendment", example.equivalent)
+            )
+            try viewModel.applyPendingInteractionResolution(resolution, to: session)
+            XCTAssertNil(session.pendingApproval)
+        }
+        await fulfillment(of: [sent], timeout: 3)
+        let received = try controller.recorder.events.map { event in
+            XCTAssertTrue(event.hasPrefix("1:"))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(event.dropFirst(2).utf8)) as? [String: Any])
+            return try amendmentBytes(object)
+        }
+        XCTAssertEqual(received.count, examples.count)
+        for example in examples {
+            XCTAssertTrue(received.contains(example.expected.map { Array($0.utf8) }), "Wire comparison must not use String canonical equality")
+        }
+    }
+
+    func testAmendmentsMatchDecodedAdvertisementAndNeverWidenOnMalformedInput() async throws {
+        let params: [String: Any] = [
+            "threadId": "thread", "command": "git status", "proposedExecpolicyAmendment": ["wrong"],
+            "availableDecisions": [["acceptWithExecpolicyAmendment": ["execpolicy_amendment": ["git", "status"]]]]
+        ]
+        let request = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
+            requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+            activeThreadID: "thread", currentTurnID: "turn"
+        ))
+        let equal = AgentApprovalDecision.acceptWithExecpolicyAmendment(" [ \"git\", \"status\" ] ")
+        XCTAssertTrue(request.allows(equal))
+        XCTAssertFalse(request.allows(.acceptWithExecpolicyAmendment(#"["wrong"]"#)))
+        XCTAssertFalse(request.allows(.acceptForSession))
+        var withoutProposal = params
+        withoutProposal.removeValue(forKey: "proposedExecpolicyAmendment")
+        let advertisedOnly = try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
+            requestID: .int(1), method: "item/commandExecution/requestApproval", params: withoutProposal,
+            activeThreadID: "thread", currentTurnID: "turn"
+        ))
+        XCTAssertEqual(advertisedOnly.rememberedDecision, request.rememberedDecision)
+        let remembered = try XCTUnwrap(request.rememberedDecision)
+        XCTAssertTrue(request.allows(remembered), "The advertised payload, not the top-level proposal, owns Remember")
+        let wire = try XCTUnwrap(CodexAgentModeCoordinator.buildApprovalResult(decision: remembered, request: request))
+        let object = try XCTUnwrap(wire["decision"] as? [String: [String: [String]]])
+        XCTAssertEqual(object, ["acceptWithExecpolicyAmendment": ["execpolicy_amendment": ["git", "status"]]])
+
+        let context = try await makeContext()
+        let presentations: [(String, AgentApprovalRequest, [String]?)] = try [
+            ("inconsistent proposal", request, ["git", "status"]),
+            ("advertised only", advertisedOnly, ["git", "status"]),
+            ("present without amendment", parsedRequest(#"{"threadId":"thread","command":"git status","proposedExecpolicyAmendment":["wrong"],"availableDecisions":["accept","cancel"]}"#), nil),
+            ("absent legacy", parsedRequest(#"{"threadId":"thread","command":"git status","proposedExecpolicyAmendment":["wrong"]}"#), ["wrong"]),
+            ("null legacy", parsedRequest(#"{"threadId":"thread","command":"git status","proposedExecpolicyAmendment":["wrong"],"availableDecisions":null}"#), ["wrong"])
+        ]
+        for (label, target, expected) in presentations {
+            install(target, in: context)
+            let cardDetails = target.details.filter { $0.label == "Execpolicy Amendment" }
+            let interaction = try XCTUnwrap(context.window.agentModeViewModel.mcpPendingInteraction(for: context.session))
+            let mcpDetails = interaction.details.filter { ["Suggested Amendment", "Execpolicy Amendment"].contains($0.label) }
+            XCTAssertEqual(cardDetails.count, expected == nil ? 0 : 1, label)
+            XCTAssertEqual(mcpDetails.count, expected == nil ? 0 : 2, label)
+            for value in cardDetails.map(\.value) + mcpDetails.map(\.value) {
+                let tokens = try XCTUnwrap(AgentApprovalDecision.parseExecpolicyAmendment(value))
+                XCTAssertEqual(tokens.map { Array($0.utf8) }, expected?.map { Array($0.utf8) } ?? [], label)
+            }
+            if let expected {
+                let decision = try XCTUnwrap(target.rememberedDecision)
+                let result = try XCTUnwrap(CodexAgentModeCoordinator.buildApprovalResult(decision: decision, request: target))
+                let object = try XCTUnwrap(result["decision"] as? [String: [String: [String]]])
+                let tokens = try XCTUnwrap(object["acceptWithExecpolicyAmendment"]?["execpolicy_amendment"])
+                XCTAssertEqual(tokens.map { Array($0.utf8) }, expected.map { Array($0.utf8) }, label)
+            }
+        }
+
+        let legacy = try parsedRequest(#"{"threadId":"thread","command":"git status"}"#)
+        let fileChange = AgentApprovalRequest(
+            requestID: .codex(.int(1)), method: "item/fileChange/requestApproval", kind: .fileChange,
+            threadID: "thread", turnID: "turn", itemID: "file"
+        )
+        XCTAssertTrue(legacy.allows(equal))
+        XCTAssertFalse(fileChange.allows(equal))
+        for malformed in ["not-json", "null", "{}", "[]", "[1]", "[true]", #"["git",1]"#] {
+            for target in [request, legacy, fileChange] {
+                let decision = AgentApprovalDecision.acceptWithExecpolicyAmendment(malformed)
+                XCTAssertFalse(target.allows(decision), malformed)
+                XCTAssertNil(CodexAgentModeCoordinator.buildApprovalResult(decision: decision, request: target), malformed)
+            }
+        }
+    }
+
+    func testCheckedApplyPreservesRejectedRequestsAndRecordsOnlyAllowedWireResponses() async throws {
+        let context = try await makeContext()
+        let viewModel = context.window.agentModeViewModel
+        let session = context.session
+        session.selectedAgent = .codexExec
+        let sent = expectation(description: "Only the six allowed responses reach the passive controller")
+        sent.expectedFulfillmentCount = 6
+        let controller = ApprovalRecordingController(sent: sent)
+        session.codexController = controller
+        let plain = try parsedRequest(Self.plainCommand)
+        let amendment = try parsedRequest(Self.amendmentCommand)
+        install(plain, in: context)
+        for (response, value) in [
+            ("accept_for_session", nil), ("always_allow", nil), ("approve_for_session", nil),
+            ("decline", nil), ("reject", nil), ("amend", #"["git"]"#), ("accept_with_amendment", "not-json")
+        ] as [(String, String?)] {
+            XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+                for: session, kind: .approval, interactionID: plain.id, payload: payload(response, value)
+            )) { error in
+                guard case let MCPError.invalidParams(message) = error, let message else { return XCTFail("\(error)") }
+                XCTAssertTrue(message.contains("accept, cancel"))
+                XCTAssertTrue(message.contains("No response was applied."))
+            }
+            XCTAssertEqual(session.pendingApproval, plain)
+            XCTAssertEqual(session.runState, .waitingForApproval)
+        }
+        for decision: AgentApprovalDecision in [.acceptForSession, .decline, .acceptWithExecpolicyAmendment(#"["git"]"#)] {
+            XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: plain.id, decision: decision))
+            XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(.approval(request: plain, decision: decision), to: session))
+            XCTAssertEqual(session.pendingApproval, plain)
+            XCTAssertEqual(session.runState, .waitingForApproval)
+        }
+        let stale = try viewModel.mcpPendingInteractionResolution(
+            for: session, kind: .approval, interactionID: plain.id, payload: payload("accept", nil)
+        )
+        install(amendment, in: context)
+        XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(stale, to: session))
+        XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: plain.id, decision: .accept))
+        XCTAssertEqual(session.pendingApproval, amendment)
+        XCTAssertEqual(session.runState, .waitingForApproval)
+
+        let legacy = try parsedRequest(#"{"threadId":"thread","command":"git status"}"#)
+        install(legacy, in: context)
+        let beforeCU = try viewModel.mcpPendingInteractionResolution(
+            for: session, kind: .approval, interactionID: legacy.id, payload: payload("accept_for_session", nil)
+        )
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false)
+        XCTAssertEqual(try XCTUnwrap(viewModel.mcpPendingInteraction(for: session)).options.map(\.label), ["accept", "decline", "cancel"])
+        XCTAssertThrowsError(try viewModel.mcpPendingInteractionResolution(
+            for: session, kind: .approval, interactionID: legacy.id, payload: payload("accept_for_session", nil)
+        ))
+        XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(beforeCU, to: session))
+        XCTAssertEqual(session.pendingApproval, legacy)
+        XCTAssertEqual(session.runState, .waitingForApproval)
+        XCTAssertTrue(controller.recorder.events.isEmpty)
+        session.codexControllerFeatureState = nil
+
+        let cancelOnly = try parsedRequest(#"{"threadId":"thread","command":"git status","availableDecisions":["cancel"]}"#)
+        let network = try parsedRequest(#"{"threadId":"thread","command":"git status","availableDecisions":["accept","acceptForSession","cancel"]}"#)
+        let fileChange = AgentApprovalRequest(
+            requestID: .codex(.int(1)), method: "item/fileChange/requestApproval", kind: .fileChange,
+            threadID: "thread", turnID: "turn", itemID: "file"
+        )
+        let cases: [(AgentApprovalRequest, String, String?, [AgentNotificationAction], String)] = [
+            (plain, "accept", nil, [.approve, .review], #"{"decision":"accept"}"#),
+            (cancelOnly, "cancel", nil, [.review], #"{"decision":"cancel"}"#),
+            (amendment, "accept_with_amendment", " [ \"git\", \"status\" ] ", [.approve, .review], #"{"decision":{"acceptWithExecpolicyAmendment":{"execpolicy_amendment":["git","status"]}}}"#),
+            (legacy, "decline", nil, [.approve, .decline, .review], #"{"decision":"decline"}"#),
+            (fileChange, "decline", nil, [.decline, .review], #"{"decision":"decline"}"#),
+            (network, "accept_for_session", nil, [.approve, .review], #"{"decision":"acceptForSession"}"#)
+        ]
+        for (request, response, value, expectedActions, _) in cases {
+            install(request, in: context)
+            let descriptor = try XCTUnwrap(AgentPendingInteractionDescriptor.make(from: session))
+            XCTAssertEqual(descriptor.supportsDecline, expectedActions.contains(.decline))
+            let actions = AgentNotificationActionEligibility.actions(for: descriptor, isMCPControlled: false, preferences: .defaults)
+            XCTAssertEqual(actions, expectedActions)
+            let category = try XCTUnwrap(AgentNotificationAction.category(for: actions, interactionID: nil))
+            XCTAssertTrue(AgentNotificationAction.staticCategories.contains(category), "Non-choice approval actions must remain registered")
+            let resolution = try viewModel.mcpPendingInteractionResolution(
+                for: session, kind: .approval, interactionID: request.id, payload: payload(response, value)
+            )
+            try viewModel.applyPendingInteractionResolution(resolution, to: session)
+            XCTAssertNil(session.pendingApproval)
+            XCTAssertNotEqual(session.runState, .waitingForApproval)
+            XCTAssertFalse(viewModel.submitApprovalDecision(tabID: session.tabID, requestID: request.id, decision: .cancel))
+            XCTAssertThrowsError(try viewModel.applyPendingInteractionResolution(resolution, to: session))
+        }
+        await fulfillment(of: [sent], timeout: 3)
+        XCTAssertEqual(controller.recorder.events.sorted(), cases.map { "1:\($0.4)" }.sorted())
+    }
+
+    private final class ApprovalRecordingController: CodexSessionControllerPassiveStubDefaults {
+        let recorder = LifecycleRecorder()
+        let sent: XCTestExpectation
+        init(sent: XCTestExpectation) {
+            self.sent = sent
+        }
+
+        var events: AsyncStream<CodexNativeSessionController.Event> {
+            AsyncStream { $0.finish() }
+        }
+
+        func shutdown() async {}
+        func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
+            do {
+                let data = try JSONSerialization.data(withJSONObject: result, options: .sortedKeys)
+                recorder.record("\(id.displayValue):\(String(decoding: data, as: UTF8.self))")
+            } catch { XCTFail("Invalid wire result: \(error)") }
+            sent.fulfill()
+        }
+    }
+
+    private func makeContext() async throws -> AgentRunMCPControlledSessionContext {
+        let context = try await AgentRunMCPControlledSessionContext.make(
+            workspaceNamePrefix: "Codex approval choices", workspaceSwitchReason: "codexApprovalChoiceTests",
+            clientName: "codex-approval-choice-tests", unusedStartRunMessage: "No provider starts"
+        )
+        addTeardownBlock { @MainActor in await context.cleanup() }
+        return context
+    }
+
+    private func parsedRequest(_ json: String) throws -> AgentApprovalRequest {
+        let params = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any], "Fixture must be a JSON object"
+        )
+        return try XCTUnwrap(CodexNativeSessionController.parseApprovalRequest(
+            requestID: .int(1), method: "item/commandExecution/requestApproval", params: params,
+            activeThreadID: "thread", currentTurnID: "turn"
+        ), "Codex fixture must parse: \(json)")
+    }
+
+    private func install(_ request: AgentApprovalRequest, in context: AgentRunMCPControlledSessionContext) {
+        context.session.pendingApproval = request
+        context.session.runState = .waitingForApproval
+    }
+
+    private func payload(_ response: String, _ amendment: String?) -> AgentModeViewModel.MCPInteractionResponsePayload {
+        AgentModeViewModel.MCPInteractionResponsePayload(
+            text: nil, skip: false, responseArgument: .scalar(response), amendment: amendment, answersByQuestionID: [:]
         )
     }
 }

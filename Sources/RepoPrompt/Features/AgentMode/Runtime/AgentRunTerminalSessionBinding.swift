@@ -12,6 +12,7 @@ import RepoPromptDomainRuntime
 @MainActor
 struct AgentRunTerminalSessionBinding {
     struct Hooks {
+        var sealQuietCheckIn: @MainActor (AgentRunOwnership, AgentSessionRunState, Bool, Bool) -> Void = { _, _, _, _ in }
         let flushPendingAssistantDelta: @MainActor () -> Void
         let finalizeStreamingItems: @MainActor () -> Void
         let finalizePendingToolCalls: @MainActor (AgentSessionRunState) -> Void

@@ -6,9 +6,9 @@ enum BundledRoutingProfiles {
     static let data = Data((#"""
     {
       "schemaVersion": 1,
-      "profileVersion": "rpce.bundled-routing-profiles.2026-09-30.2",
-      "evidenceVersion": "rpce.model-routing-evidence.2026-09-30.2",
-      "rubricVersion": "rpce.automatic-utility-frontier.v2-evidence-2026-09-30.2",
+      "profileVersion": "rpce.bundled-routing-profiles.2026-10-26.1",
+      "evidenceVersion": "rpce.model-routing-evidence.2026-10-26.1",
+      "rubricVersion": "rpce.capability-first-frontier.v3-evidence-2026-10-26.1",
       "issuedAt": "2026-09-23T00:00:00Z",
       "expiresAt": "2027-09-23T00:00:00Z",
       "families": [
@@ -17,7 +17,7 @@ enum BundledRoutingProfiles {
           "id": "luna",
           "utilityTier": "gpt-6-luna",
           "summary": "Provider-scoped luna family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Luna as a base model using its capability, expected completion reliability, and price. Do not choose it merely because the prompt is short.",
+          "rubric": "Luna is a light, high-volume tier meant for exploration and simple lookups. Not suitable for implementation, review, debugging, or multi-step agentic work. A short prompt does not make a task simple.",
           "aliases": [],
           "matchers": [
             {
@@ -31,7 +31,7 @@ enum BundledRoutingProfiles {
           "id": "terra",
           "utilityTier": "gpt-5.6-terra",
           "summary": "Provider-scoped terra family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Terra as a base model using its capability, expected completion reliability, and price. It is not a default and receives no preference from its market tier.",
+          "rubric": "Terra is a previous-generation balanced tier, weaker than current flagships. Choose it only for clearly bounded, routine work; it is not cheaper than Sol.",
           "aliases": [],
           "matchers": []
         },
@@ -40,7 +40,7 @@ enum BundledRoutingProfiles {
           "id": "sol",
           "utilityTier": "gpt-6-sol",
           "summary": "Provider-scoped sol family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Sol as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries.",
+          "rubric": "Sol is OpenAI's current flagship for complex coding and agentic work. Strong default for substantive primary work; its base capability avoids missed findings and retries.",
           "aliases": [],
           "matchers": [
             {
@@ -54,7 +54,7 @@ enum BundledRoutingProfiles {
           "id": "astra",
           "utilityTier": "gpt-6-astra",
           "summary": "Provider-scoped astra family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Astra as a base model using its capability, expected completion reliability, and premium price.",
+          "rubric": "Astra is OpenAI's most capable premium tier. Choose it for the hardest, highest-risk, or longest-horizon work where its extra capability justifies premium price.",
           "aliases": [],
           "matchers": []
         },
@@ -63,7 +63,7 @@ enum BundledRoutingProfiles {
           "id": "haiku",
           "utilityTier": "claude-haiku",
           "summary": "Provider-scoped haiku family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Haiku as a base model using its capability, expected completion reliability, and price. Do not choose it merely because the prompt is short.",
+          "rubric": "Haiku is a light, fast tier meant for exploration and simple lookups. Not suitable for implementation, review, debugging, or multi-step agentic work. A short prompt does not make a task simple.",
           "aliases": [],
           "matchers": []
         },
@@ -72,7 +72,7 @@ enum BundledRoutingProfiles {
           "id": "sonnet",
           "utilityTier": "claude-sonnet",
           "summary": "Provider-scoped sonnet family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Sonnet as a base model using its capability, expected completion reliability, and price. It is not a default and receives no preference from its market tier.",
+          "rubric": "Sonnet is a balanced tier below the flagships. Choose it only for clearly bounded, routine work with a clear reliability margin.",
           "aliases": [
             "sonnet-family"
           ],
@@ -88,7 +88,7 @@ enum BundledRoutingProfiles {
           "id": "opus",
           "utilityTier": "claude-opus",
           "summary": "Provider-scoped opus family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Opus as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries.",
+          "rubric": "Opus is Anthropic's recommended flagship for long-running agentic coding and knowledge work. Strong default for substantive primary work; its base capability avoids missed findings and retries.",
           "aliases": [],
           "matchers": []
         },
@@ -97,7 +97,7 @@ enum BundledRoutingProfiles {
           "id": "fable",
           "utilityTier": "claude-fable",
           "summary": "Provider-scoped fable family; exact capability and cost depend on the advertised model.",
-          "rubric": "Judge Fable as a base model using its capability, expected completion reliability, and premium price.",
+          "rubric": "Fable is Anthropic's most capable premium tier. Choose it for the hardest, highest-risk, or longest-horizon work where its extra capability justifies premium price.",
           "aliases": [],
           "matchers": []
         }
@@ -109,7 +109,7 @@ enum BundledRoutingProfiles {
           "aliases": [],
           "familyID": "luna",
           "utilityTier": "gpt-6-luna",
-          "summary": "GPT-6 Luna is OpenAI's efficient, high-volume GPT-6 tier with a 1.05M-token context window and 128K-token maximum output.",
+          "summary": "GPT-6 Luna is OpenAI's light, high-volume GPT-6 tier (nano class) for exploration, lookups, and simple bounded edits; it is not intended for substantive implementation, review, or multi-step agentic work. 1.05M-token context window and 128K-token maximum output.",
           "rubric": null,
           "price": {
             "text": "API list price: $0.10 input / $0.50 output per 1M tokens.",
@@ -141,7 +141,7 @@ enum BundledRoutingProfiles {
           "aliases": [],
           "familyID": "terra",
           "utilityTier": "gpt-5.6-terra",
-          "summary": "GPT-5.6 Terra is the balanced intelligence-and-cost tier for everyday agentic work.",
+          "summary": "GPT-5.6 Terra is a previous-generation (GPT-5.6) balanced tier for routine agentic work. Current GPT-6.1 Sol is more capable at a lower list price. Its benchmark figures below are not directly comparable to unlisted GPT-6 models.",
           "rubric": null,
           "price": {
             "text": "API list price: $2 input / $12 output per 1M tokens.",
@@ -442,7 +442,7 @@ enum BundledRoutingProfiles {
         },
         {
           "id": "published-6",
-          "text": "Anthropic reports 55.8% on Terminal-Bench 4.0 versus 52.3% for Opus 5 and 37.3% for GPT-5.6 Sol in its harness.",
+          "text": "Anthropic reports 55.8% on Terminal-Bench 4.0 versus 52.3% for Opus 5 in its harness.",
           "publisher": "Anthropic",
           "sourceURL": null,
           "checkedAt": "2026-09-23T00:00:00Z",

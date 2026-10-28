@@ -374,6 +374,20 @@ extension AgentModeViewModel {
         )
     }
 
+    func agentSessionLinkRunFacts(
+        for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus
+    ) -> AgentRunQuietFacts? {
+        guard case let .success(session) = agentSessionLinkReadableSession(for: candidate),
+              session.permitsBoundOperationAndSave else { return nil }
+        // The snapshot's status, not owner release or a later mutable runState, chooses the cutoff.
+        let state: AgentSessionRunState = switch capturedStatus {
+        case .idle: .idle
+        case .running: .running
+        case .awaitingUser: .waitingForUser
+        }
+        return session.quietRunFacts(capturedState: state)
+    }
+
     /// Sanitized status projection for one live endpoint.
     ///
     /// This carries status only. Interaction identifiers, prompt/option bodies, tool payloads, run

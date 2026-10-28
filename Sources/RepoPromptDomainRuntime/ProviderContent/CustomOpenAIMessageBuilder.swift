@@ -63,7 +63,8 @@ package enum CompletionParams {
 }
 
 package enum CustomOpenAIMessageBuilder {
-    package static func messages(for aiMessage: AIMessage) -> [CompletionParams.Message] {
+    package static func messages(for aiMessage: AIMessage) throws -> [CompletionParams.Message] {
+        let planned = try AttachmentEncoding.plan(aiMessage.attachments, route: .customOpenAI)
         var results: [CompletionParams.Message] = []
 
         // 1) System prompt
@@ -105,27 +106,17 @@ package enum CustomOpenAIMessageBuilder {
                 var userContent = ""
 
                 // If this is the last user message, add context before the message
-                if index == lastUserIndex, !additionsForFinalUserMessage.isEmpty {
-                    userContent = additionsForFinalUserMessage + "\n" + entry.content
+                if index == lastUserIndex {
+                    let body = AttachmentEncoding.prependingInlineText(of: planned, to: entry.content)
+                    userContent = additionsForFinalUserMessage.isEmpty ? body : additionsForFinalUserMessage + "\n" + body
                 } else {
                     userContent = entry.content
                 }
 
-                let content: CompletionParams.Message.Content
-                if index == lastUserIndex, !aiMessage.transientImages.isEmpty {
-                    var parts: [CompletionParams.Message.Content.Part] = []
-                    if !userContent.isEmpty {
-                        parts.append(.text(userContent))
-                    }
-                    for image in aiMessage.transientImages {
-                        if let annotation = image.titleAnnotation {
-                            parts.append(.text(annotation))
-                        }
-                        parts.append(.imageURL(url: image.openAIDataURL, detail: "auto"))
-                    }
-                    content = .parts(parts)
+                let content: CompletionParams.Message.Content = if index == lastUserIndex {
+                    try userContentValue(text: userContent, planned: planned)
                 } else {
-                    content = .text(userContent)
+                    .text(userContent)
                 }
                 results.append(CompletionParams.Message(role: .user, content: content))
             } else {
@@ -138,20 +129,41 @@ package enum CustomOpenAIMessageBuilder {
             }
         }
 
-        if lastUserIndex == nil, !aiMessage.transientImages.isEmpty {
-            var parts: [CompletionParams.Message.Content.Part] = []
-            if !additionsForFinalUserMessage.isEmpty {
-                parts.append(.text(additionsForFinalUserMessage))
-            }
-            for image in aiMessage.transientImages {
-                if let annotation = image.titleAnnotation {
-                    parts.append(.text(annotation))
-                }
-                parts.append(.imageURL(url: image.openAIDataURL, detail: "auto"))
-            }
-            results.append(CompletionParams.Message(role: .user, content: .parts(parts)))
+        if lastUserIndex == nil, !planned.isEmpty {
+            let text = AttachmentEncoding.prependingInlineText(of: planned, to: additionsForFinalUserMessage)
+            try results.append(CompletionParams.Message(
+                role: .user,
+                content: userContentValue(text: text, planned: planned)
+            ))
         }
 
         return results
+    }
+
+    private static func userContentValue(
+        text: String,
+        planned: [PlannedAttachment]
+    ) throws -> CompletionParams.Message.Content {
+        var parts: [CompletionParams.Message.Content.Part] = []
+        if !text.isEmpty {
+            parts.append(.text(text))
+        }
+        for item in planned {
+            switch item.delivery {
+            case let .nativeImage(mediaType, data):
+                if let annotation = item.titleAnnotation {
+                    parts.append(.text(annotation))
+                }
+                parts.append(.imageURL(
+                    url: AttachmentEncoding.dataURL(mimeType: mediaType.rawValue, data: data),
+                    detail: "auto"
+                ))
+            case .inlineText:
+                break
+            case .nativeDocument:
+                throw item.undeclaredRung(on: .customOpenAI)
+            }
+        }
+        return parts.count == (text.isEmpty ? 0 : 1) ? .text(text) : .parts(parts)
     }
 }

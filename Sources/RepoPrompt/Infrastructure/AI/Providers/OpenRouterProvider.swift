@@ -58,7 +58,7 @@ class OpenRouterProvider: AIProvider {
             }
         }
 
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: false)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: false)
         let config = getConfiguration()
 
         // Use configuration values only if useCustomSettings is true
@@ -129,7 +129,7 @@ class OpenRouterProvider: AIProvider {
     }
 
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult {
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: false)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: false)
         let config = getConfiguration()
 
         // Use configuration values only if useCustomSettings is true

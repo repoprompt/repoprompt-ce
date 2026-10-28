@@ -3,6 +3,17 @@ import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 
 extension AgentModeViewModel {
+    /// The guarded target behind the composer Stop button; `nil` when there is nothing to stop.
+    func composerRunCancelTarget(tabID: UUID?) -> AgentRunCancelTarget? {
+        guard let tabID,
+              let session = sessions[tabID],
+              session.runState.isActive,
+              session.runState != .waitingForUser,
+              session.runID != nil
+        else { return nil }
+        return makeRunCancelTarget(tabID: tabID, session: session)
+    }
+
     func makeComposerProps(tabID explicitTabID: UUID? = nil) -> AgentComposerProps {
         let tabID = explicitTabID ?? currentTabID
         let session = tabID.flatMap { sessions[$0] }
@@ -11,15 +22,7 @@ extension AgentModeViewModel {
             guard selectedAgent == .codexExec, let tabID else { return false }
             return isTabRunning(tabID)
         }()
-        let cancelTarget: AgentRunCancelTarget? = {
-            guard let tabID,
-                  let session,
-                  session.runState.isActive,
-                  session.runState != .waitingForUser,
-                  session.runID != nil
-            else { return nil }
-            return makeRunCancelTarget(tabID: tabID, session: session)
-        }()
+        let cancelTarget = composerRunCancelTarget(tabID: tabID)
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
         let acpControls = acpModelParameterControls(session: session)
         // Cursor's catalog can refresh while a run is active. Metadata disappearing must
@@ -40,7 +43,7 @@ extension AgentModeViewModel {
             submitTarget: submitTarget,
             attachments: AgentAttachmentStripSnapshot(
                 scopeTabID: tabID,
-                imageAttachments: pendingImageAttachments,
+                attachments: pendingFileAttachments,
                 taggedFileAttachments: pendingTaggedFileAttachments
             ),
             runState: runState,

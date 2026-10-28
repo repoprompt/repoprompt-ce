@@ -5,6 +5,7 @@
 //  Created by RepoPrompt MCP integration
 //
 
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// A comprehensive MCP server status dashboard view.
@@ -373,6 +374,16 @@ struct MCPStatusView: View {
 
     // MARK: - Auto-Approve Section
 
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+
+    private var approvalModeDescription: String {
+        if globalSettings.mcpStrictConnectionApproval() {
+            return "Strict connection approval is enabled. Saved names do not skip approval."
+        }
+        return "Always allow trusts apps by name. Any program using an approved app's name is let in. "
+            + "Enable Strict connection approval in Settings → MCP to prompt once per run instead."
+    }
+
     private var autoApproveSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
@@ -394,15 +405,15 @@ struct MCPStatusView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-            Text("Saved client names no longer skip approval. Names are self-reported, not verified identities.")
+            Text(approvalModeDescription)
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-            // Preserved legacy records; these do not grant admission.
+            // Strict mode leaves the persistent list intact but never uses it for admission.
             let allowedClients = server.dashboard?.alwaysAllowedClients ?? []
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("Legacy Client Names (Inactive)")
+                Text(globalSettings.mcpStrictConnectionApproval() ? "Always-Allowed Clients (Inactive)" : "Always-Allowed Clients")
                     .font(.subheadline.weight(.medium))
 
                 if allowedClients.isEmpty {
@@ -437,12 +448,18 @@ struct MCPStatusView: View {
 
             Spacer()
 
-            Button(action: { server.setAlwaysAllowed(clientID: client, allowed: false) }) {
-                Text("Remove")
-                    .font(.caption.weight(.medium))
-                    .foregroundColor(.red)
+            if server.isBuiltInAlwaysAllowedClient(client) {
+                Text("Built-in")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Button(action: { server.setAlwaysAllowed(clientID: client, allowed: false) }) {
+                    Text("Remove")
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(10)
         .background(

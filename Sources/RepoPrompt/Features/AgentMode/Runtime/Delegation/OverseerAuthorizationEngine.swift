@@ -362,7 +362,8 @@ final class OverseerAuthorizationEngine {
             for record in chain where request.operation.requiresScopeUsage(for: record.grant.guardrails) {
                 // In-flight creations (spawn, fork, worktree_create) count until they settle.
                 guard let evidence = projector.usageEvidence(
-                    of: record.grant, spawnParentSessionID: request.targetSessionIDs.first
+                    of: record.grant, spawnParentSessionID: request.targetSessionIDs.first,
+                    requiresWorktreeAccounting: request.operation.scopeGuardrailUse == .worktree
                 ) else { return .denied(.usageProofMissing, sessionID: nil) }
                 usage[record.id] = scopes.usageIncludingReservations(evidence)
             }

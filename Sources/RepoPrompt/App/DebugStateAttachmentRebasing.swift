@@ -9,7 +9,7 @@ extension DebugStateBootstrap.Builder {
             guard let values = record["attachments"] as? [[String: Any]] else { return record }
             var copy = record
             copy["attachments"] = try values.map { value -> [String: Any] in
-                let attachment = try JSONDecoder().decode(AgentImageAttachment.self, from: json(value))
+                let attachment = try JSONDecoder().decode(AgentFileAttachment.self, from: json(value))
                 guard case let .localFile(path) = attachment.source, path.hasPrefix("/") else { return value }
                 let candidate = URL(fileURLWithPath: path).standardizedFileURL
                 for (source, destination) in mappings where destination.pathComponents.starts(with: locations.workspaceRoot.pathComponents) {
@@ -19,7 +19,7 @@ extension DebugStateBootstrap.Builder {
                     let target = candidate.pathComponents.dropFirst(managed.pathComponents.count).reduce(targetRoot) { $0.appendingPathComponent($1) }
                     var copy = value
                     // Re-encode only the typed source field; preserve all other/unknown fields.
-                    copy["source"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(AgentImageSource.localFile(path: target.path)))
+                    copy["source"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(AgentAttachmentSource.localFile(path: target.path)))
                     return copy
                 }
                 return value

@@ -932,6 +932,16 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         }
     }
 
+    package func mcpStrictConnectionApproval() -> Bool {
+        scalarPreferences.mcp?.strictConnectionApproval ?? false
+    }
+
+    package func setMCPStrictConnectionApproval(_ enabled: Bool, commit: Bool = true) {
+        updateMCPScalar(commit: commit) { settings in
+            settings.strictConnectionApproval = enabled
+        }
+    }
+
     package func mcpAutoStart() -> Bool {
         scalarPreferences.mcp?.autoStart ?? false
     }

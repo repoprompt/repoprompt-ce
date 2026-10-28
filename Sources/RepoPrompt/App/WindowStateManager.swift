@@ -560,6 +560,17 @@ class WindowStatesManager: ObservableObject {
                 updateKeyboardShortcutsState()
             }
             .store(in: &focusCancellables)
+        for name in [
+            NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification,
+            NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+            NSWindow.willBeginSheetNotification, NSWindow.didEndSheetNotification,
+            UserDefaults.didChangeNotification
+        ] {
+            NotificationCenter.default.publisher(for: name)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.updateKeyboardShortcutsState() }
+                .store(in: &focusCancellables)
+        }
         updateKeyboardShortcutsState()
     }
 
@@ -1291,22 +1302,27 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - Keyboard Shortcuts Enabling/Disabling
 
-    /// Updates `KeyboardShortcuts.isEnabled` depending on whether
-    /// any of our tracked windows is currently focused and if shortcuts are enabled in settings.
+    /// Application commands remain available in Settings and after the last main window closes.
+    /// Individual workspace/session handlers additionally require a key main window.
     private func updateKeyboardShortcutsState() {
         // Skip during termination to prevent observation crashes
         guard !isTerminating else { return }
 
         let shortcutsEnabled = GlobalSettingsStore.shared.enableKeyboardShortcuts()
 
-        // If *any* window is currently focused AND shortcuts are enabled, enable shortcuts; otherwise disable them.
-        let anyFocused = allWindows.contains { $0.isCurrentlyFocused == true }
-        let shouldEnable = anyFocused && shortcutsEnabled
+        let shouldEnable = NSApplication.shared.isActive && shortcutsEnabled
         if shouldEnable {
             // Register handlers lazily to avoid installing Carbon hotkeys during background/inactive launch.
             GlobalKeyboardShortcutsCoordinator.shared.ensureHandlersRegistered()
         }
         KeyboardShortcuts.isEnabled = shouldEnable
+        // Resolve from self: this also runs during singleton initialization, before `.shared`
+        // is safe for the coordinator to look up recursively.
+        let keyWindow = NSApplication.shared.keyWindow
+        let eligible = keyWindow != nil && NSApplication.shared.modalWindow == nil
+            && keyWindow?.attachedSheet == nil
+            && allWindows.contains { $0.nsWindow === keyWindow && !$0.isClosing }
+        GlobalKeyboardShortcutsCoordinator.shared.updateRegistrationContext(hasEligibleMainWindow: eligible)
     }
 
     // MARK: - Window Lookup Helpers (for MCP routing)

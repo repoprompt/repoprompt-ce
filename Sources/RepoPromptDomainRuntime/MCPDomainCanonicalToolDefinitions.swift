@@ -1127,8 +1127,9 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
         return (canonicalize ? definitions.map(canonicalizeGlobalSemantics) : definitions)
             .map(advertiseModelParameters)
-            .map(advertiseOracleImageAttachments)
+            .map(advertiseOracleAttachments)
             .map(advertiseWorktreeListPagination)
+            .map(advertiseDefaultRepositoryElection)
             .map(advertiseSessionDiscovery)
             .map(advertiseAgentControlTaskRoles)
     }
@@ -1259,46 +1260,25 @@ package enum MCPDomainCanonicalToolDefinitions {
         )
     }
 
-    /// The vendored Oracle send definitions predate image attachments, so
-    /// canonicalization advertises the app-backend `images` contract here instead of
-    /// re-vendoring the blob. The direct headless backend cannot resolve workspace
-    /// images and rejects the argument at execution time rather than dropping it.
-    private static func advertiseOracleImageAttachments(
+    /// The vendored Oracle send definitions predate file attachments, so canonicalization
+    /// advertises the app-backend `attachments` contract here instead of re-vendoring the blob.
+    private static func advertiseOracleAttachments(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        guard [MCPWindowToolName.askOracle, MCPWindowToolName.oracleSend].contains(definition.name),
+        typealias Contract = OracleAttachmentContract
+        guard Contract.oracleToolNames.contains(definition.name),
               case var .object(schema) = definition.inputSchema,
               case var .object(properties)? = schema["properties"],
-              properties["images"] == nil
+              properties[Contract.argumentName] == nil
         else { return definition }
 
-        let limits = OracleImageAttachmentLimits.production
-        properties["images"] = .object([
-            "type": .string("array"),
-            "description": .string("Optional workspace-local PNG/JPEG/GIF/WebP images for transports that support image input. Each item requires canonical absolute `path` inside a loaded workspace root (including screenshots saved under a workspace root) or the exact path of an image the user attached to this agent session, and may include transient `title`. Unsupported transports, remote URLs, sibling attachments, and arbitrary paths outside loaded roots are rejected. Max \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit. Requires the app backend; the direct headless backend rejects `images`."),
-            "items": .object([
-                "type": .string("object"),
-                "properties": .object([
-                    "path": .object([
-                        "type": .string("string"),
-                        "description": .string("Canonical absolute path inside a currently loaded workspace root, or the exact path of an image attached to this agent session")
-                    ]),
-                    "title": .object([
-                        "type": .string("string"),
-                        "description": .string("Optional transient image title"),
-                        "maxLength": .int(200)
-                    ])
-                ]),
-                "required": .array([.string("path")])
-            ]),
-            "maxItems": .int(limits.maxCount)
-        ])
+        properties[Contract.argumentName] = Contract.schemaProperty(headlessLimitation: true)
         schema["properties"] = .object(properties)
 
         var description = definition.description
-        let imageUsage = "Optional `images` attaches workspace-local PNG, JPEG, GIF, or WebP files to the Oracle request when the resolved model transport supports image input. Each item is `{path,title?}` with a canonical absolute path inside the current loaded roots — a screenshot saved under a workspace root is fine — or the exact path of an image the user attached to this agent session (pasted or dropped into the composer; its path is listed in the user's message). Remote URLs, relative paths, sibling attachments, and arbitrary files outside the loaded roots are rejected before a message is sent, and models on transports without image input reject `images` with an error. Image input is additional to pre-send text estimates and Context Builder text-selection budgets. Originals, not transcript thumbnails, are sent to each Oracle lane; group fan-out multiplies image usage/cost, not any one request's attachment cap. Provider-reported input totals may already include image usage. Session attachment files are normally deleted when the agent turn ends; forward them during that turn. Originals are this-turn-only: continuations do not automatically reattach prior images or send saved thumbnails. Limits: \(limits.maxCount) images, \(limits.maxBytesPerImage / 1_048_576) MiB each, \(limits.maxTotalBytes / 1_048_576) MiB total, measured as raw attachment-file bytes before provider encoding. The selected provider or model may impose additional restrictions; accepted attachments do not guarantee full-request or model-context fit. Requires the app backend; the direct headless backend rejects `images`."
-        if !description.contains(imageUsage) {
-            description += "\n\n\(imageUsage)"
+        let usage = Contract.usageDescription() + Contract.headlessLimitationNote
+        if !description.contains(usage) {
+            description += "\n\n\(usage)"
         }
 
         return MCPDomainToolDefinition(
@@ -1346,6 +1326,73 @@ package enum MCPDomainCanonicalToolDefinitions {
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
         )
+    }
+
+    /// The vendored `git` and `manage_worktree` definitions advertise a first-loaded-root default. App-backed
+    /// calls use the shared default repository election instead; the direct headless backend keeps its own
+    /// root-set semantics, so the copy qualifies the policy by backend. `agent_run` startup is not part of that
+    /// election, so its copy states its own PRIMARY-only and full-set inheritance rules instead. Obsolete prose is
+    /// replaced in place (never contradicted by appended text), field shapes are unchanged, and reapplying
+    /// changes nothing.
+    private static func advertiseDefaultRepositoryElection(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        typealias Copy = MCPDefaultRepositoryElectionCopy
+        var description = definition.description
+        let propertyDescriptions: [String: String]
+        switch definition.name {
+        case MCPWindowToolName.git:
+            description = replacingObsoleteLine(Copy.gitObsoleteDefault, with: Copy.gitDefault, in: description)
+            description = replacingObsoleteLine(Copy.gitObsoleteTreeSpecifiers, with: Copy.gitTreeSpecifiers, in: description)
+            description = replacingObsoleteLine(Copy.gitObsoleteMultiRootNote, with: Copy.gitMultiRootNote, in: description)
+            propertyDescriptions = ["repo_root": Copy.gitRepoRootProperty]
+        case MCPWindowToolName.manageWorktree:
+            if !description.contains(Copy.manageWorktreeSection) {
+                description = description.contains(Copy.manageWorktreeSectionAnchor)
+                    ? description.replacingOccurrences(
+                        of: Copy.manageWorktreeSectionAnchor,
+                        with: Copy.manageWorktreeSectionAnchor + Copy.manageWorktreeSection
+                    )
+                    : description + Copy.manageWorktreeSection
+            }
+            propertyDescriptions = ["repo_root": Copy.manageWorktreeRepoRootProperty]
+        case MCPWindowToolName.agentRun:
+            description = replacingObsoleteLine(Copy.agentRunObsoleteWorktreeArgs, with: Copy.agentRunWorktreeArgs, in: description)
+            propertyDescriptions = [
+                "worktree_repo_root": Copy.agentRunWorktreeRepoRootProperty,
+                "inherit_worktree": Copy.agentRunInheritWorktreeProperty
+            ]
+        default:
+            return definition
+        }
+
+        var inputSchema = definition.inputSchema
+        if case var .object(schema) = inputSchema,
+           case var .object(properties)? = schema["properties"]
+        {
+            for (name, text) in propertyDescriptions {
+                guard case var .object(property)? = properties[name] else { continue }
+                property["description"] = .string(text)
+                properties[name] = .object(property)
+            }
+            schema["properties"] = .object(properties)
+            inputSchema = .object(schema)
+        }
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: description,
+            inputSchema: inputSchema,
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    /// Replaces an obsolete line once; appends the replacement only if the anchor has drifted away.
+    private static func replacingObsoleteLine(_ obsolete: String, with replacement: String, in description: String) -> String {
+        guard !description.contains(replacement) else { return description }
+        return description.contains(obsolete)
+            ? description.replacingOccurrences(of: obsolete, with: replacement)
+            : description + "\n" + replacement
     }
 
     /// The vendored definitions still carry the retired fixed-wait wording, so canonicalization
@@ -1445,6 +1492,9 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if definition.name == MCPGlobalToolName.manageWorkspaces {
+            return canonicalizeWorkspaceSemantics(definition)
+        }
         if definition.name == MCPWindowToolName.history {
             return canonicalizeHistoryWorkspaceDiscovery(definition)
         }
@@ -1539,8 +1589,25 @@ package enum MCPDomainCanonicalToolDefinitions {
             schema["properties"] = .object(properties)
             return MCPDomainToolDefinition(
                 name: definition.name,
-                description: definition.description + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
+                description: definition.description
+                    .replacingOccurrences(
+                        of: "Use `oracle_chat_log` after compaction to recover recent oracle messages.",
+                        with: "Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and reading it with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit."
+                    )
+                    + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
                 inputSchema: .object(schema),
+                annotations: definition.annotations,
+                isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+        if definition.name == MCPWindowToolName.oracleChatLog {
+            return MCPDomainToolDefinition(
+                name: definition.name,
+                description: definition.description.replacingOccurrences(
+                    of: "Available only during agent mode runs.",
+                    with: "Available only during agent mode runs. In app-backed Agent Mode, only chats created by the current Agent run can be read; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused. The direct headless backend does not apply this run limit."
+                ),
+                inputSchema: definition.inputSchema,
                 annotations: definition.annotations,
                 isEnabledByDefault: definition.isEnabledByDefault
             )
@@ -1604,14 +1671,96 @@ package enum MCPDomainCanonicalToolDefinitions {
         else {
             return definition
         }
-        properties.removeValue(forKey: "window_id")
+        properties["window_id"] = .object([
+            "type": .string("integer"),
+            "description": .string("App-backed only. For list: filter to one window. For bind: capture and explicitly bind that window's current compose-tab context. Direct headless rejects this parameter when supplied.")
+        ])
+        properties["working_dirs"] = .object([
+            "anyOf": .array([
+                .object([
+                    "type": .string("array"),
+                    "description": .string("Preferred for bind: absolute workspace root paths. Exact root-set match first, then superset fallback; the match must resolve unambiguously. Each string is one root, including a path containing a comma."),
+                    "items": .object(["type": .string("string")])
+                ]),
+                .object([
+                    "type": .string("string"),
+                    "description": .string("Compatibility form for bind: comma-separated absolute workspace root paths. The string is split on commas; use an array for a root containing a comma.")
+                ])
+            ])
+        ])
+        properties["create_if_missing"] = .object([
+            "type": .string("boolean"),
+            "description": .string("App-backed bind with working_dirs: create a workspace after approval when no exact or superset match exists. Headless ignores this flag: existing matches still bind; no match is an error and nothing is created.")
+        ])
+        properties["tab_name"] = .object([
+            "type": .string("string"),
+            "description": .string("App-backed only: optional workspace name hint when creating through working_dirs + create_if_missing. Ignored by headless; it does not name or rename an existing match.")
+        ])
         schema["properties"] = .object(properties)
         return MCPDomainToolDefinition(
             name: definition.name,
-            description: "List, inspect, and bind the canonical workspace context for this MCP connection. Bind by working_dirs (preferred) or context_id. This global tool never accepts an app window selector.",
+            description: "List, inspect, and bind this MCP connection's workspace context. `op` is `list`, `status`, or `bind`. App-backed `list` returns open windows and their compose tabs; `window_id` filters that list. App-backed `bind` accepts `working_dirs` (preferred), `context_id`, or `window_id`; a window bind captures and explicitly binds that window's current compose-tab context. Later visible-tab changes do not redirect the binding. Direct headless `list` returns the saved workspace/context inventory and current binding, without windows; `status` returns the current binding. Headless `bind` accepts `context_id` or `working_dirs` and rejects any supplied `window_id`. `working_dirs` matches workspace roots, exact set first, then superset fallback; descendant paths are not root selectors. App-backed calls can use window_id to disambiguate matching workspaces. Headless requires a unique eligible match. Prefer an array of absolute root paths. A string remains accepted and is split on commas; use an array when a root contains a comma. App-backed `create_if_missing=true` may create a workspace after approval when no match exists. Headless never creates a workspace implicitly: an existing match still binds when `create_if_missing` or `tab_name` is supplied, and no match is an error.",
             inputSchema: .object(schema),
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    /// Shared publication qualifiers preserve the existing app/headless behavior and accepted inputs.
+    private static func canonicalizeWorkspaceSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+        if case var .object(property)? = properties["tab"] {
+            property["description"] = .string("Required for select_tab and close_tab. App-backed: compose-tab UUID or name. Headless: canonical UUID for select_tab; UUID exactly as listed or unambiguous name for close_tab. Other actions do not require tab.")
+            properties["tab"] = .object(property)
+        }
+        if case var .object(property)? = properties["window_id"] {
+            property["description"] = .string("App-backed target window; defaults to the selected or only window. Headless rejects this parameter when supplied.")
+            properties["window_id"] = .object(property)
+        }
+        if case var .object(property)? = properties["open_in_new_window"] {
+            property["description"] = .string("App-backed switch/create: when true, open a new window and bind to it. Headless rejects true; false or omission requests no new-window effect.")
+            properties["open_in_new_window"] = .object(property)
+        }
+        if case var .object(property)? = properties["focus"] {
+            property["description"] = .string("App-backed select_tab/create_tab: true also switches the visible tab; use only when the user requests a UI switch. Headless accepts and ignores this compatibility flag; it has no UI effect.")
+            properties["focus"] = .object(property)
+        }
+        if case var .object(property)? = properties["close_window"] {
+            property["description"] = .string("App-backed delete: true requests window closure after deletion. Headless accepts and ignores this compatibility flag; it does not prevent the delete action.")
+            properties["close_window"] = .object(property)
+        }
+        if case var .object(property)? = properties["switch_to_created"] {
+            property["description"] = .string("For create: when true, switch to the new workspace in the app target window, or bind its context on headless.")
+            properties["switch_to_created"] = .object(property)
+        }
+        schema["properties"] = .object(properties)
+        let description = definition.description
+            .replacingOccurrences(of: "'hide'/'unhide' are non-destructive.", with: "'hide'/'unhide' are non-destructive and ignore include_hidden. Name-based 'hide' uses the unique visible match and falls back to a unique hidden match only when no visible workspace matches, so an ambiguous visible name stays ambiguous. Name-based 'unhide' needs a unique match among visible and hidden workspaces. Use a workspace UUID to disambiguate.")
+            .replacingOccurrences(of: "Manage workspaces and compose-tab lifecycle across RepoPrompt windows.", with: "Manage workspaces and compose-tab lifecycle. App-backed calls operate through RepoPrompt windows; direct headless calls operate on canonical workspace contexts without windows.")
+            .replacingOccurrences(of: "canonical API for per-window tab routing and context_id discovery", with: "canonical API for context binding and context_id discovery")
+            .replacingOccurrences(of: "(id, name, repoPaths, showing window IDs, is_hidden)", with: "(app-backed: id, name, repo_paths, showing window IDs, is_hidden; headless: workspace_id, name, repo_paths, hidden, contexts, without window IDs)")
+            .replacingOccurrences(of: "Switch a window to a specified workspace", with: "App-backed: switch the target window to a workspace. Headless: bind its active context, or first stored context when none is active")
+            .replacingOccurrences(of: "List compose tabs in one window", with: "List app-backed tabs in one window or headless workspace/context inventory")
+            .replacingOccurrences(of: "Bind this connection to a compose tab (Legacy compatibility", with: "Bind this connection to a compose tab: UUID or name on the app backend; canonical UUID only on headless (Legacy compatibility")
+            .replacingOccurrences(of: "Create a new compose tab in the background", with: "Create a compose tab; app-backed creation can stay in the background. Headless has no UI")
+            .replacingOccurrences(of: "`manage_workspaces.list` returns workspace inventory: names, folder paths, and which windows show each workspace", with: "`manage_workspaces.list` returns workspace inventory; app-backed results also identify showing windows")
+            .replacingOccurrences(of: "`bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding", with: "App-backed `bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding. Headless lists canonical workspace/context identities and the connection binding; there is no window routing")
+            .replacingOccurrences(of: "When the same workspace is open in multiple windows", with: "App-backed: when the same workspace is open in multiple windows")
+            .replacingOccurrences(of: "create_tab defaults to bind=true and focus=false so automation can create isolated background tabs without stealing UI focus.", with: "create_tab defaults to bind=true and focus=false. On the app backend this allows a background tab without UI focus. Headless has no UI; bind=true selects the new context and records it as the workspace's active compose tab.")
+            .replacingOccurrences(of: "IMPORTANT: The 'focus' parameter switches the visible tab in the UI, which can be disruptive to the user's workflow.", with: "IMPORTANT: App-backed 'focus' switches the visible tab in the UI, which can be disruptive to the user's workflow. Headless ignores this flag.")
+            .replacingOccurrences(of: "- tab: string                                   (required for 'select_tab'; optional for 'close_tab'; UUID or name)", with: "- tab: string — Required for select_tab and close_tab. App-backed: compose-tab UUID or name. Headless: canonical UUID for select_tab; UUID exactly as listed or unambiguous name for close_tab. Other actions do not require tab.")
+            .replacingOccurrences(of: "- window_id: integer                            (optional; target window, defaults to selected or only window)", with: "- window_id: integer — App-backed target window; defaults to the selected or only window. Headless rejects this parameter when supplied.")
+            .replacingOccurrences(of: "- open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it)", with: "- open_in_new_window: boolean — App-backed switch/create: when true, open a new window and bind to it. Headless rejects true; false or omission requests no new-window effect.")
+            .replacingOccurrences(of: "- focus: boolean                                (optional for 'select_tab' or 'create_tab'; if true, also switches the UI to show the tab)", with: "- focus: boolean — App-backed select_tab/create_tab: true also switches the visible tab; use only when the user requests a UI switch. Headless accepts and ignores this compatibility flag; it has no UI effect.")
+            .replacingOccurrences(of: "- close_window: boolean                         (optional for 'delete'; when true, switches away without saving, deletes the workspace, then requests window close)", with: "- close_window: boolean — App-backed delete: true requests window closure after deletion. Headless accepts and ignores this compatibility flag; it does not prevent the delete action.")
+            .replacingOccurrences(of: "- switch_to_created: boolean                    (optional for 'create'; when true, switches to the newly created workspace)", with: "- switch_to_created: boolean — For create: when true, switch to the new workspace in the app target window, or bind its context on headless.")
+        return MCPDomainToolDefinition(
+            name: definition.name, description: description, inputSchema: .object(schema),
+            annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
         )
     }
 
@@ -2547,17 +2696,66 @@ package enum MCPDomainCanonicalToolDefinitions {
         }
     }
 
+    /// Wording-only projection. Keep prior migration anchors and every schema/authority unchanged.
+    private enum AgentSessionLinkDirectionGuidanceMigration {
+        static let description: String = {
+            let previous = AgentSessionLinkWaitCursorMigration.description
+            let replacements = [
+                (
+                    "- `send`: deliver an attributed message when `idle_for_send: true`, or queue one with `delivery: \"when_sendable\"`.",
+                    "- `send`: `idle_for_send: true` or queue one with `delivery: \"when_sendable\"`; exact Manage grants use task framing."
+                ),
+                (
+                    "- `steer`: [manage] direct that target now with a new `idempotency_key`; pending prompts block steering. ACP live steering is supported.",
+                    "- `steer`: [manage] assign/resume, even idle; new `idempotency_key`. Pending prompts block steering. ACP live steering is supported."
+                )
+            ]
+            return replacements.reduce(previous) { text, replacement in
+                guard let revised = replacingOneExactLine(
+                    in: text, replacements: [(from: replacement.0, to: replacement.1)]
+                ) else { preconditionFailure("Expected one exact direction-guidance anchor") }
+                return revised
+            }
+        }()
+
+        static func isCurrent(_ definition: MCPDomainToolDefinition) -> Bool {
+            definition.description == description
+                && definition.inputSchema == AgentSessionLinkWaitCursorMigration.inputSchema
+        }
+
+        static func apply(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+            precondition(AgentSessionLinkWaitCursorMigration.isCurrent(definition))
+            return MCPDomainToolDefinition(
+                name: definition.name, description: description, inputSchema: definition.inputSchema,
+                annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
+            )
+        }
+    }
+
     private static func canonicalizeAgentSessionLink(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkWaitCursorMigration.isCurrent(definition) { return definition }
+        if AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition) {
+            return definition
+        }
+        return AgentSessionLinkDirectionGuidanceMigration.apply(canonicalizeAgentSessionLinkBeforeDirectionGuidance(definition))
+    }
+
+    private static func canonicalizeAgentSessionLinkBeforeDirectionGuidance(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        if AgentSessionLinkWaitCursorMigration.isCurrent(definition) {
+            return definition
+        }
         return AgentSessionLinkWaitCursorMigration.applying(to: canonicalizeAgentSessionLinkBeforeWaitCursors(definition))
     }
 
     private static func canonicalizeAgentSessionLinkBeforeWaitCursors(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) { return definition }
+        if AgentSessionLinkOverseerActivationGuidance.isCurrent(definition) {
+            return definition
+        }
         if AgentSessionLinkModelSelectionMigration.isCurrent(definition) || AgentSessionLinkOverseerActivationGuidance.isPrevious(definition) {
             return AgentSessionLinkOverseerActivationGuidance.applying(to: definition)
         }
@@ -2568,7 +2766,8 @@ package enum MCPDomainCanonicalToolDefinitions {
     }
 
     private static func agentSessionLinkModelSelectionIsPartial(_ definition: MCPDomainToolDefinition) -> Bool {
-        !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
+        !AgentSessionLinkDirectionGuidanceMigration.isCurrent(definition)
+            && !AgentSessionLinkWaitCursorMigration.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isCurrent(definition)
             && !AgentSessionLinkOverseerActivationGuidance.isPrevious(definition)
             && !AgentSessionLinkModelSelectionMigration.isCurrent(definition)
@@ -2593,7 +2792,9 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeAgentSessionLinkBeforeRefusalSubreason(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
-        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) { return definition }
+        if AgentSessionLinkLaneOperationsMigration.isCurrent(definition) {
+            return definition
+        }
         if AgentSessionLinkStopMigration.isCurrent(definition) {
             return AgentSessionLinkLaneOperationsMigration.apply(definition)
         }
@@ -2698,7 +2899,9 @@ package enum MCPDomainCanonicalToolDefinitions {
                     "agent_session_link canonical definition only partially carries request_attention"
                 )
             }
-            if descriptionWithCurrentList == definition.description { return definition }
+            if descriptionWithCurrentList == definition.description {
+                return definition
+            }
             return MCPDomainToolDefinition(
                 name: definition.name,
                 description: descriptionWithCurrentList,
@@ -2914,8 +3117,12 @@ package enum MCPDomainCanonicalToolDefinitions {
            queueClauseCount == 1,
            retiredTokenCount == 1
         {
-            if incomingOnlyCount == 1, automaticCount == 0 { return .historicalIncomingOnly }
-            if incomingOnlyCount == 0, automaticCount == 1 { return .historicalAutomatic }
+            if incomingOnlyCount == 1, automaticCount == 0 {
+                return .historicalIncomingOnly
+            }
+            if incomingOnlyCount == 0, automaticCount == 1 {
+                return .historicalAutomatic
+            }
             return .partial
         }
 
@@ -2972,6 +3179,10 @@ package enum MCPDomainCanonicalToolDefinitions {
             canonicalizeAgentSessionLinkBeforeModelSelection(test_agentSessionLinkLegacyCurrentDefinition())
         }
 
+        package static func test_agentSessionLinkBeforeDirectionGuidanceDefinition() -> MCPDomainToolDefinition {
+            canonicalizeAgentSessionLinkBeforeDirectionGuidance(test_agentSessionLinkLegacyCurrentDefinition())
+        }
+
         package static func test_agentSessionLinkPreviousCursorDefinition() -> MCPDomainToolDefinition {
             canonicalizeAgentSessionLinkBeforeWaitCursors(test_agentSessionLinkLegacyCurrentDefinition())
         }
@@ -2982,6 +3193,12 @@ package enum MCPDomainCanonicalToolDefinitions {
 
         package static func test_agentSessionLinkPreviousCompactDefinition() -> MCPDomainToolDefinition {
             applyAgentSessionLinkTokenEfficiency(test_agentSessionLinkLegacyCurrentDefinition())
+        }
+
+        package static func test_advertiseDefaultRepositoryElection(
+            _ definition: MCPDomainToolDefinition
+        ) -> MCPDomainToolDefinition {
+            advertiseDefaultRepositoryElection(definition)
         }
 
         package static func test_canonicalizeAgentControlWaitSemantics(
@@ -3790,4 +4007,47 @@ package enum MCPDomainCanonicalToolDefinitions {
             isEnabledByDefault: definition.isEnabledByDefault
         )
     }
+}
+
+/// Shipped copy for the app-backed default repository election (#1431). The canonical pipeline applies it to
+/// `git` and `manage_worktree`; the management provider's legacy description reuses the same sentences.
+package enum MCPDefaultRepositoryElectionCopy {
+    static let gitObsoleteDefault =
+        "- Generic calls default to the first loaded root's repo; nested Agent Context Builder runs default to their frozen selected repository target"
+    static let gitDefault =
+        "- Default repository (app-backed): without a repository-identifying selector, use the session's sole applicable worktree binding; with no bindings, use declared PRIMARY (the first declared workspace root, with no fallback to another root). Multiple bindings require an explicit repository or identifying worktree selector. Nested Agent Context Builder runs use their frozen selected repository target instead."
+    static let gitObsoleteTreeSpecifiers =
+        "- Tree specifiers: append `@wt` (explicit worktree), `@main` (main checkout), or `@main:<branch>` to target a worktree by branch (local branch name)"
+    static let gitTreeSpecifiers = """
+    - Tree specifiers: append `@wt` (explicit worktree), `@main` (main checkout), or `@main:<branch>` to target a worktree by branch (local branch name), e.g. `<root>@main`. Bare `@main`, `@current`, and `@wt` are relative to the default repository and do not choose one; `@id:<worktree_id>` and `@branch:<branch>` identify a checkout directly.
+    - Direct headless backend: an unqualified call inspects every loaded Git root; the app-backed default does not apply.
+    """
+    static let gitObsoleteMultiRootNote = "Note: log/show/blame run on primary repo only with multi-root."
+    static let gitMultiRootNote = "Note: with multiple `repo_roots`, log/show/blame run on the first listed repository only."
+    static let gitRepoRootProperty =
+        "Repository root path inside a loaded root, or loaded root name. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector. Nested Agent Context Builder runs use the frozen selected repository target. Supports @wt, @main, or @main:<branch> (relative to that default unless prefixed by a root, e.g. <root>@main), @id:<worktree_id>, and @branch:<branch>."
+
+    static let manageWorktreeSectionAnchor = "- `target_worktree_id`: Durable merge target ID alternative to `target`."
+    package static let manageWorktreeSection = """
+
+
+    **Default repository** (app-backed `list`, `show`, `create`, `bind`, `select`, `unbind`):
+    - Without a repository-identifying selector, use the session's sole applicable worktree binding; with no bindings, use declared PRIMARY (the first declared workspace root, with no fallback to another root). Multiple bindings require an explicit repository or identifying worktree selector. The routed caller's session supplies this default, not a `session_id` target.
+    - `repo_root`/`repo_key` and identifying worktree selectors (`worktree_id`, `@id:<worktree_id>`, `@branch:<name>`, or a worktree name, branch, or path) choose their repository directly. Bare `@main`, `@current`, and `@wt` are relative to the default repository and do not choose one.
+    - Merge ops use the session's bound source worktree rather than this default, and `unbind` with `all=true` removes bindings by identity without choosing one.
+    - Direct headless backend: uses its first Git root; the app-backed default does not apply.
+    """
+    package static let manageWorktreeRepoRootProperty =
+        "Optional loaded root path/name or repo/worktree specifier. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector."
+
+    // `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
+    // inheritance copies the source session's complete binding set. The agent control provider reuses these.
+    static let agentRunObsoleteWorktreeArgs =
+        "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree."
+    package static let agentRunWorktreeArgs =
+        "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. App-backed starts bind only the declared PRIMARY workspace root: `worktree_repo_root` defaults to it and a secondary root is refused, selectors resolve only in PRIMARY's repository, and the `git`/`manage_worktree` default repository does not apply. Inheritance copies the source session's complete binding set, secondary roots included. Direct headless backend: binds existing worktrees only (no `worktree_create`), and `worktree_repo_root` may name any declared root."
+    package static let agentRunWorktreeRepoRootProperty =
+        "[start] Repo/logical root selector for worktree resolution or creation. App-backed starts accept only the declared PRIMARY workspace root, which is the default; a secondary root is refused. The direct headless backend may name any declared root for an existing worktree."
+    package static let agentRunInheritWorktreeProperty =
+        "[start] When started from an Agent Mode run, inherit the source session's complete worktree binding set, secondary roots included, before provider startup. Default true. Set false to keep parent session threading but skip the copy; bindings the target already has are kept. Explicit worktree/worktree_id/worktree_create args take precedence, suppress parent inheritance, and bind only the requested worktree."
 }

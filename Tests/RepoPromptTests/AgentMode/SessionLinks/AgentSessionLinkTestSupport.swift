@@ -127,7 +127,7 @@ extension CodexSessionControllerTurnDispatchTestDefaults {
 
     func startUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         model _: String?,
         reasoningEffort _: String?,
         serviceTier _: String?
@@ -137,7 +137,7 @@ extension CodexSessionControllerTurnDispatchTestDefaults {
 
     func steerUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
@@ -363,7 +363,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
 
     func startUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         model _: String?,
         reasoningEffort _: String?,
         serviceTier _: String?
@@ -374,7 +374,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
 
     func steerUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         recorder.record("codex:send")

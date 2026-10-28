@@ -178,7 +178,10 @@ if workspace_core is None:
 else:
     if workspace_core.get("type") != "regular": errors.append("RepoPromptWorkspaceCore must remain an internal regular target")
     if workspace_core.get("path") != "Sources/RepoPromptWorkspaceCore": errors.append("RepoPromptWorkspaceCore target path drifted")
-    if workspace_core.get("dependencies", []): errors.append("RepoPromptWorkspaceCore must not declare target or package dependencies")
+    core_dependencies = workspace_core.get("dependencies", [])
+    core_products = {(dependency["product"][0], dependency["product"][1]) for dependency in core_dependencies if "product" in dependency}
+    if len(core_dependencies) != 1 or core_products != {("SystemPackage", "swift-system")}:
+        errors.append("RepoPromptWorkspaceCore must depend only on the existing Swift System native path package")
     if workspace_core.get("settings", []): errors.append("RepoPromptWorkspaceCore must not declare compiler settings")
 
 workspace_core_tests = targets.get("RepoPromptWorkspaceCoreTests")
@@ -387,7 +390,7 @@ for dir in "${retired_tree_sitter_grammar_dirs[@]}"; do
   fi
 done
 
-# RepoPromptWorkspaceCore is a Foundation-only path-policy boundary.
+# RepoPromptWorkspaceCore imports Foundation and the existing Swift System native path API only.
 workspace_core_source_dir="Sources/RepoPromptWorkspaceCore"
 if [[ -d "$workspace_core_source_dir" ]]; then
   unexpected_workspace_core_files="$(find "$workspace_core_source_dir" -type f ! -name '*.swift' -print)"
@@ -404,8 +407,8 @@ if [[ -d "$workspace_core_source_dir" ]]; then
   if ! workspace_core_imports="$("${workspace_core_compiler[@]}" -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
     fail "Swift compiler could not inspect RepoPromptWorkspaceCore imports"
     printf '%s\n' "$workspace_core_imports" >&2
-  elif [[ "$workspace_core_imports" != "Foundation" ]]; then
-    fail "RepoPromptWorkspaceCore compiler import allowlist is Foundation only"
+  elif [[ "$workspace_core_imports" != $'Foundation\nSystemPackage' ]]; then
+    fail "RepoPromptWorkspaceCore compiler import allowlist is Foundation and SystemPackage only"
     printf '%s\n' "$workspace_core_imports" >&2
   fi
 fi
@@ -597,12 +600,13 @@ else
     fail "M2 workspace presentation bridge declaration missing"
   fi
   # Scope each readiness check to its owner: another guard elsewhere cannot cover its removal.
+  # Drain each scoped body: grep -q can SIGPIPE awk under pipefail.
   if ! awk '/^    private func projectInitial\(/ { scoped=1 } /^    private func consume\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
-    | grep -q 'if initial.isBootstrapped, initial.workspaces.isEmpty,'; then
+    | grep 'if initial.isBootstrapped, initial.workspaces.isEmpty,' > /dev/null; then
     fail "M2 initial Default creation must be gated by authority bootstrap readiness"
   fi
   if ! awk '/^    private func project\(/ { scoped=1 } /^    private func commitAccepted\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
-    | grep -q 'guard snapshot.isBootstrapped else'; then
+    | grep 'guard snapshot.isBootstrapped else' > /dev/null; then
     fail "M2 catalog projection must reject unbootstrapped authority snapshots"
   fi
 fi
@@ -801,16 +805,20 @@ print_matches \
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
   "docs/architecture/actionable-macos-notifications.md"
+  "docs/architecture/agent-orchestration-guidance.md"
   "docs/architecture/agent-session-oversight-auto-wake.md"
   "docs/architecture/apple-identity-migration.md"
   "docs/architecture/ci-reliability-2026-10-23.md"
   "docs/architecture/ci-test-gates.md"
   "docs/architecture/codex-app-server-schema-gate.md"
+  "docs/architecture/codex-user-mcp-import.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
+  "docs/architecture/keyboard-shortcuts.md"
   "docs/architecture/mcp-lifecycle-diagnostics.md"
   "docs/architecture/model-routing.md"
   "docs/architecture/modules.md"
+  "docs/architecture/oracle-attachments.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/routing-profile-publication.md"

@@ -168,7 +168,7 @@ package struct ApplyEditsEngine {
                 editsRequested: effectiveEdits.count,
                 editsApplied: literal.outcomes.count,
                 status: .success,
-                outcomes: verbose ? literal.outcomes : nil,
+                outcomes: verbose || originalText.utf8.elementsEqual(literal.text.utf8) ? literal.outcomes : nil,
                 path: path,
                 verbose: verbose,
                 options: options
@@ -438,6 +438,25 @@ package struct ApplyEditsEngine {
         verbose: Bool,
         options: ApplyEditsExecutionOptions
     ) -> ApplyEditsResult {
+        // Matching edits is not proof of a mutation: a batch can cancel itself out.
+        // Compare bytes, not String equality (which treats Unicode normalization forms as equal).
+        if editsApplied > 0, originalText.utf8.elementsEqual(updatedText.utf8) {
+            return ApplyEditsResult(
+                updatedText: originalText,
+                diffChunks: [],
+                unifiedDiff: nil,
+                toolCardUnifiedDiff: nil,
+                stats: nil,
+                note: "Matched \(editsApplied) of \(editsRequested) edits, but the request produced no net change; no file was written.",
+                fileCreated: false,
+                fileOverwritten: false,
+                editsRequested: editsRequested,
+                editsApplied: 0,
+                status: .noChange,
+                outcomes: outcomes
+            )
+        }
+
         let filteredChunks = UnifiedDiffGenerator.removeWhitespaceOnlyChanges(from: diffChunks)
         let stats: ApplyEditsStats?
         if filteredChunks.isEmpty {

@@ -796,7 +796,7 @@ final class AgentSessionLinkCompactTransactionTests: XCTestCase {
         fixture.session.codexFallbackQueue = [AgentTabSession.CodexFallbackQueueEntry(
             id: UUID(),
             providerText: "queued follow-up",
-            images: [],
+            attachments: [],
             taggedFileAttachments: [],
             model: nil,
             reasoningEffort: nil,
@@ -1184,7 +1184,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         let workflow = AgentWorkflowDefinition(
             customID: UUID(), displayName: "Keep workflow", template: "keep"
         )
-        let attachment = AgentImageAttachment(
+        let attachment = AgentFileAttachment(
             source: .localFile(path: "/tmp/self-compact-keep.png"),
             title: "self-compact-keep.png"
         )
@@ -1193,7 +1193,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         session.lastUserMessageAt = Date(timeIntervalSince1970: 9)
         session.draftText = "unsent draft"
         session.selectedWorkflow = workflow
-        session.pendingImageAttachments = [attachment]
+        session.pendingFileAttachments = [attachment]
         let commandIntent = try intent(for: session)
         let binding = try XCTUnwrap(session.persistentSessionBindingIdentity)
         let command = AgentProviderControlCommand.compact(
@@ -1222,7 +1222,7 @@ final class AgentSessionLinkCompactClaudeDispatchTests: XCTestCase {
         XCTAssertEqual(session.lastUserMessageAt, Date(timeIntervalSince1970: 9))
         XCTAssertEqual(session.draftText, "unsent draft")
         XCTAssertEqual(session.selectedWorkflow, workflow)
-        XCTAssertEqual(session.pendingImageAttachments, [attachment])
+        XCTAssertEqual(session.pendingFileAttachments, [attachment])
     }
 
     func testDedicatedClaudeNoteRefusesLateLostWriterAndReleasesTheHold() async throws {

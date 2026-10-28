@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
 struct AgentComposerDraftRestorationOperation: Equatable {
@@ -175,6 +176,17 @@ struct AgentComposerSubmitAttempt: Equatable {
     var capturedSubmissionToken: UUID {
         target.expectedSubmissionToken
     }
+}
+
+/// A locally admitted message waiting for routing/session preparation, not yet provider-dispatched.
+/// Kept out of chatItems so it cannot change fresh-task routing eligibility or be persisted as sent.
+struct AgentComposerPendingSubmission: Equatable, Identifiable {
+    let id: UUID
+    let sourceTabID: UUID
+    var destinationTabID: UUID
+    let text: String
+    let repromptDraft: AgentRepromptUIStore.SubmittedDraft
+    let originalDraft: String?
 }
 
 struct AgentComposerSubmissionLatch {
@@ -366,7 +378,7 @@ struct AgentComposerProps: Equatable {
         currentTabID: nil,
         submitTarget: nil,
         attachments: AgentAttachmentStripSnapshot(
-            imageAttachments: [],
+            attachments: [],
             taggedFileAttachments: []
         ),
         runState: .idle,

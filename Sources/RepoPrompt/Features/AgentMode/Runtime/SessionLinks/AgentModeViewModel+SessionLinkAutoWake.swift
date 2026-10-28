@@ -67,6 +67,8 @@ struct AgentSessionLinkAutoWakeAttempt {
     }
 
     /// Captured producer identity, independent of whether a supplement was owed.
+    /// Nonsemantic shared lifetime, never claim/cache identity. Provider locals retain it across awaits.
+    var quietMarkerProducerLifetime: AgentQuietMarkerProducerLifetime?
     var periodicProducerDispatchID: AgentSessionLinkPromptDispatchID?
     var periodicStartReturned = false
     var periodicComposerAttemptID: UUID?
@@ -270,7 +272,7 @@ extension AgentModeViewModel {
             // Once content is acknowledged or removed, an old failure must not suppress a later
             // independent edge with the same shape. A dispatching attempt retains its identity until
             // its own physical outcome settles; `cancel` deliberately refuses this queue-side race.
-            session.oversight.suppressedWakeFingerprint = nil
+            session.oversight.clearWakeSuppression()
             if session.oversight.pendingAutoWake?.phase != .cancelledBeforeDispatch {
                 cancelAgentSessionLinkAutoWake(for: endpoint, reason: .naturalDeliveryWon)
             }
@@ -491,7 +493,7 @@ extension AgentModeViewModel {
               attempt.observerEndpoint == endpoint
         else { return }
         if let fingerprint = attempt.wakeFingerprint {
-            session.oversight.suppressedWakeFingerprint = fingerprint
+            session.oversight.suppressWake(fingerprint, producerWakeID: attempt.wakeID)
         }
         cancelAgentSessionLinkAutoWake(for: endpoint, reason: .userStop)
     }
@@ -502,7 +504,7 @@ extension AgentModeViewModel {
     /// selected, unsnoozed routine basis or exact purposeful-attention occurrence — so this can retry
     /// a known failure but cannot manufacture a wake out of a queue that has nothing new in it.
     func agentSessionLinkClearAutoWakeSuppression(for endpoint: DomainAgentSessionLinkEndpointIdentity) {
-        sessions[endpoint.tabID]?.oversight.suppressedWakeFingerprint = nil
+        sessions[endpoint.tabID]?.oversight.clearWakeSuppression()
     }
 
     // MARK: Dispatch
@@ -760,7 +762,10 @@ extension AgentModeViewModel {
         dispatchID: AgentSessionLinkPromptDispatchID
     ) -> Bool {
         let effectiveID = agentSessionLinkEffectiveDispatchID(for: session, dispatchID: dispatchID)
-        guard effectiveID.isAutoWakeFamily else { return true }
+        guard effectiveID.isAutoWakeFamily else {
+            session.noteAcceptedTaskInput() // Prior ordinary physical dispatch cannot become routine.
+            return true
+        }
         guard let wakeID = effectiveID.autoWakeID else { return false }
         guard var attempt = session.oversight.pendingAutoWake,
               attempt.wakeID == wakeID
@@ -777,6 +782,7 @@ extension AgentModeViewModel {
                 session.oversight.pendingAutoWake = attempt
                 session.noteMonitorObservationInputsChanged()
             }
+            session.noteAcceptedTaskInput() // Periodic turns never gain routine origin.
             return true
         }
         if attempt.phase == .cancelledBeforeDispatch {
@@ -836,6 +842,11 @@ extension AgentModeViewModel {
                 return false
             }
             guard let fingerprint = attempt.wakeFingerprint else { return false }
+            if let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner) {
+                session.quietLedger.recordPhysicalDispatch(
+                    owner: owner, wakeID: wakeID, routineQuietCheckIn: claim.routineQuietCheckIn, alreadyAcquired: false
+                )
+            }
             attempt.phase = .dispatching
             attempt.attemptedFingerprint = AgentSessionLinkPassiveStatusNotices
                 .WakeEligibilityFingerprint(
@@ -866,6 +877,10 @@ extension AgentModeViewModel {
                 attempt.observerEndpoint,
                 attempt.attemptedFingerprint,
                 "dispatching"
+            )
+        } else if let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner) {
+            session.quietLedger.recordPhysicalDispatch(
+                owner: owner, wakeID: wakeID, routineQuietCheckIn: false, alreadyAcquired: true
             )
         }
         return true
@@ -958,7 +973,7 @@ extension AgentModeViewModel {
                 $0.reference == delivered.reference
                     && $0.toStatus == delivered.toStatus
             }),
-                currentAdmission.routineLaneAdmits(entry.reference)
+                currentAdmission.routineLaneAdmits(entry.reference), attempt.isManual || entry.isRoutineWakeEligible
             else {
                 return false
             }
@@ -1155,7 +1170,7 @@ extension AgentModeViewModel {
         // owed, and there is no session state an ambiguous outcome could truthfully write.
         // A manual retry bypasses automatic suppression without replacing that policy state.
         if !attempt.isPeriodic, !attempt.isManual {
-            session.oversight.suppressedWakeFingerprint = attempt.attemptedFingerprint
+            session.oversight.suppressWake(attempt.attemptedFingerprint, producerWakeID: attempt.wakeID)
         }
         session.noteMonitorObservationInputsChanged()
         requestUIRefresh(tabID: session.tabID)
@@ -1224,7 +1239,7 @@ extension AgentModeViewModel {
               let session = sessions[endpoint.tabID],
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.permitsBoundOperationAndSave,
-              !session.items.contains(where: { $0.id == wakeID })
+              !session.liveItemIDs.contains(wakeID)
         else {
             return
         }
@@ -1241,19 +1256,21 @@ extension AgentModeViewModel {
         // Acceptance's receipt is applied immediately after this callback and republishes whatever
         // the immutable claim did not consume, so replaying before that receipt would duplicate the
         // attempted batch. The receipt publication owns this one settlement path.
-        session.oversight.autoWakeReevaluationOwed = false
-        session.oversight.suppressedWakeFingerprint = nil
+        if session.oversight.pendingAutoWake == nil { session.oversight.autoWakeReevaluationOwed = false }
+        session.oversight.clearWakeSuppression(ifProducedBy: wakeID)
         agentSessionLinkClearWaitingOnAfterAcceptedTurn(session)
         // Attribution comes from the claim — the immutable batch the provider actually accepted — and
         // never from live links, live selection, or current snooze state. Snoozed and unselected
         // hitchhikers therefore appear because they were *rendered*, and a rename or unlink after
         // construction cannot change what the row says.
-        session.appendItem(AgentChatItem.laneUpdateAutoWake(
+        let marker = AgentChatItem.laneUpdateAutoWake(
             wakeID: wakeID,
             acceptedAt: acceptedAt,
             sequenceIndex: session.nextSequenceIndex,
             displayAttribution: claim.passive?.displayAttribution
-        ))
+        )
+        guard marker.id == wakeID, session.quietLedger.registerHostMarker(marker) else { return }
+        session.appendItem(marker)
         session.isDirty = true
         requestUIRefresh(tabID: endpoint.tabID)
         scheduleSave(for: endpoint.tabID)
@@ -1847,7 +1864,7 @@ extension AgentModeViewModel {
     /// drift. A pending approval, question, input request, permission prompt, or review is never a
     /// route: answering one is a different capability than delivering an update, and lane data is
     /// never an interaction response.
-    private func agentSessionLinkAutoWakeRoute(
+    func agentSessionLinkAutoWakeRoute(
         _ session: TabSession,
         refusalPhase: AgentSessionLinkAutoWakeAttempt.Phase? = nil
     ) -> AutoWakeRoute? {
@@ -2214,7 +2231,7 @@ extension AgentModeViewModel {
         return AgentSessionLinkAutoWakeAdmission(
             routineLanesBeforeInterval: routineLanes,
             hasConcreteEntryBeforeInterval: snapshot.entries.contains {
-                routineLanes[$0.reference] != nil
+                routineLanes[$0.reference] != nil && (isManual || $0.isRoutineWakeEligible)
             },
             overflowAloneMayWakeBeforeInterval: agentSessionLinkOverflowAloneMayWake(
                 snapshot,

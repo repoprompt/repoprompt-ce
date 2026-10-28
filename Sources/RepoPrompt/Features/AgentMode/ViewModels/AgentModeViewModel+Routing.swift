@@ -149,9 +149,11 @@ extension AgentModeViewModel {
         guard let runtime = modelRouterRuntime,
               let owned = freshTaskRoutingByTabID[tabID]
         else { return }
-        await runtime.coordinator.cancel(requestID: owned.cancellationRequestID ?? owned.requestID)
+        // Withdraw ownership before backend cancellation suspends, so a cancelled route cannot
+        // dispatch or block a fresh local send while the coordinator settles.
         owned.task.cancel()
         clearFreshTaskRoutingOwnership(owned)
+        await runtime.coordinator.cancel(requestID: owned.cancellationRequestID ?? owned.requestID)
     }
 
     func isGlobalModelRouterControllingFreshTask(_ session: TabSession) -> Bool {
@@ -169,6 +171,9 @@ extension AgentModeViewModel {
         repromptedText: String? = nil,
         precomputedRouting: RepromptSpeculation? = nil
     ) async -> UserTurnSubmissionResult {
+        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
         let configuration = modelRouterSettingsStore.modelRouterConfiguration()
         guard configuration.enabled,
               freshTaskRoutingEligibility(session: session, text: text)
@@ -322,6 +327,9 @@ extension AgentModeViewModel {
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
+        guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
         guard modelRouterSettingsStore.autoEffortEnabled() else {
             return submitUserTurn(
                 text: text,
@@ -570,6 +578,9 @@ extension AgentModeViewModel {
         }
     }
 
+    /// Model-stage picks below this service-reported confidence fall back locally.
+    static let minimumModelRouteConfidence = 0.4
+
     func routeModelThenEffort(
         requestID: UUID,
         text: String,
@@ -594,7 +605,8 @@ extension AgentModeViewModel {
               let builtModels = try? builder.build(
                   snapshot: snapshot,
                   roleDefaults: capturedRoleDefaults ?? agentModelRoleDefaultReferences(),
-                  maximumChoices: registration.capabilities.finiteChoice.maximumChoices
+                  maximumChoices: registration.capabilities.finiteChoice.maximumChoices,
+                  usagePeerClasses: scope == .primarySession ? AgentTaskRoutingCandidateBuilder.primarySessionUsagePeerClasses : nil
               ), !builtModels.isEmpty
         else {
             return StagedTaskRoutingResult(
@@ -641,6 +653,14 @@ extension AgentModeViewModel {
             guard case let .selected(modelKey, evidence) = modelOutcome,
                   let match = models.only(where: { $0.opaqueKey == modelKey })
             else { return StagedTaskRoutingResult(candidates: models, outcome: modelOutcome, judgmentRequested: true) }
+            // A low-confidence advisory pick is not trusted; keep the local selection instead.
+            if let confidence = evidence?.confidence, confidence < Self.minimumModelRouteConfidence {
+                return StagedTaskRoutingResult(
+                    candidates: models,
+                    outcome: .abstained(reasonCode: "low_confidence", evidence: evidence),
+                    judgmentRequested: true
+                )
+            }
             selectedModel = match
             unbalancedModel = match
             modelEvidence = evidence
@@ -770,7 +790,7 @@ extension AgentModeViewModel {
             && session.activeRunAttemptID == nil
             && session.items.isEmpty
             && session.transcript.turns.isEmpty
-            && session.pendingImageAttachments.isEmpty
+            && session.pendingFileAttachments.isEmpty
             && session.pendingTaggedFileAttachments.isEmpty
     }
 

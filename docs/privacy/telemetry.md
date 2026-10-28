@@ -85,7 +85,8 @@ prefers connected native Claude Code / Codex subscriptions, matching the current
 when possible, then the other subscription, then configured fast API tiers (Sonnet 5.5,
 GPT-6.1 Sol Low, Gemini 3 Flash), then none. No arbitrary catalog-first or primary Oracle fallback
 is used. Other configured models require an explicit choice. The UI names the concrete model or
-shows Choose a model when unavailable. Losing an already resolved default does not silently switch
+shows a chooser with an actionable unavailable reason when no supported model is connected. The pill refreshes
+when connected models load; a first-use default does not require manual selection. Losing a default after use does not silently switch
 billing routes. Explicit models never fall back. A call freezes its billing route; failure/retry cannot switch it. The provider's retention
 and billing terms apply; do not send secrets you do not want that recipient to receive.
 
@@ -105,7 +106,8 @@ git review packaging or selection mutations**. Composer attachments/tagged files
 locally but their payloads are not sent to the rewriter. Transient Before sending questions are not
 provider-history rows. Substantive answers may cause one refinement from original text plus answers;
 skipping questions does not refine. Versioned disclosure receipts cover the recipient and recent-
-chat exposure.
+chat exposure. First enable shows a concise recipient, payload, retention/billing and automation summary;
+operating instructions are expandable rather than a blocking wall of text.
 
 The brief streams into the existing composer, read-only during preparation. **Review before
 sending** is the default: successful preparation unlocks editing and Return dispatches the current
@@ -116,7 +118,7 @@ Review, with a warning that the provider may interpret it as a command; only a d
 Send can dispatch it. Cmd+Return always prepares for Review (including a
 one-shot when the pill is off), using current edited text or the first original when unchanged.
 The header retains that first original inline. Esc cancels streaming or reverts a completed draft;
-the edited rewrite stays available through undo/recovery. After five seconds, Send original is an explicit second Send action through
+the edited rewrite stays available through undo/recovery. Send original is available immediately as an explicit second Send action through
 fresh-claim admission. Cancel/Esc restores the original; Undo preserves the edited brief in the local
 recovery banner. Invalidation (tab/target/settings changes or Stop) also restores the original when
 the composer is still operation-owned. New edits stay intact with explicit Restore original / Keep
@@ -124,7 +126,19 @@ rewrite choices, rather than silently starting another rewrite from generated ou
 is recoverable but cannot be sent as a successful preparation.
 Draft text follows ordinary composer draft persistence; clarification/recovery state stays in memory.
 
-Enabled Auto Effort can judge the rewriter's effort using its existing masked decision service.
+Re-prompt uses the selected model's low-effort variant when available, without a separate Auto Effort
+judgment call. The first Return prepares a rewrite; the next Return in that composer explicitly
+sends the current text, including during preparation, with no timing deadline. Late rewrite output
+is cancelled and fenced. Clarifications appear once in a compact, height-bounded scrollable panel
+above the composer (at most one question and three options). Finishing or dismissing clarification
+requests native composer focus restoration only in the key window and only when focus has fallen
+back to a container or a removed control; a live unrelated text field keeps focus. Cmd+Shift+O sends
+the original during preparation. Optional clarification can be skipped with Cmd+Shift+K; Cmd+Option+1–3
+chooses an offered answer. At local send admission, the editor clears immediately and a transient **Sending**
+preview shows the message while routing/session preparation finishes; it is not persisted as a sent transcript turn.
+A blocked or cancelled preparation restores the captured draft above newer typing, retaining its original/rewrite
+recovery. Pending sends lock attachment/workflow controls and offer Cancel/Esc. Successful submission replaces
+the pending preview with the ordinary transcript turn and retires only its captured recovery state.
 Router/implementing-turn Auto Effort speculation starts only after a complete brief, never partial
 tokens, and is discarded on edits or stale policy. These opted-in services may have received the
 complete draft even if it is later undone. Composer edits are never sent back to the rewrite model.

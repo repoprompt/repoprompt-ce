@@ -137,7 +137,7 @@ final class CursorCLIProvider: AIProvider {
         return AgentMessage(
             systemPrompt: systemPrompt.isEmpty ? systemPrompt : systemPrompt + Self.noToolsSuffix,
             userMessage: buildPrompt(from: aiMessage),
-            transientImages: aiMessage.transientImages,
+            attachments: aiMessage.attachments,
             resumeSessionID: nil
         )
     }

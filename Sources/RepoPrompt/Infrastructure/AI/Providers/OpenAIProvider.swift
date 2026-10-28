@@ -92,6 +92,7 @@ class OpenAIProvider: AIProvider {
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
              .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax,
              .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
              .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
@@ -134,6 +135,7 @@ class OpenAIProvider: AIProvider {
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
              .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax,
              .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
              .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
@@ -147,9 +149,9 @@ class OpenAIProvider: AIProvider {
 
     // MARK: Helper – build the `input` array for the Responses API
 
-    private func createResponseInput(for aiMessage: AIMessage) -> SwiftOpenAI.InputType {
+    private func createResponseInput(for aiMessage: AIMessage) throws -> SwiftOpenAI.InputType {
         // Forward to the centralised builder defined on AIMessage
-        aiMessage.openAIResponsesInput()
+        try aiMessage.openAIResponsesInput()
     }
 
     // MARK: - Helper to decide whether to route via Responses-API
@@ -163,10 +165,10 @@ class OpenAIProvider: AIProvider {
         model: AIModel,
         maxTokens: Int?,
         stream: Bool
-    ) -> ModelResponseParameter {
+    ) throws -> ModelResponseParameter {
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
 
-        var parameters = ModelResponseParameter(
+        var parameters = try ModelResponseParameter(
             input: createResponseInput(for: aiMessage),
             model: baseModel.toProviderModel() as! SwiftOpenAI.Model
         )
@@ -292,7 +294,7 @@ class OpenAIProvider: AIProvider {
         print("Effective model: \(effectiveModel)")
 
         let isO1PreviewOrMini = (effectiveModel == .o1Mini || effectiveModel == .o1Preview)
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
             model: effectiveModel.toProviderModel() as! SwiftOpenAI.Model
@@ -386,7 +388,7 @@ class OpenAIProvider: AIProvider {
         maxTokens: Int? // Keep maxTokens parameter
     ) async throws -> AICompletionResult {
         let service = try getService()
-        let parameters = buildForegroundResponseParameters(
+        let parameters = try buildForegroundResponseParameters(
             aiMessage,
             model: model,
             maxTokens: maxTokens,
@@ -452,7 +454,7 @@ class OpenAIProvider: AIProvider {
         maxTokens: Int?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let service = try getService()
-        let parameters = buildForegroundResponseParameters(
+        let parameters = try buildForegroundResponseParameters(
             aiMessage,
             model: model,
             maxTokens: maxTokens,
@@ -479,7 +481,7 @@ class OpenAIProvider: AIProvider {
         }
 
         let isO1PreviewOrMini = (model == .o1Mini || model == .o1Preview)
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
             model: model.toProviderModel() as! SwiftOpenAI.Model
@@ -664,9 +666,9 @@ class OpenAIProvider: AIProvider {
         _ aiMessage: AIMessage,
         model: AIModel,
         maxTokens: Int?
-    ) -> ModelResponseParameter {
+    ) throws -> ModelResponseParameter {
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
-        var parameters = ModelResponseParameter(
+        var parameters = try ModelResponseParameter(
             input: aiMessage.openAIResponsesInput(),
             model: baseModel.toProviderModel() as! SwiftOpenAI.Model
         )
@@ -756,6 +758,8 @@ class OpenAIProvider: AIProvider {
         case .gpt54Low: return (.gpt54, "low")
         case .gpt54: return (.gpt54, "medium")
         // ── GPT-6 family (no none/minimal on 6.1 Sol or Astra) ──
+        case .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax:
+            return (.gpt61Terra, model.defaultReasoningEffort)
         case .gpt61SolMax: return (.gpt61Sol, "max")
         case .gpt61SolXHigh: return (.gpt61Sol, "xhigh")
         case .gpt61SolHigh: return (.gpt61Sol, "high")
@@ -794,7 +798,7 @@ extension OpenAIProvider: ResponsesJobProvider {
         model: AIModel,
         maxTokens: Int?
     ) async throws -> ResponseModel {
-        let parameters = buildBackgroundResponseParameters(message, model: model, maxTokens: maxTokens)
+        let parameters = try buildBackgroundResponseParameters(message, model: model, maxTokens: maxTokens)
         let response = try await getService().responseCreate(parameters)
 
         if response.status == .failed {

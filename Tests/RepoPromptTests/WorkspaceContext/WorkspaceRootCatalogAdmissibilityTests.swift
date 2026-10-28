@@ -183,7 +183,20 @@ final class WorkspaceContextRootSnapshotTests: XCTestCase {
             codemapGraphIndexBuildLaunchPolicyForTesting: .disabled
         )
         weak var weakStore = store
-        _ = try await store?.loadRoot(path: url.path)
+        do {
+            let (cleanupTasks, continuation) = AsyncStream<Task<Void, Never>>.makeStream(
+                bufferingPolicy: .bufferingNewest(1)
+            )
+            defer { continuation.finish() }
+            await store?.setRootLoadCleanupTaskDidLaunchHandlerForTesting { continuation.yield($0) }
+            _ = try await store?.loadRoot(path: url.path)
+            var iterator = cleanupTasks.makeAsyncIterator()
+            let cleanupValue = await iterator.next()
+            let cleanupTask = try XCTUnwrap(cleanupValue)
+            // loadRoot returns independently of its cleanup's temporary strong actor reference.
+            await cleanupTask.value
+            await store?.setRootLoadCleanupTaskDidLaunchHandlerForTesting(nil)
+        }
         let snapshotValue = await store?.rootContextSnapshot()
         let snapshot = try XCTUnwrap(snapshotValue)
         XCTAssertTrue(snapshot.lifetimeIsCurrent())

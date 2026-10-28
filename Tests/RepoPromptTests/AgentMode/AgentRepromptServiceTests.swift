@@ -15,7 +15,7 @@ final class AgentRepromptServiceTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("do NOT carry forward the prior"))
         XCTAssertTrue(message.systemPrompt.contains("My guidance"))
         XCTAssertEqual(message.conversationMessages.count, 1)
-        XCTAssertTrue(message.transientImages.isEmpty && message.fileBlocks.isEmpty && message.metaPrompts.isEmpty && message.fileTree.isEmpty)
+        XCTAssertTrue(message.attachments.isEmpty && message.fileBlocks.isEmpty && message.metaPrompts.isEmpty && message.fileTree.isEmpty)
         XCTAssertNil(message.gitDiff)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(message.conversationMessages[0].content.utf8)) as? [String: Any])
         XCTAssertEqual(object["originalText"] as? String, request.originalText)
@@ -44,6 +44,21 @@ final class AgentRepromptServiceTests: XCTestCase {
         var plain = AgentRepromptStreamParser()
         try plain.append("Hello\n")
         XCTAssertEqual(try plain.finish(refinement: false).body, "Hello")
+    }
+
+    func testClarificationLimitsMatchTheSingleQuestionThreeShortcutContract() throws {
+        let trailers = [
+            #"[{"id":"a","question":"First?","options":[]},{"id":"b","question":"Second?","options":[]}]"#,
+            #"[{"id":"a","question":"Choose?","options":[{"label":"1"},{"label":"2"},{"label":"3"},{"label":"4"}]}]"#
+        ]
+        for trailer in trailers {
+            var parser = AgentRepromptStreamParser()
+            try parser.append(Self.valid + AgentRepromptStreamParser.delimiter + trailer + AgentRepromptStreamParser.endDelimiter)
+            XCTAssertEqual(parser.body, Self.valid)
+            XCTAssertThrowsError(try parser.finish(refinement: false)) { error in
+                XCTAssertEqual(error as? AgentRepromptError, .invalidResponse)
+            }
+        }
     }
 
     func testIncompleteOrInvalidQuestionsKeepRecoverableBodyButCannotComplete() throws {

@@ -40,6 +40,12 @@ extension AgentSessionLinkEndpointHost {
         nil
     }
 
+    func agentSessionLinkRunFacts(
+        for _: AgentSessionLinkEndpointCandidate, capturedStatus _: DomainAgentSessionLinkStatus
+    ) -> AgentRunQuietFacts? {
+        nil
+    }
+
     func agentSessionLinkBootstrapState(for _: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionOverseerBootstrapState? {
         nil
     }
@@ -251,10 +257,13 @@ protocol AgentSessionLinkEndpointHost: AnyObject {
         for endpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> String?
 
-    /// Sanitized observation snapshot for one exact live candidate.
-    ///
-    /// This is the agent-facing path: it materializes and redacts the latest assistant preview, so it
-    /// belongs to target publication and `poll`, not to UI status rendering.
+    /// Pure exact-binding lookup paired synchronously with the snapshot's own captured status.
+    func agentSessionLinkRunFacts(
+        for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus
+    ) -> AgentRunQuietFacts?
+
+    /// Sanitized agent-facing snapshot. Preview redaction belongs to target publication and poll,
+    /// not to UI status rendering; run facts are sampled separately without repeating this read.
     func agentSessionLinkObservationSnapshot(
         for candidate: AgentSessionLinkEndpointCandidate
     ) -> DomainAgentSessionObservationSnapshot
@@ -985,7 +994,39 @@ final class AgentSessionLinkRuntimeBridge {
         }
     }
 
+    private struct TargetPublicationFrame {
+        let endpoint: DomainAgentSessionLinkEndpointIdentity
+        let sourceSequence: UInt64
+        let snapshot: DomainAgentSessionObservationSnapshot
+        let runFacts: AgentRunQuietFacts?
+
+        var status: AgentSessionLinkPassiveStatusNotices.Status {
+            switch snapshot.status {
+            case .idle: .idle
+            case .running: .running
+            case .awaitingUser: .waiting
+            }
+        }
+
+        func matchesCanonical(_ canonical: DomainAgentSessionObservationSnapshot) -> Bool {
+            // Authority alone owns idleSince. It normalizes that field, and no other source field,
+            // at publication. Compare the complete canonical value, not a subset or a second read.
+            DomainAgentSessionObservationSnapshot(
+                sessionID: snapshot.sessionID, displayName: snapshot.displayName,
+                providerDisplayName: snapshot.providerDisplayName, status: snapshot.status,
+                board: snapshot.board, idleForSend: snapshot.idleForSend, idleSince: canonical.idleSince,
+                waitingOn: snapshot.waitingOn, pendingInteractionKind: snapshot.pendingInteractionKind,
+                latestVisibleAssistantPreview: snapshot.latestVisibleAssistantPreview,
+                visibleRowCount: snapshot.visibleRowCount, lastActivityAt: snapshot.lastActivityAt,
+                context: snapshot.context
+            ) == canonical
+        }
+    }
+
     private final class TargetPublicationChain {
+        var scheduledFrame: TargetPublicationFrame?
+        var pairedFrame: TargetPublicationFrame?
+
         let endpoint: DomainAgentSessionLinkEndpointIdentity
         var token: AgentSessionLinkObservationToken?
         var tail: Task<Void, Never>?
@@ -1451,6 +1492,20 @@ final class AgentSessionLinkRuntimeBridge {
 
     #if DEBUG
         var test_afterPresentationSnapshot: (@MainActor () async -> Void)?
+        var test_beforePassiveObservationSnapshot: (@MainActor (DomainAgentSessionLinkEndpointIdentity) async -> Void)?
+        var test_afterPassiveObservationSnapshot: (@MainActor (DomainAgentSessionLinkEndpointIdentity) async -> Void)?
+        var test_onPassiveSample: (@MainActor (AgentSessionLinkPassiveStatusNotices.Sample) -> Void)?
+
+        func test_pairedRunStatus(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentSessionLinkPassiveStatusNotices.Status? {
+            guard let chain = chains[endpoint.sessionID], chain.endpoint == endpoint else { return nil }
+            return chain.pairedFrame?.status
+        }
+
+        func test_pairedRunFacts(for endpoint: DomainAgentSessionLinkEndpointIdentity) -> AgentRunQuietFacts? {
+            guard let chain = chains[endpoint.sessionID], chain.endpoint == endpoint else { return nil }
+            return chain.pairedFrame?.runFacts
+        }
+
         var test_afterMonitorProjection: (@MainActor () async -> Void)?
         /// Fault injection for native tracking tests: hide coherent UI inputs without installing
         /// another catalog or blocking AppKit's nested run loop on an async authority turn.
@@ -1624,9 +1679,9 @@ final class AgentSessionLinkRuntimeBridge {
         // Awaited by the registry rather than spawned: the deleting caller must not proceed to
         // metadata cleanup, the next batch file, or view-model teardown while this UUID's grants are
         // still live and its saved rows still on disk.
-        AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID in
+        AgentSessionDeletionRegistry.shared.commitObserver = { [weak self] sessionID, origin, fileRemoved in
             guard let self else { return }
-            await handleCommittedSessionDeletion(sessionID)
+            await handleCommittedSessionDeletion(sessionID, origin: origin, fileRemoved: fileRemoved)
             self.host?.agentSessionLinkForgetDeletedSubagent(sessionID)
         }
         AgentSessionDeletionRegistry.shared.changeObserver = { [weak self] in
@@ -1688,6 +1743,12 @@ final class AgentSessionLinkRuntimeBridge {
                     await invalidateToolAdvertisement(for: event)
                     await requestProjectionRefresh(scope(for: event))
                 case .revoked, .targetStateChanged, .draining, .shutdown:
+                    if event.kind == .targetStateChanged, let target = event.targetSessionID {
+                        // Publication's return installs the pair. Drain its existing serial tail
+                        // BEFORE this one ordinary authority-event refresh, rather than racing the
+                        // pair and scheduling a duplicate fanout from the publishing task.
+                        await chains[target]?.tail?.value
+                    }
                     await requestProjectionRefresh(scope(for: event))
                     await invalidateToolAdvertisement(for: event)
                 }
@@ -2393,12 +2454,12 @@ final class AgentSessionLinkRuntimeBridge {
     /// of that UUID in any window may still be read through a grant. Only then is durable intent
     /// removed, and a disk failure there is recorded as a warning rather than pretending the deletion
     /// rolled back.
-    private func handleCommittedSessionDeletion(_ sessionID: UUID) async {
+    private func handleCommittedSessionDeletion(_ sessionID: UUID, origin: AgentSessionDeletionOrigin, fileRemoved: Bool?) async {
         creatorNames.remove(sessionID)
         host?.agentSessionLinkPublishCreatorNames(creatorNames.snapshot)
         // Revoke synchronously before the first suspension. The deletion registry retains its
         // commit task through this callback, so an overlapping quit cannot seal stale scope intent.
-        delegationScopes.revokeAll(involving: sessionID)
+        delegationScopes.revokeAll(involving: sessionID, origin: origin, fileRemoved: fileRemoved)
         await invalidateSession(sessionID, reason: .sessionDeleted)
         guard !isFrozenForTermination, let intentStore else { return }
         // `removeAll` snapshots every attempted current token and assertion generation in the same
@@ -4598,24 +4659,49 @@ final class AgentSessionLinkRuntimeBridge {
 
         let snapshot = host.agentSessionLinkObservationSnapshot(for: candidate)
         observeActivity(snapshot.lastActivityAt, for: endpoint)
-        // Drop no-op rebuilds (notably the replay burst every new `@Published` subscription emits) so
-        // an unchanged target never advances `change_sequence` or wakes a parked waiter.
-        guard lastPublishedSnapshotBySession[sessionID] != snapshot else { return }
+        let facts = host.agentSessionLinkRunFacts(for: candidate, capturedStatus: snapshot.status)
+        // An initial unknown pair adds no proof to an already seeded public snapshot. Preserve the
+        // upstream no-op behavior of unrelated/default-unknown hosts and temporarily unreadable tabs.
+        if chain.scheduledFrame == nil, facts == nil, lastPublishedSnapshotBySession[sessionID] == snapshot { return }
+        // Deduplicate the pair. Private settlement advancement is not public activity/readiness.
+        guard chain.scheduledFrame?.snapshot != snapshot || chain.scheduledFrame?.runFacts != facts else { return }
+        let publicChanged = lastPublishedSnapshotBySession[sessionID] != snapshot
         lastPublishedSnapshotBySession[sessionID] = snapshot
-        // The one readiness trigger a queued send has. It hangs off an *accepted* publication, so an
-        // unchanged target produces none at all and nothing ever polls for readiness.
-        if snapshot.idleForSend {
+        if publicChanged, snapshot.idleForSend {
             notePendingSendReadiness(forTargetSession: sessionID)
         }
         let sequence = allocateSourcePublicationSequence(for: sessionID)
+        let frame = TargetPublicationFrame(endpoint: endpoint, sourceSequence: sequence, snapshot: snapshot, runFacts: facts)
+        chain.scheduledFrame = frame
         let previous = chain.tail
-        chain.tail = Task { [authority] in
+        chain.tail = Task { [weak self, weak chain, weak host, authority] in
             await previous?.value
-            _ = await authority.publishTargetSnapshot(
-                endpoint: endpoint,
-                snapshot: snapshot,
-                sourcePublicationSequence: sequence
+            let result = await authority.publishTargetSnapshot(
+                endpoint: endpoint, snapshot: snapshot, sourcePublicationSequence: sequence
             )
+            guard let self, let chain, let host, self.host === host,
+                  !isFrozenForTermination, chains[sessionID] === chain,
+                  chain.endpoint == endpoint, chain.scheduledFrame?.sourceSequence == sequence
+            else { return }
+            switch result {
+            case .accepted:
+                chain.pairedFrame = frame
+                // The existing change feed owns the single public-change refresh. It awaits this
+                // tail before sampling, so it cannot observe accepted bytes without their pair.
+                return
+            case .unchanged:
+                let hasPrivateProof = frame.runFacts != nil || chain.pairedFrame?.runFacts != nil
+                chain.pairedFrame = frame
+                guard hasPrivateProof else { return }
+            default: return
+            }
+            // Only facts-only advancement lacks an authority event. Reuse the existing inbound
+            // index and coalesced refresh, with no second public-change fanout or discovery.
+            let observers = await authority.links(forTarget: sessionID).items.map(\.observerSessionID)
+            guard chains[sessionID] === chain, chain.scheduledFrame?.sourceSequence == sequence,
+                  chain.endpoint == endpoint, self.host === host,
+                  !isFrozenForTermination else { return }
+            await requestProjectionRefresh(.sessions(Set(observers)))
         }
     }
 
@@ -5038,7 +5124,26 @@ final class AgentSessionLinkRuntimeBridge {
                 // may reach a queued notice. Materializing the redacted preview is why this runs only
                 // on the authoritative pass, never on a location, Seen, settings, sidebar-menu, or
                 // observer-role repaint.
+                let capturedChain = chains[targetEndpoint.sessionID]
+                let capturedFrame = capturedChain?.pairedFrame
+                #if DEBUG
+                    await test_beforePassiveObservationSnapshot?(targetEndpoint)
+                #endif
                 let observation = await authority.observationSnapshot(forTargetEndpoint: targetEndpoint)
+                #if DEBUG
+                    await test_afterPassiveObservationSnapshot?(targetEndpoint)
+                #endif
+                let facts: AgentRunQuietFacts? = if let capturedChain, let capturedFrame, let observation,
+                                                    chains[targetEndpoint.sessionID] === capturedChain,
+                                                    capturedChain.endpoint == targetEndpoint, capturedFrame.endpoint == targetEndpoint,
+                                                    capturedChain.scheduledFrame?.sourceSequence == capturedFrame.sourceSequence,
+                                                    capturedChain.pairedFrame?.sourceSequence == capturedFrame.sourceSequence,
+                                                    capturedFrame.status == AgentSessionLinkPassiveStatusNotices.Status(presentation.status),
+                                                    capturedFrame.matchesCanonical(observation)
+                {
+                    capturedFrame.runFacts
+                } else { nil }
+
                 statusSamples.append(AgentSessionLinkPassiveStatusNotices.Sample(
                     reference: reference,
                     targetEndpoint: targetEndpoint,
@@ -5050,8 +5155,12 @@ final class AgentSessionLinkRuntimeBridge {
                     idleForSend: observation?.idleForSend ?? false,
                     idleSince: observation?.idleSince,
                     waitingOn: observation?.waitingOn,
-                    latestVisibleAssistantPreview: observation?.latestVisibleAssistantPreview
+                    latestVisibleAssistantPreview: observation?.latestVisibleAssistantPreview,
+                    runFacts: facts
                 ))
+                #if DEBUG
+                    if let sample = statusSamples.last { test_onPassiveSample?(sample) }
+                #endif
             }
             outbound.append(AgentMonitorPillProps.Outbound(
                 linkID: item.linkID,
@@ -5866,13 +5975,33 @@ final class AgentSessionLinkRuntimeBridge {
     /// Final fence for one management operation: the lease re-validated inside the authority (exact
     /// generation, both endpoints, and the `.manage` capability still on the grant), then deletion
     /// state and both live endpoints' eligibility.
-    private func managementLeaseIsStillAuthorized(_ lease: DomainAgentSessionLinkLease) async -> Bool {
-        guard !isFrozenForTermination,
-              lease.capability == .manage,
-              await authority.validate(lease: lease) == nil,
-              !isFrozenForTermination,
-              let host
-        else { return false }
+    /// Worktree mutations retain this exact lease through provider/root preparation suspensions.
+    func managementLeaseIsStillAuthorized(_ lease: DomainAgentSessionLinkLease) async -> Bool {
+        guard await authority.validate(lease: lease) == nil else { return false }
+        return managementLeaseEndpointsAreStillAuthorized(lease)
+    }
+
+    func managementCommitAuthorization(for lease: DomainAgentSessionLinkLease) async -> DomainAgentSessionLinkCommitAuthorization? {
+        guard lease.capability == .manage else { return nil }
+        return await authority.commitAuthorization(for: lease)
+    }
+
+    /// No suspension is permitted between live endpoint validation and the authority-fenced body.
+    func withManagementCommitAuthorization(
+        _ authorization: DomainAgentSessionLinkCommitAuthorization,
+        commit: @MainActor () throws -> Void
+    ) throws {
+        // Reconcile the owner before reading its live elevation/consent inputs in the fence.
+        // Endpoint eligibility can itself consult the owner, so it also precedes that read.
+        delegationScopes.reconcileGlobalAutoApprove()
+        guard managementLeaseEndpointsAreStillAuthorized(authorization.lease) else {
+            throw DomainAgentSessionLinkError.endpointInvalidated
+        }
+        try authorization.withAuthorization(commit)
+    }
+
+    private func managementLeaseEndpointsAreStillAuthorized(_ lease: DomainAgentSessionLinkLease) -> Bool {
+        guard !isFrozenForTermination, lease.capability == .manage, let host else { return false }
         guard managementEndpointsAreEligible(
             observerEndpoint: lease.observer,
             targetEndpoint: lease.target,
@@ -6170,7 +6299,9 @@ final class AgentSessionLinkRuntimeBridge {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) {
         guard var notices = passiveNoticesByObserver[observerEndpoint] else { return }
+        let previousRevision = notices.queueRevision
         notices.apply(receipt)
+        guard notices.queueRevision != previousRevision else { return }
         passiveNoticesByObserver[observerEndpoint] = notices
         // No row repaint: the dashboard renders live status, never queue contents.
         publishPassiveNotices(notices.snapshot, to: observerEndpoint)
@@ -6237,7 +6368,10 @@ final class AgentSessionLinkRuntimeBridge {
         } else {
             passiveNoticesByObserver[endpoint] = notices
         }
-        return snapshot
+        // The reducer already owns the last exact endpoint value. Compare only its bounded queue
+        // projection, not source history or a second publication cache. Equal authoritative passes
+        // must not enqueue another UI/wake publication; lifecycle/readiness has its own hooks.
+        return existing?.snapshot == snapshot ? nil : snapshot
     }
 
     private func publishPassiveNotices(
@@ -6511,7 +6645,8 @@ final class AgentSessionLinkRuntimeBridge {
     func authorizeTarget(
         operation: DomainAgentSessionTargetOperation,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
-        targetSessionID: UUID
+        targetSessionID: UUID,
+        allowLinkEstablishment: Bool = true
     ) async -> Result<AuthorizedTarget, AuthorizationFailure> {
         // Off means off: a full-access grant left from an earlier "on" never elevates or sources a link.
         delegationScopes.reconcileGlobalAutoApprove()
@@ -6535,6 +6670,7 @@ final class AgentSessionLinkRuntimeBridge {
         case let .success(value):
             lease = value
         case .failure(.noActiveLink):
+            guard allowLinkEstablishment else { return .failure(.denied) }
             // `linkRequired` is a permission gate: full access establishes the ordinary managed link.
             guard let established = await establishFullAccessLink(
                 operation: operation, observerEndpoint: observerEndpoint, targetSessionID: targetSessionID

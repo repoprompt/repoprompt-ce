@@ -146,6 +146,8 @@ extension DomainAgentRunSnapshot.FailureReason {
             "Timeout"
         case .agentError:
             "Agent Error"
+        case .resumeTimedOut:
+            "Resume Timed Out"
         case .resumeHistoryTooLarge:
             "Resume History Too Large"
         case .cancelled:

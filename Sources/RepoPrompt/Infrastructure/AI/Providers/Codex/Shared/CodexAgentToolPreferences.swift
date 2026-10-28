@@ -553,6 +553,26 @@ enum CodexAgentToolPreferences {
         defaults.set(toggles, forKey: mcpServerTogglesKey)
     }
 
+    /// A removed server may leave an old enabled toggle behind. New imports never inherit it.
+    static func disableImportedMCPServers(_ names: [String], defaults: UserDefaults = .standard, secureStore: AgentPermissionSecureStore? = nil) -> Bool {
+        let keys = names.filter { !MCPIntegrationHelper.isReservedMCPServerIdentifier($0) }.map(normalizedKey)
+        if let store = resolvedSecureStore(defaults: defaults, secureStore: secureStore) {
+            return store.updateCodexPermissions { document in
+                var toggles = document.mcpServerTogglesByNormalizedName ?? [:]
+                for key in keys {
+                    toggles[key] = false
+                }
+                document.mcpServerTogglesByNormalizedName = toggles
+            }
+        }
+        var toggles = storedMCPServerToggles(defaults: defaults)
+        for key in keys {
+            toggles[key] = false
+        }
+        defaults.set(toggles, forKey: mcpServerTogglesKey)
+        return true
+    }
+
     static func enabledMCPServerNames(
         for entries: [MCPIntegrationHelper.CodexServerEntry],
         defaults: UserDefaults = .standard,

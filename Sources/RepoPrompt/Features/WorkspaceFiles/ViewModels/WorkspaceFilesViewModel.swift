@@ -471,8 +471,29 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var rootLoadLifecycleGeneration: UInt64 = 0
     private var rootLoadGenerationByRootKey: [RootKey: UInt64] = [:]
     private var rootReplayIngressGenerationByRoot: [RootKey: UInt64] = [:]
+
+    /// Result of an identity-pinned root teardown. `superseded` means a different lifetime owns
+    /// the path; its selections, load token and state were left untouched.
+    enum RootUnloadOutcome: Equatable {
+        case unloaded, alreadyAbsent, superseded
+    }
+
+    /// One identity-pinned teardown per standardized root key. It is registered synchronously
+    /// before the teardown's first suspension, and `loadFolder` waits on it, so a same-key load
+    /// cannot observe or reuse the lifetime being unloaded before Store marks the path unloading.
+    private struct RootTeardownFlight {
+        let id: UUID
+        let expectedRootID: UUID
+        let task: Task<RootUnloadOutcome, Never>
+    }
+
+    private var rootTeardownsByRootKey: [RootKey: RootTeardownFlight] = [:]
+    /// Same-key loads that claimed a load token and have not returned. Teardown admission treats
+    /// one as a possibly unpublished successor when the expected root is already absent.
+    private var activeRootLoadCountByRootKey: [RootKey: Int] = [:]
     #if DEBUG
         private var rootLoadDidAttachRootShellHandler: (@Sendable (_ standardizedRootPath: String, _ rootID: UUID) async -> Void)?
+        private var rootTeardownWillUnloadStoreRootHandler: (@Sendable (_ standardizedRootPath: String, _ rootID: UUID) async -> Void)?
     #endif
 
     /// True while `flushPendingDeltas()` is actively replaying queued bursts.
@@ -946,6 +967,14 @@ class WorkspaceFilesViewModel: ObservableObject {
             _ handler: (@Sendable (_ standardizedRootPath: String, _ rootID: UUID) async -> Void)?
         ) {
             rootLoadDidAttachRootShellHandler = handler
+        }
+
+        /// Holds an admitted identity-pinned teardown after gate registration and its cleanup,
+        /// before the actor re-read and ordinary Store unload, so before Store's unload mark.
+        func setRootTeardownWillUnloadStoreRootHandler(
+            _ handler: (@Sendable (_ standardizedRootPath: String, _ rootID: UUID) async -> Void)?
+        ) {
+            rootTeardownWillUnloadStoreRootHandler = handler
         }
     #endif
 
@@ -1657,13 +1686,18 @@ class WorkspaceFilesViewModel: ObservableObject {
             hiddenSessionHandledGenerationByRootLifetime.removeValue(forKey: lifetimeKey)
             return true
         }
-        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
-              snapshot.root.kind == .sessionWorktree,
-              snapshot.root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
+        guard let root = await workspaceFileContextStore.roots().first(where: { $0.id == event.rootID }),
+              root.kind == .sessionWorktree,
+              root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
         else { return false }
 
         let handled = hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] ?? 0
         guard event.generation > handled else { return true }
+        guard let records = await workspaceFileContextStore.appliedIndexRecordLookup(
+            rootID: event.rootID,
+            fileIDs: event.modifiedFileIDs,
+            folderIDs: []
+        ) else { return false }
         let expected = handled &+ 1
         guard event.generation == expected, !event.requiresFullResync else {
             cancelHiddenSessionSliceRebases(for: lifetimeKey)
@@ -1671,13 +1705,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             return true
         }
 
-        let modifiedFileIDs = Set(event.modifiedFileIDs)
-        let modifiedFilesByID: [UUID: WorkspaceFileRecord] = Dictionary(uniqueKeysWithValues: snapshot.files.compactMap { file in
-            guard modifiedFileIDs.contains(file.id), file.rootID == event.rootID else { return nil }
-            return (file.id, file)
-        })
+        let modifiedFilesByID = records.filesByID
         let targetsByFileID = await hiddenSessionSliceRebaseTargets(
-            physicalRootPath: snapshot.root.standardizedFullPath,
+            physicalRootPath: root.standardizedFullPath,
             modifiedFilesByID: modifiedFilesByID
         ) ?? [:]
 
@@ -1703,7 +1733,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 rootID: event.rootID,
                 rootLifetimeID: rootLifetimeID,
                 fileID: fileID,
-                physicalRootPath: snapshot.root.standardizedFullPath,
+                physicalRootPath: root.standardizedFullPath,
                 physicalFullPath: file.standardizedFullPath,
                 relativePath: file.standardizedRelativePath,
                 sourceSnapshot: sourceSnapshot,
@@ -3050,6 +3080,18 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspaceFilesDebugLog("Loading folder root shell (async): \(url.path)")
         isLoading = true
 
+        // A same-key identity-pinned teardown owns this path until its Store unload settles.
+        // No suspension separates this wait from the shell check and the load-token claim below.
+        let lifecycleBeforeTeardownWait = rootLoadLifecycleGeneration
+        while let teardown = rootTeardownsByRootKey[rootKey] {
+            _ = await teardown.task.value
+        }
+        // A workspace unload during the wait obsoletes this load, as it would a claimed token.
+        guard rootLoadLifecycleGeneration == lifecycleBeforeTeardownWait else {
+            isLoading = false
+            throw CancellationError()
+        }
+
         let hadRootShellBeforeLoad = isFolderAlreadyLoaded(url)
         if hadRootShellBeforeLoad {
             workspaceFilesDebugLog("Root shell already loaded: \(url.path)")
@@ -3070,6 +3112,14 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
 
         let loadToken = beginRootLoadToken(forRootKey: rootKey)
+        activeRootLoadCountByRootKey[rootKey, default: 0] += 1
+        defer {
+            if let count = activeRootLoadCountByRootKey[rootKey], count > 1 {
+                activeRootLoadCountByRootKey[rootKey] = count - 1
+            } else {
+                activeRootLoadCountByRootKey.removeValue(forKey: rootKey)
+            }
+        }
         let loadTaskID = UUID()
         let loadRootPath = url.path
         currentFolderLoadingTaskID = loadTaskID
@@ -5753,18 +5803,10 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func unloadRootFolder(_ folder: FolderViewModel) async {
         let signpost = WorkspaceExitPerf.begin("unloadRootFolder")
-        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: folder.id)
         defer { WorkspaceExitPerf.end("unloadRootFolder", signpost) }
         let stdRoot = folder.standardizedFullPath
-        unregisterExpansionTracking(for: folder)
-        // Folder expansion state is now stored in the FolderViewModel itself
-        // No need to unregister from ExpansionManager
-
         // Remove selections under this folder before removing hierarchy
-        dropSelections(underFolderFullPath: folder.fullPath)
-        normalizeSelectionState() // Ensure no orphan IDs remain after subtree removal
-
-        removeRootFolderReferences(folder)
+        dropRootReferenceSelectionState(rootID: folder.id, rootPath: folder.fullPath, rootKey: stdRoot, shell: folder)
 
         // Drop any queued events for this root and invalidate stale watcher ingress.
         let rootKey = rootKey(forPath: folder.fullPath)
@@ -5772,37 +5814,194 @@ class WorkspaceFilesViewModel: ObservableObject {
         _ = advanceRootReplayIngressGeneration(forRootKey: rootKey)
         await workspaceFileContextStore.unregisterDeferredReplayRootGeneration(forRootKey: rootKey)
 
-        // Prune the stale loaded-root cache
-        rootShellLoadedPaths.remove(stdRoot)
-
-        // Remove the root folder from the list
-        rootFolders.removeAll { $0.id == folder.id }
-        rootShellPersistenceKeysByRootKey.removeValue(forKey: rootKey)
-        if preloadedWorkspaceFileContextRootsByRootKey[rootKey]?.id == folder.id {
-            preloadedWorkspaceFileContextRootsByRootKey.removeValue(forKey: rootKey)
-        }
-
-        // Mark snapshot cache as dirty and bump that root gen
-        invalidateStaticSnapshot(forRootFullPath: stdRoot)
+        detachRootReferences(rootID: folder.id, rootKey: rootKey, standardizedRootPath: stdRoot, shell: folder)
         await clearPathResolutionCaches()
 
         if let workspaceRoot = workspaceFileContextRootsByRootKey.removeValue(forKey: rootKey) {
             await workspaceFileContextStore.unloadRoot(id: workspaceRoot.id)
         }
 
-        publishRootShellProjectionsChanged()
+        finishRootReferenceTeardown(standardizedRootPath: stdRoot, removedShell: true)
+    }
 
-        if currentSlicesByRoot.removeValue(forKey: stdRoot) != nil {
+    /// Identity-pinned teardown of the root lifetime a caller observed. It handles a shell, a
+    /// cached root reference, or an actor-only root, and never unloads a different lifetime just
+    /// because it occupies the same path. It does not change workspace configuration: accepted
+    /// intent already owns root membership. Path-based callers keep `unloadRootFolderPath(_:)`.
+    @MainActor
+    func unloadRootFolder(_ expected: WorkspaceRootRef, kind: WorkspaceRootKind) async -> RootUnloadOutcome {
+        let rootKey = rootKey(forPath: expected.standardizedFullPath)
+        while let flight = rootTeardownsByRootKey[rootKey] {
+            // The same lifetime joins its flight; a different one waits, then observes again.
+            if flight.expectedRootID == expected.id {
+                return await flight.task.value
+            }
+            _ = await flight.task.value
+        }
+        let flightID = UUID()
+        // The unstructured task completes admitted cleanup even if this caller is cancelled.
+        let task = Task { @MainActor in
+            await self.performRootTeardown(expected: expected, kind: kind, rootKey: rootKey, flightID: flightID)
+        }
+        // Registered before the task body's first suspension: the body cannot start on this
+        // actor until the caller suspends below.
+        rootTeardownsByRootKey[rootKey] = RootTeardownFlight(id: flightID, expectedRootID: expected.id, task: task)
+        return await task.value
+    }
+
+    @MainActor
+    private func performRootTeardown(
+        expected: WorkspaceRootRef,
+        kind: WorkspaceRootKind,
+        rootKey: RootKey,
+        flightID: UUID
+    ) async -> RootUnloadOutcome {
+        defer {
+            if rootTeardownsByRootKey[rootKey]?.id == flightID {
+                rootTeardownsByRootKey.removeValue(forKey: rootKey)
+            }
+        }
+        let standardizedRootPath = expected.standardizedFullPath
+        // The registered gate protects this read: no same-key loadFolder entrant can observe
+        // shell state or claim a load token until this flight finishes. Store record identity is
+        // read without a queryability filter so a nonqueryable expected root still unloads.
+        let admitted = await workspaceFileContextStore.rootRecords(forRootFolderPaths: [standardizedRootPath]).first
+        if let admitted, admitted.id != expected.id || admitted.kind != kind {
+            return .superseded
+        }
+        // An absent expected root with a same-key load in flight may have an unpublished successor;
+        // invalidating that load's token would strand its Store root without a shell.
+        if admitted == nil, activeRootLoadCountByRootKey[rootKey] != nil {
+            return .superseded
+        }
+        guard !rootKeyHasOtherLifetime(rootKey, expectedRootID: expected.id) else { return .superseded }
+
+        // Synchronous invalidation and cleanup for the admitted or already-absent lifetime.
+        invalidateRootLoadToken(forRootKey: rootKey)
+        _ = advanceRootReplayIngressGeneration(forRootKey: rootKey)
+        let shell = rootFolders.first { $0.standardizedFullPath == rootKey && $0.id == expected.id }
+        dropRootReferenceSelectionState(rootID: expected.id, rootPath: standardizedRootPath, rootKey: rootKey, shell: shell)
+        if workspaceFileContextRootsByRootKey[rootKey]?.id == expected.id {
+            workspaceFileContextRootsByRootKey.removeValue(forKey: rootKey)
+        }
+        detachRootReferences(rootID: expected.id, rootKey: rootKey, standardizedRootPath: standardizedRootPath, shell: shell)
+
+        await workspaceFileContextStore.unregisterDeferredReplayRootGeneration(forRootKey: rootKey)
+        await clearPathResolutionCaches()
+        #if DEBUG
+            if let rootTeardownWillUnloadStoreRootHandler {
+                await rootTeardownWillUnloadStoreRootHandler(rootKey, expected.id)
+            }
+        #endif
+
+        // Re-read before the ID-only unload. A replacement always has a new UUID, so this unload
+        // cannot remove it even if the observation is overtaken.
+        let outcome: RootUnloadOutcome
+        if let current = await workspaceFileContextStore.rootRecords(forRootFolderPaths: [standardizedRootPath]).first {
+            if current.id == expected.id, current.kind == kind {
+                await workspaceFileContextStore.unloadRoot(id: expected.id)
+                outcome = .unloaded
+            } else {
+                outcome = .superseded
+            }
+        } else {
+            outcome = .alreadyAbsent
+        }
+        if rootKeyHasOtherLifetime(rootKey, expectedRootID: expected.id) {
+            // A replacement now owns the path-keyed slice and hierarchy state.
+            if shell != nil {
+                publishRootShellProjectionsChanged()
+            }
+        } else {
+            finishRootReferenceTeardown(standardizedRootPath: standardizedRootPath, removedShell: shell != nil)
+        }
+        return outcome
+    }
+
+    /// True when a shell or cached root reference at this key belongs to another lifetime.
+    @MainActor
+    private func rootKeyHasOtherLifetime(_ rootKey: RootKey, expectedRootID: UUID) -> Bool {
+        if let shell = rootFolders.first(where: { $0.standardizedFullPath == rootKey }), shell.id != expectedRootID {
+            return true
+        }
+        if let cached = workspaceFileContextRootsByRootKey[rootKey], cached.id != expectedRootID {
+            return true
+        }
+        if let preloaded = preloadedWorkspaceFileContextRootsByRootKey[rootKey], preloaded.id != expectedRootID {
+            return true
+        }
+        return false
+    }
+
+    /// Selection, handled-generation and index state owned by one root lifetime. Shell work
+    /// (expansion tracking and subtree index ownership) runs only when that shell exists.
+    @MainActor
+    private func dropRootReferenceSelectionState(rootID: UUID, rootPath: String, rootKey: RootKey, shell: FolderViewModel?) {
+        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: rootID)
+        if let shell {
+            unregisterExpansionTracking(for: shell)
+        }
+        dropSelections(underFolderFullPath: rootPath)
+        normalizeSelectionState() // Ensure no orphan IDs remain after subtree removal
+        if let shell {
+            removeRootFolderReferences(shell)
+        } else {
+            removeRootOwnedIndexEntries(forRootKey: rootKey)
+        }
+    }
+
+    /// Loaded-path, shell, persistence and preloaded-reference state for one root lifetime.
+    /// Only the given shell and an ID-matching preloaded reference are removed.
+    @MainActor
+    private func detachRootReferences(rootID: UUID, rootKey: RootKey, standardizedRootPath: String, shell: FolderViewModel?) {
+        // Prune the stale loaded-root cache
+        rootShellLoadedPaths.remove(standardizedRootPath)
+        // Remove the root folder from the list
+        if let shell {
+            rootFolders.removeAll { $0.id == shell.id }
+        }
+        rootShellPersistenceKeysByRootKey.removeValue(forKey: rootKey)
+        if preloadedWorkspaceFileContextRootsByRootKey[rootKey]?.id == rootID {
+            preloadedWorkspaceFileContextRootsByRootKey.removeValue(forKey: rootKey)
+        }
+        // Mark snapshot cache as dirty and bump that root gen
+        invalidateStaticSnapshot(forRootFullPath: standardizedRootPath)
+    }
+
+    /// Publication, slice and hierarchy-generation cleanup once the root is fully gone.
+    @MainActor
+    private func finishRootReferenceTeardown(standardizedRootPath: String, removedShell: Bool) {
+        if removedShell {
+            publishRootShellProjectionsChanged()
+        }
+        if currentSlicesByRoot.removeValue(forKey: standardizedRootPath) != nil {
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
         }
         // Remove per-root generation entry once the root is fully gone
-        removeHierarchyGenerationEntry(forRootFullPath: stdRoot)
+        removeHierarchyGenerationEntry(forRootFullPath: standardizedRootPath)
+    }
+
+    /// Removes index entries a shell-less root still owns, for example after a partial load
+    /// removed its shell without shared cleanup. Skips the global scan when nothing is owned.
+    @MainActor
+    private func removeRootOwnedIndexEntries(forRootKey rootKey: RootKey) {
+        guard fileHierarchyIndex.folderPathsByRoot[rootKey] != nil else { return }
+        let cleanup = rootReferenceCleanupPlan(forRootKey: rootKey)
+        fileHierarchyIndex.removeOwnedEntries(
+            forRootKey: cleanup.rootKey,
+            folderPaths: cleanup.folderPaths,
+            filePaths: cleanup.filePaths
+        )
     }
 
     @MainActor
     private func rootReferenceCleanupPlan(for folder: FolderViewModel) -> RootCleanupPlan {
-        let rootKey = folder.standardizedFullPath
-        let rootPrefix = folder.standardizedFullPath
+        rootReferenceCleanupPlan(forRootKey: folder.standardizedFullPath)
+    }
+
+    @MainActor
+    private func rootReferenceCleanupPlan(forRootKey rootKey: String) -> RootCleanupPlan {
+        let rootPrefix = rootKey
         if let ownedFolderPaths = fileHierarchyIndex.folderPathsByRoot[rootKey] {
             if let ownedFilePaths = fileHierarchyIndex.filePathsByRoot[rootKey] {
                 #if DEBUG
@@ -6425,6 +6624,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         await Task.yield()
 
         await workspaceFileContextStore.unloadRoots(ids: storeRootsToUnload.map(\.id))
+
+        // Identity-pinned teardowns own their Store unloads; join them before the final reset.
+        while let teardown = rootTeardownsByRootKey.values.first {
+            _ = await teardown.task.value
+        }
 
         // Preserve a clean final state after actor cleanup and any unload events that
         // raced in from the store bridge.

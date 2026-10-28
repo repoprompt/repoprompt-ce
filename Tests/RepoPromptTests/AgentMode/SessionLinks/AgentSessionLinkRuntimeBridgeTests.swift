@@ -4,8 +4,27 @@ import Foundation
 import MCP
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptPersistence
 import RepoPromptSettingsCore
 import XCTest
+
+/// Fails exactly the first continuity commit with the store's documented retryable admission error.
+private final class OneShotContinuityWriterBusy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+
+    var didFire: Bool {
+        lock.withLock { fired }
+    }
+
+    func beforeCommit() throws {
+        let shouldThrow = lock.withLock {
+            defer { fired = true }
+            return !fired
+        }
+        if shouldThrow { throw OverseerContinuityError.writerBusy }
+    }
+}
 
 /// Cross-window lifecycle bridge: synchronous first-link seeding, activation-time observation
 /// ownership, serialized publication, and eager plus lazy revocation.
@@ -382,6 +401,11 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         }
 
         var snapshotOverrides: [UUID: DomainAgentSessionObservationSnapshot] = [:]
+        var runFacts: [UUID: AgentRunQuietFacts] = [:]
+        func agentSessionLinkRunFacts(for candidate: AgentSessionLinkEndpointCandidate, capturedStatus _: DomainAgentSessionLinkStatus) -> AgentRunQuietFacts? {
+            runFacts[candidate.sessionID]
+        }
+
         var installCountsBySession: [UUID: Int] = [:]
         var liveObservations: [UUID: () -> Void] = [:]
         var waitingOnByEndpoint: [DomainAgentSessionLinkEndpointIdentity: DomainAgentSessionWaitingOn] = [:]
@@ -3944,11 +3968,13 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
 
         // Duplicate delivery of the same batch, and a receipt addressed to an endpoint that holds no
         // queue, both change nothing.
+        let afterAcceptancePublications = fixture.host.passiveNoticePublicationCount
         fixture.bridge.applyPassiveMonitorNoticeReceipt(
             receipt,
             observerEndpoint: fixture.observer.domainEndpoint
         )
         XCTAssertEqual(passiveSnapshot(fixture), reduced)
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, afterAcceptancePublications, "Duplicate acceptance is not a new publication")
         fixture.bridge.applyPassiveMonitorNoticeReceipt(
             receipt,
             observerEndpoint: fixture.target.domainEndpoint
@@ -4998,6 +5024,18 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
         XCTAssertTrue(saved.contains(AgentSessionOversightIntent(
             observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID
         )))
+    }
+
+    func testAddIsSavedAfterRetryableWriterBusyDefersTheFirstCommit() async throws {
+        let fixture = makeFixture()
+        let gate = OneShotContinuityWriterBusy()
+        let directory = try installLaneIntentStore(fixture, beforeCommit: { try gate.beforeCommit() })
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        let saved = await savedLaneIntents(in: directory)
+        XCTAssertTrue(gate.didFire, "The first commit must have met bounded store admission contention")
+        XCTAssertTrue(saved.contains(AgentSessionOversightIntent(
+            observerSessionID: fixture.observer.sessionID, targetSessionID: fixture.target.sessionID
+        )), "A retryable writerBusy defers the save to the store's own retry; it does not lose the intent")
     }
 
     func testLinklessPillEndpointCapturedBeforeConsentRejectsSameSessionRebind() async throws {
@@ -7863,7 +7901,8 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
     @discardableResult
     private func installLaneIntentStore(
         _ fixture: Fixture,
-        mode: AgentSessionOversightPersistenceMode = .enabled
+        mode: AgentSessionOversightPersistenceMode = .enabled,
+        beforeCommit: @escaping @Sendable () throws -> Void = {}
     ) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("lane-bridge-\(UUID().uuidString)", isDirectory: true)
@@ -7874,25 +7913,53 @@ final class AgentSessionLinkRuntimeBridgeTests: XCTestCase {
             backupsDirectoryURL: directory.appendingPathComponent(
                 AgentSessionOversightIntentStore.backupsDirectoryName, isDirectory: true
             ),
-            mode: mode
+            mode: mode,
+            beforeCommit: beforeCommit
         )
         laneIntentStores[directory] = store
         fixture.bridge.installIntentStore(store)
         return directory
     }
 
-    private func savedLaneIntents(in directory: URL) async -> [AgentSessionOversightIntent] {
-        await laneIntentStores[directory]?.serializationBarrier()
+    /// Durable read-back must follow a retryable save failure (for example bounded-admission
+    /// `writerBusy` under CI load) into the store's own scheduled retry. The production
+    /// `serializationBarrier` deliberately awaits only the current attempt so termination never
+    /// waits on a retry loop. This adds no attempt: it awaits the store's own tasks until nothing
+    /// queued remains scheduled, and a store whose failures persist keeps it waiting.
+    private func awaitOutboxSettled(_ store: AgentSessionOversightIntentStore) async {
+        while let task = await store.test_outboxProgressTask {
+            await task.value
+        }
+    }
+
+    private func savedLaneIntents(
+        in directory: URL,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> [AgentSessionOversightIntent] {
+        guard let original = laneIntentStores[directory] else {
+            XCTFail("No installed lane continuity store", file: file, line: line)
+            return []
+        }
+        await awaitOutboxSettled(original)
+        let saveState = await original.saveState
+        let saveDiagnostic = await original.diagnostic
+        XCTAssertEqual(saveState, "saved", "Lane continuity was not saved: \(saveDiagnostic ?? "no diagnostic")", file: file, line: line)
+        let liveIntents = await original.allIntents()
         let restored = AgentSessionOversightIntentStore(
             fileURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename),
             backupsDirectoryURL: directory.appendingPathComponent(AgentSessionOversightIntentStore.backupsDirectoryName),
             mode: .enabled
         )
-        guard case .ready = await restored.loadForLaunch() else {
-            XCTFail("Saved lane continuity did not load")
+        let load = await restored.loadForLaunch()
+        guard case .ready = load else {
+            let loadDiagnostic = await restored.diagnostic
+            XCTFail("Saved lane continuity did not load (\(load)): \(loadDiagnostic ?? "no diagnostic")", file: file, line: line)
             return []
         }
-        return await restored.allIntents()
+        let restoredIntents = await restored.allIntents()
+        XCTAssertEqual(restoredIntents, liveIntents, "Saved lane continuity differs from the original store's live intents", file: file, line: line)
+        return restoredIntents
     }
 
     private func laneRequest(_ fixture: Fixture, key: String = "create-1", message: String? = nil)
@@ -9520,5 +9587,274 @@ private extension Result {
     var success: Success? {
         guard case let .success(value) = self else { return nil }
         return value
+    }
+}
+
+extension AgentSessionLinkRuntimeBridgeTests {
+    func testFactsOnlyPublicationPairsWithoutPublicSequenceOrReadinessActivityAndDeduplicates() async throws {
+        let fixture = makeFixture()
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 8, ordinaryThrough: 8)
+        guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        let seedValue = await pollState(fixture)
+        let seed = try XCTUnwrap(seedValue)
+        let reads = fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0]
+        let discoveries = fixture.host.candidateReadCount
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 9, ordinaryThrough: 8)
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        let quietValue = await pollState(fixture)
+        let quiet = try XCTUnwrap(quietValue)
+        XCTAssertEqual(quiet.changeSequence, seed.changeSequence, "private facts never forge public activity")
+        XCTAssertEqual(fixture.host.observationSnapshotCalls[fixture.target.sessionID, default: 0], reads + 1)
+        XCTAssertEqual(fixture.host.candidateReadCount, discoveries, "facts fanout uses existing inbound index, not discovery")
+        XCTAssertTrue(try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint]).entries.isEmpty)
+        fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 10, ordinaryThrough: 10)
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        let snapshot = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint])
+        let entry = try XCTUnwrap(snapshot.entries.first)
+        XCTAssertEqual(entry.fromStatus, .idle)
+        XCTAssertEqual(entry.toStatus, .idle)
+        XCTAssertEqual(entry.runFacts, .init(settledThrough: 10, ordinaryThrough: 10))
+        let sequence = fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID)
+        fixture.host.fireObservation(for: fixture.target.sessionID)
+        await fixture.bridge.test_settleTargetPublications()
+        XCTAssertEqual(fixture.bridge.test_sourcePublicationSequence(for: fixture.target.sessionID), sequence)
+        XCTAssertEqual(fixture.host.publishedPassiveNoticesByEndpoint[fixture.observer.domainEndpoint], snapshot)
+    }
+
+    func testAuthorityAwaitNeverAttachesNewerOrSupersededFactsToCapturedStatusInEitherOrdering() async throws {
+        for afterAuthorityRead in [false, true] {
+            let fixture = makeFixture()
+            fixture.host.runFacts[fixture.target.sessionID] = .init(settledThrough: 8, ordinaryThrough: 8)
+            guard case .added = await addLink(fixture) else { return XCTFail("add failed") }
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            // Establish an actionable pending row so the sampled frame's proof can be inspected.
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = quietSnapshot(fixture, status: .running)
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            fixture.host.snapshotOverrides[fixture.target.sessionID] = quietSnapshot(fixture, status: .awaitingUser)
+            fixture.host.fireObservation(for: fixture.target.sessionID)
+            await fixture.bridge.test_settleTargetPublications()
+            var fired = false
+            var capturedMixed: AgentSessionLinkPassiveStatusNotices.Sample?
+            fixture.bridge.test_onPassiveSample = { sample in
+                if fired, sample.status == .waiting, sample.runFacts == nil { capturedMixed = sample }
+            }
+            let replacement = try XCTUnwrap(AgentRunQuietFacts(settledThrough: 9, ordinaryThrough: 9))
+            let interleave: @MainActor (DomainAgentSessionLinkEndpointIdentity) async -> Void = { endpoint in
+                guard endpoint == fixture.target.domainEndpoint, !fired else { return }
+                fired = true
+                fixture.host.runFacts[fixture.target.sessionID] = replacement
+                fixture.host.snapshotOverrides[fixture.target.sessionID] = self.quietSnapshot(fixture, status: .idle)
+                fixture.host.fireObservation(for: fixture.target.sessionID)
+                try? await AsyncTestWait.waitUntil("new pair crosses authority await", timeout: 4) {
+                    fixture.bridge.test_pairedRunFacts(for: fixture.target.domainEndpoint) == replacement
+                }
+            }
+            if afterAuthorityRead { fixture.bridge.test_afterPassiveObservationSnapshot = interleave }
+            else { fixture.bridge.test_beforePassiveObservationSnapshot = interleave }
+            await fixture.bridge.test_refreshStatus(sessionIDs: [fixture.observer.sessionID])
+            fixture.bridge.test_beforePassiveObservationSnapshot = nil
+            fixture.bridge.test_afterPassiveObservationSnapshot = nil
+            await fixture.bridge.test_settleTargetPublications()
+            XCTAssertTrue(fired)
+            // The hook captures the ACTUAL mixed sample, before a later valid pass repairs it.
+            let mixed = try XCTUnwrap(capturedMixed)
+            XCTAssertEqual(mixed.targetEndpoint, fixture.target.domainEndpoint)
+            XCTAssertEqual(mixed.status, .waiting)
+            XCTAssertNil(mixed.runFacts)
+            fixture.bridge.test_onPassiveSample = nil
+        }
+    }
+
+    private func quietSnapshot(_ fixture: Fixture, status: DomainAgentSessionLinkStatus) -> DomainAgentSessionObservationSnapshot {
+        .init(
+            sessionID: fixture.target.sessionID,
+            displayName: "Build API",
+            providerDisplayName: "Codex CLI",
+            status: status,
+            board: .empty,
+            idleForSend: status == .idle,
+            pendingInteractionKind: nil,
+            latestVisibleAssistantPreview: "unchanged",
+            visibleRowCount: 2,
+            lastActivityAt: Date(timeIntervalSince1970: 100)
+        )
+    }
+}
+
+extension AgentSessionLinkRuntimeBridgeTests {
+    /// Fixed headless topology. Time values are diagnostic evidence, not hardware-dependent CI
+    /// assertions. The asserted work bounds cover exact lookup/publication/queue behavior.
+    func testQuietScaleThreeHundredChatsThirtyFourWindowsTenLinksSixObservers() async throws {
+        let started = ContinuousClock.now
+        let fixture = makeFixture()
+        let replay = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        let sources = (0 ..< 300).map { _ in replay.makeSession(agent: .codexExec) }
+        let candidates = sources.enumerated().map { index, source in
+            makeCandidate(windowID: index % 34 + 1, tabID: source.tabID, displayName: "Task \(index)")
+        }
+        for (source, candidate) in zip(sources, candidates) {
+            source.testInstallPersistentSessionBinding(sessionID: candidate.sessionID)
+            for index in 0 ..< 6 {
+                source.appendItem(.user("retained request \(index)"))
+                source.appendItem(.assistant("retained response \(index)"))
+            }
+        }
+        let dormant = AgentTranscript(turns: (0 ..< 8).map { _ in AgentQuietCheckInReplay.toolHeavyTurn(date: .distantPast) })
+        let dormantOldCache = AgentTranscriptProjectionBuilder.buildWithCaches(from: dormant, protection: .none, turnCaches: [:])
+        sources[299].transcript = AgentTranscriptCompactor.compact(dormant)
+        XCTAssertTrue(sources[299].transcript.allActivities.isEmpty)
+        let dormantInputs = dormantOldCache.updatedTurnCaches.values.flatMap(\.workingBlocks).flatMap(\.displaySummaryInputs)
+        XCTAssertEqual(dormantInputs.flatMap(\.rows).count, 400)
+        XCTAssertEqual(dormantInputs.flatMap(\.rows).reduce(0) { $0 + ($1.narration?.utf8.count ?? 0) }, 1968)
+        fixture.host.candidates = candidates
+        for candidate in candidates {
+            fixture.host.runFacts[candidate.sessionID] = .zero
+        }
+        let links = [(0, 6), (0, 7), (1, 6), (1, 8), (2, 7), (2, 9), (3, 8), (4, 9), (5, 6), (5, 7)]
+        for (observer, target) in links {
+            guard case .added = await fixture.bridge.addMonitorLink(observerEndpoint: candidates[observer].domainEndpoint, targetEndpoint: candidates[target].domainEndpoint) else { return XCTFail("scale link failed") }
+        }
+        await fixture.bridge.test_settleProjections()
+        await fixture.bridge.test_settleTargetPublications()
+        let setup = started.duration(to: .now)
+        let fullReads = fixture.host.candidateReadCount
+        let visits = fixture.host.boundedCandidateVisits
+        let observers = Set(candidates.prefix(6).map(\.sessionID))
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        // Isolate synchronous production-reducer cost using the real integrated bridge samples.
+        // The whole indexed refresh awaits authority per linked target, so its wall duration is
+        // retained separately and must not be mislabeled synchronous actor work.
+        var capturedSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        fixture.bridge.test_onPassiveSample = { capturedSamples.append($0) }
+        await fixture.bridge.test_refreshStatus(sessionIDs: observers)
+        func exactSamples(_ inventory: AgentSessionLinkPromptInventory) throws -> [AgentSessionLinkPassiveStatusNotices.Sample] {
+            try inventory.items.map { item in
+                try XCTUnwrap(capturedSamples.last(where: { $0.reference == item.reference }))
+            }
+        }
+        var timingReducers: [AgentSessionLinkPassiveStatusNotices] = []
+        for observer in candidates.prefix(6) {
+            let inventory = try XCTUnwrap(fixture.host.publishedInventoriesByEndpoint[observer.domainEndpoint])
+            var reducer = AgentSessionLinkPassiveStatusNotices(observerEndpoint: observer.domainEndpoint)
+            try reducer.enable(samples: exactSamples(inventory), linkSetRevision: inventory.linkSetRevision, observedAt: .distantPast)
+            timingReducers.append(reducer)
+        }
+        var claimMS: [Double] = [], receiptMS: [Double] = [], sealMS: [Double] = [], displayMS: [Double] = [], frameMS: [Double] = [], refreshWallMS: [Double] = [], reducerMS: [Double] = []
+        var physicalDispatches = 0
+        var warmClaimMS: [Double] = []
+        func milliseconds(_ duration: Duration) -> Double {
+            Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
+        }
+        for iteration in 0 ..< 64 {
+            capturedSamples.removeAll(keepingCapacity: true)
+            let index = 6 + iteration % 4
+            let source = sources[index]
+            let candidate = candidates[index]
+            source.runState = .running
+            source.installRunID(UUID())
+            let owner = source.beginRunAttempt(source: "quiet-scale")
+            source.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: UUID(), routineQuietCheckIn: true, alreadyAcquired: false)
+            if iteration % 8 == 0 { source.noteAcceptedTaskInput() }
+            let sealStart = ContinuousClock.now
+            source.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+            sealMS.append(milliseconds(sealStart.duration(to: .now)))
+            // Commit the same sealed owner through the real terminal barrier. No second classification.
+            _ = await AgentRunTerminalCommitBarrier().commit(.init(
+                binding: replay.hooks.bindTerminalSession(source), ownership: owner, expectedRunID: source.runID,
+                terminalState: .completed, source: "quiet-scale", attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: true, classifiesQuietCheckIn: true
+            ))
+            fixture.host.runFacts[candidate.sessionID] = source.quietLedger.facts
+            let frameStart = ContinuousClock.now
+            fixture.host.fireObservation(for: candidate.sessionID)
+            frameMS.append(milliseconds(frameStart.duration(to: .now)))
+            await fixture.bridge.test_settleTargetPublications()
+            let refreshStart = ContinuousClock.now
+            await fixture.bridge.test_refreshStatus(sessionIDs: observers)
+            // Includes actor hops/queueing, so this is a conservative wall measurement, NOT a
+            // claim that await duration is synchronous MainActor work or provider latency.
+            refreshWallMS.append(milliseconds(refreshStart.duration(to: .now)))
+            for (observerIndex, observer) in candidates.prefix(6).enumerated() {
+                let snapshot = try XCTUnwrap(fixture.host.publishedPassiveNoticesByEndpoint[observer.domainEndpoint])
+                XCTAssertLessThanOrEqual(snapshot.entries.count, 16)
+                let inventory = try XCTUnwrap(fixture.host.publishedInventoriesByEndpoint[observer.domainEndpoint])
+                let samples = try exactSamples(inventory)
+                let reducerStart = ContinuousClock.now
+                timingReducers[observerIndex].reconcile(samples: samples, linkSetRevision: inventory.linkSetRevision, deliverable: true, observedAt: .distantPast)
+                let timedSnapshot = timingReducers[observerIndex].snapshot
+                reducerMS.append(milliseconds(reducerStart.duration(to: .now)))
+                XCTAssertLessThanOrEqual(timedSnapshot.entries.count, inventory.items.count)
+                guard snapshot.entries.contains(where: \.isRoutineWakeEligible) else { continue }
+                let claimStart = ContinuousClock.now
+                let claim = try XCTUnwrap(store.claim(
+                    dispatchID: .autoWake(wakeID: UUID()), epoch: .init(endpoint: observer.domainEndpoint, allowsSupplement: true, providerContext: .claudeCode),
+                    inventory: inventory, passiveNotices: snapshot, routineQuietCheckIn: true, render: AgentSessionLinkPrompts.rendered
+                ))
+                claimMS.append(milliseconds(claimStart.duration(to: .now)))
+                XCTAssertLessThanOrEqual(claim.fragment.utf8.count, 24 * 1024)
+                if warmClaimMS.isEmpty {
+                    // Separate warm-render qualification from the small-N integrated samples:
+                    // 200 UNIQUE, unaccepted claims render the SAME actually owed full envelope.
+                    // This is not a same-ID cache-hit benchmark or 200 invented provider calls.
+                    let epoch = AgentSessionLinkPromptEpoch(endpoint: observer.domainEndpoint, allowsSupplement: true, providerContext: .claudeCode)
+                    var renderCalls = 0
+                    for _ in 0 ..< 200 {
+                        // A fresh store excludes the existing shared rendered-fingerprint cache,
+                        // not merely the same-dispatch claim cache. Count REAL renderer calls.
+                        let warmStore = AgentSessionLinkOutboundPromptClaimStore()
+                        let start = ContinuousClock.now
+                        let warm = warmStore.claim(dispatchID: .autoWake(wakeID: UUID()), epoch: epoch, inventory: inventory, passiveNotices: snapshot, routineQuietCheckIn: true, render: { request in
+                            renderCalls += 1
+                            return AgentSessionLinkPrompts.rendered(request)
+                        })
+                        warmClaimMS.append(milliseconds(start.duration(to: .now)))
+                        XCTAssertEqual(warm?.fragment, claim.fragment)
+                        XCTAssertEqual(warm?.passive?.receipt, claim.passive?.receipt)
+                    }
+                    XCTAssertEqual(renderCalls, 200)
+                }
+                // This bounded fake transport accepts exactly the immutable chosen envelope.
+                physicalDispatches += 1
+                let receiptStart = ContinuousClock.now
+                store.accept(claim)
+                try fixture.bridge.applyPassiveMonitorNoticeReceipt(XCTUnwrap(claim.passive?.receipt), observerEndpoint: observer.domainEndpoint)
+                receiptMS.append(milliseconds(receiptStart.duration(to: .now)))
+            }
+            let materialized = AgentTranscriptProjectionBuilder.build(from: AgentTranscriptIO.buildTranscript(from: source.items, compact: false))
+            let presentation = AgentTranscriptPresentationSnapshot(revision: iteration, visibleBlocks: materialized.workingBlocks, workingBlocks: materialized.workingBlocks, visibleRows: materialized.workingRows, workingRows: materialized.workingRows, rowAnchorIndex: materialized.rowAnchorIndex, anchorBlockIndex: materialized.anchorBlockIndex)
+            let displayStart = ContinuousClock.now
+            _ = AgentTranscriptProjectionBuilder.maskForLocalDisplay(presentation, archivedBlocks: [], hiddenSourceIDs: source.quietLedger.hiddenSourceIDs)
+            displayMS.append(milliseconds(displayStart.duration(to: .now)))
+        }
+        XCTAssertEqual(fixture.host.candidateReadCount, fullReads, "No discovery scans of 300 chats/34 windows on critical work")
+        XCTAssertLessThanOrEqual(fixture.host.boundedCandidateVisits - visits, 64 * 150, "Indexed live-link fanout, not topology-sized work")
+        fixture.bridge.test_onPassiveSample = nil
+        let pubs = fixture.host.passiveNoticePublicationCount
+        let snapshot = fixture.host.publishedPassiveNoticesByEndpoint
+        let sequences = candidates[6 ..< 10].map { fixture.bridge.test_sourcePublicationSequence(for: $0.sessionID) }
+        for _ in 0 ..< 32 {
+            for target in candidates[6 ..< 10] {
+                fixture.host.fireObservation(for: target.sessionID)
+            }
+            await fixture.bridge.test_settleTargetPublications()
+            await fixture.bridge.test_refreshStatus(sessionIDs: observers)
+        }
+        XCTAssertEqual(fixture.host.candidateReadCount, fullReads, "Unchanged passes also perform zero discovery scans")
+        XCTAssertEqual(fixture.host.passiveNoticePublicationCount, pubs)
+        XCTAssertEqual(fixture.host.publishedPassiveNoticesByEndpoint, snapshot)
+        XCTAssertEqual(candidates[6 ..< 10].map { fixture.bridge.test_sourcePublicationSequence(for: $0.sessionID) }, sequences)
+        XCTAssertGreaterThan(physicalDispatches, 0)
+        func percentile(_ values: [Double]) -> Double {
+            values.sorted()[min(values.count - 1, Int(Double(values.count) * 0.99))]
+        }
+        print("QUIET_C5_SCALE chats=300 windows=34 links=10 observers=6 samples=64 setupMS=\(milliseconds(setup)) totalMS=\(milliseconds(started.duration(to: .now))) criticalDiscoveryScans=0 candidateVisits=\(fixture.host.boundedCandidateVisits - visits) physicalFakeAccepted=\(physicalDispatches) claimSamples=\(claimMS.count) warmFullRenderSamples=\(warmClaimMS.count) warmFullRenderP99MS=\(percentile(warmClaimMS)) warmFullRenderMaxMS=\(warmClaimMS.max()!) frameCaptureP99MS=\(percentile(frameMS)) synchronousReducerReplaySamples=\(reducerMS.count) synchronousReducerReplayP99MS=\(percentile(reducerMS)) indexedRefreshWallP99MS=\(percentile(refreshWallMS)) claimP99MS=\(percentile(claimMS)) receiptP99MS=\(percentile(receiptMS)) directSealP99MS=\(percentile(sealMS)) pureDisplayP99MS=\(percentile(displayMS)) displayMaxMS=\(displayMS.max()!) dormantHelperRows=400 dormantNarrationUTF8=1968 dormantRawPayloadFields=0")
+        print("QUIET_C5_CLAIM_TIMING integratedMS=\(claimMS) warmFullRenderMS=\(warmClaimMS)")
+        withExtendedLifetime(dormantOldCache) {}
     }
 }

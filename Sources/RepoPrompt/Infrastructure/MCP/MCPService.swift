@@ -355,12 +355,12 @@ actor MCPService: Sendable {
     /// ──────────────────────────────────────────────
     /// Called by the MainActor after the alert sheet closes
     /// Runs on the actor executor – no extra Task hop required.
-    func continuePendingApproval(allow: Bool, generation: UInt64) async {
+    func continuePendingApproval(allow: Bool, generation: UInt64, alwaysAllow: Bool = false) async {
         guard state.pendingApprovalGeneration == generation else { return }
         // Clear before the controller activates the next queued request; clearing
         // afterward would erase that next prompt, including a same-name peer.
         clearPendingApproval(generation: generation)
-        await controller.resolvePendingApproval(allow: allow, generation: generation)
+        await controller.resolvePendingApproval(allow: allow, generation: generation, alwaysAllow: alwaysAllow)
     }
 
     func clearPendingApproval(generation: UInt64) {

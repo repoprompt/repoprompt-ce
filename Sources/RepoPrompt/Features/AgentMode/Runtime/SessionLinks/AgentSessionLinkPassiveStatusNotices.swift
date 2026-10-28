@@ -58,6 +58,8 @@ struct AgentSessionLinkPassiveStatusNotices {
         let idleSince: Date?
         let waitingOn: DomainAgentSessionWaitingOn?
         let latestVisibleAssistantPreview: String?
+        /// Proof from this exact publication only; nil never means zero.
+        var runFacts: AgentRunQuietFacts?
 
         init(
             reference: DomainAgentSessionLinkReference,
@@ -68,8 +70,10 @@ struct AgentSessionLinkPassiveStatusNotices {
             idleForSend: Bool = false,
             idleSince: Date? = nil,
             waitingOn: DomainAgentSessionWaitingOn? = nil,
-            latestVisibleAssistantPreview: String? = nil
+            latestVisibleAssistantPreview: String? = nil,
+            runFacts: AgentRunQuietFacts? = nil
         ) {
+            self.runFacts = runFacts
             self.reference = reference
             self.targetEndpoint = targetEndpoint
             self.targetSessionID = targetSessionID
@@ -120,6 +124,45 @@ struct AgentSessionLinkPassiveStatusNotices {
         /// inside one queue epoch, and a single failed attempt would suppress every future identical
         /// transition for the life of the link.
         let edgeSequence: UInt64
+        /// This row's current paired proof. Never filled from the observation cache or old receipt.
+        let runFacts: AgentRunQuietFacts?
+        /// The immutable payable cutoff; a same-status unpaired refresh may retain an older one.
+        let receiptSettledThrough: UInt64?
+        /// Known same-endpoint coverage survives unknown current proof.
+        let ordinaryThrough: UInt64?
+        /// Opening cutoff from a preceding fresh observation, preserved through coalescing.
+        /// Never reconstructed from the representation cache or a later closing cutoff.
+        let openingSettledThrough: UInt64?
+
+        /// Read-only snapshot projection of the reducer's ONE live position, not another counter,
+        /// receipt cutoff, or debt flag. Only snapshot construction writes this value copy.
+        fileprivate var deliveredThroughAtSnapshot: UInt64?
+
+        var isStatusEdge: Bool {
+            Self.isStatusEdge(from: fromStatus, to: toStatus)
+        }
+
+        var isRoutineWakeEligible: Bool {
+            let freshIdle = toStatus == .idle && runFacts != nil
+            let unpaid = ordinaryThrough.map { ordinary in
+                deliveredThroughAtSnapshot.map { ordinary > $0 } ?? false
+            } ?? false
+            if freshIdle, let runFacts, let openingSettledThrough,
+               runFacts.settledThrough > openingSettledThrough,
+               let deliveredThroughAtSnapshot, runFacts.ordinaryThrough <= deliveredThroughAtSnapshot
+            {
+                return false
+            }
+            return isStatusEdge || (freshIdle && unpaid)
+        }
+
+        fileprivate static func isStatusEdge(from: Status, to: Status) -> Bool {
+            from != to && (
+                (from == .running && to == .idle)
+                    || (to == .waiting && from != .unavailable)
+                    || (from == .waiting && to == .idle)
+            )
+        }
 
         /// Explicit rather than memberwise so the enriched fields can default.
         ///
@@ -140,8 +183,16 @@ struct AgentSessionLinkPassiveStatusNotices {
             waitingOn: DomainAgentSessionWaitingOn? = nil,
             latestVisibleAssistantPreview: String? = nil,
             changeSequence: UInt64,
-            edgeSequence: UInt64? = nil
+            edgeSequence: UInt64? = nil,
+            runFacts: AgentRunQuietFacts? = nil,
+            receiptSettledThrough: UInt64? = nil,
+            ordinaryThrough: UInt64? = nil,
+            openingSettledThrough: UInt64? = nil
         ) {
+            self.runFacts = runFacts
+            self.receiptSettledThrough = receiptSettledThrough ?? runFacts?.settledThrough
+            self.ordinaryThrough = ordinaryThrough ?? runFacts?.ordinaryThrough
+            self.openingSettledThrough = openingSettledThrough
             self.edgeSequence = edgeSequence ?? changeSequence
             self.reference = reference
             self.targetEndpoint = targetEndpoint
@@ -155,29 +206,6 @@ struct AgentSessionLinkPassiveStatusNotices {
             self.waitingOn = waitingOn
             self.latestVisibleAssistantPreview = latestVisibleAssistantPreview
             self.changeSequence = changeSequence
-        }
-
-        fileprivate func refreshed(
-            from sample: Sample,
-            observedAt: Date,
-            changeSequence: UInt64
-        ) -> PendingEntry {
-            PendingEntry(
-                reference: reference,
-                targetEndpoint: targetEndpoint,
-                targetSessionID: targetSessionID,
-                displayName: sample.displayName,
-                fromStatus: fromStatus,
-                toStatus: toStatus,
-                observedAt: observedAt,
-                idleForSend: sample.idleForSend,
-                idleSince: sample.idleSince,
-                waitingOn: sample.waitingOn,
-                latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
-                changeSequence: changeSequence,
-                // Preserve only edge occurrence; refreshed readiness uses the new sample time above.
-                edgeSequence: edgeSequence
-            )
         }
 
         fileprivate func hasSameFinalMetadata(as sample: Sample) -> Bool {
@@ -302,6 +330,29 @@ struct AgentSessionLinkPassiveStatusNotices {
             /// Occurrence identity of this exact transition. Stable across metadata refreshes,
             /// strictly advancing for a genuinely new transition.
             let edgeSequence: UInt64
+            var ordinaryThrough: UInt64?
+
+            /// A coverage row's displayed pair may rebase without becoming a new occurrence.
+            /// Real edges always advance edgeSequence; legacy unknown-only rows keep shape identity.
+            static func == (lhs: Self, rhs: Self) -> Bool {
+                lhs.reference == rhs.reference && lhs.targetEndpoint == rhs.targetEndpoint
+                    && lhs.edgeSequence == rhs.edgeSequence && lhs.ordinaryThrough == rhs.ordinaryThrough
+                    && (
+                        lhs.ordinaryThrough != nil
+                            || (lhs.fromStatus == rhs.fromStatus && lhs.toStatus == rhs.toStatus)
+                    )
+            }
+
+            func hash(into hasher: inout Hasher) {
+                hasher.combine(reference)
+                hasher.combine(targetEndpoint)
+                hasher.combine(edgeSequence)
+                hasher.combine(ordinaryThrough)
+                if ordinaryThrough == nil {
+                    hasher.combine(fromStatus)
+                    hasher.combine(toStatus)
+                }
+            }
         }
 
         let queueEpoch: UUID
@@ -316,7 +367,12 @@ struct AgentSessionLinkPassiveStatusNotices {
             overflowProduced: UInt64
         ) {
             self.queueEpoch = queueEpoch
-            self.edges = edges
+            // One occurrence per exact reference; display metadata order is not failure identity.
+            // Canonicalize only this fingerprint, never the rendered rows or receipt subset.
+            self.edges = edges.sorted {
+                ($0.reference.linkID.uuidString, $0.reference.generation)
+                    < ($1.reference.linkID.uuidString, $1.reference.generation)
+            }
             self.attentionOccurrences = attentionOccurrences
             self.overflowProduced = overflowProduced
         }
@@ -405,7 +461,8 @@ struct AgentSessionLinkPassiveStatusNotices {
                         targetEndpoint: $0.targetEndpoint,
                         fromStatus: $0.fromStatus,
                         toStatus: $0.toStatus,
-                        edgeSequence: $0.edgeSequence
+                        edgeSequence: $0.edgeSequence,
+                        ordinaryThrough: $0.ordinaryThrough
                     )
                 },
                 attentionOccurrences: attentionRequests.map(\.occurrence),
@@ -416,10 +473,14 @@ struct AgentSessionLinkPassiveStatusNotices {
 
     struct DeliveredStatus: Hashable {
         let reference: DomainAgentSessionLinkReference
+        let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+        let settledThrough: UInt64?
         let toStatus: Status
         let changeSequence: UInt64
 
         init(entry: PendingEntry) {
+            targetEndpoint = entry.targetEndpoint
+            settledThrough = entry.receiptSettledThrough
             reference = entry.reference
             toStatus = entry.toStatus
             changeSequence = entry.changeSequence
@@ -471,6 +532,7 @@ struct AgentSessionLinkPassiveStatusNotices {
     private struct Observation: Hashable {
         let sample: Sample
         let observedAt: Date
+        let lastKnownRunFacts: AgentRunQuietFacts?
 
         var targetEndpoint: DomainAgentSessionLinkEndpointIdentity {
             sample.targetEndpoint
@@ -484,19 +546,21 @@ struct AgentSessionLinkPassiveStatusNotices {
             sample.status
         }
 
-        init(sample: Sample, observedAt: Date) {
+        init(sample: Sample, observedAt: Date, lastKnownRunFacts: AgentRunQuietFacts? = nil) {
             self.sample = sample
             self.observedAt = observedAt
+            self.lastKnownRunFacts = sample.runFacts ?? lastKnownRunFacts
         }
 
         /// The latest sample time enriches a future attention occurrence but is not itself queue
         /// content. Re-observing byte-identical state must not advance the reducer revision.
         static func == (lhs: Observation, rhs: Observation) -> Bool {
-            lhs.sample == rhs.sample
+            lhs.sample == rhs.sample && lhs.lastKnownRunFacts == rhs.lastKnownRunFacts
         }
 
         func hash(into hasher: inout Hasher) {
             hasher.combine(sample)
+            hasher.combine(lastKnownRunFacts)
         }
     }
 
@@ -518,6 +582,23 @@ struct AgentSessionLinkPassiveStatusNotices {
     /// lane-less snapshot, which the fence would read as "no lane is selected any more" and use to
     /// retract a live attempt and reset every consumed-epoch watermark.
     private(set) var autoWakeLanes: [AutoWakeLane] = []
+
+    private struct DeliveredRunPosition {
+        let target: DomainAgentSessionLinkEndpointIdentity
+        var through: UInt64?
+        /// Ordinary watermark this lane's evicted rows already disclosed as anonymous overflow.
+        /// Representation-only: it never pays, and a late exact receipt still advances `through`.
+        /// A quiet close may not re-represent this debt as a fresh occurrence; only a newer ordinary
+        /// watermark can, which keeps quiet churn from inflating overflow or failure identity.
+        var overflowDisclosedOrdinaryThrough: UInt64?
+    }
+
+    /// One position per live lane, not per pending row. Target unreadability does not retire it.
+    private var deliveredRunThrough: [DomainAgentSessionLinkReference: DeliveredRunPosition] = [:]
+
+    func deliveredRunThrough(for reference: DomainAgentSessionLinkReference) -> UInt64? {
+        deliveredRunThrough[reference]?.through
+    }
 
     /// Disclosure-only frontiers. Never included in snapshots, receipts, revisions or wake identity.
     var localInputFrontiers: [DomainAgentSessionLinkReference: LocalInputFrontier] = [:]
@@ -543,14 +624,23 @@ struct AgentSessionLinkPassiveStatusNotices {
     }
 
     var snapshot: Snapshot {
-        Snapshot(
+        // Reuse the existing <=16 sorted entry buffer. Projection does not mutate the queue or own
+        // payment state; admission must see payment even when status cleanup intentionally retained
+        // a newer row. No per-claim position map or extra index travels with the snapshot.
+        var entries = orderedPendingEntries
+        for index in entries.indices {
+            if let position = deliveredRunThrough[entries[index].reference], position.target == entries[index].targetEndpoint {
+                entries[index].deliveredThroughAtSnapshot = position.through
+            }
+        }
+        return Snapshot(
             observerEndpoint: observerEndpoint,
             queueEpoch: queueEpoch,
             queueRevision: queueRevision,
             linkSetRevision: linkSetRevision,
             isEnabled: isEnabled,
             isDeliverable: isEnabled && isDeliverable,
-            entries: orderedPendingEntries,
+            entries: entries,
             attentionRequests: orderedPendingAttentionRequests,
             unacknowledgedOverflowCount: overflowProduced - overflowAcknowledged,
             overflowProduced: overflowProduced,
@@ -596,6 +686,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         pendingByReference.removeAll()
         pendingAttentionByReference.removeAll()
         lastObservedStatus = baselines(from: samples, observedAt: observedAt)
+        resetDeliveredPositions(samples)
         advanceQueueRevision()
     }
 
@@ -614,6 +705,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         isDeliverable = false
         self.linkSetRevision = linkSetRevision
         lastObservedStatus.removeAll()
+        deliveredRunThrough.removeAll()
         pendingByReference.removeAll()
         pendingAttentionByReference.removeAll()
         overflowAcknowledged = overflowProduced
@@ -658,6 +750,7 @@ struct AgentSessionLinkPassiveStatusNotices {
             localInputFrontiers.removeAll()
             isDeliverable = deliverable
             lastObservedStatus = newBaselines
+            resetDeliveredPositions(samples)
             pendingByReference.removeAll()
             pendingAttentionByReference.removeAll()
             overflowAcknowledged = overflowProduced
@@ -672,120 +765,143 @@ struct AgentSessionLinkPassiveStatusNotices {
 
         let currentByReference = samplesByReference(samples)
         let currentReferences = Set(currentByReference.keys)
-        let removedReferences = Set(lastObservedStatus.keys).subtracting(currentReferences)
+        let removedReferences = Set(deliveredRunThrough.keys).subtracting(currentReferences)
+            .union(Set(lastObservedStatus.keys).subtracting(currentReferences))
             .union(Set(pendingByReference.keys).subtracting(currentReferences))
             .union(Set(pendingAttentionByReference.keys).subtracting(currentReferences))
         if !removedReferences.isEmpty {
             changed = true
             for reference in removedReferences {
+                deliveredRunThrough.removeValue(forKey: reference)
                 lastObservedStatus.removeValue(forKey: reference)
                 pendingByReference.removeValue(forKey: reference)
                 pendingAttentionByReference.removeValue(forKey: reference)
             }
         }
 
-        for sample in sortedSamples(currentByReference.values) {
+        for var sample in sortedSamples(currentByReference.values) {
+            let reference = sample.reference
+            let priorPosition = deliveredRunThrough[reference]
+            let isNewLane = priorPosition?.target != sample.targetEndpoint
+            if isNewLane {
+                deliveredRunThrough[reference] = DeliveredRunPosition(target: sample.targetEndpoint, through: nil)
+                lastObservedStatus.removeValue(forKey: reference)
+                pendingByReference.removeValue(forKey: reference)
+                pendingAttentionByReference.removeValue(forKey: reference)
+                changed = true
+            }
             if sample.status == .unavailable {
-                if lastObservedStatus.removeValue(forKey: sample.reference) != nil {
-                    changed = true
+                // Remove public detail/attention, not the same-endpoint monotonic cache. An
+                // unavailable placeholder has NO fresh pair and cannot baseline, close, or pay;
+                // its existing Observation cache rejects a regressing first return without a resume
+                // flag or a second map. Default-unknown hosts keep their upstream removal behavior.
+                if let known = lastObservedStatus[reference]?.lastKnownRunFacts {
+                    sample.runFacts = nil
+                    let unavailable = Observation(sample: sample, observedAt: observedAt, lastKnownRunFacts: known)
+                    changed = lastObservedStatus[reference] != unavailable || changed
+                    lastObservedStatus[reference] = unavailable
+                } else {
+                    changed = lastObservedStatus.removeValue(forKey: reference) != nil || changed
                 }
-                if pendingByReference.removeValue(forKey: sample.reference) != nil {
-                    changed = true
-                }
-                if pendingAttentionByReference.removeValue(forKey: sample.reference) != nil {
-                    changed = true
-                }
+                changed = pendingByReference.removeValue(forKey: reference) != nil || changed
+                changed = pendingAttentionByReference.removeValue(forKey: reference) != nil || changed
                 continue
             }
 
-            guard let observation = lastObservedStatus[sample.reference] else {
-                lastObservedStatus[sample.reference] = Observation(
-                    sample: sample,
-                    observedAt: observedAt
-                )
-                changed = true
-                continue
-            }
-
-            guard observation.targetEndpoint == sample.targetEndpoint,
-                  observation.targetSessionID == sample.targetSessionID
-            else {
-                lastObservedStatus[sample.reference] = Observation(
-                    sample: sample,
-                    observedAt: observedAt
-                )
-                pendingByReference.removeValue(forKey: sample.reference)
-                pendingAttentionByReference.removeValue(forKey: sample.reference)
-                changed = true
-                continue
-            }
-
-            if let attention = pendingAttentionByReference[sample.reference],
-               !attention.hasSameCurrentMetadata(as: sample)
+            let preceding = lastObservedStatus[reference]
+            if let incoming = sample.runFacts, let known = preceding?.lastKnownRunFacts,
+               incoming.settledThrough < known.settledThrough || incoming.ordinaryThrough < known.ordinaryThrough
             {
-                pendingAttentionByReference[sample.reference] = attention.refreshed(
-                    from: sample,
-                    observedAt: observedAt
-                )
+                sample.runFacts = nil
+            }
+            if let incoming = sample.runFacts, let delivered = deliveredRunThrough[reference]?.through,
+               incoming.settledThrough < delivered { sample.runFacts = nil }
+            let known = sample.runFacts ?? preceding?.lastKnownRunFacts
+            let isBaseline = deliveredRunThrough[reference]?.through == nil && sample.runFacts != nil
+            if isBaseline {
+                deliveredRunThrough[reference]?.through = sample.runFacts?.settledThrough
+            }
+            let delivered = deliveredRunThrough[reference]?.through
+            let owesCoverage = known.map { facts in delivered.map { facts.ordinaryThrough > $0 } ?? false } ?? false
+            let overflowDisclosed = deliveredRunThrough[reference]?.overflowDisclosedOrdinaryThrough
+            let owesUndisclosedCoverage = owesCoverage
+                && known.map { facts in overflowDisclosed.map { facts.ordinaryThrough > $0 } ?? true } ?? false
+            let freshIdleDebt = sample.status == .idle && sample.runFacts != nil && owesCoverage
+            let newOrdinary = sample.runFacts.map { $0.ordinaryThrough > (preceding?.lastKnownRunFacts?.ordinaryThrough ?? 0) } ?? false
+            let reacquired = sample.runFacts != nil && preceding?.sample.runFacts == nil
+            let priorStatus = preceding?.status == .unavailable ? sample.status : preceding?.status ?? sample.status
+            let statusChanged = priorStatus != sample.status
+            changed = changed || statusChanged
+            let quietInterval: Bool = if let opening = preceding?.sample.runFacts, let closing = sample.runFacts {
+                closing.settledThrough > opening.settledThrough
+                    && closing.ordinaryThrough == opening.ordinaryThrough
+            } else {
+                false
+            }
+            let oldEntry = pendingByReference[reference]
+            lastObservedStatus[reference] = Observation(
+                sample: sample, observedAt: observedAt, lastKnownRunFacts: known
+            )
+            if let attention = pendingAttentionByReference[reference], !attention.hasSameCurrentMetadata(as: sample) {
+                pendingAttentionByReference[reference] = attention.refreshed(from: sample, observedAt: observedAt)
                 changed = true
             }
-
-            let precedingStatus = observation.status
-            lastObservedStatus[sample.reference] = Observation(
-                sample: sample,
-                observedAt: observedAt
-            )
-            guard precedingStatus != sample.status else {
-                // Same status: the pending edge is unchanged, but the metadata a reader would triage
-                // from may have settled after it. Refresh it in place — preserving the edge and its
-                // timestamp — and advance the sequence so a receipt rendered before the refresh can
-                // no longer clear it.
-                if let entry = pendingByReference[sample.reference],
-                   !entry.hasSameFinalMetadata(as: sample)
-                {
-                    nextChangeSequence += 1
-                    pendingByReference[sample.reference] = entry.refreshed(
-                        from: sample,
-                        observedAt: observedAt,
-                        changeSequence: nextChangeSequence
-                    )
+            // A first observation is a silent baseline, but a surviving position returning from an
+            // unavailable/proof gap must recover owed work BEFORE same-status early return.
+            let recoverDebt = freshIdleDebt && !isBaseline && (newOrdinary || reacquired)
+            if preceding == nil && !recoverDebt { continue }
+            let immediateEdge = PendingEntry.isStatusEdge(from: priorStatus, to: sample.status)
+            let quietClose = sample.status == .idle && quietInterval
+            var origin = oldEntry?.fromStatus ?? priorStatus
+            if sample.status == .waiting, statusChanged, let oldEntry, !oldEntry.isStatusEdge {
+                // A retained coverage-only waiting row cannot swallow the next real waiting edge.
+                origin = priorStatus
+            }
+            let coalescedEdge = PendingEntry.isStatusEdge(from: origin, to: sample.status)
+            let retainsCoverage = oldEntry != nil && owesCoverage
+            // A quiet successor may be the first observed close after ordinary coverage was
+            // sampled only while running. Quiet proof cannot suppress that still-unpaid coverage,
+            // but debt an eviction already disclosed as overflow is not a fresh occurrence.
+            let shouldRepresent = retainsCoverage || recoverDebt || (oldEntry != nil && !statusChanged)
+                || (statusChanged && coalescedEdge && (!quietClose || owesUndisclosedCoverage))
+            if !shouldRepresent {
+                if statusChanged, oldEntry != nil {
+                    pendingByReference.removeValue(forKey: reference)
                     changed = true
                 }
                 continue
             }
 
-            changed = true
-
-            // First-to-final coalescing: the origin of the still-pending interval outlives every
-            // intermediate edge, so `running → waiting → idle` is delivered as `running → idle`
-            // rather than losing the fact that the target had been working.
-            let originStatus = pendingByReference[sample.reference]?.fromStatus ?? precedingStatus
-            guard originStatus != sample.status,
-                  isActionableTransition(from: originStatus, to: sample.status)
-            else {
-                // Net reversion, or a net edge that was never worth a turn.
-                pendingByReference.removeValue(forKey: sample.reference)
-                continue
+            let advancesEdge = recoverDebt && newOrdinary
+                || (statusChanged && !quietClose && ((sample.status == .idle && immediateEdge) || coalescedEdge))
+            let cutoff = sample.runFacts?.settledThrough ?? (!statusChanged ? oldEntry?.receiptSettledThrough : nil)
+            // A frozen old cutoff is payable, but cannot masquerade as current fresh idle proof.
+            let opening: UInt64? = if advancesEdge || oldEntry == nil {
+                // A new occurrence uses its immediately preceding frame, not the retained display
+                // origin. Quiet refresh/coalescing preserves the old occurrence's boundary.
+                preceding?.sample.runFacts?.settledThrough
+            } else {
+                oldEntry?.openingSettledThrough
             }
-
+            if quietClose, let oldEntry { origin = oldEntry.fromStatus }
+            let ordinary = known?.ordinaryThrough ?? oldEntry?.ordinaryThrough
+            if let oldEntry, !statusChanged, !advancesEdge,
+               oldEntry.hasSameFinalMetadata(as: sample), oldEntry.runFacts == sample.runFacts,
+               oldEntry.receiptSettledThrough == cutoff,
+               oldEntry.ordinaryThrough == ordinary, oldEntry.openingSettledThrough == opening
+            { continue }
             nextChangeSequence += 1
-            pendingByReference[sample.reference] = PendingEntry(
-                reference: sample.reference,
-                targetEndpoint: sample.targetEndpoint,
-                targetSessionID: sample.targetSessionID,
-                displayName: sample.displayName,
-                fromStatus: originStatus,
-                toStatus: sample.status,
-                observedAt: observedAt,
-                idleForSend: sample.idleForSend,
-                idleSince: sample.idleSince,
-                waitingOn: sample.waitingOn,
-                latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
+            pendingByReference[reference] = PendingEntry(
+                reference: reference, targetEndpoint: sample.targetEndpoint, targetSessionID: sample.targetSessionID,
+                displayName: sample.displayName, fromStatus: origin, toStatus: sample.status,
+                observedAt: observedAt, idleForSend: sample.idleForSend, idleSince: sample.idleSince,
+                waitingOn: sample.waitingOn, latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
                 changeSequence: nextChangeSequence,
-                // A status edge, so this *is* a new occurrence: the wake fingerprint must not compare
-                // equal to the one a previous, already-settled edge of the same shape produced.
-                edgeSequence: nextChangeSequence
+                edgeSequence: advancesEdge ? nextChangeSequence : oldEntry?.edgeSequence ?? nextChangeSequence,
+                runFacts: sample.runFacts, receiptSettledThrough: cutoff,
+                ordinaryThrough: ordinary, openingSettledThrough: opening
             )
+            changed = true
         }
 
         let overflowCount = enforcePendingBound()
@@ -874,12 +990,33 @@ struct AgentSessionLinkPassiveStatusNotices {
 
         // Each receipt names only rendered rows; a newer partial receipt may omit these statuses.
         for delivered in receipt.deliveredStatuses {
-            guard let current = pendingByReference[delivered.reference],
-                  current.toStatus == delivered.toStatus,
-                  current.changeSequence <= delivered.changeSequence
-            else { continue }
-            pendingByReference.removeValue(forKey: delivered.reference)
-            changed = true
+            guard var position = deliveredRunThrough[delivered.reference], position.target == delivered.targetEndpoint else { continue }
+            if let cutoff = delivered.settledThrough, let through = position.through, cutoff > through {
+                position.through = cutoff
+                deliveredRunThrough[delivered.reference] = position
+                changed = true
+            }
+            guard let current = pendingByReference[delivered.reference], current.targetEndpoint == delivered.targetEndpoint else { continue }
+            let exact = current.toStatus == delivered.toStatus && current.changeSequence <= delivered.changeSequence
+            let unpaid = current.ordinaryThrough.map { ordinary in position.through.map { ordinary > $0 } ?? true } ?? false
+            if !unpaid, exact || (!current.isStatusEdge && current.ordinaryThrough != nil) {
+                pendingByReference.removeValue(forKey: delivered.reference)
+                changed = true
+            } else if exact, unpaid, delivered.settledThrough == nil {
+                // Settle the shown status, not its unpaid coverage. This inert hitchhiker can only
+                // independently readmit after fresh idle proof; no payment is invented.
+                nextChangeSequence += 1
+                pendingByReference[delivered.reference] = PendingEntry(
+                    reference: current.reference, targetEndpoint: current.targetEndpoint,
+                    targetSessionID: current.targetSessionID, displayName: current.displayName,
+                    fromStatus: current.toStatus, toStatus: current.toStatus, observedAt: current.observedAt,
+                    idleForSend: current.idleForSend, idleSince: current.idleSince, waitingOn: current.waitingOn,
+                    latestVisibleAssistantPreview: current.latestVisibleAssistantPreview,
+                    changeSequence: nextChangeSequence, edgeSequence: current.edgeSequence,
+                    ordinaryThrough: current.ordinaryThrough
+                )
+                changed = true
+            }
         }
 
         if receipt.queueRevision > lastAcceptedReceiptRevision {
@@ -953,10 +1090,13 @@ struct AgentSessionLinkPassiveStatusNotices {
         }
     }
 
-    private func isActionableTransition(from: Status, to: Status) -> Bool {
-        (from == .running && to == .idle)
-            || (to == .waiting && from != .unavailable)
-            || (from == .waiting && to == .idle)
+    private mutating func resetDeliveredPositions(_ samples: [Sample]) {
+        deliveredRunThrough = [:]
+        for sample in samples {
+            deliveredRunThrough[sample.reference] = DeliveredRunPosition(
+                target: sample.targetEndpoint, through: sample.status == .unavailable ? nil : sample.runFacts?.settledThrough
+            )
+        }
     }
 
     private mutating func enforcePendingBound() -> Int {
@@ -964,6 +1104,12 @@ struct AgentSessionLinkPassiveStatusNotices {
         guard overflowCount > 0 else { return 0 }
         for entry in orderedPendingEntries.prefix(overflowCount) {
             pendingByReference.removeValue(forKey: entry.reference)
+            if let ordinary = entry.ordinaryThrough, var position = deliveredRunThrough[entry.reference],
+               position.target == entry.targetEndpoint
+            {
+                position.overflowDisclosedOrdinaryThrough = max(position.overflowDisclosedOrdinaryThrough ?? 0, ordinary)
+                deliveredRunThrough[entry.reference] = position
+            }
         }
         return overflowCount
     }

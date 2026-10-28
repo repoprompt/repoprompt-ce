@@ -285,28 +285,23 @@ import XCTest
             await mutatingManager.awaitInitialized()
             let existingFolder = try makeFolder(named: "ExistingBeforeRootAddition")
             let requestedFolder = try makeFolder(named: "AddedDuringFolderOpen")
-            let existing = mutatingManager.createWorkspace(
+            let creation = try mutatingManager.createPersistentWorkspace(
                 name: "Existing Root Receiver",
                 repoPaths: [existingFolder.path]
             )
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(2))
-            var existingIsAuthoritative = false
-            while clock.now < deadline {
-                let snapshot = await mutatingManager.workspaceRoutingCatalogSnapshot()
-                existingIsAuthoritative = snapshot?.contains(where: { $0.id == existing.id }) == true
-                if existingIsAuthoritative {
-                    break
-                }
-                try await clock.sleep(for: .milliseconds(10))
-            }
-            XCTAssertTrue(existingIsAuthoritative)
+            // Finish setup through its retained receipt before starting the root-edit race.
+            let existing = try await creation.publishedWorkspace()
             let mutationGate = WorkspaceRootMutationTestGate()
+            let folderOpenSnapshotBarrier = TwoPartyAsyncBarrier()
+            openingManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                await folderOpenSnapshotBarrier.arriveAndWait()
+            }
             await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired { workspaceID in
                 guard workspaceID == existing.id else { return }
                 await mutationGate.pauseUntilReleased()
             }
             defer {
+                openingManager.setPersistentFolderOpenDidSnapshotHandlerForTesting(nil)
                 Task {
                     await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired(nil)
                 }
@@ -318,7 +313,8 @@ import XCTest
                 fromFolderURL: requestedFolder,
                 behavior: .createNewWorkspace
             )
-            await Task.yield()
+            // The caller must capture a catalog without the new root while its mutation is gated.
+            await folderOpenSnapshotBarrier.arriveAndWait()
             await mutationGate.release()
             _ = try await (rootAddition, folderOpen)
 

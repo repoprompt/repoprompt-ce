@@ -6,6 +6,7 @@ struct AgentTranscriptUISnapshot: Equatable {
     var presentation: AgentTranscriptPresentationSnapshot
     var isHydrated: Bool
     var presentationRevision: Int
+    var displayMaskRevision: UInt64 = 0
     var followBindingState: AgentModeViewModel.ActiveTranscriptFollowBindingState
     var activeSessionLoadInProgressTabID: UUID?
     var activeBashLiveExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState]
@@ -41,6 +42,7 @@ struct AgentTranscriptUISnapshot: Equatable {
     static func == (lhs: AgentTranscriptUISnapshot, rhs: AgentTranscriptUISnapshot) -> Bool {
         lhs.currentTabID == rhs.currentTabID
             && lhs.presentationRevision == rhs.presentationRevision
+            && lhs.displayMaskRevision == rhs.displayMaskRevision
             && lhs.presentation.tabID == rhs.presentation.tabID
             && lhs.isHydrated == rhs.isHydrated
             && lhs.followBindingState == rhs.followBindingState

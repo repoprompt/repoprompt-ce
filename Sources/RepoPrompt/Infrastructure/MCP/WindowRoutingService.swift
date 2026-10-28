@@ -458,7 +458,10 @@ final class WindowRoutingService: Service {
         }
 
         guard let rawTabParam, !rawTabParam.isEmpty else {
-            throw MCPError.invalidParams("Missing required 'tab' or 'context_id' parameter for '\(action)' action.")
+            let message = action == "close_tab"
+                ? "Missing required 'tab' parameter (UUID or name) for 'close_tab' action."
+                : "Missing required 'tab' or 'context_id' parameter for '\(action)' action."
+            throw MCPError.invalidParams(message)
         }
         return try resolveComposeTab(rawTabParam: rawTabParam, tabs: tabs)
     }
@@ -3083,7 +3086,10 @@ final class WindowRoutingService: Service {
                         )
                     }
 
-                    await targetWindow.promptManager.closeComposeTab(tab.id)
+                    let callerID = await targetWindow.mcpServer.resolveSpawnParentSessionID(
+                        metadata: invocationContext.metadata, targetWindow: targetWindow
+                    )
+                    await targetWindow.promptManager.closeComposeTab(tab.id, deletionOrigin: .mcpClient(callerID))
 
                     return ManageWorkspacesResponse(action: "close_tab", workspaces: nil, tabs: [summary], status: "ok")
 

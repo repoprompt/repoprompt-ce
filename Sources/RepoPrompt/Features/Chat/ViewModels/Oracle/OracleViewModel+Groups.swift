@@ -392,7 +392,7 @@ extension OracleViewModel {
         } else {
             throw ChatToolError.internalError("Resolved Oracle execution is required for a new group.")
         }
-        if let images = tabContext?.transientImages, !images.isEmpty {
+        if let attachments = tabContext?.attachments, !attachments.isEmpty {
             for (laneIndex, laneModel) in roster.orderedModels.enumerated() {
                 let resolution = PromptViewModel.mcpOraclePlanningModelResolution(
                     rawValue: laneModel.modelID,
@@ -400,13 +400,15 @@ extension OracleViewModel {
                 )
                 guard case let .configured(resolvedModel) = resolution else {
                     throw ChatToolError.invalidParams(
-                        "Image attachments require every Oracle lane model to be configured; Oracle \(laneIndex + 1) is unavailable."
+                        "Attachments require every Oracle lane model to be configured; Oracle \(laneIndex + 1) is unavailable."
                     )
                 }
-                guard OracleImageRouteAdmission.supports(resolvedModel) else {
-                    throw ChatToolError.invalidParams(
-                        "Image attachments are not supported by Oracle \(laneIndex + 1)'s model '\(resolvedModel.displayName)' on provider '\(resolvedModel.providerType.displayName)'."
-                    )
+                if case let .failure(error) = AttachmentPlanner.plan(
+                    OracleAttachmentSet(attachments),
+                    route: resolvedModel.attachmentRoute,
+                    limits: .production
+                ) {
+                    throw ChatToolError.invalidParams("Oracle \(laneIndex + 1): \(error.localizedDescription)")
                 }
             }
         }
@@ -861,7 +863,7 @@ extension OracleViewModel {
             agentModeRunID: context.agentModeRunID,
             activationPolicy: .background,
             packaging: context.packaging,
-            transientImages: context.transientImages
+            attachments: context.attachments
         )
     }
 

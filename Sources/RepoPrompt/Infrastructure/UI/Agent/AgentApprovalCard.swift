@@ -74,13 +74,19 @@ struct AgentApprovalCard: View {
 
     private var actionButtons: some View {
         HStack {
-            Button(action: { onDecision(.decline) }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "xmark")
-                    Text("Decline")
+            if request.allows(.decline) {
+                Button(action: { onDecision(.decline) }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "xmark")
+                        Text("Decline")
+                    }
                 }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
+            if case .codex = request.requestID, request.availableDecisions != nil, request.allows(.cancel) {
+                Button("Cancel", action: { onDecision(.cancel) })
+                    .buttonStyle(.bordered)
+            }
 
             Spacer()
 
@@ -94,31 +100,29 @@ struct AgentApprovalCard: View {
                 .buttonStyle(.bordered)
             }
 
-            Button(action: { onDecision(.accept) }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
-                    Text("Approve")
+            if request.availableDecisions == nil || request.supportsPlainApprove {
+                Button(action: { onDecision(.accept) }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                        Text("Approve")
+                    }
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(!request.supportsPlainApprove)
+                .keyboardShortcut(.return, modifiers: [])
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!request.supportsPlainApprove)
-            .keyboardShortcut(.return, modifiers: [])
         }
     }
 
     private var alwaysAllowLabel: String {
-        if request.proposedExecpolicyAmendmentJSON != nil {
+        if case .acceptWithExecpolicyAmendment? = request.rememberedDecision {
             return "Approve & Remember"
         }
         return request.sessionApprovalLabel
     }
 
     private func alwaysAllowDecision() {
-        if let amendment = request.proposedExecpolicyAmendmentJSON, !amendment.isEmpty {
-            onDecision(.acceptWithExecpolicyAmendment(amendment))
-        } else {
-            onDecision(.acceptForSession)
-        }
+        if let decision = request.rememberedDecision { onDecision(decision) }
     }
 }
 

@@ -122,6 +122,7 @@ struct ApplyEditsResultCard: View {
         if let dto {
             switch dto.status.lowercased() {
             case "success": return .success
+            case "no_change": return .neutral
             case "partial", "warning": return .warning
             case "failed", "error": return .failure
             default: break

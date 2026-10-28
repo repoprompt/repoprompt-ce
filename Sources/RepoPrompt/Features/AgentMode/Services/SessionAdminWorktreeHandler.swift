@@ -225,6 +225,10 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         // The ownership row now counts the same identity; the anonymous creation reservation must
         // transfer before an optional bind checks usage, otherwise create+bind charges twice.
         context.scopes.release(reservation)
+        // `info.repoRootPath` is a literal path, but `repo_root` is a selector whose last `@` starts a tree specifier,
+        // so `/tmp/project@main` alone would name `/tmp/project`'s main checkout. Every selector generated from it
+        // appends `@current`: the parser then keeps the whole path as the base and resolves exactly that checkout.
+        let createdRepositorySelector = info.repoRootPath + "@current"
         var reply: [String: Value] = [
             "result": .string("created"), "op": .string("worktree_create"),
             "session_id": .string(target.uuidString), "worktree": info.value,
@@ -233,13 +237,18 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
                 "op": .string("worktree_bind"), "session_id": .string(target.uuidString),
                 "scope_id": .string(batch.scope.id.uuidString), "worktree": .string("@id:\(info.worktreeID)"),
-                "repo_root": .string(info.repoRootPath), "apply": .string("next_boundary")
+                "repo_root": .string(createdRepositorySelector), "apply": .string("next_boundary")
             ])])
         ]
         if bindAfter {
+            // An omitted `repo_root` becomes the selector of the repository creation elected (the one `next_call`
+            // replays) for the bind, any deferred continuation, and their recovery calls: an unqualified `@id:` of the
+            // new checkout is ambiguous when the target's workspace holds several checkouts of its repository. An
+            // explicit token is kept, so a relative one still binds under the logical root it elects.
             let binding: SessionAdminItemResult = if context.scopes.isCurrent(lease) {
                 await bindOne(
-                    lease: lease, scope: batch.scope, caller: caller, worktree: "@id:\(info.worktreeID)", repoRoot: repoRoot, mode: mode
+                    lease: lease, scope: batch.scope, caller: caller, worktree: "@id:\(info.worktreeID)",
+                    repoRoot: repoRoot ?? createdRepositorySelector, mode: mode
                 )
             } else {
                 .revoked(target)
@@ -332,7 +341,7 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     "next_call": .object(["tool": .string("session_admin"), "arguments": .object([
                         "op": .string("worktree_bind"), "scope_id": .string(scope.id.uuidString),
                         "session_id": .string(target.uuidString), "worktree": .string(worktree), "apply": .string("next_boundary")
-                    ])])
+                    ].merging(repoRoot.map { ["repo_root": Value.string($0)] } ?? [:]) { current, _ in current })])
                 ]
             )
         } catch {
@@ -649,8 +658,12 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         // Prunability checks suspend. Re-prove the whole chain and every named member before
         // returning worktree paths or deferred outcomes; a stale pre-await census is not authority.
         try Task.checkCancellation()
+        // A chain snapshot alone does not refresh time-based expiry. Read through the authority
+        // runtime first so expiry (including any ancestor's) cascades before the disclosure fence.
+        let refreshedScope = context.scopes.record(id: batch.scope.id)
         let currentChain = context.scopeChain(of: batch.scope)
-        guard !initialChain.isEmpty, currentChain.count == initialChain.count,
+        guard refreshedScope?.isActive == true, refreshedScope?.generation == batch.scope.generation,
+              !initialChain.isEmpty, currentChain.count == initialChain.count,
               zip(initialChain, currentChain).allSatisfy({ before, after in
                   before.id == after.id && before.generation == after.generation && after.isActive
               }),

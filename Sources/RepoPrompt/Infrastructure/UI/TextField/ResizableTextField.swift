@@ -3,17 +3,47 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum AttachmentPasteboard {
+    static let readableTypes: [NSPasteboard.PasteboardType] =
+        [.fileURL] + NSImage.imageTypes.map { NSPasteboard.PasteboardType($0) }
+
+    static func isRegularFile(_ url: URL) -> Bool {
+        guard url.isFileURL,
+              let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
+        else { return false }
+        return values.isRegularFile == true
+    }
+
+    static func isDirectory(_ url: URL) -> Bool {
+        guard url.isFileURL,
+              let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+        else { return false }
+        return values.isDirectory == true
+    }
+
+    static func regularFileURLs(in pasteboard: NSPasteboard) -> [URL] {
+        var urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
+        for item in pasteboard.pasteboardItems ?? [] {
+            if let fileURLString = item.string(forType: .fileURL),
+               let fileURL = URL(string: fileURLString)
+            {
+                urls.append(fileURL)
+            } else if let fileURLData = item.data(forType: .fileURL),
+                      let fileURL = URL(dataRepresentation: fileURLData, relativeTo: nil)
+            {
+                urls.append(fileURL)
+            }
+        }
+        var seenPaths: Set<String> = []
+        return urls
+            .map(\.standardizedFileURL)
+            .filter { isRegularFile($0) && seenPaths.insert($0.path).inserted }
+    }
+}
+
 enum ImagePasteboardTypes {
     static let legacyApplePNG = NSPasteboard.PasteboardType("Apple PNG pasteboard type")
     static let legacyNeXTTIFF = NSPasteboard.PasteboardType("NeXT TIFF v4.0 pasteboard type")
-
-    static let explicitImageReadableTypes: [NSPasteboard.PasteboardType] = [
-        NSPasteboard.PasteboardType(UTType.image.identifier),
-        NSPasteboard.PasteboardType(UTType.png.identifier),
-        NSPasteboard.PasteboardType(UTType.tiff.identifier),
-        legacyApplePNG,
-        legacyNeXTTIFF
-    ]
 
     static func canonicalImageType(forIdentifier identifier: String) -> UTType? {
         if let type = UTType(identifier), type.conforms(to: .image) {
@@ -39,14 +69,66 @@ enum ImagePasteboardTypes {
     }
 }
 
-final class ImageAwareTextView: NSTextView {
-    var imagePasteHandler: ((NSPasteboard) -> Bool)?
-    var enablesImagePasteHandling = false
+final class AttachmentAwareTextView: NSTextView {
+    var attachmentPasteHandler: ((NSPasteboard) -> Bool)?
+    var enablesAttachmentPasteHandling = false
     var commandReturnHandler: (() -> Bool)?
+    /// Which key press triggers `commandReturnHandler`; `nil` keeps the fixed Command-Return.
+    var commandReturnMatcher: ((NSEvent) -> Bool)?
+    var readOnlyReturnHandler: (() -> Void)?
+    var beginUserEditingHandler: (() -> Void)?
+    private(set) var currentKeyDownEvent: NSEvent?
+
+    override func insertText(_ insertString: Any, replacementRange: NSRange) {
+        if isEditable { beginUserEditingHandler?() }
+        super.insertText(insertString, replacementRange: replacementRange)
+    }
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        if isEditable { beginUserEditingHandler?() }
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let previousEvent = currentKeyDownEvent
+        currentKeyDownEvent = event
+        defer { currentKeyDownEvent = previousEvent }
+        if handleReadOnlyReturn(event) { return }
+        // Remapped bindings without Command never reach performKeyEquivalent.
+        if commandReturnMatcher != nil, isEditable, !hasMarkedText(), let commandReturnHandler,
+           isCommandReturnTrigger(event), event.isARepeat || commandReturnHandler()
+        {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    func isCommandReturnTrigger(_ event: NSEvent) -> Bool {
+        commandReturnMatcher?(event) ?? Self.isCommandReturn(event)
+    }
+
+    /// Non-editable NSTextView does not reliably forward insertion commands to its delegate.
+    /// Handle only plain Return here; IME, newline and command shortcuts keep native ownership.
+    func handleReadOnlyReturn(_ event: NSEvent) -> Bool {
+        guard !isEditable, !hasMarkedText(), let readOnlyReturnHandler,
+              event.keyCode == 36 || event.keyCode == 76,
+              event.modifierFlags.intersection([.shift, .command, .option, .control]).isEmpty else { return false }
+        if !event.isARepeat { readOnlyReturnHandler() }
+        return true
+    }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if Self.isCommandReturn(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
-           commandReturnHandler?() == true { return true }
+        if window?.firstResponder === self, isEditable, !hasMarkedText(),
+           event.modifierFlags.intersection([.command, .option, .control]) == .command,
+           event.charactersIgnoringModifiers?.lowercased() == "z"
+        {
+            beginUserEditingHandler?()
+        }
+        if isCommandReturnTrigger(event), window?.firstResponder === self, isEditable, !hasMarkedText(),
+           let commandReturnHandler
+        {
+            if event.isARepeat || commandReturnHandler() { return true }
+        }
         return super.performKeyEquivalent(with: event)
     }
 
@@ -57,10 +139,10 @@ final class ImageAwareTextView: NSTextView {
 
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
         var types = super.readablePasteboardTypes
-        guard enablesImagePasteHandling else {
+        guard enablesAttachmentPasteHandling else {
             return types
         }
-        for type in ImagePasteboardTypes.explicitImageReadableTypes where !types.contains(type) {
+        for type in AttachmentPasteboard.readableTypes where !types.contains(type) {
             types.append(type)
         }
         return types
@@ -69,7 +151,7 @@ final class ImageAwareTextView: NSTextView {
     override func paste(_ sender: Any?) {
         guard isEditable else { return }
         let pasteboard = sender as? NSPasteboard ?? NSPasteboard.general
-        if enablesImagePasteHandling, imagePasteHandler?(pasteboard) == true {
+        if enablesAttachmentPasteHandling, attachmentPasteHandler?(pasteboard) == true {
             return
         }
         super.paste(sender)
@@ -77,9 +159,9 @@ final class ImageAwareTextView: NSTextView {
 
     override func readSelection(from pboard: NSPasteboard, type: NSPasteboard.PasteboardType) -> Bool {
         guard isEditable else { return false }
-        if enablesImagePasteHandling,
-           isImageLikePasteboardType(type),
-           imagePasteHandler?(pboard) == true
+        if enablesAttachmentPasteHandling,
+           isImageLikePasteboardType(type) || type == .fileURL,
+           attachmentPasteHandler?(pboard) == true
         {
             return true
         }
@@ -92,18 +174,18 @@ final class ImageAwareTextView: NSTextView {
         if superOperation != [] {
             return superOperation
         }
-        guard enablesImagePasteHandling else {
+        guard enablesAttachmentPasteHandling else {
             return []
         }
-        return canHandleImageDrop(from: sender.draggingPasteboard) ? .copy : []
+        return canHandleAttachmentDrop(from: sender.draggingPasteboard) ? .copy : []
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
         guard isEditable else { return false }
-        guard enablesImagePasteHandling else {
+        guard enablesAttachmentPasteHandling else {
             return super.prepareForDragOperation(sender)
         }
-        if canHandleImageDrop(from: sender.draggingPasteboard) {
+        if canHandleAttachmentDrop(from: sender.draggingPasteboard) {
             return true
         }
         return super.prepareForDragOperation(sender)
@@ -111,39 +193,23 @@ final class ImageAwareTextView: NSTextView {
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         guard isEditable else { return false }
-        guard enablesImagePasteHandling else {
+        guard enablesAttachmentPasteHandling else {
             return super.performDragOperation(sender)
         }
         let pasteboard = sender.draggingPasteboard
-        guard canHandleImageDrop(from: pasteboard) else {
+        guard canHandleAttachmentDrop(from: pasteboard) else {
             return super.performDragOperation(sender)
         }
-        _ = imagePasteHandler?(pasteboard)
-        // Consume image-like drops so file paths are not inserted into the text body.
+        _ = attachmentPasteHandler?(pasteboard)
+        // Consume attachable drops so file paths are not inserted into the text body.
         return true
     }
 
-    private func canHandleImageDrop(from pasteboard: NSPasteboard) -> Bool {
-        if let types = pasteboard.types {
-            for type in types where isImageLikePasteboardType(type) {
-                return true
-            }
+    private func canHandleAttachmentDrop(from pasteboard: NSPasteboard) -> Bool {
+        if let types = pasteboard.types, types.contains(where: isImageLikePasteboardType) {
+            return true
         }
-
-        if let urlObjects = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-            for url in urlObjects where url.isFileURL {
-                if let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
-                   contentType.conforms(to: .image)
-                {
-                    return true
-                }
-                if let extType = UTType(filenameExtension: url.pathExtension), extType.conforms(to: .image) {
-                    return true
-                }
-            }
-        }
-
-        return false
+        return !AttachmentPasteboard.regularFileURLs(in: pasteboard).isEmpty
     }
 
     private func isImageLikePasteboardType(_ type: NSPasteboard.PasteboardType) -> Bool {
@@ -195,20 +261,61 @@ struct TextFieldExternalEditTransaction: Equatable {
     let isComplete: Bool
 }
 
+struct TextFieldExternalEditTakeover {
+    let id: UUID
+    let revision: Int
+}
+
+@MainActor
+final class TextFieldNativeEditor {
+    struct Snapshot {
+        let text: String
+        let hasMarkedText: Bool
+    }
+
+    private weak var textView: NSTextView?
+    private var identity: AnyHashable?
+
+    func snapshot(matching identity: AnyHashable) -> Snapshot? {
+        guard self.identity == identity, let textView, textView.window != nil else { return nil }
+        return .init(text: textView.string, hasMarkedText: textView.hasMarkedText())
+    }
+
+    func attach(_ textView: NSTextView, identity: AnyHashable?) {
+        self.textView = textView
+        self.identity = identity
+    }
+
+    func detach(_ textView: NSTextView) {
+        guard self.textView === textView else { return }
+        self.textView = nil
+        identity = nil
+    }
+}
+
 struct ResizableTextField: View {
     @Binding var text: String
     let placeholder: String
     var onReturn: () -> Void
     @Binding var resetTrigger: Bool
-    var onImagePaste: ((NSPasteboard) -> Bool)?
+    var onAttachmentPaste: ((NSPasteboard) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
     /// Revision for intentional programmatic text changes while the editor is focused.
     var externalUpdateTick: Int? = .none
     var isReadOnly = false
     var externalEditTransaction: TextFieldExternalEditTransaction?
     var onUndoExternalEdit: (() -> Void)?
+    /// Checks the live operation against the last yielded ID before native text or IME changes.
+    var onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
+    /// Optional configurable trigger for `onCommandReturn`; `nil` keeps Command-Return.
+    var commandReturnMatcher: ((NSEvent) -> Bool)?
+    var onReadOnlyReturn: (() -> Void)?
+    /// Explicit, scoped handoff after a transient composer interaction finishes.
+    var focusRestoreRequest: UUID?
+    var nativeEditor: TextFieldNativeEditor?
+    var nativeEditorIdentity: AnyHashable?
 
     /// Callback for height changes to coordinate with parent
     var onHeightChange: (CGFloat) -> Void = { _ in }
@@ -264,14 +371,20 @@ struct ResizableTextField: View {
             text: $text,
             placeholder: placeholder,
             onReturn: onReturn,
-            onImagePaste: onImagePaste,
+            onAttachmentPaste: onAttachmentPaste,
             features: features,
             externalUpdateTick: externalUpdateTick,
             isReadOnly: isReadOnly,
             externalEditTransaction: externalEditTransaction,
             onUndoExternalEdit: onUndoExternalEdit,
+            onBeginUserEditing: onBeginUserEditing,
             onEscape: onEscape,
             onCommandReturn: onCommandReturn,
+            commandReturnMatcher: commandReturnMatcher,
+            onReadOnlyReturn: onReadOnlyReturn,
+            focusRestoreRequest: focusRestoreRequest,
+            nativeEditor: nativeEditor,
+            nativeEditorIdentity: nativeEditorIdentity,
             currentHeightPresetIndex: $currentHeightPresetIndex,
             onHeightChange: onHeightChange
         )
@@ -303,14 +416,23 @@ struct CustomTextField: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
     var onReturn: () -> Void
-    var onImagePaste: ((NSPasteboard) -> Bool)?
+    var onAttachmentPaste: ((NSPasteboard) -> Bool)?
     var features: ResizableTextFieldFeatures = .plain
     var externalUpdateTick: Int? = .none
     var isReadOnly = false
     var externalEditTransaction: TextFieldExternalEditTransaction?
     var onUndoExternalEdit: (() -> Void)?
+    /// Checks the live operation against the last yielded ID before native text or IME changes.
+    var onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?
     var onEscape: (() -> Void)?
     var onCommandReturn: (() -> Bool)?
+    /// Optional configurable trigger for `onCommandReturn`; `nil` keeps Command-Return.
+    var commandReturnMatcher: ((NSEvent) -> Bool)?
+    var onReadOnlyReturn: (() -> Void)?
+    /// Explicit, scoped handoff after a transient composer interaction finishes.
+    var focusRestoreRequest: UUID?
+    var nativeEditor: TextFieldNativeEditor?
+    var nativeEditorIdentity: AnyHashable?
     @Binding var currentHeightPresetIndex: Int
 
     /// Callback for height changes
@@ -335,8 +457,8 @@ struct CustomTextField: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = ImageAwareTextView.scrollableTextView()
-        guard let textView = scrollView.documentView as? ImageAwareTextView else {
+        let scrollView = AttachmentAwareTextView.scrollableTextView()
+        guard let textView = scrollView.documentView as? AttachmentAwareTextView else {
             return scrollView
         }
 
@@ -378,9 +500,15 @@ struct CustomTextField: NSViewRepresentable {
         textView.layoutManager?.usesFontLeading = true
 
         textView.delegate = context.coordinator
+        textView.beginUserEditingHandler = { [weak coordinator = context.coordinator, weak textView] in
+            guard let textView else { return }
+            coordinator?.beginUserEditingIfNeeded(textView: textView)
+        }
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
-        textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
-        textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
+        textView.commandReturnMatcher = commandReturnMatcher
+        textView.readOnlyReturnHandler = onReadOnlyReturn
+        textView.attachmentPasteHandler = isReadOnly ? nil : onAttachmentPaste
+        textView.enablesAttachmentPasteHandling = !isReadOnly && onAttachmentPaste != nil
         context.coordinator.configureFileTagSupport(
             textView: textView,
             enabled: features.enableFileTagOverlay && !isReadOnly,
@@ -399,6 +527,8 @@ struct CustomTextField: NSViewRepresentable {
         textView.string = text
         context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
         context.coordinator.clearUndoHistory()
+        context.coordinator.nativeEditorIdentity = nativeEditorIdentity
+        context.coordinator.connectNativeEditor(textView: textView)
 
         // Initial height calculation
         Task { @MainActor in
@@ -410,12 +540,16 @@ struct CustomTextField: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         context.coordinator.parent = self
-        guard let textView = nsView.documentView as? ImageAwareTextView else { return }
+        guard let textView = nsView.documentView as? AttachmentAwareTextView else { return }
+        defer { context.coordinator.connectNativeEditor(textView: textView) }
         textView.isEditable = !isReadOnly
+        context.coordinator.restoreFocusIfRequested(textView: textView)
         context.coordinator.beginExternalEditIfNeeded()
         textView.commandReturnHandler = isReadOnly ? nil : onCommandReturn
-        textView.imagePasteHandler = isReadOnly ? nil : onImagePaste
-        textView.enablesImagePasteHandling = !isReadOnly && onImagePaste != nil
+        textView.commandReturnMatcher = commandReturnMatcher
+        textView.readOnlyReturnHandler = onReadOnlyReturn
+        textView.attachmentPasteHandler = isReadOnly ? nil : onAttachmentPaste
+        textView.enablesAttachmentPasteHandling = !isReadOnly && onAttachmentPaste != nil
         if textView.font != fontPreset.nsFont {
             textView.font = fontPreset.nsFont
             Task { @MainActor in
@@ -438,26 +572,35 @@ struct CustomTextField: NSViewRepresentable {
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
 
+        if context.coordinator.shouldIgnoreYieldedExternalUpdate(externalUpdateTick) {
+            context.coordinator.pendingExternalTextUpdate = nil
+            if let externalUpdateTick {
+                context.coordinator.lastAppliedExternalUpdateTick = max(context.coordinator.lastAppliedExternalUpdateTick ?? externalUpdateTick, externalUpdateTick)
+            }
+            return
+        }
+
         var appliedProgrammaticTextChange = false
         let isFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
         let hasPendingExternalUpdate = externalUpdateTick.map {
             context.coordinator.lastAppliedExternalUpdateTick != $0
         } ?? false
+        let isNativeIdentityChanging = context.coordinator.nativeEditorIdentity != nativeEditorIdentity
+        if textView.hasMarkedText(), textView.string != text || isNativeIdentityChanging {
+            if hasPendingExternalUpdate || isNativeIdentityChanging {
+                context.coordinator.pendingExternalTextUpdate = (
+                    text: text,
+                    tick: externalUpdateTick,
+                    identity: nativeEditorIdentity
+                )
+            }
+            return
+        }
         // Avoid replacing active user edits with a stale SwiftUI binding snapshot. Explicit
         // external updates are allowed through via externalUpdateTick. Callers that do not
         // opt into revision tracking retain the previous synchronization behavior.
         if textView.string != text {
-            let hasMarkedText = textView.hasMarkedText()
-            if hasMarkedText {
-                if let externalUpdateTick, hasPendingExternalUpdate {
-                    context.coordinator.pendingExternalTextUpdate = (
-                        text: text,
-                        tick: externalUpdateTick
-                    )
-                }
-                return
-            }
-            let shouldApplyFocusedBindingUpdate = externalUpdateTick == nil || hasPendingExternalUpdate
+            let shouldApplyFocusedBindingUpdate = externalUpdateTick == nil || hasPendingExternalUpdate || isNativeIdentityChanging
             guard Self.shouldApplyTextSynchronization(
                 isFirstResponder: isFirstResponder,
                 hasMarkedText: false,
@@ -476,6 +619,8 @@ struct CustomTextField: NSViewRepresentable {
                 context.coordinator.lastAppliedExternalUpdateTick = externalUpdateTick
             }
         }
+        context.coordinator.pendingExternalTextUpdate = nil
+        context.coordinator.nativeEditorIdentity = nativeEditorIdentity
         context.coordinator.completeExternalEditIfNeeded()
         if appliedProgrammaticTextChange, !isReadOnly {
             context.coordinator.scheduleFileTagSuggestionsRefresh(for: textView, immediate: true)
@@ -485,10 +630,15 @@ struct CustomTextField: NSViewRepresentable {
 
     // NEW: stop callbacks after view is torn down
     static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
-        guard let textView = nsView.documentView as? ImageAwareTextView else { return }
+        guard let textView = nsView.documentView as? AttachmentAwareTextView else { return }
         textView.delegate = nil
-        textView.imagePasteHandler = nil
+        textView.attachmentPasteHandler = nil
         textView.commandReturnHandler = nil
+        textView.commandReturnMatcher = nil
+        textView.readOnlyReturnHandler = nil
+        textView.beginUserEditingHandler = nil
+        coordinator.connectedNativeEditor?.detach(textView)
+        coordinator.focusRestorationTask?.cancel()
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
@@ -499,14 +649,58 @@ struct CustomTextField: NSViewRepresentable {
     @MainActor
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: CustomTextField
+        var lastFocusRestoreRequest: UUID?
+        var focusRestorationTask: Task<Void, Never>?
+        weak var connectedNativeEditor: TextFieldNativeEditor?
+        var nativeEditorIdentity: AnyHashable?
+
+        func connectNativeEditor(textView: NSTextView) {
+            if connectedNativeEditor !== parent.nativeEditor { connectedNativeEditor?.detach(textView) }
+            parent.nativeEditor?.attach(textView, identity: nativeEditorIdentity)
+            connectedNativeEditor = parent.nativeEditor
+        }
+
+        /// Only reclaim abandoned/container focus. Never steal a live sibling field's editor.
+        static func mayRestoreFocus(to textView: NSTextView, in window: NSWindow) -> Bool {
+            guard window.isKeyWindow else { return false }
+            guard let responder = window.firstResponder else { return true }
+            if responder === window || responder === textView { return true }
+            guard let view = responder as? NSView else { return false }
+            if view.window !== window || textView.isDescendant(of: view) { return true }
+            if let fieldEditor = view as? NSTextView, fieldEditor.isFieldEditor,
+               let owner = fieldEditor.delegate as? NSView
+            {
+                return owner.window !== window
+            }
+            return false
+        }
+
+        func restoreFocusIfRequested(textView: NSTextView) {
+            let request = parent.focusRestoreRequest
+            guard request != lastFocusRestoreRequest else { return }
+            lastFocusRestoreRequest = request
+            focusRestorationTask?.cancel()
+            focusRestorationTask = nil
+            guard let request else { return }
+            focusRestorationTask = Task { @MainActor [weak self, weak textView] in
+                await Task.yield()
+                guard let self, let textView, !Task.isCancelled, isActive,
+                      parent.focusRestoreRequest == request, let window = textView.window,
+                      Self.mayRestoreFocus(to: textView, in: window) else { return }
+                window.makeFirstResponder(textView)
+            }
+        }
+
         var internalUpdateInProgress = false
         var lastReportedHeight: CGFloat?
         var lastAppliedExternalUpdateTick: Int?
-        var pendingExternalTextUpdate: (text: String, tick: Int)?
+        var pendingExternalTextUpdate: (text: String, tick: Int?, identity: AnyHashable?)?
 
         private let textViewUndoManager = UndoManager()
         private var externalEditID: UUID?
         private var externalEditUndoRegistered = false
+        private var yieldedExternalEditID: UUID?
+        private var yieldedExternalUpdateThroughTick: Int?
         private let fileTagHelper = FileTagMentionHelper()
         private let slashSkillHelper = SlashSkillMentionHelper()
         // NEW: mark inactive after dismantle
@@ -514,6 +708,32 @@ struct CustomTextField: NSViewRepresentable {
 
         init(_ parent: CustomTextField) {
             self.parent = parent
+        }
+
+        func shouldIgnoreYieldedExternalUpdate(_ tick: Int?) -> Bool {
+            guard let tick, let yieldedExternalUpdateThroughTick else { return false }
+            return tick <= yieldedExternalUpdateThroughTick
+        }
+
+        func beginUserEditingIfNeeded(textView: NSTextView) {
+            guard isActive, !internalUpdateInProgress, !parent.isReadOnly,
+                  nativeEditorIdentity == parent.nativeEditorIdentity,
+                  let onBeginUserEditing = parent.onBeginUserEditing,
+                  let takeover = onBeginUserEditing(textView.string, yieldedExternalEditID) else { return }
+            beginExternalEditIfNeeded()
+            yieldedExternalEditID = takeover.id
+            yieldedExternalUpdateThroughTick = takeover.revision
+            pendingExternalTextUpdate = nil
+            if parent.externalEditTransaction?.id == takeover.id {
+                registerExternalEditUndoIfNeeded()
+            } else {
+                externalEditUndoRegistered = true
+            }
+        }
+
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            if !internalUpdateInProgress { beginUserEditingIfNeeded(textView: textView) }
+            return true
         }
 
         func textDidChange(_ notification: Notification) {
@@ -538,6 +758,8 @@ struct CustomTextField: NSViewRepresentable {
                 } else {
                     lastAppliedExternalUpdateTick = pendingExternalTextUpdate.tick
                 }
+                nativeEditorIdentity = pendingExternalTextUpdate.identity
+                connectNativeEditor(textView: textView)
             } else {
                 parent.text = textView.string
             }
@@ -562,11 +784,27 @@ struct CustomTextField: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            // AppKit can deliver a command while the window still reports a KitDefined event.
+            // Key-only accessors such as isARepeat raise an Objective-C exception for that event.
+            let currentEvent = (textView as? AttachmentAwareTextView)?.currentKeyDownEvent ?? textView.window?.currentEvent
+            let event = currentEvent?.type == .keyDown ? currentEvent : nil
             if parent.isReadOnly, commandSelector == #selector(NSResponder.cancelOperation(_:)) {
                 parent.onEscape?()
                 return true
             }
-            if parent.isReadOnly { return false }
+            if parent.isReadOnly {
+                // Preparation locks editing, not the composer's explicit Return override.
+                let flags = event?.modifierFlags.intersection(.deviceIndependentFlagsMask) ?? []
+                if commandSelector == #selector(NSResponder.insertNewline(_:)),
+                   !textView.hasMarkedText(), isActive,
+                   flags.intersection([.shift, .command, .option, .control]).isEmpty,
+                   let onReturn = parent.onReadOnlyReturn
+                {
+                    if event?.isARepeat != true { onReturn() }
+                    return true
+                }
+                return false
+            }
             // IME FIX: if composing, let IME handle keys (Return/space/numbers etc.)
             if textView.hasMarkedText() { return false }
             guard isActive else { return false }
@@ -590,24 +828,30 @@ struct CustomTextField: NSViewRepresentable {
                 return true
             }
             if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                // Use the *current* event to read modifier flags (more reliable)
-                let flags = textView.window?.currentEvent?.modifierFlags ?? []
-                if flags.contains(.shift) {
+                let flags = event?.modifierFlags.intersection([.shift, .command, .option, .control]) ?? []
+                if flags == .shift {
                     textView.insertNewline(nil) // Shift+Return → newline
-                } else if flags.contains(.command), !flags.contains(.option), !flags.contains(.control), let action = parent.onCommandReturn {
+                } else if flags == .command, let action = parent.onCommandReturn,
+                          parent.commandReturnMatcher.map({ matches in event.map(matches) ?? false }) ?? true
+                {
+                    if event?.isARepeat == true { return true }
                     return action()
-                } else {
-                    parent.onReturn() // Plain Return → send
-                }
+                } else if flags.isEmpty {
+                    // A held Return is not an explicit second press/submit.
+                    if event?.isARepeat != true {
+                        parent.text = textView.string
+                        parent.onReturn()
+                    }
+                } else { return false }
                 return true
             }
             // Some keyboards/IMEs use insertLineBreak for Shift+Return; let it fall through to newline.
             if commandSelector == #selector(NSResponder.insertLineBreak(_:)) { return false }
             if commandSelector == #selector(NSText.paste(_:)) {
-                if let imageAwareTextView = textView as? ImageAwareTextView {
-                    return imageAwareTextView.imagePasteHandler?(NSPasteboard.general) == true
+                if let imageAwareTextView = textView as? AttachmentAwareTextView {
+                    return imageAwareTextView.attachmentPasteHandler?(NSPasteboard.general) == true
                 }
-                return parent.onImagePaste?(NSPasteboard.general) == true
+                return parent.onAttachmentPaste?(NSPasteboard.general) == true
             }
             return false
         }
@@ -656,19 +900,42 @@ struct CustomTextField: NSViewRepresentable {
         func beginExternalEditIfNeeded() {
             let id = parent.externalEditTransaction?.id
             guard id != externalEditID else { return }
+            if let id, id == yieldedExternalEditID {
+                externalEditID = id
+                return
+            }
             if id != nil, !textViewUndoManager.isUndoing, !textViewUndoManager.isRedoing {
                 textViewUndoManager.removeAllActions()
             }
             externalEditID = id
             externalEditUndoRegistered = false
+            yieldedExternalEditID = nil
+            yieldedExternalUpdateThroughTick = nil
         }
 
         func completeExternalEditIfNeeded() {
-            guard parent.externalEditTransaction?.isComplete == true, !externalEditUndoRegistered else { return }
+            guard parent.externalEditTransaction?.isComplete == true else { return }
+            registerExternalEditUndoIfNeeded()
+        }
+
+        private func registerExternalEditUndoIfNeeded() {
+            guard parent.externalEditTransaction != nil, !externalEditUndoRegistered else { return }
             externalEditUndoRegistered = true
             let undo = parent.onUndoExternalEdit
+            let ownsUndoGroup = textViewUndoManager.groupingLevel == 0
+            if ownsUndoGroup { textViewUndoManager.beginUndoGrouping() }
             textViewUndoManager.registerUndo(withTarget: self) { _ in undo?() }
             textViewUndoManager.setActionName("Re-prompt")
+            if ownsUndoGroup { textViewUndoManager.endUndoGrouping() }
+            // An explicit group can leave the implicit event group open. Split that outer group
+            // after the rewrite, then leave a fresh event group for native typing registration.
+            // Do not toggle groupsByEvent or close explicitly nested/undo/redo-owned groups.
+            if textViewUndoManager.groupsByEvent, textViewUndoManager.groupingLevel == 1,
+               !textViewUndoManager.isUndoing, !textViewUndoManager.isRedoing
+            {
+                textViewUndoManager.endUndoGrouping()
+                textViewUndoManager.beginUndoGrouping()
+            }
         }
 
         func clearUndoHistory() {
@@ -698,7 +965,7 @@ struct CustomTextField: NSViewRepresentable {
         }
 
         func configureFileTagSupport(
-            textView: ImageAwareTextView,
+            textView: AttachmentAwareTextView,
             enabled: Bool,
             store: WorkspaceFileContextStore?,
             searchService: WorkspaceSearchService?,
@@ -733,7 +1000,7 @@ struct CustomTextField: NSViewRepresentable {
         }
 
         func configureSlashSkillSupport(
-            textView: ImageAwareTextView,
+            textView: AttachmentAwareTextView,
             enabled: Bool,
             suggestionsProvider: ((String) async -> [MentionSuggestion])?
         ) {

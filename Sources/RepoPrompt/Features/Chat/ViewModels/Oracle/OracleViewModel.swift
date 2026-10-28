@@ -422,7 +422,7 @@ actor MessageFinalisationHub {
 }
 
 private struct SessionRunState {
-    var pendingImagePreparationID: UUID?
+    var pendingAttachmentPreparationID: UUID?
     var activeQueryId: UUID?
     var activeStreamId: ChatStreamID?
     var isStreaming: Bool {
@@ -659,6 +659,7 @@ class OracleViewModel: ObservableObject {
 
     /// Store Combine cancellables
     private var cancellables = Set<AnyCancellable>()
+    private var activeComposeTabChangedSubscription: AnyCancellable?
 
     /// Token for tab-close listener (to remove on deinit if needed)
     private var tabCloseListenerToken: UUID?
@@ -1090,7 +1091,7 @@ class OracleViewModel: ObservableObject {
             stream: AsyncThrowingStream<ChatStreamOutput, Error>
         )
 
-        var oracleImageThumbnailsForTesting: (@MainActor ([AITransientImage]) async throws -> [AIChatImageAttachment])?
+        var oracleImageThumbnailsForTesting: (@MainActor ([OracleAttachment]) async throws -> [AIChatFileAttachment])?
 
         var oracleReviewPackagingTraceObserverForTesting:
             OracleReviewPackagingTraceContext.Observer?
@@ -1099,6 +1100,12 @@ class OracleViewModel: ObservableObject {
         var workspaceChatSessionCancellationBeforeCleanupForTesting: (@MainActor @Sendable (UUID, UUID?) async -> Void)?
         var workspaceChatSessionDeletionBeforeCommitForTesting: (@MainActor @Sendable (UUID) async -> Void)?
         var workspaceChatSessionLoadBeforePublicationForTesting: (@MainActor @Sendable (UUID, UInt64) async -> Void)?
+        /// Revoke admission before the fixture's first yield; already-enqueued tasks are not cancelled.
+        func disableActiveComposeTabChangedListenerForTesting() {
+            activeComposeTabChangedSubscription?.cancel()
+            activeComposeTabChangedSubscription = nil
+        }
+
         var workspaceChatSessionLoadGenerationForTesting: UInt64 {
             workspaceChatSessionLoadGeneration
         }
@@ -1217,7 +1224,7 @@ class OracleViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        NotificationCenter.default.publisher(for: .activeComposeTabChanged)
+        activeComposeTabChangedSubscription = NotificationCenter.default.publisher(for: .activeComposeTabChanged)
             .receive(on: RunLoop.main)
             .sink { [weak self] notification in
                 guard let self,
@@ -1228,7 +1235,6 @@ class OracleViewModel: ObservableObject {
                     await self?.handleActiveComposeTabChanged(tabID: tabID)
                 }
             }
-            .store(in: &cancellables)
 
         // Initial value
         updateUpcomingInputTokenText()
@@ -2497,7 +2503,7 @@ class OracleViewModel: ObservableObject {
                 timestamp: Date(),
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
-                imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
+                fileAttachments: msg.fileAttachments.isEmpty ? nil : msg.fileAttachments,
                 promptTokens: msg.promptTokens,
                 completionTokens: msg.completionTokens,
                 cost: msg.cost,
@@ -3048,7 +3054,7 @@ class OracleViewModel: ObservableObject {
                 timestamp: Date(),
                 sequenceIndex: msg.sequenceIndex,
                 allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
-                imageAttachments: msg.imageAttachments.isEmpty ? nil : msg.imageAttachments,
+                fileAttachments: msg.fileAttachments.isEmpty ? nil : msg.fileAttachments,
                 promptTokens: msg.promptTokens,
                 completionTokens: msg.completionTokens,
                 cost: msg.cost,
@@ -3245,7 +3251,7 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
-        oracleTransientImages: [AITransientImage] = [],
+        oracleAttachments: [OracleAttachment] = [],
         completionPolicy: OracleResponseCompletionPolicy = .interactive,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
@@ -3278,38 +3284,38 @@ class OracleViewModel: ObservableObject {
         // Create the user message
         // Only suspend when images are attached so the text-only path keeps
         // creating the user message synchronously on the main actor.
-        let preparationID = oracleTransientImages.isEmpty ? nil : UUID()
-        runStateBySession[targetSessionID]?.pendingImagePreparationID = preparationID
+        let preparationID = oracleAttachments.isEmpty ? nil : UUID()
+        runStateBySession[targetSessionID]?.pendingAttachmentPreparationID = preparationID
         defer {
             if let preparationID,
-               runStateBySession[targetSessionID]?.pendingImagePreparationID == preparationID
+               runStateBySession[targetSessionID]?.pendingAttachmentPreparationID == preparationID
             {
-                runStateBySession[targetSessionID]?.pendingImagePreparationID = nil
+                runStateBySession[targetSessionID]?.pendingAttachmentPreparationID = nil
             }
         }
-        let imageAttachments: [AIChatImageAttachment]
+        let fileAttachments: [AIChatFileAttachment]
         do {
-            if oracleTransientImages.isEmpty {
-                imageAttachments = []
+            if oracleAttachments.isEmpty {
+                fileAttachments = []
             } else {
                 #if DEBUG
                     if let override = oracleImageThumbnailsForTesting {
-                        imageAttachments = try await override(oracleTransientImages)
+                        fileAttachments = try await override(oracleAttachments)
                     } else {
-                        imageAttachments = try await AIChatImageAttachment.thumbnails(from: oracleTransientImages)
+                        fileAttachments = try await AIChatFileAttachment.thumbnails(from: oracleAttachments)
                     }
                 #else
-                    imageAttachments = try await AIChatImageAttachment.thumbnails(from: oracleTransientImages)
+                    fileAttachments = try await AIChatFileAttachment.thumbnails(from: oracleAttachments)
                 #endif
             }
         } catch {
             return nil
         }
         guard !Task.isCancelled, contextBuilderScope?.isLive != false,
-              preparationID == nil || runStateBySession[targetSessionID]?.pendingImagePreparationID == preparationID
+              preparationID == nil || runStateBySession[targetSessionID]?.pendingAttachmentPreparationID == preparationID
         else { return nil }
         if preparationID != nil {
-            runStateBySession[targetSessionID]?.pendingImagePreparationID = nil
+            runStateBySession[targetSessionID]?.pendingAttachmentPreparationID = nil
         }
         let userId = UUID()
         let userMessage = AIChatMessage(
@@ -3317,7 +3323,7 @@ class OracleViewModel: ObservableObject {
             content: newUserMessage,
             isUser: true,
             sequenceIndex: nextSequenceIndex(for: targetSessionID),
-            imageAttachments: imageAttachments
+            fileAttachments: fileAttachments
         )
         withSessionMessages(targetSessionID) { msgs in
             msgs.append(userMessage)
@@ -3451,8 +3457,8 @@ class OracleViewModel: ObservableObject {
                         reviewGitContextOverride: reviewGitContextOverride
                     )
                 }
-                if !oracleTransientImages.isEmpty {
-                    aiMessage.transientImages = oracleTransientImages
+                if !oracleAttachments.isEmpty {
+                    aiMessage.attachments = oracleAttachments
                 }
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
@@ -4103,7 +4109,7 @@ class OracleViewModel: ObservableObject {
         cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         guard cleanupOwnerIsCurrent?() != false else { return }
-        runStateBySession[sessionID]?.pendingImagePreparationID = nil
+        runStateBySession[sessionID]?.pendingAttachmentPreparationID = nil
         if let query = runStateBySession[sessionID]?.activeQueryId, let scope = contextBuilderScopes[query] {
             await scope.cancelAndDrain()
             return
@@ -4206,7 +4212,7 @@ class OracleViewModel: ObservableObject {
     func cancelAllActiveSessionStreams(cleanupOwnerIsCurrent: (@MainActor () -> Bool)? = nil) async {
         guard cleanupOwnerIsCurrent?() != false else { return }
         for sessionID in Array(runStateBySession.keys) {
-            runStateBySession[sessionID]?.pendingImagePreparationID = nil
+            runStateBySession[sessionID]?.pendingAttachmentPreparationID = nil
         }
         let activeSessions = Array(streamingSessions)
         for sessionID in activeSessions {
@@ -4224,7 +4230,7 @@ class OracleViewModel: ObservableObject {
             sequenceIndex: stored.sequenceIndex,
             allowedFilePaths: stored.allowedFilePaths ?? [],
             modelName: stored.modelName,
-            imageAttachments: stored.imageAttachments ?? []
+            fileAttachments: stored.fileAttachments ?? []
         )
 
         let tokenInfo = ChatTokenInfo(

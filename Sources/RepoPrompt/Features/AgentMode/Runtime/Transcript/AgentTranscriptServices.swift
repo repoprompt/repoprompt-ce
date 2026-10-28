@@ -5573,6 +5573,298 @@ struct AgentTranscriptProjectionBuildResult: Equatable {
 }
 
 enum AgentTranscriptProjectionBuilder {
+    struct DisplayMaskResult {
+        let presentation: AgentTranscriptPresentationSnapshot
+        let archivedBlocks: [AgentTranscriptRenderBlock]
+        let blockVisits: Int
+        let rowVisits: Int
+        let anchorVisits: Int
+        var archiveBlockVisits = 0
+        var archiveRowVisits = 0
+    }
+
+    /// The existing transform's temporary identity/count contribution, retained only with the
+    /// derived display cache. No independently maintained source index or history revision.
+    struct DisplayMaskRegion {
+        let blocks: [AgentTranscriptRenderBlock]
+        let removedRowIDs: Set<UUID>
+        let blockIDs: Set<String>
+        let originalTurnIDs: Set<UUID>
+        let retainedTurnIDs: Set<UUID>
+        let changed: Bool
+        let presentedRowCount: Int
+        let blockVisits: Int
+        let rowVisits: Int
+    }
+
+    static func maskArchiveForLocalDisplay(
+        _ archive: AgentArchivedTranscriptSnapshot, hiddenSourceIDs: Set<UUID>
+    ) -> DisplayMaskRegion {
+        maskDisplayRegion(archive.blocks, rowAnchorIndex: archive.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+    }
+
+    private static func maskDisplayRegion(
+        _ blocks: [AgentTranscriptRenderBlock], rowAnchorIndex: [UUID: AgentTranscriptAnchor], hiddenSourceIDs: Set<UUID>
+    ) -> DisplayMaskRegion {
+        let context = AgentTranscriptProjectionBuildContext()
+        var blockVisits = 0
+        var rowVisits = 0
+        var removedRowIDs = Set<UUID>()
+        var mutations = 0
+        var blockIDs = Set<String>()
+        var originalTurnIDs = Set<UUID>()
+        var retainedTurnIDs = Set<UUID>()
+        var presentedRowCount = 0
+        func hiddenAnchor(_ anchor: AgentTranscriptAnchor?) -> Bool {
+            switch anchor {
+            case let .activity(_, _, id), let .conclusion(_, id): hiddenSourceIDs.contains(id)
+            default: false
+            }
+        }
+        func hideRow(_ row: AgentChatItem) -> Bool {
+            hiddenSourceIDs.contains(row.id) || hiddenAnchor(rowAnchorIndex[row.id])
+        }
+        func masked(_ blocks: [AgentTranscriptRenderBlock], topLevel: Bool = false) -> [AgentTranscriptRenderBlock] {
+            let initialMutations = mutations
+            let result = blocks.compactMap { block -> AgentTranscriptRenderBlock? in
+                let before = mutations
+                blockVisits += 1
+                originalTurnIDs.insert(block.turnID)
+                let rows = block.rows.filter { row in
+                    rowVisits += 1
+                    let hidden = hideRow(row) || (block.kind == .conclusion && hiddenAnchor(block.primaryAnchor))
+                    if hidden {
+                        mutations += 1
+                        removedRowIDs.insert(row.id)
+                    }
+                    return !hidden
+                }
+                var grouped = block.groupedHistory
+                var inputs = block.displaySummaryInputs
+                if let history = grouped {
+                    if !history.sections.isEmpty {
+                        let childStart = mutations
+                        let children = masked(history.sections.flatMap(\.childBlocks))
+                        let childrenChanged = mutations != childStart
+                        let priorInputCount = inputs.count
+                        inputs = inputs.filter { input in
+                            !input.rows.contains { row in
+                                rowVisits += 1
+                                return hiddenSourceIDs.contains(row.id)
+                            }
+                        }
+                        let prefixChanged = inputs.count != priorInputCount
+                        if prefixChanged { mutations += 1 }
+                        if childrenChanged || prefixChanged {
+                            guard !children.isEmpty else { return nil }
+                            let childInputs = children.map(displaySummaryInput)
+                            grouped = .init(
+                                summary: displaySummary(for: inputs + childInputs, preservingTools: history.summary, countedInputs: childInputs),
+                                sections: childrenChanged
+                                    ? groupedHistorySections(for: children, spanID: block.spanID ?? block.turnID, context: context)
+                                    : history.sections
+                            )
+                        }
+                    } else if !inputs.isEmpty {
+                        var changed = false
+                        inputs = inputs.compactMap { input in
+                            let surviving = input.rows.filter { row in
+                                rowVisits += 1
+                                return !hiddenSourceIDs.contains(row.id)
+                            }
+                            let ids = input.activityIDs.filter { !hiddenSourceIDs.contains($0) }
+                            changed = changed || surviving.count != input.rows.count || ids.count != input.activityIDs.count
+                            guard !surviving.isEmpty || !ids.isEmpty else { return nil }
+                            return .init(
+                                blockID: input.blockID,
+                                kind: input.kind,
+                                primaryAnchor: input.primaryAnchor,
+                                anchorActivityID: input.anchorActivityID.flatMap { hiddenSourceIDs.contains($0) ? nil : $0 } ?? ids.first,
+                                activityIDs: ids,
+                                rows: surviving
+                            )
+                        }
+                        if changed { mutations += 1 }
+                        guard !inputs.isEmpty else { return nil }
+                        if changed {
+                            grouped = .init(summary: displaySummary(for: inputs, preservingTools: history.summary), sections: [])
+                        }
+                    }
+                }
+                let ids = block.activityIDs.filter { !hiddenSourceIDs.contains($0) }
+                if ids.count != block.activityIDs.count { mutations += 1 }
+                func retain(_ result: AgentTranscriptRenderBlock) -> AgentTranscriptRenderBlock {
+                    retainedTurnIDs.insert(result.turnID)
+                    if topLevel {
+                        blockIDs.insert(result.id)
+                        // presentedItemCount reads only the already visited block and rows.count.
+                        presentedRowCount += presentedItemCount(for: result)
+                    }
+                    return result
+                }
+                guard mutations != before else { return retain(block) }
+                if block.groupedHistory == nil, block.collapsedHistoryRange == nil, rows.isEmpty { return nil }
+                // A hidden first anchor cannot hide visible siblings. Prefer a surviving source row.
+                let anchorID = block.anchorActivityID.flatMap { hiddenSourceIDs.contains($0) ? nil : $0 } ?? ids.first
+                let primary = hiddenAnchor(block.primaryAnchor)
+                    ? anchorID.flatMap { rowAnchorIndex[$0] } ?? rows.first.flatMap { rowAnchorIndex[$0.id] }
+                    : block.primaryAnchor
+                let summary = block.clusterSummary == nil ? nil : clusterSummary(for: rows, context: context)
+                var result = AgentTranscriptRenderBlock(
+                    id: block.id, kind: block.kind, turnID: block.turnID, spanID: block.spanID,
+                    retentionTier: block.retentionTier, rows: rows, isArchived: block.isArchived,
+                    primaryAnchor: primary, anchorActivityID: anchorID, activityIDs: ids,
+                    clusterSummary: summary, groupedHistory: grouped, collapsedHistoryRange: block.collapsedHistoryRange,
+                    defaultPresentation: block.defaultPresentation
+                )
+                result.displaySummaryInputs = inputs
+                return retain(result)
+            }
+            return mutations == initialMutations ? blocks : result
+        }
+        let result = masked(blocks, topLevel: true)
+        return .init(
+            blocks: result, removedRowIDs: removedRowIDs, blockIDs: blockIDs,
+            originalTurnIDs: originalTurnIDs, retainedTurnIDs: retainedTurnIDs, changed: mutations != 0,
+            presentedRowCount: presentedRowCount, blockVisits: blockVisits, rowVisits: rowVisits
+        )
+    }
+
+    /// Pure local-UI transform. Never installed in a canonical/session projection or used by Read.
+    static func maskForLocalDisplay(
+        _ base: AgentTranscriptPresentationSnapshot,
+        archivedBlocks: [AgentTranscriptRenderBlock],
+        hiddenSourceIDs: Set<UUID>,
+        reusableArchive: DisplayMaskRegion? = nil
+    ) -> DisplayMaskResult {
+        guard !hiddenSourceIDs.isEmpty else {
+            return .init(presentation: base, archivedBlocks: archivedBlocks, blockVisits: 0, rowVisits: 0, anchorVisits: 0)
+        }
+        let visible = maskDisplayRegion(base.visibleBlocks, rowAnchorIndex: base.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+        let working = maskDisplayRegion(base.workingBlocks, rowAnchorIndex: base.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+        let archive = reusableArchive ?? maskDisplayRegion(archivedBlocks, rowAnchorIndex: base.rowAnchorIndex, hiddenSourceIDs: hiddenSourceIDs)
+        let archiveBlocksVisited = reusableArchive == nil ? archive.blockVisits : 0
+        let archiveRowsVisited = reusableArchive == nil ? archive.rowVisits : 0
+        var rowVisits = visible.rowVisits + working.rowVisits + archiveRowsVisited
+        var anchorVisits = 0
+        func hiddenAnchor(_ anchor: AgentTranscriptAnchor?) -> Bool {
+            switch anchor {
+            case let .activity(_, _, id), let .conclusion(_, id): hiddenSourceIDs.contains(id)
+            default: false
+            }
+        }
+        func removed(_ id: UUID) -> Bool {
+            hiddenSourceIDs.contains(id) || visible.removedRowIDs.contains(id)
+                || working.removedRowIDs.contains(id) || archive.removedRowIDs.contains(id)
+        }
+        func rows(_ input: [AgentChatItem]) -> [AgentChatItem] {
+            var changed = false
+            let result = input.filter { row in
+                rowVisits += 1
+                let hide = removed(row.id) || hiddenAnchor(base.rowAnchorIndex[row.id])
+                changed = changed || hide
+                return !hide
+            }
+            return changed ? result : input
+        }
+        let visibleRows = rows(base.visibleRows)
+        let workingRows = rows(base.workingRows)
+        let blockVisits = visible.blockVisits + working.blockVisits + archiveBlocksVisited
+        guard visible.changed || working.changed || archive.changed
+            || visibleRows.count != base.visibleRows.count || workingRows.count != base.workingRows.count
+        else {
+            return .init(
+                presentation: base, archivedBlocks: archive.blocks, blockVisits: blockVisits, rowVisits: rowVisits, anchorVisits: 0,
+                archiveBlockVisits: archiveBlocksVisited, archiveRowVisits: archiveRowsVisited
+            )
+        }
+        let rowAnchors = base.rowAnchorIndex.filter { id, anchor in
+            anchorVisits += 1
+            return !removed(id) && !hiddenAnchor(anchor)
+        }
+        let blockAnchors = base.anchorBlockIndex.filter { anchor, block in
+            anchorVisits += 1
+            // Reuse the archive's already-computed contribution: no archive-containing union/map.
+            return (visible.blockIDs.contains(block) || working.blockIDs.contains(block) || archive.blockIDs.contains(block)) && !hiddenAnchor(anchor)
+        }
+        let old = base.metadata
+        func retained(_ id: UUID?) -> UUID? {
+            id.flatMap { removed($0) ? nil : $0 }
+        }
+        func lostTurn(_ target: UUID) -> Bool {
+            let wasMaterialized = visible.originalTurnIDs.contains(target) || working.originalTurnIDs.contains(target) || archive.originalTurnIDs.contains(target)
+            let survives = visible.retainedTurnIDs.contains(target) || working.retainedTurnIDs.contains(target) || archive.retainedTurnIDs.contains(target)
+            return wasMaterialized && !survives
+        }
+        let metadata = AgentTranscriptPresentationMetadata(
+            latestUserMessageID: retained(old.latestUserMessageID),
+            latestTurnID: old.latestTurnID.flatMap { lostTurn($0) ? visible.blocks.last?.turnID : $0 },
+            dynamicSummaryLockTargetTurnID: old.dynamicSummaryLockTargetTurnID.flatMap { lostTurn($0) ? nil : $0 },
+            recentAssistantItemIDs: old.recentAssistantItemIDs.filter { !removed($0) },
+            activeContextBuilderCallItemID: retained(old.activeContextBuilderCallItemID),
+            activeContextBuilderResultItemID: retained(old.activeContextBuilderResultItemID), mostRecentEditItemID: retained(old.mostRecentEditItemID)
+        )
+        let presentation = AgentTranscriptPresentationSnapshot(
+            tabID: base.tabID, revision: base.revision, visibleBlocks: visible.blocks, workingBlocks: working.blocks,
+            visibleRows: visibleRows, workingRows: workingRows, rowAnchorIndex: rowAnchors, anchorBlockIndex: blockAnchors,
+            archivedHistoryState: archive.changed
+                ? .init(hasArchivedHistory: !archive.blocks.isEmpty, presentedRowCount: archive.presentedRowCount, blockCount: archive.blocks.count)
+                : base.archivedHistoryState,
+            isCompressedHistoryRevealed: base.isCompressedHistoryRevealed, isTranscriptWindowExpanded: base.isTranscriptWindowExpanded,
+            isWindowCappedWhileActive: base.isWindowCappedWhileActive, bindingsHydrated: base.bindingsHydrated,
+            hydratedPersistentBinding: base.hydratedPersistentBinding, hydratedBindingTransitionGeneration: base.hydratedBindingTransitionGeneration,
+            performanceSnapshot: base.performanceSnapshot, metadata: metadata,
+            rawToolResultPayloadRenderRevisionByItemID: base.rawToolResultPayloadRenderRevisionByItemID
+        )
+        return .init(
+            presentation: presentation, archivedBlocks: archive.blocks, blockVisits: blockVisits, rowVisits: rowVisits, anchorVisits: anchorVisits,
+            archiveBlockVisits: archiveBlocksVisited, archiveRowVisits: archiveRowsVisited
+        )
+    }
+
+    private static func displaySummary(
+        for inputs: [AgentTranscriptDisplaySummaryInput], preservingTools original: AgentTranscriptGroupedHistorySummary,
+        countedInputs: [AgentTranscriptDisplaySummaryInput]? = nil
+    ) -> AgentTranscriptGroupedHistorySummary {
+        let rows = inputs.flatMap(\.rows)
+        let narration = rows.last(where: { $0.hasAssistantBody })?.narration
+            ?? (rows.contains(where: \.hasAssistantBody) ? nil : rows.last(where: { $0.kind == .thinking })?.narration)
+        let toolSummary = original.toolSummary.map { tool in
+            let value = AgentTranscriptClusterSummary(
+                toolCount: tool.toolCount, toolNames: tool.toolNames, toolNameCounts: tool.toolNameCounts, toolGroups: tool.toolGroups,
+                keyPaths: tool.keyPaths, containsRunningWork: tool.containsRunningWork, containsFailure: tool.containsFailure,
+                containsWarning: tool.containsWarning, shortNarration: narration
+            )
+            return AgentTranscriptClusterSummary(
+                toolCount: value.toolCount, toolNames: value.toolNames, toolNameCounts: value.toolNameCounts, toolGroups: value.toolGroups,
+                keyPaths: value.keyPaths, containsRunningWork: value.containsRunningWork, containsFailure: value.containsFailure,
+                containsWarning: value.containsWarning, shortNarration: narration,
+                collapsedDisplay: AgentTranscriptSummaryTextFormatter.collapsedDisplay(for: value, fallbackCount: value.toolCount)
+            )
+        }
+        // With zero tools the existing cluster builder still emits narration metadata for any rows.
+        let narrationSummary = toolSummary ?? (rows.isEmpty ? nil : AgentTranscriptClusterSummary(
+            toolCount: 0, toolNames: [], keyPaths: [], containsRunningWork: false, containsFailure: false,
+            containsWarning: false, shortNarration: narration
+        ))
+        let countedRows = countedInputs?.flatMap(\.rows) ?? rows
+        let summary = AgentTranscriptGroupedHistorySummary(
+            hiddenToolCardCount: original.hiddenToolCardCount,
+            hiddenAssistantCount: countedRows.count(where: \.hasAssistantBody),
+            hiddenProgressCount: countedRows.count(where: { $0.kind == .thinking }),
+            hiddenNoteCount: countedRows.count(where: { $0.kind == .system || $0.kind == .error }),
+            toolSummary: narrationSummary
+        )
+        return .init(
+            hiddenToolCardCount: summary.hiddenToolCardCount,
+            hiddenAssistantCount: summary.hiddenAssistantCount,
+            hiddenProgressCount: summary.hiddenProgressCount,
+            hiddenNoteCount: summary.hiddenNoteCount,
+            toolSummary: summary.toolSummary,
+            collapsedDisplay: AgentTranscriptSummaryTextFormatter.collapsedDisplay(summary: summary)
+        )
+    }
+
     private static func debugRowSummary(_ item: AgentChatItem) -> String {
         let label = item.toolName ?? item.kind.rawValue
         return "\(item.sequenceIndex):\(item.kind.rawValue):\(label):stream=\(item.isStreaming)"
@@ -7745,7 +8037,7 @@ enum AgentTranscriptProjectionBuilder {
         let allActivityIDs = childBlocks.flatMap(\.activityIDs)
         let summaryBlocks = summarySourceBlocks ?? childBlocks
         let presentationSummary = frozenSummary.map(sanitizedGroupedHistorySummaryForPresentation)
-        return .init(
+        var block = AgentTranscriptRenderBlock(
             id: groupedHistoryBlockID(turnID: turn.id, spanID: spanID),
             kind: .groupedHistory,
             turnID: turn.id,
@@ -7771,6 +8063,30 @@ enum AgentTranscriptProjectionBuilder {
                     : []
             ),
             defaultPresentation: .collapsed
+        )
+        // Full sections already own their children. Only a buffered leading source, excluded
+        // from those sections but included in the frozen summary, needs the lightweight helper.
+        let summaryOnlyPrefix = summaryBlocks.prefix(max(0, summaryBlocks.count - childBlocks.count))
+        block.displaySummaryInputs = (turn.retentionTier == .full ? Array(summaryOnlyPrefix) : childBlocks)
+            .map(displaySummaryInput)
+
+        return block
+    }
+
+    private static func displaySummaryInput(_ child: AgentTranscriptRenderBlock) -> AgentTranscriptDisplaySummaryInput {
+        .init(
+            blockID: child.id, kind: child.kind, primaryAnchor: child.primaryAnchor,
+            anchorActivityID: child.anchorActivityID, activityIDs: child.activityIDs,
+            rows: child.rows.map { row in
+                let assistant = row.hasDisplayableAssistantBody
+                let thinking = row.kind == .thinking
+                return .init(
+                    id: row.id,
+                    kind: row.kind,
+                    hasAssistantBody: assistant,
+                    narration: assistant || thinking ? ownedDisplayNarration(row.text) : nil
+                )
+            }
         )
     }
 
@@ -8163,11 +8479,7 @@ enum AgentTranscriptProjectionBuilder {
         let containsFailure = toolExecutions.contains { $0.status == .failed || $0.status == .cancelled }
         let containsWarning = toolExecutions.contains { $0.status == .warning }
         let narration = latestNarrationText(from: rows)
-        let shortNarration: String? = narration.flatMap {
-            let sanitized = $0.sanitizedForDisplay
-            guard !sanitized.isEmpty else { return nil }
-            return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
-        }
+        let shortNarration = narration.flatMap(displayNarration)
         let allToolNames = toolNameCounts.isEmpty ? Array(toolNames) : Array(toolNameCounts.keys.sorted())
         let toolGroups = ClusterToolCategory.buildGroups(toolNames: allToolNames, counts: toolNameCounts)
         let summary = AgentTranscriptClusterSummary(
@@ -8199,6 +8511,25 @@ enum AgentTranscriptProjectionBuilder {
         )
         context.clusterSummaryByRowIDs[cacheKey] = renderedSummary
         return renderedSummary
+    }
+
+    private static func displayNarration(_ text: String) -> String? {
+        let sanitized = text.sanitizedForDisplay
+        guard !sanitized.isEmpty else { return nil }
+        return sanitized.count > 120 ? String(sanitized.prefix(120)) + "…" : sanitized
+    }
+
+    private static func ownedDisplayNarration(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix = String(trimmed.prefix(122))
+        // The sanitizer only removes NUL Characters. Once the sanitized prefix has more than
+        // 120 graphemes, its first 120 boundaries are closed regardless of later input. Otherwise
+        // NUL removal may join graphemes or leave too few, so preserve the full-input formatter.
+        let input = prefix.sanitizedForDisplay.count > 120 ? prefix : trimmed
+        guard let narration = displayNarration(input) else { return nil }
+        // A new bounded UTF-8 buffer, never a Substring/full-body storage reference. Character
+        // truncation is the existing policy; UTF-8 byte size is measured, not assumed to be 120.
+        return String(decoding: Array(narration.utf8), as: UTF8.self)
     }
 
     private static func latestNarrationText(from rows: [AgentChatItem]) -> String? {
@@ -8323,6 +8654,16 @@ enum AgentTranscriptProjectionBuilder {
                 } else {
                     index[activity.id] = .activity(turnID: turn.id, spanID: span.id, activityID: activity.id)
                 }
+            }
+        }
+        // A compacted conclusion can be a synthetic row with the original source anchor even
+        // after its activity leaves the canonical suffix. Retention/reload proof uses this same
+        // existing index; neither the synthetic row nor its represented source is a pending wake.
+        for block in blocks where block.kind == .conclusion {
+            guard let anchor = block.primaryAnchor, case let .conclusion(_, sourceID) = anchor else { continue }
+            index[sourceID] = anchor
+            for row in block.rows {
+                index[row.id] = anchor
             }
         }
         if let summary = turn.summary,

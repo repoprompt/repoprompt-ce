@@ -19,6 +19,17 @@ import RepoPromptDomainRuntime
 /// never builds a fragment of its own. `AgentSessionLinkMCPToolService.untrustedContentNotice`
 /// mirrors the autonomy clauses in compact form for the per-response notice.
 enum AgentSessionLinkPrompts {
+    /// Shared by classification and routine-dispatch copy. Calling this predicate is not provider
+    /// enablement: the normal terminal path must first qualify its accepted ingress coverage.
+    static func supportsQuietCheckIn(_ provider: AgentSessionLinkPromptProviderContext) -> Bool {
+        switch provider {
+        case .codexExec, .claudeCode: true
+        // Devin stays disabled for BOTH classification and future copy until exact own-echo U4 proof exists.
+        case .devin, .unselected, .claudeCodeGLM, .kimiCode, .customClaudeCompatible,
+             .openCode, .cursor, .grokBuild, .antigravity: false
+        }
+    }
+
     /// Hard cap on the baseline supplement, before the separate optional-input markup delta and
     /// guidance line. An inventory that cannot fit keeps a deterministic,
     /// order-preserving subset — each row is kept only if it still fits, so a single oversized row
@@ -68,7 +79,8 @@ enum AgentSessionLinkPrompts {
     /// revision 8 adds creator provenance and lane operations.
     /// Revision 9 teaches Grok's isolated runtime server name.
     /// Revision 10 distinguishes full access from missing-scope approval without discarding standing consent.
-    static let currentInventoryGuidanceRevision: UInt64 = 10
+    /// Revision 11 distinguishes managed task direction from coordination and clarifies recovery.
+    static let currentInventoryGuidanceRevision: UInt64 = 11
     /// Emitted only beside a managed, respondable pending interaction.
     static let respondHint =
         "Use `respond` for this exact `interaction_id` under your user's instruction. If it changes, refresh with `poll` or `wait`; never auto-retry approval."
@@ -244,6 +256,9 @@ enum AgentSessionLinkPrompts {
             return AgentSessionLinkPromptRenderResult(fragment: fragment)
         }
 
+        let offersQuietReply = request.routineQuietCheckIn
+            && AgentSessionLinkPrompts.supportsQuietCheckIn(request.providerContext)
+            && request.providerContext != .codexExec
         let omitsDuplicateAutonomy = request.membershipKind == .inventory
             && request.laneGuidanceMode == .full
         var fragments: [String] = []
@@ -262,7 +277,8 @@ enum AgentSessionLinkPrompts {
                    passive,
                    maximumBytes: reservationBudget,
                    guidanceMode: request.laneGuidanceMode,
-                   includesAutonomyContract: !omitsDuplicateAutonomy
+                   includesAutonomyContract: !omitsDuplicateAutonomy,
+                   offersQuietReply: offersQuietReply
                )
             {
                 let inventoryBudget = maximumRenderedBytes
@@ -289,7 +305,8 @@ enum AgentSessionLinkPrompts {
             passive,
             maximumBytes: passiveBudget,
             guidanceMode: request.laneGuidanceMode,
-            includesAutonomyContract: !omitsDuplicateAutonomy
+            includesAutonomyContract: !omitsDuplicateAutonomy,
+            offersQuietReply: offersQuietReply
         ) else {
             return AgentSessionLinkPromptRenderResult(fragment: joined(fragments))
         }
@@ -324,7 +341,8 @@ enum AgentSessionLinkPrompts {
         entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
         attentionRequests: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest],
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> String {
         let offeredCount = passive.entries.count + passive.attentionRequests.count
         return statusChangeSupplement(
@@ -334,7 +352,8 @@ enum AgentSessionLinkPrompts {
             omittedCount: passive.unacknowledgedOverflowCount,
             deferredCount: offeredCount - entries.count - attentionRequests.count,
             guidanceMode: guidanceMode,
-            includesAutonomyContract: includesAutonomyContract
+            includesAutonomyContract: includesAutonomyContract,
+            offersQuietReply: offersQuietReply
         )
     }
 
@@ -344,7 +363,8 @@ enum AgentSessionLinkPrompts {
         _ passive: AgentSessionLinkPassiveStatusNotices.Snapshot,
         maximumBytes: Int,
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> String? {
         let fragment = { (
             entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
@@ -355,7 +375,8 @@ enum AgentSessionLinkPrompts {
                 entries: entries,
                 attentionRequests: attentionRequests,
                 guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
+                includesAutonomyContract: includesAutonomyContract,
+                offersQuietReply: offersQuietReply
             )
         }
         if passive.entries.isEmpty, passive.attentionRequests.isEmpty {
@@ -364,11 +385,15 @@ enum AgentSessionLinkPrompts {
         }
         for request in passive.attentionRequests {
             let candidate = fragment([], [request])
-            if candidate.utf8.count <= maximumBytes { return candidate }
+            if candidate.utf8.count <= maximumBytes {
+                return candidate
+            }
         }
         for entry in passive.entries {
             let candidate = fragment([entry], [])
-            if candidate.utf8.count <= maximumBytes { return candidate }
+            if candidate.utf8.count <= maximumBytes {
+                return candidate
+            }
         }
         return nil
     }
@@ -377,7 +402,8 @@ enum AgentSessionLinkPrompts {
         _ passive: AgentSessionLinkPassiveStatusNotices.Snapshot,
         maximumBytes: Int,
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> RenderedPassiveSubset? {
         let fragment = { (
             entries: [AgentSessionLinkPassiveStatusNotices.PendingEntry],
@@ -388,7 +414,8 @@ enum AgentSessionLinkPrompts {
                 entries: entries,
                 attentionRequests: attentionRequests,
                 guidanceMode: guidanceMode,
-                includesAutonomyContract: includesAutonomyContract
+                includesAutonomyContract: includesAutonomyContract,
+                offersQuietReply: offersQuietReply
             )
         }
         var renderedAttention: [AgentSessionLinkPassiveStatusNotices.PendingAttentionRequest] = []
@@ -452,7 +479,8 @@ enum AgentSessionLinkPrompts {
         omittedCount: UInt64,
         deferredCount: Int,
         guidanceMode: LaneGuidanceMode,
-        includesAutonomyContract: Bool
+        includesAutonomyContract: Bool,
+        offersQuietReply: Bool
     ) -> String {
         var guidance = laneGuidance(
             mode: guidanceMode,
@@ -463,6 +491,9 @@ enum AgentSessionLinkPrompts {
             guidance.append(
                 "`deferred` counts pending offered rows not shown here; they remain queued for a later accepted delivery."
             )
+        }
+        if offersQuietReply, attentionRequests.isEmpty {
+            guidance.append("Nothing needed? Reply [ack].")
         }
         var body = """
         <\(statusChangeEnvelopeTag) revision="\(revision)" \
@@ -561,7 +592,8 @@ enum AgentSessionLinkPrompts {
             for record in offer.candidates.reversed() {
                 guard let element = localInputElement(record) else { continue }
                 let cost = element.utf8.count + 1
-                if cost <= remaining { kept.append(record)
+                if cost <= remaining {
+                    kept.append(record)
                     remaining -= cost
                 }
             }
@@ -599,7 +631,9 @@ enum AgentSessionLinkPrompts {
             idleForSend: entry.idleForSend,
             idleSince: entry.idleSince
         )
-        if userInputsOmitted > 0 { attributes += " user_inputs_omitted=\"\(userInputsOmitted)\"" }
+        if userInputsOmitted > 0 {
+            attributes += " user_inputs_omitted=\"\(userInputsOmitted)\""
+        }
         var children = laneObservationChildren(waitingOn: entry.waitingOn, preview: entry.latestVisibleAssistantPreview)
         children.insert(contentsOf: userInputs, at: entry.waitingOn == nil ? 0 : 1)
         return laneElement("change", attributes: attributes, children: children)
@@ -820,16 +854,16 @@ enum AgentSessionLinkPrompts {
         lines.append(contentsOf: autonomyContract)
         lines.append(contentsOf: [
             MCPDomainSessionAdminToolDefinition.overseerPlaybook,
-            "Operations on listed outbound targets: `list` refreshes grants; `poll` snapshots status, readiness, and managed-only pending prompts; `wait` waits on a returned cursor for change, idle, or sendable without busy-polling; `read` pages the redacted transcript.",
-            "`send` delivers an attributed message to an `idle_for_send: true` target or queues one with `delivery: \"when_sendable\"`; `cancel_pending_send` withdraws your queued message. Use a new `idempotency_key` for each new delivery and reuse it only for the same retry.",
+            "`list` refreshes outbound grants; `poll` snapshots status/readiness and managed-only pending prompts; `wait` waits on a returned cursor for change/idle/sendable without busy-polling; `read` pages redacted transcript.",
+            "Managed assignments/resumes: prefer `steer`, including idle. `send`: `idle_for_send: true` or queue `delivery: \"when_sendable\"`; exact current Manage authority gives it task framing, otherwise coordination only. `cancel_pending_send` withdraws it. New `idempotency_key` per delivery; reuse only for the same retry.",
             "`compact` requests native context compaction of an `idle_for_send: true` target.",
             "`snooze_auto_wake` pauses only routine status-triggered admission on one lane, not collection or delivery. Exact purposeful attention may bypass its snooze. `set_waiting_on` is self-scoped; `request_attention` is an attributed inverse signal, not a reverse observer grant.",
             "Managed `poll`/`wait` may include a redacted `pending_interaction` beside the snapshot. `respond` applies only to its exact current `interaction_id`; manual-only prompts remain with the target's user. `steer` cannot bypass a pending prompt; `stop` cancels one current run and never queues a continuation.",
-            "`create_lane` makes your own top-level lane under a direct link; it inherits no authority. `retire_lane` unlinks and stashes only your own idle creation under a live manage grant; it never deletes it.",
-            "A `read` may repeat an updated newest `item_id`; replace your copy, do not append it.",
+            "`create_lane` creates your lane; its first message assigns the lane job, not unrelated authority or approval. `retire_lane` unlinks/stashes only your own idle lane under a live manage grant; never deletes.",
+            "A `read` may repeat the newest `item_id`; replace that item, do not append.",
             "`status: \"idle\"` is not send readiness. Use `idle_for_send: true` or wait for `sendable`; `awaiting_user` without a pending interaction is waiting for its next instruction, not asking you a question. On a managed link, `steer` may deliver that instruction only when your own user's instruction covers it.",
-            "Idle does not prove completion. Revocation may close an inventory silently; never treat an old list as authority.",
-            "This block is versioned by membership `revision` and `guidance_revision`. If several active `\(envelopeTag)` blocks appear, only the newest is current; never merge older targets or permissions into it."
+            "Idle does not prove completion. Inspect current child/ticket outcomes; queued work and no-match tests are not passes. Preserve explicit approval/conflict gates. Revocation may close an inventory silently; old lists grant nothing.",
+            "Versioned by membership `revision` and `guidance_revision`. Of active `\(envelopeTag)` blocks, only the newest is current; never merge older targets or permissions."
         ])
         let escapedLines = lines.map { escaped($0) }.joined(separator: "\n")
         return """

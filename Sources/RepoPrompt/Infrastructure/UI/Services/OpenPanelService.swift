@@ -41,9 +41,8 @@ final class OpenPanelService {
         }
     }
 
-    /// Picks one or more image files.
-    func pickImageFiles(
-        title: String = "Choose Images",
+    func pickFiles(
+        title: String = "Choose Files",
         message: String? = nil,
         startingDirectory: URL? = nil,
         allowsMultipleSelection: Bool = true,
@@ -58,7 +57,6 @@ final class OpenPanelService {
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = allowsMultipleSelection
         panel.canCreateDirectories = false
-        panel.allowedContentTypes = [.image]
         panel.prompt = "Attach"
         panel.title = title
         if let message { panel.message = message }

@@ -980,7 +980,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             for: failedStatus.observerEndpoint,
             reason: .settingDisabled
         )
-        fixture.session.oversight.suppressedWakeFingerprint = failedStatus.wakeFingerprint
+        fixture.session.oversight.suppressWake(failedStatus.wakeFingerprint, producerWakeID: UUID())
 
         let attention = Self.attentionRequest(0)
         try publishLane(
@@ -1051,7 +1051,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             for: failedStatus.observerEndpoint,
             reason: .settingDisabled
         )
-        fixture.session.oversight.suppressedWakeFingerprint = failedStatus.wakeFingerprint
+        fixture.session.oversight.suppressWake(failedStatus.wakeFingerprint, producerWakeID: UUID())
 
         let attention = Self.attentionRequest(1)
         try publishLane(
@@ -1239,7 +1239,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             for: failed.observerEndpoint,
             reason: .settingDisabled
         )
-        fixture.session.oversight.suppressedWakeFingerprint = failed.wakeFingerprint
+        fixture.session.oversight.suppressWake(failed.wakeFingerprint, producerWakeID: UUID())
 
         fixture.session.oversight.autoWakeOnUpdates = false
         let successor = Self.attentionRequest(1)
@@ -1277,7 +1277,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             for: failedStatus.observerEndpoint,
             reason: .settingDisabled
         )
-        fixture.session.oversight.suppressedWakeFingerprint = failedStatus.wakeFingerprint
+        fixture.session.oversight.suppressWake(failedStatus.wakeFingerprint, producerWakeID: UUID())
 
         try publishLane(
             fixture,
@@ -2467,6 +2467,11 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         XCTAssertNotNil(fixture.session.instructionContinuation)
 
         try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        let waitingClaim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session, dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        XCTAssertFalse(waitingClaim.routineQuietCheckIn, "a supported provider's waiting continuation is still ordinary")
         let response = try await waiting.value
         guard case let .laneUpdateAutoWake(wakeID) = response.origin else {
             return XCTFail("expected the waiting continuation to preserve lane-update origin")
@@ -2733,7 +2738,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         ).wakeEligibilityFingerprint
         fixture.session.oversight.autoWakeOnUpdates = true
         fixture.session.oversight.autoWakeTargetSessionIDs = []
-        fixture.session.oversight.suppressedWakeFingerprint = fingerprint
+        fixture.session.oversight.suppressWake(fingerprint, producerWakeID: UUID())
 
         XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(false, for: endpoint))
 
@@ -4279,7 +4284,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
         let failedShape = reserved.wakeFingerprint
         fixture.viewModel.cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
-        fixture.session.oversight.suppressedWakeFingerprint = failedShape
+        fixture.session.oversight.suppressWake(failedShape, producerWakeID: UUID())
 
         try publishLane(fixture, linkSetRevision: 1, queueRevision: 2)
         XCTAssertNil(
@@ -4321,7 +4326,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         let failedShape = try XCTUnwrap(fixture.session.oversight.pendingAutoWake).wakeFingerprint
         fixture.viewModel.cancelAgentSessionLinkAutoWake(for: endpoint, reason: .eligibilityLost)
-        fixture.session.oversight.suppressedWakeFingerprint = failedShape
+        fixture.session.oversight.suppressWake(failedShape, producerWakeID: UUID())
 
         XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
         let manual = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
@@ -4339,7 +4344,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             let original = hasPriorSuppression ? try XCTUnwrap(
                 fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
             ).wakeEligibilityFingerprint : nil
-            fixture.session.oversight.suppressedWakeFingerprint = original
+            fixture.session.oversight.suppressWake(original, producerWakeID: UUID())
             try publishLane(
                 fixture, linkSetRevision: 1, queueRevision: 2,
                 edgeSequenceOffset: 1, selectedTargetIndices: []
@@ -4421,11 +4426,11 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         fixture.session.oversight.autoWakeOnUpdates = false
         XCTAssertNil(projection().routineWakeDeferredUntil, "deselected content cannot promise a wake")
         fixture.session.oversight.autoWakeOnUpdates = true
-        fixture.session.oversight.suppressedWakeFingerprint = try XCTUnwrap(
+        try fixture.session.oversight.suppressWake(XCTUnwrap(
             fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]
-        ).wakeEligibilityFingerprint
+        ).wakeEligibilityFingerprint, producerWakeID: UUID())
         XCTAssertNil(projection().routineWakeDeferredUntil, "failure suppression has no timed retry")
-        fixture.session.oversight.suppressedWakeFingerprint = nil
+        fixture.session.oversight.clearWakeSuppression()
         XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
         XCTAssertNil(projection().routineWakeDeferredUntil, "an existing attempt is not a countdown")
     }
@@ -4581,9 +4586,9 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         )
         let gate = AutoWakeCatalogAuthorityGate()
         let cleanup = registry.commitObserver
-        registry.commitObserver = { sessionID in
+        registry.commitObserver = { sessionID, origin, fileRemoved in
             _ = await gate.requirement()
-            await cleanup?(sessionID)
+            await cleanup?(sessionID, origin, fileRemoved)
         }
         let token = try registry.beginDurableDeletion(sessionID: fixture.sessionID)
         let deletion = Task { @MainActor in await registry.didCommitDurableDeletion(token) }
@@ -5072,14 +5077,15 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
         let nativeController: MonitorFakeNativeController
     }
 
-    private func makeFixture(catalogReady: Bool = true, fenceProviderLaunch: Bool = false) throws -> Fixture {
+    private func makeFixture(catalogReady: Bool = true, fenceProviderLaunch: Bool = false, windowID: Int = 1, codexController: MonitorFakeCodexController? = nil) throws -> Fixture {
         let tabID = UUID()
         let nativeController = MonitorFakeNativeController()
         let viewModel = AgentModeViewModel(
-            testWindowID: 1,
+            testWindowID: windowID,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
-                LifecycleNoopCodexController(recorder: LifecycleRecorder())
+                if let codexController { return codexController }
+                return LifecycleNoopCodexController(recorder: LifecycleRecorder())
             },
             claudeControllerFactory: { _, _, _, _ in
                 if fenceProviderLaunch { XCTFail("This fixture must not initialize a Claude provider") }
@@ -5391,5 +5397,1308 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
                 )
             }
         )
+    }
+}
+
+// C3: real claim reservation, preparation and physical fences; no provider process is launched.
+extension AgentSessionLinkAutoWakeTests {
+    private func reserveQuietWake(_ fixture: Fixture) throws -> AgentSessionLinkOutboundPromptClaim {
+        let reserved = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+        reserved.task?.cancel()
+        let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+            for: fixture.session, dispatchID: .autoWake(wakeID: reserved.wakeID)
+        ))
+        XCTAssertNotNil(fixture.viewModel.agentSessionLinkPrepareAutoWakeDispatch(
+            wakeID: reserved.wakeID, endpoint: reserved.observerEndpoint
+        ))
+        return claim
+    }
+
+    private func beginAndAcquireQuietWake(_ fixture: Fixture, claim: AgentSessionLinkOutboundPromptClaim) throws -> AgentRunOwnership {
+        let owner = fixture.session.beginRunAttempt(source: "test.quiet.physical")
+        fixture.session.runState = .running
+        // The adapter sees a running session, but must reuse the qualification frozen while idle.
+        XCTAssertEqual(fixture.viewModel.agentSessionLinkPromptClaim(for: fixture.session, dispatchID: .codexNativeSend(UUID())), claim)
+        XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
+        return owner
+    }
+
+    func testRoutinePhysicalOriginIsFrozenAndReentryDoesNotQualifyANewOwner() throws {
+        for provider in [AgentProviderKind.codexExec, .claudeCode] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            fixture.session.selectedAgent = provider
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            let claim = try reserveQuietWake(fixture)
+            XCTAssertTrue(claim.routineQuietCheckIn)
+            XCTAssertEqual(claim.fragment.contains("Nothing needed? Reply [ack]."), provider == .claudeCode)
+            let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
+            fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+            XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0))
+            XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.quiet.complete"))
+            let replacement = fixture.session.beginRunAttempt(source: "test.quiet.replay")
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
+            fixture.session.sealQuietCheckIn(owner: replacement, terminalState: .completed, normal: true, hasSuccessor: false)
+            XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 2, ordinaryThrough: 2))
+        }
+    }
+
+    func testManualAttentionAndUnqualifiedProviderClaimsStayOrdinary() throws {
+        for mode in ["manual", "attention", "devin", "otherACP"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            fixture.session.selectedAgent = mode == "devin" ? .devin : mode == "otherACP" ? .openCode : .codexExec
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            try publishLane(
+                fixture,
+                linkSetRevision: 1,
+                queueRevision: 1,
+                attentionRequests: mode == "attention" ? [Self.attentionRequest(0)] : []
+            )
+            if mode == "manual" {
+                var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+                attempt.admissionBasis = .manual
+                fixture.session.oversight.pendingAutoWake = attempt
+            }
+            let claim = try reserveQuietWake(fixture)
+            XCTAssertFalse(claim.routineQuietCheckIn, mode)
+            let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+            fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+            XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), mode)
+        }
+    }
+
+    func testClearPreservesPendingQuietMarkerButManualMarkerRemainsVisibleInSuccessor() async throws {
+        for manual in [false, true] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            fixture.session.selectedAgent = .codexExec
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            if manual {
+                var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+                attempt.admissionBasis = .manual
+                fixture.session.oversight.pendingAutoWake = attempt
+            }
+            let old = try reserveQuietWake(fixture)
+            let oldBinding = fixture.session.currentRestorationBindingToken
+            let oldOwner = try beginAndAcquireQuietWake(fixture, claim: old)
+            let oldWake = try XCTUnwrap(old.dispatchID.autoWakeID)
+            fixture.session.sealQuietCheckIn(owner: oldOwner, terminalState: .completed, normal: true, hasSuccessor: false)
+            XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: oldOwner, source: "test.old.complete"))
+            fixture.session.runState = .completed
+            // Ambiguous coordinator settlement is NOT physical producer completion.
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: old.dispatchID)
+            fixture.viewModel.clearChat(tabID: fixture.tabID)
+            XCTAssertEqual(fixture.session.currentRestorationBindingToken, oldBinding)
+            XCTAssertEqual(fixture.session.quietLedger.hiddenSourceIDs.contains(oldWake), !manual)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 10)
+            let successor = try reserveQuietWake(fixture)
+            XCTAssertTrue(successor.routineQuietCheckIn)
+            let newOwner = try beginAndAcquireQuietWake(fixture, claim: successor)
+            // Queued MainActor acceptance retains the pending ID until its own final completion.
+            let callback = Task { @MainActor [lifetime = fixture.session.retainQuietMarkerProducer(for: old)] in
+                fixture.viewModel.acceptAgentSessionLinkPromptClaim(old)
+                withExtendedLifetime(lifetime) {}
+            }
+            XCTAssertEqual(fixture.session.quietLedger.hiddenSourceIDs.contains(oldWake), !manual)
+            await callback.value
+            XCTAssertEqual(fixture.session.items.first?.id, oldWake)
+            XCTAssertTrue(fixture.session.quietLedger.hostMarkerIDs.contains(oldWake))
+            fixture.session.sealQuietCheckIn(owner: newOwner, terminalState: .completed, normal: true, hasSuccessor: false)
+            XCTAssertEqual(fixture.session.quietLedger.facts?.ordinaryThrough, manual ? 1 : 0)
+            XCTAssertEqual(fixture.session.quietLedger.hiddenSourceIDs.contains(oldWake), !manual)
+            // A materialized verdict is lost on reload; the successor's unmaterialized ID is not.
+            let rows = fixture.session.items
+            fixture.session.setItemsSilently(rows, reason: .persistedSessionHydration)
+            XCTAssertFalse(fixture.session.quietLedger.hiddenSourceIDs.contains(oldWake))
+            XCTAssertTrue(try fixture.session.quietLedger.hiddenSourceIDs.contains(XCTUnwrap(successor.dispatchID.autoWakeID)))
+        }
+    }
+
+    func testLateW1AcceptanceCannotClearSameFingerprintW2StopOrFailure() throws {
+        for stop in [false, true] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            let first = try reserveQuietWake(fixture)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: first.dispatchID))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: first.dispatchID)
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(false, for: endpoint))
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(true, for: endpoint))
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            let second = try reserveQuietWake(fixture)
+            XCTAssertNotEqual(first.dispatchID, second.dispatchID)
+            XCTAssertEqual(first.passiveQueue, second.passiveQueue)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: second.dispatchID))
+            if stop { fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session) }
+            else { fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: second.dispatchID) }
+            let suppression = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+            fixture.viewModel.acceptAgentSessionLinkPromptClaim(first)
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, suppression)
+            XCTAssertTrue(try fixture.session.liveItemIDs.contains(XCTUnwrap(first.dispatchID.autoWakeID)))
+            if stop { fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: second.dispatchID) }
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 2)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake, "same failed shape must not call again")
+            fixture.viewModel.acceptAgentSessionLinkPromptClaim(second)
+            XCTAssertNil(fixture.session.oversight.suppressedWakeFingerprint, "only W2 can clear its slot")
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 3, edgeSequenceOffset: 10)
+            XCTAssertNotNil(fixture.session.oversight.pendingAutoWake, "genuinely new edge remains admissible")
+        }
+    }
+}
+
+private actor QuietMarkerProducerHolder {
+    private var lifetime: AgentQuietMarkerProducerLifetime?
+    init(_ lifetime: AgentQuietMarkerProducerLifetime?) {
+        self.lifetime = lifetime
+    }
+
+    func release() {
+        lifetime = nil
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    private func sealedPendingMarker() throws -> (Fixture, AgentSessionLinkOutboundPromptClaim) {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        fixture.session.selectedAgent = .codexExec
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let claim = try reserveQuietWake(fixture)
+        let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+        fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.pending.sealed"))
+        fixture.session.runState = .completed
+        return (fixture, claim)
+    }
+
+    func testLastProducerReleaseOnAndOffMainActorRetiresOnlyUnmaterializedMarker() async throws {
+        for offActor in [false, true] {
+            let (fixture, claim) = try sealedPendingMarker()
+            let wakeID = try XCTUnwrap(claim.dispatchID.autoWakeID)
+            var producer = fixture.session.retainQuietMarkerProducer(for: claim)
+            weak var lifetime = producer
+            XCTAssertNotNil(lifetime)
+            XCTAssertTrue(producer === fixture.session.retainQuietMarkerProducer(for: claim))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+            if offActor {
+                let holder = QuietMarkerProducerHolder(producer)
+                producer = nil
+                XCTAssertNotNil(lifetime)
+                await holder.release()
+            } else { producer = nil }
+            try await AsyncTestWait.waitUntil("final release cleans pending ID on MainActor") {
+                await MainActor.run { !fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID) }
+            }
+            XCTAssertNil(lifetime)
+            XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0))
+        }
+    }
+
+    func testQueuedMainActorCallbackStronglyRetainsSharedLifetimeAcrossClearAndSlotRetirement() async throws {
+        let (fixture, claim) = try sealedPendingMarker()
+        let wakeID = try XCTUnwrap(claim.dispatchID.autoWakeID)
+        var producer = fixture.session.retainQuietMarkerProducer(for: claim)
+        weak var lifetime = producer
+        let gate = AutoWakeCatalogAuthorityGate()
+        let callback = Task { @MainActor [producer] in
+            _ = await gate.requirement()
+            fixture.viewModel.acceptAgentSessionLinkPromptClaim(claim)
+            withExtendedLifetime(producer) {}
+        }
+        await gate.waitUntilEntered()
+        producer = nil
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        fixture.viewModel.clearChat(tabID: fixture.tabID)
+        XCTAssertNotNil(lifetime)
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        await gate.open()
+        await callback.value
+        try await AsyncTestWait.waitUntil("queued callback releases its producer lifetime") {
+            await MainActor.run { lifetime == nil }
+        }
+        XCTAssertTrue(fixture.session.liveItemIDs.contains(wakeID))
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID), "materialized marker retains its own verdict")
+        // Retain an actual source anchor after the working suffix no longer contains the row.
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        XCTAssertNotNil(fixture.session.fullTranscriptProjection.rowAnchorIndex[wakeID])
+        fixture.session.setItemsSilentlyForRetentionCompaction([])
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        fixture.session.clearDerivedTranscriptCaches()
+        XCTAssertFalse(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID), "both row and source anchor really retired")
+    }
+
+    func testLateFinalReleaseCannotPruneReplacementBindingAndRestartHasNoVerdict() async throws {
+        let (fixture, claim) = try sealedPendingMarker()
+        let wakeID = try XCTUnwrap(claim.dispatchID.autoWakeID)
+        var producer = fixture.session.retainQuietMarkerProducer(for: claim)
+        weak var lifetime = producer
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
+        let old = fixture.session.currentRestorationBindingToken
+        _ = try XCTUnwrap(fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: fixture.session, updateWorkspaceMetadata: true
+        ))
+        XCTAssertNotEqual(fixture.session.currentRestorationBindingToken, old)
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.isEmpty)
+        // Reuse the same test wake ID deliberately: even then old cleanup must be binding-fenced.
+        let successor = fixture.session.beginRunAttempt(source: "test.rebound")
+        fixture.session.quietLedger.recordPhysicalDispatch(owner: successor, wakeID: wakeID, routineQuietCheckIn: true, alreadyAcquired: false)
+        fixture.session.sealQuietCheckIn(owner: successor, terminalState: .completed, normal: true, hasSuccessor: false)
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        producer = nil
+        try await AsyncTestWait.waitUntil("old producer reference releases") { await MainActor.run { lifetime == nil } }
+        // A MainActor round trip drains final-release work queued before it.
+        await Task { @MainActor in }.value
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        let restored = AgentModeViewModel.TabSession(tabID: fixture.tabID)
+        restored.setItemsSilently(fixture.session.items, reason: .persistedSessionHydration)
+        XCTAssertTrue(restored.quietLedger.hiddenSourceIDs.isEmpty)
+        XCTAssertEqual(restored.quietLedger.facts, .zero)
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testNativeClaudeSuspendedAcceptanceRetainsQuietMarkerAcrossClearAndSuccessor() async throws {
+        let fixture = try makeFixture()
+        fixture.session.selectedAgent = .claudeCode
+        let projection = try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
+        let routeToken = try XCTUnwrap(projection.routeToken)
+        fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
+        fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in routeToken }
+        fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
+            candidate == routeToken && tabID == fixture.tabID
+        }
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let claim = try reserveQuietWake(fixture)
+        XCTAssertTrue(claim.routineQuietCheckIn)
+        let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+        let gate = AutoWakeCatalogAuthorityGate()
+        await fixture.nativeController.setSendSuspension { _ = await gate.requirement() }
+        addTeardownBlock { await gate.open() }
+        let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
+        let producer = Task { @MainActor in
+            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "", attachments: [], intent: intent,
+                allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await gate.waitUntilEntered()
+        let wakeID = try XCTUnwrap(claim.dispatchID.autoWakeID)
+        fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+        XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0))
+        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.claude.sealed"))
+        fixture.session.runState = .completed
+        fixture.viewModel.clearChat(tabID: fixture.tabID)
+        weak var cohort = fixture.session.oversight.pendingAutoWake?.quietMarkerProducerLifetime
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
+        XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        XCTAssertNotNil(cohort, "only the suspended native local, not the retired reservation, owns this lifetime")
+        let successor = fixture.session.beginRunAttempt(source: "test.claude.successor")
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        await gate.open()
+        _ = await producer.value
+        XCTAssertTrue(fixture.session.liveItemIDs.contains(wakeID))
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        XCTAssertEqual(fixture.session.activeRunOwnership, successor)
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testAnchoredQuietRowsRetireAtProjectionInstallAndCannotBecomePendingOnReload() throws {
+        let fixture = try makeFixture(fenceProviderLaunch: true)
+        fixture.session.selectedAgent = .codexExec
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let claim = try reserveQuietWake(fixture)
+        let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+        let producer = try XCTUnwrap(fixture.session.retainQuietMarkerProducer(for: claim))
+        defer { withExtendedLifetime(producer) {} }
+        let thinking = AgentChatItem.thinking("private reasoning", sequenceIndex: fixture.session.nextSequenceIndex)
+        fixture.session.appendItem(thinking)
+        let assistant = AgentChatItem.assistant("[ack]", sequenceIndex: fixture.session.nextSequenceIndex)
+        fixture.session.appendItem(assistant)
+        fixture.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.rows.sealed"))
+        fixture.session.runState = .completed
+        let wakeID = try XCTUnwrap(claim.dispatchID.autoWakeID)
+        let rows = [thinking, assistant]
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(row.id))
+            XCTAssertNotNil(fixture.session.fullTranscriptProjection.rowAnchorIndex[row.id])
+        }
+        _ = fixture.session.removeItem(at: 1)
+        _ = fixture.session.removeItem(at: 0)
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertEqual(
+                fixture.session.quietLedger.hiddenSourceIDs.contains(row.id),
+                fixture.session.fullTranscriptProjection.rowAnchorIndex[row.id] != nil,
+                "incremental removal may still retain a canonical prefix anchor; only actual retirement prunes it"
+            )
+        }
+        // Retire any canonical prefix anchors through their actual cache owner, then install the
+        // empty presentation before hydration. Neither retired assistant nor thinking may become pending.
+        fixture.session.clearDerivedTranscriptCaches()
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertNil(fixture.session.fullTranscriptProjection.rowAnchorIndex[row.id])
+            XCTAssertFalse(fixture.session.quietLedger.hiddenSourceIDs.contains(row.id))
+        }
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID))
+        fixture.session.setItemsSilently(rows, reason: .persistedSessionHydration)
+        fixture.viewModel.refreshDerivedTranscriptState(for: fixture.session, publishActivePresentation: false)
+        for row in rows {
+            XCTAssertFalse(fixture.session.quietLedger.hiddenSourceIDs.contains(row.id), "rehydrated assistant/thinking cannot masquerade as pending markers")
+        }
+        XCTAssertTrue(fixture.session.quietLedger.hiddenSourceIDs.contains(wakeID), "a genuinely capable unmaterialized marker stays pending")
+        XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0))
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testPeriodicActualReservationWithPendingRowsFreezesOrdinaryClaimAndZeroQuietSentence() throws {
+        for provider in [AgentProviderKind.claudeCode, .codexExec] {
+            let (fixture, clock, endpoint) = try periodicFixture()
+            fixture.session.selectedAgent = provider
+            try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
+            let wakeID = try reservePeriodic(fixture, clock: clock, endpoint: endpoint)
+            XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.admissionBasis, .periodic)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            let claim = try XCTUnwrap(fixture.viewModel.agentSessionLinkPromptClaim(
+                for: fixture.session, dispatchID: .autoWake(wakeID: wakeID)
+            ))
+            XCTAssertFalse(claim.routineQuietCheckIn)
+            XCTAssertFalse(claim.fragment.contains("Nothing needed? Reply [ack]."))
+            XCTAssertFalse(
+                try XCTUnwrap(claim.passive).receipt.deliveredStatuses.isEmpty,
+                "negative control carries real pending content, not an absent claim"
+            )
+            fixture.session.oversight.retirePeriodicScheduling()
+        }
+    }
+}
+
+private actor QuietWakeSendOrder {
+    private var count = 0
+    func advance() -> Int {
+        count += 1
+        return count
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testW1CutoffNineAcceptanceDuringW2FailureAtTenPaysOnlyNineAndCannotRearmPhysicalWake() async throws {
+        let fixture = try makeFixture()
+        fixture.session.selectedAgent = .claudeCode
+        let projection = try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
+        let routeToken = try XCTUnwrap(projection.routeToken)
+        fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
+        fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in routeToken }
+        fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
+            candidate == routeToken && tabID == fixture.tabID
+        }
+        try publishInventory(fixture, revision: 1)
+        fixture.session.oversight.autoWakeOnUpdates = true
+        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+        typealias Notices = AgentSessionLinkPassiveStatusNotices
+        var reducer = Notices(observerEndpoint: endpoint, queueEpoch: Self.laneQueueEpoch)
+        func sample(_ status: Notices.Status, _ settled: UInt64, _ ordinary: UInt64) -> Notices.Sample {
+            .init(
+                reference: Self.laneReference(0),
+                targetEndpoint: Self.laneTargetEndpoint(0),
+                targetSessionID: Self.targetID(0),
+                displayName: "Build API",
+                status: status,
+                idleForSend: status == .idle,
+                runFacts: .init(settledThrough: settled, ordinaryThrough: ordinary)
+            )
+        }
+        func publish() {
+            fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(reducer.snapshot, to: endpoint)
+        }
+        reducer.enable(samples: [sample(.idle, 8, 8)], linkSetRevision: 1)
+        reducer.setAutoWakeLanes([.init(
+            reference: Self.laneReference(0),
+            targetEndpoint: Self.laneTargetEndpoint(0),
+            targetSessionID: Self.targetID(0),
+            isEffectivelySelected: true
+        )])
+        reducer.reconcile(samples: [sample(.idle, 9, 9)], linkSetRevision: 1, deliverable: true)
+        publish()
+        let first = try reserveQuietWake(fixture)
+        let firstOwner = try beginAndAcquireQuietWake(fixture, claim: first)
+        let firstGate = AutoWakeCatalogAuthorityGate()
+        let secondGate = AutoWakeCatalogAuthorityGate()
+        let order = QuietWakeSendOrder()
+        await fixture.nativeController.setSendSuspension {
+            switch await order.advance() {
+            case 1: _ = await firstGate.requirement()
+            case 2: _ = await secondGate.requirement()
+            default: break
+            }
+        }
+        addTeardownBlock { await firstGate.open()
+            await secondGate.open()
+        }
+        let firstIntent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: firstOwner, runID: XCTUnwrap(fixture.session.runID))
+        let w1 = Task { @MainActor in
+            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "", attachments: [], intent: firstIntent, allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await firstGate.waitUntilEntered()
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: first.dispatchID)
+        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: firstOwner, source: "test.w1.local-finished"))
+        fixture.session.runState = .completed
+        reducer.reconcile(samples: [sample(.idle, 10, 10)], linkSetRevision: 1, deliverable: true)
+        publish()
+        let second = try reserveQuietWake(fixture)
+        XCTAssertNotEqual(first.dispatchID, second.dispatchID)
+        let secondOwner = try beginAndAcquireQuietWake(fixture, claim: second)
+        let secondIntent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: secondOwner, runID: XCTUnwrap(fixture.session.runID))
+        let w2 = Task { @MainActor in
+            await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                session: fixture.session, text: "", attachments: [], intent: secondIntent, allowsCatalogRouteControllerRecovery: false
+            )
+        }
+        await secondGate.waitUntilEntered()
+        fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: second.dispatchID)
+        let failedTen = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+        XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: secondOwner, source: "test.w2.stopped"))
+        fixture.session.runState = .completed
+        await firstGate.open()
+        _ = await w1.value
+        XCTAssertTrue(try fixture.session.liveItemIDs.contains(XCTUnwrap(first.dispatchID.autoWakeID)))
+        // The fixture routes this production-created frozen receipt to its own reducer, exactly as
+        // the shared bridge does in the app; never synthesize a newer payment from current facts.
+        let firstReceipt = try XCTUnwrap(first.passive?.receipt)
+        XCTAssertEqual(firstReceipt.deliveredStatuses.first?.settledThrough, 9)
+        reducer.apply(firstReceipt)
+        XCTAssertEqual(reducer.deliveredRunThrough(for: Self.laneReference(0)), 9)
+        XCTAssertEqual(reducer.snapshot.entries.first?.ordinaryThrough, 10)
+        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failedTen)
+        let calls = await fixture.nativeController.sentCount
+        XCTAssertEqual(calls, 2)
+        for index in 0 ..< 5 {
+            reducer.reconcile(samples: [sample(.running, UInt64(10 + index), 10)], linkSetRevision: 1, deliverable: true)
+            reducer.reconcile(samples: [sample(.idle, UInt64(11 + index), 10)], linkSetRevision: 1, deliverable: true)
+            publish()
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        }
+        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failedTen)
+        let after = await fixture.nativeController.sentCount
+        XCTAssertEqual(after, calls, "quiet round trips/metadata cannot produce another physical call")
+        await secondGate.open()
+        _ = await w2.value
+        try reducer.apply(XCTUnwrap(second.passive?.receipt))
+        XCTAssertEqual(reducer.deliveredRunThrough(for: Self.laneReference(0)), 10)
+        XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+        reducer.reconcile(samples: [sample(.idle, 16, 16)], linkSetRevision: 1, deliverable: true)
+        publish()
+        XCTAssertNotNil(fixture.session.oversight.pendingAutoWake, "new ordinary work may admit under unchanged controls")
+        fixture.session.oversight.pendingAutoWake?.task?.cancel()
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testLateUnknownW1AcceptanceRebasesDebtWithoutClearingW2AndFreshProofRedisclosesOnlyWithoutFailure() throws {
+        for storedFailure in [false, true] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            typealias Notices = AgentSessionLinkPassiveStatusNotices
+            var reducer = Notices(observerEndpoint: endpoint, queueEpoch: Self.laneQueueEpoch)
+            func sample(_ status: Notices.Status, _ proof: AgentRunQuietFacts?) -> Notices.Sample {
+                .init(
+                    reference: Self.laneReference(0),
+                    targetEndpoint: Self.laneTargetEndpoint(0),
+                    targetSessionID: Self.targetID(0),
+                    displayName: "Build API",
+                    status: status,
+                    runFacts: proof
+                )
+            }
+            func publish() {
+                fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(reducer.snapshot, to: endpoint)
+            }
+            reducer.enable(samples: [sample(.running, .init(settledThrough: 8, ordinaryThrough: 8))], linkSetRevision: 1)
+            reducer.setAutoWakeLanes([.init(reference: Self.laneReference(0), targetEndpoint: Self.laneTargetEndpoint(0), targetSessionID: Self.targetID(0), isEffectivelySelected: true)])
+            reducer.reconcile(samples: [sample(.running, .init(settledThrough: 10, ordinaryThrough: 10))], linkSetRevision: 1, deliverable: true)
+            reducer.reconcile(samples: [sample(.idle, nil)], linkSetRevision: 1, deliverable: true)
+            publish()
+            let first = try reserveQuietWake(fixture)
+            XCTAssertNil(first.passive?.receipt.deliveredStatuses.first?.settledThrough)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: first.dispatchID))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: first.dispatchID)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(false, for: endpoint))
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkSetAutoWakeOnUpdatesEnabled(true, for: endpoint))
+            publish()
+            let second = try reserveQuietWake(fixture)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: second.dispatchID))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: second.dispatchID)
+            let failure = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+            fixture.viewModel.acceptAgentSessionLinkPromptClaim(first)
+            try reducer.apply(XCTUnwrap(first.passive?.receipt))
+            XCTAssertEqual(reducer.deliveredRunThrough(for: Self.laneReference(0)), 8)
+            XCTAssertEqual(reducer.snapshot.entries.first?.fromStatus, .idle)
+            XCTAssertFalse(try XCTUnwrap(reducer.snapshot.entries.first).isRoutineWakeEligible)
+            XCTAssertEqual(reducer.snapshot.wakeEligibilityFingerprint, failure)
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failure)
+            if !storedFailure { fixture.session.oversight.clearWakeSuppression() }
+            for _ in 0 ..< 5 {
+                reducer.reconcile(samples: [sample(.idle, nil)], linkSetRevision: 1, deliverable: true)
+                publish()
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake, "unpaired debt cannot independently repeat at each interval")
+            }
+            if storedFailure {
+                // Manual retry is still permitted on an unpaired inert hitchhiker. It changes no
+                // routine failure identity and its physical failure pays nothing.
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+                let manual = try reserveQuietWake(fixture)
+                XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: manual.dispatchID))
+                fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: manual.dispatchID)
+                XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failure)
+                XCTAssertEqual(reducer.deliveredRunThrough(for: Self.laneReference(0)), 8)
+            }
+            reducer.reconcile(samples: [sample(.idle, .init(settledThrough: 10, ordinaryThrough: 10))], linkSetRevision: 1, deliverable: true)
+            publish()
+            if storedFailure {
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake, "fresh proof does not invent a new failed occurrence")
+                XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failure)
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+            } else {
+                XCTAssertNotNil(fixture.session.oversight.pendingAutoWake, "one fresh-proof redisclosure is owed without failure")
+            }
+            let retry = try reserveQuietWake(fixture)
+            XCTAssertEqual(retry.passive?.receipt.deliveredStatuses.first?.settledThrough, 10)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: retry.dispatchID))
+            fixture.viewModel.acceptAgentSessionLinkPromptClaim(retry)
+            try reducer.apply(XCTUnwrap(retry.passive?.receipt))
+            publish()
+            XCTAssertEqual(reducer.deliveredRunThrough(for: Self.laneReference(0)), 10)
+            XCTAssertTrue(reducer.snapshot.entries.isEmpty)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        }
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testF1QuietCloseThenControllerRunReplacementAndAcceptedLocalSuccessorReachActualObserverPhysicalWake() async throws {
+        let observer = try makeFixture()
+        let target = try makeFixture(windowID: 2)
+        observer.session.selectedAgent = .claudeCode
+        target.session.selectedAgent = .claudeCode
+        observer.session.runState = .running // park wake admission until this test supplies its physical producer
+        let catalog = try publishCatalogProjection(observer, revision: 2, hasAgentSessionLink: true)
+        let token = try XCTUnwrap(catalog.routeToken)
+        observer.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
+        observer.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
+        observer.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in
+            candidate == token && tabID == observer.tabID
+        }
+        let host = LiveWindowEndpointHost()
+        host.register(observer.viewModel, windowID: 1)
+        host.register(target.viewModel, windowID: 2)
+        let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(
+            runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: Date(timeIntervalSince1970: 0)
+        ))
+        let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+        guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else {
+            return XCTFail("grant failed")
+        }
+        let observerEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(observer.viewModel, tabID: observer.tabID)
+        XCTAssertTrue(observer.viewModel.agentSessionLinkSetAutoWakeTargetSessionIDs([target.sessionID], for: observerEndpoint))
+        let terminal = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        func finish(_ owner: AgentRunOwnership) async throws {
+            let candidate = try XCTUnwrap(target.viewModel.agentSessionLinkCandidates(isWindowClosing: false).first)
+            let opening = target.session.quietLedger.facts
+            var preparingFacts: AgentRunQuietFacts?
+            var inlineIdleFacts: AgentRunQuietFacts?
+            var idleStillOwned = false
+            let previous = target.session.onRunStateChanged
+            target.session.onRunStateChanged = { session in
+                previous?(session)
+                guard session.runState == .completed else { return }
+                let captured = host.agentSessionLinkObservationSnapshot(for: candidate)
+                inlineIdleFacts = host.agentSessionLinkRunFacts(for: candidate, capturedStatus: captured.status)
+                idleStillOwned = session.activeRunOwnership == owner
+            }
+            defer { target.session.onRunStateChanged = previous }
+            let revision = await AgentRunTerminalCommitBarrier().commit(.init(
+                binding: terminal.hooks.bindTerminalSession(target.session), ownership: owner,
+                expectedRunID: target.session.runID, terminalState: .completed, source: "test.F1",
+                attachmentDisposition: .deleteFiles, finalizeNonCodexUsage: false, supportsFollowUp: false,
+                notifyTurnComplete: false, classifiesQuietCheckIn: true,
+                prepareProviderState: {
+                    let captured = host.agentSessionLinkObservationSnapshot(for: candidate)
+                    preparingFacts = host.agentSessionLinkRunFacts(for: candidate, capturedStatus: captured.status)
+                    return nil
+                }
+            ))
+            XCTAssertNotNil(revision)
+            XCTAssertEqual(preparingFacts, opening, "real host accessor uses the captured active status after seal")
+            XCTAssertEqual(inlineIdleFacts, target.session.quietLedger.facts)
+            XCTAssertTrue(idleStillOwned, "first captured idle facts do not wait for ownership release")
+            // Source publishers coalesce on the main queue. Wait for their existing signal, then
+            // drain the owning serial publication and ordinary authoritative observer projection.
+            await bridge.test_settleProjections()
+            await bridge.test_settleTargetPublications()
+            await bridge.test_settleProjections()
+        }
+        await bridge.test_settleTargetPublications()
+        let old = target.session.beginRunAttempt(source: "test.F1.quiet")
+        target.session.runState = .running
+        let targetEndpoint = try AgentSessionLinkEndpointTestSupport.endpoint(target.viewModel, tabID: target.tabID)
+        try await AsyncTestWait.waitUntil("F1 running frame accepted", timeout: 4) {
+            bridge.test_pairedRunStatus(for: targetEndpoint) == .running
+        }
+        await bridge.test_settleTargetPublications()
+        // Seed the precondition through the same ledger physical-origin seam as the shared native
+        // replay family. This test's outcome is the downstream real claim/physical provider handoff.
+        target.session.quietLedger.markRoutineWake(owner: old, wakeID: UUID())
+        try await finish(old)
+        let oldVerdict = target.session.quietLedger.hiddenSourceIDs
+        XCTAssertEqual(target.session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 0))
+        XCTAssertNil(observer.session.oversight.pendingAutoWake, "quiet close must not wake the observer")
+        target.session.installRunID(UUID())
+        target.session.claudeController = MonitorFakeNativeController()
+        let successor = target.session.beginRunAttempt(source: "test.F1.local-successor")
+        target.session.runState = .running
+        // Use the real accepted pre-row composer boundary on an open owner. waitingForUser by
+        // itself is neutral (no interaction); without a continuation it uses the existing follow-up
+        // queue, so this fixture does not invent a second provider callback during terminal replay.
+        target.session.runState = .waitingForUser
+        let result = target.viewModel.submitUserTurn(text: "local successor work", tabID: target.tabID)
+        XCTAssertEqual(result, .submitted)
+        XCTAssertTrue(target.session.items.contains { $0.kind == .user && $0.text == "local successor work" })
+        target.session.runState = .running
+        target.session.appendItem(.assistant("ordinary successor finished"))
+        try await finish(successor)
+        XCTAssertEqual(target.session.quietLedger.facts, .init(settledThrough: 2, ordinaryThrough: 2))
+        XCTAssertEqual(target.session.quietLedger.hiddenSourceIDs, oldVerdict)
+        let notices = try XCTUnwrap(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID])
+        XCTAssertEqual(notices.entries.first?.ordinaryThrough, 2)
+        XCTAssertEqual(notices.entries.first?.latestVisibleAssistantPreview, "ordinary successor finished")
+        observer.session.runState = .completed
+        let claim = try reserveQuietWake(observer)
+        let owner = try beginAndAcquireQuietWake(observer, claim: claim)
+        let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(observer.session.runID))
+        _ = await observer.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+            session: observer.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
+        )
+        let physical = await observer.nativeController.sentMessages
+        XCTAssertEqual(physical.count, 1)
+        XCTAssertTrue(try XCTUnwrap(physical.first).contains("ordinary successor finished"))
+        XCTAssertEqual(claim.passive?.receipt.deliveredStatuses.first?.settledThrough, 2)
+        try bridge.applyPassiveMonitorNoticeReceipt(XCTUnwrap(claim.passive?.receipt), observerEndpoint: observerEndpoint)
+        XCTAssertTrue(try XCTUnwrap(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID]).entries.isEmpty)
+        target.session.pendingInstructions.removeAll()
+        observer.session.oversight.pendingAutoWake?.task?.cancel()
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testQuietBatchReorderingKeepsFailureSuppressedWithoutBlockingFreshAdmissionBases() throws {
+        typealias Notices = AgentSessionLinkPassiveStatusNotices
+        for freshBasis in ["ordinary", "status", "attention", "overflow", "manual"] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            var reducer = Notices(observerEndpoint: endpoint, queueEpoch: Self.laneQueueEpoch)
+            func sample(_ index: Int, _ settled: UInt64, _ ordinary: UInt64, status: Notices.Status = .idle) -> Notices.Sample {
+                .init(
+                    reference: Self.laneReference(index), targetEndpoint: Self.laneTargetEndpoint(index),
+                    targetSessionID: Self.targetID(index), displayName: "Lane \(index)", status: status,
+                    idleForSend: status == .idle, runFacts: .init(settledThrough: settled, ordinaryThrough: ordinary)
+                )
+            }
+            func publish(_ snapshot: Notices.Snapshot) {
+                fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+            }
+            reducer.enable(samples: [sample(0, 8, 8), sample(1, 8, 8)], linkSetRevision: 1)
+            reducer.setAutoWakeLanes((0 ..< 2).map { .init(
+                reference: Self.laneReference($0), targetEndpoint: Self.laneTargetEndpoint($0),
+                targetSessionID: Self.targetID($0), isEffectivelySelected: true
+            ) })
+            reducer.reconcile(samples: [sample(0, 9, 9), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            let original = reducer.snapshot
+            XCTAssertEqual(original.entries.map(\.reference), [Self.laneReference(0), Self.laneReference(1)])
+            publish(original)
+            let first = try reserveQuietWake(fixture)
+            let frozen = try XCTUnwrap(first.passive?.receipt)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: first.dispatchID))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: first.dispatchID)
+            let failed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+
+            // Only A's quiet cutoff/metadata advances: display order becomes B,A, not a new failure.
+            reducer.reconcile(samples: [sample(0, 10, 9), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            let quiet = reducer.snapshot
+            XCTAssertEqual(quiet.entries.map(\.reference), [Self.laneReference(1), Self.laneReference(0)])
+            XCTAssertEqual(quiet.entries.last?.edgeSequence, original.entries.first?.edgeSequence)
+            XCTAssertEqual(quiet.entries.last?.ordinaryThrough, 9)
+            XCTAssertEqual(quiet.entries.last?.receiptSettledThrough, 10)
+            XCTAssertGreaterThan(try XCTUnwrap(quiet.entries.last?.changeSequence), try XCTUnwrap(original.entries.first?.changeSequence))
+            XCTAssertEqual(frozen.deliveredStatuses.map(\.reference), [Self.laneReference(0), Self.laneReference(1)])
+            XCTAssertEqual(frozen.deliveredStatuses.map(\.settledThrough), [9, 9])
+            for _ in 0 ..< 3 {
+                publish(quiet)
+            }
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake, "\(freshBasis): quiet-only reordering must not rearm the failed batch")
+            guard fixture.session.oversight.pendingAutoWake == nil else {
+                fixture.session.oversight.pendingAutoWake?.task?.cancel()
+                continue
+            }
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, failed)
+
+            switch freshBasis {
+            case "ordinary":
+                reducer.reconcile(samples: [sample(0, 11, 11), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            case "status":
+                reducer.reconcile(samples: [sample(0, 10, 9, status: .waiting), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            case "attention":
+                XCTAssertEqual(reducer.requestAttention(
+                    reference: Self.laneReference(1), targetEndpoint: Self.laneTargetEndpoint(1),
+                    targetSessionID: Self.targetID(1), linkSetRevision: 1
+                ), .accepted)
+            case "overflow", "manual": break
+            default: return XCTFail("Unknown admission control")
+            }
+            var successor = reducer.snapshot
+            if freshBasis == "overflow" {
+                // Existing anonymous overflow producer shape; retain the reducer's exact row order.
+                successor = .init(
+                    observerEndpoint: successor.observerEndpoint, queueEpoch: successor.queueEpoch,
+                    queueRevision: successor.queueRevision + 1, linkSetRevision: successor.linkSetRevision,
+                    isEnabled: successor.isEnabled, isDeliverable: successor.isDeliverable,
+                    entries: successor.entries, attentionRequests: successor.attentionRequests,
+                    unacknowledgedOverflowCount: 1, overflowProduced: successor.overflowProduced + 1,
+                    autoWakeLanes: successor.autoWakeLanes
+                )
+            }
+            publish(successor)
+            if freshBasis == "manual" {
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+                XCTAssertEqual(fixture.viewModel.agentSessionLinkRequestManualWakeNow(for: endpoint), .scheduled)
+            }
+            let next = try reserveQuietWake(fixture)
+            XCTAssertEqual(next.passive?.receipt.deliveredStatuses.map(\.reference), successor.entries.map(\.reference))
+            XCTAssertEqual(next.passive?.receipt.deliveredStatuses.map(\.settledThrough), successor.entries.map(\.receiptSettledThrough))
+            XCTAssertEqual(fixture.session.oversight.pendingAutoWake?.isManual, freshBasis == "manual")
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: next.dispatchID), freshBasis)
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: next.dispatchID)
+            XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, freshBasis == "manual" ? failed : successor.wakeEligibilityFingerprint)
+            for _ in 0 ..< 3 {
+                publish(successor)
+            }
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake, "\(freshBasis): one attempt, not a retry loop")
+        }
+    }
+
+    func testF3QuietLaneNewOrdinaryCoverageRearmsFailureBeforeClaimAndWhenBudgetOmitted() throws {
+        for omitted in [false, true] {
+            let fixture = try makeFixture(fenceProviderLaunch: true)
+            try publishInventory(fixture, revision: 1)
+            fixture.session.oversight.autoWakeOnUpdates = true
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            if omitted {
+                let live = Self.inventory(observerSessionID: fixture.sessionID, revision: 1)
+                fixture.viewModel.agentSessionLinkPublishPromptInventory(.init(
+                    observerSessionID: fixture.sessionID, linkSetRevision: 1,
+                    items: live.items + (2 ..< 200).map { index in
+                        .init(
+                            targetSessionID: UUID(uuidString: String(format: "F3000000-0000-0000-0000-%012d", index))!,
+                            displayName: String(repeating: "inventory & lane", count: 8),
+                            capabilityNames: ["poll", "read", "wait"]
+                        )
+                    }
+                ), to: endpoint)
+            }
+            typealias Notices = AgentSessionLinkPassiveStatusNotices
+            var reducer = Notices(observerEndpoint: endpoint, queueEpoch: Self.laneQueueEpoch)
+            func sample(_ index: Int, _ settled: UInt64, _ ordinary: UInt64) -> Notices.Sample {
+                .init(
+                    reference: Self.laneReference(index),
+                    targetEndpoint: Self.laneTargetEndpoint(index),
+                    targetSessionID: Self.targetID(index),
+                    displayName: index == 0 && omitted ? String(repeating: "&", count: 120) : "Lane \(index)",
+                    status: .idle,
+                    latestVisibleAssistantPreview: index == 0 && omitted ? String(repeating: "&", count: 280) : "finished",
+                    runFacts: .init(settledThrough: settled, ordinaryThrough: ordinary)
+                )
+            }
+            reducer.enable(samples: [sample(0, 8, 8), sample(1, 8, 8)], linkSetRevision: 1)
+            reducer.setAutoWakeLanes((0 ..< 2).map { .init(reference: Self.laneReference($0), targetEndpoint: Self.laneTargetEndpoint($0), targetSessionID: Self.targetID($0), isEffectivelySelected: true) })
+            // C precedes B in the real detail order, so the existing budget reserves small C and
+            // can omit large B. B's quiet close preserves its earlier unpaid ordinary contribution.
+            reducer.reconcile(samples: [sample(0, 8, 8), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            reducer.reconcile(samples: [sample(0, 9, 9), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            reducer.reconcile(samples: [sample(0, 10, 9), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(reducer.snapshot, to: endpoint)
+            if omitted {
+                let claim = try reserveQuietWake(fixture)
+                let rendered = try XCTUnwrap(claim.passive?.receipt.deliveredStatuses)
+                XCTAssertTrue(rendered.contains { $0.reference == Self.laneReference(1) })
+                XCTAssertFalse(rendered.contains { $0.reference == Self.laneReference(0) }, "B truly did not fit, not a fabricated receipt")
+                XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: claim.dispatchID))
+                fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: claim.dispatchID)
+            } else {
+                let wake = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+                XCTAssertNil(fixture.viewModel.agentSessionLinkPromptClaimStore.pendingClaim(dispatchID: .autoWake(wakeID: wake.wakeID), observerSessionID: fixture.sessionID))
+                fixture.viewModel.agentSessionLinkRetractAutoWakeForUserStop(fixture.session)
+            }
+            let failed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+            for _ in 0 ..< 3 {
+                fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(reducer.snapshot, to: endpoint)
+            }
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            reducer.reconcile(samples: [sample(0, 11, 11), sample(1, 9, 9)], linkSetRevision: 1, deliverable: true)
+            fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(reducer.snapshot, to: endpoint)
+            XCTAssertNotEqual(reducer.snapshot.wakeEligibilityFingerprint, failed)
+            let next = try reserveQuietWake(fixture)
+            XCTAssertTrue(fixture.viewModel.agentSessionLinkAcquirePhysicalDispatch(for: fixture.session, dispatchID: next.dispatchID))
+            fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: next.dispatchID)
+            for _ in 0 ..< 3 {
+                fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(reducer.snapshot, to: endpoint)
+            }
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake, "one rearm for new ordinary coverage, never a metadata retry loop")
+        }
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testClaudeQuietGuidanceWholePhysicalNativeEnvelopesBeforeAfterFullReminderAndNearCap() async throws {
+        for reminder in [false, true] {
+            for nearCap in [false, true] {
+                for basis in ["routine", "overflow"] {
+                    var texts: [String] = []
+                    var fragmentBytes: [Int] = []
+                    var renderedRows: [[String]] = []
+                    for routine in [false, true] {
+                        let fixture = try makeFixture()
+                        fixture.session.selectedAgent = .claudeCode
+                        let catalog = try publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true)
+                        let token = try XCTUnwrap(catalog.routeToken)
+                        fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
+                        fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
+                        fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { candidate, tabID in candidate == token && tabID == fixture.tabID }
+                        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                        func publish(_ revision: UInt64) {
+                            let small = Self.inventory(observerSessionID: fixture.sessionID, revision: revision)
+                            let extra: [AgentSessionLinkPromptInventoryItem] = nearCap ? (2 ..< 200).map { index in
+                                .init(
+                                    targetSessionID: UUID(uuidString: String(format: "C4000000-0000-0000-0000-%012d", index))!,
+                                    displayName: String(repeating: "inventory & lane", count: 8),
+                                    capabilityNames: ["poll", "read", "wait"]
+                                )
+                            } : []
+                            fixture.viewModel.agentSessionLinkPublishPromptInventory(.init(
+                                observerSessionID: fixture.sessionID,
+                                linkSetRevision: revision,
+                                items: small.items + extra
+                            ), to: endpoint)
+                            let offered = Self.laneSnapshot(observerEndpoint: endpoint, linkSetRevision: revision, queueRevision: revision)
+                            let snapshot = AgentSessionLinkPassiveStatusNotices.Snapshot(
+                                observerEndpoint: endpoint, queueEpoch: offered.queueEpoch, queueRevision: revision,
+                                linkSetRevision: revision, isEnabled: true, isDeliverable: true,
+                                entries: (basis == "overflow" ? [] : offered.entries).map { row in
+                                    .init(
+                                        reference: row.reference,
+                                        targetEndpoint: row.targetEndpoint,
+                                        targetSessionID: row.targetSessionID,
+                                        displayName: nearCap ? String(repeating: "&", count: 120) : row.displayName,
+                                        fromStatus: row.fromStatus,
+                                        toStatus: row.toStatus,
+                                        observedAt: row.observedAt,
+                                        latestVisibleAssistantPreview: nearCap ? String(repeating: "&", count: 280) : "finished",
+                                        changeSequence: row.changeSequence,
+                                        edgeSequence: row.edgeSequence
+                                    )
+                                }, unacknowledgedOverflowCount: basis == "overflow" ? 1 : 0,
+                                overflowProduced: basis == "overflow" ? 1 : 0, autoWakeLanes: offered.autoWakeLanes
+                            )
+                            fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(snapshot, to: endpoint)
+                        }
+                        publish(1)
+                        if reminder {
+                            let owner = fixture.session.beginRunAttempt(source: "test.copy.primer")
+                            fixture.session.runState = .running
+                            let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
+                            _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                                session: fixture.session, text: "primer", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
+                            )
+                            XCTAssertTrue(fixture.session.endRunAttempt(ifCurrent: owner, source: "test.copy.primer.finished"))
+                            fixture.session.runState = .completed
+                        }
+                        fixture.session.oversight.autoWakeOnUpdates = true
+                        publish(reminder ? 2 : 1)
+                        if !routine {
+                            var attempt = try XCTUnwrap(fixture.session.oversight.pendingAutoWake)
+                            attempt.admissionBasis = .manual
+                            fixture.session.oversight.pendingAutoWake = attempt
+                        }
+                        let claim = try reserveQuietWake(fixture)
+                        XCTAssertEqual(claim.routineQuietCheckIn, routine)
+                        let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+                        let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
+                        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(
+                            session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false
+                        )
+                        let sent = await fixture.nativeController.sentMessages
+                        let physical = try XCTUnwrap(sent.last)
+                        XCTAssertEqual(physical.contains("Nothing needed? Reply [ack]."), routine)
+                        XCTAssertTrue(physical.contains(claim.fragment), "measure the physical provider bytes, not only a render handed to the test")
+                        texts.append(physical)
+                        fragmentBytes.append(claim.fragment.utf8.count)
+                        try renderedRows.append(XCTUnwrap(claim.passive?.receipt.deliveredStatuses).map(\.targetEndpoint.sessionID.uuidString))
+                    }
+                    let data = try JSONSerialization.data(withJSONObject: [
+                        "provider": "claudeCode", "adapter": "physical-native", "basis": basis, "guidance": reminder ? "reminder" : "full",
+                        "budget": nearCap ? "near-cap" : "generous", "before": texts[0], "after": texts[1],
+                        "beforeFragmentBytes": fragmentBytes[0], "afterFragmentBytes": fragmentBytes[1],
+                        "beforeRows": renderedRows[0], "renderedRows": renderedRows[1]
+                    ], options: [.sortedKeys])
+                    print("QUIET_C4_ENVELOPE " + data.base64EncodedString())
+                }
+            }
+        }
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    private func installQuietNativeRoute(_ fixture: Fixture) throws {
+        let token = try XCTUnwrap(publishCatalogProjection(fixture, revision: 2, hasAgentSessionLink: true).routeToken)
+        fixture.viewModel.test_agentSessionLinkHasActiveOutboundLink = { _ in true }
+        fixture.viewModel.test_agentSessionLinkAuthoritativeRunCatalogRouteToken = { _, _, _ in token }
+        fixture.viewModel.test_agentSessionLinkCurrentRunCatalogRouteToken = { value, tabID in value == token && tabID == fixture.tabID }
+    }
+
+    func testEClaudeCodexRingDrainsAtMostTwoRealNativeFakeWakesAndDoesNotEchoQuietClosures() async throws {
+        try await exerciseNativeRing(failing: false)
+    }
+
+    func testEPersistentFailingTwoWayNativeRingAdvancesOrdinaryWatermarksAtExistingInterval() async throws {
+        try await exerciseNativeRing(failing: true)
+    }
+
+    private func exerciseNativeRing(failing: Bool) async throws {
+        let codex = MonitorFakeCodexController(dispatches: MonitorCodexDispatchRecorder())
+        let a = try makeFixture(windowID: 1)
+        let b = try makeFixture(windowID: 2, codexController: codex)
+        a.session.selectedAgent = .claudeCode
+        b.session.selectedAgent = .codexExec
+        try installQuietNativeRoute(a)
+        let codexCatalog = MonitorInventoryPublisher(viewModel: b.viewModel, observerSessionID: b.sessionID, tabID: b.tabID)
+        await codexCatalog.publishCodex(revision: 1, targetCount: 1)
+        codex.setStartOrResumeHook { await codexCatalog.republishCurrentCodexCatalog() }
+        addTeardownBlock { await codexCatalog.cleanupCodexCatalogPublications() }
+        let host = LiveWindowEndpointHost()
+        host.register(a.viewModel, windowID: 1)
+        host.register(b.viewModel, windowID: 2)
+        let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast))
+        let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+        let terminal = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        for (observer, target) in [(a, b), (b, a)] {
+            guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("ring grant failed") }
+            observer.session.isPreparingInitialWorktree = true
+            observer.session.oversight.autoWakeOnUpdates = false
+        }
+        func finish(_ fixture: Fixture, _ owner: AgentRunOwnership) async throws {
+            _ = await AgentRunTerminalCommitBarrier().commit(.init(
+                binding: terminal.hooks.bindTerminalSession(fixture.session), ownership: owner, expectedRunID: fixture.session.runID,
+                terminalState: .completed, source: "test.E.ring", attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false, classifiesQuietCheckIn: true
+            ))
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            try await AsyncTestWait.waitUntil("ring source idle frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .idle }
+            await bridge.test_settleTargetPublications()
+            await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])
+        }
+        for fixture in [a, b] {
+            fixture.session.runState = .running
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            try await AsyncTestWait.waitUntil("ring ordinary running frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .running }
+            let owner = fixture.session.beginRunAttempt(source: "test.E.ordinary")
+            fixture.session.noteAcceptedTaskInput()
+            try await finish(fixture, owner)
+        }
+        if failing {
+            b.viewModel.test_codexCoordinator.installTerminalCommitBarrier(AgentRunTerminalCommitBarrier(), terminalSessionBinder: terminal.hooks.bindTerminalSession)
+            // One shared deterministic instant; timestamps are recorded INSIDE the actual fake
+            // send/start boundary, not at reservation or by inferring that an adapter was called.
+            let clock = AgentSessionLinkAutoWakeSnoozeTestClock()
+            let start = clock.wallNow
+            var calls: [(provider: String, seconds: TimeInterval)] = []
+            await a.nativeController.setFailSendAfterRecord(true)
+            await a.nativeController.setSendSuspension {
+                await MainActor.run { calls.append(("Claude", clock.wallNow.timeIntervalSince(start))) }
+            }
+            codex.setStartFailure(true) {
+                await MainActor.run { calls.append(("Codex", clock.wallNow.timeIntervalSince(start))) }
+            }
+            for fixture in [a, b] {
+                fixture.session.oversight.snoozeClock = clock.clock
+                fixture.session.oversight.routineWakeIntervalEnabled = true
+                fixture.session.oversight.routineWakeIntervalSeconds = 300
+                fixture.session.isPreparingInitialWorktree = true
+            }
+            func freshNotices(for observer: Fixture) async throws -> AgentSessionLinkPassiveStatusNotices.Snapshot {
+                let target = observer.session === a.session ? b : a
+                try await AsyncTestWait.waitUntil("failing ring observer has the peer's exact fresh ordinary facts") {
+                    await bridge.test_settleTargetPublications()
+                    await bridge.test_refreshStatus(sessionIDs: [observer.sessionID])
+                    return observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID]?.entries.first?.runFacts == target.session.quietLedger.facts
+                }
+                return try XCTUnwrap(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID])
+            }
+            var maxQueueRows = 0
+            // A real failure pays no receipt. Each failed ordinary closure advances a NEW source
+            // watermark, so the peer can keep waking. The contract bounds cadence/queue, NOT an
+            // invented universal cycle dampener or a new retry/backoff rule.
+            for round in 0 ..< 8 {
+                if round > 0 {
+                    clock.advanceWithoutFiring(seconds: 299)
+                    for fixture in [a, b] {
+                        fixture.session.oversight.autoWakeOnUpdates = true
+                        let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                        let notices = try await freshNotices(for: fixture)
+                        fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(notices, to: endpoint)
+                        XCTAssertNil(fixture.session.oversight.pendingAutoWake, "Fresh ordinary debt must still respect the existing interval")
+                    }
+                    XCTAssertEqual(calls.count, round * 2)
+                    clock.advanceWithoutFiring(seconds: 1)
+                }
+                for fixture in [a, b] {
+                    fixture.session.oversight.autoWakeOnUpdates = true
+                    let notices = try await freshNotices(for: fixture)
+                    let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+                    // Owner publication is an admission hint even when its bounded display value
+                    // is unchanged. Existing timer expiry/readiness tests separately exercise the
+                    // automatic re-drive; this fixture cancels its task to control physical sends.
+                    fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(notices, to: endpoint)
+                    // The peer may already have an interval-expiry readiness waiter. Hold both
+                    // providers at the existing worktree hard gate, then cancel this exact task
+                    // before releasing only this side for its controlled native transport call.
+                    fixture.session.oversight.pendingAutoWake?.task?.cancel()
+                    fixture.session.isPreparingInitialWorktree = false
+                    guard fixture.session.oversight.pendingAutoWake != nil else {
+                        return XCTFail("Failing ring has no reserved attempt at round=\(round) provider=\(fixture.session.selectedAgent) freshOrdinary=\(String(describing: notices.entries.first?.ordinaryThrough))")
+                    }
+                    let claim = try reserveQuietWake(fixture)
+                    let before = try XCTUnwrap(fixture.session.quietLedger.facts)
+                    let callCount = calls.count
+                    let owner = fixture.session.selectedAgent == .codexExec
+                        ? fixture.session.beginRunAttempt(source: "test.E.failing.codex")
+                        : try beginAndAcquireQuietWake(fixture, claim: claim)
+                    fixture.session.runState = .running
+                    try await AsyncTestWait.waitUntil("failing ring running frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .running }
+                    if fixture.session.selectedAgent == .claudeCode {
+                        let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
+                        let outcome = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+                        guard case .failed = outcome else { return XCTFail("Expected physical Claude failure, got \(outcome)") }
+                        _ = await AgentRunTerminalCommitBarrier().commit(.init(
+                            binding: terminal.hooks.bindTerminalSession(fixture.session), ownership: owner, expectedRunID: fixture.session.runID,
+                            terminalState: .failed, source: "test.E.claude.sendFailure", attachmentDisposition: .restoreToPending,
+                            finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false
+                        ))
+                    } else {
+                        // The real Codex error path owns failed terminalization; do not insert a
+                        // final row or mint a second completion on behalf of the fake provider.
+                        fixture.session.runState = .completed
+                        let outcome = await fixture.viewModel.test_codexCoordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+                        guard case .failed = outcome else { return XCTFail("Expected physical Codex failure, got \(outcome)") }
+                    }
+                    XCTAssertEqual(calls.count, callCount + 1, "Exactly one physical fake call per failed producer in this no-retry scenario")
+                    let after = try XCTUnwrap(fixture.session.quietLedger.facts)
+                    XCTAssertEqual(after.settledThrough, before.settledThrough + 1)
+                    XCTAssertEqual(after.ordinaryThrough, after.settledThrough)
+                    XCTAssertNil(fixture.session.activeRunOwnership)
+                    try await AsyncTestWait.waitUntil("failing ring exact new paired ordinary closure accepted") {
+                        bridge.test_pairedRunStatus(for: endpoint) == .idle && bridge.test_pairedRunFacts(for: endpoint) == after
+                    }
+                    await bridge.test_settleTargetPublications()
+                    await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])
+                    // Disable this side's automatic reservation while its peer's NEW ordinary
+                    // closure arrives. It is re-enabled at the next controlled interval boundary.
+                    fixture.session.oversight.autoWakeOnUpdates = false
+                    fixture.session.isPreparingInitialWorktree = true
+                    for observer in [a, b] {
+                        let queue = try XCTUnwrap(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID])
+                        maxQueueRows = max(maxQueueRows, queue.entries.count)
+                        XCTAssertLessThanOrEqual(queue.entries.count, 1, "One linked target keeps one coalesced row, not one row per failure")
+                        XCTAssertEqual(queue.unacknowledgedOverflowCount, 0)
+                        XCTAssertFalse(queue.entries.isEmpty, "No acceptance means no invented delivery/payment")
+                    }
+                }
+            }
+            for provider in ["Claude", "Codex"] {
+                let times = calls.filter { $0.provider == provider }.map(\.seconds)
+                XCTAssertEqual(times, (0 ..< 8).map { TimeInterval($0 * 300) })
+                for (prior, next) in zip(times, times.dropFirst()) {
+                    XCTAssertGreaterThanOrEqual(next - prior, 300)
+                }
+            }
+            for fixture in [a, b] {
+                XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 9, ordinaryThrough: 9))
+                XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            }
+            print("QUIET_C5_FAILING_RING rounds=8 physicalFailures=\(calls.count) providerCallSeconds=\(calls.map { "\($0.provider):\(Int($0.seconds))" }.joined(separator: ",")) minSameProviderIntervalSeconds=300 maxQueueRows=\(maxQueueRows) overflow=0 finalOrdinaryThrough=9,9 policy=existing-no-universal-damping")
+            return
+        }
+        for fixture in [a, b] {
+            fixture.session.isPreparingInitialWorktree = false
+            fixture.session.oversight.autoWakeOnUpdates = true
+            let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(fixture.viewModel, tabID: fixture.tabID)
+            try fixture.viewModel.agentSessionLinkPublishPassiveStatusNotices(XCTUnwrap(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]), to: endpoint)
+            let claim = try reserveQuietWake(fixture)
+            XCTAssertTrue(claim.routineQuietCheckIn)
+            // Codex chooses start-vs-steer from the current run state. Let its real start adapter
+            // acquire the first physical fence while the observer is idle, not a fabricated active
+            // turn lacking an authoritative provider turn identity.
+            let owner = fixture.session.selectedAgent == .codexExec
+                ? fixture.session.beginRunAttempt(source: "test.E.codex.physical")
+                : try beginAndAcquireQuietWake(fixture, claim: claim)
+            if fixture.session.selectedAgent == .claudeCode {
+                let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
+                _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+            } else {
+                let outcome = await fixture.viewModel.test_codexCoordinator.sendCodexNativeMessage(session: fixture.session, text: "", attachments: [])
+                guard outcome == .sent else { return XCTFail("Ring Codex fake did not accept: \(outcome)") }
+            }
+            guard let wakeID = claim.dispatchID.autoWakeID, fixture.session.liveItemIDs.contains(wakeID) else {
+                return XCTFail("Ring cannot pay a receipt without actual native acceptance")
+            }
+            try await AsyncTestWait.waitUntil("ring quiet running frame accepted") { bridge.test_pairedRunStatus(for: endpoint) == .running }
+            try bridge.applyPassiveMonitorNoticeReceipt(XCTUnwrap(claim.passive?.receipt), observerEndpoint: endpoint)
+            try await finish(fixture, owner)
+        }
+        let claudeMessages = await a.nativeController.sentMessages
+        XCTAssertEqual(claudeMessages.count, 1)
+        XCTAssertEqual(codex.startedTurns.count, 1)
+        XCTAssertTrue(try XCTUnwrap(claudeMessages.first).contains("Nothing needed? Reply [ack]."))
+        XCTAssertFalse(try XCTUnwrap(codex.startedTurns.first).contains("Nothing needed? Reply [ack]."))
+        for _ in 0 ..< 16 {
+            await bridge.test_refreshStatus(sessionIDs: [a.sessionID, b.sessionID])
+        }
+        for fixture in [a, b] {
+            XCTAssertEqual(fixture.session.quietLedger.facts, .init(settledThrough: 2, ordinaryThrough: 1))
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+            XCTAssertTrue(try XCTUnwrap(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]).entries.isEmpty)
+        }
+        print("QUIET_C5_RING providers=Claude,Codex ordinarySeedAttempts=2 acceptedPhysical=2 repeatedPasses=16 finalQueues=0")
+    }
+
+    func testEPersistentNativeFailureKeepsQueueAndIntervalAndHardGatesWithoutNewBackoff() async throws {
+        let fixture = try makeFixture()
+        fixture.session.selectedAgent = .claudeCode
+        try installQuietNativeRoute(fixture)
+        let clock = installSnoozeClock(fixture)
+        fixture.session.oversight.routineWakeIntervalEnabled = true
+        fixture.session.oversight.routineWakeIntervalSeconds = 300
+        fixture.session.oversight.autoWakeOnUpdates = true
+        try publishInventory(fixture, revision: 1)
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+        let claim = try reserveQuietWake(fixture)
+        let owner = try beginAndAcquireQuietWake(fixture, claim: claim)
+        await fixture.nativeController.setFailSendAfterRecord(true)
+        let intent = try ClaudeAgentModeCoordinator.NativeSessionIntent.runAttempt(ownership: owner, runID: XCTUnwrap(fixture.session.runID))
+        _ = await fixture.viewModel.test_claudeCoordinator.sendClaudeNativeMessage(session: fixture.session, text: "", attachments: [], intent: intent, allowsCatalogRouteControllerRecovery: false)
+        let sendsAfterFailure = await fixture.nativeController.sentMessages.count
+        XCTAssertGreaterThan(sendsAfterFailure, 0)
+        let suppressed = try XCTUnwrap(fixture.session.oversight.suppressedWakeFingerprint)
+        fixture.session.runState = .completed
+        for _ in 0 ..< 100 {
+            clock.advanceWithoutFiring(seconds: 6)
+            try publishLane(fixture, linkSetRevision: 1, queueRevision: 1)
+            XCTAssertNil(fixture.session.oversight.pendingAutoWake)
+        }
+        let afterTicks = await fixture.nativeController.sentMessages.count
+        XCTAssertEqual(afterTicks, sendsAfterFailure)
+        XCTAssertEqual(fixture.session.oversight.suppressedWakeFingerprint, suppressed)
+        XCTAssertFalse(try XCTUnwrap(fixture.viewModel.agentSessionLinkPassiveNoticesBySessionID[fixture.sessionID]).entries.isEmpty, "Failure pays nothing and expiry does not erase queued work")
+        fixture.session.isPreparingInitialWorktree = true
+        try publishLane(fixture, linkSetRevision: 1, queueRevision: 2, edgeSequenceOffset: 1, metadataSequenceOffset: 1)
+        try await AsyncTestWait.waitUntil("new edge waits on the existing hard readiness gate") {
+            fixture.session.oversight.pendingAutoWake?.phase == .awaitingSettlement
+        }
+        let sendsWhileHardBlocked = await fixture.nativeController.sentMessages.count
+        XCTAssertEqual(sendsWhileHardBlocked, sendsAfterFailure)
+        fixture.session.oversight.pendingAutoWake?.task?.cancel()
+        fixture.session.isPreparingInitialWorktree = false
+        let successor = try reserveQuietWake(fixture)
+        XCTAssertNotEqual(successor.dispatchID, claim.dispatchID)
+        XCTAssertEqual(fixture.session.oversight.routineWakeIntervalSeconds, 300)
+        fixture.viewModel.agentSessionLinkRecordPhysicalDispatchFailure(for: fixture.session, dispatchID: successor.dispatchID)
+        print("QUIET_C5_FAILURE_CADENCE ticks=100 advancedSeconds=600 extraPhysicalRetries=0 queuePreserved=true existingIntervalSeconds=300 hardGatePreserved=true")
+    }
+}
+
+extension AgentSessionLinkAutoWakeTests {
+    func testSameValuedAuthoritativeQueueStillRedrivesObserverReadinessAfterHardGate() async throws {
+        let observer = try makeFixture()
+        observer.session.selectedAgent = .claudeCode
+        try installQuietNativeRoute(observer)
+        let target = try makeFixture(fenceProviderLaunch: true, windowID: 2)
+        let host = LiveWindowEndpointHost()
+        host.register(observer.viewModel, windowID: 1)
+        host.register(target.viewModel, windowID: 2)
+        let authority = DomainAgentSessionLinkAuthority(identity: DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 1, mode: .app, createdAt: .distantPast))
+        let bridge = AgentSessionLinkRuntimeBridge(authority: authority, host: host, toolAdvertisementInvalidator: { _ in })
+        guard case .added = await bridge.addMonitorLink(observerSessionID: observer.sessionID, rawTargetSessionID: target.sessionID.uuidString) else { return XCTFail("readiness grant failed") }
+        // The link-time seed carries no paired proof, and first paired facts baseline a new lane.
+        // Settle the lane's paired resting baseline before the target runs; otherwise whether the
+        // owed run is visible depends on whether a refresh happened to sample it mid-run.
+        var targetSamples: [AgentSessionLinkPassiveStatusNotices.Sample] = []
+        bridge.test_onPassiveSample = { sample in
+            if sample.targetSessionID == target.sessionID { targetSamples.append(sample) }
+        }
+        await bridge.test_settleTargetPublications()
+        await bridge.test_refreshStatus(sessionIDs: [observer.sessionID])
+        XCTAssertEqual(targetSamples.last?.status, .idle)
+        XCTAssertEqual(targetSamples.last?.runFacts, .zero, "the observer must hold the lane's paired resting baseline")
+        observer.session.oversight.autoWakeOnUpdates = true
+        observer.session.isPreparingInitialWorktree = true
+        let replay = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, replayTranscript: true)
+        _ = await AgentQuietCheckInReplay.settle(target.session, harness: replay, form: 3, wakeID: UUID())
+        await bridge.test_settleTargetPublications()
+        await bridge.test_refreshStatus(sessionIDs: [observer.sessionID])
+        let owed = try XCTUnwrap(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID])
+        XCTAssertTrue(owed.entries.contains(where: \.isRoutineWakeEligible))
+        try await AsyncTestWait.waitUntil("owned readiness waiter is subscribed") {
+            observer.session.oversight.pendingAutoWake?.phase == .awaitingSettlement
+        }
+        let reserved = try XCTUnwrap(observer.session.oversight.pendingAutoWake)
+        let beforeReady = await observer.nativeController.sentMessages.count
+        XCTAssertEqual(beforeReady, 0)
+        observer.session.isPreparingInitialWorktree = false
+        // No passive publication from the test. The ordinary indexed authoritative refresh used to
+        // provide the admission hint even when the target's queue/display value remained identical.
+        await bridge.test_refreshStatus(sessionIDs: [observer.sessionID])
+        XCTAssertEqual(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID], owed)
+        try await AsyncTestWait.waitUntil("same-valued queue's owned readiness waiter admits provider preparation") {
+            observer.session.oversight.pendingAutoWake?.phase == .preparingDispatch
+        }
+        XCTAssertEqual(observer.session.oversight.pendingAutoWake?.wakeID, reserved.wakeID)
+        XCTAssertEqual(observer.viewModel.agentSessionLinkPassiveNoticesBySessionID[observer.sessionID], owed)
+        // Preparation admission is the assertion, not fabricated transport acceptance/payment.
+        // The shared native adapter ring separately proves actual accepted physical handoffs.
+        observer.session.oversight.pendingAutoWake?.task?.cancel()
+        observer.viewModel.cancelAgentSessionLinkAutoWake(for: reserved.observerEndpoint, reason: .settingDisabled)
     }
 }

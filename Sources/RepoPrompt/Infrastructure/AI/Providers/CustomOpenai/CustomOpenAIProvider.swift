@@ -375,22 +375,22 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     // ---------------------------------------
     // NEW: createMessages(for:)
     // ---------------------------------------
-    private func createMessages(for aiMessage: AIMessage) -> [CompletionParams.Message] {
-        CustomOpenAIMessageBuilder.messages(for: aiMessage)
+    private func createMessages(for aiMessage: AIMessage) throws -> [CompletionParams.Message] {
+        try CustomOpenAIMessageBuilder.messages(for: aiMessage)
     }
 
     #if DEBUG
         func serializedMessagesForTesting(
             _ aiMessage: AIMessage
-        ) -> [CompletionParams.Message] {
-            createMessages(for: aiMessage)
+        ) throws -> [CompletionParams.Message] {
+            try createMessages(for: aiMessage)
         }
     #endif
 
     /// completeMessage now accepts temperature as a param
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult {
         // Build message array using new approach
-        let messages = createMessages(for: aiMessage)
+        let messages = try createMessages(for: aiMessage)
 
         // Ensure there's at least a system prompt
         guard !messages.isEmpty else {
@@ -439,7 +439,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         }
 
         // Build message array once (outside the retry loop for efficiency)
-        let messages = createMessages(for: aiMessage)
+        let messages = try createMessages(for: aiMessage)
         guard !messages.isEmpty else {
             throw AIProviderError.invalidSystemPrompt
         }

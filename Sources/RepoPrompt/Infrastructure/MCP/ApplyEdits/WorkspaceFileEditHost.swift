@@ -3,6 +3,15 @@ import RepoPromptDomainRuntime
 import RepoPromptFoundation
 
 struct WorkspaceFileEditHost: FileEditHost {
+    @MainActor
+    final class WriteReceipt {
+        private(set) var file: WorkspaceFileRecord?
+
+        func record(_ file: WorkspaceFileRecord?) {
+            self.file = file
+        }
+    }
+
     enum Target {
         case existing(WorkspaceFileRecord)
         case create(path: String)
@@ -15,6 +24,7 @@ struct WorkspaceFileEditHost: FileEditHost {
     let createPathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy
     let selectCreatedFiles: Bool
     let mutationRootMappings: [DomainMutationPhysicalRootMapping]
+    let writeReceipt: WriteReceipt?
 
     init(
         store: WorkspaceFileContextStore,
@@ -23,7 +33,8 @@ struct WorkspaceFileEditHost: FileEditHost {
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         createPathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger,
         selectCreatedFiles: Bool = true,
-        mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
+        mutationRootMappings: [DomainMutationPhysicalRootMapping] = [],
+        writeReceipt: WriteReceipt? = nil
     ) {
         mutationService = WorkspaceFileMutationService(store: store)
         self.target = target
@@ -32,6 +43,7 @@ struct WorkspaceFileEditHost: FileEditHost {
         self.createPathResolutionPolicy = createPathResolutionPolicy
         self.selectCreatedFiles = selectCreatedFiles
         self.mutationRootMappings = mutationRootMappings
+        self.writeReceipt = writeReceipt
     }
 
     func fileExists(path _: String) async -> Bool {
@@ -76,6 +88,7 @@ struct WorkspaceFileEditHost: FileEditHost {
                 content: content,
                 mutationRootMappings: mutationRootMappings
             )
+            await writeReceipt?.record(file)
 
         case let .create(path):
             try Task.checkCancellation()
@@ -88,6 +101,7 @@ struct WorkspaceFileEditHost: FileEditHost {
                 pathResolutionPolicy: createPathResolutionPolicy,
                 mutationRootMappings: mutationRootMappings
             )
+            await writeReceipt?.record(writeResult.materializedFile)
             if selectCreatedFiles, let selectionCoordinator, let created = writeResult.materializedFile {
                 _ = await selectionCoordinator.addPathsToActiveSelection(
                     paths: [created.standardizedFullPath],

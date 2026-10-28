@@ -1145,6 +1145,7 @@ final actor ClaudeNativeProcessSessionController {
         stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
             switch diagnostic {
             case let .overflow(droppedBytes, retainedBytes):
+                emitQuietUncertainty("Provider stream overflow")
                 writeRawEventLogRecord(kind: "framer.overflow", payload: [
                     "droppedBytes": droppedBytes,
                     "retainedBytes": retainedBytes
@@ -1169,6 +1170,7 @@ final actor ClaudeNativeProcessSessionController {
             guard let inbound = try ClaudeSDKProtocolCodec.decodeLine(lineData) else { return }
             routeInboundMessage(inbound)
         } catch let codecError as ClaudeSDKProtocolCodec.CodecError {
+            emitQuietUncertainty("Provider stream recovery")
             if case .invalidJSON = codecError {
                 if recoverConcatenatedInboundMessagesIfNeeded(from: lineData)
                     || recoverEmbeddedInboundTailIfNeeded(from: lineData)
@@ -1373,6 +1375,7 @@ final actor ClaudeNativeProcessSessionController {
             "preview": String(text.prefix(200)),
             "length": text.count
         ] as [String: Any])
+        // Decode salvage is not a fully classified normal stream, even if a later result succeeds.
         emit(.stream(AIStreamResult(type: "content", text: text)))
         return true
     }
@@ -1522,6 +1525,9 @@ final actor ClaudeNativeProcessSessionController {
             emit(.rateLimit(rateLimit))
         }
         let streamResults = translator.parseNDJSONLine(data)
+        if Self.hasUnrepresentedQuietActivity(payload) {
+            emitQuietUncertainty("Unclassified provider activity")
+        }
         #if DEBUG
             if ClaudeReasoningExtractionFeature.isEnabled {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
@@ -1589,6 +1595,7 @@ final actor ClaudeNativeProcessSessionController {
             }
 
             if Self.shouldSuppressUserFacingStreamResult(result) {
+                emitQuietUncertainty("Suppressed provider activity")
                 writeRawEventLogRecord(kind: "translator.streamResultSuppressed", payload: logPayload)
                 continue
             }
@@ -1661,6 +1668,7 @@ final actor ClaudeNativeProcessSessionController {
         guard generation == authoritativeIdleFallbackGeneration else { return }
         authoritativeIdleFallbackTask = nil
         guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
+        emitQuietUncertainty("Provider completion recovery")
         let status = pendingAuthoritativeTurnStatuses.removeFirst()
         guard hasPendingTurnIDs else {
             assertionFailure("[ClaudeController] idle fallback with no pending turn IDs — possible protocol drift")
@@ -1685,10 +1693,79 @@ final actor ClaudeNativeProcessSessionController {
         // already established the correct turn outcome; only idle was missing.
         for status in pendingAuthoritativeTurnStatuses {
             guard hasPendingTurnIDs else { break }
+            emitQuietUncertainty("Provider completion recovery")
             let turnID = dequeueTurnID()
             emit(.turnCompleted(turnID: turnID, status: status))
         }
         pendingAuthoritativeTurnStatuses.removeAll()
+    }
+
+    /// Preserve negative evidence before transport/UI suppression, on the qualified first-party
+    /// Agent Mode path only. Existing compatible and prompt-only event streams stay unchanged.
+    private func emitQuietUncertainty(_ reason: String) {
+        guard config.runtimeVariant == .standard, config.toolContext == .agentRun else { return }
+        emit(.stream(AIStreamResult(type: "event", text: reason)))
+    }
+
+    /// Inspect only this incoming payload, never transcript history. The translator intentionally
+    /// omits framing, empty deltas and optional reasoning; unknown or hidden semantic activity must
+    /// not be mistaken for silence. No payload text or parallel event history is retained.
+    private static func hasUnrepresentedQuietActivity(_ payload: [String: Any]) -> Bool {
+        switch payload["type"] as? String {
+        case "assistant", "message":
+            let message = (payload["message"] as? [String: Any]) ?? payload
+            guard let messageID = message["id"] as? String, !messageID.isEmpty else { return true }
+            if payload["parent_tool_use_id"] as? String != nil || payload["parentToolUseId"] as? String != nil { return true }
+            guard let content = message["content"] else { return true }
+            if content is String { return false }
+            guard let blocks = content as? [[String: Any]] else { return true }
+            return blocks.contains { block in
+                switch block["type"] as? String {
+                case "text": !(block["text"] is String)
+                case "thinking": !(block["thinking"] is String)
+                case "tool_use", "tool_result": false // Translator emits activity even with fallback fields.
+                default: true
+                }
+            }
+        case "stream_event":
+            guard let event = payload["event"] as? [String: Any] else { return true }
+            switch event["type"] as? String {
+            case "message_start":
+                guard let message = event["message"] as? [String: Any],
+                      let messageID = message["id"] as? String, !messageID.isEmpty
+                else { return true }
+                return false
+            case "message_delta", "message_stop", "content_block_stop": return false
+            case "content_block_start":
+                guard let block = event["content_block"] as? [String: Any] else { return true }
+                switch block["type"] as? String {
+                case "text": return !(block["text"] is String)
+                case "thinking": return !(block["thinking"] is String)
+                default: return true
+                }
+            case "content_block_delta":
+                guard let delta = event["delta"] as? [String: Any] else { return true }
+                // Empty Strings are legitimate framing. Missing/malformed payloads are not
+                // neutral merely because their type name is recognized by the translator.
+                switch delta["type"] as? String {
+                case "text_delta": return !(delta["text"] is String)
+                case "thinking_delta": return !(delta["thinking"] is String)
+                case "signature_delta": return !(delta["signature"] is String)
+                default: return true
+                }
+            default: return true
+            }
+        case "system":
+            // Initialization and running/idle lifecycle are represented by typed results.
+            return !["init", "session_state_changed"].contains(payload["subtype"] as? String ?? "")
+        case "result":
+            if let result = payload["result"], !(result is String) { return true }
+            return payload["subtype"] as? String != "success" || payload["is_error"] as? Bool == true
+        case "rate_limit_event":
+            let info = payload["rate_limit_info"] as? [String: Any]
+            return info?["status"] as? String != "allowed"
+        default: return true // Includes user/tool/auth/error and future event types, even if empty.
+        }
     }
 
     static func shouldSuppressUserFacingStreamResult(_ result: AIStreamResult) -> Bool {
@@ -2041,6 +2118,9 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private func handleControlRequest(_ request: ClaudeSDKProtocolCodec.ControlRequest) {
+        // Tool/interaction intent remains activity even when existing policy auto-approves it,
+        // cannot build a UI approval, or rejects an unknown subtype. Authority is unchanged.
+        emitQuietUncertainty("Provider control request")
         writeRawEventLogRecord(kind: "control.request.received", payload: [
             "requestID": request.requestID,
             "subtype": request.subtype,

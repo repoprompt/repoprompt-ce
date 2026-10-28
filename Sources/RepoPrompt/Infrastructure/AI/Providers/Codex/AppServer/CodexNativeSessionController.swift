@@ -162,14 +162,14 @@ protocol CodexSessionControlling: AnyObject {
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt
     func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
@@ -873,6 +873,7 @@ final class CodexNativeSessionController {
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
+    private let serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)?
     private let hookTrustFaultInjection: HookTrustFaultInjection
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
@@ -1492,6 +1493,7 @@ final class CodexNativeSessionController {
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
+        serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)? = nil,
         hookTrustFaultInjection: HookTrustFaultInjection = .init(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
@@ -1504,6 +1506,7 @@ final class CodexNativeSessionController {
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
+        self.serverRequestResponseExecutor = serverRequestResponseExecutor
         self.hookTrustFaultInjection = hookTrustFaultInjection
         self.perfRecorder = perfRecorder
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
@@ -2216,13 +2219,13 @@ final class CodexNativeSessionController {
 
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
 
         var params: [String: Any] = [
             "threadId": threadID,
@@ -2292,14 +2295,14 @@ final class CodexNativeSessionController {
 
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
         guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
         do {
             let result = try await performRequest(
                 method: "turn/steer",
@@ -2493,12 +2496,12 @@ final class CodexNativeSessionController {
 
     private static func turnInput(
         text: String,
-        images: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) throws -> [[String: Any]] {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var input: [[String: Any]] = []
-        for image in images {
-            switch image.source {
+        for attachment in attachments where attachment.kind == .image {
+            switch attachment.source {
             case let .localFile(path):
                 guard let path = nonEmptyString(path) else { continue }
                 input.append([
@@ -3554,6 +3557,12 @@ final class CodexNativeSessionController {
         {
             markTurnActivity(notifiedTurnID, makeCurrent: true)
         }
+        // Preserve semantic/unknown activity before item/tool deduplication or malformed-payload
+        // early returns. Reuse the existing scoped non-rendering liveness channel; no history or
+        // extra event registry. The coordinator applies its current controller/turn acceptance.
+        if hasUnrepresentedQuietActivity(method: notification.method, params: params) {
+            await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+        }
         switch notification.method {
         case "turn/started", "codex/event/turn_started":
             emittedToolEventDedupKeys.removeAll(keepingCapacity: true)
@@ -3666,20 +3675,23 @@ final class CodexNativeSessionController {
                 await emit(.contextCompacted(turnID: compactionTurnID))
             }
         case "item/agentMessage/delta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                var state = assistantEmittedTextByTurnID[scope.turnID]
-                    ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
-                if state.itemID != scope.itemID {
-                    state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
-                } else {
-                    state.text.append(delta)
-                }
-                assistantEmittedTextByTurnID[scope.turnID] = state
-                await emit(.canonicalAssistantDelta(text: delta, scope: scope))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            var state = assistantEmittedTextByTurnID[scope.turnID]
+                ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
+            if state.itemID != scope.itemID {
+                state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
+            } else {
+                state.text.append(delta)
+            }
+            assistantEmittedTextByTurnID[scope.turnID] = state
+            await emit(.canonicalAssistantDelta(text: delta, scope: scope))
         case "codex/event/agent_message":
             let legacyTurnID = Self.notificationTurnID(from: params)
             let legacyItemID = Self.notificationItemID(
@@ -3756,37 +3768,43 @@ final class CodexNativeSessionController {
                 }
             }
         case "item/reasoning/summaryTextDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
-                let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .summary,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: summaryIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
+            let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .summary,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: summaryIndex,
+                scope: scope
+            )))
         case "item/reasoning/textDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
-                let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .text,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: contentIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
+            let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .text,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: contentIndex,
+                scope: scope
+            )))
         case let method where Self.isItemLifecycleNotificationMethod(method):
             let item = Self.canonicalItem(from: params)
             let typeRaw = item.map { normalizedTypeString(from: $0) } ?? ""
@@ -3850,7 +3868,10 @@ final class CodexNativeSessionController {
             {
                 let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
                 Self.logCodexDebug("[CodexNativeController] fileChangeOutputDelta invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) result=\(Self.debugPreview(resultJSON))")
-                guard emitted else { break }
+                guard emitted else {
+                    await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                    break
+                }
                 await emit(.toolResult(
                     name: name,
                     invocationID: invocationID,
@@ -3858,6 +3879,8 @@ final class CodexNativeSessionController {
                     resultJSON: resultJSON,
                     isError: isError
                 ))
+            } else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
             }
         case "codex/event/exec_command_begin":
             if let beginEvent = parseExecCommandBeginEvent(params: params) {
@@ -3911,6 +3934,7 @@ final class CodexNativeSessionController {
         case "item/commandExecution/outputDelta":
             let itemID = commandExecutionItemID(from: params)
             guard shouldAcceptCommandExecutionEvent(itemID: itemID, family: .normalized) else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
                 break
             }
             if let update = parseCommandExecutionRunningUpdateFromNotification(
@@ -3919,6 +3943,8 @@ final class CodexNativeSessionController {
             ) {
                 Self.logCodexDebug("[CodexNativeController] runningUpdate method=\(notification.method) invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
                 await emit(.commandExecutionRunning(update))
+            } else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
             }
         case "item/commandExecution/terminalInteraction":
             let itemID = commandExecutionItemID(from: params)
@@ -4017,6 +4043,144 @@ final class CodexNativeSessionController {
             if let activity = Self.parseLivenessActivity(method: notification.method, params: params) {
                 await emit(.livenessActivity(activity))
             }
+        }
+    }
+
+    private func emitUnrepresentedQuietActivity(method: String, params: [String: Any]) async {
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
+    private func hasUnrepresentedQuietActivity(method: String, params: [String: Any]) -> Bool {
+        if Self.isItemLifecycleNotificationMethod(method) {
+            guard let item = Self.canonicalItem(from: params),
+                  Self.canonicalItemScope(from: params, item: item) != nil
+            else { return true }
+            let type = normalizedTypeString(from: item)
+            if type == "usermessage" || type == "user_message" {
+                // Canonical prompt echo; accepted task input is latched by the host before send.
+                return !(item["content"] is [Any])
+            }
+            if method == "item/completed" {
+                switch type {
+                case "agentmessage", "agent_message":
+                    // Required by the pinned schema; rendering fallbacks must not prove silence.
+                    return !(item["text"] is String)
+                case "reasoning":
+                    // Absent arrays default to empty; present arrays must contain only strings.
+                    return ["summary", "content"].contains { key in
+                        item[key] != nil && !(item[key] is [String])
+                    }
+                default: break
+                }
+            }
+            return !["agentmessage", "agent_message", "reasoning"].contains(type)
+        }
+        switch method {
+        case "turn/completed", "codex/event/turn_completed":
+            let turn = params["turn"] as? [String: Any]
+            return turn?["status"] as? String != "completed"
+        case "codex/event/agent_message":
+            return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+        case "turn/moderationMetadata":
+            // v0.160.1 protocol metadata is arbitrary JSON, not semantic turn activity.
+            // Require the canonical envelope; malformed ingress must remain fail-visible.
+            return Self.turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) == nil
+                || params["metadata"] == nil
+        case "rawResponseItem/completed":
+            return hasUnrepresentedRawResponseItem(params)
+        case "rawResponse/completed":
+            guard Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) != nil,
+                  Self.firstString(in: params, keys: ["responseId"]) != nil,
+                  params["usageMetadata"] == nil || params["usageMetadata"] is NSNull || params["usageMetadata"] is [String: Any]
+            else { return true }
+            if params["usage"] is NSNull { return false }
+            guard let usage = params["usage"] as? [String: Any] else { return true }
+            return Self.parseTokenUsagePayload(from: ["tokenUsage": ["last": usage]]) == nil
+        case "item/reasoning/summaryPartAdded":
+            return Self.canonicalItemScope(from: params) == nil || (intValue(params["summaryIndex"]) ?? -1) < 0
+        case "thread/tokenUsage/updated":
+            return Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) == nil
+                || Self.parseTokenUsagePayload(from: params) == nil
+        case "account/rateLimits/updated":
+            return !(params["rateLimits"] is [String: Any])
+        case "account/updated":
+            return !(params["authMode"] is NSNull || params["authMode"] is String)
+                || !(params["planType"] is NSNull || params["planType"] is String)
+        case "item/commandExecution/outputDelta", "item/fileChange/outputDelta":
+            // Their handlers preserve uncertainty on parse/dedup failure using the actual result.
+            // In particular, never invoke the stateful file-change parser a second time here.
+            return false
+        case "item/mcpToolCall/progress", "item/plan/delta", "turn/diff/updated":
+            return Self.parseLivenessActivity(method: method, params: params) == nil
+        case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
+            // A valid tool event already reaches typed activity before UI suppression. Only a
+            // malformed envelope needs the uncertainty fallback; preserve the existing first event.
+            return parseRawMCPToolLifecycleEvent(method: method, params: params) == nil
+        case "turn/started", "codex/event/turn_started",
+             "codex/event/task_complete", "item/agentMessage/delta",
+             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta",
+             "thread/status/changed", "deprecationNotice":
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func hasUnrepresentedRawResponseItem(_ params: [String: Any]) -> Bool {
+        guard let item = Self.canonicalItem(from: params),
+              let scope = Self.canonicalItemScope(from: params, item: item),
+              Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: scope.turnID) != nil
+        else { return true }
+        switch item["type"] as? String {
+        case "message":
+            guard let content = item["content"] as? [[String: Any]] else { return true }
+            switch item["role"] as? String {
+            case "user":
+                // Harness-owned v0.160.1 wire annotation (outside exported schema), not text or
+                // version inference. Missing/new/mixed/misaligned kinds stay ordinary and visible.
+                guard let metadata = item["internal_chat_message_metadata_passthrough"] as? [String: Any],
+                      let kinds = metadata["content_item_kinds"] as? [String],
+                      let kind = kinds.first, kinds.count == content.count,
+                      ["user.text", "user.image", "user.audio"].contains(kind),
+                      kinds.allSatisfy({ $0 == kind })
+                else { return true }
+                return !content.allSatisfy { part in
+                    switch (kind, part["type"] as? String) {
+                    case ("user.text", "input_text"), ("user.text", "output_text"):
+                        part["text"] is String
+                    case ("user.image", "input_image"):
+                        Self.nonEmptyString(part["image_url"] as? String) != nil
+                            || Self.nonEmptyString(part["file_id"] as? String) != nil
+                    case ("user.audio", "input_audio"):
+                        Self.nonEmptyString(part["audio_url"] as? String) != nil
+                    default: false
+                    }
+                }
+            case "assistant":
+                // Core emits canonical completion before recording this raw model-output mirror.
+                // Its exact existing scope, not its text, proves the final replacement is represented.
+                return !completedCanonicalItemScopes.contains(scope) || !content.allSatisfy {
+                    ["input_text", "output_text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }
+            default: return true
+            }
+        case "reasoning":
+            guard completedCanonicalItemScopes.contains(scope),
+                  let summary = item["summary"] as? [[String: Any]],
+                  summary.allSatisfy({ $0["type"] as? String == "summary_text" && $0["text"] is String })
+            else { return true }
+            if let content = item["content"], !(content is NSNull) {
+                guard let parts = content as? [[String: Any]], parts.allSatisfy({
+                    ["reasoning_text", "text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }) else { return true }
+            }
+            if let encrypted = item["encrypted_content"], !(encrypted is NSNull), !(encrypted is String) { return true }
+            return false
+        default: return true
         }
     }
 
@@ -4825,6 +4989,7 @@ final class CodexNativeSessionController {
             let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
             if autoApproveHost || autoApproveCompanion {
                 logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4866,6 +5031,7 @@ final class CodexNativeSessionController {
                )
             {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: [
                     "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
                 ])
@@ -4873,6 +5039,7 @@ final class CodexNativeSessionController {
             }
             if let approvalResult = hostApprovalResult {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -4914,6 +5081,16 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func emitAutoApprovedServerRequestActivity(method: String, params: [String: Any]) async {
+        // Automatic consent is still interaction, even with no surfaced request or later tool.
+        // Reuse raw scope parsing; the coordinator owns current-controller/turn acceptance.
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
         #if DEBUG
             writeRawEventLogRecord(
@@ -4925,7 +5102,11 @@ final class CodexNativeSessionController {
             )
         #endif
         do {
-            try await client.respondToServerRequest(id: id, result: result)
+            if let serverRequestResponseExecutor {
+                try await serverRequestResponseExecutor(id, result)
+            } else {
+                try await client.respondToServerRequest(id: id, result: result)
+            }
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
         }
@@ -4986,6 +5167,7 @@ final class CodexNativeSessionController {
             )
             return
         }
+        await emitAutoApprovedServerRequestActivity(method: method, params: params)
         do {
             try await client.respondToServerRequest(id: requestID, result: response.payload)
         } catch {
@@ -5426,6 +5608,29 @@ final class CodexNativeSessionController {
             return .fileChange
         }()
 
+        // This authority is top-level only: nested fields must never resurrect legacy choices.
+        let availableDecisions: [AgentApprovalDecision]? = {
+            guard let value = params["availableDecisions"], !(value is NSNull) else { return nil }
+            guard let entries = value as? [Any] else { return [] }
+            return entries.compactMap { entry in
+                if let name = entry as? String {
+                    switch name {
+                    case "accept": return .accept
+                    case "acceptForSession": return .acceptForSession
+                    case "decline": return .decline
+                    case "cancel": return .cancel
+                    default: return nil
+                    }
+                }
+                guard let object = entry as? [String: Any], object.count == 1,
+                      let amendment = object["acceptWithExecpolicyAmendment"] as? [String: Any],
+                      let values = amendment["execpolicy_amendment"] as? [String], !values.isEmpty,
+                      let data = try? JSONSerialization.data(withJSONObject: values)
+                else { return nil }
+                return .acceptWithExecpolicyAmendment(String(decoding: data, as: UTF8.self))
+            }
+        }()
+
         let approvalID = AgentApprovalRequest.stableID(
             requestID: .codex(requestID),
             method: method,
@@ -5434,6 +5639,25 @@ final class CodexNativeSessionController {
             turnID: stableTurnID,
             itemID: itemID
         )
+        func makeRequest(details: [AgentApprovalDetail]) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                id: approvalID,
+                requestID: .codex(requestID),
+                method: method,
+                kind: kind,
+                threadID: threadID,
+                turnID: turnID,
+                itemID: itemID,
+                reason: reason,
+                command: command,
+                cwd: cwd,
+                grantRoot: grantRoot,
+                proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
+                availableDecisions: availableDecisions,
+                details: details
+            )
+        }
+        let presentedAmendment = makeRequest(details: []).presentedExecpolicyAmendmentJSON
         let detailSeed = approvalID.uuidString
         var details: [AgentApprovalDetail] = []
         var detailIndex = 0
@@ -5469,28 +5693,14 @@ final class CodexNativeSessionController {
         if let commandActionsJSON, !commandActionsJSON.isEmpty {
             appendDetail(label: "Command Actions", value: commandActionsJSON, isCode: true)
         }
-        if let proposedExecpolicyAmendmentJSON, !proposedExecpolicyAmendmentJSON.isEmpty {
-            appendDetail(label: "Execpolicy Amendment", value: proposedExecpolicyAmendmentJSON, isCode: true)
+        if let presentedAmendment, !presentedAmendment.isEmpty {
+            appendDetail(label: "Execpolicy Amendment", value: presentedAmendment, isCode: true)
         }
         if details.isEmpty {
             appendDetail(label: "Method", value: method, isCode: true)
         }
 
-        return AgentApprovalRequest(
-            id: approvalID,
-            requestID: .codex(requestID),
-            method: method,
-            kind: kind,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID,
-            reason: reason,
-            command: command,
-            cwd: cwd,
-            grantRoot: grantRoot,
-            proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
-            details: details
-        )
+        return makeRequest(details: details)
     }
 
     private static func firstString(in value: Any, keys: [String]) -> String? {
@@ -9543,14 +9753,14 @@ enum CommandExecutionOutputSanitizer {
 }
 
 enum CodexSessionControllerError: LocalizedError {
-    case imageAttachmentsUnsupported
+    case attachmentsUnsupported
     case emptyUserTurn
     case invalidResumeReferenceMissingThreadID
     case invalidLifecycleState(String)
 
     var errorDescription: String? {
         switch self {
-        case .imageAttachmentsUnsupported:
+        case .attachmentsUnsupported:
             "This Codex session controller does not support image attachments."
         case .emptyUserTurn:
             "Cannot send an empty user turn."

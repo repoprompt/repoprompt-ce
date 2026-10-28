@@ -782,6 +782,71 @@ import XCTest
         }
 
         @MainActor
+        func testPublishedWorkspaceContractPreservesAppBindingAndCloseDiagnostic() async throws {
+            let parent = try makeTemporaryRoot()
+            let commaRoot = parent.appendingPathComponent("comma,root", isDirectory: true)
+            try FileManager.default.createDirectory(at: commaRoot, withIntermediateDirectories: true)
+            let fixture = try await makeFixture(rootPaths: [parent.path, commaRoot.path])
+            let previousWindows = WindowStatesManager.shared.allWindows
+            WindowStatesManager.shared.allWindows = [fixture.window]
+            addTeardownBlock { @MainActor in WindowStatesManager.shared.allWindows = previousWindows }
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let enabled = await fixture.window.mcpServer.setWindowToolsEnabled(true)
+            XCTAssertTrue(enabled)
+            addTeardownBlock { @MainActor in _ = await fixture.window.mcpServer.setWindowToolsEnabled(false) }
+            let connection = try await makeProductionMCPConnection()
+            addTeardownBlock { await connection.cleanup() }
+
+            let tools = try await connection.client.listTools().tools
+            let bind = try XCTUnwrap(tools.first { $0.name == "bind_context" })
+            let properties = try XCTUnwrap(bind.inputSchema.objectValue?["properties"]?.objectValue)
+            XCTAssertEqual(properties["window_id"]?.objectValue?["type"], .string("integer"))
+            let forms = try XCTUnwrap(properties["working_dirs"]?.objectValue?["anyOf"]?.arrayValue)
+            XCTAssertEqual(forms.map { $0.objectValue?["type"] }, [.string("array"), .string("string")])
+            XCTAssertTrue(forms.allSatisfy { $0.objectValue?["description"]?.stringValue?.isEmpty == false })
+            let manage = try XCTUnwrap(tools.first { $0.name == "manage_workspaces" })
+            XCTAssertNotNil(manage.inputSchema.objectValue?["properties"]?.objectValue?["window_id"])
+            XCTAssertEqual(manage.inputSchema.objectValue?["required"], .array([.string("action")]))
+            XCTAssertTrue(manage.description?.contains("Required for select_tab and close_tab") == true)
+
+            // SDK inputs exercise the restored app selector and both compatible root forms.
+            for selectors: [String: Value] in [
+                ["window_id": .int(fixture.window.windowID)],
+                ["working_dirs": .array([.string(parent.path), .string(commaRoot.path)])],
+                ["working_dirs": .string(parent.path)]
+            ] {
+                let result = try await connection.client.callTool(
+                    name: "bind_context",
+                    arguments:
+                    selectors.merging(["op": .string("bind"), "_rawJSON": .bool(true)]) { _, new in new }
+                )
+                XCTAssertNotEqual(result.isError, true, toolText(result))
+                let response = try JSONDecoder().decode(BindContextResponse.self, from: Data(toolText(result).utf8))
+                XCTAssertEqual(response.binding.contextID, fixture.contextID)
+                XCTAssertTrue(response.binding.explicit)
+            }
+            // No explicit window_id: keep the existing schema-dependent app window injection usable.
+            let listed = try await connection.client.callTool(name: "manage_workspaces", arguments: [
+                "action": .string("list_tabs"), "_rawJSON": .bool(true)
+            ])
+            XCTAssertNotEqual(listed.isError, true, toolText(listed))
+            let before = fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id)
+            let diagnostic: String
+            do {
+                let refused = try await connection.client.callTool(name: "manage_workspaces", arguments: [
+                    "action": .string("close_tab"), "_rawJSON": .bool(true)
+                ])
+                XCTAssertEqual(refused.isError, true, toolText(refused))
+                diagnostic = toolText(refused)
+            } catch {
+                diagnostic = String(describing: error)
+            }
+            XCTAssertTrue(diagnostic.contains("Missing required 'tab' parameter (UUID or name) for 'close_tab' action."), diagnostic)
+            XCTAssertFalse(diagnostic.contains("'context_id'"), diagnostic)
+            XCTAssertEqual(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id), before)
+        }
+
+        @MainActor
         func testGenuinelyRootlessBindProducesExplicitEmptyAuthority() async throws {
             let fixture = try await makeFixture(rootPaths: [])
             let authority = try await fixture.window.mcpServer.resolveFileToolAuthority(

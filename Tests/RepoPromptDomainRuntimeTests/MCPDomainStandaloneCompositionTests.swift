@@ -205,7 +205,7 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         _ = await runtime.shutdown()
     }
 
-    func testCanonicalBindContextIsGlobalAndHasNoWindowSelector() throws {
+    func testCanonicalBindContextIsGlobalWithQualifiedWindowAndBothRootForms() throws {
         let definition = try XCTUnwrap(
             MCPDomainCanonicalToolDefinitions.definition(named: MCPGlobalToolName.bindContext)
         )
@@ -213,7 +213,11 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
         XCTAssertNotNil(properties["context_id"])
         XCTAssertNotNil(properties["working_dirs"])
-        XCTAssertNil(properties["window_id"])
+        XCTAssertEqual(properties["window_id"]?.objectValue?["type"], .string("integer"))
+        XCTAssertTrue(definition.description.contains("Headless"))
+        let alternatives = try XCTUnwrap(properties["working_dirs"]?.objectValue?["anyOf"]?.arrayValue)
+        XCTAssertEqual(alternatives.map { $0.objectValue?["type"] }, [.string("array"), .string("string")])
+        XCTAssertEqual(alternatives.first?.objectValue?["items"]?.objectValue?["type"], .string("string"))
         XCTAssertTrue(MCPGlobalToolName.orderedToolNames.contains(definition.name))
         XCTAssertFalse(MCPWindowToolName.orderedToolNames.contains(definition.name))
     }

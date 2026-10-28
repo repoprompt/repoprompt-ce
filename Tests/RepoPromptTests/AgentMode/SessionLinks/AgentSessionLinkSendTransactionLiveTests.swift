@@ -510,6 +510,40 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
 
     // MARK: - Durable acceptance and start reporting
 
+    func testDirectManagedHostPersistenceBoundarySurvivesRollbackAndCannotReopenSealedOwner() async throws {
+        for afterSeal in [false, true] {
+            let f = try makeFixture(saverBehavior: .failFirst)
+            let owner = f.session.beginRunAttempt(source: "direct-host-terminal-window")
+            f.session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+            if afterSeal {
+                f.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+            }
+            let before = f.session.quietLedger.facts
+            let target = try XCTUnwrap(f.viewModel.makeComposerSubmitTarget(tabID: f.tabID, session: f.session))
+            let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "")
+            guard case let .claimed(claim) = f.viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) else {
+                return XCTFail("Expected direct-host claim")
+            }
+            // Same persistence/start seam used by managed-host submissions, without fabricated link authority.
+            let outcome = await f.viewModel.persistAndStartNoncomposerTurn(
+                session: f.session, tabID: f.tabID, workspaceID: f.workspaceID, claim: claim,
+                displayText: "programmatic task", providerMessage: "programmatic task", workflow: nil,
+                attribution: nil, stopFence: AgentRunStartStopFence(session: f.session), dispatchIsCurrent: { true }
+            )
+            guard case .blocked = outcome else { return XCTFail("Expected persistence rollback") }
+            XCTAssertFalse(f.session.items.contains { $0.kind == .user })
+            XCTAssertFalse(f.events.contains(.providerControllerCreated))
+            if afterSeal {
+                XCTAssertEqual(f.session.quietLedger.facts, before)
+                XCTAssertEqual(before?.ordinaryThrough, 0)
+            } else {
+                XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner))
+                f.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+                XCTAssertEqual(f.session.quietLedger.facts?.ordinaryThrough, 1)
+            }
+        }
+    }
+
     func testDeliversAttributedRowDurablyBeforeProviderStart() async throws {
         let fixture = try makeFixture()
         let request = makeRequest()

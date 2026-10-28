@@ -137,9 +137,13 @@ struct AgentTaskRoutingCandidateBuilder {
     func build(
         snapshot: RoutingExecutionMetadataSnapshot,
         roleDefaults: [RoleDefaultReference] = [],
-        maximumChoices: Int = FiniteChoiceDecisionValidator.maximumChoices
+        maximumChoices: Int = FiniteChoiceDecisionValidator.maximumChoices,
+        usagePeerClasses: Set<String>? = nil
     ) throws -> [Candidate] {
-        let allSelected = Self.executableModels(in: snapshot)
+        // Class filtering happens before capacity truncation so excluded tiers never consume slots.
+        let allSelected = Self.executableModels(in: snapshot).filter { definition, _ in
+            usagePeerClasses.map { classes in definition.usagePeerClass.map(classes.contains) == true } ?? true
+        }
         guard !allSelected.isEmpty else { throw BuildError.noAvailableTargets }
         let capacity = min(maximumChoices, FiniteChoiceDecisionValidator.maximumChoices)
         guard capacity > 0, allSelected.count == 1 || capacity >= 2 else {
@@ -298,6 +302,10 @@ struct AgentTaskRoutingCandidateBuilder {
             || target.modelParameters.contains { $0.configID == "fast" && $0.valueRaw == "true" }
     }
 
+    /// Capability floor for user-created primary sessions. Light and balanced classes (Luna, Haiku,
+    /// Terra, Sonnet) are never offered to the primary-session Model Router.
+    static let primarySessionUsagePeerClasses: Set<String> = ["strong", "frontier"]
+
     private static func effortRaw(_ target: AgentRoutingExecutableTarget, provider: AgentProviderKind) -> String? {
         switch provider {
         case .codexExec: target.reasoningEffortRaw ?? CodexModelSpecifier(raw: target.modelRaw).reasoningEffort?.rawValue
@@ -358,7 +366,7 @@ struct AgentTaskRoutingCandidateBuilder {
             availability: availability,
             surface: surface
         )
-        return Self.modelDefinitions.map { definition in
+        return Self.familyDisplayOrderedDefinitions.map { definition in
             let displayName = Self.familyDisplayName(for: definition)
             let providerAvailable = surface.allows(definition.provider)
                 && AgentModelCatalog.isAgentAvailable(definition.provider, availability: availability)
@@ -382,58 +390,72 @@ struct AgentTaskRoutingCandidateBuilder {
         }
     }
 
+    /// Strongest-first within each provider so that position bias in a finite-choice judge and
+    /// any capacity truncation favor capable models. Main-session flagships (Sol, Opus) lead.
     private static let modelDefinitions: [ModelDefinition] = [
-        .init(
-            provider: .codexExec,
-            baseModelAliases: ["gpt-6-luna", "gpt-5.6-luna"],
-            modelClass: "gpt-luna",
-            preferredCodexFamily: "luna",
-            rubric: "Judge Luna as a base model using its capability, expected completion reliability, and price. Do not choose it merely because the prompt is short."
-        ),
-        .init(
-            provider: .codexExec,
-            baseModelAliases: ["gpt-5.6-terra"],
-            modelClass: "gpt-5.6-terra",
-            rubric: "Judge Terra as a base model using its capability, expected completion reliability, and price. It is not a default and receives no preference from its market tier."
-        ),
         .init(
             provider: .codexExec,
             baseModelAliases: ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6"],
             modelClass: "gpt-sol",
             preferredCodexFamily: "sol",
-            rubric: "Judge Sol as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries."
+            rubric: "Sol is OpenAI's current flagship for complex coding and agentic work. Strong default for substantive primary work; its base capability avoids missed findings and retries."
         ),
         .init(
             provider: .codexExec,
             baseModelAliases: ["gpt-6-astra"],
             modelClass: "gpt-6-astra",
-            rubric: "Judge Astra as a base model using its capability, expected completion reliability, and premium price."
+            rubric: "Astra is OpenAI's most capable premium tier. Choose it for the hardest, highest-risk, or longest-horizon work where its extra capability justifies premium price."
         ),
         .init(
-            provider: .claudeCode,
-            baseModelAliases: ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "haiku"],
-            modelClass: "claude-haiku",
-            rubric: "Judge Haiku as a base model using its capability, expected completion reliability, and price. Do not choose it merely because the prompt is short."
+            provider: .codexExec,
+            baseModelAliases: ["gpt-5.6-terra"],
+            modelClass: "gpt-5.6-terra",
+            rubric: "Terra is a previous-generation balanced tier, weaker than current flagships. Choose it only for clearly bounded, routine work; it is not cheaper than Sol."
         ),
         .init(
-            provider: .claudeCode,
-            baseModelAliases: ["claude-sonnet-5-5", "claude-sonnet-5", "sonnet"],
-            modelClass: "claude-sonnet",
-            rubric: "Judge Sonnet as a base model using its capability, expected completion reliability, and price. It is not a default and receives no preference from its market tier."
+            provider: .codexExec,
+            baseModelAliases: ["gpt-6-luna", "gpt-5.6-luna"],
+            modelClass: "gpt-luna",
+            preferredCodexFamily: "luna",
+            rubric: "Luna is a light, high-volume tier meant for exploration and simple lookups. Not suitable for implementation, review, debugging, or multi-step agentic work. A short prompt does not make a task simple."
         ),
         .init(
             provider: .claudeCode,
             baseModelAliases: ["claude-opus-5-5", "opus", "claude-opus-5"],
             modelClass: "claude-opus",
-            rubric: "Judge Opus as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries."
+            rubric: "Opus is Anthropic's recommended flagship for long-running agentic coding and knowledge work. Strong default for substantive primary work; its base capability avoids missed findings and retries."
         ),
         .init(
             provider: .claudeCode,
             baseModelAliases: ["claude-fable-5-1", "fable"],
             modelClass: "claude-fable",
-            rubric: "Judge Fable as a base model using its capability, expected completion reliability, and premium price."
+            rubric: "Fable is Anthropic's most capable premium tier. Choose it for the hardest, highest-risk, or longest-horizon work where its extra capability justifies premium price."
+        ),
+        .init(
+            provider: .claudeCode,
+            baseModelAliases: ["claude-sonnet-5-5", "claude-sonnet-5", "sonnet"],
+            modelClass: "claude-sonnet",
+            rubric: "Sonnet is a balanced tier below the flagships. Choose it only for clearly bounded, routine work with a clear reliability margin."
+        ),
+        .init(
+            provider: .claudeCode,
+            baseModelAliases: ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "haiku"],
+            modelClass: "claude-haiku",
+            rubric: "Haiku is a light, fast tier meant for exploration and simple lookups. Not suitable for implementation, review, debugging, or multi-step agentic work. A short prompt does not make a task simple."
         )
     ]
+
+    /// Settings list families lightest-first; router candidate order is independent of this.
+    private static let familyDisplayOrder = [
+        "gpt-luna", "gpt-5.6-terra", "gpt-sol", "gpt-6-astra",
+        "claude-haiku", "claude-sonnet", "claude-opus", "claude-fable"
+    ]
+
+    private static var familyDisplayOrderedDefinitions: [ModelDefinition] {
+        modelDefinitions.sorted {
+            (familyDisplayOrder.firstIndex(of: $0.modelClass) ?? .max) < (familyDisplayOrder.firstIndex(of: $1.modelClass) ?? .max)
+        }
+    }
 
     private static let curatedProviders: [AgentProviderKind] = [.codexExec, .claudeCode]
 

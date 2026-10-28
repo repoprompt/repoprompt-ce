@@ -37,7 +37,7 @@ package struct AIMessage {
     package let conversationMessages: [ConversationEntry]
 
     /// Request-scoped provider payload. Never copied into persisted chat messages.
-    package var transientImages: [AITransientImage]
+    package var attachments: [OracleAttachment]
 
     package let temperature: Double?
 
@@ -125,7 +125,7 @@ package struct AIMessage {
         fileBlocks: [String] = [],
         gitDiff: String? = nil,
         conversationMessages: [ConversationEntry] = [],
-        transientImages: [AITransientImage] = [],
+        attachments: [OracleAttachment] = [],
         temperature: Double?,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
@@ -137,7 +137,7 @@ package struct AIMessage {
         self.fileBlocks = fileBlocks
         self.gitDiff = gitDiff
         self.conversationMessages = conversationMessages
-        self.transientImages = transientImages
+        self.attachments = attachments
         self.temperature = temperature
         self.promptSectionsOrder = promptSectionsOrder
         self.disabledPromptSections = disabledPromptSections
@@ -157,7 +157,7 @@ package struct AIMessage {
         conversationMessages = [
             ConversationEntry(role: .user, content: userMessage)
         ]
-        transientImages = []
+        attachments = []
         // Use library defaults for prompt ordering
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
         disabledPromptSections = []

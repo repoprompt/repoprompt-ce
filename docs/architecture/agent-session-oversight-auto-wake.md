@@ -8,7 +8,8 @@ observer — an **Auto-wake** — so the model learns about it without its user 
 This document covers the parts that are easy to break because their invariants are enforced in one
 file and depended on in another. For the tool contract a model sees, read the `agent_session_link`
 definition in `MCPDomainCanonicalToolDefinitions.swift`; for the guidance the model is taught, read
-`AgentSessionLinkPrompts.swift`.
+`AgentSessionLinkPrompts.swift`. For choosing child versus managed-lane control, binding recovery,
+exact prompt decisions, and validation receipts, see [Agent orchestration guidance](agent-orchestration-guidance.md).
 
 ## One request, one exact-target approval
 
@@ -75,6 +76,56 @@ publishes a read-only live-consent fence to link authority; leases, cursors and 
 immediately when that specific scope ends, including during asynchronous cleanup or restoration.
 Valid committed scope/link rows restore normally. Failed continuity writes retain their existing
 honest pending/failed receipts; this flow does not strengthen a failed write into crash durability.
+
+## Delegation scope ending evidence
+
+Scope endings are app-owned diagnostic facts, not another authority. `scope_status` includes an
+`ending` object for known ended grants: `reason`, optional `at`, `initiator`, optional
+`actor_session_id`, `originating_scope_id`, and `originating_session_id`. Reasons are
+`user_revoked`, `grantee_released`, `session_deleted`, `expired`, `full_access_disabled`,
+`full_access_reconciled`, and `historical_unknown`. Explicit settings changes differ from a lazy
+full-access reconciliation. A cascade keeps its initiating scope/session, not an invented child actor.
+MCP actor/deleted-session identifiers are disclosed only when they identify the caller's grantee;
+the user-facing monitor resolves session display names instead of presenting raw UUIDs.
+`at` is when the owning transition was materialized, including recovery after an offline expiry;
+the grant's `expires_at` remains the scheduled deadline. Historical tombstones lacking evidence
+report an unknown initiator and no fabricated time. Existing history cannot explain the original
+unexpected ending retroactively.
+
+Ending evidence and the irreversible terminal identity share a continuity transaction. The first
+ending wins across later release/revoke calls, ancestor cascades, and operation retries. A terminal
+row wraps its original grant bytes for diagnostic status after restart; it is never reactivated.
+Old readers already ignore terminal payloads, and live grant payloads/schema are unchanged.
+Descendants known only to storage are terminalized in the same recursive transaction and inherit
+the initiating evidence. Explicit child transitions are written deepest-first to preserve their
+own evidence before an ancestor cascade. Session deletion also covers unloaded grants with the
+runtime's exact evidence, including its injected clock, typed `deletion_origin` (`user_ui`,
+`agent_cleanup`, `mcp_client`, `automatic_discard`, or `unknown`), and `file_removed` when known.
+Unspecified callers default to `unknown`, never the user. Real UI deletion commands explicitly set
+`user_ui`; MCP `close_tab` and external `cleanup_sessions` set `mcp_client`, retaining a routed agent
+caller when proven. `initiator` is `agent` for a proven routed caller, `mcp_client` for an external
+client, and `unknown` when provenance is absent. Legacy `compose_tab_batch` evidence identifies a
+mechanism, not a human actor, and now reports an unknown initiator. Keyboard close currently stashes
+rather than deletes a chat, so it does not produce a deletion ending.
+Already-absent files still commit a deletion fence; `file_removed: false` distinguishes that path.
+Agent cleanup retains its routed caller ID internally. Malformed optional evidence falls back to a
+plain deny tombstone rather than blocking the durable revocation queue.
+
+The monitor and per-grantee MCP history expose the latest 16 endings (dated entries first, UUID
+ascending as a deterministic tie-break). The runtime caches the per-grantee projection rather than
+decoding all history on every status/render. Only this 16-item projection is bounded: the backing
+`scopeEndings` map and persisted terminal rows remain unbounded; retention pruning is deferred.
+Restore-time drops in `recoverContinuity` and `reactivate` (deleted sessions, orphan grants, invalid
+children) still record no ending evidence. Passive expiry projection can also hide a grant before
+lazy expiry materializes its ending. These are remaining observability gaps, not explained endings.
+`record(id:)` remains authority-only; only status uses
+`statusRecord(id:)` to project persisted history. MCP status remains caller-owned; knowing another
+scope UUID does not authorize reading its historical details. Scope status also reports continuity
+save state: a failed write still denies authority immediately in this process but must not claim
+that either the ending evidence or denial survived a crash. Shutdown itself is not revocation;
+compatible saved grants can restore. Mixed-profile legacy descriptions remain preserved for
+explicit user review rather than being represented as revoked grants. Guardrail admission or
+membership-proof failure refuses the operation and does not itself end its scope.
 
 ## Four owners, deliberately disjoint
 
@@ -284,9 +335,12 @@ the user's card.
 - **Leases are re-checked after every suspension** before the next mutation; a revocation that
   lands mid-batch stops the remaining items (`scope_revoked`). An unlink re-checks the lease and
   both endpoints' membership right before the bridge's Stop. Worktree binds and unbinds re-check the
-  lease and the target's membership right before the binding transition and again at its
-  `beforeCommit` fence; as with `manage_worktree`, the transition can still await recovery handoff
-  and provider-context invalidation after that fence, before it publishes.
+  lease and the target's membership throughout the binding transition, after recovery handoff,
+  provider-context invalidation, and root installation. `manage_worktree` retains the exact Manage
+  link generation and endpoint incarnations, and synchronously fences retirement and binding
+  assignment against revocation. The fence covers only the authority mutation, not settings writes
+  or UI publication. A refusal keeps the old binding; before retirement it restores the original
+  handoff, and after retirement it retains the restart handoff with a visible recovery note.
 - **`worktree_inventory` drops `unbound`/`released` flags while any session binds the worktree**, even one outside the scope; this is a deliberate safety property, and nothing names or counts the outside binder.
 
 ### Authorization ownership: Overseer full access versus restricted delegation
@@ -418,6 +472,22 @@ bidirectional MainActor mapping fence. Controller/configuration/attempt ownershi
 acquisition and cancelled-before-dispatch tombstones remain independent hard gates. A real route
 failure still refuses or uses the existing bounded route recovery. Unknown, absent or stale tool names
 are not route failures and never trigger send-time controller recycling.
+
+The one permitted wait is on the route token itself, and only for a Claude controller the same send
+just launched (a fresh start after an app restart, or a recovery replacement): its `repoprompt-mcp`
+child may not yet have connected, passed the PID gate and admission, and committed the run mapping.
+`ServerNetworkManager.awaitAuthoritativeRunCatalogRouteToken` re-runs the strict token query, waking
+on a per-run route-change pulse (route commit, run mapping, cleanup/revoke) with a short poll as
+backstop; it never consults catalogs or the weaker `MCPRoutingWaiter` routed flag. The wait is bounded
+(about 10 s per controller, 15 s per send), abandoned as soon as the send's intent or controller
+ownership is lost, and a timed-out wait recycles at most once. A reused controller with a missing
+route still recycles immediately, and steering still fails closed with no wait and no recycle. Every
+route-recovery recycle re-arms the run's one-shot admission policy through the run's bootstrap lease
+(`MCPBootstrapLease.reinstallPolicyForReplacementProcess`), because the retired process's child
+consumed the original. When an initial run send is still refused (`[route:*]`, nothing dispatched),
+only the exact user row identified by its submission producer is withdrawn and its text restored to an
+empty composer, as Codex already does. Rowless Auto-wake and maintenance starts never infer a rollback
+row from transcript history, even if the last historical user row is unanswered.
 
 Prompt carry and wake admission read exact published membership and the claim epoch, not catalog
 freshness. Required rendered content, current authority, budget and provider acceptance still own
@@ -857,6 +927,82 @@ sidebar and title consumers cannot cross this boundary either. Auto-wake admissi
 the canonical passive queue and the wake coordinator described above, never sidebar presentation. A
 location repaint before claim reservation may affect the claim's local display provenance described
 below, but it still cannot enqueue, authorize, or alter the Auto-wake itself.
+
+## Quiet routine settlement and accepted coverage
+
+Quietness and delivery have different owners. `AgentTabSession` owns one exact run-attempt ledger.
+A normal drained terminal barrier seals the finished range synchronously, after its second ownership
+check and before teardown. A positively routine first physical dispatch may be quiet only when no
+accepted task input, tool, interaction, recovery, uncertainty, incomplete range, or queued successor
+occurred. Finished assistant messages may be silent or exactly `[ack]` (ASCII padding/case and one
+trailing full stop); plain `ack` is ordinary. Acceptance is not required to seal, and completion
+notifications are unchanged. Unsupported providers, natural/manual/periodic/waiting/control work,
+watchdog completion, and replay onto a new owner are ordinary.
+
+The single frozen `routineQuietCheckIn` claim/render Boolean records initial idle-follow-up routine
+qualification, including Codex. Actual rendered attention makes it false. Only qualified Claude Code
+gets `Nothing needed? Reply [ack].` in that dispatch's lane guidance, inside the existing 24 KiB
+budget and deterministic subset selection. Codex gets no sentence. Devin's classification and copy
+remain disabled together until its raw negative-evidence qualification closes. No standing guidance
+revision, autonomy rule, public field, provider protocol, or saved state changes.
+
+Same-owner/same-wake physical reentry is intentionally idempotent, not a new qualification. Every
+real non-routine input or recovery on a reused owner must continue to latch its accepted occurrence;
+future provider paths must preserve that dependency rather than infer inactivity from final text.
+A replay can retain previously frozen prompt bytes without acquiring quiet permission on a new owner.
+
+Every known attempt end advances checked `settledThrough`; ordinary ends also advance
+`ordinaryThrough`. These process-local facts never wrap or reset under a surviving binding. The
+bridge captures facts with the snapshot's **own** coarse status: an active frame sees its attempt's
+opening cutoff, while the first idle frame sees settlement even before ownership ends. Its private
+frame travels through the existing serial target-publication chain with full endpoint, source sequence,
+public snapshot, and accepted/unchanged result. Facts-only advancement refreshes indexed inbound
+observers without forging public `change_sequence`, activity, or send readiness. A sample can use
+only its captured frame after chain/endpoint/source/canonical/status revalidation across the authority
+await. Unknown is never zero, and cached facts never supply fresh closing or payment proof.
+
+The passive reducer owns one delivered settlement position per exact live reference/target,
+independently of pending rows. First valid paired facts baseline a genuinely new lane at settlement.
+An ordinary close can create one truthful `idle → idle` row even when all intermediate samples were
+missed; it does not count missed events. Unpaid ordinary coverage survives net reversion and carries
+the current running/waiting metadata. A coverage-only running/equal-waiting row can hitchhike but
+cannot independently wake the observer. A real new waiting edge still admits under pristine waiting
+coalescing policy. A proven quiet interval refreshes the old occurrence without erasing old debt or
+rearming its failed identity. Unexplained closes fail open; fresh paired idle proof reacquisition runs
+before same-status handling and may conservatively redisclose once after an unknown gap.
+
+Admission reads a scalar value projection of that sole live delivered position on the existing
+bounded snapshot entries; it owns no second position or per-claim map. This matters when an older
+receipt pays debt after a quiet close has already refreshed the pending row: the newer row remains
+available to hitchhike, but cannot independently admit another wake for paid quiet coverage.
+
+An immutable rendered status receipt captures the full target endpoint and that row's settled cutoff.
+On valid acceptance, payment happens **before** looking for the current pending row or comparing its
+status/sequence: cutoff 9 can pay 9 during running successor 10 or after row eviction, never ordinary
+10. Cleanup then independently preserves newer actionable edges, attention, and unpaid coverage.
+An exact accepted unknown-only status clears without invented payment. When known debt has no
+payable cutoff, acceptance settles the shown status by rebasing it to an inert equal-state hitchhiker;
+only fresh paired idle proof can independently redisclose it. Metadata-only unpaired refreshes may
+pay an older already-frozen cutoff, not a newer cache value.
+
+The sixteen-row bound and attention queue are unchanged. Eviction represents debt in existing
+anonymous overflow, never pays a target; overflow acceptance acknowledges only its own watermark.
+Unchanged evicted ordinary coverage is not repeatedly re-enqueued/overflowed, including across
+quiet running/idle cycles: the lane's delivered position records the ordinary watermark its eviction
+already disclosed as overflow, and a quiet close re-represents only coverage beyond it. That record
+never pays; a late exact receipt still pays its frozen cutoff. A new ordinary
+watermark or real new edge changes failure identity; quiet refresh/rebase does not. The existing
+single failure slot holds fingerprint plus producer wake identity. A late W1 may append its canonical
+marker and pay its frozen receipt, but only W2 can clear W2's suppression, even for identical shapes.
+
+These are not durable notification or quiet-result fields. Temporary target unreadability keeps its
+exact delivered position and resumes at fresh proof; observer ineligibility, Read retirement, unlink,
+and endpoint replacement still retire their queues/claims. Cold restart restores existing intent and
+preferences through the ordinary readiness/durability owners, but creates fresh grants and baselines:
+no quiet verdict, delivered position, in-flight wake, suppression, or callback is restored, and no
+history catch-up is invented. Losing live verdict proof makes canonical rows visible again; it does
+not lose saved link intent. Local display masking is a separate projection boundary; canonical rows,
+Read, replay/export, and assistant preview remain unchanged.
 
 ## Purposeful attention is an inverse signal, not reverse send
 
@@ -1384,3 +1530,28 @@ This channel observes existing authority; it does not add a refresh receipt, ret
 state machine, or provider policy. Its purpose is to distinguish future failures where RepoPrompt never
 publishes the tool from failures where the server projection is ready but the provider/model catalog
 does not converge.
+
+### Local quiet transcript display
+
+Quiet verdicts mask only the local transcript UI. The session's canonical items, structured
+transcript/projections, Read/replay/save/export, previews and completion notifications remain intact.
+The UI synchronization owner prepares one derived presentation keyed by exact session/binding,
+base presentation revision and internal display-mask revision. Getters never rebuild it. Every
+archive install/reset invalidates it; unchanged reads reuse the same archived array buffer.
+Terminal sealing only changes membership/revision and requests the existing transcript-runtime
+refresh. Inline UI synchronization during the terminal barrier waits for its existing phase-end
+signal before preparing a mask; hiding never bumps the canonical presentation revision.
+
+Masks follow positively retained source anchors, including a synthetic conclusion's original source
+ID. Mixed groups retain ordinary siblings and rebuild counts/narration/anchors with the existing
+formatters. Aggregate-only groups carry lightweight, nonpersisted summary inputs in their existing
+materialized render-block values: identities/count facts and independently copied narration under
+the existing 120-character policy, never full source/tool payloads. Full groups reuse their sections;
+only a buffered leading narration source omitted from those sections needs summary metadata.
+Those inputs share the projection/cache lifetime, not a separate history store or ID index.
+Reload without materialized verdict proof shows those rows again. A still-admissible unmaterialized
+marker instead retains its exclusion until its last producer or exact source binding retires.
+
+The passive reducer's existing value also suppresses equal queue publications and duplicate receipts.
+This is not an admission cache: readiness waiters, catalog readiness, selection changes and the
+existing shared snooze/interval deadline continue to reevaluate genuinely owed work independently.

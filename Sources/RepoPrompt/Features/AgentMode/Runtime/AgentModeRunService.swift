@@ -183,14 +183,15 @@ final class AgentModeRunService {
         session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         providerControlCommand: AgentProviderControlCommand? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil,
-        localComposerCandidate: UUID? = nil
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         var candidateTransferred = false
         defer {
@@ -308,7 +309,8 @@ final class AgentModeRunService {
                 providerControlCommand: providerControlCommand,
                 selfCompactDispatchID: selfCompactDispatchID,
                 stopFence: stopFence,
-                localComposerCandidate: localComposerCandidate
+                localComposerCandidate: localComposerCandidate,
+                initialUserItemID: initialUserItemID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
@@ -369,7 +371,7 @@ final class AgentModeRunService {
     func submitActiveACPPromptIfSupported(
         session: AgentTabSession,
         messageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
         targetController: ACPAgentSessionController,
@@ -421,7 +423,7 @@ final class AgentModeRunService {
     static func makeACPRunRequest(
         session: AgentTabSession,
         workspacePath: String?,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         runtimePermission: AgentProviderRuntimePermissionBinding
     ) -> ACPRunRequest? {
         let selectedAgent = session.selectedAgent

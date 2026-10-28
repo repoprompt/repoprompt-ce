@@ -1,7 +1,9 @@
+import Darwin
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
+import RepoPromptShared
 import SwiftAnthropic
 import SwiftOpenAI
 import XCTest
@@ -286,8 +288,8 @@ final class OracleImageSerializationTests: XCTestCase {
             systemPrompt: "system",
             fileTree: "root",
             conversationMessages: [.init(role: .assistant, content: "answer")],
-            transientImages: [
-                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")
+            attachments: [
+                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
             ],
             temperature: nil,
             promptSectionsOrder: [.fileMap],
@@ -306,8 +308,8 @@ final class OracleImageSerializationTests: XCTestCase {
         let message = AIMessage(
             systemPrompt: "system",
             conversationMessages: [.init(role: .user, content: "")],
-            transientImages: [
-                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "  Diagram  ")
+            attachments: [
+                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "  Diagram  ")
             ],
             temperature: nil,
             promptSectionsOrder: [],
@@ -325,33 +327,13 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertEqual(countObjects(type: "image", in: json), 1)
     }
 
-    func testRouteAdmissionAllowsEveryVerifiedOracleProviderTransport() {
-        let models: [AIModel] = [
-            .claude4Sonnet,
-            .anthropicCustom(name: "custom"),
-            .gpt5,
-            .openAIServiceTierVariant(base: .gpt5, tier: "flex"),
-            .openaiCustom(name: "custom"),
-            .ollama,
-            .azureCustom(name: "azure"),
-            .openrouterCustom(name: "openrouter"),
-            .geminiFlash25,
-            .deepseekChat,
-            .customProviderUser(name: "custom"),
-            .fireworksDeepseekV3p1Terminus,
-            .grokCodeFast1,
-            .groqKimi,
-            .zaiGLM45,
-            .claudeCodeSonnet,
-            .codexCustom(name: "codex"),
-            .openCodeCustom(name: "opencode"),
-            .cursorCustom(name: "cursor"),
-            .devinCustom(name: "devin")
-        ]
-        for model in models {
-            XCTAssertTrue(OracleImageRouteAdmission.supports(model), "Expected \(model) to admit images")
-        }
-        XCTAssertFalse(OracleImageRouteAdmission.supports(.grokBuildCustom(name: "grok")))
+    func testAttachmentRouteFollowsTheCodeThatEncodesTheRequest() {
+        XCTAssertEqual(AIModel.gpt5.attachmentRoute, .openAIResponses)
+        XCTAssertEqual(AIModel.ollama.attachmentRoute, .openAIChat)
+        XCTAssertEqual(AIModel.claude4Sonnet.attachmentRoute, .anthropicMessages)
+        XCTAssertEqual(AIModel.grokBuildCustom(name: "grok").attachmentRoute, .grokBuild)
+        XCTAssertEqual(AIModel.azureCustom(name: "azure").attachmentRoute, .openAIChat)
+        XCTAssertEqual(AIModel.customProviderUser(name: "custom").attachmentRoute, .customOpenAI)
     }
 
     func testOpenAITextOnlyMessagesRemainScalar() throws {
@@ -444,8 +426,8 @@ final class OracleImageSerializationTests: XCTestCase {
             systemPrompt: "system",
             fileTree: "root",
             conversationMessages: [.init(role: .assistant, content: "answer")],
-            transientImages: [
-                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")
+            attachments: [
+                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
             ],
             temperature: nil,
             promptSectionsOrder: [.fileMap],
@@ -463,11 +445,11 @@ final class OracleImageSerializationTests: XCTestCase {
     }
 
     func testACPEncodesTransientImagesInlineWithoutURI() throws {
-        let image = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")
+        let image = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
         let blocks = try ACPPromptContentBuilder.blocks(
             text: "Inspect",
             attachments: [],
-            transientImages: [image]
+            oracleAttachments: [image]
         )
         let imageBlock = try XCTUnwrap(blocks.last)
 
@@ -483,9 +465,9 @@ final class OracleImageSerializationTests: XCTestCase {
         let cursor = CursorCLIProvider.test_makeAgentMessage(from: message)
         let devin = DevinCLIProvider.test_makeImageAgentMessage(from: message)
 
-        XCTAssertEqual(openCode.transientImages, message.transientImages)
-        XCTAssertEqual(cursor.transientImages, message.transientImages)
-        XCTAssertEqual(devin.transientImages, message.transientImages)
+        XCTAssertEqual(openCode.attachments, message.attachments)
+        XCTAssertEqual(cursor.attachments, message.attachments)
+        XCTAssertEqual(devin.attachments, message.attachments)
     }
 
     func testDevinACPPromptBlocksCarryTransientImages() throws {
@@ -516,9 +498,11 @@ final class OracleImageSerializationTests: XCTestCase {
         var stagedFileURL: URL?
         var stagedDirectoryURL: URL?
 
-        let stagedImages = try await OracleTransientImageStaging.stage([
-            .init(bytes: bytes, mediaType: .jpeg, title: "  Reference  ")
-        ])
+        let planned = try AttachmentEncoding.plan(
+            [.init(payload: .image(.jpeg, bytes), fileName: "image.jpg", title: "  Reference  ")],
+            route: .codexAppServer
+        )
+        let stagedImages = try await OracleTransientImageStaging.stage(planned, route: .codexAppServer)
         let staging = try XCTUnwrap(stagedImages)
         do {
             let file = try XCTUnwrap(staging.files.first)
@@ -550,7 +534,7 @@ final class OracleImageSerializationTests: XCTestCase {
     func testClaudeStreamJSONEncodesTransientImages() throws {
         let line = try ClaudeCodeProvider.makeStreamJSONInput(
             prompt: "Inspect",
-            images: [.init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")]
+            attachments: [.init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")]
         )
         XCTAssertTrue(line.hasSuffix("\n"))
         let data = try XCTUnwrap(line.dropLast().data(using: .utf8))
@@ -663,8 +647,8 @@ final class OracleImageSerializationTests: XCTestCase {
                 .init(role: .assistant, content: "answer"),
                 .init(role: .user, content: "final")
             ],
-            transientImages: [
-                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Diagram")
+            attachments: [
+                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
             ],
             temperature: nil,
             promptSectionsOrder: [],
@@ -690,5 +674,318 @@ final class OracleImageSerializationTests: XCTestCase {
             return array.reduce(0) { $0 + countObjects(type: type, in: $1) }
         }
         return 0
+    }
+}
+
+final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
+    private enum Emitted: Hashable {
+        case image
+        case document
+        case inlineText
+    }
+
+    private enum Reach {
+        case appTarget(([OracleAttachment]) async throws -> Set<Emitted>)
+        case domainRuntime
+    }
+
+    private func reach(of route: AttachmentRoute) -> Reach {
+        switch route {
+        case .anthropicMessages: .appTarget(Self.anthropic)
+        case .openAIChat: .appTarget(Self.openAIChat)
+        case .openAIResponses: .appTarget(Self.openAIResponses)
+        case .codexAppServer: .appTarget(Self.codex)
+        case .grokBuild: .appTarget(Self.grok)
+        case .customOpenAI, .claudeCodeStreamJSON, .acp: .domainRuntime
+        }
+    }
+
+    func testEveryAppEncoderEmitsExactlyWhatItsRowPromisesOrRefusesByName() async throws {
+        var exercised = 0
+        for route in AttachmentRoute.allCases {
+            guard case let .appTarget(encode) = reach(of: route) else { continue }
+            let row = AttachmentRouteCapability.capability(for: route)
+            for kind in AttachmentKind.allCases {
+                let attachment = Self.sample(kind)
+                let label = "\(route) × \(kind)"
+                switch Self.promised(by: row, kind: kind) {
+                case let promised?:
+                    let emitted = try await encode([attachment])
+                    XCTAssertEqual(emitted, [promised], label)
+                case nil:
+                    do {
+                        let emitted = try await encode([attachment])
+                        XCTFail("\(label) emitted \(emitted) but its row refuses it")
+                    } catch let error as AttachmentAdmissionError {
+                        XCTAssertTrue(
+                            error.localizedDescription.contains(attachment.fileName),
+                            "\(label) refusal must name the file: \(error.localizedDescription)"
+                        )
+                    }
+                }
+                exercised += 1
+            }
+        }
+        XCTAssertEqual(exercised, 5 * AttachmentKind.allCases.count)
+    }
+
+    func testAnthropicSendsPDFCSVAndPNGInOneRequest() throws {
+        let json = try Self.json(AnthropicProvider.makeMessages(for: Self.message([
+            Self.sample(.pdf), Self.sample(.text), Self.sample(.image)
+        ])))
+        let messages = try XCTUnwrap(json as? [[String: Any]])
+        let parts = try XCTUnwrap(messages.last?["content"] as? [[String: Any]])
+        XCTAssertEqual(parts.compactMap { $0["type"] as? String }.sorted(), ["document", "image", "text"])
+        let text = try XCTUnwrap(parts.first { $0["type"] as? String == "text" }?["text"] as? String)
+        XCTAssertTrue(text.hasPrefix("Attached file: data.csv\n```\na,b\n1,2\n```"), text)
+        XCTAssertTrue(text.hasSuffix("Question"), text)
+        let document = try XCTUnwrap(parts.first { $0["type"] as? String == "document" })
+        XCTAssertEqual((document["source"] as? [String: Any])?["media_type"] as? String, "application/pdf")
+    }
+
+    func testOpenAIChatRefusesThePDFByNameAndStillPlansTheCSVAndPNG() throws {
+        let attachments = [Self.sample(.pdf), Self.sample(.text), Self.sample(.image)]
+        XCTAssertThrowsError(try Self.message(attachments).openAIChatMessages(embedSystemPrompt: false)) { error in
+            let message = error.localizedDescription
+            XCTAssertTrue(message.contains("report.pdf"), message)
+            XCTAssertFalse(message.contains("data.csv"), message)
+            XCTAssertFalse(message.contains("diagram.png"), message)
+        }
+
+        let delivered = try Self.json(
+            Self.message([Self.sample(.text), Self.sample(.image)]).openAIChatMessages(embedSystemPrompt: false)
+        )
+        let messages = try XCTUnwrap(delivered as? [[String: Any]])
+        let parts = try XCTUnwrap(messages.last?["content"] as? [[String: Any]])
+        XCTAssertEqual(Self.emitted(fromParts: parts), [.inlineText, .image])
+    }
+
+    func testResponsesEncoderAcceptsASetAdmittedUnderTheChatRow() throws {
+        let attachments = [Self.sample(.text), Self.sample(.image)]
+        XCTAssertNoThrow(try AttachmentEncoding.plan(attachments, route: .openAIChat))
+        let json = try Self.json(Self.message(attachments).openAIResponsesInput())
+        let items = try XCTUnwrap(json as? [[String: Any]])
+        let parts = try XCTUnwrap(items.last?["content"] as? [[String: Any]])
+        XCTAssertEqual(Self.emitted(fromParts: parts), [.inlineText, .image])
+    }
+
+    func testResponsesCarriesThePDFAsAFileWithItsName() throws {
+        let json = try Self.json(Self.message([Self.sample(.pdf)]).openAIResponsesInput())
+        let items = try XCTUnwrap(json as? [[String: Any]])
+        let parts = try XCTUnwrap(items.last?["content"] as? [[String: Any]])
+        let file = try XCTUnwrap(parts.first { $0["type"] as? String == "input_file" })
+        XCTAssertEqual(file["filename"] as? String, "report.pdf")
+        XCTAssertTrue((file["file_data"] as? String)?.hasPrefix("data:application/pdf;base64,") == true)
+    }
+
+    func testAnthropicRefusesBeforeTheSDKWhenEncodedPDFsExceedTheRequestCap() throws {
+        let limit = try XCTUnwrap(AttachmentRouteCapability.capability(for: .anthropicMessages).maxEncodedRequestBytes)
+        let size = limit / 4 * 3 / 2 + 1024
+        let pdfs = ["first.pdf", "second.pdf"].map {
+            OracleAttachment(payload: .pdf(Self.pdfBytes(extra: size)), fileName: $0, title: nil)
+        }
+        XCTAssertThrowsError(try AnthropicProvider.makeMessages(for: Self.message(pdfs))) { error in
+            XCTAssertTrue(error is AttachmentAdmissionError, "\(error)")
+        }
+    }
+
+    private static func promised(by row: AttachmentRouteCapability, kind: AttachmentKind) -> Emitted? {
+        switch kind {
+        case .image: row.image == .nativeImage ? .image : nil
+        case .pdf: row.pdf == .nativeDocument ? .document : nil
+        case .text: row.text == .inlineText ? .inlineText : nil
+        case .binary: nil
+        }
+    }
+
+    private static func sample(_ kind: AttachmentKind) -> OracleAttachment {
+        switch kind {
+        case .image:
+            OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "diagram.png", title: nil)
+        case .pdf:
+            OracleAttachment(payload: .pdf(pdfBytes()), fileName: "report.pdf", title: nil)
+        case .text:
+            OracleAttachment(payload: .text("a,b\n1,2\n", Data("a,b\n1,2\n".utf8)), fileName: "data.csv", title: nil)
+        case .binary:
+            OracleAttachment(payload: .binary(Data([0, 1, 2, 3])), fileName: "blob.bin", title: nil)
+        }
+    }
+
+    private static func pdfBytes(extra: Int = 0) -> Data {
+        var data = Data("%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n".utf8)
+        if extra > 0 { data.append(Data(count: extra)) }
+        return data
+    }
+
+    private static func message(_ attachments: [OracleAttachment]) -> AIMessage {
+        AIMessage(
+            systemPrompt: "",
+            conversationMessages: [.init(role: .user, content: "Question")],
+            attachments: attachments,
+            temperature: nil,
+            promptSectionsOrder: [],
+            disabledPromptSections: []
+        )
+    }
+
+    private static func json(_ value: some Encodable) throws -> Any {
+        try JSONSerialization.jsonObject(with: JSONEncoder().encode(value))
+    }
+
+    private static func anthropic(_ attachments: [OracleAttachment]) throws -> Set<Emitted> {
+        let json = try json(AnthropicProvider.makeMessages(for: message(attachments)))
+        let messages = try XCTUnwrap(json as? [[String: Any]])
+        return try emitted(fromContent: XCTUnwrap(messages.last?["content"]))
+    }
+
+    private static func openAIChat(_ attachments: [OracleAttachment]) throws -> Set<Emitted> {
+        let json = try json(message(attachments).openAIChatMessages(embedSystemPrompt: false))
+        let messages = try XCTUnwrap(json as? [[String: Any]])
+        return try emitted(fromContent: XCTUnwrap(messages.last?["content"]))
+    }
+
+    private static func openAIResponses(_ attachments: [OracleAttachment]) throws -> Set<Emitted> {
+        let json = try json(message(attachments).openAIResponsesInput())
+        let items = try XCTUnwrap(json as? [[String: Any]])
+        return try emitted(fromContent: XCTUnwrap(items.last?["content"]))
+    }
+
+    private static func emitted(fromContent content: Any) -> Set<Emitted> {
+        if let parts = content as? [[String: Any]] { return emitted(fromParts: parts) }
+        return emitted(fromParts: [["type": "text", "text": content]])
+    }
+
+    private static func emitted(fromParts parts: [[String: Any]]) -> Set<Emitted> {
+        var emitted = Set<Emitted>()
+        for part in parts {
+            switch part["type"] as? String {
+            case "image", "image_url", "input_image": emitted.insert(.image)
+            case "document", "input_file", "file": emitted.insert(.document)
+            default:
+                let text = (part["text"] as? String) ?? ""
+                if text.contains("Attached file: data.csv"), text.contains("a,b\n1,2") { emitted.insert(.inlineText) }
+            }
+        }
+        return emitted
+    }
+
+    private static func isInlineBlock(_ text: String) -> Bool {
+        text.contains("Attached file: data.csv") && text.contains("a,b\n1,2")
+    }
+
+    private static func codex(_ attachments: [OracleAttachment]) async throws -> Set<Emitted> {
+        let controller = RecordingCodexController()
+        let provider = CodexCLIProvider(sessionControllerFactory: { _, _ in controller })
+        let stream = try await provider.streamMessage(message(attachments), model: .codexCliGpt5Low)
+        for try await _ in stream {}
+        await provider.dispose()
+
+        let turn = try XCTUnwrap(controller.recordedTurn, "Codex never started a turn")
+        var emitted = Set<Emitted>()
+        if !turn.attachmentFilesExisted.isEmpty, turn.attachmentFilesExisted.allSatisfy(\.self) {
+            emitted.insert(.image)
+        }
+        if isInlineBlock(turn.text) { emitted.insert(.inlineText) }
+        return emitted
+    }
+
+    private static func grok(_ attachments: [OracleAttachment]) async throws -> Set<Emitted> {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GrokMatrix-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = root.appendingPathComponent("grok")
+        let script = #"""
+        #!/bin/sh
+        if [ "$1" = agent ] && [ "$2" = --help ]; then
+            printf 'stdio\n'
+            exit 0
+        fi
+        /bin/cat prompt.txt > "$RPCE_FIXTURE_ROOT/prompt-seen"
+        printf '%s\n' '{"text":"ok","stopReason":"end_turn","sessionId":"s","usage":{"input_tokens":1,"output_tokens":1}}'
+        """#
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let environment = [
+            "PATH": "/usr/bin:/bin",
+            "HOME": root.appendingPathComponent("home", isDirectory: true).path,
+            "GROK_HOME": root.appendingPathComponent("grok-home", isDirectory: true).path,
+            "RPCE_FIXTURE_ROOT": root.path
+        ]
+        let provider = GrokBuildOneShotHeadlessAgentProvider(
+            config: GrokBuildAgentConfig(
+                commandName: executable.path,
+                modelString: nil,
+                includeRepoPromptMCPServer: false
+            ),
+            launchResolver: GrokBuildACPLaunchResolver(environmentProvider: { _ in environment }),
+            requestTimeout: 30,
+            apiKeyProvider: { nil }
+        )
+        let agentMessage = AgentMessage(systemPrompt: "", userMessage: "Question", attachments: attachments)
+        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            let stream = try await provider.streamAgentMessage(agentMessage)
+            for try await _ in stream {}
+        }
+        await provider.dispose()
+
+        let seen = try String(contentsOf: root.appendingPathComponent("prompt-seen"), encoding: .utf8)
+        return isInlineBlock(seen) ? [.inlineText] : []
+    }
+}
+
+private final class RecordingCodexController: CodexSessionControllerPassiveStubDefaults, @unchecked Sendable {
+    struct Turn {
+        let text: String
+        let attachmentFilesExisted: [Bool]
+    }
+
+    private let lock = NSLock()
+    private var turn: Turn?
+    private var active = false
+    private let stream = AsyncStream<CodexNativeSessionController.Event>.makeStream()
+
+    var hasActiveThread: Bool {
+        lock.withLock { active }
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        stream.stream
+    }
+
+    var recordedTurn: Turn? {
+        lock.withLock { turn }
+    }
+
+    func startOrResume(
+        existing _: CodexNativeSessionController.SessionRef?,
+        baseInstructions _: String,
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier _: String?
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        lock.withLock { active = true }
+        return .init(conversationID: "matrix", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
+    }
+
+    func startUserTurn(
+        text: String,
+        attachments: [AgentFileAttachment],
+        model _: String?,
+        reasoningEffort _: String?,
+        serviceTier _: String?
+    ) async throws -> CodexTurnStartReceipt {
+        let existed = attachments.map { attachment -> Bool in
+            guard case let .localFile(path) = attachment.source else { return false }
+            return FileManager.default.fileExists(atPath: path)
+        }
+        lock.withLock { turn = Turn(text: text, attachmentFilesExisted: existed) }
+        stream.continuation.yield(.turnCompleted(turnID: "matrix", status: .completed))
+        return CodexTurnStartReceipt(provisionalSubmissionID: "matrix")
+    }
+
+    func shutdown() async {
+        lock.withLock { active = false }
+        stream.continuation.finish()
     }
 }

@@ -1328,6 +1328,34 @@ extension AgentModeViewModel {
         return rows[rootIndices[nextRootOrdinal]].tabID
     }
 
+    /// Next session (in sidebar order, wrapping) with an unseen completed, failed, or waiting badge.
+    /// Follows the rendered group-first order without paging or collapse, then any rows that
+    /// rendering hides, so badges in collapsed groups or threads stay reachable.
+    func nextAttentionSidebarSessionTabID(from activeTabID: UUID?, in tabs: [ComposeTabState]) -> UUID? {
+        let rows = sidebarSessions(for: tabs)
+        let displayed = Self.sidebarDisplayOrder(rows, collapsedGroups: []).map(\.tabID)
+        let displayedSet = Set(displayed)
+        return Self.nextAttentionSidebarSessionTabID(
+            from: activeTabID,
+            orderedTabIDs: displayed + rows.map(\.tabID).filter { !displayedSet.contains($0) },
+            needingAttention: Set(ui.sessionSidebar.snapshot.attentionRunStateByTabID.keys)
+        )
+    }
+
+    static func nextAttentionSidebarSessionTabID(
+        from activeTabID: UUID?,
+        orderedTabIDs: [UUID],
+        needingAttention: Set<UUID>
+    ) -> UUID? {
+        guard !needingAttention.isEmpty, !orderedTabIDs.isEmpty else { return nil }
+        let start = activeTabID.flatMap { orderedTabIDs.firstIndex(of: $0) }.map { $0 + 1 } ?? 0
+        for offset in 0 ..< orderedTabIDs.count {
+            let tabID = orderedTabIDs[(start + offset) % orderedTabIDs.count]
+            if tabID != activeTabID, needingAttention.contains(tabID) { return tabID }
+        }
+        return nil
+    }
+
     func computeLastUserMessageDate(in items: [AgentChatItem]) -> Date? {
         Self.computeLastUserMessageDateNonisolated(in: items)
     }

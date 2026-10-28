@@ -729,7 +729,7 @@ private final class ExecutionCounter: @unchecked Sendable {
             XCTAssertEqual(Set([principal(), principal(parent: 999)]).count, 1)
         }
 
-        func testUnverifiedNamesNeverAuthorizeAdmission() {
+        func testBundledHelperAdmissionStillRequiresExecutableVerification() {
             let names = [
                 "claude-code", "codex-mcp-client", "gemini-cli-mcp-client",
                 "opencode", "cursor", "cursor-mcp-client", "claude-ai",
@@ -738,14 +738,17 @@ private final class ExecutionCounter: @unchecked Sendable {
             ]
             for name in names {
                 XCTAssertFalse(ServerController.canAutomaticallyApprove(clientName: name, bundledCLI: false), name)
-                XCTAssertFalse(ServerController.isBuiltInAlwaysAllowedClient(name), name)
             }
             XCTAssertTrue(ServerController.canAutomaticallyApprove(clientName: "RepoPrompt CLI", bundledCLI: true))
             XCTAssertTrue(ServerController.canAutomaticallyApprove(clientName: "RepoPrompt CLI Debug", bundledCLI: true))
             XCTAssertFalse(ServerController.canAutomaticallyApprove(clientName: "cursor", bundledCLI: true))
+            XCTAssertFalse(ServerController.canSaveAlwaysAllowed(clientName: "RepoPrompt CLI"))
+            XCTAssertFalse(ServerController.isBuiltInAlwaysAllowedClient("RepoPrompt CLI Debug"))
+            XCTAssertTrue(ServerController.canSaveAlwaysAllowed(clientName: "external-test-client"))
+            XCTAssertTrue(ServerController.isBuiltInAlwaysAllowedClient("cursor"))
         }
 
-        func testLegacyNamesArePreservedWithoutBecomingGrants() throws {
+        func testLegacyNamesArePreservedAndCannotBypassBundledHelperVerification() throws {
             let suite = "MCPConnectionAdmissionTests.\(UUID().uuidString)"
             let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
             defer { defaults.removePersistentDomain(forName: suite) }
@@ -755,6 +758,56 @@ private final class ExecutionCounter: @unchecked Sendable {
             XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients"), names)
             for name in names {
                 XCTAssertFalse(ServerController.canAutomaticallyApprove(clientName: name, bundledCLI: false))
+            }
+        }
+
+        func testStrictModeCannotSaveAlwaysAllowAndStaleResponseCannotSaveSuccessorName() async throws {
+            for strict in [true, false] {
+                let suite = "MCPConnectionAdmissionTests.\(UUID().uuidString)"
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let controller = ServerController(
+                    installNetworkCallbacks: false, approvalDefaults: defaults,
+                    strictConnectionApprovalEnabled: { strict }
+                )
+                let events = AdmissionEvents()
+                await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+                for name in ["first", "second"] {
+                    await controller.test_requestApproval(
+                        clientID: name, approve: { events.decide(name) }, deny: {}
+                    )
+                }
+                let first = try XCTUnwrap(events.generations.first)
+                await controller.resolvePendingApproval(allow: true, generation: first, alwaysAllow: true)
+                await controller.resolvePendingApproval(allow: true, generation: first, alwaysAllow: true)
+                XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients") ?? [], strict ? [] : ["first"])
+                XCTAssertEqual(events.decisions, ["first"])
+                await controller.resolvePendingApproval(allow: false, generation: events.generations[1])
+            }
+        }
+
+        func testAlwaysAllowCannotPersistForClosedAnonymousConnectionOrExitedProcess() async throws {
+            for (hasPrincipal, connectionIsValid) in [(false, false), (true, false), (true, true)] {
+                let suite = "MCPConnectionAdmissionTests.\(UUID().uuidString)"
+                let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+                defer { defaults.removePersistentDomain(forName: suite) }
+                let process = AdmissionLiveness()
+                let controller = ServerController(
+                    installNetworkCallbacks: false, approvalDefaults: defaults,
+                    strictConnectionApprovalEnabled: { false }, processIsCurrent: { _ in process.isLive }
+                )
+                let events = AdmissionEvents()
+                await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
+                await controller.test_requestApproval(
+                    clientID: "external-test-client", principal: hasPrincipal ? principal() : nil,
+                    validate: { connectionIsValid },
+                    approve: { events.decide("allowed") }, deny: { events.decide("denied") }
+                )
+                let generation = try XCTUnwrap(events.generations.first)
+                process.close()
+                await controller.resolvePendingApproval(allow: true, generation: generation, alwaysAllow: true)
+                XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients") ?? [], [])
+                XCTAssertEqual(events.decisions, ["denied"])
             }
         }
 
@@ -922,6 +975,67 @@ private final class ExecutionCounter: @unchecked Sendable {
     /// Isolated socket-level coverage: real MCP initialize, kernel peer credentials,
     /// production admission/identity/liveness, and connection removal. No app launch.
     final class MCPConnectionApprovalTransportTests: XCTestCase {
+        func testAlwaysAllowPersistsAcrossReconnectAndControllerRestart() async throws {
+            try await exerciseReconnectAndRestart(strict: false, clientName: "external-test-client")
+        }
+
+        func testBuiltInNamesAreAllowedByDefault() async throws {
+            try await exerciseReconnectAndRestart(strict: false, clientName: "cursor")
+        }
+
+        func testStrictModeIgnoresSavedNamesAndResetsOnRestart() async throws {
+            try await exerciseReconnectAndRestart(strict: true, clientName: "external-test-client")
+        }
+
+        func testStrictModeKeepsExplicitGlobalAutoApprove() async throws {
+            try await exerciseReconnectAndRestart(strict: true, clientName: "external-test-client", autoApproveAll: true)
+        }
+
+        func testStrictModeAlsoPromptsForBuiltInNames() async throws {
+            try await exerciseReconnectAndRestart(strict: true, clientName: "cursor")
+        }
+
+        private func exerciseReconnectAndRestart(
+            strict: Bool, clientName: String, autoApproveAll: Bool = false
+        ) async throws {
+            let suite = "MCPConnectionApprovalTransportTests.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
+            // Strict runs start with a saved name that default mode would honor.
+            if strict { defaults.set([clientName], forKey: "mcp.alwaysAllowedClients") }
+            defaults.set(autoApproveAll, forKey: "mcpAutoApproveAllClients")
+            let events = ApprovalEvents()
+            // New owners model a RepoPrompt restart: only the same defaults survive.
+            for _ in 0 ..< 2 {
+                let network = ServerNetworkManager()
+                let controller = ServerController(
+                    networkManager: network, installNetworkCallbacks: false,
+                    approvalDefaults: defaults, strictConnectionApprovalEnabled: { strict }
+                )
+                await controller.setApprovalCallback { [weak controller] name, generation, _ in
+                    XCTAssertEqual(name, clientName)
+                    events.prompt(generation)
+                    await controller?.resolvePendingApproval(allow: true, generation: generation, alwaysAllow: true)
+                }
+                for _ in 0 ..< 2 {
+                    let connection = try await makeConnection(network: network, controller: controller, clientName: clientName)
+                    do {
+                        _ = try await connection.client.connect(transport: connection.transport)
+                    } catch {
+                        await connection.close()
+                        await network.stop()
+                        throw error
+                    }
+                    await connection.close()
+                }
+                await controller.setApprovalCallback { _, _, _ in }
+                await network.stop()
+            }
+            let expectedPrompts = autoApproveAll ? 0 : (strict ? 2 : (clientName == "cursor" ? 0 : 1))
+            XCTAssertEqual(events.generations.count, expectedPrompts)
+            XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients") ?? [], clientName == "cursor" && !strict ? [] : [clientName])
+        }
+
         func testAllowSurvivesSocketCloseBeforeClickAndAdmitsReconnectWithoutPrompt() async throws {
             try await exerciseDecisionAfterSocketCloses(allow: true)
         }
@@ -930,9 +1044,21 @@ private final class ExecutionCounter: @unchecked Sendable {
             try await exerciseDecisionAfterSocketCloses(allow: false)
         }
 
-        private func exerciseDecisionAfterSocketCloses(allow: Bool) async throws {
+        func testAlwaysAllowSurvivesSocketCloseBeforeClickAndControllerRestart() async throws {
+            try await exerciseDecisionAfterSocketCloses(allow: true, strict: false, alwaysAllow: true)
+        }
+
+        private func exerciseDecisionAfterSocketCloses(
+            allow: Bool, strict: Bool = true, alwaysAllow: Bool = false
+        ) async throws {
+            let suite = "MCPConnectionApprovalTransportTests.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite) }
             let network = ServerNetworkManager()
-            let controller = ServerController(networkManager: network, installNetworkCallbacks: false)
+            let controller = ServerController(
+                networkManager: network, installNetworkCallbacks: false,
+                approvalDefaults: defaults, strictConnectionApprovalEnabled: { strict }
+            )
             let autoApprove = await controller.getAutoApproveAllClients()
             XCTAssertFalse(autoApprove, "This regression must exercise manual approval, not the global bypass")
             let prompted = expectation(description: "External initialize requests manual approval")
@@ -963,7 +1089,7 @@ private final class ExecutionCounter: @unchecked Sendable {
             await first.close()
             let firstIsLive = await network.isConnectionLiveForApproval(first.id)
             XCTAssertFalse(firstIsLive)
-            await controller.resolvePendingApproval(allow: allow, generation: generation)
+            await controller.resolvePendingApproval(allow: allow, generation: generation, alwaysAllow: alwaysAllow)
             initialize.cancel()
             _ = await initialize.result
             let removed = await network.debugDirectAdmissionStateForTesting(connectionID: first.id)
@@ -993,11 +1119,38 @@ private final class ExecutionCounter: @unchecked Sendable {
             await second.close()
             await controller.setApprovalCallback { _, _, _ in }
             await network.stop()
+
+            let shouldPersist = allow && alwaysAllow && !strict
+            XCTAssertEqual(defaults.stringArray(forKey: "mcp.alwaysAllowedClients") ?? [], shouldPersist ? ["external-test-client"] : [])
+            guard shouldPersist else { return }
+
+            let restartedNetwork = ServerNetworkManager()
+            let restartedController = ServerController(
+                networkManager: restartedNetwork, installNetworkCallbacks: false,
+                approvalDefaults: defaults, strictConnectionApprovalEnabled: { strict }
+            )
+            await restartedController.setApprovalCallback { [weak restartedController] _, generation, _ in
+                events.prompt(generation)
+                XCTFail("Always Allow after socket closure must survive controller recreation")
+                await restartedController?.resolvePendingApproval(allow: false, generation: generation)
+            }
+            let reconnected = try await makeConnection(network: restartedNetwork, controller: restartedController)
+            do {
+                _ = try await reconnected.client.connect(transport: reconnected.transport)
+                XCTAssertEqual(events.generations.count, 1)
+            } catch {
+                await reconnected.close()
+                await restartedNetwork.stop()
+                throw error
+            }
+            await reconnected.close()
+            await restartedNetwork.stop()
         }
 
         private func makeConnection(
             network: ServerNetworkManager,
-            controller: ServerController
+            controller: ServerController,
+            clientName: String = "external-test-client"
         ) async throws -> SocketConnection {
             var descriptors = [Int32](repeating: -1, count: 2)
             guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
@@ -1018,14 +1171,14 @@ private final class ExecutionCounter: @unchecked Sendable {
             let token = UUID().uuidString
             let server = try BootstrapSocketConnectionManager(
                 connectionID: id, sessionToken: token, clientPid: Int(peerPID),
-                observedKernelPeerPID: Int(peerPID), clientName: "external-test-client",
+                observedKernelPeerPID: Int(peerPID), clientName: clientName,
                 purpose: .unknown, codeMapsDisabled: true, connectedFD: descriptors[0], parentManager: network
             )
             descriptors[0] = -1
             let transport = try UnixSocketMCPTransport(connectedFD: descriptors[1], connectionID: id, correlationConnectionID: token)
             descriptors[1] = -1
             await network.debugInstallDirectAdmissionConnectionForTesting(
-                connectionID: id, connection: server, pendingClientID: "external-test-client"
+                connectionID: id, connection: server, pendingClientID: clientName
             )
             _ = await network.debugInstallConnectionLimiterForTesting(connectionID: id)
             do {
@@ -1039,7 +1192,7 @@ private final class ExecutionCounter: @unchecked Sendable {
                 throw error
             }
             return SocketConnection(
-                id: id, client: Client(name: "external-test-client", version: "1.0"),
+                id: id, client: Client(name: clientName, version: "1.0"),
                 transport: transport, server: server, network: network
             )
         }

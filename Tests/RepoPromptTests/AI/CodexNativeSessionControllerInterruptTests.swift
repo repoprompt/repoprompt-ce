@@ -177,65 +177,104 @@ final class CodexMCPDiscoveryPolicyTests: XCTestCase {
 final class CodexAppServerFramingTests: XCTestCase {
     private let budget = 64 * 1024 * 1024
 
+    @MainActor
     func testLargeResumeSettlesWithRestoredStateAndTokenReplayAcrossChunkings() async throws {
-        for chunkSize in [31 * 1024 * 1024, 9 * 1024 * 1024, 65537] {
-            let sent = AsyncStream<Data>.makeStream()
-            let client = CodexAppServerClient(writeFrameHandler: { _, frame in sent.continuation.yield(frame) })
-            await client.debugInstallTestTransport()
-            let generation = await client.debugTransportGeneration()
-            var writes = sent.stream.makeAsyncIterator()
-            // Exercise numeric JSON-RPC id 5, matching a resume after initialization.
-            for id in 1 ... 4 {
-                let request = beginRequest(client, method: "fixture/ping")
+        for includesTurnID in [true, false] {
+            for chunkSize in [31 * 1024 * 1024, 9 * 1024 * 1024, 65537] {
+                let sent = AsyncStream<Data>.makeStream()
+                let client = CodexAppServerClient(writeFrameHandler: { _, frame in sent.continuation.yield(frame) })
+                await client.debugInstallTestTransport()
+                let generation = await client.debugTransportGeneration()
+                var writes = sent.stream.makeAsyncIterator()
+                // Exercise numeric JSON-RPC id 5, matching a resume after initialization.
+                for id in 1 ... 4 {
+                    let request = beginRequest(client, method: "fixture/ping")
+                    _ = await writes.next()
+                    await client.debugIngestStdoutChunk(Data("{\"id\":\(id),\"result\":{}}\n".utf8), generation: generation)
+                    _ = try await request.value
+                }
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let session = harness.host.session(for: UUID())
+                session.selectedAgent = .codexExec
+                session.hasLoadedPersistedState = true
+                session.runState = .running
+                let runID = UUID()
+                session.installRunID(runID)
+                let owner = session.beginRunAttempt(source: "buffered-token-scope")
+                let wakeID = UUID()
+                session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                let controller = CodexNativeSessionController(
+                    client: client, runID: runID, tabID: session.tabID, windowID: 1,
+                    workspacePaths: .uniform(NSTemporaryDirectory())
+                )
+                session.codexController = controller
+                session.codexConversationID = "thread-fixture"
+                try await controller.test_beginBindingSession()
+                var tokenParams: [String: CodexJSONValue] = [
+                    "threadId": .string("thread-fixture"), "turnId": .string("active-b"),
+                    "tokenUsage": .object(["last": .object(["totalTokens": .number(123)]), "total": .object(["totalTokens": .number(456)]), "modelContextWindow": .number(1000)])
+                ]
+                if !includesTurnID { tokenParams["turnId"] = nil }
+                await controller.test_bufferNotificationDuringBinding(.init(method: "thread/tokenUsage/updated", params: tokenParams))
+                let request = beginRequest(client, method: "thread/resume")
                 _ = await writes.next()
-                await client.debugIngestStdoutChunk(Data("{\"id\":\(id),\"result\":{}}\n".utf8), generation: generation)
-                _ = try await request.value
-            }
-            let controller = CodexNativeSessionController(
-                client: client, runID: UUID(), tabID: UUID(), windowID: 1,
-                workspacePaths: .uniform(NSTemporaryDirectory())
-            )
-            try await controller.test_beginBindingSession()
-            await controller.test_bufferNotificationDuringBinding(.init(method: "thread/tokenUsage/updated", params: [
-                "threadId": .string("thread-fixture"),
-                "tokenUsage": .object(["last": .object(["totalTokens": .number(123)]), "total": .object(["totalTokens": .number(456)]), "modelContextWindow": .number(1000)])
-            ]))
-            let request = beginRequest(client, method: "thread/resume")
-            _ = await writes.next()
-            let frame = resumeFrame(paddingBytes: 30 * 1024 * 1024)
-            for start in stride(from: 0, to: frame.count, by: chunkSize) {
-                await client.debugIngestStdoutChunk(frame.subdata(in: start ..< min(start + chunkSize, frame.count)), generation: generation)
-            }
-            let result = try await request.value
-            let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(result, fallbackEffort: nil)
-            let small = try XCTUnwrap(try JSONSerialization.jsonObject(with: resumeFrame(paddingBytes: 0)) as? [String: Any])
-            let expected = try CodexNativeSessionController.test_parseThreadSnapshot(XCTUnwrap(small["result"] as? [String: Any]), fallbackEffort: nil)
-            XCTAssertEqual(snapshot, expected)
-            XCTAssertEqual(snapshot.activeTurnIDs, ["active-a", "active-b"])
-            XCTAssertEqual(snapshot.currentTurnID, "active-b")
-            XCTAssertEqual(snapshot.activeToolItems.map(\.itemID), ["tool-a", "tool-b"])
-            XCTAssertEqual(snapshot.latestTerminalTurnID, "failed-turn")
-            XCTAssertEqual(snapshot.latestTurnFailure?.message, "fixture failure")
-            let reference = await controller.test_finishBinding(result: result, fallbackEffort: nil)
-            XCTAssertEqual(reference.conversationID, "thread-fixture")
-            XCTAssertEqual(controller.test_routingCurrentTurnID, "active-b")
-            var events = controller.events.makeAsyncIterator()
-            guard case let .tokenUsage(usage) = await events.next() else {
-                XCTFail("Buffered token usage was not replayed after binding")
+                let frame = resumeFrame(paddingBytes: 30 * 1024 * 1024)
+                for start in stride(from: 0, to: frame.count, by: chunkSize) {
+                    await client.debugIngestStdoutChunk(frame.subdata(in: start ..< min(start + chunkSize, frame.count)), generation: generation)
+                }
+                let result = try await request.value
+                let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(result, fallbackEffort: nil)
+                let small = try XCTUnwrap(try JSONSerialization.jsonObject(with: resumeFrame(paddingBytes: 0)) as? [String: Any])
+                let expected = try CodexNativeSessionController.test_parseThreadSnapshot(XCTUnwrap(small["result"] as? [String: Any]), fallbackEffort: nil)
+                XCTAssertEqual(snapshot, expected)
+                XCTAssertEqual(snapshot.activeTurnIDs, ["active-a", "active-b"])
+                XCTAssertEqual(snapshot.currentTurnID, "active-b")
+                XCTAssertEqual(snapshot.activeToolItems.map(\.itemID), ["tool-a", "tool-b"])
+                XCTAssertEqual(snapshot.latestTerminalTurnID, "failed-turn")
+                XCTAssertEqual(snapshot.latestTurnFailure?.message, "fixture failure")
+                let reference = await controller.test_finishBinding(result: result, fallbackEffort: nil)
+                XCTAssertEqual(reference.conversationID, "thread-fixture")
+                XCTAssertEqual(controller.test_routingCurrentTurnID, "active-b")
+                await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "active-b"), session: session, sourceController: controller)
+                var events = controller.events.makeAsyncIterator()
+                if !includesTurnID {
+                    let next = await events.next()
+                    let event = try XCTUnwrap(next)
+                    guard case let .livenessActivity(activity) = event else { return XCTFail("Expected uncertainty before unscoped token usage") }
+                    XCTAssertEqual(activity.kind, .warning)
+                    XCTAssertEqual(activity.method, "thread/tokenUsage/updated")
+                    XCTAssertNil(activity.turnID)
+                    await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(event, session: session, sourceController: controller)
+                }
+                let tokenEvent = await events.next()
+                guard case let .tokenUsage(usage) = tokenEvent else {
+                    XCTFail("Buffered token usage was not replayed after binding")
+                    await controller.shutdown()
+                    await client.stop()
+                    continue
+                }
+                XCTAssertEqual(usage.lastTotalTokens, 123)
+                XCTAssertEqual(usage.totalTotalTokens, 456)
+                XCTAssertEqual(usage.modelContextWindow, 1000)
+                if let tokenEvent { await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(tokenEvent, session: session, sourceController: controller) }
+                _ = await AgentRunTerminalCommitBarrier().commit(.init(
+                    binding: harness.hooks.bindTerminalSession(session), ownership: owner, expectedRunID: runID,
+                    terminalState: .completed, source: "buffered-token-scope", attachmentDisposition: .deleteFiles,
+                    finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false, classifiesQuietCheckIn: true
+                ))
+                XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: includesTurnID ? 0 : 1))
+                XCTAssertEqual(session.quietLedger.hiddenSourceIDs.contains(wakeID), includesTurnID)
+                let pending = await client.debugPendingRequestCount()
+                let timers = await client.debugTimeoutTaskCount()
+                XCTAssertEqual(pending, 0)
+                XCTAssertEqual(timers, 0)
                 await controller.shutdown()
+                let unexpected = await events.next()
+                XCTAssertNil(unexpected, "Exactly token usage, or uncertainty then token usage; no extra event")
                 await client.stop()
-                continue
+                sent.continuation.finish()
+                session.saveDebounceTask?.cancel()
             }
-            XCTAssertEqual(usage.lastTotalTokens, 123)
-            XCTAssertEqual(usage.totalTotalTokens, 456)
-            XCTAssertEqual(usage.modelContextWindow, 1000)
-            let pending = await client.debugPendingRequestCount()
-            let timers = await client.debugTimeoutTaskCount()
-            XCTAssertEqual(pending, 0)
-            XCTAssertEqual(timers, 0)
-            await controller.shutdown()
-            await client.stop()
-            sent.continuation.finish()
         }
     }
 

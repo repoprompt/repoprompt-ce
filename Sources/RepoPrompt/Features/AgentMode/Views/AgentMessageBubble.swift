@@ -358,7 +358,7 @@ struct AgentMessageBubble: View {
                     HStack(spacing: 0) {
                         Spacer(minLength: 0)
                         AgentAttachmentsStrip(
-                            imageAttachments: item.attachments,
+                            attachments: item.attachments,
                             taggedFileAttachments: item.taggedFileAttachments,
                             disabled: true,
                             allowsRemoval: false

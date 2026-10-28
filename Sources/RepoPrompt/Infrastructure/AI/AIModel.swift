@@ -79,6 +79,12 @@ public enum AIModel: Equatable, Hashable {
     case gpt61SolHigh
     case gpt61SolXHigh
     case gpt61SolMax
+    case gpt61Terra
+    case gpt61TerraNone
+    case gpt61TerraLow
+    case gpt61TerraHigh
+    case gpt61TerraXHigh
+    case gpt61TerraMax
     case gpt6Astra
     case gpt6AstraLow
     case gpt6AstraHigh
@@ -352,6 +358,13 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .gpt61SolHigh, rawValue: "gpt-6.1-sol-high", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol High", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt61SolXHigh, rawValue: "gpt-6.1-sol-xhigh", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol XHigh", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt61SolMax, rawValue: "gpt-6.1-sol-max", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol Max", provider: ProviderIndex.openAI),
+        // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+        ModelInfo(model: .gpt61Terra, rawValue: "gpt-6.1-terra", actualName: nil, displayName: "GPT-6.1 Terra Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraNone, rawValue: "gpt-6.1-terra-none", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra None", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraLow, rawValue: "gpt-6.1-terra-low", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraHigh, rawValue: "gpt-6.1-terra-high", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraXHigh, rawValue: "gpt-6.1-terra-xhigh", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraMax, rawValue: "gpt-6.1-terra-max", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra Max", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6Astra, rawValue: "gpt-6-astra", actualName: nil, displayName: "GPT-6 Astra Med", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6AstraLow, rawValue: "gpt-6-astra-low", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Low", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6AstraHigh, rawValue: "gpt-6-astra-high", actualName: "gpt-6-astra", displayName: "GPT-6 Astra High", provider: ProviderIndex.openAI),
@@ -1090,6 +1103,12 @@ public enum AIModel: Equatable, Hashable {
             .gpt61SolHigh,
             .gpt61SolXHigh,
             .gpt61SolMax,
+            .gpt61Terra,
+            .gpt61TerraNone,
+            .gpt61TerraLow,
+            .gpt61TerraHigh,
+            .gpt61TerraXHigh,
+            .gpt61TerraMax,
             .gpt6Astra,
             .gpt6AstraLow,
             .gpt6AstraHigh,
@@ -1270,11 +1289,12 @@ public enum AIModel: Equatable, Hashable {
         case .gpt5, .gpt54, .gpt5CodexMed, .o3: return "medium"
         case .gpt5Low, .gpt54Low, .gpt5CodexLow, .o3Low: return "low"
         // GPT-6 family (API)
-        case .gpt61SolMax, .gpt6AstraMax: return "max"
-        case .gpt61SolXHigh, .gpt6AstraXHigh, .gpt6LunaXHigh: return "xhigh"
-        case .gpt61SolHigh, .gpt6AstraHigh, .gpt6LunaHigh: return "high"
-        case .gpt61Sol, .gpt6Astra, .gpt6Luna, .gpt6Sol: return "medium"
-        case .gpt61SolLow, .gpt6AstraLow, .gpt6LunaLow: return "low"
+        case .gpt61TerraNone: return "none"
+        case .gpt61TerraMax, .gpt61SolMax, .gpt6AstraMax: return "max"
+        case .gpt61TerraXHigh, .gpt61SolXHigh, .gpt6AstraXHigh, .gpt6LunaXHigh: return "xhigh"
+        case .gpt61TerraHigh, .gpt61SolHigh, .gpt6AstraHigh, .gpt6LunaHigh: return "high"
+        case .gpt61Terra, .gpt61Sol, .gpt6Astra, .gpt6Luna, .gpt6Sol: return "medium"
+        case .gpt61TerraLow, .gpt61SolLow, .gpt6AstraLow, .gpt6LunaLow: return "low"
         // Codex CLI models
         case .codexCliGpt61SolUltra, .codexCliGpt56SolUltra, .codexCliGpt56TerraUltra: return "ultra"
         case .codexCliGpt61SolMax, .codexCliGpt6AstraMax, .codexCliGpt6LunaMax, .codexCliGpt6SolMax,
@@ -2195,6 +2215,12 @@ public enum AIModel: Equatable, Hashable {
         case gpt61SolHigh
         case gpt61SolXHigh
         case gpt61SolMax
+        case gpt61Terra
+        case gpt61TerraNone
+        case gpt61TerraLow
+        case gpt61TerraHigh
+        case gpt61TerraXHigh
+        case gpt61TerraMax
         case gpt6Astra
         case gpt6AstraLow
         case gpt6AstraHigh
@@ -2419,6 +2445,18 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt61SolXHigh)
         case .gpt61SolMax:
             .staticCase(.gpt61SolMax)
+        case .gpt61Terra:
+            .staticCase(.gpt61Terra)
+        case .gpt61TerraNone:
+            .staticCase(.gpt61TerraNone)
+        case .gpt61TerraLow:
+            .staticCase(.gpt61TerraLow)
+        case .gpt61TerraHigh:
+            .staticCase(.gpt61TerraHigh)
+        case .gpt61TerraXHigh:
+            .staticCase(.gpt61TerraXHigh)
+        case .gpt61TerraMax:
+            .staticCase(.gpt61TerraMax)
         case .gpt6Astra:
             .staticCase(.gpt6Astra)
         case .gpt6AstraLow:

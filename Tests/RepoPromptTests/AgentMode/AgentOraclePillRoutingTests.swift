@@ -1453,9 +1453,9 @@ final class AgentOracleAttachmentForwardingTests: XCTestCase {
     func testNativeImageTransportsReceiveAttachmentPathsAsText() {
         let viewModel = makeViewModel()
         let attachments = [
-            AgentImageAttachment(source: .localFile(path: "/tmp/agent_attachments/A.png")),
-            AgentImageAttachment(source: .url("https://example.com/remote.png")),
-            AgentImageAttachment(source: .localFile(path: "/tmp/agent_attachments/B.jpg"))
+            AgentFileAttachment(source: .localFile(path: "/tmp/agent_attachments/A.png")),
+            AgentFileAttachment(source: .url("https://example.com/remote.png")),
+            AgentFileAttachment(source: .localFile(path: "/tmp/agent_attachments/B.jpg"))
         ]
         let expected = [
             "what do you see?",
@@ -1495,15 +1495,15 @@ final class AgentOracleAttachmentForwardingTests: XCTestCase {
         let inFlight = "\(store)/IN-FLIGHT.png"
         let earlierTurn = "\(store)/EARLIER.png"
         session.attachmentTurnState = .reserved(reservationID: UUID(), attachments: [
-            AgentImageAttachment(source: .localFile(path: inFlight)),
+            AgentFileAttachment(source: .localFile(path: inFlight)),
             // Outside the managed store: never authorized even though the session references it.
-            AgentImageAttachment(source: .localFile(path: "/etc/hosts.png")),
-            AgentImageAttachment(source: .localFile(path: "\(store)/nested/DEEP.png")),
-            AgentImageAttachment(source: .url("https://example.com/remote.png"))
+            AgentFileAttachment(source: .localFile(path: "/etc/hosts.png")),
+            AgentFileAttachment(source: .localFile(path: "\(store)/nested/DEEP.png")),
+            AgentFileAttachment(source: .url("https://example.com/remote.png"))
         ])
         session.appendItem(.user("earlier", attachments: [
-            AgentImageAttachment(source: .localFile(path: earlierTurn)),
-            AgentImageAttachment(source: .localFile(path: inFlight))
+            AgentFileAttachment(source: .localFile(path: earlierTurn)),
+            AgentFileAttachment(source: .localFile(path: inFlight))
         ]))
 
         XCTAssertEqual(
