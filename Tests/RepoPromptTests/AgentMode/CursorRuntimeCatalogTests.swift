@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp

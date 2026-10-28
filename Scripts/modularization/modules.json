@@ -232,6 +232,7 @@
     "RepoPromptSettingsCore": {
       "source_root": "Sources/RepoPromptSettingsCore",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "RepoPromptFoundation",
         "RepoPromptDomainRuntime",
         "RepoPromptProviderQuota",
@@ -324,6 +325,13 @@
     }
   },
   "moved_families": {
+    "AINeutralModelValues": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPromptSettingsCore/AgentModelSelectionID.swift",
+        "Sources/RepoPromptSettingsCore/AgentModelParameterValues.swift"
+      ]
+    },
     "AIModelInterpretationKernel": {
       "owner": "RepoPromptAIContracts",
       "former_app_files": [

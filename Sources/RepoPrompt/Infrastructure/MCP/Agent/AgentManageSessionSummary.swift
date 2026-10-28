@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Shared metadata rendering and state filtering for agent_manage session responses.

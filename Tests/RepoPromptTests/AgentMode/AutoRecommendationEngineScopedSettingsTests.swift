@@ -1,5 +1,6 @@
 import Combine
 import enum MCP.Value
+import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore

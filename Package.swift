@@ -240,7 +240,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptSettingsCore",
-            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptProviderQuota", "RepoPromptShared"],
+            dependencies: ["RepoPromptAIContracts", "RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptProviderQuota", "RepoPromptShared"],
             path: "Sources/RepoPromptSettingsCore",
             swiftSettings: repoPromptSettingsCoreSwiftSettings
         ),

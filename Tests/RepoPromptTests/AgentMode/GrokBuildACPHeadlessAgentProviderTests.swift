@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import os
+import RepoPromptAIContracts
 import RepoPromptProcess
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp

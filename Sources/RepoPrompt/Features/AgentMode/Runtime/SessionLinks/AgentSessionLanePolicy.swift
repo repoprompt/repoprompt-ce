@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Pre-allocation policy for ordinary, top-level sessions created by an overseer.

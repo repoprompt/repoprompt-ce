@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 package extension ACPModelParameterSelection {
     var identity: ACPModelParameterIdentity {

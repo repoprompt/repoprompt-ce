@@ -1,5 +1,6 @@
 import Foundation
 import os
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptProcess

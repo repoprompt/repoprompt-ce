@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import os
+import RepoPromptAIContracts
 import RepoPromptFoundation
 import RepoPromptProcess
 import RepoPromptSettingsCore

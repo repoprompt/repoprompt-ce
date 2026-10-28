@@ -1,5 +1,6 @@
 import Foundation
 import Logging
+import RepoPromptAIContracts
 import RepoPromptProcess
 import RepoPromptSettingsCore
 

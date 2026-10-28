@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 struct AgentSessionIndexEntry: Identifiable, Equatable {

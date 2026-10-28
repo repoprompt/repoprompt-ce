@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptPersistence

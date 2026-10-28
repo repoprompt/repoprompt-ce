@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptSettingsCore
+@testable import RepoPromptAIContracts
 import XCTest
 
 final class AgentModelNeutralValuesTests: XCTestCase {

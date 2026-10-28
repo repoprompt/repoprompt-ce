@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptProcess
 import RepoPromptSettingsCore
 

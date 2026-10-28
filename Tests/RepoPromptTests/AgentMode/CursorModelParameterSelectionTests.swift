@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
