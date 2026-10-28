@@ -1490,7 +1490,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         }
     }
 
-    private func withActivatedLaneFixture(_ body: (ReadReleaseFixture) async throws -> Void) async throws {
+    private func withActivatedLaneFixture(canonicalHost: Bool = false, _ body: (ReadReleaseFixture) async throws -> Void) async throws {
         var fixture = try await makeReadReleaseFixture()
         defer { fixture.tearDown() }
         let currentReference = await fixture.linkReference()
@@ -1502,20 +1502,42 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             resolveObserverEndpoint: { _ in endpoint }, isEnabled: { true }, bridge: fixture.bridge,
             prepareActivationCommit: { _, _ in .init(commitIfCurrent: { $0() }, invalidate: {}) }
         )
-        _ = try await bootstrap.execute(args: [:])
-        XCTAssertNotNil(fixture.host.activations[endpoint])
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("activated-lane-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let fileURL = directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)
-        fixture.intentStoreFileURL = fileURL
-        let store = AgentSessionOversightIntentStore(fileURL: fileURL, backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled)
-        fixture.intentStore = store
-        fixture.bridge.installIntentStore(store)
-        try await body(fixture)
+        let ingress = canonicalHost ? SessionContractHost(windowID: fixture.window.windowID) : nil
+        fixture.ingress = ingress
+        do {
+            if let ingress {
+                let service = fixture.service
+                try await ingress.start([
+                    MCPDomainToolBinding(definition: XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "become_overseer"))) {
+                        try await bootstrap.execute(args: $0)
+                    },
+                    MCPDomainToolBinding(definition: XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_session_link"))) {
+                        try await service.execute(args: $0)
+                    }
+                ])
+                let activation = try await ingress.invoke("become_overseer", [:])
+                XCTAssertEqual(activation, .string(BecomeOverseerMCPToolService.nextTurnResult))
+            } else {
+                _ = try await bootstrap.execute(args: [:])
+            }
+            XCTAssertNotNil(fixture.host.activations[endpoint])
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("activated-lane-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let fileURL = directory.appendingPathComponent(AgentSessionOversightIntentStore.filename)
+            fixture.intentStoreFileURL = fileURL
+            let store = AgentSessionOversightIntentStore(fileURL: fileURL, backupsDirectoryURL: directory.appendingPathComponent("Backups"), mode: .enabled)
+            fixture.intentStore = store
+            fixture.bridge.installIntentStore(store)
+            try await body(fixture)
+        } catch {
+            await ingress?.cleanup()
+            throw error
+        }
+        await ingress?.cleanup()
     }
 
-    /// Assembled tool/bridge/authority contract with a controlled endpoint host. This proves
+    /// Assembled canonical-host/tool/bridge/authority contract with a controlled endpoint host. This proves
     /// returned-call composition, not packaged transport routing or a real provider's completion.
     func testActivatedTwoLaneJourneyReplaysBareCursorsAndRetiresOwnedLanes() async throws {
         let settings = GlobalSettingsStore.shared
@@ -1525,7 +1547,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         profile.mcpAgentRoleOverrides = ["explore": "claudeCode:sonnet:medium"]
         profile.mcpAgentRoleModelParameters = [:]
         settings.setGlobalAgentModelsProfile(profile, contextBuilderWriteIntent: .preserveExistingOwnership)
-        try await withActivatedLaneFixture { fixture in
+        try await withActivatedLaneFixture(canonicalHost: true) { fixture in
             await fixture.window.workspaceManager.awaitInitialized()
             fixture.host.acceptFirstTasks = true
             fixture.host.permitsLaneRetirement = true
@@ -1533,7 +1555,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             let tabBefore = fixture.window.promptManager.activeComposeTabID
             var laneIDs: [Value] = []
             for key in ["first-explore", "second-explore"] {
-                let created = try await Self.executeObject(fixture.service, args: [
+                let created = try await fixture.call([
                     "op": .string("create_lane"), "role": .string("explore"),
                     "idempotency_key": .string(key), "message": .string("LANE_OK")
                 ])
@@ -1551,7 +1573,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             })
             let persistedBeforeRetirement = try await fixture.readPersistedIntents()
             XCTAssertEqual(persistedBeforeRetirement, expectedIntents, "Both exact pairs must be durable before cleanup is exercised")
-            let polled = try await Self.executeObject(fixture.service, args: [
+            let polled = try await fixture.call([
                 "op": .string("poll"), "session_ids": .array(laneIDs)
             ])
             var rows = try XCTUnwrap(polled["targets"]?.arrayValue)
@@ -1561,7 +1583,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             for expected in ["changed", "timeout"] {
                 let handles = try rows.map { try XCTUnwrap($0.objectValue?["wait_cursor"]) }
                 XCTAssertTrue(handles.allSatisfy { $0.stringValue != nil })
-                let waited = try await Self.executeObject(fixture.service, args: [
+                let waited = try await fixture.call([
                     "op": .string("wait"), "cursors": .array(handles),
                     "until": .string("change"), "timeout_seconds": .int(0)
                 ])
@@ -1570,7 +1592,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
                 XCTAssertEqual(rows.map { $0.objectValue?["session_id"] }, laneIDs.map(Optional.some))
             }
             for id in laneIDs {
-                let retired = try await Self.executeObject(fixture.service, args: [
+                let retired = try await fixture.call([
                     "op": .string("retire_lane"), "session_id": id
                 ])
                 XCTAssertEqual(retired["result"], .string("retired"), String(describing: retired))
@@ -4368,6 +4390,14 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         let service: AgentSessionLinkMCPToolService
         var intentStoreFileURL: URL?
         var intentStore: AgentSessionOversightIntentStore?
+        var ingress: SessionContractHost?
+
+        @MainActor
+        func call(_ arguments: [String: Value]) async throws -> [String: Value] {
+            if let ingress { return try await ingress.call("agent_session_link", arguments) }
+            let value = try await service.execute(args: arguments)
+            return try XCTUnwrap(value.objectValue)
+        }
 
         @MainActor
         func readPersistedIntents() async throws -> Set<AgentSessionOversightIntent> {

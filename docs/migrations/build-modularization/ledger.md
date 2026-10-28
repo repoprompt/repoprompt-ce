@@ -1433,3 +1433,62 @@ and remaining adversarial/effect coverage, C3 app-free extraction, move/access/i
 and edit-to-test evidence, final milestone review, and broader product/release/live
 validation remain outstanding. No roadmap/readiness issue is closed, no module or
 ratchet limit is raised, and no visible app is launched, stopped or replaced.
+
+### Stage 0 host/service readiness checkpoint (2026-10-28)
+
+Normally merged pinned main `c47a23d61b2970625772e0b900252da9b3a2064f` into
+existing M6 lineage `c92605d21c6fe4fb0196316e73523fc3865fe5e4`, producing
+`33d00d600373f169b296467de36eaba0c242bb84`. Primary checkout untouched.
+
+Selected existing journeys now enter the real canonical registry/domain host,
+then the existing service, authorization engine, production organizer/configuration/
+worktree owners or link bridge/authority. The small test-only host helper owns its
+temporary runtime and verifies invocation/resource cleanup. Exact returned bare
+cursors and successors, ordinary/preview group-order recovery, zero-change
+satisfaction, unopened model/effort writes, real temporary-Git bind/release,
+conflicting writers, committed-save versus late-authority change and pre-publication
+save rejection retain effect-level assertions without foreground changes.
+
+Preserved only the remaining +19 FrontDoor and +41 first-save-test hunks from local
+`6b02b155da4f1c059c398c572563c10afaaed1ed`; other handler/scope-test progress was
+already upstream. Repaired the inherited first-save oracle against current main's
+structured `.admissionRejected` evidence, retaining all no-publication/save/provider
+assertions. Preview recovery intentionally preserves `preview: true`; the separate
+ordinary returned call proves `state_satisfied: true`, `changed_count: 0`.
+
+- **PASS:** seven exact focused tests, zero failures; conductor
+  `b7dcda37-47af-43dc-a829-f4863ecac49c`, request
+  `runtime-contract-20261028-host-first-v3`, exit 0. One link-tool journey,
+  two organizer journeys, three worktree/configuration journeys, one first-save
+  rejection. Selected tests 117.017s; build 209.95s; job execution 487.720s;
+  heavy admission 0.106s. Auxiliary zero-match bundles are not coverage.
+  Tested parent is `33d00d600373f169b296467de36eaba0c242bb84`; six-Swift-file
+  binary-diff SHA-256 `f58c6e243b1238d958dcdd857e9ffc5302c585aa0eb6e77621925ab20bd187d6`.
+- Earlier `9adfdd8d-ff2e-4267-ae9a-bf31ac52f627` timed out at 3600s after a
+  3375.75s cold build and partial execution. `a9ba2f96-b4ee-4081-beeb-a7dad5326b1f`
+  failed exit 1: seven tests, two failed test methods (ten oracle assertions).
+  Neither is passing evidence; v3 corrects the typed-error/preview oracles.
+- Scoped pinned SwiftFormat and strict SwiftLint passed for changed files.
+  Whole-tree combined lint `04fb6848-0241-402d-8416-b9dd6d0d49cb` **FAILED**
+  exit 70 after 14m53s: `redundantEquatable` timed out in unchanged
+  `WorkspaceCodemapLiveOverlayModels.swift`. No SwiftLint phase/pass is claimed
+  for this job. Missing-tool and canceled attempts are not passes. A separate
+  worktree's earlier timeout was followed by a passing format-check, so a
+  deterministic source defect is not established. No formatter policy was
+  weakened; repository-wide style is **NOT_PASSED**, not landing-ready.
+- One local Oracle review found a setup-error host-cleanup gap, fixed by covering
+  post-start temporary-directory setup with the existing asynchronous cleanup.
+  This is not the final independent milestone review.
+
+Evidence tier: **in-process host + real service/engine effects with controlled
+endpoint resolution**. It does not execute transport early/pre-admission policy,
+app binder or real bootstrap route-proof issuance. `LANE_OK` still acknowledges
+controlled-host task delivery, not a provider response. The existing discovery
+socket fixture's default admission is debug-only; a subsequent serialized-transport
+journey must explicitly use production Agent admission. Packaged/live/vendor
+validation is **NOT_RUN**; no app lifecycle or GitHub write occurred.
+
+The existing 32-line dead transcript-filter retirement remains intact, with
+`AgentTranscriptIO` / `AgentTranscriptImportPolicy` surviving; this phase adds no
+broader VM/bridge retirement and does not certify M6/M10. No extraction or ratchet
+change is included, and no readiness issue is closed.
