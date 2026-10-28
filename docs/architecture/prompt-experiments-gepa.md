@@ -80,7 +80,7 @@ A future `ContextBuilderHarness` may evaluate repository-aware workflows using a
 
 ### Current boundary
 
-The carry-forward implementation has useful foundations: a native spend boundary, durable evaluation admissions, a credential-free GEPA worker, retained evidence and reviewed source patches. The immediate usability problems sit around that core: incomplete target coverage, readiness checks that previously missed the actual worker, and an experiment creation flow that required an agent. The fixes make the supported path accessible; they do not complete the larger prompt-optimization product.
+The carry-forward implementation has useful foundations: a native spend boundary, durable evaluation admissions, a credential-free GEPA worker, retained evidence and reviewed source patches. The fixes address incomplete Oracle target coverage, worker readiness and native experiment creation. They stabilize the existing Oracle experiment path; they do not deliver the requested general prompt lab. The larger gap includes the experiment's objective, execution contract, setup assistance and trustworthy measurement, not only target coverage or presentation.
 
 Current support remains **DEBUG-only, prompt-only GEPA experiments for four built-in Oracle prompts**. There is no arbitrary project-prompt import, DSPy program execution, or tool-using Engineer evaluation. This PR changes no production prompt bodies and bumps no persistence schema. The existing document schema is 10; the ledger schema is 2. [The runtime architecture](prompt-experiments-gepa.md) records the implemented workflow and budget rules.
 
@@ -106,31 +106,79 @@ All advertised built-ins now have suites under `AppResources/Prompts`: Plan reta
 
 Judge selection ignores effort suffixes when rejecting the reflection model as its own judge. Results describe observed baseline spread, and proposal review attaches held-out comparisons only to the candidate actually measured. Applying a patch changes the checkout; rebuilding is required before the running app uses that default.
 
-### Proposed stage 1: a dependable small experiment
+### Why the current loop cannot reproduce a token-saving prototype
 
-Finish the current loop before broadening execution. Acceptance should include a fresh packaged DEBUG app completing a tiny run, cancellation and explicit resume, an unavailable worker failing before spend, a perfect-score run terminating, and a source conflict refusing application. Exercise actual provider callbacks on macOS in addition to mocked and Python tests.
+These are source-established limitations of the current experiment semantics, separate from worker launch failures:
 
-Keep the beginner path to choosing a target, reviewing examples and success criteria, choosing a bounded run, and comparing baseline against candidate. Show per-case answers and failures alongside aggregate scores. A result of “baseline remained best” or “evidence inconclusive” is a successful experiment outcome. Provide intermediate users with editable suites, rubric review and evidence export before adding many optimizer controls.
+| Boundary | Current implementation | Required behavior for the lab |
+| --- | --- | --- |
+| User goal | `PromptExperimentCreateRequest` has no objective field. `GEPARunController.makeWorkerRequest` supplies fixed Oracle-specific objective and background strings. | Persist the user's goal and the derived scoring policy as part of the experiment. A title is metadata, not an objective. |
+| Candidate acceptance | `gepa_worker.py:QualityThenBrevityAcceptance` compares quality sums, then prompt characters only. `preferred_best_index` also breaks validation ties with prompt characters. | Acceptance and final selection must reflect the requested quality/cost objective. Equal-quality output-token savings cannot be ignored merely because the instruction length is unchanged. |
+| Search policy | Default perfect-score skipping tests quality alone; the default parent selector sees scalar quality. | A correct but expensive answer still needs optimization in an efficiency experiment. Parent selection, acceptance, stopping and winner selection must use one coherent objective. |
+| Prompt ceiling | A proposal may be no longer than its parent by default. | Treat a hard length cap as an optional constraint. A slightly longer instruction may reduce total input/output usage over the real task. |
+| Usage | The Claude-compatible translator separates uncached input from cache-inclusive context usage. `PromptExperimentCompletionAccumulator` retains only `promptTokens` and `completionTokens`. | Normalize provider usage explicitly. Preserve fresh input, cache reads/writes and output; report missing or estimated data honestly. Uncached input alone is not full input size. |
+| Savings comparison | `GEPARunController.candidateUsage` averages all completed visible evaluations for each candidate, mixing different cases and baseline replicates. | Compare baseline and finalist on the same cases and execution settings. Show separate paired input and output deltas, with sample counts and usage coverage. |
 
-### Proposed stage 2: standalone project prompt files
+Sending a free-text goal to the current worker would fix only the first row. Adding a generic file picker would fix none of the scoring rows. The product acceptance test must exercise the complete pipeline rather than infer success from a completed GEPA process.
 
-Start with explicit `.md` or `.txt` files, not arbitrary source-code extraction. Introduce a typed prompt target containing source identity, original bytes/hash, renderer identity, declared variables and a suite reference. Preserve the built-in target as one implementation of this abstraction. Do not impersonate an Oracle ID for a project prompt.
+### One experiment contract and one optimization pipeline
 
-An import flow should capture examples, expected outputs or reviewed criteria, then preview the exact messages an evaluation will send. Version the template renderer and reject missing variables or changed placeholder contracts. Case inputs and references must remain distinct; keep a final test split outside optimizer feedback. Small exact-match or structured-output tasks should work without requiring a model judge.
+Keep the upstream Python optimizer as the search engine. Do not implement a second GEPA search loop in Swift or require every prompt to become a DSPy program. [GEPA's `optimize_anything` API](https://gepa-ai.github.io/gepa/api/optimize_anything/optimize_anything/) already accepts a candidate, evaluator, development examples, validation examples, objective and background. The current worker already calls it. RPCE's work is to prepare a useful experiment, execute the real task, measure it correctly and make the result reviewable.
 
-Reuse the existing ledger and result review. Add a project patch writer that checks containment and baseline hashes, previews the precise diff and refuses concurrent edits. Its acceptance test is a small real project going from selected prompt file to measured candidate to reviewed patch, with no handwritten transport JSON. Template literals embedded in code can follow once source-region parsing and escaping have explicit tests.
+An experiment must freeze these inputs before optimization:
 
-### Proposed stage 3: application and DSPy adapters
+- **Candidate source:** original prompt/component bytes, source identity and baseline hash, editable components, variables and a verified apply/export mapping. A built-in resource, project prompt file and selected code region are source types, not separate optimizer implementations.
+- **Task runner:** how candidate text and example input become actual messages or an application/agent run, including production rendering and output parsing. Record the runner version, relevant code/dependencies, model/provider settings and tool permissions.
+- **Examples and criteria:** representative user inputs, expected behavior, deterministic checks where available, reviewed judging criteria, and separate search/selection/final cases. References never become task-model input.
+- **Objective and constraints:** the user's goal, machine-readable quality and usage policy, mandatory behavior, optional length constraints and stopping rules. Use the same policy throughout the search and final comparison.
+- **Limits:** a small default run with bounds that include preparation, execution, judging, reflection, repairs, retries and final verification. Present provider costs only when measurable; do not label an evaluation count as a dollar cap.
 
-An application adapter must execute the application's actual message assembly and output parsing. Define a versioned entry point accepting candidate parameters and frozen input, returning output, task metrics, diagnostic feedback and optional trace artifacts. Include code/dependency revision, runtime parameters and data version in experiment identity. Bound execution time and external effects; a test run must not silently use production side effects.
+The task runner returns the actual output or trace, task results, quality feedback and normalized usage. GEPA proposes candidates using those observations. RPCE owns credentials, source access, admission, cancellation, progress, artifact persistence and reviewed application. Keep the existing useful ledger and patch protections, but remove `BuiltInPromptID` and Oracle rendering from the generic experiment contract. The same frozen experiment must be runnable headlessly and from Studio.
 
-A DSPy adapter should load an explicitly selected program and metric, identify editable predictors or instructions, retain compiled-program artifacts, and describe how the result is applied. Expose a simple preset initially; keep DSPy-specific settings in advanced controls. The [official DSPy GEPA reference](https://dspy.ai/api/optimizers/GEPA/) and implementation describe that backend's contract. Changing backends must not bypass RPCE's budget, evidence or review boundaries.
+A plain prompt runner sends the selected roles/templates with supplied variables. An application runner invokes the project's actual assembly/parser code. A DSPy runner loads the selected program and metric, exposes editable predictors to `dspy.GEPA`, and retains the compiled program and application instructions. [DSPy's GEPA documentation](https://dspy.ai/3.3.0/api/optimizers/GEPA/overview/) defines that program/metric contract. Backend-specific controls belong in advanced settings; choosing a backend must not bypass the common evidence and budget boundaries.
 
-### Proposed stage 4: tool-using Engineer experiments
+### Beginner workflow
 
-Evaluate Engineer on isolated per-case snapshots or worktrees with run-scoped tools, reset state, turn/time limits and deterministic acceptance tests. Retain tool traces, changed files, test results and failures. Never reuse the active window's mutable workspace authority; `PromptHarness.swift` already records why that approach failed for an earlier context-builder adapter.
+The normal path should require the user's task knowledge, not optimizer knowledge:
 
-Separate optimizable stable guidance from code-owned provider/tool protocol fragments. Test the rendered combinations that production actually uses. A prompt that writes a convincing explanation but edits the wrong file must fail an Engineer task; a prompt-only proxy cannot establish this behavior. Ship this stage only after isolation, cancellation and artifact collection work independently of optimization.
+1. Select or paste a prompt, or choose an RPCE built-in. For an embedded code prompt, identify its call site and preserve template/escaping semantics; offer extraction to a prompt file if a safe source mapping cannot be established.
+2. Describe the improvement in ordinary language, such as “keep this blog's voice and factual accuracy, and reduce input and output tokens.” Show available examples discovered from project tests or supplied by the user.
+3. Draft representative tasks and success criteria from the goal, prompt and examples. Let the user inspect a few concrete cases and correct assumptions. Mark generated cases as provisional, especially when no real examples exist. Freeze the reviewed criteria before searching.
+4. Run a small baseline and flag unusable inputs, missing usage, broken checks or a judge that cannot distinguish obvious failures. Show the exact rendered messages when useful. Preparation must be bounded and included in the run's spend accounting.
+5. Run GEPA with sensible presets. Show progress in terms of examples tried, candidates compared, observed quality and measured usage. Keep minibatches, Pareto selection and reflection settings out of the default flow.
+6. Compare baseline and finalist on fresh paired cases reserved for final verification. Show actual before/after answers, failed checks, input/output tokens, uncertainty and a precise source diff. Permit “no improvement” and “insufficient evidence” outcomes. Apply or export only the selected, reviewed change.
+
+Automatically drafted tests make the workflow accessible; they do not establish production quality by themselves. The user reviews task meaning and examples, while RPCE handles splits, transport, optimizer setup and evidence collection. A blog writer should never need to author `suite.json`, choose a GEPA adapter or understand an authority digest.
+
+### Efficiency objectives and fair comparisons
+
+For “reduce tokens without losing quality,” require mandatory behavior checks and a declared quality constraint against the baseline, then optimize the chosen usage measure among eligible candidates. Support separate goals for input tokens, output tokens and provider cost; a weighted total must not be reported as a reduction in both input and output. If quality tolerance is allowed, make it explicit and tie the final claim to measured evidence. Do not infer a statistical non-inferiority guarantee from two baseline repeats.
+
+Use provider-reported totals with provider-specific cache semantics. Keep instruction-only size, full task input, output, reasoning tokens where exposed and optimizer overhead distinct. An external tokenizer estimate can be useful when labeled, but missing usage cannot become zero or a claimed percentage saving. Compare baseline and finalist using the same examples, model settings, renderer and cache policy. Calculate corpus-level savings from matched totals and retain per-case deltas so a shorter workload or a lucky cache hit cannot masquerade as a better prompt.
+
+Efficiency goals must continue searching when quality is already perfect. Remove the unconditional no-growth rule from the default efficiency policy; use a declared hard cap only when the task requires one. Include response quality in reflection feedback along with the usage objective so short empty answers cannot win. Version this objective/runner contract in approval and cache identity before changing any live scoring semantics.
+
+### Real Engineer evaluation uses the same contract
+
+Engineer optimization requires isolated task execution with the candidate installed in the real system-prompt rendering path. Run each case in a fresh snapshot or worktree with run-scoped tools, explicit bounded permissions, turn/time limits, deterministic tests and retained tool/file traces. Reset state between candidates. Never reuse the active window's mutable workspace authority; `PromptHarness.swift` records the failure of that earlier approach.
+
+There is reusable infrastructure: `repoprompt-mcp --backend headless` accepts a profile directory and working roots and uses canonical file/edit tooling. It is not already an Engineer evaluator. `DirectHeadlessProviderCoordinator` currently resolves engineer/design aliases to Codex, sends a user message without the RPCE Engineer system-prompt assembly, and does not grant writes merely because the profile is fresh. Candidate injection, production rendering, run-scoped permissions, reset and task-result collection still need explicit implementation and verification.
+
+Separate editable stable guidance from code-owned provider/tool protocol fragments and test the rendered combinations used in production. A convincing final explanation with an incorrect edit must fail. A prompt-only writing score cannot support a claim that the Engineer agent improved.
+
+### Concrete acceptance gates
+
+First preserve the successful Python prototype as a reference experiment: exact baseline prompt, representative inputs, metric/feedback, model settings and usage definition. Replay that configuration through the shared worker and Studio. The prototype was not supplied for this review, so no claim is made that its token savings have been reproduced.
+
+The implementation should satisfy all of these before being described as the requested lab:
+
+- **Objective regression:** a scripted generic project experiment with 4 training, 2 validation and 2 final cases. Baseline and candidate A have equal perfect quality and equal prompt character length; A uses 20% fewer input and output tokens on matched cases. A must be explored, accepted, available for further refinement, selected and reported with both savings. Candidate B saves more tokens but violates the quality constraint and cannot win. These numbers define a deterministic semantics test, not an expected model improvement.
+- **Project workflow:** select a blog prompt from another project, describe its goal, review generated cases/criteria, run, inspect actual answers and paired usage, then apply/export the selected prompt without handwritten evaluation JSON. A changed source file must refuse stale application.
+- **Built-in workflow:** run a representative built-in prompt through its production renderer. For Engineer, complete isolated tool-using tasks and retain tests, edits and traces. Test a deliberately broken prompt to prove the evaluator detects meaningful regressions.
+- **Runtime behavior:** a fresh packaged macOS app completes the flow; an unavailable worker fails before spend; cancellation/resume preserves accounting and evidence; perfect-quality efficiency runs continue productively and terminate within limits.
+- **Performance evidence:** rerun the reference prototype with real providers and fresh paired final measurements. Report the observed result even when it fails to recover the original gain. Scripted tests establish mechanics; they cannot demonstrate an actual 20% improvement.
+
+These gates supersede an additions-first sequence of polishing Oracle UI, then adding more target types, then eventually addressing evaluation. The deliverable is a complete reusable experiment that works on real workloads, with the optimizer remaining upstream.
 
 ### Evidence requirements before default promotion
 
