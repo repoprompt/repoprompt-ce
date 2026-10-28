@@ -59,6 +59,15 @@ enum ModelCatalogSemantics {
         let reasoningEffort: CodexReasoningEffort?
         let displayName: String
         let tieBreaker: String
+
+        init(family: String, versionComponents: [Int], suffix: String, reasoningEffort: CodexReasoningEffort?, displayName: String, tieBreaker: String) {
+            self.family = family
+            self.versionComponents = versionComponents
+            self.suffix = suffix
+            self.reasoningEffort = reasoningEffort
+            self.displayName = displayName
+            self.tieBreaker = tieBreaker
+        }
     }
 
     static func codexBaseModelPrecedes(_ lhs: String, _ rhs: String, catalogRecords: () -> [CodexDynamicModelRecord]) -> Bool {

@@ -1,10 +1,16 @@
 import Foundation
 
 /// Speed capabilities published by the signed-in Codex model catalog.
-struct CodexModelServiceTier: Codable, Hashable {
+package struct CodexModelServiceTier: Codable, Hashable {
     let id: String
     let name: String
     let description: String
+
+    package init(id: String, name: String, description: String) {
+        self.id = id
+        self.name = name
+        self.description = description
+    }
 }
 
 enum CodexModelIdentity {
@@ -13,9 +19,14 @@ enum CodexModelIdentity {
     }
 }
 
-struct CodexDynamicReasoningRecord: Codable, Hashable {
+package struct CodexDynamicReasoningRecord: Codable, Hashable {
     let reasoningEffort: String
     let description: String
+
+    package init(reasoningEffort: String, description: String) {
+        self.reasoningEffort = reasoningEffort
+        self.description = description
+    }
 }
 
 struct CodexDynamicModelRecord: Codable, Hashable {

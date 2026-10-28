@@ -81,6 +81,61 @@ final class CodexDynamicModelMapperTests: XCTestCase {
         }
     }
 
+    func testLegacyRecordDefaultsAndRawIdentityRoundTrip() throws {
+        let legacy = Data(#"{"id":" GPT-Future-MAX ","model":"remote-model","displayName":"Future","description":"description","isDefault":true}"#.utf8)
+        let record = try JSONDecoder().decode(CodexDynamicModelRecord.self, from: legacy)
+        XCTAssertEqual(record.id, " GPT-Future-MAX ")
+        XCTAssertEqual(record.model, "remote-model")
+        XCTAssertTrue(record.supportedReasoningEfforts.isEmpty)
+        XCTAssertNil(record.defaultReasoningEffort)
+        XCTAssertTrue(record.serviceTiers.isEmpty)
+        XCTAssertEqual(try JSONDecoder().decode(CodexDynamicModelRecord.self, from: JSONEncoder().encode(record)), record)
+
+        let future = Data(#"{"id":"future","model":"future","displayName":"Future","description":"","isDefault":false,"supportedReasoningEfforts":[{"reasoningEffort":"provider-future","description":"opaque"}],"defaultReasoningEffort":"provider-future","serviceTiers":[{"id":"future-tier","name":"Future Tier","description":"opaque tier"}]}"#.utf8)
+        let decoded = try JSONDecoder().decode(CodexDynamicModelRecord.self, from: future)
+        XCTAssertEqual(decoded.supportedReasoningEfforts.first?.reasoningEffort, "provider-future")
+        XCTAssertEqual(decoded.defaultReasoningEffort, "provider-future")
+        XCTAssertEqual(decoded.serviceTiers.first?.id, "future-tier")
+        XCTAssertEqual(try JSONDecoder().decode(CodexDynamicModelRecord.self, from: JSONEncoder().encode(decoded)), decoded)
+    }
+
+    func testExplicitLookupIsLazyAndExactAdvertisedIdentityWins() {
+        var lookups = 0
+        let records = [CodexDynamicModelRecord(id: "gpt-5.6-max", model: "gpt-5.6-max", displayName: "", description: "", isDefault: false)]
+        func lookup() -> [CodexDynamicModelRecord] {
+            lookups += 1
+            return records
+        }
+        for raw: String? in [nil, "", "  ", "default"] {
+            XCTAssertNil(CodexModelSpecifier(raw: raw, catalogRecords: lookup).baseModel)
+        }
+        XCTAssertEqual(lookups, 0)
+        let exact = CodexModelSpecifier(raw: "gpt-5.6-max", catalogRecords: lookup)
+        XCTAssertEqual(exact.baseModel, "gpt-5.6-max")
+        XCTAssertNil(exact.reasoningEffort)
+        XCTAssertEqual(lookups, 1)
+        let synthetic = CodexModelSpecifier(raw: "gpt-5.6-max", catalogRecords: { [] })
+        XCTAssertEqual(synthetic.baseModel, "gpt-5.6")
+        XCTAssertEqual(synthetic.reasoningEffort, .max)
+    }
+
+    func testStructuredEmptyTiersAndDefaultOptionSemantics() {
+        XCTAssertTrue(CodexServiceTierVariantCatalog.advertisedTiers(from: [
+            "serviceTiers": [[String: Any]](), "additionalSpeedTiers": ["ultrafast"]
+        ]).isEmpty)
+        let record = CodexDynamicModelRecord(
+            id: "gpt-5.6", model: "gpt-5.6", displayName: "", description: "base", isDefault: true,
+            supportedReasoningEfforts: [.init(reasoningEffort: "high", description: "high description")],
+            defaultReasoningEffort: "medium"
+        )
+        let options = CodexDynamicModelMapper.options(from: [record], catalogRecords: { [] })
+        XCTAssertEqual(options.map(\.id), ["gpt-5.6-medium", "gpt-5.6-high"])
+        XCTAssertEqual(options.map(\.isDefault), [true, false])
+        XCTAssertEqual(options.first?.description, "base")
+        XCTAssertEqual(options.first?.supportedReasoningEffortRawValues, ["high", "medium"])
+        XCTAssertEqual(CodexModelSpecifier(raw: "default", catalogRecords: { [] }).cliModelArgs, [])
+    }
+
     private func option(
         id: String,
         base: String,
