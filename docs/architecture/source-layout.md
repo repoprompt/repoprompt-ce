@@ -51,7 +51,7 @@ Sources/
   RepoPromptPersistence/      # CodeMap and durable artifact storage; presets remain app-owned
   RepoPromptSettingsCore/     # app-only persisted settings values/store and global-ignore facet
   RepoPromptProviderQuota/    # account quota values, injected acquisition coordination, cached consumer signals; no concrete IO
-  RepoPromptAIContracts/      # Foundation-only model interpretation and effort values; no catalog or storage authority
+  RepoPromptAIContracts/      # Foundation-only model and provider vocabulary, ACP canonicalization; no catalog or storage authority
   RepoPromptCodeMapCore/        # internal deterministic synchronous parsing/query/extraction and canonical artifact core
   RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
   RepoPromptWorkspaceCore/      # internal Foundation + Swift System workspace path values and deterministic policies
