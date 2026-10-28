@@ -96,7 +96,7 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
         let legacy = #"{"providerID":"cursor","currentModelRaw":"grok-4.6","options":[{"rawValue":"grok-4.6","displayName":"Grok 4.6","isPlaceholderDefault":false,"isProviderDefault":false,"supportedReasoningEfforts":[]}]}"#
         let record = try JSONDecoder().decode(ACPDynamicProviderRecord.self, from: Data(legacy.utf8))
-        let snapshot = try XCTUnwrap(ACPDynamicModelStore.snapshot(from: record))
+        let snapshot = try XCTUnwrap(ACPDynamicModelCanonicalization.snapshot(from: record))
         XCTAssertFalse(snapshot.hasModelParameterMetadata)
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .cursor)
         AgentACPModelRegistry.shared.test_clearMemoryPreservingStore(providerID: .cursor)
@@ -110,10 +110,10 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         let options = [AgentModelOption(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: false)]
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(.init(options: options, currentModelRaw: "grok-4.6"), for: .cursor)
         XCTAssertNil(ACPModelParameterResolver.parameterSet(providerID: .cursor, selectedModelRaw: "grok-4.6"))
-        let record = try XCTUnwrap(ACPDynamicModelStore.canonicalProviderRecord(
+        let record = try XCTUnwrap(ACPDynamicModelCanonicalization.canonicalProviderRecord(
             from: .init(options: options, currentModelRaw: "grok-4.6"), providerID: .cursor
         ))
-        let restored = try XCTUnwrap(ACPDynamicModelStore.snapshot(from: record))
+        let restored = try XCTUnwrap(ACPDynamicModelCanonicalization.snapshot(from: record))
         XCTAssertTrue(restored.hasModelParameterMetadata)
         XCTAssertTrue(restored.modelParameterSets.isEmpty)
     }

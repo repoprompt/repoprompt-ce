@@ -132,10 +132,10 @@ final class CursorRuntimeCatalogTests: XCTestCase {
                 modelParameterSets: [],
                 hasModelParameterMetadata: hasMetadata
             )
-            let record = try XCTUnwrap(ACPDynamicModelStore.canonicalProviderRecord(from: snapshot, providerID: .cursor))
+            let record = try XCTUnwrap(ACPDynamicModelCanonicalization.canonicalProviderRecord(from: snapshot, providerID: .cursor))
             XCTAssertEqual(record.modelParameterSets != nil, hasMetadata)
             let decoded = try JSONDecoder().decode(ACPDynamicProviderRecord.self, from: JSONEncoder().encode(record))
-            XCTAssertEqual(try XCTUnwrap(ACPDynamicModelStore.snapshot(from: decoded)).hasModelParameterMetadata, hasMetadata)
+            XCTAssertEqual(try XCTUnwrap(ACPDynamicModelCanonicalization.snapshot(from: decoded)).hasModelParameterMetadata, hasMetadata)
             _ = AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .cursor)
             XCTAssertNil(CursorAIModelCatalog.parameterSet(for: model.rawValue))
         }

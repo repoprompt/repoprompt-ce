@@ -45,11 +45,11 @@ final class AgentACPModelRegistry {
         for providerID: ACPProviderID
     ) -> Bool {
         preconditionNotInvalidating()
-        guard let providerRecord = ACPDynamicModelStore.canonicalProviderRecord(
+        guard let providerRecord = ACPDynamicModelCanonicalization.canonicalProviderRecord(
             from: snapshot,
             providerID: providerID
         ),
-            let normalizedSnapshot = ACPDynamicModelStore.snapshot(from: providerRecord)
+            let normalizedSnapshot = ACPDynamicModelCanonicalization.snapshot(from: providerRecord)
         else {
             return false
         }
