@@ -623,46 +623,71 @@ private final class ExecutionCounter: @unchecked Sendable {
                 let controller = ServerController(installNetworkCallbacks: false)
                 let events = AdmissionEvents()
                 await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
-                let first = Process()
-                first.executableURL = URL(fileURLWithPath: "/bin/sleep")
-                first.arguments = ["60"]
-                try first.run()
-                defer { if first.isRunning { first.terminate()
-                    first.waitUntilExit()
-                } }
-                let firstPID = first.processIdentifier
-                let firstPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: firstPID))
-                let launcher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: firstPID, bundledHelper: true))
-                XCTAssertEqual(launcher.pid, getpid())
-                await controller.test_requestApproval(
-                    clientID: "external-test-client", principal: launcher,
-                    validate: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
-                    isConnectionLive: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
-                    approve: { events.decide("unexpected") }, deny: { events.decide("old-helper-denied") }
-                )
-                first.terminate()
-                first.waitUntilExit()
-                let second = Process()
-                second.executableURL = URL(fileURLWithPath: "/bin/sleep")
-                second.arguments = ["60"]
-                try second.run()
-                defer { if second.isRunning { second.terminate()
-                    second.waitUntilExit()
-                } }
-                let secondPID = second.processIdentifier
-                let secondPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: secondPID))
-                let secondLauncher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: secondPID, bundledHelper: true))
-                XCTAssertEqual(secondLauncher, launcher)
-                await controller.test_requestApproval(
-                    clientID: "external-test-client", principal: secondLauncher,
-                    validate: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
-                    isConnectionLive: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
-                    approve: { events.decide("new-helper-allowed") }, deny: { events.decide("new-helper-denied") }
-                )
-                await controller.resolvePendingApproval(allow: allow, generation: events.generations[0])
-                XCTAssertEqual(events.generations.count, 1)
-                XCTAssertEqual(events.decisions, ["old-helper-denied", allow ? "new-helper-allowed" : "new-helper-denied"])
+                try await withAdmissionChild { first in
+                    let firstPID = first.process.processIdentifier
+                    let firstPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: firstPID))
+                    let launcher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: firstPID, bundledHelper: true))
+                    XCTAssertEqual(launcher.pid, getpid())
+                    await controller.test_requestApproval(
+                        clientID: "external-test-client", principal: launcher,
+                        validate: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
+                        isConnectionLive: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
+                        approve: { events.decide("unexpected") }, deny: { events.decide("old-helper-denied") }
+                    )
+                    try await first.stop()
+                    try await withAdmissionChild { second in
+                        let secondPID = second.process.processIdentifier
+                        let secondPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: secondPID))
+                        let secondLauncher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: secondPID, bundledHelper: true))
+                        XCTAssertEqual(secondLauncher, launcher)
+                        await controller.test_requestApproval(
+                            clientID: "external-test-client", principal: secondLauncher,
+                            validate: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
+                            isConnectionLive: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
+                            approve: { events.decide("new-helper-allowed") }, deny: { events.decide("new-helper-denied") }
+                        )
+                        await controller.resolvePendingApproval(allow: allow, generation: events.generations[0])
+                        XCTAssertEqual(events.generations.count, 1)
+                        XCTAssertEqual(events.decisions, ["old-helper-denied", allow ? "new-helper-allowed" : "new-helper-denied"])
+                    }
+                }
             }
+        }
+
+        private final class AdmissionChild {
+            let process = Process()
+            private let exited = XCTestExpectation(description: "owned admission child exited")
+            private var stopped = false
+
+            init() {
+                process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+                process.arguments = ["60"]
+                // Install before launch: waitUntilExit can lose its wakeup after an await.
+                process.terminationHandler = { [exited] _ in exited.fulfill() }
+            }
+
+            func stop() async throws {
+                guard !stopped else { return }
+                stopped = true
+                if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
+                let result = await XCTWaiter.fulfillment(of: [exited], timeout: 5)
+                guard result == .completed else {
+                    XCTFail("Owned admission child did not report exit: \(result)")
+                    throw CancellationError()
+                }
+            }
+        }
+
+        private func withAdmissionChild(_ body: (AdmissionChild) async throws -> Void) async throws {
+            let child = AdmissionChild()
+            try child.process.run()
+            do {
+                try await body(child)
+            } catch {
+                try? await child.stop()
+                throw error
+            }
+            try await child.stop()
         }
 
         func testClosedQueuedConnectionNeverPresentsAnotherDialog() async {
