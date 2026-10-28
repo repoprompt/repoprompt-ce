@@ -1587,3 +1587,59 @@ workspace selection and assert the exact captured observer/workspace route witho
 fallback, focus changes or fabricated success. Existing destination resolution draws
 from active window workspaces, so this remains a separate windowless/foreground
 gate, not a demonstrated passing case or a claim about #1408 completion.
+
+### Stage 0 — no-selection and adversarial current-head receipt
+
+At parent `8946c2bdf364042d1466e8dba0a5ab083e1da12f` plus test diff SHA-256
+`3912ed88773a30439a4f7d47be3a685a3e264715ddbb8174d1fdfb84d9d4d206`, the
+existing serialized production-admission journey asserts its caller's `WindowState`
+has no attached `NSWindow` before and after tool calls. Setup explicitly routes an
+active workspace; the journey does not select another workspace or tab, alter its
+foreground draft, or hydrate/change the persisted unopened sentinel's session and
+draft. It still exercises two returned lane IDs, controlled assistant replies,
+returned bare cursors and successors, and exact group-order recovery. This is a
+real socket observer/binder/bootstrap with controlled lane providers, not a
+packaged/vendor/live or generally windowless runtime claim.
+
+- `630fa54a-5a6e-436b-8576-b25a81306e0a`, request
+  `runtime-contract-20261028-no-selection-sentinel`: exit 0, **1/1** matched,
+  `AgentSessionLinkLiveDiscoveryTests.testActivatedTwoLaneContractUsesProductionAgentAdmissionAndReturnedCalls`,
+  41.513s test, 6m40s execution.
+- `821faaa1-3a10-4fa7-9803-ce436fa961b7`, request
+  `runtime-contract-20261028-adversarial-final`: exit 0, **10/10** matched,
+  1m58s execution. Its exact passing cases and evidence are:
+  - `AgentSessionLaneFirstSaveTests.testAuthorityRevisionConflictBeforeLanePublicationLeavesNoLaneOrProvider`,
+    `testFailedFirstSaveKeepsTheLaneForRecoveryWithoutLinkProof`, and
+    `testRebindDuringHydrationDoesNotMarkReplacementAsCreatorOwned`: actual app
+    destination/save fixtures show no prepublication allocation/provider on conflict,
+    retained unproven recovery on failed first save, and no ownership for a rebound
+    replacement.
+  - `AgentSessionLinkToolServiceTests.testActivatedLaneBasisIsFencedAtClaimCapSaveInsertReserveSeedAndActivation`
+    and `testActivatedLaneCancelledCallerStillCommitsFirstTaskOnceAndReplayJoinsReceipt`:
+    controlled bridge fixture rejects changed activation at each named fence and
+    preserves one committed first task across caller cancellation/replay.
+  - `SessionAdminInFlightIdempotencyTests.testCancelledCreationReleasesReservationWithoutCachingAnEffect`:
+    controlled worktree host proves no precommit effect and successful fresh retry.
+  - `SessionAdminInventoryReadTests.testFullAccessOffAfterLinkRevalidatesConsentBeforeDelivery`:
+    loaded-window bridge fixture returns partial `scope_revoked` with stable replay
+    after access changes between link and dispatch.
+  - `SessionAdminWorktreeRecoveryTests.testCompetingBoundWritersCannotMutateConfigurationOrCreateWorktree`,
+    `testUnopenedLaneModelAndEffortUseItsWriterDespiteEarlierWorkspaceReplica`, and
+    `testExistingCheckoutRecoveryReplaysThroughToolBindAndRelease`: canonical-host
+    fixtures prove competing writers fail closed, unopened model/effort persistence
+    leaves the replica unhydrated, and a real temporary Git checkout's returned bind
+    recovery is replayed and released without deleting the checkout.
+- The organizer cases were unmatched by the first selector (file name was mistaken
+  for suite name) and are **not** counted in its ten. Corrected ticket
+  `4977b03e-3eaf-4884-b362-19a4924008fe`, request
+  `runtime-contract-20261028-organizer-final`, passed exit 0, **2/2**, 1m34s:
+  `SessionAdminProductionOrganizerJourneyTests.testReorderGroupsMCPRecoveryAndApplyUseOneWriterForAgreeingReplicas`
+  replays the exact zero-change and preview recovery across agreeing replicas;
+  `testReorderGroupsReportsCommittedSaveWhenAuthorityOrReplicaIdentityChangesDuringSave`
+  returns a partial committed-effect receipt after scope/identity changes at the
+  real save suspension, without pretending the durable edit was rolled back. Both
+  use canonical host fixtures, not serialized or live provider evidence.
+
+Scoped pinned SwiftFormat 0.61.1 and strict no-cache SwiftLint both passed for the
+changed test file. Whole-tree style remains NOT_PASSED as previously recorded;
+full integration, packaged, real vendor and live app gates remain for integration.

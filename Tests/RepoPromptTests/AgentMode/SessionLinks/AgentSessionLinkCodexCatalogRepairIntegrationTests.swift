@@ -639,6 +639,9 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
             let foregroundTab = window.promptManager.activeComposeTabID
             let foregroundDraft = window.promptManager.promptText
+            XCTAssertNil(window.nsWindow, "The routed caller has no attached presentation window")
+            let sentinel = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first { $0.name == "Unopened contract sentinel" })
+            XCTAssertNil(vm.sessions[sentinel.id], "The unrelated sentinel must start unhydrated")
             var laneIDs: [String] = []
             var laneTabs: [UUID] = []
             var nativeControllers: [MonitorFakeNativeController] = []
@@ -750,6 +753,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID)
             XCTAssertEqual(window.promptManager.activeComposeTabID, foregroundTab)
             XCTAssertEqual(window.promptManager.promptText, foregroundDraft)
+            XCTAssertNil(window.nsWindow, "The tool journey must not attach a presentation window")
+            let finalSentinel = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == sentinel.id })
+            XCTAssertEqual(finalSentinel.name, sentinel.name)
+            XCTAssertEqual(finalSentinel.promptText, sentinel.promptText)
+            XCTAssertEqual(finalSentinel.activeAgentSessionID, sentinel.activeAgentSessionID)
+            XCTAssertNil(vm.sessions[sentinel.id], "The unrelated sentinel must remain unhydrated")
         }
 
         private func exerciseLiveDiscovery(
@@ -870,6 +879,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     ComposeTabState(id: observerTab, name: "User-created planning chat", activeAgentSessionID: observerID),
                     ComposeTabState(id: targetTab, name: "Harmless idle target", activeAgentSessionID: targetID)
                 ]
+                if contractJourney {
+                    workspace.composeTabs.append(ComposeTabState(
+                        name: "Unopened contract sentinel", activeAgentSessionID: UUID(),
+                        promptText: "Unrelated sentinel draft"
+                    ))
+                }
                 workspace.activeComposeTabID = observerTab
                 // Restoration must earn both runtime readiness and owner-valid placement metadata.
                 // A fabricated loaded latch has no index row until an unrelated debounced save wins.
@@ -904,6 +919,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let initialTabID = window.promptManager.activeComposeTabID
                 let initialDraft = window.promptManager.promptText
                 if contractJourney {
+                    XCTAssertNil(window.nsWindow, "Fixture setup routes a workspace without attaching an NSWindow")
                     // The observer represents an already-active Agent Mode session. Enter through
                     // the real UI lifecycle and wait for its ordinary workspace-switch fence.
                     vm.setAgentModeActive(true)
