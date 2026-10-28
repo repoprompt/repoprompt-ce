@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import Combine
 import enum MCP.Value
 import RepoPromptAIContracts

@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import CryptoKit
 import Foundation
 import MCP

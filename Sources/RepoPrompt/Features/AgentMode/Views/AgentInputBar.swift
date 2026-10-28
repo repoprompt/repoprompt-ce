@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
 

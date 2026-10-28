@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import Foundation
 import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp

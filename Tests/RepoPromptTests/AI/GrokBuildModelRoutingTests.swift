@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import Darwin
 import Foundation
 import RepoPromptAIContracts

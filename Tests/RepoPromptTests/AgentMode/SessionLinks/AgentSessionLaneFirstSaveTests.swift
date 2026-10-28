@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import Foundation
 import MCP
 import RepoPromptAIContracts
