@@ -7,13 +7,13 @@ import RepoPromptPersistence
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
-struct GitWorkspaceAuthorityRepositoryKey: Hashable {
-    let standardizedCommonDirectoryPath: String
-    let standardizedGitDirectoryPath: String
-    let commonDirectoryDevice: UInt64?
-    let commonDirectoryInode: UInt64?
+package struct GitWorkspaceAuthorityRepositoryKey: Hashable {
+    package let standardizedCommonDirectoryPath: String
+    package let standardizedGitDirectoryPath: String
+    package let commonDirectoryDevice: UInt64?
+    package let commonDirectoryInode: UInt64?
 
-    init(layout: GitRepositoryLayout) {
+    package init(layout: GitRepositoryLayout) {
         standardizedCommonDirectoryPath = layout.commonDir.standardizedFileURL.path
         standardizedGitDirectoryPath = layout.gitDir.standardizedFileURL.path
         var value = stat()
@@ -27,13 +27,13 @@ struct GitWorkspaceAuthorityRepositoryKey: Hashable {
     }
 }
 
-struct GitWorkspaceSearchABIIdentity: Hashable {
-    let matcherSchemaVersion: Int
-    let projectedKeySchemaVersion: Int
-    let comparatorSchemaVersion: Int
-    let pathNormalizationSchemaVersion: Int
+package struct GitWorkspaceSearchABIIdentity: Hashable {
+    package let matcherSchemaVersion: Int
+    package let projectedKeySchemaVersion: Int
+    package let comparatorSchemaVersion: Int
+    package let pathNormalizationSchemaVersion: Int
 
-    static let current = GitWorkspaceSearchABIIdentity(
+    package static let current = GitWorkspaceSearchABIIdentity(
         matcherSchemaVersion: 1,
         projectedKeySchemaVersion: 3,
         comparatorSchemaVersion: 1,
@@ -41,12 +41,12 @@ struct GitWorkspaceSearchABIIdentity: Hashable {
     )
 }
 
-struct GitWorkspacePolicyIdentity: Hashable {
-    let mandatoryIgnorePolicyIdentity: String
-    let committedIgnoreControlDigest: String
-    let configuredIgnoreAuthorityDigest: String
-    let attributePolicyDigest: String
-    let sparsePolicyDigest: String
+package struct GitWorkspacePolicyIdentity: Hashable {
+    package let mandatoryIgnorePolicyIdentity: String
+    package let committedIgnoreControlDigest: String
+    package let configuredIgnoreAuthorityDigest: String
+    package let attributePolicyDigest: String
+    package let sparsePolicyDigest: String
     let searchABI: GitWorkspaceSearchABIIdentity
     let resolvedExcludesFileIdentity: GitWorkspaceAuthorityContentIdentity?
     let resolvedAttributesFileIdentity: GitWorkspaceAuthorityContentIdentity?
@@ -56,7 +56,7 @@ struct GitWorkspacePolicyIdentity: Hashable {
     #endif
 
     #if DEBUG
-        init(
+        package init(
             mandatoryIgnorePolicyIdentity: String,
             committedIgnoreControlDigest: String,
             configuredIgnoreAuthorityDigest: String,
@@ -78,7 +78,7 @@ struct GitWorkspacePolicyIdentity: Hashable {
             self.canonicalizationDiagnostics = canonicalizationDiagnostics
         }
     #else
-        init(
+        package init(
             mandatoryIgnorePolicyIdentity: String,
             committedIgnoreControlDigest: String,
             configuredIgnoreAuthorityDigest: String,
@@ -101,7 +101,7 @@ struct GitWorkspacePolicyIdentity: Hashable {
 
     // Diagnostics are deliberately excluded from semantic identity.
     // swiftformat:disable:next redundantEquatable
-    static func == (lhs: Self, rhs: Self) -> Bool {
+    package static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.mandatoryIgnorePolicyIdentity == rhs.mandatoryIgnorePolicyIdentity
             && lhs.committedIgnoreControlDigest == rhs.committedIgnoreControlDigest
             && lhs.configuredIgnoreAuthorityDigest == rhs.configuredIgnoreAuthorityDigest
@@ -112,7 +112,7 @@ struct GitWorkspacePolicyIdentity: Hashable {
             && lhs.resolvedAttributesFileIdentity == rhs.resolvedAttributesFileIdentity
     }
 
-    func hash(into hasher: inout Hasher) {
+    package func hash(into hasher: inout Hasher) {
         hasher.combine(mandatoryIgnorePolicyIdentity)
         hasher.combine(committedIgnoreControlDigest)
         hasher.combine(configuredIgnoreAuthorityDigest)
@@ -124,80 +124,80 @@ struct GitWorkspacePolicyIdentity: Hashable {
     }
 }
 
-struct GitWorkspaceAuthorityContentIdentity: Hashable {
-    let exists: Bool
-    let sha256: String
-    let byteCount: Int
+package struct GitWorkspaceAuthorityContentIdentity: Hashable {
+    package let exists: Bool
+    package let sha256: String
+    package let byteCount: Int
 }
 
-enum GitWorkspacePrefixControlKind: String, Hashable {
+package enum GitWorkspacePrefixControlKind: String, Hashable {
     case gitignore
     case repoIgnore
     case cursorIgnore
     case gitAttributes
 }
 
-struct GitWorkspacePrefixControlIdentity: Hashable {
-    let repositoryRelativePath: String
-    let kind: GitWorkspacePrefixControlKind
-    let content: GitWorkspaceAuthorityContentIdentity
+package struct GitWorkspacePrefixControlIdentity: Hashable {
+    package let repositoryRelativePath: String
+    package let kind: GitWorkspacePrefixControlKind
+    package let content: GitWorkspaceAuthorityContentIdentity
 }
 
-struct GitWorkspaceAuthorityMetadata {
-    let repositoryKey: GitWorkspaceAuthorityRepositoryKey
-    let objectFormat: GitObjectFormat
-    let headCommitOID: GitObjectID
-    let treeOID: GitObjectID
-    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
-    let indexGeneration: String
-    let checkoutConfigurationGeneration: String
-    let ignoreAuthorityGeneration: String
-    let attributeAuthorityGeneration: String
-    let sparsePolicyGeneration: String
-    let metadataGeneration: String
-    let policyIdentity: GitWorkspacePolicyIdentity
-    let resolvedExternalAuthorityPaths: [URL]
+package struct GitWorkspaceAuthorityMetadata {
+    package let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+    package let objectFormat: GitObjectFormat
+    package let headCommitOID: GitObjectID
+    package let treeOID: GitObjectID
+    package let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    package let indexGeneration: String
+    package let checkoutConfigurationGeneration: String
+    package let ignoreAuthorityGeneration: String
+    package let attributeAuthorityGeneration: String
+    package let sparsePolicyGeneration: String
+    package let metadataGeneration: String
+    package let policyIdentity: GitWorkspacePolicyIdentity
+    package let resolvedExternalAuthorityPaths: [URL]
 }
 
-struct GitWorkspaceAuthorityScopeKey: Hashable {
-    let repositoryKey: GitWorkspaceAuthorityRepositoryKey
-    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+package struct GitWorkspaceAuthorityScopeKey: Hashable {
+    package let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+    package let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
 }
 
-struct GitWorkspaceAuthorityCaptureToken: Hashable {
+package struct GitWorkspaceAuthorityCaptureToken: Hashable {
     let scopeKey: GitWorkspaceAuthorityScopeKey
-    let invalidationGeneration: UInt64
+    package let invalidationGeneration: UInt64
     let scopePublicationGeneration: UInt64
-    let acceptedMetadataWatermark: UInt64
+    package let acceptedMetadataWatermark: UInt64
 }
 
 /// Immutable identity required before a later content-addressed root/search
 /// snapshot may be considered compatible. Target-local generations, records,
 /// caches, and watcher state are intentionally excluded.
-struct GitWorkspaceAuthoritySnapshot: Hashable {
-    let repositoryKey: GitWorkspaceAuthorityRepositoryKey
-    let repositoryNamespace: GitBlobRepositoryNamespace
-    let objectFormat: GitObjectFormat
-    let headCommitOID: GitObjectID
-    let treeOID: GitObjectID
-    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
-    let repositoryBindingEpoch: String
-    let worktreeBindingEpoch: String
-    let layoutGeneration: String
-    let indexGeneration: String
-    let checkoutConfigurationGeneration: String
-    let metadataGeneration: String
-    let policyIdentity: GitWorkspacePolicyIdentity
+package struct GitWorkspaceAuthoritySnapshot: Hashable {
+    package let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+    package let repositoryNamespace: GitBlobRepositoryNamespace
+    package let objectFormat: GitObjectFormat
+    package let headCommitOID: GitObjectID
+    package let treeOID: GitObjectID
+    package let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    package let repositoryBindingEpoch: String
+    package let worktreeBindingEpoch: String
+    package let layoutGeneration: String
+    package let indexGeneration: String
+    package let checkoutConfigurationGeneration: String
+    package let metadataGeneration: String
+    package let policyIdentity: GitWorkspacePolicyIdentity
 }
 
-struct GitWorkspaceAuthorityLease: Hashable {
+package struct GitWorkspaceAuthorityLease: Hashable {
     let scopeKey: GitWorkspaceAuthorityScopeKey
-    let authorityGeneration: UInt64
-    let invalidationGeneration: UInt64
-    let acceptedMetadataWatermark: UInt64
-    let snapshot: GitWorkspaceAuthoritySnapshot
+    package let authorityGeneration: UInt64
+    package let invalidationGeneration: UInt64
+    package let acceptedMetadataWatermark: UInt64
+    package let snapshot: GitWorkspaceAuthoritySnapshot
 
-    var repositoryKey: GitWorkspaceAuthorityRepositoryKey {
+    package var repositoryKey: GitWorkspaceAuthorityRepositoryKey {
         scopeKey.repositoryKey
     }
 }
@@ -206,17 +206,17 @@ struct GitWorkspaceAuthorityLease: Hashable {
 /// the immutable 8A authority snapshot, this value owns live metadata
 /// observation and must be released on publication handoff, fallback, abort,
 /// or supersession.
-struct GitWorkspacePendingInitializationAuthorityFence: Equatable {
-    let snapshot: GitWorkspaceAuthoritySnapshot
-    let lease: GitWorkspaceAuthorityLease
-    let metadataObservationToken: GitWorkspaceMetadataMonitor.RetainToken
-    let acceptedMetadataWatermark: UInt64
-    let targetLayout: GitRepositoryLayout
-    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
-    let additionalAuthorityPaths: [URL]
-    let revalidationUsed: Bool
+package struct GitWorkspacePendingInitializationAuthorityFence: Equatable {
+    package let snapshot: GitWorkspaceAuthoritySnapshot
+    package let lease: GitWorkspaceAuthorityLease
+    package let metadataObservationToken: GitWorkspaceMetadataMonitor.RetainToken
+    package let acceptedMetadataWatermark: UInt64
+    package let targetLayout: GitRepositoryLayout
+    package let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    package let additionalAuthorityPaths: [URL]
+    package let revalidationUsed: Bool
 
-    var repositoryKey: GitWorkspaceAuthorityRepositoryKey {
+    package var repositoryKey: GitWorkspaceAuthorityRepositoryKey {
         lease.repositoryKey
     }
 }
@@ -224,7 +224,7 @@ struct GitWorkspacePendingInitializationAuthorityFence: Equatable {
 /// A pending preparation performs no Git work while its retained evidence is
 /// current. Accepted metadata events coalesce into one requested recapture;
 /// instability after that single recapture fails closed.
-enum GitWorkspacePendingAuthorityFenceDecision: Equatable {
+package enum GitWorkspacePendingAuthorityFenceDecision: Equatable {
     case current
     case revalidationRequired(latestAcceptedMetadataWatermark: UInt64)
     case fallback
@@ -240,21 +240,21 @@ enum GitWorkspaceAuthorityInvalidationKind: Equatable {
 /// It is only a wakeup signal; consumers must prove currentness from a lease
 /// and accepted metadata watermark rather than treating delivery as evidence.
 struct GitWorkspaceAuthorityInvalidationEvent: Equatable {
-    let repositoryKey: GitWorkspaceAuthorityRepositoryKey
-    let invalidationGeneration: UInt64
-    let acceptedMetadataWatermark: UInt64
-    let kind: GitWorkspaceAuthorityInvalidationKind
+    package let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+    package let invalidationGeneration: UInt64
+    package let acceptedMetadataWatermark: UInt64
+    package let kind: GitWorkspaceAuthorityInvalidationKind
 }
 
-struct GitWorktreeInitializationContext: Equatable {
-    let agentSessionID: UUID
-    let correlationID: UUID
-    let standardizedLogicalRootPath: String
-    let expectedOwnerBindingGeneration: UInt64
-    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
-    let observeReceipt: Bool
+package struct GitWorktreeInitializationContext: Equatable {
+    package let agentSessionID: UUID
+    package let correlationID: UUID
+    package let standardizedLogicalRootPath: String
+    package let expectedOwnerBindingGeneration: UInt64
+    package let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    package let observeReceipt: Bool
 
-    init(
+    package init(
         agentSessionID: UUID,
         correlationID: UUID,
         logicalRootPath: String,
@@ -274,42 +274,42 @@ struct GitWorktreeInitializationContext: Equatable {
 /// Scalar-only proof that the creation interval was continuously observed.
 /// Creation contents come from final Git/index/status authority and exact
 /// include-copy inventory; post-cut mutations replay from `endEventID`.
-struct GitWorktreeCreationWitnessCoverage: Equatable {
+package struct GitWorktreeCreationWitnessCoverage: Equatable {
     static let maximumLifetime: Duration = .seconds(60)
 
-    let startedAtUptimeNanoseconds: UInt64
-    let endedAtUptimeNanoseconds: UInt64
-    let startEventID: UInt64
-    let endEventID: UInt64
-    let stableWatchRootAvailableBeforeMutation: Bool
-    let destinationWasAbsentBeforeMutation: Bool
-    let destinationWasStrictDescendant: Bool
-    let stableWatchRootUnchangedAfterInitialization: Bool
-    let streamCreationSucceeded: Bool
-    let streamStartedBeforeMutation: Bool
-    let activationFlushCompleted: Bool
-    let activationCallbackBarrierCompleted: Bool
-    let streamEndedAfterInitialization: Bool
-    let endingFlushCompleted: Bool
-    let endingCallbackBarrierCompleted: Bool
-    let startAcceptedCallbackWatermark: UInt64
-    let endAcceptedCallbackWatermark: UInt64
-    let acceptedCallbackCount: Int
-    let acceptedEventCount: Int
-    let acceptedDestinationEventCount: Int
-    let acceptedNonDestinationEventCount: Int
-    let mustScanSubDirs: Bool
-    let rootChanged: Bool
-    let userDropped: Bool
-    let kernelDropped: Bool
-    let eventIDsWrapped: Bool
-    let eventIDRegressed: Bool
-    let lifetimeExceeded: Bool
-    let hadGap: Bool
-    let hadDrop: Bool
-    let overflowed: Bool
+    package let startedAtUptimeNanoseconds: UInt64
+    package let endedAtUptimeNanoseconds: UInt64
+    package let startEventID: UInt64
+    package let endEventID: UInt64
+    package let stableWatchRootAvailableBeforeMutation: Bool
+    package let destinationWasAbsentBeforeMutation: Bool
+    package let destinationWasStrictDescendant: Bool
+    package let stableWatchRootUnchangedAfterInitialization: Bool
+    package let streamCreationSucceeded: Bool
+    package let streamStartedBeforeMutation: Bool
+    package let activationFlushCompleted: Bool
+    package let activationCallbackBarrierCompleted: Bool
+    package let streamEndedAfterInitialization: Bool
+    package let endingFlushCompleted: Bool
+    package let endingCallbackBarrierCompleted: Bool
+    package let startAcceptedCallbackWatermark: UInt64
+    package let endAcceptedCallbackWatermark: UInt64
+    package let acceptedCallbackCount: Int
+    package let acceptedEventCount: Int
+    package let acceptedDestinationEventCount: Int
+    package let acceptedNonDestinationEventCount: Int
+    package let mustScanSubDirs: Bool
+    package let rootChanged: Bool
+    package let userDropped: Bool
+    package let kernelDropped: Bool
+    package let eventIDsWrapped: Bool
+    package let eventIDRegressed: Bool
+    package let lifetimeExceeded: Bool
+    package let hadGap: Bool
+    package let hadDrop: Bool
+    package let overflowed: Bool
 
-    var provesCreationInterval: Bool {
+    package var provesCreationInterval: Bool {
         stableWatchRootAvailableBeforeMutation
             && destinationWasAbsentBeforeMutation
             && destinationWasStrictDescendant
@@ -341,32 +341,32 @@ struct GitWorktreeCreationWitnessCoverage: Equatable {
     }
 }
 
-struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
-    let id: UUID
-    let agentSessionID: UUID
-    let correlationID: UUID
-    let standardizedLogicalRootPath: String
-    let expectedOwnerBindingGeneration: UInt64
-    let mutationID: UUID
-    let parentSnapshotIdentity: WorkspaceRootReusableSnapshotIdentity
-    let parentCompatibilityKey: WorkspaceRootSeedCompatibilityKey
-    let parentAuthorityBefore: GitWorkspaceAuthoritySnapshot
-    let targetAuthorityAfter: GitWorkspaceAuthoritySnapshot
-    let requestedBaseRef: String?
-    let resolvedBaseTreeOID: GitObjectID
-    let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
-    let plannedTargetPath: String
-    let actualTargetPath: String
-    let exactCopiedRelativePaths: [String]
-    let includeCopyHadFailures: Bool
-    let includeCopyWasComplete: Bool
-    let destinationIsAppManaged: Bool
-    let worktree: GitWorktreeDescriptor
-    let targetLayout: GitRepositoryLayout
-    let witnessCoverage: GitWorktreeCreationWitnessCoverage
-    let expiresAtUptimeNanoseconds: UInt64
+package struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
+    package let id: UUID
+    package let agentSessionID: UUID
+    package let correlationID: UUID
+    package let standardizedLogicalRootPath: String
+    package let expectedOwnerBindingGeneration: UInt64
+    package let mutationID: UUID
+    package let parentSnapshotIdentity: WorkspaceRootReusableSnapshotIdentity
+    package let parentCompatibilityKey: WorkspaceRootSeedCompatibilityKey
+    package let parentAuthorityBefore: GitWorkspaceAuthoritySnapshot
+    package let targetAuthorityAfter: GitWorkspaceAuthoritySnapshot
+    package let requestedBaseRef: String?
+    package let resolvedBaseTreeOID: GitObjectID
+    package let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    package let plannedTargetPath: String
+    package let actualTargetPath: String
+    package let exactCopiedRelativePaths: [String]
+    package let includeCopyHadFailures: Bool
+    package let includeCopyWasComplete: Bool
+    package let destinationIsAppManaged: Bool
+    package let worktree: GitWorktreeDescriptor
+    package let targetLayout: GitRepositoryLayout
+    package let witnessCoverage: GitWorktreeCreationWitnessCoverage
+    package let expiresAtUptimeNanoseconds: UInt64
 
-    func fallbackReason(
+    package func fallbackReason(
         nowUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> WorkspaceRootSeedFallbackReason? {
         guard nowUptimeNanoseconds <= expiresAtUptimeNanoseconds else { return .expiredReceipt }
@@ -394,7 +394,7 @@ struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
     }
 }
 
-enum GitWorkspaceMutationKind: String, Hashable {
+package enum GitWorkspaceMutationKind: String, Hashable {
     case worktreeCreate
     case branchSwitch
     case fetch
@@ -405,18 +405,18 @@ enum GitWorkspaceMutationKind: String, Hashable {
     case other
 }
 
-enum GitWorkspaceMutationOutcome: String, Hashable {
+package enum GitWorkspaceMutationOutcome: String, Hashable {
     case succeeded
     case failed
     case cancelled
 }
 
-struct GitWorkspaceMutationToken: Hashable {
-    let id: UUID
-    let repositoryKey: GitWorkspaceAuthorityRepositoryKey
+package struct GitWorkspaceMutationToken: Hashable {
+    package let id: UUID
+    package let repositoryKey: GitWorkspaceAuthorityRepositoryKey
     let affectedRepositoryKeys: Set<GitWorkspaceAuthorityRepositoryKey>
-    let kind: GitWorkspaceMutationKind
-    let correlationID: UUID?
+    package let kind: GitWorkspaceMutationKind
+    package let correlationID: UUID?
 }
 
 enum GitWorkspaceMetadataEventKind: String, CaseIterable, Hashable {
@@ -433,7 +433,7 @@ enum GitWorkspaceMetadataEventKind: String, CaseIterable, Hashable {
     case monitorGap
 }
 
-enum GitWorkspaceAuthorityUnavailableReason: String, Error, Equatable {
+package enum GitWorkspaceAuthorityUnavailableReason: String, Error, Equatable {
     case noSnapshot
     case mutationInProgress
     case metadataEventPending

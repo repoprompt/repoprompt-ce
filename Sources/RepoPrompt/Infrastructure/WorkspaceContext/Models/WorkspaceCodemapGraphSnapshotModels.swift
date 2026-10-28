@@ -1,6 +1,6 @@
 import Foundation
 
-enum WorkspaceCodemapGraphUnresolvedReason: Hashable {
+package enum WorkspaceCodemapGraphUnresolvedReason: Hashable {
     case notIndexedYet
     case missing
     case tooCommon
@@ -67,7 +67,7 @@ enum WorkspaceCodemapGraphFenceDisposition: Hashable {
     case revoked(WorkspaceCodemapGraphRevocationReason)
 }
 
-enum WorkspaceCodemapGraphReceiptInvalidReason: Hashable {
+package enum WorkspaceCodemapGraphReceiptInvalidReason: Hashable {
     case rootEpochMismatch
     case rootAuthorityMismatch
     case schemaMismatch

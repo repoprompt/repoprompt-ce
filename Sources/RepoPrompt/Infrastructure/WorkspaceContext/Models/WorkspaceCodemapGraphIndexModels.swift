@@ -197,7 +197,7 @@ private func workspaceCodemapGraphIndexCatalogKeyPrecedes(
     return lhs.fileID.uuidString.utf8.lexicographicallyPrecedes(rhs.fileID.uuidString.utf8)
 }
 
-enum WorkspaceCodemapGraphIndexLaunchPhase: Hashable {
+package enum WorkspaceCodemapGraphIndexLaunchPhase: Hashable {
     case notScheduled
     case eligibilityQueued
     case setupJoining
@@ -210,7 +210,7 @@ enum WorkspaceCodemapGraphIndexLaunchPhase: Hashable {
     case superseded
 }
 
-enum WorkspaceCodemapGraphIndexPhase: Hashable {
+package enum WorkspaceCodemapGraphIndexPhase: Hashable {
     case scheduled
     case waitingForAdmission
     case readingCatalogPage
@@ -300,7 +300,7 @@ enum WorkspaceCodemapGraphIndexAccountingError: Error, Hashable {
     case underflow(WorkspaceCodemapGraphIndexAccountingField)
 }
 
-struct WorkspaceCodemapGraphIndexCounts: Hashable {
+package struct WorkspaceCodemapGraphIndexCounts: Hashable {
     static let zero = Self(
         supportedCandidateCount: 0,
         processedCandidateCount: 0,
@@ -311,13 +311,13 @@ struct WorkspaceCodemapGraphIndexCounts: Hashable {
         transientCount: 0
     )
 
-    let supportedCandidateCount: UInt64
-    let processedCandidateCount: UInt64
-    let contributedCount: UInt64
-    let emptyCount: UInt64
-    let terminalArtifactCount: UInt64
-    let terminalExcludedCount: UInt64
-    let transientCount: UInt64
+    package let supportedCandidateCount: UInt64
+    package let processedCandidateCount: UInt64
+    package let contributedCount: UInt64
+    package let emptyCount: UInt64
+    package let terminalArtifactCount: UInt64
+    package let terminalExcludedCount: UInt64
+    package let transientCount: UInt64
 
     func adding(
         _ other: Self
@@ -367,13 +367,13 @@ struct WorkspaceCodemapGraphIndexCounts: Hashable {
 struct WorkspaceCodemapGraphIndexCatalogCompletion: Hashable {
     let token: WorkspaceCodemapGraphIndexCatalogToken
     let finalCursor: WorkspaceCodemapGraphIndexCatalogCursor?
-    let supportedCandidateCount: UInt64
+    package let supportedCandidateCount: UInt64
 }
 
-struct WorkspaceCodemapGraphIndexRetry: Hashable {
-    let attempt: UInt64
-    let retryAfterMilliseconds: UInt64?
-    let nextEligibleAdmissionUptimeNanoseconds: UInt64?
+package struct WorkspaceCodemapGraphIndexRetry: Hashable {
+    package let attempt: UInt64
+    package let retryAfterMilliseconds: UInt64?
+    package let nextEligibleAdmissionUptimeNanoseconds: UInt64?
 }
 
 struct WorkspaceCodemapGraphIndexInBatchProgress: Hashable {
@@ -415,7 +415,7 @@ struct WorkspaceCodemapGraphIndexInBatchProgress: Hashable {
     }
 }
 
-struct WorkspaceCodemapGraphIndexProgress: Hashable {
+package struct WorkspaceCodemapGraphIndexProgress: Hashable {
     static let notStarted = Self(
         phase: .scheduled,
         counts: .zero,
@@ -427,11 +427,11 @@ struct WorkspaceCodemapGraphIndexProgress: Hashable {
     )
 
     let phase: WorkspaceCodemapGraphIndexPhase
-    let counts: WorkspaceCodemapGraphIndexCounts
+    package let counts: WorkspaceCodemapGraphIndexCounts
     let catalogPageCount: UInt64
     let catalogPathByteCount: UInt64
-    let publishedGraphChangeCount: UInt64
-    let publishedGraphChangeByteCount: UInt64
+    package let publishedGraphChangeCount: UInt64
+    package let publishedGraphChangeByteCount: UInt64
     let catalogCompletion: WorkspaceCodemapGraphIndexCatalogCompletion?
 
     func advancing(
@@ -489,11 +489,11 @@ struct WorkspaceCodemapGraphIndexProgressDelta: Hashable {
         publishedGraphChangeByteCount: 0
     )
 
-    let counts: WorkspaceCodemapGraphIndexCounts
+    package let counts: WorkspaceCodemapGraphIndexCounts
     let catalogPageCount: UInt64
     let catalogPathByteCount: UInt64
-    let publishedGraphChangeCount: UInt64
-    let publishedGraphChangeByteCount: UInt64
+    package let publishedGraphChangeCount: UInt64
+    package let publishedGraphChangeByteCount: UInt64
 }
 
 enum WorkspaceCodemapGraphIndexByteAccounting {
@@ -548,7 +548,7 @@ enum WorkspaceCodemapGraphIndexByteAccounting {
     }
 }
 
-enum WorkspaceCodemapGraphIndexBudgetDimension: Hashable {
+package enum WorkspaceCodemapGraphIndexBudgetDimension: Hashable {
     case catalogEntries
     case catalogPathBytes
     case activeBatches
@@ -559,17 +559,17 @@ enum WorkspaceCodemapGraphIndexBudgetDimension: Hashable {
     case queuedManifestMutationBytes
 }
 
-struct WorkspaceCodemapGraphIndexBudget: Hashable {
-    let dimension: WorkspaceCodemapGraphIndexBudgetDimension
-    let attempted: UInt64
-    let limit: UInt64
+package struct WorkspaceCodemapGraphIndexBudget: Hashable {
+    package let dimension: WorkspaceCodemapGraphIndexBudgetDimension
+    package let attempted: UInt64
+    package let limit: UInt64
 
     var terminalMessage: String {
         "Code Map indexing stopped at the \(dimension) budget (attempted \(attempted), limit \(limit)). This generation cannot be resumed with Retry."
     }
 }
 
-struct WorkspaceCodemapGraphIndexResourceAccounting: Hashable {
+package struct WorkspaceCodemapGraphIndexResourceAccounting: Hashable {
     static let zero = Self(
         retainedPathBytes: 0,
         retainedSourceBytes: 0,
@@ -579,12 +579,12 @@ struct WorkspaceCodemapGraphIndexResourceAccounting: Hashable {
         queuedManifestMutationBytes: 0
     )
 
-    let retainedPathBytes: UInt64
-    let retainedSourceBytes: UInt64
-    let retainedGraphIndexBytes: UInt64
-    let stagedGraphBytes: UInt64
-    let residentGraphBytes: UInt64
-    let queuedManifestMutationBytes: UInt64
+    package let retainedPathBytes: UInt64
+    package let retainedSourceBytes: UInt64
+    package let retainedGraphIndexBytes: UInt64
+    package let stagedGraphBytes: UInt64
+    package let residentGraphBytes: UInt64
+    package let queuedManifestMutationBytes: UInt64
 
     func adding(
         _ other: Self

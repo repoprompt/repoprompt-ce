@@ -6,13 +6,13 @@ import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import RepoPromptWorkspaceCore
 
-enum FilePathDisplay: String, CaseIterable {
+package enum FilePathDisplay: String, CaseIterable {
     case full = "Full"
     case relative = "Relative"
 }
 
 #if DEBUG
-    enum WorkspacePreparationPhase: String, CaseIterable, Equatable {
+    package enum WorkspacePreparationPhase: String, CaseIterable, Equatable {
         case scopeResolution = "scope_resolution"
         case setFlagsTotal = "set_flags_total"
         case loadedRootIngressFence = "loaded_root_ingress_fence"
@@ -38,7 +38,7 @@ enum FilePathDisplay: String, CaseIterable {
         case finalLoadedRootCurrentness = "final_loaded_root_currentness"
     }
 
-    enum WorkspacePreparationCounter: String, CaseIterable, Equatable {
+    package enum WorkspacePreparationCounter: String, CaseIterable, Equatable {
         case authorityCaptures = "authority_captures"
         case gitCommandCount = "git_command_count"
         case gitQueueMicroseconds = "git_queue_us"
@@ -66,52 +66,52 @@ enum FilePathDisplay: String, CaseIterable {
 #endif
 
 #if DEBUG
-    enum WorkspaceReceiptMatchState: String, Equatable {
+    package enum WorkspaceReceiptMatchState: String, Equatable {
         case notEvaluated
         case match
         case mismatch
     }
 
-    enum WorkspaceReceiptFinalObservation: Equatable {
+    package enum WorkspaceReceiptFinalObservation: Equatable {
         case eligible
         case disabled
         case fallback(WorkspaceRootSeedFallbackReason)
     }
 
-    struct WorkspaceReceiptProjectionDecision: Equatable {
-        var suppliedHintCount = 0
-        var matchedHintCount = 0
-        var allHintKeysMatchedBindings: Bool?
-        var validationFallback: WorkspaceRootSeedFallbackReason?
+    package struct WorkspaceReceiptProjectionDecision: Equatable {
+        package var suppliedHintCount = 0
+        package var matchedHintCount = 0
+        package var allHintKeysMatchedBindings: Bool?
+        package var validationFallback: WorkspaceRootSeedFallbackReason?
 
-        init() {}
+        package init() {}
     }
 
-    struct WorkspaceReceiptConsumptionDecision: Equatable {
-        var ownerGenerationMatch: WorkspaceReceiptMatchState = .notEvaluated
-        var hintSessionMatch: WorkspaceReceiptMatchState = .notEvaluated
-        var hintCorrelationMatch: WorkspaceReceiptMatchState = .notEvaluated
-        var hintOwnerMatch: WorkspaceReceiptMatchState = .notEvaluated
-        var ownershipReused: Bool?
-        var initialHintObservation: WorkspaceReceiptFinalObservation?
-        var pendingSeededPreparationResult: WorkspaceReceiptFinalObservation?
-        var fullCrawlPerformed: Bool?
-        var finalObservation: WorkspaceReceiptFinalObservation?
-        var selectedRoute: WorkspaceRootStartupRoute?
+    package struct WorkspaceReceiptConsumptionDecision: Equatable {
+        package var ownerGenerationMatch: WorkspaceReceiptMatchState = .notEvaluated
+        package var hintSessionMatch: WorkspaceReceiptMatchState = .notEvaluated
+        package var hintCorrelationMatch: WorkspaceReceiptMatchState = .notEvaluated
+        package var hintOwnerMatch: WorkspaceReceiptMatchState = .notEvaluated
+        package var ownershipReused: Bool?
+        package var initialHintObservation: WorkspaceReceiptFinalObservation?
+        package var pendingSeededPreparationResult: WorkspaceReceiptFinalObservation?
+        package var fullCrawlPerformed: Bool?
+        package var finalObservation: WorkspaceReceiptFinalObservation?
+        package var selectedRoute: WorkspaceRootStartupRoute?
 
-        init() {}
+        package init() {}
     }
 
-    struct WorkspaceBenchmarkMetricTag: Hashable {
-        let correlationID: UUID
-        let contextID: UUID
-        let agentSessionID: UUID
-        let logicalRootID: UUID
-        let repositoryID: String
-        let destinationID: String
+    package struct WorkspaceBenchmarkMetricTag: Hashable {
+        package let correlationID: UUID
+        package let contextID: UUID
+        package let agentSessionID: UUID
+        package let logicalRootID: UUID
+        package let repositoryID: String
+        package let destinationID: String
     }
 
-    enum WorkspaceBenchmarkPlannerPhase: String, CaseIterable {
+    package enum WorkspaceBenchmarkPlannerPhase: String, CaseIterable {
         case targetNamespace
         case treeEvidence
         case indexEvidence
@@ -119,17 +119,17 @@ enum FilePathDisplay: String, CaseIterable {
         case reconcile
     }
 
-    enum WorkspaceBenchmarkMarkerPublicationSource: String, Equatable {
+    package enum WorkspaceBenchmarkMarkerPublicationSource: String, Equatable {
         case publishedUpdate
         case warmReplay
     }
 
 #endif
 
-typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSessionWorktreeBinding
+package typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSessionWorktreeBinding
 
 #if DEBUG
-    enum WorkspacePreparationReason: String, CaseIterable, Equatable {
+    package enum WorkspacePreparationReason: String, CaseIterable, Equatable {
         case absent
         case bypassed
         case rootIdentityChanged = "root_identity_changed"
@@ -147,11 +147,11 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
         case cancellation
     }
 
-    protocol WorkspacePreparationSpan: Sendable {
+    package protocol WorkspacePreparationSpan: Sendable {
         func end()
     }
 
-    protocol WorkspacePreparationRecording: Sendable {
+    package protocol WorkspacePreparationRecording: Sendable {
         func beginPhase(_ phase: WorkspacePreparationPhase) -> any WorkspacePreparationSpan
         func increment(_ counter: WorkspacePreparationCounter, by amount: UInt64)
         func recordPreparationReason(_ reason: WorkspacePreparationReason)
@@ -163,11 +163,11 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
         }
     }
 
-    protocol WorkspacePreparationRecorderProviding: Sendable {
+    package protocol WorkspacePreparationRecorderProviding: Sendable {
         func currentRecorder() -> (any WorkspacePreparationRecording)?
     }
 
-    enum WorkspacePreparationInstrumentation {
+    package enum WorkspacePreparationInstrumentation {
         private final class Storage: @unchecked Sendable {
             let lock = NSLock()
             var provider: (any WorkspacePreparationRecorderProviding)?
@@ -175,7 +175,7 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
 
         private static let storage = Storage()
 
-        static func install(_ provider: any WorkspacePreparationRecorderProviding) {
+        package static func install(_ provider: any WorkspacePreparationRecorderProviding) {
             storage.lock.lock()
             storage.provider = provider
             storage.lock.unlock()
@@ -189,13 +189,13 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
         }
     }
 
-    protocol WorkspaceApplyEditsRebaseProbeRecording: Sendable {
+    package protocol WorkspaceApplyEditsRebaseProbeRecording: Sendable {
         func recordPublisherIngress(rootID: UUID, source: FileSystemDeltaPublicationSource, deltas: [FileSystemDelta])
         func recordStoreModification(rootID: UUID, fileID: UUID, generation: UInt64)
         func recordAppliedIndexModification(rootID: UUID, fileIDs: [UUID], generation: UInt64)
     }
 
-    enum WorkspaceApplyEditsRebaseProbeHooks {
+    package enum WorkspaceApplyEditsRebaseProbeHooks {
         private final class Storage: @unchecked Sendable {
             let lock = NSLock()
             var recorder: (any WorkspaceApplyEditsRebaseProbeRecording)?
@@ -203,7 +203,7 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
 
         private static let storage = Storage()
 
-        static func install(_ recorder: any WorkspaceApplyEditsRebaseProbeRecording) {
+        package static func install(_ recorder: any WorkspaceApplyEditsRebaseProbeRecording) {
             storage.lock.lock()
             storage.recorder = recorder
             storage.lock.unlock()
@@ -228,12 +228,12 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
         }
     }
 
-    protocol WorkspaceRootLoadFieldProviding: Sendable {
+    package protocol WorkspaceRootLoadFieldProviding: Sendable {
         func rootRecordCreatedFields(forPath path: String) -> [String: String]
         func firstPreparedChunkFields(forPath path: String) -> [String: String]
     }
 
-    enum WorkspaceRootLoadFieldHooks {
+    package enum WorkspaceRootLoadFieldHooks {
         private final class Storage: @unchecked Sendable {
             let lock = NSLock()
             var provider: (any WorkspaceRootLoadFieldProviding)?
@@ -241,7 +241,7 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
 
         private static let storage = Storage()
 
-        static func install(_ provider: any WorkspaceRootLoadFieldProviding) {
+        package static func install(_ provider: any WorkspaceRootLoadFieldProviding) {
             storage.lock.lock()
             storage.provider = provider
             storage.lock.unlock()
@@ -263,8 +263,8 @@ typealias WorkspaceSessionWorktreeBinding = RepoPromptDomainRuntime.AgentSession
     }
 #endif
 
-enum WorkspaceSessionBindingFingerprint {
-    static func make(_ bindings: [WorkspaceSessionWorktreeBinding]) -> String {
+package enum WorkspaceSessionBindingFingerprint {
+    package static func make(_ bindings: [WorkspaceSessionWorktreeBinding]) -> String {
         bindings
             .map { binding in
                 [
@@ -284,11 +284,11 @@ enum WorkspaceSessionBindingFingerprint {
     }
 }
 
-enum WorkspaceLookupContextResolutionError: LocalizedError {
+package enum WorkspaceLookupContextResolutionError: LocalizedError {
     case unavailableProjection
     case unknownBindingState
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .unavailableProjection:
             "The Agent session worktree projection is unavailable. The operation stopped rather than falling back to the canonical checkout."
@@ -298,10 +298,10 @@ enum WorkspaceLookupContextResolutionError: LocalizedError {
     }
 }
 
-struct WorkspaceSelectedFilesDiagnostics {
-    let perfRecorder: any AgentModePerfRecording
+package struct WorkspaceSelectedFilesDiagnostics {
+    package let perfRecorder: any AgentModePerfRecording
 
-    func timestampMSIfEnabled() -> Double? {
+    package func timestampMSIfEnabled() -> Double? {
         #if DEBUG
             perfRecorder.timestampMSIfEnabled()
         #else
@@ -309,7 +309,7 @@ struct WorkspaceSelectedFilesDiagnostics {
         #endif
     }
 
-    func elapsedFields(since startMS: Double?) -> [String: String] {
+    package func elapsedFields(since startMS: Double?) -> [String: String] {
         #if DEBUG
             guard let startMS else { return [:] }
             return ["duration": perfRecorder.formatElapsedMS(since: startMS)]
@@ -318,7 +318,7 @@ struct WorkspaceSelectedFilesDiagnostics {
         #endif
     }
 
-    func event(
+    package func event(
         _ name: String,
         fields: [String: String] = [:],
         includeStack: Bool = false
@@ -333,7 +333,7 @@ struct WorkspaceSelectedFilesDiagnostics {
         #endif
     }
 
-    func durationEvent(
+    package func durationEvent(
         _ name: String,
         startMS: Double?,
         fields: [String: String] = [:]
@@ -343,7 +343,7 @@ struct WorkspaceSelectedFilesDiagnostics {
         #endif
     }
 
-    static func shortID(_ id: UUID?) -> String {
+    package static func shortID(_ id: UUID?) -> String {
         #if DEBUG
             NoopAgentModePerfRecorder().shortID(id)
         #else
@@ -351,7 +351,7 @@ struct WorkspaceSelectedFilesDiagnostics {
         #endif
     }
 
-    static func selectionFields(_ selection: StoredSelection) -> [String: String] {
+    package static func selectionFields(_ selection: StoredSelection) -> [String: String] {
         #if DEBUG
             let nonEmptySlices = selection.slices.filter { !$0.value.isEmpty }
             let sliceRanges = nonEmptySlices.values.reduce(0) { $0 + $1.count }
@@ -381,19 +381,19 @@ struct WorkspaceSelectedFilesDiagnostics {
     }
 }
 
-struct WorkspaceRootBindingProjection: Equatable {
-    let sessionID: UUID
+package struct WorkspaceRootBindingProjection: Equatable {
+    package let sessionID: UUID
     let replacementsByLogicalRootPath: [String: BoundRoot]
     private let visibleLogicalRoots: [WorkspaceRootRef]
     private let lookupPhysicalRootPaths: Set<String>
 
-    struct BoundRoot: Equatable {
-        let logicalRoot: WorkspaceRootRef
-        let physicalRoot: WorkspaceRootRef
-        let binding: WorkspaceSessionWorktreeBinding
-        let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
+    package struct BoundRoot: Equatable {
+        package let logicalRoot: WorkspaceRootRef
+        package let physicalRoot: WorkspaceRootRef
+        package let binding: WorkspaceSessionWorktreeBinding
+        package let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
 
-        init(
+        package init(
             logicalRoot: WorkspaceRootRef,
             physicalRoot: WorkspaceRootRef,
             binding: WorkspaceSessionWorktreeBinding,
@@ -406,7 +406,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         }
     }
 
-    init(
+    package init(
         sessionID: UUID,
         boundRoots: [BoundRoot],
         visibleLogicalRoots: [WorkspaceRootRef] = [],
@@ -425,7 +425,7 @@ struct WorkspaceRootBindingProjection: Equatable {
             ?? Set(boundRoots.map(\.physicalRoot.standardizedFullPath))
     }
 
-    static func logicalAbsolutePath(
+    package static func logicalAbsolutePath(
         forPhysicalPath rawPath: String,
         binding: WorkspaceSessionWorktreeBinding
     ) -> String? {
@@ -442,7 +442,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         )
     }
 
-    var isEmpty: Bool {
+    package var isEmpty: Bool {
         replacementsByLogicalRootPath.isEmpty
     }
 
@@ -458,7 +458,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         Set(visibleLogicalRoots.map(\.standardizedFullPath)).subtracting(logicalRootPaths)
     }
 
-    var lookupRootScope: WorkspaceLookupRootScope {
+    package var lookupRootScope: WorkspaceLookupRootScope {
         .validatedSessionBoundWorkspace(
             canonicalRoots: Set(visibleLogicalRootRefs.filter {
                 canonicalRootPaths.contains($0.standardizedFullPath)
@@ -469,26 +469,26 @@ struct WorkspaceRootBindingProjection: Equatable {
         )
     }
 
-    var isFullyMaterialized: Bool {
+    package var isFullyMaterialized: Bool {
         lookupPhysicalRootPaths == physicalRootPaths
     }
 
-    var logicalRootRefs: [WorkspaceRootRef] {
+    package var logicalRootRefs: [WorkspaceRootRef] {
         replacementsByLogicalRootPath.values
             .map(\.logicalRoot)
             .sorted { $0.standardizedFullPath < $1.standardizedFullPath }
     }
 
-    var visibleLogicalRootRefs: [WorkspaceRootRef] {
+    package var visibleLogicalRootRefs: [WorkspaceRootRef] {
         visibleLogicalRoots.sorted { $0.standardizedFullPath < $1.standardizedFullPath }
     }
 
-    var physicalRootRefs: [WorkspaceRootRef] {
+    package var physicalRootRefs: [WorkspaceRootRef] {
         Array(Set(replacementsByLogicalRootPath.values.map(\.physicalRoot)))
             .sorted { $0.standardizedFullPath < $1.standardizedFullPath }
     }
 
-    var boundRootsForMetadata: [BoundRoot] {
+    package var boundRootsForMetadata: [BoundRoot] {
         replacementsByLogicalRootPath.values.sorted { lhs, rhs in
             if lhs.logicalRoot.standardizedFullPath != rhs.logicalRoot.standardizedFullPath {
                 return lhs.logicalRoot.standardizedFullPath < rhs.logicalRoot.standardizedFullPath
@@ -500,7 +500,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         }
     }
 
-    func translateInputPath(_ rawPath: String) -> String {
+    package func translateInputPath(_ rawPath: String) -> String {
         let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return rawPath }
         let expanded = (trimmed as NSString).expandingTildeInPath
@@ -535,11 +535,11 @@ struct WorkspaceRootBindingProjection: Equatable {
         )
     }
 
-    func translateInputPaths(_ paths: [String]) -> [String] {
+    package func translateInputPaths(_ paths: [String]) -> [String] {
         paths.map { translateInputPath($0) }
     }
 
-    func translateSliceInputs(_ slices: [WorkspaceSelectionSliceInput]) -> [WorkspaceSelectionSliceInput] {
+    package func translateSliceInputs(_ slices: [WorkspaceSelectionSliceInput]) -> [WorkspaceSelectionSliceInput] {
         slices.map { input in
             WorkspaceSelectionSliceInput(
                 path: translateInputPath(input.path),
@@ -548,7 +548,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         }
     }
 
-    func projectedLogicalRootMetadata(forPhysicalPath rawPath: String) -> (rootPath: String, pathWithinRoot: String)? {
+    package func projectedLogicalRootMetadata(forPhysicalPath rawPath: String) -> (rootPath: String, pathWithinRoot: String)? {
         let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
         guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
             return nil
@@ -558,7 +558,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         return (boundRoot.logicalRoot.standardizedFullPath, StandardizedPath.relative(relative))
     }
 
-    func projectedLogicalPathComponents(forPhysicalPath rawPath: String) -> (root: WorkspaceRootRef, relativePath: String)? {
+    package func projectedLogicalPathComponents(forPhysicalPath rawPath: String) -> (root: WorkspaceRootRef, relativePath: String)? {
         let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
         guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
             return nil
@@ -568,7 +568,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         return (boundRoot.logicalRoot, StandardizedPath.relative(relative))
     }
 
-    func projectedLogicalDisplayPath(forPhysicalPath rawPath: String, display: FilePathDisplay = .relative) -> String? {
+    package func projectedLogicalDisplayPath(forPhysicalPath rawPath: String, display: FilePathDisplay = .relative) -> String? {
         let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
         guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
             return nil
@@ -637,7 +637,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         )
     }
 
-    func logicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
+    package func logicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         var slices: [String: [LineRange]] = [:]
         for (path, ranges) in selection.slices {
             let logicalPath = logicalDisplayPath(forPhysicalPath: path, display: .full)
@@ -653,7 +653,7 @@ struct WorkspaceRootBindingProjection: Equatable {
         )
     }
 
-    func physicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
+    package func physicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         var slices: [String: [LineRange]] = [:]
         for (path, ranges) in selection.slices {
             let physicalPath = translateInputPath(path)
@@ -706,7 +706,7 @@ struct WorkspaceRootBindingProjection: Equatable {
             .max { $0.logicalRoot.standardizedFullPath.count < $1.logicalRoot.standardizedFullPath.count }
     }
 
-    func boundRoot(containingPhysicalAbsolutePath path: String) -> BoundRoot? {
+    package func boundRoot(containingPhysicalAbsolutePath path: String) -> BoundRoot? {
         let matches = boundRootsForMetadata.filter {
             path == $0.physicalRoot.standardizedFullPath || path.hasPrefix($0.physicalRoot.standardizedFullPath + "/")
         }
@@ -725,8 +725,8 @@ struct WorkspaceRootBindingProjection: Equatable {
     }
 }
 
-struct WorkspaceRootBindingProjectionPreparation {
-    let sessionID: UUID
+package struct WorkspaceRootBindingProjectionPreparation {
+    package let sessionID: UUID
     let bindings: [WorkspaceSessionWorktreeBinding]
     let visibleRoots: [WorkspaceRootRef]
     let logicalRootsByPath: [String: WorkspaceRootRef]
@@ -734,10 +734,10 @@ struct WorkspaceRootBindingProjectionPreparation {
     let startupContext: WorktreeStartupContext?
 }
 
-struct WorkspaceRootBindingProjectionMaterializer {
-    let store: WorkspaceFileContextStore
+package struct WorkspaceRootBindingProjectionMaterializer {
+    package let store: WorkspaceFileContextStore
 
-    func prepare(
+    package func prepare(
         sessionID: UUID,
         bindings: [WorkspaceSessionWorktreeBinding],
         startupContext: WorktreeStartupContext? = nil,
@@ -772,7 +772,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
         return preparation
     }
 
-    func prepare(
+    package func prepare(
         sessionID: UUID,
         bindings: [WorkspaceSessionWorktreeBinding],
         visibleRoots: [WorkspaceRootRef],
@@ -855,7 +855,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
         )
     }
 
-    func commit(
+    package func commit(
         _ preparation: WorkspaceRootBindingProjectionPreparation
     ) async throws -> WorkspaceRootBindingProjection? {
         let startMS = WorkspaceSelectedFilesDiagnostics(perfRecorder: store.perfRecorder).timestampMSIfEnabled()
@@ -955,7 +955,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
         }
     }
 
-    func abort(_ preparation: WorkspaceRootBindingProjectionPreparation) async {
+    package func abort(_ preparation: WorkspaceRootBindingProjectionPreparation) async {
         await store.abortSessionWorktreeOwnership(preparation.ownership)
     }
 
@@ -963,11 +963,11 @@ struct WorkspaceRootBindingProjectionMaterializer {
         _ = await store.releaseSessionWorktreeOwnership(ifOwnedBy: token)
     }
 
-    func release(sessionID: UUID) async {
+    package func release(sessionID: UUID) async {
         await store.releaseSessionWorktreeOwnership(ownerID: sessionID)
     }
 
-    func materialize(
+    package func materialize(
         sessionID: UUID,
         bindings: [WorkspaceSessionWorktreeBinding]
     ) async -> WorkspaceRootBindingProjection? {
@@ -980,7 +980,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
         }
     }
 
-    func materialize(
+    package func materialize(
         sessionID: UUID,
         bindings: [WorkspaceSessionWorktreeBinding],
         visibleRoots: [WorkspaceRootRef]
@@ -1120,37 +1120,37 @@ struct WorkspaceRootBindingProjectionMaterializer {
     }
 }
 
-struct WorkspaceLookupContext: Equatable {
-    let rootScope: WorkspaceLookupRootScope
-    let bindingProjection: WorkspaceRootBindingProjection?
+package struct WorkspaceLookupContext: Equatable {
+    package let rootScope: WorkspaceLookupRootScope
+    package let bindingProjection: WorkspaceRootBindingProjection?
 
     static let visibleWorkspace = WorkspaceLookupContext(rootScope: .visibleWorkspace, bindingProjection: nil)
 
-    func translateInputPath(_ path: String) -> String {
+    package func translateInputPath(_ path: String) -> String {
         bindingProjection?.translateInputPath(path) ?? path
     }
 
-    func translateInputPaths(_ paths: [String]) -> [String] {
+    package func translateInputPaths(_ paths: [String]) -> [String] {
         bindingProjection?.translateInputPaths(paths) ?? paths
     }
 
-    func translateSliceInputs(_ slices: [WorkspaceSelectionSliceInput]) -> [WorkspaceSelectionSliceInput] {
+    package func translateSliceInputs(_ slices: [WorkspaceSelectionSliceInput]) -> [WorkspaceSelectionSliceInput] {
         bindingProjection?.translateSliceInputs(slices) ?? slices
     }
 
-    func displayPath(forPhysicalPath path: String, display: FilePathDisplay = .relative) -> String {
+    package func displayPath(forPhysicalPath path: String, display: FilePathDisplay = .relative) -> String {
         bindingProjection?.logicalDisplayPath(forPhysicalPath: path, display: display) ?? path
     }
 
-    func logicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
+    package func logicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         bindingProjection?.logicalizeSelection(selection) ?? selection
     }
 
-    func physicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
+    package func physicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         bindingProjection?.physicalizeSelection(selection) ?? selection
     }
 
-    func exactFileNamespace(storeRoots: [WorkspaceRootRef]) -> WorkspaceExactFileNamespace {
+    package func exactFileNamespace(storeRoots: [WorkspaceRootRef]) -> WorkspaceExactFileNamespace {
         guard let bindingProjection else { return .identity(roots: storeRoots) }
         let boundRoots = bindingProjection.boundRootsForMetadata
         let visibleLogicalRoots = bindingProjection.visibleLogicalRootRefs
@@ -1196,7 +1196,7 @@ struct WorkspaceLookupContext: Equatable {
         return WorkspaceExactFileNamespace(rootBindings: bindings)
     }
 
-    func domainMutationPhysicalRootMappings(
+    package func domainMutationPhysicalRootMappings(
         store: WorkspaceFileContextStore
     ) async -> [DomainMutationPhysicalRootMapping] {
         let roots = await store.rootRefs(scope: rootScope)
@@ -1215,7 +1215,7 @@ struct WorkspaceLookupContext: Equatable {
 }
 
 /// App-independent diagnostic events. The app adapter owns counters, task-local tags, and logs.
-enum WorkspaceStartupDiagnosticEvent {
+package enum WorkspaceStartupDiagnosticEvent {
     case phase(WorktreeStartupPhaseEvent)
     case inventoryComparison(matched: Bool)
     case shadowFallback(WorkspaceRootSeedFallbackReason)
@@ -1250,7 +1250,7 @@ enum WorkspaceStartupDiagnosticEvent {
     #endif
 }
 
-protocol WorkspaceStartupEventRecording: Sendable {
+package protocol WorkspaceStartupEventRecording: Sendable {
     func record(_ event: WorkspaceStartupDiagnosticEvent)
     #if DEBUG
         var currentBenchmarkMetricTag: WorkspaceBenchmarkMetricTag? {
@@ -1259,14 +1259,14 @@ protocol WorkspaceStartupEventRecording: Sendable {
     #endif
 }
 
-extension WorktreeStartupFeatureFlags {
+package extension WorktreeStartupFeatureFlags {
     /// A standalone store has no application preferences domain.
     static func standaloneOperationalDefault() -> Self {
         Self(observeDiffSeededWorktreeStartup: true, serveDiffSeededWorktreeStartup: true)
     }
 }
 
-enum WorkspaceContextStartupInstrumentation {
+package enum WorkspaceContextStartupInstrumentation {
     #if DEBUG
         typealias ReceiptProjectionDecision = WorkspaceReceiptProjectionDecision
         typealias ReceiptConsumptionDecision = WorkspaceReceiptConsumptionDecision
@@ -1280,7 +1280,7 @@ enum WorkspaceContextStartupInstrumentation {
 
     private static let storage = Storage()
 
-    static func install(_ recorder: (any WorkspaceStartupEventRecording)?) {
+    package static func install(_ recorder: (any WorkspaceStartupEventRecording)?) {
         storage.lock.lock()
         storage.recorder = recorder
         storage.lock.unlock()

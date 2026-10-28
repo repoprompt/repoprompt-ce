@@ -8,7 +8,7 @@ import RepoPromptShared
 ///
 /// Production access is intentionally lazy and inert until an explicit codemap caller requests it.
 /// Tests and benchmarks should construct isolated runtimes with explicit temporary roots instead.
-final class CodeMapArtifactRuntime: @unchecked Sendable {
+package final class CodeMapArtifactRuntime: @unchecked Sendable {
     let artifactStore: CodeMapArtifactStore
     let locatorStore: GitBlobCodeMapLocatorStore
     let manifestStore: CodeMapRootManifestStore
@@ -88,7 +88,7 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         )
     }
 
-    static func makeProcessWideProvider(
+    package static func makeProcessWideProvider(
         bindingServicesFactory: @escaping @Sendable (Data) -> WorkspaceCodemapBindingEngineServices,
         identity: MCPFilesystemIdentity,
         applicationSupportRootURL: URL,
@@ -151,7 +151,7 @@ enum CodeMapRepositoryNamespaceSaltSynchronizationOperation: Equatable {
     case rootDirectory
 }
 
-struct CodeMapRepositoryNamespaceSaltStoreHooks {
+package struct CodeMapRepositoryNamespaceSaltStoreHooks {
     var beforePublish: @Sendable () -> Void
     var synchronize: @Sendable (Int32, CodeMapRepositoryNamespaceSaltSynchronizationOperation) -> Int32
 
@@ -166,15 +166,15 @@ struct CodeMapRepositoryNamespaceSaltStoreHooks {
         self.synchronize = synchronize
     }
 
-    static let none = CodeMapRepositoryNamespaceSaltStoreHooks()
+    package static let none = CodeMapRepositoryNamespaceSaltStoreHooks()
 }
 
 /// Persists the private installation salt used to derive path-free Git repository namespaces.
 /// Product/build identity separates debug and release storage without incorporating repository paths.
-enum CodeMapRepositoryNamespaceSaltStore {
+package enum CodeMapRepositoryNamespaceSaltStore {
     private static let fileMode = mode_t(S_IRUSR | S_IWUSR)
 
-    static func loadOrCreate(
+    package static func loadOrCreate(
         rootURL: URL,
         identity: MCPFilesystemIdentity,
         hooks: CodeMapRepositoryNamespaceSaltStoreHooks = .none
@@ -333,8 +333,8 @@ enum CodeMapRepositoryNamespaceSaltStore {
     }
 }
 
-final class CodeMapArtifactRuntimeProvider: @unchecked Sendable {
-    typealias Factory = @Sendable () throws -> CodeMapArtifactRuntime
+package final class CodeMapArtifactRuntimeProvider: @unchecked Sendable {
+    package typealias Factory = @Sendable () throws -> CodeMapArtifactRuntime
 
     private let lock = NSLock()
     private let factory: Factory
@@ -344,7 +344,7 @@ final class CodeMapArtifactRuntimeProvider: @unchecked Sendable {
         self.factory = factory
     }
 
-    func runtime() throws -> CodeMapArtifactRuntime {
+    package func runtime() throws -> CodeMapArtifactRuntime {
         lock.lock()
         defer { lock.unlock() }
 

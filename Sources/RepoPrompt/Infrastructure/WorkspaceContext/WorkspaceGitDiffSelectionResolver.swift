@@ -2,18 +2,18 @@ import Foundation
 import RepoPromptFoundation
 import RepoPromptWorkspaceCore
 
-enum SelectedGitDiffFolderPolicy {
+package enum SelectedGitDiffFolderPolicy {
     case filesOnly
     case expandFolders
 }
 
-struct WorkspaceSelectedGitPathResolution: Equatable {
-    let paths: [String]
-    let unresolvedCandidates: [String]
+package struct WorkspaceSelectedGitPathResolution: Equatable {
+    package let paths: [String]
+    package let unresolvedCandidates: [String]
 }
 
-enum WorkspaceGitDiffSelectionResolver {
-    static func candidates(from selection: StoredSelection) -> [String] {
+package enum WorkspaceGitDiffSelectionResolver {
+    package static func candidates(from selection: StoredSelection) -> [String] {
         var candidates = StoredSelectionPathNormalization.standardizedPaths(selection.selectedPaths)
         var seen = Set(candidates)
         for (path, ranges) in StoredSelectionPathNormalization.standardizedSlices(selection.slices) where !ranges.isEmpty {
@@ -42,7 +42,7 @@ enum WorkspaceGitDiffSelectionResolver {
         ).paths
     }
 
-    static func resolveSelectedGitDiffPaths(
+    package static func resolveSelectedGitDiffPaths(
         for selection: StoredSelection,
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope,
@@ -174,7 +174,7 @@ enum WorkspaceGitDiffSelectionResolver {
     }
 }
 
-extension WorkspaceLookupRootScope {
+package extension WorkspaceLookupRootScope {
     var allowsSelectedGitDiffFilesystemFallback: Bool {
         switch self {
         case .sessionBoundWorkspace, .validatedSessionBoundWorkspace:

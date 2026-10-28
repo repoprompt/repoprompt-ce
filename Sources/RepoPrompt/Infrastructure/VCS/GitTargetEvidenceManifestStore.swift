@@ -4,8 +4,8 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptVCS
 
-struct GitTargetEvidenceResourcePolicy: Equatable {
-    static let `default` = GitTargetEvidenceResourcePolicy()
+package struct GitTargetEvidenceResourcePolicy: Equatable {
+    package static let `default` = GitTargetEvidenceResourcePolicy()
 
     let maximumBufferedRecordBytes: Int
     let maximumRecordsPerBatch: Int
@@ -171,7 +171,7 @@ struct GitTargetEvidenceSpillFormat<Codec: GitTargetEvidenceRecordCodec>:
     }
 }
 
-final class GitTargetEvidenceManifestStore: @unchecked Sendable {
+package final class GitTargetEvidenceManifestStore: @unchecked Sendable {
     private let spillStore: SpillBackedSortedArtifactStore
 
     var directoryURL: URL {
@@ -193,7 +193,7 @@ final class GitTargetEvidenceManifestStore: @unchecked Sendable {
         }
     }
 
-    func makeTreeDeltaWriter(
+    package func makeTreeDeltaWriter(
         identity: GitTargetEvidenceArtifactIdentity,
         resourcePolicy: GitTargetEvidenceResourcePolicy = .default
     ) throws -> GitTargetTreeDeltaEvidenceWriter {
@@ -203,7 +203,7 @@ final class GitTargetEvidenceManifestStore: @unchecked Sendable {
         return try makeWriter(codec: GitTargetTreeDeltaRecordCodec.self, identity: identity, policy: resourcePolicy)
     }
 
-    func makeIndexWriter(
+    package func makeIndexWriter(
         identity: GitTargetEvidenceArtifactIdentity,
         resourcePolicy: GitTargetEvidenceResourcePolicy = .default
     ) throws -> GitTargetIndexEvidenceWriter {
@@ -213,7 +213,7 @@ final class GitTargetEvidenceManifestStore: @unchecked Sendable {
         return try makeWriter(codec: GitTargetIndexRecordCodec.self, identity: identity, policy: resourcePolicy)
     }
 
-    func makeStatusWriter(
+    package func makeStatusWriter(
         identity: GitTargetEvidenceArtifactIdentity,
         resourcePolicy: GitTargetEvidenceResourcePolicy = .default
     ) throws -> GitTargetStatusEvidenceWriter {
@@ -250,7 +250,7 @@ final class GitTargetEvidenceManifestStore: @unchecked Sendable {
     }
 }
 
-actor GitTargetEvidenceManifestWriter<Codec: GitTargetEvidenceRecordCodec> {
+package actor GitTargetEvidenceManifestWriter<Codec: GitTargetEvidenceRecordCodec> {
     private let writer: SpillBackedSortedArtifactWriter<GitTargetEvidenceSpillFormat<Codec>>
     private var closed = false
 
@@ -260,7 +260,7 @@ actor GitTargetEvidenceManifestWriter<Codec: GitTargetEvidenceRecordCodec> {
         self.writer = writer
     }
 
-    func append(_ record: Codec.Record) async throws {
+    package func append(_ record: Codec.Record) async throws {
         guard !closed else { throw GitTargetEvidenceManifestError.closed }
         do { try await writer.append(record) }
         catch {
@@ -269,7 +269,7 @@ actor GitTargetEvidenceManifestWriter<Codec: GitTargetEvidenceRecordCodec> {
         }
     }
 
-    func append(contentsOf records: [Codec.Record]) async throws {
+    package func append(contentsOf records: [Codec.Record]) async throws {
         guard !closed else { throw GitTargetEvidenceManifestError.closed }
         do { try await writer.append(contentsOf: records) }
         catch {
@@ -278,20 +278,20 @@ actor GitTargetEvidenceManifestWriter<Codec: GitTargetEvidenceRecordCodec> {
         }
     }
 
-    func finish() async throws -> GitTargetEvidenceManifestLease<Codec> {
+    package func finish() async throws -> GitTargetEvidenceManifestLease<Codec> {
         guard !closed else { throw GitTargetEvidenceManifestError.closed }
         closed = true
         return try await GitTargetEvidenceManifestLease(spillLease: writer.finish())
     }
 
-    func cancel() async {
+    package func cancel() async {
         guard !closed else { return }
         closed = true
         await writer.cancel()
     }
 }
 
-final class GitTargetEvidenceManifestLease<Codec: GitTargetEvidenceRecordCodec>:
+package final class GitTargetEvidenceManifestLease<Codec: GitTargetEvidenceRecordCodec>:
     @unchecked Sendable
 {
     let fileURL: URL
@@ -337,12 +337,12 @@ final class GitTargetEvidenceManifestLease<Codec: GitTargetEvidenceRecordCodec>:
     }
 }
 
-typealias GitTargetTreeDeltaEvidenceWriter = GitTargetEvidenceManifestWriter<GitTargetTreeDeltaRecordCodec>
-typealias GitTargetIndexEvidenceWriter = GitTargetEvidenceManifestWriter<GitTargetIndexRecordCodec>
-typealias GitTargetStatusEvidenceWriter = GitTargetEvidenceManifestWriter<GitTargetStatusRecordCodec>
-typealias GitTargetTreeDeltaEvidenceLease = GitTargetEvidenceManifestLease<GitTargetTreeDeltaRecordCodec>
-typealias GitTargetIndexEvidenceLease = GitTargetEvidenceManifestLease<GitTargetIndexRecordCodec>
-typealias GitTargetStatusEvidenceLease = GitTargetEvidenceManifestLease<GitTargetStatusRecordCodec>
+package typealias GitTargetTreeDeltaEvidenceWriter = GitTargetEvidenceManifestWriter<GitTargetTreeDeltaRecordCodec>
+package typealias GitTargetIndexEvidenceWriter = GitTargetEvidenceManifestWriter<GitTargetIndexRecordCodec>
+package typealias GitTargetStatusEvidenceWriter = GitTargetEvidenceManifestWriter<GitTargetStatusRecordCodec>
+package typealias GitTargetTreeDeltaEvidenceLease = GitTargetEvidenceManifestLease<GitTargetTreeDeltaRecordCodec>
+package typealias GitTargetIndexEvidenceLease = GitTargetEvidenceManifestLease<GitTargetIndexRecordCodec>
+package typealias GitTargetStatusEvidenceLease = GitTargetEvidenceManifestLease<GitTargetStatusRecordCodec>
 
 /// Strongly owns one coherent target-evidence set. Readers independently retain
 /// their constituent lease, so dropping the bundle cannot unlink an artifact

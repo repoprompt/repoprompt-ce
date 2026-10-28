@@ -66,14 +66,14 @@ private actor RegexCache {
 /// `lineNumber` is **0‑based** (the first line in the file is numbered `0`).
 /// MCP tool output converts to 1-based line numbers for display (`file_search`),
 /// while internal indexing stays 0-based for array operations.
-struct SearchMatch: Hashable, Codable {
-    let filePath: String
-    let lineNumber: Int // 0‑based
-    let lineText: String // original text (no newline)
-    let contextBefore: [String]? // Lines before the match (when contextLines > 0)
-    let contextAfter: [String]? // Lines after the match (when contextLines > 0)
+package struct SearchMatch: Hashable, Codable {
+    package let filePath: String
+    package let lineNumber: Int // 0‑based
+    package let lineText: String // original text (no newline)
+    package let contextBefore: [String]? // Lines before the match (when contextLines > 0)
+    package let contextAfter: [String]? // Lines after the match (when contextLines > 0)
 
-    init(filePath: String, lineNumber: Int, lineText: String, contextBefore: [String]? = nil, contextAfter: [String]? = nil) {
+    package init(filePath: String, lineNumber: Int, lineText: String, contextBefore: [String]? = nil, contextAfter: [String]? = nil) {
         self.filePath = filePath
         self.lineNumber = lineNumber
         self.lineText = lineText
@@ -92,14 +92,14 @@ struct SearchMatch: Hashable, Codable {
  * `.content` – search **only** inside files.
  * `.both`    – execute *both* path and content search stages.
  */
-enum SearchMode: String, Codable {
+package enum SearchMode: String, Codable {
     case auto, path, content, both
 }
 
 /// Enhanced search options for fine-grained control
-struct SearchOptions {
+package struct SearchOptions {
     var mode: SearchMode = .auto
-    var caseInsensitive: Bool = true
+    package var caseInsensitive: Bool = true
     var wholeWord: Bool = false
     var includeExtensions: [String] = [] // e.g., [".js", ".ts", ".swift"]
     var excludePatterns: [String] = [] // e.g., ["node_modules", ".git", "*.log"]
@@ -116,7 +116,7 @@ struct PatternErrorInfo: Codable {
     let errorType: String
     let description: String
 
-    init(_ error: RegexPatternFailure) {
+    package init(_ error: RegexPatternFailure) {
         errorType = String(reflecting: Swift.type(of: error))
         description = error.localizedDescription
     }
@@ -124,29 +124,29 @@ struct PatternErrorInfo: Codable {
 
 /// Codable wrapper for per-file errors
 struct PerFileError: Codable {
-    let filePath: String
+    package let filePath: String
     let error: PatternErrorInfo
 
-    init(filePath: String, error: RegexPatternFailure) {
+    package init(filePath: String, error: RegexPatternFailure) {
         self.filePath = filePath
         self.error = PatternErrorInfo(error)
     }
 }
 
 /// Result returned by the new `FileSearchActor.searchUnified`.
-struct SearchResults: Codable {
+package struct SearchResults: Codable {
     /// Absolute file paths whose *path* matched the pattern (may be omitted).
-    var paths: [String]?
+    package var paths: [String]?
     /// Individual in-file hits (same payload as `SearchMatch`, may be omitted).
-    var matches: [SearchMatch]?
+    package var matches: [SearchMatch]?
     /// Number of files that contained content matches (optional when count-only)
-    var contentFileCount: Int?
+    package var contentFileCount: Int?
     /// Total count of matches (useful for count-only mode)
-    var totalCount: Int?
+    package var totalCount: Int?
     /// Number of files actually searched after all filters are applied.
-    var searchedFileCount: Int?
+    package var searchedFileCount: Int?
     /// Number of files admitted by the path scope before extension/exclude filtering.
-    var scopedFileCount: Int?
+    package var scopedFileCount: Int?
     /// Error that occurred during path search phase
     var pathError: PatternErrorInfo?
     /// Error that occurred during content search phase
@@ -154,9 +154,9 @@ struct SearchResults: Codable {
     /// Per-file errors that occurred during scanning
     var perFileErrors: [PerFileError]?
     /// Optional warning surfaced when the requested pattern was implicitly repaired.
-    var warningMessage: String?
+    package var warningMessage: String?
 
-    init(
+    package init(
         paths: [String] = [],
         matches: [SearchMatch] = [],
         contentFileCount: Int? = nil,
@@ -424,7 +424,7 @@ private struct SearchScanPlan {
     let contentFreshnessPolicy: FileContentFreshnessPolicy
 }
 
-protocol WorkspaceSearchFileProjection: AnyObject {
+package protocol WorkspaceSearchFileProjection: AnyObject {
     var id: UUID { get }
     var name: String { get }
     var relativePath: String { get }
@@ -565,7 +565,7 @@ struct OrderedSearchBatchWindow {
     private(set) var nextBatchToEnqueue = 0
     private(set) var nextBatchToDrain = 0
 
-    init(batchCount: Int, maxEnqueueLead: Int) {
+    package init(batchCount: Int, maxEnqueueLead: Int) {
         precondition(batchCount >= 0)
         precondition(maxEnqueueLead > 0)
         self.batchCount = batchCount
@@ -591,7 +591,7 @@ struct OrderedSearchBatchWindow {
 }
 
 /// Ripgrep-style asynchronous searcher, fully cancellable.
-actor FileSearchActor {
+package actor FileSearchActor {
     static func pathSearchInputPrecedes(_ lhsPath: String, _ rhsPath: String) -> Bool {
         WorkspaceFileContextStore.compareUTF8Binary(lhsPath, rhsPath) == .orderedAscending
     }
@@ -994,7 +994,7 @@ actor FileSearchActor {
     // MARK: - Public entry points ----------------------------------------------
 
     /// Enhanced search with full options support and auto-correction reporting
-    func search(
+    package func search(
         pattern: String,
         isRegex: Bool = false,
         wasAutoCorrected: inout Bool?,
@@ -1013,7 +1013,7 @@ actor FileSearchActor {
         return result.matches
     }
 
-    func search(
+    package func search(
         pattern: String,
         isRegex: Bool = false,
         wasAutoCorrected: inout Bool?,
@@ -1174,7 +1174,7 @@ actor FileSearchActor {
     }
 
     /// Enhanced search with full options support (backward compatibility)
-    func search(
+    package func search(
         pattern: String,
         isRegex: Bool = false,
         options: SearchOptions = SearchOptions(),
@@ -1190,7 +1190,7 @@ actor FileSearchActor {
         )
     }
 
-    func search(
+    package func search(
         pattern: String,
         isRegex: Bool = false,
         options: SearchOptions = SearchOptions(),
@@ -3069,7 +3069,7 @@ actor FileSearchActor {
     // MARK: - Helper to detect regex patterns  ------------------------------
 
     /// Detects if a pattern contains regex syntax that should trigger regex mode
-    static func containsRegexSyntax(_ pattern: String) -> Bool {
+    package static func containsRegexSyntax(_ pattern: String) -> Bool {
         if RegexToolkit.usesPCREOnlyFeatures(pattern) {
             return true
         }

@@ -1,23 +1,23 @@
 import Foundation
 
-struct WorkspaceCodemapAutomaticSelectionSourceIdentity: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let fileID: UUID
+package struct WorkspaceCodemapAutomaticSelectionSourceIdentity: Hashable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let fileID: UUID
     let catalogGeneration: UInt64
-    let requestGeneration: UInt64
+    package let requestGeneration: UInt64
 }
 
-struct WorkspaceCodemapAutomaticSelectionTarget: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let fileID: UUID
+package struct WorkspaceCodemapAutomaticSelectionTarget: Hashable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let fileID: UUID
     let catalogGeneration: UInt64
-    let requestGeneration: UInt64
-    let logicalPath: WorkspaceCodemapLogicalPresentationPath
+    package let requestGeneration: UInt64
+    package let logicalPath: WorkspaceCodemapLogicalPresentationPath
 }
 
 struct WorkspaceCodemapAutomaticSelectionGraphSeed: Hashable {
-    let fileID: UUID
-    let requestGeneration: UInt64
+    package let fileID: UUID
+    package let requestGeneration: UInt64
 }
 
 enum WorkspaceCodemapAutomaticSelectionGraphSourceState: Hashable {
@@ -30,26 +30,26 @@ enum WorkspaceCodemapAutomaticSelectionGraphSourceState: Hashable {
 }
 
 struct WorkspaceCodemapAutomaticSelectionGraphSource: Hashable {
-    let fileID: UUID
-    let requestGeneration: UInt64
+    package let fileID: UUID
+    package let requestGeneration: UInt64
     let state: WorkspaceCodemapAutomaticSelectionGraphSourceState
 }
 
 struct WorkspaceCodemapAutomaticSelectionGraphTarget: Hashable {
-    let fileID: UUID
-    let requestGeneration: UInt64
+    package let fileID: UUID
+    package let requestGeneration: UInt64
     let standardizedRelativePath: String
 }
 
 struct WorkspaceCodemapAutomaticSelectionGraphQuery: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
+    package let rootEpoch: WorkspaceCodemapRootEpoch
     let sources: [WorkspaceCodemapAutomaticSelectionGraphSeed]
     let maximumTargetCount: Int
     let maximumResolutionCount: Int
     let maximumReferenceFailureCount: Int
     let maximumByteCount: Int
 
-    init(
+    package init(
         rootEpoch: WorkspaceCodemapRootEpoch,
         sources: [WorkspaceCodemapAutomaticSelectionGraphSeed],
         maximumTargetCount: Int,
@@ -71,19 +71,19 @@ struct WorkspaceCodemapAutomaticSelectionGraphQuery: Hashable {
 }
 
 struct WorkspaceCodemapAutomaticSelectionGraphQueryResult: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let receipt: WorkspaceCodemapGraphSnapshotReceipt
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let receipt: WorkspaceCodemapGraphSnapshotReceipt
     let coverage: WorkspaceCodemapGraphCatalogCoverage
     let freshness: WorkspaceCodemapGraphSnapshotFreshness
-    let reconciling: Bool
+    package let reconciling: Bool
     let sources: [WorkspaceCodemapAutomaticSelectionGraphSource]
-    let targets: [WorkspaceCodemapAutomaticSelectionGraphTarget]
+    package let targets: [WorkspaceCodemapAutomaticSelectionGraphTarget]
     let resolutionCount: Int
     let referenceFailureCount: Int
     let materializedByteCount: Int
 }
 
-enum WorkspaceCodemapAutomaticSelectionBudgetReason: Hashable {
+package enum WorkspaceCodemapAutomaticSelectionBudgetReason: Hashable {
     case sourceLimit(attempted: Int, limit: Int)
     case uniqueSourceLimit(attempted: Int, limit: Int)
     case sourceIssueLimit(attempted: Int, limit: Int)
@@ -104,14 +104,14 @@ enum WorkspaceCodemapAutomaticSelectionGraphDisposition: Hashable {
     case cancelled
 }
 
-enum WorkspaceCodemapAutomaticSelectionStatus: String, Hashable {
+package enum WorkspaceCodemapAutomaticSelectionStatus: String, Hashable {
     case ok
     case partial
     case pending
     case unavailable
 }
 
-enum WorkspaceCodemapAutomaticSelectionIssue: Equatable {
+package enum WorkspaceCodemapAutomaticSelectionIssue: Equatable {
     case emptySources
     case sourceOutsideRootScope(WorkspaceCodemapAutomaticSelectionSourceIdentity)
     case sourceNotCataloged(WorkspaceCodemapAutomaticSelectionSourceIdentity)
@@ -143,13 +143,13 @@ enum WorkspaceCodemapAutomaticSelectionIssue: Equatable {
     case budget(WorkspaceCodemapAutomaticSelectionBudgetReason)
 }
 
-enum WorkspaceCodemapAutomaticSelectionAggregateCoverage: Equatable {
+package enum WorkspaceCodemapAutomaticSelectionAggregateCoverage: Equatable {
     case ok
     case partial([WorkspaceCodemapAutomaticSelectionIssue])
     case pending([WorkspaceCodemapAutomaticSelectionIssue])
     case unavailable([WorkspaceCodemapAutomaticSelectionIssue])
 
-    var status: WorkspaceCodemapAutomaticSelectionStatus {
+    package var status: WorkspaceCodemapAutomaticSelectionStatus {
         switch self {
         case .ok: .ok
         case .partial: .partial
@@ -159,43 +159,43 @@ enum WorkspaceCodemapAutomaticSelectionAggregateCoverage: Equatable {
     }
 }
 
-struct WorkspaceCodemapAutomaticSelectionRootReceipt: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
+package struct WorkspaceCodemapAutomaticSelectionRootReceipt: Hashable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
     let graphReceipt: WorkspaceCodemapGraphSnapshotReceipt
     let sources: [WorkspaceCodemapAutomaticSelectionGraphSeed]
-    let targets: [WorkspaceCodemapAutomaticSelectionTarget]
+    package let targets: [WorkspaceCodemapAutomaticSelectionTarget]
 
     var affectedFileIDs: Set<UUID> {
         Set(sources.map(\.fileID)).union(targets.map(\.fileID))
     }
 }
 
-struct WorkspaceCodemapAutomaticSelectionReceipt: Hashable {
+package struct WorkspaceCodemapAutomaticSelectionReceipt: Hashable {
     let rootScope: WorkspaceLookupRootScope
     let rootScopeEpochs: [WorkspaceCodemapRootEpoch]
-    let roots: [WorkspaceCodemapAutomaticSelectionRootReceipt]
+    package let roots: [WorkspaceCodemapAutomaticSelectionRootReceipt]
 }
 
-struct WorkspaceCodemapAutomaticSelectionRootResult: Equatable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let status: WorkspaceCodemapAutomaticSelectionStatus
-    let targets: [WorkspaceCodemapAutomaticSelectionTarget]
+package struct WorkspaceCodemapAutomaticSelectionRootResult: Equatable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let status: WorkspaceCodemapAutomaticSelectionStatus
+    package let targets: [WorkspaceCodemapAutomaticSelectionTarget]
     let sources: [WorkspaceCodemapAutomaticSelectionGraphSource]
-    let issues: [WorkspaceCodemapAutomaticSelectionIssue]
+    package let issues: [WorkspaceCodemapAutomaticSelectionIssue]
     let coverage: WorkspaceCodemapGraphCatalogCoverage?
     let graphTargetCount: Int
     let graphResolutionCount: Int
     let graphReferenceFailureCount: Int
     let graphByteCount: Int
-    let receipt: WorkspaceCodemapAutomaticSelectionRootReceipt?
+    package let receipt: WorkspaceCodemapAutomaticSelectionRootReceipt?
 }
 
-struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
-    let roots: [WorkspaceCodemapAutomaticSelectionRootResult]
+package struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
+    package let roots: [WorkspaceCodemapAutomaticSelectionRootResult]
     let aggregateCoverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage
-    let receipt: WorkspaceCodemapAutomaticSelectionReceipt?
+    package let receipt: WorkspaceCodemapAutomaticSelectionReceipt?
 
-    init(
+    package init(
         roots: [WorkspaceCodemapAutomaticSelectionRootResult],
         aggregateCoverage: WorkspaceCodemapAutomaticSelectionAggregateCoverage? = nil,
         receipt: WorkspaceCodemapAutomaticSelectionReceipt? = nil
@@ -205,16 +205,16 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
         self.receipt = receipt
     }
 
-    var status: WorkspaceCodemapAutomaticSelectionStatus {
+    package var status: WorkspaceCodemapAutomaticSelectionStatus {
         aggregateCoverage.status
     }
 
     /// Useful targets survive mixed-root partial, pending, and unavailable results.
-    var targets: [WorkspaceCodemapAutomaticSelectionTarget] {
+    package var targets: [WorkspaceCodemapAutomaticSelectionTarget] {
         roots.flatMap(\.targets).sorted(by: automaticSelectionTargetPrecedes)
     }
 
-    var issues: [WorkspaceCodemapAutomaticSelectionIssue] {
+    package var issues: [WorkspaceCodemapAutomaticSelectionIssue] {
         roots.flatMap(\.issues).sorted(by: automaticSelectionIssuePrecedes)
     }
 
@@ -233,35 +233,35 @@ struct WorkspaceCodemapAutomaticSelectionResult: Equatable {
     }
 }
 
-enum WorkspaceCodemapAutomaticSelectionRootRevalidation: Equatable {
+package enum WorkspaceCodemapAutomaticSelectionRootRevalidation: Equatable {
     case valid(rootEpoch: WorkspaceCodemapRootEpoch, targets: [WorkspaceCodemapAutomaticSelectionTarget])
     case invalid(rootEpoch: WorkspaceCodemapRootEpoch, issues: [WorkspaceCodemapAutomaticSelectionIssue])
 }
 
-struct WorkspaceCodemapAutomaticSelectionRevalidation: Equatable {
-    let roots: [WorkspaceCodemapAutomaticSelectionRootRevalidation]
-    let validTargets: [WorkspaceCodemapAutomaticSelectionTarget]
-    let issues: [WorkspaceCodemapAutomaticSelectionIssue]
+package struct WorkspaceCodemapAutomaticSelectionRevalidation: Equatable {
+    package let roots: [WorkspaceCodemapAutomaticSelectionRootRevalidation]
+    package let validTargets: [WorkspaceCodemapAutomaticSelectionTarget]
+    package let issues: [WorkspaceCodemapAutomaticSelectionIssue]
 }
 
-struct WorkspaceCodemapRootScopedFileSlot: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let fileID: UUID
+package struct WorkspaceCodemapRootScopedFileSlot: Hashable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let fileID: UUID
 
-    init(rootEpoch: WorkspaceCodemapRootEpoch, fileID: UUID) {
+    package init(rootEpoch: WorkspaceCodemapRootEpoch, fileID: UUID) {
         self.rootEpoch = rootEpoch
         self.fileID = fileID
     }
 
-    init(target: WorkspaceCodemapAutomaticSelectionTarget) {
+    package init(target: WorkspaceCodemapAutomaticSelectionTarget) {
         self.init(rootEpoch: target.rootEpoch, fileID: target.fileID)
     }
 
-    init(ticket: WorkspaceCodemapArtifactDemandTicket) {
+    package init(ticket: WorkspaceCodemapArtifactDemandTicket) {
         self.init(rootEpoch: ticket.rootEpoch, fileID: ticket.fileID)
     }
 
-    init(source: WorkspaceCodemapAutomaticSelectionSourceIdentity) {
+    package init(source: WorkspaceCodemapAutomaticSelectionSourceIdentity) {
         self.init(rootEpoch: source.rootEpoch, fileID: source.fileID)
     }
 }
@@ -294,10 +294,10 @@ func automaticSelectionIssuePrecedes(
     String(reflecting: lhs) < String(reflecting: rhs)
 }
 
-struct WorkspaceCodemapSelectionGraphFactory {
+package struct WorkspaceCodemapSelectionGraphFactory {
     private let makeGraph: @Sendable (WorkspaceCodemapRootEpoch) -> WorkspaceCodemapSelectionGraph
 
-    init(
+    package init(
         makeGraph: @escaping @Sendable (WorkspaceCodemapRootEpoch) -> WorkspaceCodemapSelectionGraph
     ) {
         self.makeGraph = makeGraph
@@ -307,13 +307,13 @@ struct WorkspaceCodemapSelectionGraphFactory {
         makeGraph(rootEpoch)
     }
 
-    static let production = Self { rootEpoch in
+    package static let production = Self { rootEpoch in
         WorkspaceCodemapSelectionGraph(rootEpoch: rootEpoch)
     }
 }
 
-struct WorkspaceCodemapAutomaticSelectionBudgetPolicy: Hashable {
-    static let initial = Self(
+package struct WorkspaceCodemapAutomaticSelectionBudgetPolicy: Hashable {
+    package static let initial = Self(
         maximumTargetCount: 100_000,
         maximumResolutionCount: 100_000,
         maximumReferenceFailureCount: 100_000
@@ -328,7 +328,7 @@ struct WorkspaceCodemapAutomaticSelectionBudgetPolicy: Hashable {
     let maximumReferenceFailureCount: Int
     let maximumByteCount: Int
 
-    init(
+    package init(
         maximumRootCount: Int = 64,
         maximumRawSourceCount: Int = 4096,
         maximumUniqueSourceCount: Int = 4096,

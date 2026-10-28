@@ -3,14 +3,14 @@ import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptWorkspaceCore
 
-enum FileManagerError: Error, LocalizedError {
+package enum FileManagerError: Error, LocalizedError {
     case failedToLoadFolder(Error)
     case failedToLoadFile(Error)
     case fileSystemServiceNotFound
     case failedToLoadContent
     case fileSystemServiceNotFoundWithContext(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .failedToLoadFolder(err):
             "Failed to load folder: \(err.localizedDescription)"
@@ -26,15 +26,15 @@ enum FileManagerError: Error, LocalizedError {
     }
 }
 
-enum WorkspaceFileCreatePathResolutionPolicy {
+package enum WorkspaceFileCreatePathResolutionPolicy {
     case literalPreferredIfStronger
     case canonicalAliasFirst
 }
 
-struct WorkspaceFileMutationWriteResult: Equatable {
+package struct WorkspaceFileMutationWriteResult: Equatable {
     let diskSucceeded: Bool
-    let materializedFile: WorkspaceFileRecord?
-    let catalogIneligibility: CatalogRegularFileIneligibilityReason?
+    package let materializedFile: WorkspaceFileRecord?
+    package let catalogIneligibility: CatalogRegularFileIneligibilityReason?
 
     var catalogMaterialized: Bool {
         materializedFile != nil
@@ -50,17 +50,17 @@ struct WorkspaceFileMutationWriteResult: Equatable {
     }
 }
 
-struct WorkspaceFileMutationService {
-    let store: WorkspaceFileContextStore
+package struct WorkspaceFileMutationService {
+    package let store: WorkspaceFileContextStore
 
-    func resolveExactExistingFile(
+    package func resolveExactExistingFile(
         _ input: WorkspaceExactFileInput,
         namespace: WorkspaceExactFileNamespace
     ) async throws -> WorkspaceExactExistingFileResolution {
         try await store.resolveExactExistingWorkspaceFile(input, namespace: namespace)
     }
 
-    func exactExistingFile(
+    package func exactExistingFile(
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceFileRecord? {
@@ -73,7 +73,7 @@ struct WorkspaceFileMutationService {
         return match.file
     }
 
-    func resolveExactExistingFileForMutation(
+    package func resolveExactExistingFileForMutation(
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceFileRecord {
@@ -101,12 +101,12 @@ struct WorkspaceFileMutationService {
         }
     }
 
-    func readText(file: WorkspaceFileRecord) async throws -> String? {
+    package func readText(file: WorkspaceFileRecord) async throws -> String? {
         try await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
     }
 
     @discardableResult
-    func overwrite(
+    package func overwrite(
         file: WorkspaceFileRecord,
         content: String,
         mutationRootMappings: [DomainMutationPhysicalRootMapping] = []
@@ -123,7 +123,7 @@ struct WorkspaceFileMutationService {
     }
 
     @discardableResult
-    func overwriteIfUnchanged(
+    package func overwriteIfUnchanged(
         file: WorkspaceFileRecord,
         content: String,
         expectedOriginalContent: String,
@@ -172,7 +172,7 @@ struct WorkspaceFileMutationService {
         )
     }
 
-    func createFileWithPostcondition(
+    package func createFileWithPostcondition(
         userPath: String,
         content: String,
         overwrite: Bool = false,

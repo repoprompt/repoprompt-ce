@@ -6,11 +6,11 @@ import RepoPromptPersistence
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
-struct WorkspaceCodemapPathFingerprintClient {
+package struct WorkspaceCodemapPathFingerprintClient {
     let fingerprint: @Sendable (_ repositoryRoot: URL, _ repositoryRelativePath: String) throws
         -> GitBlobLStatFingerprint
 
-    static let noFollow = WorkspaceCodemapPathFingerprintClient { repositoryRoot, relativePath in
+    package static let noFollow = WorkspaceCodemapPathFingerprintClient { repositoryRoot, relativePath in
         let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
         guard !components.isEmpty,
               components.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." && !$0.contains("\0") })
@@ -298,7 +298,7 @@ enum WorkspaceCodemapSourceAuthorityRejection: Equatable {
     )
 }
 
-struct WorkspaceCodemapRootCapabilityServiceHooks {
+package struct WorkspaceCodemapRootCapabilityServiceHooks {
     var beforeResolution: @Sendable () async -> Void
     var afterFirstAuthorityCapture: @Sendable () async -> Void
     var afterSourcePathFingerprintCapture: @Sendable () async -> Void
@@ -319,10 +319,10 @@ struct WorkspaceCodemapRootCapabilityServiceHooks {
         self.sourceAuthorityRejected = sourceAuthorityRejected
     }
 
-    static let none = WorkspaceCodemapRootCapabilityServiceHooks()
+    package static let none = WorkspaceCodemapRootCapabilityServiceHooks()
 }
 
-actor WorkspaceCodemapRootCapabilityService {
+package actor WorkspaceCodemapRootCapabilityService {
     #if DEBUG
         struct Snapshot: Equatable {
             let activeRecordCount: Int
@@ -452,7 +452,7 @@ actor WorkspaceCodemapRootCapabilityService {
         private var authorityCaptureCount: UInt64 = 0
     #endif
 
-    init(
+    package init(
         gitService: any WorkspaceGitClient,
         namespaceSalt: Data,
         hooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,

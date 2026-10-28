@@ -132,8 +132,8 @@ enum WorkspaceRootTargetSeedPlanReaderValidationState: Equatable {
     case failed
 }
 
-struct WorkspaceRootTargetSeedPlanResourcePolicy: Equatable {
-    static let `default` = WorkspaceRootTargetSeedPlanResourcePolicy()
+package struct WorkspaceRootTargetSeedPlanResourcePolicy: Equatable {
+    package static let `default` = WorkspaceRootTargetSeedPlanResourcePolicy()
 
     let maximumBufferedRecordBytes: Int
     let maximumRecordsPerBatch: Int

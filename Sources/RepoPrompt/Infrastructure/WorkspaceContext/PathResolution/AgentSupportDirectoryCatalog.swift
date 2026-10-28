@@ -1,6 +1,6 @@
 import Foundation
 
-struct AlwaysReadableDirectory: Hashable {
+package struct AlwaysReadableDirectory: Hashable {
     enum Source: Hashable {
         case globalAgentsSkills
         case globalAgentsSlash
@@ -17,16 +17,16 @@ struct AlwaysReadableDirectory: Hashable {
     }
 }
 
-struct AgentSupportGlobalRootURLs {
-    let agentsSkills: URL
-    let agentsSlash: URL
-    let claudeSkills: URL
-    let claudeCommands: URL
+package struct AgentSupportGlobalRootURLs {
+    package let agentsSkills: URL
+    package let agentsSlash: URL
+    package let claudeSkills: URL
+    package let claudeCommands: URL
     let codexPrompts: URL
 }
 
-enum AgentSupportDirectoryCatalog {
-    static func globalRootURLs(homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> AgentSupportGlobalRootURLs {
+package enum AgentSupportDirectoryCatalog {
+    package static func globalRootURLs(homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> AgentSupportGlobalRootURLs {
         let home = homeDirectoryURL.standardizedFileURL
         let agentsDir = home.appendingPathComponent(".agents", isDirectory: true)
         let claudeDir = home.appendingPathComponent(".claude", isDirectory: true)
@@ -52,7 +52,7 @@ enum AgentSupportDirectoryCatalog {
         ])
     }
 
-    static func effectiveAlwaysReadableDirectories(
+    package static func effectiveAlwaysReadableDirectories(
         homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser,
         additionalAbsolutePaths: [String] = []
     ) -> [AlwaysReadableDirectory] {
@@ -63,7 +63,7 @@ enum AgentSupportDirectoryCatalog {
         return dedupe(builtInAlwaysReadableDirectories(homeDirectoryURL: homeDirectoryURL) + configured)
     }
 
-    static func displayPath(for absolutePath: String, homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> String {
+    package static func displayPath(for absolutePath: String, homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser) -> String {
         let normalizedAbsolute = normalizedPath(for: absolutePath)
         let homePath = normalizedPath(for: homeDirectoryURL.path)
         guard normalizedAbsolute == homePath || normalizedAbsolute.hasPrefix(homePath + "/") else {
@@ -73,7 +73,7 @@ enum AgentSupportDirectoryCatalog {
         return suffix.isEmpty ? "~" : "~" + suffix
     }
 
-    static func contains(
+    package static func contains(
         absolutePath: String,
         in directory: AlwaysReadableDirectory,
         fileManager: FileManager = .default
@@ -81,7 +81,7 @@ enum AgentSupportDirectoryCatalog {
         contains(absolutePath: absolutePath, inDirectoryPath: directory.standardizedPath, fileManager: fileManager)
     }
 
-    static func contains(
+    package static func contains(
         absolutePath: String,
         inDirectoryPath directoryPath: String,
         fileManager: FileManager = .default
@@ -100,7 +100,7 @@ enum AgentSupportDirectoryCatalog {
         return false
     }
 
-    static func normalizedPath(for path: String) -> String {
+    package static func normalizedPath(for path: String) -> String {
         var normalized = ((path as NSString).expandingTildeInPath as NSString).standardizingPath
         while normalized.count > 1, normalized.hasSuffix("/") {
             normalized.removeLast()

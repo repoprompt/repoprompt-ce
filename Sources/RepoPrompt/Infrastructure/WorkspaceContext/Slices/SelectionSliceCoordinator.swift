@@ -7,17 +7,17 @@ import RepoPromptWorkspaceCore
 /// This service intentionally does not read or write compose-tab `StoredSelection` values.
 /// `WorkspaceManagerViewModel` remains the only writer of compose-tab selections; this
 /// coordinator only loads and mutates partition-backed slice state.
-actor SelectionSliceCoordinator {
-    struct RootScopeRequest {
+package actor SelectionSliceCoordinator {
+    package struct RootScopeRequest {
         let rootPath: String
         let scope: PartitionScope
 
-        init(rootPath: String, scope: PartitionScope) {
+        package init(rootPath: String, scope: PartitionScope) {
             self.rootPath = (rootPath as NSString).standardizingPath
             self.scope = scope
         }
 
-        init(root: WorkspaceRootRecord, scope: PartitionScope) {
+        package init(root: WorkspaceRootRecord, scope: PartitionScope) {
             self.init(rootPath: root.standardizedFullPath, scope: scope)
         }
     }
@@ -28,7 +28,7 @@ actor SelectionSliceCoordinator {
         let fileModificationTime: Double?
         let anchors: [SliceAnchor]?
 
-        init(
+        package init(
             relativePath: String,
             ranges: [LineRange],
             fileModificationTime: Double?,
@@ -40,7 +40,7 @@ actor SelectionSliceCoordinator {
             self.anchors = anchors
         }
 
-        init(file: WorkspaceFileRecord, ranges: [LineRange], anchors: [SliceAnchor]? = nil) {
+        package init(file: WorkspaceFileRecord, ranges: [LineRange], anchors: [SliceAnchor]? = nil) {
             self.init(
                 relativePath: file.standardizedRelativePath,
                 ranges: ranges,
@@ -51,16 +51,16 @@ actor SelectionSliceCoordinator {
     }
 
     private let store: PartitionStore
-    nonisolated let notificationSourceID: UUID
+    package nonisolated let notificationSourceID: UUID
 
-    init(store: PartitionStore = PartitionStore()) {
+    package init(store: PartitionStore = PartitionStore()) {
         self.store = store
         notificationSourceID = store.notificationSourceID
     }
 
     // MARK: - Loading
 
-    func loadSlices(
+    package func loadSlices(
         forRootPath rootPath: String,
         scope: PartitionScope
     ) async -> [String: PartitionStore.StoredSlices] {
@@ -69,14 +69,14 @@ actor SelectionSliceCoordinator {
         return data.files
     }
 
-    func loadSlices(
+    package func loadSlices(
         forRoot root: WorkspaceRootRecord,
         scope: PartitionScope
     ) async -> [String: PartitionStore.StoredSlices] {
         await loadSlices(forRootPath: root.standardizedFullPath, scope: scope)
     }
 
-    func loadSlices(
+    package func loadSlices(
         forRoots roots: [WorkspaceRootRecord],
         scope: PartitionScope
     ) async -> [String: [String: PartitionStore.StoredSlices]] {
@@ -85,7 +85,7 @@ actor SelectionSliceCoordinator {
         )
     }
 
-    func loadSlices(
+    package func loadSlices(
         for requests: [RootScopeRequest]
     ) async -> [String: [String: PartitionStore.StoredSlices]] {
         var result: [String: [String: PartitionStore.StoredSlices]] = [:]
@@ -99,7 +99,7 @@ actor SelectionSliceCoordinator {
     // MARK: - Applying updates
 
     @discardableResult
-    func applyPartitionUpdates(
+    package func applyPartitionUpdates(
         forRootPath rootPath: String,
         scope: PartitionScope,
         updates: [String: PartitionStore.SliceUpdate],
@@ -114,7 +114,7 @@ actor SelectionSliceCoordinator {
     }
 
     @discardableResult
-    func applyPartitionUpdatesIfCurrent(
+    package func applyPartitionUpdatesIfCurrent(
         forRootPath rootPath: String,
         scope: PartitionScope,
         updates: [String: PartitionStore.SliceUpdate],
@@ -164,7 +164,7 @@ actor SelectionSliceCoordinator {
     // MARK: - Moves and clears
 
     @discardableResult
-    func moveSliceState(
+    package func moveSliceState(
         rootPath: String,
         oldRelativePath: String,
         newRelativePath: String,
@@ -264,7 +264,7 @@ actor SelectionSliceCoordinator {
 
     // MARK: - Projection
 
-    nonisolated static func buildFileIDProjection(
+    package nonisolated static func buildFileIDProjection(
         from sliceMapsByRootPath: [String: [String: PartitionStore.StoredSlices]],
         files: [WorkspaceFileRecord]
     ) -> [UUID: [LineRange]] {

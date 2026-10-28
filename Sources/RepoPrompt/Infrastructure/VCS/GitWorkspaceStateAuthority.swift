@@ -5,7 +5,7 @@ import RepoPromptFoundation
 import RepoPromptPersistence
 import RepoPromptVCS
 
-struct GitPrefixControlEvidenceCacheLimits: Equatable {
+package struct GitPrefixControlEvidenceCacheLimits: Equatable {
     static let production = GitPrefixControlEvidenceCacheLimits(
         maximumEntryCount: 32,
         maximumEntriesPerRepository: 4,
@@ -25,28 +25,28 @@ struct GitPrefixControlEvidenceCacheLimits: Equatable {
     let maximumPendingArtifactBytes: UInt64
 }
 
-enum GitPrefixControlEvidenceCacheError: Error, Equatable {
+package enum GitPrefixControlEvidenceCacheError: Error, Equatable {
     case invalidatedDuringCollection
     case rootIdentityChanged
     case corruptFooter
     case resourceAdmission
 }
 
-struct GitPrefixControlCollectionDetail: Equatable {
-    let collectionCompleted: Bool
-    let ignoreControlCount: Int
-    let attributeControlCount: Int
-    let prunedRootCount: Int
+package struct GitPrefixControlCollectionDetail: Equatable {
+    package let collectionCompleted: Bool
+    package let ignoreControlCount: Int
+    package let attributeControlCount: Int
+    package let prunedRootCount: Int
     /// Domain-separated digest of every pruned repository-relative root in
     /// canonical traversal order. This keeps cache carriage constant-size;
     /// count overflow or an unavailable digest makes the detail invalid rather
     /// than silently truncating diagnostic evidence.
-    let prunedRootSummarySHA256: String
+    package let prunedRootSummarySHA256: String
 }
 
-struct GitPrefixControlCollectedEvidence: Equatable {
-    let footer: GitPrefixControlEvidenceManifestFooter
-    let collectionDetail: GitPrefixControlCollectionDetail?
+package struct GitPrefixControlCollectedEvidence: Equatable {
+    package let footer: GitPrefixControlEvidenceManifestFooter
+    package let collectionDetail: GitPrefixControlCollectionDetail?
 }
 
 private final class GitWorkspaceAuthoritySynchronousState: @unchecked Sendable {
@@ -108,8 +108,8 @@ private final class GitWorkspaceAuthoritySynchronousState: @unchecked Sendable {
 /// Owns currentness and metadata observation for worktree bootstrap. Collection
 /// is always bracketed by a scope-bound capture token and conditional install;
 /// reusable snapshot storage/eviction is bounded and remains observation-only.
-actor GitWorkspaceStateAuthority {
-    static let shared = GitWorkspaceStateAuthority()
+package actor GitWorkspaceStateAuthority {
+    package static let shared = GitWorkspaceStateAuthority()
 
     #if DEBUG
         struct Snapshot: Equatable {
@@ -268,7 +268,7 @@ actor GitWorkspaceStateAuthority {
     private var prefixControlCacheBypassCount: UInt64 = 0
     private var prefixControlPhysicalScanCount: UInt64 = 0
 
-    init(
+    package init(
         metadataMonitor: GitWorkspaceMetadataMonitor = GitWorkspaceMetadataMonitor(),
         reusableSnapshotCacheLimits: WorkspaceRootReusableSnapshotCacheLimits = .production,
         prefixControlCacheLimits: GitPrefixControlEvidenceCacheLimits = .production
@@ -287,7 +287,7 @@ actor GitWorkspaceStateAuthority {
         self.prefixControlCacheLimits = prefixControlCacheLimits
     }
 
-    func collectionMutationFenceReason(
+    package func collectionMutationFenceReason(
         for repositoryKey: GitWorkspaceAuthorityRepositoryKey
     ) -> GitWorkspaceAuthorityUnavailableReason? {
         let record = records[repositoryKey]
@@ -296,7 +296,7 @@ actor GitWorkspaceStateAuthority {
             : nil
     }
 
-    func prefixControlEvidence(
+    package func prefixControlEvidence(
         in layout: GitRepositoryLayout,
         prefix: GitRepositoryRelativeRootPrefix,
         cacheMode: GitPrefixControlEvidenceCacheMode,
@@ -317,7 +317,7 @@ actor GitWorkspaceStateAuthority {
         }.footer
     }
 
-    func prefixControlEvidenceWithDetail(
+    package func prefixControlEvidenceWithDetail(
         in layout: GitRepositoryLayout,
         prefix: GitRepositoryRelativeRootPrefix,
         cacheMode: GitPrefixControlEvidenceCacheMode,
@@ -898,7 +898,7 @@ actor GitWorkspaceStateAuthority {
         )
     }
 
-    func beginCollection(
+    package func beginCollection(
         scopeKey: GitWorkspaceAuthorityScopeKey
     ) -> Result<GitWorkspaceAuthorityCaptureToken, GitWorkspaceAuthorityUnavailableReason> {
         let record = records[scopeKey.repositoryKey] ?? Record()
@@ -930,7 +930,7 @@ actor GitWorkspaceStateAuthority {
     }
 
     @discardableResult
-    func install(
+    package func install(
         _ snapshot: GitWorkspaceAuthoritySnapshot,
         capturedUsing token: GitWorkspaceAuthorityCaptureToken
     ) -> Result<GitWorkspaceAuthorityLease, GitWorkspaceAuthorityUnavailableReason> {
@@ -1003,7 +1003,7 @@ actor GitWorkspaceStateAuthority {
     /// Test/support convenience for an already collected immutable value. There
     /// is no suspension between token issue and conditional installation.
     @discardableResult
-    func install(_ snapshot: GitWorkspaceAuthoritySnapshot) throws -> GitWorkspaceAuthorityLease {
+    package func install(_ snapshot: GitWorkspaceAuthoritySnapshot) throws -> GitWorkspaceAuthorityLease {
         let scopeKey = GitWorkspaceAuthorityScopeKey(
             repositoryKey: snapshot.repositoryKey,
             repositoryRelativeRootPrefix: snapshot.repositoryRelativeRootPrefix
@@ -1019,7 +1019,7 @@ actor GitWorkspaceStateAuthority {
         }
     }
 
-    func currentLease(
+    package func currentLease(
         for repositoryKey: GitWorkspaceAuthorityRepositoryKey,
         prefix: GitRepositoryRelativeRootPrefix
     ) -> Result<GitWorkspaceAuthorityLease, GitWorkspaceAuthorityUnavailableReason> {
@@ -1046,7 +1046,7 @@ actor GitWorkspaceStateAuthority {
         ))
     }
 
-    func isCurrent(_ lease: GitWorkspaceAuthorityLease) -> Bool {
+    package func isCurrent(_ lease: GitWorkspaceAuthorityLease) -> Bool {
         guard let record = records[lease.repositoryKey] else { return false }
         return !hasActiveMutation(for: lease.repositoryKey)
             && record.mutationDepth == 0
@@ -1070,7 +1070,7 @@ actor GitWorkspaceStateAuthority {
         }
     }
 
-    func pendingInitializationFenceDecision(
+    package func pendingInitializationFenceDecision(
         _ fence: GitWorkspacePendingInitializationAuthorityFence
     ) async -> GitWorkspacePendingAuthorityFenceDecision {
         if await pendingInitializationAuthorityFenceIsCurrent(fence) {
@@ -1082,7 +1082,7 @@ actor GitWorkspaceStateAuthority {
         )
     }
 
-    func pendingInitializationAuthorityFenceIsCurrent(
+    package func pendingInitializationAuthorityFenceIsCurrent(
         _ fence: GitWorkspacePendingInitializationAuthorityFence
     ) async -> Bool {
         guard fence.snapshot == fence.lease.snapshot,
@@ -1150,7 +1150,7 @@ actor GitWorkspaceStateAuthority {
         return permitResult
     }
 
-    func releasePendingInitializationAuthorityFence(
+    package func releasePendingInitializationAuthorityFence(
         _ fence: GitWorkspacePendingInitializationAuthorityFence
     ) async {
         await retireEphemeralAuthorityLease(
@@ -1160,7 +1160,7 @@ actor GitWorkspaceStateAuthority {
     }
 
     @discardableResult
-    func admitReusableSnapshot(
+    package func admitReusableSnapshot(
         _ snapshot: WorkspaceRootReusableSnapshot,
         capturedUsing lease: GitWorkspaceAuthorityLease,
         observationToken: GitWorkspaceMetadataMonitor.RetainToken
@@ -1330,7 +1330,7 @@ actor GitWorkspaceStateAuthority {
         removeUnaliasedReusableSnapshot(snapshotIdentity)
     }
 
-    func currentReusableSnapshot(
+    package func currentReusableSnapshot(
         capturedUsing lease: GitWorkspaceAuthorityLease
     ) async -> WorkspaceRootReusableSnapshot? {
         guard isCurrent(lease),
@@ -1354,7 +1354,7 @@ actor GitWorkspaceStateAuthority {
         return entry.snapshot
     }
 
-    func reusableSnapshot(
+    package func reusableSnapshot(
         compatibleWith snapshot: GitWorkspaceAuthoritySnapshot
     ) -> WorkspaceRootReusableSnapshot? {
         let key = WorkspaceRootSeedCompatibilityKey(authority: snapshot)
@@ -1366,7 +1366,7 @@ actor GitWorkspaceStateAuthority {
         return reusableSnapshotsByIdentity[identity]?.snapshot
     }
 
-    func reusableSnapshot(
+    package func reusableSnapshot(
         identity: WorkspaceRootReusableSnapshotIdentity,
         expectedCompatibilityKey: WorkspaceRootSeedCompatibilityKey
     ) -> WorkspaceRootReusableSnapshot? {
@@ -1456,7 +1456,7 @@ actor GitWorkspaceStateAuthority {
         return pending
     }
 
-    func beginMutation(
+    package func beginMutation(
         repositoryKey: GitWorkspaceAuthorityRepositoryKey,
         kind: GitWorkspaceMutationKind,
         correlationID: UUID? = nil
@@ -1492,7 +1492,7 @@ actor GitWorkspaceStateAuthority {
     /// Completion balances mutation state exactly once. Invalidation occurs at
     /// begin, so a collection spanning even a failed/cancelled mutation cannot
     /// reinstall stale evidence.
-    func finishMutation(
+    package func finishMutation(
         _ token: GitWorkspaceMutationToken,
         outcome: GitWorkspaceMutationOutcome
     ) {
@@ -1544,7 +1544,7 @@ actor GitWorkspaceStateAuthority {
         }
     }
 
-    func retainMetadataObservation(
+    package func retainMetadataObservation(
         for layout: GitRepositoryLayout,
         additionalAuthorityPaths: [URL] = []
     ) async throws -> GitWorkspaceMetadataMonitor.RetainToken {
@@ -1576,7 +1576,7 @@ actor GitWorkspaceStateAuthority {
         metadataMonitor.acceptedWatermark(for: repositoryKey)
     }
 
-    func metadataObservationIsCurrent(
+    package func metadataObservationIsCurrent(
         _ token: GitWorkspaceMetadataMonitor.RetainToken,
         for layout: GitRepositoryLayout,
         additionalAuthorityPaths: [URL] = [],
@@ -1590,7 +1590,7 @@ actor GitWorkspaceStateAuthority {
         )
     }
 
-    func retireEphemeralAuthorityLease(
+    package func retireEphemeralAuthorityLease(
         _ lease: GitWorkspaceAuthorityLease,
         observationToken: GitWorkspaceMetadataMonitor.RetainToken
     ) async {
@@ -1608,7 +1608,7 @@ actor GitWorkspaceStateAuthority {
         await removeReusableSnapshotAliases(for: [lease.repositoryKey])
     }
 
-    func releaseMetadataObservation(_ token: GitWorkspaceMetadataMonitor.RetainToken) async {
+    package func releaseMetadataObservation(_ token: GitWorkspaceMetadataMonitor.RetainToken) async {
         await metadataMonitor.release(token)
     }
 

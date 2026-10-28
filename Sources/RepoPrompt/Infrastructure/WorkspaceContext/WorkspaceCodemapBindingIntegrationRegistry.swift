@@ -27,7 +27,7 @@ final class WorkspaceCodemapBindingIntegrationEndpoint: @unchecked Sendable {
     }
 }
 
-actor WorkspaceCodemapBindingIntegrationRegistry {
+package actor WorkspaceCodemapBindingIntegrationRegistry {
     private final class WeakEndpoint {
         weak var value: WorkspaceCodemapBindingIntegrationEndpoint?
 

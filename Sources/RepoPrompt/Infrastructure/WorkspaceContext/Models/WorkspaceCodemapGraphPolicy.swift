@@ -1,24 +1,24 @@
 import Foundation
 
-enum WorkspaceCodemapGraphOutputSize: String, Codable, CaseIterable, Hashable {
+package enum WorkspaceCodemapGraphOutputSize: String, Codable, CaseIterable, Hashable {
     case small
     case medium
     case large
 }
 
-struct WorkspaceCodemapGraphQueryBudget: Hashable {
+package struct WorkspaceCodemapGraphQueryBudget: Hashable {
     let maximumTokenCount: Int
-    let maximumNodeCount: Int
+    package let maximumNodeCount: Int
     let maximumEdgeCount: Int
     let maximumGraphByteCount: UInt64
     let graphEvidenceTokenCount: Int
-    let renderTokenCount: Int
+    package let renderTokenCount: Int
 }
 
 /// The single internal home for graph indexing, update, safety, traversal, and
 /// rendering limits. These are implementation policy, not public settings.
-struct WorkspaceCodemapGraphPolicy: Hashable {
-    static let initial: WorkspaceCodemapGraphPolicy = {
+package struct WorkspaceCodemapGraphPolicy: Hashable {
+    package static let initial: WorkspaceCodemapGraphPolicy = {
         guard let policy = WorkspaceCodemapGraphPolicy() else {
             preconditionFailure("The built-in workspace codemap graph policy must be valid.")
         }
@@ -123,7 +123,7 @@ struct WorkspaceCodemapGraphPolicy: Hashable {
         self.renderedEvidenceBudgetDenominator = renderedEvidenceBudgetDenominator
     }
 
-    func queryBudget(
+    package func queryBudget(
         size: WorkspaceCodemapGraphOutputSize,
         includesSignatures: Bool
     ) -> WorkspaceCodemapGraphQueryBudget {
@@ -138,7 +138,7 @@ struct WorkspaceCodemapGraphPolicy: Hashable {
         )
     }
 
-    func queryBudget(
+    package func queryBudget(
         maximumTokenCount requestedTokenCount: Int,
         includesSignatures: Bool
     ) -> WorkspaceCodemapGraphQueryBudget {

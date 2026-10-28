@@ -4,7 +4,7 @@ import RepoPromptFoundation
 import RepoPromptWorkspaceCore
 
 /// Root scopes shared by UI and headless workspace file lookup paths.
-enum WorkspaceLookupRootScope: Hashable {
+package enum WorkspaceLookupRootScope: Hashable {
     case visibleWorkspace
     case visibleWorkspacePlusGitData
     case allLoaded
@@ -17,23 +17,23 @@ enum WorkspaceLookupRootScope: Hashable {
     )
 }
 
-enum WorkspaceLookupRootSelectorConflict: Error, Equatable {
+package enum WorkspaceLookupRootSelectorConflict: Error, Equatable {
     case rootIDHasMultiplePaths
     case rootIDHasMultipleRoles
 }
 
-struct WorkspaceValidatedLookupRootSelector: Equatable {
-    let canonicalRootPathsByID: [UUID: String]
-    let physicalRootPathsByID: [UUID: String]
+package struct WorkspaceValidatedLookupRootSelector: Equatable {
+    package let canonicalRootPathsByID: [UUID: String]
+    package let physicalRootPathsByID: [UUID: String]
 }
 
-enum WorkspaceLookupRootSelectorValidation: Equatable {
+package enum WorkspaceLookupRootSelectorValidation: Equatable {
     case valid(WorkspaceValidatedLookupRootSelector)
     case conflict(WorkspaceLookupRootSelectorConflict)
 }
 
-enum WorkspaceLookupRootSelectorValidator {
-    static func validate(
+package enum WorkspaceLookupRootSelectorValidator {
+    package static func validate(
         canonicalRoots: Set<WorkspaceRootRef>,
         physicalRoots: Set<WorkspaceRootRef>
     ) -> WorkspaceLookupRootSelectorValidation {
@@ -71,46 +71,46 @@ enum WorkspaceLookupRootSelectorValidator {
     }
 }
 
-enum WorkspaceLookupRootScopeAvailability: Equatable {
+package enum WorkspaceLookupRootScopeAvailability: Equatable {
     case available
     case sessionWorktreeUnavailable(missingPhysicalRootPaths: [String])
 }
 
-enum WorkspaceSearchCatalogAccess: Equatable {
+package enum WorkspaceSearchCatalogAccess: Equatable {
     case available(WorkspaceSearchCatalogSnapshot)
     case unavailable(WorkspaceLookupRootScopeAvailability)
 }
 
 typealias LookupRootScope = WorkspaceLookupRootScope
 
-enum WorkspaceRootKind: Hashable {
+package enum WorkspaceRootKind: Hashable {
     case primaryWorkspace
     case workspaceGitData
     case supplementalSystem
     case sessionWorktree
 }
 
-enum WorkspaceExactPathLookupKind: Hashable {
+package enum WorkspaceExactPathLookupKind: Hashable {
     case file
     case folder
     case either
 }
 
-struct WorkspaceFolderExpansionResult: Equatable {
-    let files: [WorkspaceFileRecord]
-    let handled: Bool
-    let displayPath: String?
-    let issue: PathResolutionIssue?
+package struct WorkspaceFolderExpansionResult: Equatable {
+    package let files: [WorkspaceFileRecord]
+    package let handled: Bool
+    package let displayPath: String?
+    package let issue: PathResolutionIssue?
 }
 
-struct WorkspaceRootLoadFailure: Equatable, Identifiable {
-    let id: UUID
-    let rootPath: String
-    let standardizedRootPath: String
-    let kind: WorkspaceRootKind
-    let errorDescription: String
+package struct WorkspaceRootLoadFailure: Equatable, Identifiable {
+    package let id: UUID
+    package let rootPath: String
+    package let standardizedRootPath: String
+    package let kind: WorkspaceRootKind
+    package let errorDescription: String
 
-    init(id: UUID = UUID(), rootPath: String, kind: WorkspaceRootKind, errorDescription: String) {
+    package init(id: UUID = UUID(), rootPath: String, kind: WorkspaceRootKind, errorDescription: String) {
         self.id = id
         self.rootPath = rootPath
         standardizedRootPath = StandardizedPath.absolute(rootPath)
@@ -118,25 +118,25 @@ struct WorkspaceRootLoadFailure: Equatable, Identifiable {
         self.errorDescription = errorDescription
     }
 
-    static func == (lhs: WorkspaceRootLoadFailure, rhs: WorkspaceRootLoadFailure) -> Bool {
+    package static func == (lhs: WorkspaceRootLoadFailure, rhs: WorkspaceRootLoadFailure) -> Bool {
         lhs.standardizedRootPath == rhs.standardizedRootPath &&
             lhs.kind == rhs.kind &&
             lhs.errorDescription == rhs.errorDescription
     }
 }
 
-struct WorkspaceSearchReadinessTicket: Equatable, Hashable {
-    let workspaceID: UUID?
-    let generation: UInt64
+package struct WorkspaceSearchReadinessTicket: Equatable, Hashable {
+    package let workspaceID: UUID?
+    package let generation: UInt64
 }
 
-enum WorkspaceSearchReadinessWaitError: Error, Equatable {
+package enum WorkspaceSearchReadinessWaitError: Error, Equatable {
     case unavailable
     case timedOut
     case superseded
 }
 
-enum WorkspaceSearchReadinessState: Equatable {
+package enum WorkspaceSearchReadinessState: Equatable {
     case idle
     case activating(workspaceID: UUID?, generation: UInt64)
     case loadingCatalog(workspaceID: UUID?, generation: UInt64, loadedRootCount: Int, expectedRootCount: Int, failures: [WorkspaceRootLoadFailure])
@@ -144,7 +144,7 @@ enum WorkspaceSearchReadinessState: Equatable {
     case ready(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64, indexedGeneration: UInt64, diagnostics: WorkspaceCatalogDiagnostics)
     case degraded(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64?, indexedGeneration: UInt64?, failures: [WorkspaceRootLoadFailure], diagnostics: WorkspaceCatalogDiagnostics?)
 
-    var ticket: WorkspaceSearchReadinessTicket? {
+    package var ticket: WorkspaceSearchReadinessTicket? {
         switch self {
         case .idle:
             nil
@@ -157,7 +157,7 @@ enum WorkspaceSearchReadinessState: Equatable {
         }
     }
 
-    var isSearchAdmissible: Bool {
+    package var isSearchAdmissible: Bool {
         switch self {
         case .ready, .degraded:
             true
@@ -186,11 +186,11 @@ enum WorkspaceSearchReadinessState: Equatable {
 /// Which completion a readiness waiter is gated on. Two consumers wait on the same state
 /// machine for different things, so the admission rule travels with the waiter rather than
 /// being baked into the state.
-enum WorkspaceReadinessAdmission: Equatable {
+package enum WorkspaceReadinessAdmission: Equatable {
     case searchIndex
     case rootCatalog
 
-    func admits(_ state: WorkspaceSearchReadinessState) -> Bool {
+    package func admits(_ state: WorkspaceSearchReadinessState) -> Bool {
         switch self {
         case .searchIndex:
             state.isSearchAdmissible
@@ -206,24 +206,24 @@ enum WorkspaceReadinessAdmission: Equatable {
 /// Deliberately carries no `Codable`/serialization conformance: the ticket and the root
 /// identities are process-lifetime values, so a persisted copy would outlive the generation
 /// that makes it true and would reassert loaded roots that no longer exist.
-struct WorkspaceRootCatalogSnapshot: Equatable {
-    let ticket: WorkspaceSearchReadinessTicket
-    let workspaceID: UUID
+package struct WorkspaceRootCatalogSnapshot: Equatable {
+    package let ticket: WorkspaceSearchReadinessTicket
+    package let workspaceID: UUID
     /// Canonical, de-duplicated, workspace-declaration order.
-    let configuredRootPaths: [String]
+    package let configuredRootPaths: [String]
     /// Loaded primary roots, ordered to match `configuredRootPaths`.
-    let primaryRoots: [WorkspaceRootRef]
+    package let primaryRoots: [WorkspaceRootRef]
 
     /// A workspace that declares no roots at all. Distinct from a workspace whose roots
     /// have not been hydrated yet, which never produces a snapshot.
-    var isGenuinelyRootless: Bool {
+    package var isGenuinelyRootless: Bool {
         configuredRootPaths.isEmpty && primaryRoots.isEmpty
     }
 }
 
 /// Messages stay free of absolute root paths so a failure can be surfaced to an MCP client
 /// without leaking filesystem layout.
-enum WorkspaceRootCatalogSnapshotError: LocalizedError, Equatable {
+package enum WorkspaceRootCatalogSnapshotError: LocalizedError, Equatable {
     case missingWorkspaceIdentity
     case workspaceNotActive
     case readinessUnavailable
@@ -231,7 +231,7 @@ enum WorkspaceRootCatalogSnapshotError: LocalizedError, Equatable {
     case readinessSuperseded
     case inconsistentRootProjection
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .missingWorkspaceIdentity:
             "Workspace readiness did not identify a workspace."
@@ -249,15 +249,15 @@ enum WorkspaceRootCatalogSnapshotError: LocalizedError, Equatable {
     }
 }
 
-struct WorkspaceCatalogDiagnostics: Equatable {
-    let generation: UInt64
-    let rootScope: WorkspaceLookupRootScope
-    let rootCount: Int
-    let folderCount: Int
-    let fileCount: Int
-    let totalItemCount: Int
+package struct WorkspaceCatalogDiagnostics: Equatable {
+    package let generation: UInt64
+    package let rootScope: WorkspaceLookupRootScope
+    package let rootCount: Int
+    package let folderCount: Int
+    package let fileCount: Int
+    package let totalItemCount: Int
 
-    init(
+    package init(
         generation: UInt64,
         rootScope: WorkspaceLookupRootScope,
         rootCount: Int,
@@ -273,19 +273,19 @@ struct WorkspaceCatalogDiagnostics: Equatable {
     }
 }
 
-struct WorkspaceSearchCatalogEntry: Identifiable, Equatable, Hashable {
-    let id: UUID
-    let rootID: UUID
-    let rootPath: String
-    let rootName: String
-    let name: String
-    let relativePath: String
-    let standardizedRelativePath: String
-    let fullPath: String
-    let standardizedFullPath: String
-    let displayPath: String
+package struct WorkspaceSearchCatalogEntry: Identifiable, Equatable, Hashable {
+    package let id: UUID
+    package let rootID: UUID
+    package let rootPath: String
+    package let rootName: String
+    package let name: String
+    package let relativePath: String
+    package let standardizedRelativePath: String
+    package let fullPath: String
+    package let standardizedFullPath: String
+    package let displayPath: String
 
-    init(file: WorkspaceFileRecord, root: WorkspaceRootRecord, displayPath: String? = nil) {
+    package init(file: WorkspaceFileRecord, root: WorkspaceRootRecord, displayPath: String? = nil) {
         id = file.id
         rootID = file.rootID
         rootPath = root.standardizedFullPath
@@ -305,15 +305,15 @@ struct WorkspaceSearchCatalogEntry: Identifiable, Equatable, Hashable {
 }
 
 /// Opaque ARC lease keeping immutable catalog generations alive for snapshot readers.
-final class WorkspaceSearchCatalogGenerationLease: @unchecked Sendable {
+package final class WorkspaceSearchCatalogGenerationLease: @unchecked Sendable {
     private let retainedObjects: [AnyObject]
 
-    init(retaining retainedObjects: [AnyObject]) {
+    package init(retaining retainedObjects: [AnyObject]) {
         self.retainedObjects = retainedObjects
     }
 }
 
-enum WorkspaceSearchCatalogAccessRequirement: Equatable {
+package enum WorkspaceSearchCatalogAccessRequirement: Equatable {
     case recordsOnly
     case recordsAndPathIndexes
 
@@ -331,17 +331,17 @@ enum WorkspaceSearchCatalogAccessRequirement: Equatable {
     }
 }
 
-struct WorkspaceSearchCatalogSnapshot: Equatable {
-    let generation: UInt64
-    let rootScope: WorkspaceLookupRootScope
-    let roots: [WorkspaceRootRecord]
-    let files: [WorkspaceFileRecord]
-    let entries: [WorkspaceSearchCatalogEntry]
-    let rootPathIndexes: [WorkspaceSearchRootPathIndex]
-    let diagnostics: WorkspaceCatalogDiagnostics
+package struct WorkspaceSearchCatalogSnapshot: Equatable {
+    package let generation: UInt64
+    package let rootScope: WorkspaceLookupRootScope
+    package let roots: [WorkspaceRootRecord]
+    package let files: [WorkspaceFileRecord]
+    package let entries: [WorkspaceSearchCatalogEntry]
+    package let rootPathIndexes: [WorkspaceSearchRootPathIndex]
+    package let diagnostics: WorkspaceCatalogDiagnostics
     private let generationLease: WorkspaceSearchCatalogGenerationLease?
 
-    init(
+    package init(
         generation: UInt64,
         rootScope: WorkspaceLookupRootScope,
         roots: [WorkspaceRootRecord],
@@ -374,7 +374,7 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
         )
     }
 
-    static func == (lhs: WorkspaceSearchCatalogSnapshot, rhs: WorkspaceSearchCatalogSnapshot) -> Bool {
+    package static func == (lhs: WorkspaceSearchCatalogSnapshot, rhs: WorkspaceSearchCatalogSnapshot) -> Bool {
         lhs.generation == rhs.generation
             && lhs.rootScope == rhs.rootScope
             && lhs.roots == rhs.roots
@@ -385,9 +385,9 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
 }
 
 struct WorkspaceDirectFolderChildrenSnapshot: Equatable {
-    let generation: UInt64
-    let root: WorkspaceRootRecord
-    let folder: WorkspaceFolderRecord
+    package let generation: UInt64
+    package let root: WorkspaceRootRecord
+    package let folder: WorkspaceFolderRecord
     let childFolders: [WorkspaceFolderRecord]
     let childFiles: [WorkspaceFileRecord]
 
@@ -396,17 +396,17 @@ struct WorkspaceDirectFolderChildrenSnapshot: Equatable {
     }
 }
 
-struct WorkspaceSearchQueryResult: Equatable {
+package struct WorkspaceSearchQueryResult: Equatable {
     let query: String
     let indexedGeneration: UInt64?
     let snapshotGeneration: UInt64?
     let pendingGeneration: UInt64?
     let observedGeneration: UInt64?
-    let results: [WorkspaceSearchCatalogEntry]
-    let isIndexReady: Bool
-    let isStale: Bool
+    package let results: [WorkspaceSearchCatalogEntry]
+    package let isIndexReady: Bool
+    package let isStale: Bool
 
-    init(
+    package init(
         query: String,
         indexedGeneration: UInt64?,
         snapshotGeneration: UInt64?,
@@ -440,15 +440,15 @@ struct WorkspaceCodemapOnlyCandidates: Equatable {
     let codemapUnavailable: [String]
 }
 
-struct WorkspaceRootRecord: Identifiable, Equatable, Hashable {
-    let id: UUID
-    let name: String
-    let fullPath: String
-    let standardizedFullPath: String
-    let isSystemRoot: Bool
-    let kind: WorkspaceRootKind
+package struct WorkspaceRootRecord: Identifiable, Equatable, Hashable {
+    package let id: UUID
+    package let name: String
+    package let fullPath: String
+    package let standardizedFullPath: String
+    package let isSystemRoot: Bool
+    package let kind: WorkspaceRootKind
 
-    init(id: UUID = UUID(), name: String, fullPath: String, isSystemRoot: Bool = false) {
+    package init(id: UUID = UUID(), name: String, fullPath: String, isSystemRoot: Bool = false) {
         self.init(
             id: id,
             name: name,
@@ -458,7 +458,7 @@ struct WorkspaceRootRecord: Identifiable, Equatable, Hashable {
         )
     }
 
-    init(id: UUID = UUID(), name: String, fullPath: String, kind: WorkspaceRootKind) {
+    package init(id: UUID = UUID(), name: String, fullPath: String, kind: WorkspaceRootKind) {
         self.init(
             id: id,
             name: name,
@@ -478,18 +478,18 @@ struct WorkspaceRootRecord: Identifiable, Equatable, Hashable {
     }
 }
 
-struct WorkspaceFolderRecord: Identifiable, Equatable, Hashable {
-    let id: UUID
-    let rootID: UUID
-    let name: String
-    let relativePath: String
-    let standardizedRelativePath: String
-    let fullPath: String
-    let standardizedFullPath: String
-    let parentFolderID: UUID?
-    let modificationDate: Date?
+package struct WorkspaceFolderRecord: Identifiable, Equatable, Hashable {
+    package let id: UUID
+    package let rootID: UUID
+    package let name: String
+    package let relativePath: String
+    package let standardizedRelativePath: String
+    package let fullPath: String
+    package let standardizedFullPath: String
+    package let parentFolderID: UUID?
+    package let modificationDate: Date?
 
-    init(
+    package init(
         id: UUID = UUID(),
         rootID: UUID,
         name: String,
@@ -510,18 +510,18 @@ struct WorkspaceFolderRecord: Identifiable, Equatable, Hashable {
     }
 }
 
-struct WorkspaceFileRecord: Identifiable, Equatable, Hashable {
-    let id: UUID
-    let rootID: UUID
-    let name: String
-    let relativePath: String
-    let standardizedRelativePath: String
-    let fullPath: String
-    let standardizedFullPath: String
-    let parentFolderID: UUID?
-    let modificationDate: Date?
+package struct WorkspaceFileRecord: Identifiable, Equatable, Hashable {
+    package let id: UUID
+    package let rootID: UUID
+    package let name: String
+    package let relativePath: String
+    package let standardizedRelativePath: String
+    package let fullPath: String
+    package let standardizedFullPath: String
+    package let parentFolderID: UUID?
+    package let modificationDate: Date?
 
-    init(
+    package init(
         id: UUID = UUID(),
         rootID: UUID,
         name: String,
@@ -542,23 +542,23 @@ struct WorkspaceFileRecord: Identifiable, Equatable, Hashable {
     }
 }
 
-struct WorkspaceExactFileNamespace: Equatable {
-    struct RootBinding: Equatable {
+package struct WorkspaceExactFileNamespace: Equatable {
+    package struct RootBinding: Equatable {
         enum LookupRole: Equatable {
             case canonical
             case projectedPhysical
         }
 
-        let lookupRoot: WorkspaceRootRef
+        package let lookupRoot: WorkspaceRootRef
         let lookupRole: LookupRole
-        let clientRoots: [WorkspaceRootRef]
+        package let clientRoots: [WorkspaceRootRef]
         let preferredClientRoot: WorkspaceRootRef
     }
 
-    let rootBindings: [RootBinding]
+    package let rootBindings: [RootBinding]
     let explicitAliasByClientRootID: [UUID: String]
 
-    init(rootBindings: [RootBinding]) {
+    package init(rootBindings: [RootBinding]) {
         self.rootBindings = rootBindings
         let clientRoots = rootBindings.flatMap(\.clientRoots)
         explicitAliasByClientRootID = ClientPathFormatter.exactRootAliases(visibleRoots: clientRoots)
@@ -581,7 +581,7 @@ struct WorkspaceExactFileNamespace: Equatable {
         rootBindings.map(\.lookupRoot)
     }
 
-    var clientRoots: [WorkspaceRootRef] {
+    package var clientRoots: [WorkspaceRootRef] {
         var seenPaths: Set<String> = []
         return rootBindings.flatMap(\.clientRoots).filter {
             seenPaths.insert($0.standardizedFullPath).inserted
@@ -597,18 +597,18 @@ struct WorkspaceExactFileNamespace: Equatable {
     }
 }
 
-struct WorkspaceExactExistingFileMatch: Equatable {
-    let file: WorkspaceFileRecord
-    let canonicalPath: String
+package struct WorkspaceExactExistingFileMatch: Equatable {
+    package let file: WorkspaceFileRecord
+    package let canonicalPath: String
 }
 
-struct WorkspaceExactDirectoryMatch: Equatable {
-    let lookupRoot: WorkspaceRootRef
-    let relativePath: String
-    let displayPath: String
+package struct WorkspaceExactDirectoryMatch: Equatable {
+    package let lookupRoot: WorkspaceRootRef
+    package let relativePath: String
+    package let displayPath: String
 }
 
-enum WorkspaceExactExistingFileResolution: Equatable {
+package enum WorkspaceExactExistingFileResolution: Equatable {
     case matched(WorkspaceExactExistingFileMatch)
     case directory(WorkspaceExactDirectoryMatch)
     case issue(PathResolutionIssue)
@@ -617,22 +617,22 @@ enum WorkspaceExactExistingFileResolution: Equatable {
 }
 
 struct ResolvedWorkspaceSelection: Equatable {
-    let files: [WorkspaceFileRecord]
-    let folders: [WorkspaceFolderRecord]
-    let missingPaths: [String]
+    package let files: [WorkspaceFileRecord]
+    package let folders: [WorkspaceFolderRecord]
+    package let missingPaths: [String]
 }
 
-struct ResolvedPromptFileEntry: Identifiable, Equatable {
-    let id: ResolvedPromptFileEntryID
-    let file: WorkspaceFileRecord
-    let isCodemap: Bool
-    let lineRanges: [LineRange]?
-    let mode: PromptFileEntryMode
-    let loadedContent: String?
-    let rootFolderPath: String?
-    let role: ResolvedPromptFileEntryRole
+package struct ResolvedPromptFileEntry: Identifiable, Equatable {
+    package let id: ResolvedPromptFileEntryID
+    package let file: WorkspaceFileRecord
+    package let isCodemap: Bool
+    package let lineRanges: [LineRange]?
+    package let mode: PromptFileEntryMode
+    package let loadedContent: String?
+    package let rootFolderPath: String?
+    package let role: ResolvedPromptFileEntryRole
 
-    init(
+    package init(
         file: WorkspaceFileRecord,
         isCodemap: Bool = false,
         lineRanges: [LineRange]? = nil,
@@ -652,85 +652,85 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
     }
 }
 
-enum ResolvedPromptFileEntryRole: Equatable {
+package enum ResolvedPromptFileEntryRole: Equatable {
     case ordinary
     case authorizedGitDiffArtifact
 }
 
-struct ResolvedPromptFileBlockRecord: Equatable {
-    let entry: ResolvedPromptFileEntry
-    let file: WorkspaceFileRecord
-    let text: String
-    let isCodemap: Bool
+package struct ResolvedPromptFileBlockRecord: Equatable {
+    package let entry: ResolvedPromptFileEntry
+    package let file: WorkspaceFileRecord
+    package let text: String
+    package let isCodemap: Bool
 }
 
-struct ResolvedPromptFileEntryID: Hashable {
-    let fileID: UUID
-    let mode: PromptFileEntryMode
-    let lineRanges: [LineRange]?
+package struct ResolvedPromptFileEntryID: Hashable {
+    package let fileID: UUID
+    package let mode: PromptFileEntryMode
+    package let lineRanges: [LineRange]?
 }
 
-enum PromptFileEntryMode: Hashable {
+package enum PromptFileEntryMode: Hashable {
     case fullFile
     case sliced
     case codemap
 }
 
-struct WorkspaceExternalReadableFile: Equatable, Hashable {
-    let absolutePath: String
-    let displayPath: String
+package struct WorkspaceExternalReadableFile: Equatable, Hashable {
+    package let absolutePath: String
+    package let displayPath: String
 }
 
-enum WorkspaceReadableFileHandle: Equatable {
+package enum WorkspaceReadableFileHandle: Equatable {
     case workspace(WorkspaceFileRecord)
     case external(WorkspaceExternalReadableFile)
 }
 
-struct WorkspaceFileSystemDeltaEvent: Equatable {
-    let rootID: UUID
-    let rootPath: String
-    let delta: FileSystemDelta
+package struct WorkspaceFileSystemDeltaEvent: Equatable {
+    package let rootID: UUID
+    package let rootPath: String
+    package let delta: FileSystemDelta
 }
 
-struct WorkspaceIngressBarrierSample: Equatable {
-    let rootID: UUID
-    let rootPath: String
-    let pendingRawEventCountBeforeFlush: Int
+package struct WorkspaceIngressBarrierSample: Equatable {
+    package let rootID: UUID
+    package let rootPath: String
+    package let pendingRawEventCountBeforeFlush: Int
     let acceptedWatcherWatermark: UInt64
     let publishedServicePublicationSequence: UInt64
     let appliedServicePublicationSequence: UInt64
     let appliedWatcherWatermark: UInt64
 }
 
-struct WorkspaceAppliedIndexRootSnapshot: Equatable {
-    let root: WorkspaceRootRecord
-    let generation: UInt64
-    let files: [WorkspaceFileRecord]
-    let folders: [WorkspaceFolderRecord]
+package struct WorkspaceAppliedIndexRootSnapshot: Equatable {
+    package let root: WorkspaceRootRecord
+    package let generation: UInt64
+    package let files: [WorkspaceFileRecord]
+    package let folders: [WorkspaceFolderRecord]
 }
 
-struct WorkspaceAppliedIndexRecordLookup: Equatable {
-    let root: WorkspaceRootRecord
-    let generation: UInt64
-    let filesByID: [UUID: WorkspaceFileRecord]
-    let foldersByID: [UUID: WorkspaceFolderRecord]
+package struct WorkspaceAppliedIndexRecordLookup: Equatable {
+    package let root: WorkspaceRootRecord
+    package let generation: UInt64
+    package let filesByID: [UUID: WorkspaceFileRecord]
+    package let foldersByID: [UUID: WorkspaceFolderRecord]
 }
 
-struct WorkspaceSliceRebasePathState: Equatable {
-    let rootID: UUID
-    let rootLifetimeID: UUID
-    let rootKind: WorkspaceRootKind
-    let appliedIndexGeneration: UInt64
+package struct WorkspaceSliceRebasePathState: Equatable {
+    package let rootID: UUID
+    package let rootLifetimeID: UUID
+    package let rootKind: WorkspaceRootKind
+    package let appliedIndexGeneration: UInt64
 }
 
-struct WorkspaceSliceRebaseSourceSnapshot: Equatable {
-    let rootID: UUID
-    let rootLifetimeID: UUID
-    let fileID: UUID
-    let relativePath: String
-    let fullPath: String
-    let text: String
-    let modificationTime: Double
+package struct WorkspaceSliceRebaseSourceSnapshot: Equatable {
+    package let rootID: UUID
+    package let rootLifetimeID: UUID
+    package let fileID: UUID
+    package let relativePath: String
+    package let fullPath: String
+    package let text: String
+    package let modificationTime: Double
 }
 
 enum WorkspaceSearchCatalogChangeKind: Equatable {
@@ -743,14 +743,14 @@ enum WorkspaceSearchCatalogChangeKind: Equatable {
 }
 
 struct WorkspaceSearchCatalogChangeEvent: Equatable {
-    let rootID: UUID
-    let rootPath: String
-    let rootLifetimeID: UUID?
+    package let rootID: UUID
+    package let rootPath: String
+    package let rootLifetimeID: UUID?
     let rootAppliedIndexGeneration: UInt64?
     let catalogGeneration: UInt64?
-    let kind: WorkspaceSearchCatalogChangeKind
+    package let kind: WorkspaceSearchCatalogChangeKind
 
-    init(
+    package init(
         rootID: UUID,
         rootPath: String,
         rootLifetimeID: UUID?,
@@ -778,24 +778,24 @@ struct WorkspaceSearchCatalogChangeEvent: Equatable {
     }
 }
 
-struct WorkspaceAppliedIndexBatchEvent: Equatable {
-    let rootID: UUID
-    let rootPath: String
-    let generation: UInt64
-    let rootLifetimeID: UUID?
-    let modifiedFileSourceSnapshotsByID: [UUID: WorkspaceSliceRebaseSourceSnapshot]
-    let upsertedFiles: [WorkspaceFileRecord]
-    let upsertedFolders: [WorkspaceFolderRecord]
-    let removedFileIDs: [UUID]
-    let removedFolderIDs: [UUID]
-    let removedFilePaths: [String]
-    let removedFolderPaths: [String]
-    let modifiedFileIDs: [UUID]
-    let modifiedFolderIDs: [UUID]
-    let requiresFullResync: Bool
-    let isRootUnload: Bool
+package struct WorkspaceAppliedIndexBatchEvent: Equatable {
+    package let rootID: UUID
+    package let rootPath: String
+    package let generation: UInt64
+    package let rootLifetimeID: UUID?
+    package let modifiedFileSourceSnapshotsByID: [UUID: WorkspaceSliceRebaseSourceSnapshot]
+    package let upsertedFiles: [WorkspaceFileRecord]
+    package let upsertedFolders: [WorkspaceFolderRecord]
+    package let removedFileIDs: [UUID]
+    package let removedFolderIDs: [UUID]
+    package let removedFilePaths: [String]
+    package let removedFolderPaths: [String]
+    package let modifiedFileIDs: [UUID]
+    package let modifiedFolderIDs: [UUID]
+    package let requiresFullResync: Bool
+    package let isRootUnload: Bool
 
-    init(
+    package init(
         rootID: UUID,
         rootPath: String,
         generation: UInt64,
@@ -830,13 +830,13 @@ struct WorkspaceAppliedIndexBatchEvent: Equatable {
     }
 }
 
-struct WorkspacePathLookupRequest: Equatable {
+package struct WorkspacePathLookupRequest: Equatable {
     let userPath: String
     let profile: PathLocateProfile
-    let rootScope: WorkspaceLookupRootScope
+    package let rootScope: WorkspaceLookupRootScope
     let selectedFileFullPaths: Set<String>
 
-    init(
+    package init(
         userPath: String,
         profile: PathLocateProfile = .uiAssisted,
         rootScope: WorkspaceLookupRootScope = .allLoaded,
@@ -849,12 +849,12 @@ struct WorkspacePathLookupRequest: Equatable {
     }
 }
 
-struct WorkspacePathLocation: Equatable, Hashable {
-    let rootID: UUID
-    let rootPath: String
-    let correctedPath: String
+package struct WorkspacePathLocation: Equatable, Hashable {
+    package let rootID: UUID
+    package let rootPath: String
+    package let correctedPath: String
 
-    var absolutePath: String {
+    package var absolutePath: String {
         let standardizedRoot = (rootPath as NSString).standardizingPath
         if correctedPath.hasPrefix("/") {
             return (correctedPath as NSString).standardizingPath
@@ -863,52 +863,52 @@ struct WorkspacePathLocation: Equatable, Hashable {
     }
 }
 
-struct WorkspacePathLookupResult: Equatable {
+package struct WorkspacePathLookupResult: Equatable {
     let input: String
-    let location: WorkspacePathLocation
-    let file: WorkspaceFileRecord?
-    let folder: WorkspaceFolderRecord?
+    package let location: WorkspacePathLocation
+    package let file: WorkspaceFileRecord?
+    package let folder: WorkspaceFolderRecord?
 }
 
 /// Transient accepted root intent. Invalid entries are counted, never silently authorized away.
-struct WorkspacePrimaryRootManifest: Equatable {
-    let orderedPaths: [String]
-    let invalidEntryCount: Int
+package struct WorkspacePrimaryRootManifest: Equatable {
+    package let orderedPaths: [String]
+    package let invalidEntryCount: Int
 
-    init(normalizedPaths: [String?]) {
+    package init(normalizedPaths: [String?]) {
         var seen = Set<String>()
         orderedPaths = normalizedPaths.compactMap(\.self).filter { seen.insert($0).inserted }
         invalidEntryCount = normalizedPaths.count(where: { $0 == nil })
     }
 }
 
-struct WorkspaceRootReconciliationTicket: Hashable {
-    let workspaceID: UUID
-    let activationGeneration: UInt64
-    let rootIntentGeneration: UInt64
+package struct WorkspaceRootReconciliationTicket: Hashable {
+    package let workspaceID: UUID
+    package let activationGeneration: UInt64
+    package let rootIntentGeneration: UInt64
 }
 
-struct WorkspacePrimaryRootSnapshot: Equatable {
-    let ticket: WorkspaceRootReconciliationTicket
-    let roots: [WorkspaceRootRef]
+package struct WorkspacePrimaryRootSnapshot: Equatable {
+    package let ticket: WorkspaceRootReconciliationTicket
+    package let roots: [WorkspaceRootRef]
 }
 
-struct WorkspaceRootReadinessFailure: Error, Equatable {
-    enum Availability: String {
+package struct WorkspaceRootReadinessFailure: Error, Equatable {
+    package enum Availability: String {
         case missingDirectory, notDirectory, accessDenied, loadFailed
     }
 
-    enum Reason: Equatable {
+    package enum Reason: Equatable {
         case emptyConfiguration, invalidConfiguration, workspaceUnavailable, workspaceInactive
         case rootsChanging, rootsUnavailable(Availability), wrongRootKind, incompleteProjection, staleInvocation
     }
 
-    let reason: Reason
-    let expectedCount: Int
-    let loadedCount: Int
-    let missingCount: Int
+    package let reason: Reason
+    package let expectedCount: Int
+    package let loadedCount: Int
+    package let missingCount: Int
 
-    var retryable: Bool {
+    package var retryable: Bool {
         switch reason {
         case .emptyConfiguration, .invalidConfiguration, .workspaceUnavailable, .wrongRootKind: false
         default: true
@@ -917,10 +917,10 @@ struct WorkspaceRootReadinessFailure: Error, Equatable {
 }
 
 /// In-memory authority only; filesystem availability is deliberately observed off this actor.
-struct WorkspacePrimaryRootReadinessObservation: Equatable {
-    let primaryRoots: [WorkspaceRootRef]
-    let requestedRoots: [WorkspaceRootRef]
-    let missingPaths: [String]
-    let wrongKindPaths: [String]
-    let nonqueryablePaths: [String]
+package struct WorkspacePrimaryRootReadinessObservation: Equatable {
+    package let primaryRoots: [WorkspaceRootRef]
+    package let requestedRoots: [WorkspaceRootRef]
+    package let missingPaths: [String]
+    package let wrongKindPaths: [String]
+    package let nonqueryablePaths: [String]
 }

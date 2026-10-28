@@ -10,18 +10,18 @@ import Foundation
 
 /// Info for each file/folder's tokens
 /// Stores both full file tokens and codemap tokens to support different rendering modes.
-struct TokenInfo: Identifiable, Equatable {
-    let id = UUID()
+package struct TokenInfo: Identifiable, Equatable {
+    package let id = UUID()
     /// The "display" token count based on current rendering mode (full, slice, or codemap)
-    let count: Int
+    package let count: Int
     /// Always stores the full file content tokens (for `fullTokens()` lookups)
-    let fullCount: Int
+    package let fullCount: Int
     /// Stores the codemap token count if available (0 if no codemap)
-    let codemapCount: Int
+    package let codemapCount: Int
     let formatted: String
     let percentage: Double
 
-    init(count: Int, fullCount: Int? = nil, codemapCount: Int = 0, totalTokens: Int) {
+    package init(count: Int, fullCount: Int? = nil, codemapCount: Int = 0, totalTokens: Int) {
         self.count = count
         self.fullCount = fullCount ?? count
         self.codemapCount = codemapCount
@@ -32,77 +32,77 @@ struct TokenInfo: Identifiable, Equatable {
 
 /// High-level struct for returning all relevant token results.
 /// Now includes codeMapFileCount and codeMapTokenCount.
-struct TokenCalculationResult {
-    let totalTokenCount: Int
+package struct TokenCalculationResult {
+    package let totalTokenCount: Int
     // NEW – raw integer count of tokens for **files only**
-    let totalTokenCountFilesOnly: Int
-    let fileTokenInfo: [UUID: TokenInfo]
-    let folderTokenInfo: [String: TokenInfo]
+    package let totalTokenCountFilesOnly: Int
+    package let fileTokenInfo: [UUID: TokenInfo]
+    package let folderTokenInfo: [String: TokenInfo]
     let tokenCountString: String
-    let tokenCountFilesOnlyString: String
-    let charCount: Int
-    let fileTreeContent: String
+    package let tokenCountFilesOnlyString: String
+    package let charCount: Int
+    package let fileTreeContent: String
     let fileTreeTokenCount: Double
-    let fileTreeTokenCountRaw: Int
-    let codeMapContent: String // NEW – raw code-map block text
-    let codeMapFileCount: Int
-    let codeMapTokenCount: Int
-    let entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult]
+    package let fileTreeTokenCountRaw: Int
+    package let codeMapContent: String // NEW – raw code-map block text
+    package let codeMapFileCount: Int
+    package let codeMapTokenCount: Int
+    package let entryResultsByFileID: [UUID: PromptEntriesEvaluation.EntryResult]
 }
 
-struct TokenComponentBreakdown {
-    let prompt: Int
-    let duplicatePrompt: Int
-    let instructions: Int
-    let fileTree: Int
-    let gitDiff: Int
-    let metadata: Int
+package struct TokenComponentBreakdown {
+    package let prompt: Int
+    package let duplicatePrompt: Int
+    package let instructions: Int
+    package let fileTree: Int
+    package let gitDiff: Int
+    package let metadata: Int
 
-    var promptDisplay: Int {
+    package var promptDisplay: Int {
         prompt + duplicatePrompt
     }
 
-    var other: Int {
+    package var other: Int {
         metadata
     }
 
-    var totalNonFile: Int {
+    package var totalNonFile: Int {
         prompt + duplicatePrompt + instructions + fileTree + gitDiff + metadata
     }
 }
 
-struct PromptEntriesEvaluation {
-    enum RenderMode: String {
+package struct PromptEntriesEvaluation {
+    package enum RenderMode: String {
         case full
         case slice
         case codemap
     }
 
-    struct EntryResult {
-        let fileID: UUID
-        let renderedDisplayPath: String
-        let renderMode: RenderMode
-        let displayTokens: Int
-        let fullTokens: Int
-        let codemapTokens: Int
-        let displayLineCount: Int?
+    package struct EntryResult {
+        package let fileID: UUID
+        package let renderedDisplayPath: String
+        package let renderMode: RenderMode
+        package let displayTokens: Int
+        package let fullTokens: Int
+        package let codemapTokens: Int
+        package let displayLineCount: Int?
     }
 
-    let entryResultsByFileID: [UUID: EntryResult]
+    package let entryResultsByFileID: [UUID: EntryResult]
     let totalDisplayTokens: Int
     let totalContentTokens: Int
-    let fullCount: Int
+    package let fullCount: Int
     let sliceCount: Int
-    let codemapCount: Int
-    let fullTokens: Int
+    package let codemapCount: Int
+    package let fullTokens: Int
     let sliceTokens: Int
-    let codemapTokens: Int
-    let fileTokenInfo: [UUID: TokenInfo]
-    let folderTokenInfo: [String: TokenInfo]
-    let charCount: Int
-    let codeMapContent: String
-    let codeMapFileCount: Int
-    let codeMapTokenCount: Int
+    package let codemapTokens: Int
+    package let fileTokenInfo: [UUID: TokenInfo]
+    package let folderTokenInfo: [String: TokenInfo]
+    package let charCount: Int
+    package let codeMapContent: String
+    package let codeMapFileCount: Int
+    package let codeMapTokenCount: Int
 
     static let empty = PromptEntriesEvaluation(
         entryResultsByFileID: [:],
@@ -124,19 +124,19 @@ struct PromptEntriesEvaluation {
 }
 
 /// An actor for gathering file contents and running token calculations.
-actor TokenCalculationService {
+package actor TokenCalculationService {
     /// Hold the currently running calculation task.
     private var currentCalculationTask: Task<TokenCalculationResult, Never>?
 
     /// Compute tokens from raw text using a cheap UTF-8 byte count plus a safety multiplier.
     @inline(__always)
-    static func estimateTokens(for text: String) -> Int {
+    package static func estimateTokens(for text: String) -> Int {
         estimateTokens(utf8ByteCount: text.utf8.count)
     }
 
     /// Compute tokens from a known nonnegative UTF-8 byte count using the canonical heuristic.
     @inline(__always)
-    static func estimateTokens(utf8ByteCount: Int) -> Int {
+    package static func estimateTokens(utf8ByteCount: Int) -> Int {
         precondition(utf8ByteCount >= 0, "UTF-8 byte count must be nonnegative")
         return Int((Double(utf8ByteCount) / 4.0) * 1.05)
     }
@@ -146,7 +146,7 @@ actor TokenCalculationService {
     ///
     /// Uses a simple 4-bytes-per-token heuristic. Cut points are aligned to grapheme
     /// cluster boundaries to avoid splitting characters.
-    static func middleTruncate(
+    package static func middleTruncate(
         text: String,
         maxTokens: Int,
         marker: String = "\n\n[content truncated]\n\n"
@@ -227,7 +227,7 @@ actor TokenCalculationService {
         return joined
     }
 
-    static func calculateComponentBreakdown(
+    package static func calculateComponentBreakdown(
         promptText: String,
         selectedInstructionsText: String,
         fileTreeText: String,
@@ -251,7 +251,7 @@ actor TokenCalculationService {
         )
     }
 
-    func evaluatePromptEntries(
+    package func evaluatePromptEntries(
         _ fileEntries: [PromptFileEntrySnapshot]
     ) -> PromptEntriesEvaluation {
         Self.evaluatePromptEntries(fileEntries)
@@ -306,7 +306,7 @@ actor TokenCalculationService {
     }
 
     /// Calculate token statistics. Heavy work is offloaded and cancellation is checked.
-    func calculatePromptStats(
+    package func calculatePromptStats(
         snapshot: TokenCalculationSnapshot
     ) async -> TokenCalculationResult {
         currentCalculationTask?.cancel()
@@ -363,7 +363,7 @@ actor TokenCalculationService {
     }
 
     /// Cancel any pending token calculations.
-    func shutdown() async {
+    package func shutdown() async {
         currentCalculationTask?.cancel()
         _ = await currentCalculationTask?.value
         currentCalculationTask = nil

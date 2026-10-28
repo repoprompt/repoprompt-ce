@@ -1,10 +1,10 @@
 import Foundation
 import os
 
-struct WorkspaceRootUnloadTerminationPolicy: @unchecked Sendable {
+package struct WorkspaceRootUnloadTerminationPolicy: @unchecked Sendable {
     static let productionGraceNanoseconds: UInt64 = 5_000_000_000
 
-    static let production = WorkspaceRootUnloadTerminationPolicy(
+    package static let production = WorkspaceRootUnloadTerminationPolicy(
         publisherIngressGraceNanoseconds: productionGraceNanoseconds,
         watcherStopGraceNanoseconds: productionGraceNanoseconds,
         sleep: { nanoseconds in

@@ -64,7 +64,7 @@ struct WorkspaceCodemapNonGitFilesystemProof: Equatable {
     let ancestorWitnesses: [AncestorWitness]
 }
 
-struct WorkspaceCodemapLocalGitClassificationProbe {
+package struct WorkspaceCodemapLocalGitClassificationProbe {
     let resolve: @Sendable (URL) async -> WorkspaceCodemapLocalGitClassification
     let refresh: @Sendable (
         WorkspaceCodemapNonGitFilesystemProof
@@ -82,7 +82,7 @@ struct WorkspaceCodemapLocalGitClassificationProbe {
         self.refresh = refresh
     }
 
-    static let production = Self { rootURL in
+    package static let production = Self { rootURL in
         classify(rootURL)
     }
 

@@ -2,13 +2,13 @@ import Foundation
 import RepoPromptFoundation
 import RepoPromptWorkspaceCore
 
-struct StoredSelection: Codable, Equatable, Hashable {
-    let selectedPaths: [String]
-    let manualCodemapPaths: [String]
-    let slices: [String: [LineRange]]
-    let codemapAutoEnabled: Bool
+package struct StoredSelection: Codable, Equatable, Hashable {
+    package let selectedPaths: [String]
+    package let manualCodemapPaths: [String]
+    package let slices: [String: [LineRange]]
+    package let codemapAutoEnabled: Bool
 
-    init(
+    package init(
         selectedPaths: [String] = [],
         manualCodemapPaths: [String] = [],
         slices: [String: [LineRange]] = [:],
@@ -20,11 +20,11 @@ struct StoredSelection: Codable, Equatable, Hashable {
         self.codemapAutoEnabled = codemapAutoEnabled
     }
 
-    var isEmptyForSelectedFileTree: Bool {
+    package var isEmptyForSelectedFileTree: Bool {
         selectedPaths.isEmpty && manualCodemapPaths.isEmpty && slices.isEmpty
     }
 
-    init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         try self.init(
             selectedPaths: container.decodeIfPresent([String].self, forKey: .selectedPaths) ?? [],
@@ -34,7 +34,7 @@ struct StoredSelection: Codable, Equatable, Hashable {
         )
     }
 
-    func encode(to encoder: Encoder) throws {
+    package func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(selectedPaths, forKey: .selectedPaths)
         try container.encode(manualCodemapPaths, forKey: .manualCodemapPaths)
@@ -52,60 +52,60 @@ struct StoredSelection: Codable, Equatable, Hashable {
     }
 }
 
-struct WorkspaceSelectionSliceInput: Equatable {
-    let path: String
-    let ranges: [LineRange]
+package struct WorkspaceSelectionSliceInput: Equatable {
+    package let path: String
+    package let ranges: [LineRange]
 }
 
-struct WorkspaceBuildSelectionResult: Equatable {
-    let selection: StoredSelection
-    let invalidPaths: [String]
-    let codemapUnavailable: [String]
+package struct WorkspaceBuildSelectionResult: Equatable {
+    package let selection: StoredSelection
+    package let invalidPaths: [String]
+    package let codemapUnavailable: [String]
 }
 
-struct WorkspaceAddSelectionResult: Equatable {
-    let selection: StoredSelection
-    let invalidPaths: [String]
-    let resolvedMap: [String: String]
-    let mutated: Bool
-    let codemapUnavailable: [String]
+package struct WorkspaceAddSelectionResult: Equatable {
+    package let selection: StoredSelection
+    package let invalidPaths: [String]
+    package let resolvedMap: [String: String]
+    package let mutated: Bool
+    package let codemapUnavailable: [String]
 }
 
-struct WorkspaceRemoveSelectionResult: Equatable {
-    let selection: StoredSelection
-    let invalidPaths: [String]
-    let resolvedMap: [String: String]
-    let mutated: Bool
+package struct WorkspaceRemoveSelectionResult: Equatable {
+    package let selection: StoredSelection
+    package let invalidPaths: [String]
+    package let resolvedMap: [String: String]
+    package let mutated: Bool
 }
 
-struct WorkspaceDemoteSelectionResult: Equatable {
-    let selection: StoredSelection
-    let invalidPaths: [String]
-    let codemapUnavailable: [String]
-    let mutated: Bool
-    let validCandidateCount: Int
+package struct WorkspaceDemoteSelectionResult: Equatable {
+    package let selection: StoredSelection
+    package let invalidPaths: [String]
+    package let codemapUnavailable: [String]
+    package let mutated: Bool
+    package let validCandidateCount: Int
 }
 
-struct WorkspaceSliceSelectionMutationResult: Equatable {
-    let selection: StoredSelection
-    let invalidPaths: [String]
-    let resolvedMap: [String: String]
-    let mutated: Bool
+package struct WorkspaceSliceSelectionMutationResult: Equatable {
+    package let selection: StoredSelection
+    package let invalidPaths: [String]
+    package let resolvedMap: [String: String]
+    package let mutated: Bool
 }
 
-enum WorkspacePreResolvedFullFileMutationMode {
+package enum WorkspacePreResolvedFullFileMutationMode {
     case add
     case remove
 }
 
-enum WorkspacePreResolvedSelectionTargetState: Equatable {
+package enum WorkspacePreResolvedSelectionTargetState: Equatable {
     case full
     case codemapOnly
     case unselected
 }
 
-struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
-    static let `default` = Self()
+package struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
+    package static let `default` = Self()
 
     let maximumReadinessRounds: Int
     let initialBackoffMilliseconds: Int
@@ -113,7 +113,7 @@ struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
     let maximumTotalWait: Duration
     let maximumCandidateDemandCount: Int
 
-    init(
+    package init(
         maximumReadinessRounds: Int = 6,
         initialBackoffMilliseconds: Int = 50,
         maximumBackoffMilliseconds: Int = 400,
@@ -142,28 +142,28 @@ struct WorkspaceCodemapAutomaticSelectionRequestPolicy: Equatable {
     }
 }
 
-struct WorkspaceCodemapAutomaticSelectionWaiter {
+package struct WorkspaceCodemapAutomaticSelectionWaiter {
     let sleep: @Sendable (Duration) async throws -> Void
 
-    static let production = Self { duration in
+    package static let production = Self { duration in
         try await Task.sleep(for: duration)
     }
 }
 
-struct WorkspaceCodemapAutomaticSelectionClock {
+package struct WorkspaceCodemapAutomaticSelectionClock {
     let now: @Sendable () -> ContinuousClock.Instant
 
-    static let production = Self { ContinuousClock.now }
+    package static let production = Self { ContinuousClock.now }
 }
 
-struct WorkspaceCodemapAutomaticSelectionDemandChangeWaiter {
+package struct WorkspaceCodemapAutomaticSelectionDemandChangeWaiter {
     let wait: @Sendable (
         WorkspaceFileContextStore,
         WorkspaceCodemapArtifactDemandTicket,
         ContinuousClock.Instant
     ) async -> WorkspaceCodemapArtifactDemandResult
 
-    static let production = Self { store, ticket, deadline in
+    package static let production = Self { store, ticket, deadline in
         await store.waitForCodemapArtifactDemandChange(ticket, deadline: deadline)
     }
 }
@@ -205,7 +205,7 @@ private actor WorkspaceCodemapAutomaticSelectionDemandOwnership {
     }
 }
 
-struct WorkspaceSelectionMutationService {
+package struct WorkspaceSelectionMutationService {
     let store: WorkspaceFileContextStore
     let codemapsGloballyDisabled: Bool
     let codemapsGloballyDisabledMessage: String
@@ -215,7 +215,7 @@ struct WorkspaceSelectionMutationService {
     let automaticSelectionDemandChangeWaiter: WorkspaceCodemapAutomaticSelectionDemandChangeWaiter
     let removePathsDidCaptureExistingHook: @Sendable (StoredSelection) async -> Void
 
-    init(
+    package init(
         store: WorkspaceFileContextStore,
         codemapsGloballyDisabled: Bool = false,
         codemapsGloballyDisabledMessage: String = "Code maps are disabled for this tool.",
@@ -235,7 +235,7 @@ struct WorkspaceSelectionMutationService {
         self.removePathsDidCaptureExistingHook = removePathsDidCaptureExistingHook
     }
 
-    func buildSelection(
+    package func buildSelection(
         paths: [String],
         slices sliceInputs: [WorkspaceSelectionSliceInput] = [],
         sliceErrors: [String] = [],
@@ -304,7 +304,7 @@ struct WorkspaceSelectionMutationService {
         return WorkspaceBuildSelectionResult(selection: selection, invalidPaths: invalid, codemapUnavailable: codemapUnavailable)
     }
 
-    func buildManageSelectionSet(
+    package func buildManageSelectionSet(
         paths: [String],
         slices sliceInputs: [WorkspaceSelectionSliceInput] = [],
         sliceErrors: [String] = [],
@@ -382,7 +382,7 @@ struct WorkspaceSelectionMutationService {
 
     /// Applies already-authorized exact identities without path lookup, folder expansion, or
     /// codemap discovery. Git artifact policy remains owned by the MCP boundary.
-    func mutatePreResolvedFullFilePaths(
+    package func mutatePreResolvedFullFilePaths(
         base: StoredSelection,
         absolutePaths: [String],
         mode: WorkspacePreResolvedFullFileMutationMode
@@ -458,7 +458,7 @@ struct WorkspaceSelectionMutationService {
         )
     }
 
-    func mutateSlices(
+    package func mutateSlices(
         base: StoredSelection,
         entries: [WorkspaceSelectionSliceInput],
         mode: SliceMutationMode,
@@ -565,7 +565,7 @@ struct WorkspaceSelectionMutationService {
         )
     }
 
-    func addPaths(
+    package func addPaths(
         existing: StoredSelection,
         paths: [String],
         rawPaths: [String],
@@ -644,7 +644,7 @@ struct WorkspaceSelectionMutationService {
         )
     }
 
-    func removePaths(
+    package func removePaths(
         existing: StoredSelection,
         paths: [String],
         rawPaths: [String],
@@ -701,7 +701,7 @@ struct WorkspaceSelectionMutationService {
         )
     }
 
-    func promotePaths(
+    package func promotePaths(
         existing: StoredSelection,
         paths: [String],
         rawPaths: [String],
@@ -739,7 +739,7 @@ struct WorkspaceSelectionMutationService {
         )
     }
 
-    func demotePaths(
+    package func demotePaths(
         existing: StoredSelection,
         paths: [String],
         rawPaths: [String],
@@ -926,7 +926,7 @@ struct WorkspaceSelectionMutationService {
     /// Resolves graph-inferred codemap targets without folding them into `StoredSelection`.
     /// Source lookup and root-scope validation happen before exact root-qualified identities
     /// cross into the graph query.
-    func resolveAutomaticCodemapSelection(
+    package func resolveAutomaticCodemapSelection(
         for selection: StoredSelection,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceCodemapAutomaticSelectionResult? {
@@ -953,7 +953,7 @@ struct WorkspaceSelectionMutationService {
         )
     }
 
-    func resolveAutomaticCodemapSelection(
+    package func resolveAutomaticCodemapSelection(
         sourceFileIDs: [UUID],
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceCodemapAutomaticSelectionResult {
@@ -1374,7 +1374,7 @@ struct WorkspaceSelectionMutationService {
         return mutated
     }
 
-    static func supportsCodemap(_ file: WorkspaceFileRecord) -> Bool {
+    package static func supportsCodemap(_ file: WorkspaceFileRecord) -> Bool {
         let ext = (file.name as NSString).pathExtension.lowercased()
         guard !ext.isEmpty else { return false }
         return SyntaxManager.supportsCodeMap(fileExtension: ext)

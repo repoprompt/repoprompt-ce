@@ -2,8 +2,8 @@ import Foundation
 import RepoPromptFoundation
 import RepoPromptSettingsCore
 
-enum WorkspaceCodemapPresentationIntentResolver {
-    static func plan(
+package enum WorkspaceCodemapPresentationIntentResolver {
+    package static func plan(
         codeMapUsage: CodeMapUsage,
         selection: StoredSelection,
         store: WorkspaceFileContextStore,
@@ -97,7 +97,7 @@ enum WorkspaceCodemapPresentationIntentResolver {
         return WorkspaceCodemapOperationPresentationPlan(intent: intent, preflightIssues: [])
     }
 
-    static func merging(
+    package static func merging(
         _ presentation: WorkspaceCodemapOperationPresentation,
         preflightIssues: [WorkspaceCodemapOperationIssue]
     ) -> WorkspaceCodemapOperationPresentation {

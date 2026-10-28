@@ -1,25 +1,25 @@
 import Foundation
 import RepoPromptCodeMapCore
 
-enum WorkspaceCodemapOperationPresentationIntent: Equatable {
+package enum WorkspaceCodemapOperationPresentationIntent: Equatable {
     case none
     case exact(fileIDs: [UUID], completeRootSet: Bool)
     case automatic(sourceFileIDs: [UUID])
 }
 
-struct WorkspaceCodemapOperationPresentationPlan {
-    let intent: WorkspaceCodemapOperationPresentationIntent
-    let preflightIssues: [WorkspaceCodemapOperationIssue]
+package struct WorkspaceCodemapOperationPresentationPlan {
+    package let intent: WorkspaceCodemapOperationPresentationIntent
+    package let preflightIssues: [WorkspaceCodemapOperationIssue]
 }
 
 struct WorkspaceCodemapOperationPresentationCandidate: Equatable, Hashable {
-    let fileID: UUID
-    let rootEpoch: WorkspaceCodemapRootEpoch
+    package let fileID: UUID
+    package let rootEpoch: WorkspaceCodemapRootEpoch
     let catalogGeneration: UInt64
-    let logicalPath: WorkspaceCodemapLogicalPresentationPath
+    package let logicalPath: WorkspaceCodemapLogicalPresentationPath
 }
 
-enum WorkspaceCodemapOperationCandidateIssue: Equatable {
+package enum WorkspaceCodemapOperationCandidateIssue: Equatable {
     case fileNotCataloged(UUID)
     case fileOutsideRootScope(UUID)
     case logicalPathUnavailable(UUID)
@@ -27,28 +27,28 @@ enum WorkspaceCodemapOperationCandidateIssue: Equatable {
 }
 
 struct WorkspaceCodemapOperationCompleteRootCatalogReceipt: Equatable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
+    package let rootEpoch: WorkspaceCodemapRootEpoch
     let catalogGeneration: UInt64
     let supportedFileIDs: [UUID]
 }
 
 struct WorkspaceCodemapOperationCandidateCollection: Equatable {
     let candidates: [WorkspaceCodemapOperationPresentationCandidate]
-    let issues: [WorkspaceCodemapOperationCandidateIssue]
+    package let issues: [WorkspaceCodemapOperationCandidateIssue]
     let completeRootCatalogs: [WorkspaceCodemapOperationCompleteRootCatalogReceipt]
 }
 
-struct WorkspaceCodemapOperationRenderedEntry: Equatable {
+package struct WorkspaceCodemapOperationRenderedEntry: Equatable {
     let bundleID: WorkspaceCodemapFrozenPresentationBundleID
-    let fileID: UUID
-    let rootEpoch: WorkspaceCodemapRootEpoch
+    package let fileID: UUID
+    package let rootEpoch: WorkspaceCodemapRootEpoch
     let artifactKey: CodeMapArtifactKey
-    let logicalPath: WorkspaceCodemapLogicalPresentationPath
-    let text: String
-    let tokenCount: Int
+    package let logicalPath: WorkspaceCodemapLogicalPresentationPath
+    package let text: String
+    package let tokenCount: Int
 }
 
-enum WorkspaceCodemapOperationIssue: Equatable {
+package enum WorkspaceCodemapOperationIssue: Equatable {
     case coordinationUnavailable
     case cancelled
     case candidate(WorkspaceCodemapOperationCandidateIssue)
@@ -66,7 +66,7 @@ enum WorkspaceCodemapOperationIssue: Equatable {
     case publicationStale(WorkspaceCodemapOperationPublicationStaleReason)
 }
 
-enum WorkspaceCodemapOperationPresentationCoverage: Equatable {
+package enum WorkspaceCodemapOperationPresentationCoverage: Equatable {
     case complete
     case partial([WorkspaceCodemapOperationIssue])
     case pending([WorkspaceCodemapOperationIssue])
@@ -75,13 +75,13 @@ enum WorkspaceCodemapOperationPresentationCoverage: Equatable {
 
 struct WorkspaceCodemapOperationPresentationBundleReceipt: Equatable {
     let bundleID: WorkspaceCodemapFrozenPresentationBundleID
-    let rootEpoch: WorkspaceCodemapRootEpoch
+    package let rootEpoch: WorkspaceCodemapRootEpoch
     let entries: [WorkspaceCodemapFrozenPresentationEntry]
 }
 
-struct WorkspaceCodemapOperationPresentationPublicationReceipt: Equatable {
+package struct WorkspaceCodemapOperationPresentationPublicationReceipt: Equatable {
     let requestID: UUID
-    let rootScope: WorkspaceLookupRootScope
+    package let rootScope: WorkspaceLookupRootScope
     let logicalRootDisplayNamesByRootID: [UUID: String]
     let completeRootSet: Bool
     let completeRootCatalogs: [WorkspaceCodemapOperationCompleteRootCatalogReceipt]
@@ -91,7 +91,7 @@ struct WorkspaceCodemapOperationPresentationPublicationReceipt: Equatable {
     let automaticReceipt: WorkspaceCodemapAutomaticSelectionReceipt?
 }
 
-enum WorkspaceCodemapOperationPublicationStaleReason: Equatable {
+package enum WorkspaceCodemapOperationPublicationStaleReason: Equatable {
     case rootScope
     case rootEpoch(WorkspaceCodemapRootEpoch)
     case catalog(fileID: UUID)
@@ -108,15 +108,15 @@ enum WorkspaceCodemapOperationPublicationDisposition: Equatable {
     case stale(WorkspaceCodemapOperationPublicationStaleReason)
 }
 
-struct WorkspaceCodemapOperationPresentation: Equatable {
-    let id: UUID
-    let renderedEntriesByFileID: [UUID: WorkspaceCodemapOperationRenderedEntry]
-    let orderedEntries: [WorkspaceCodemapOperationRenderedEntry]
-    let coverage: WorkspaceCodemapOperationPresentationCoverage
-    let issues: [WorkspaceCodemapOperationIssue]
+package struct WorkspaceCodemapOperationPresentation: Equatable {
+    package let id: UUID
+    package let renderedEntriesByFileID: [UUID: WorkspaceCodemapOperationRenderedEntry]
+    package let orderedEntries: [WorkspaceCodemapOperationRenderedEntry]
+    package let coverage: WorkspaceCodemapOperationPresentationCoverage
+    package let issues: [WorkspaceCodemapOperationIssue]
     let publicationReceipt: WorkspaceCodemapOperationPresentationPublicationReceipt?
 
-    init(
+    package init(
         id: UUID = UUID(),
         orderedEntries: [WorkspaceCodemapOperationRenderedEntry],
         coverage: WorkspaceCodemapOperationPresentationCoverage,
@@ -131,7 +131,7 @@ struct WorkspaceCodemapOperationPresentation: Equatable {
         self.publicationReceipt = publicationReceipt
     }
 
-    static var empty: WorkspaceCodemapOperationPresentation {
+    package static var empty: WorkspaceCodemapOperationPresentation {
         WorkspaceCodemapOperationPresentation(
             orderedEntries: [],
             coverage: .complete,

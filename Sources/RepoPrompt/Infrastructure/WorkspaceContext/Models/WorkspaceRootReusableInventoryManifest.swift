@@ -561,7 +561,7 @@ actor WorkspaceRootReusableInventoryManifestWriter {
     }
 }
 
-final class WorkspaceRootReusableInventoryManifestLease: @unchecked Sendable {
+package final class WorkspaceRootReusableInventoryManifestLease: @unchecked Sendable {
     let fileURL: URL
     let header: WorkspaceRootReusableInventoryManifestHeader
     let footer: WorkspaceRootReusableInventoryManifestFooter

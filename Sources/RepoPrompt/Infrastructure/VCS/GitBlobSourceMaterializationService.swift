@@ -22,10 +22,10 @@ struct ValidatedGitBlobSourceSnapshot {
     }
 }
 
-struct GitBlobSourceMaterializationPolicy: Equatable {
+package struct GitBlobSourceMaterializationPolicy: Equatable {
     let maximumRawByteCount: Int
 
-    static let `default` = GitBlobSourceMaterializationPolicy(maximumRawByteCount: 8 * 1024 * 1024)
+    package static let `default` = GitBlobSourceMaterializationPolicy(maximumRawByteCount: 8 * 1024 * 1024)
 
     init(maximumRawByteCount: Int) {
         precondition(maximumRawByteCount >= 0 && maximumRawByteCount < Int.max)
@@ -75,12 +75,12 @@ struct GitBlobSourceMaterializationClient {
     }
 }
 
-struct GitBlobSourceMaterializationService {
+package struct GitBlobSourceMaterializationService {
     private let client: GitBlobSourceMaterializationClient
     private let policy: GitBlobSourceMaterializationPolicy
     private let oidForBytes: @Sendable (Data, GitObjectFormat) -> GitBlobOID
 
-    init(
+    package init(
         gitService: any WorkspaceGitClient,
         policy: GitBlobSourceMaterializationPolicy = .default
     ) {

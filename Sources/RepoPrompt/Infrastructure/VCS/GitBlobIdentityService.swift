@@ -4,14 +4,14 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptVCS
 
-struct GitBlobIdentityServiceHooks {
+package struct GitBlobIdentityServiceHooks {
     var afterGitCollection: @Sendable () async -> Void
     var afterPathSecurityComponentOpen: @Sendable (String) -> Void = { _ in }
 
-    static let none = GitBlobIdentityServiceHooks(afterGitCollection: {})
+    package static let none = GitBlobIdentityServiceHooks(afterGitCollection: {})
 }
 
-actor GitBlobIdentityService {
+package actor GitBlobIdentityService {
     private struct Attempt {
         let batch: GitBlobIdentityBatch
         let unstable: Bool
@@ -42,7 +42,7 @@ actor GitBlobIdentityService {
     private var digestMatchCount: UInt64 = 0
     private var digestMismatchCount: UInt64 = 0
 
-    init(
+    package init(
         gitService: any WorkspaceGitClient,
         hooks: GitBlobIdentityServiceHooks = .none
     ) {

@@ -4,7 +4,7 @@ import RepoPromptFoundation
 import RepoPromptShared
 
 /// Compatibility seam for app/MCP consumers; build selection has one authority.
-enum WorkspaceContextFilesystemIdentity {
+package enum WorkspaceContextFilesystemIdentity {
     static let identity = MCPFilesystemIdentity.current
 }
 
@@ -15,12 +15,12 @@ public enum SliceMutationMode: Sendable {
     case setPaths // file-scoped replacement: replace slices only for specified files
 }
 
-struct SliceAnchor: Codable, Equatable {
+package struct SliceAnchor: Codable, Equatable {
     var range: LineRange
     var startSignature: [String]
     var endSignature: [String]
 
-    init(
+    package init(
         range: LineRange,
         startSignature: [String] = [],
         endSignature: [String] = []
@@ -41,13 +41,13 @@ public struct PartitionScope: Sendable, Equatable {
     }
 }
 
-actor PartitionStore {
+package actor PartitionStore {
     /// Posted **after** a successful save so other windows/tabs reload in-memory slices.
-    static let didSaveNotification = Notification.Name("RepoPrompt.PartitionStoreDidSave")
-    static let notifRootPathKey = "rootPath"
-    static let notifWorkspaceIDKey = "workspaceID"
-    static let notifTabIDKey = "tabID"
-    static let notifSourceIDKey = "sourceID"
+    package static let didSaveNotification = Notification.Name("RepoPrompt.PartitionStoreDidSave")
+    package static let notifRootPathKey = "rootPath"
+    package static let notifWorkspaceIDKey = "workspaceID"
+    package static let notifTabIDKey = "tabID"
+    package static let notifSourceIDKey = "sourceID"
     nonisolated let notificationSourceID = UUID()
     private static let partitionFileLock = NSLock()
 
@@ -72,12 +72,12 @@ actor PartitionStore {
         return "\(leaf)-\(short)"
     }
 
-    struct StoredSlices: Codable, Equatable {
-        var ranges: [LineRange]
-        var fileModificationTime: Double?
-        var anchors: [SliceAnchor]?
+    package struct StoredSlices: Codable, Equatable {
+        package var ranges: [LineRange]
+        package var fileModificationTime: Double?
+        package var anchors: [SliceAnchor]?
 
-        init(
+        package init(
             ranges: [LineRange],
             fileModificationTime: Double?,
             anchors: [SliceAnchor]? = nil
@@ -88,12 +88,12 @@ actor PartitionStore {
         }
     }
 
-    struct SliceUpdate {
-        var ranges: [LineRange]
-        var fileModificationTime: Double?
-        var anchors: [SliceAnchor]?
+    package struct SliceUpdate {
+        package var ranges: [LineRange]
+        package var fileModificationTime: Double?
+        package var anchors: [SliceAnchor]?
 
-        init(
+        package init(
             ranges: [LineRange],
             fileModificationTime: Double?,
             anchors: [SliceAnchor]? = nil
@@ -113,7 +113,7 @@ actor PartitionStore {
             PartitionData(version: 1, files: [:], updatedAt: nil)
         }
 
-        init(version: Int, files: [String: StoredSlices], updatedAt: String?) {
+        package init(version: Int, files: [String: StoredSlices], updatedAt: String?) {
             self.version = version
             self.files = files
             self.updatedAt = updatedAt
@@ -125,7 +125,7 @@ actor PartitionStore {
             case updatedAt
         }
 
-        init(from decoder: Decoder) throws {
+        package init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
             updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)

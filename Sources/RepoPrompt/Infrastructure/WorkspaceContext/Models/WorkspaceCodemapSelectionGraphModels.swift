@@ -24,7 +24,7 @@ struct WorkspaceCodemapSelectionGraphSizePolicy: Hashable {
     let maxDefinitionCandidates: UInt64
 }
 
-enum WorkspaceCodemapSelectionGraphSizeDimension: Hashable {
+package enum WorkspaceCodemapSelectionGraphSizeDimension: Hashable {
     case nodes
     case postings
     case edges

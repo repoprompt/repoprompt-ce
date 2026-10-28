@@ -2,12 +2,12 @@ import CryptoKit
 import Foundation
 import RepoPromptFoundation
 
-enum SliceRebaseEngine {
-    struct Result {
-        let rebased: [LineRange]
+package enum SliceRebaseEngine {
+    package struct Result {
+        package let rebased: [LineRange]
         let dropped: [LineRange]
         let didChange: Bool
-        let isStale: Bool
+        package let isStale: Bool
     }
 
     private struct RangeKey: Hashable {
@@ -37,7 +37,7 @@ enum SliceRebaseEngine {
     /// Larger edit distances fall back to one conservative replacement region.
     private static let maximumSparseEditDistance = 512
 
-    static func rebase(
+    package static func rebase(
         oldText: String?,
         newText: String,
         oldRanges: [LineRange],
@@ -98,7 +98,7 @@ enum SliceRebaseEngine {
         )
     }
 
-    static func buildAnchors(content: String, ranges: [LineRange], maxSignatureLines: Int = 3) -> [SliceAnchor] {
+    package static func buildAnchors(content: String, ranges: [LineRange], maxSignatureLines: Int = 3) -> [SliceAnchor] {
         buildAnchors(lines: lines(from: content), ranges: ranges, maxSignatureLines: maxSignatureLines)
     }
 

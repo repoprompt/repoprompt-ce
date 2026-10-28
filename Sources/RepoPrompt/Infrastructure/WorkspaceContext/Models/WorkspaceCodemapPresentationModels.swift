@@ -2,11 +2,11 @@ import Foundation
 import RepoPromptCodeMapCore
 import RepoPromptWorkspaceCore
 
-struct WorkspaceCodemapLogicalPresentationPath: Hashable {
+package struct WorkspaceCodemapLogicalPresentationPath: Hashable {
     let rootDisplayName: String
-    let standardizedRelativePath: String
+    package let standardizedRelativePath: String
 
-    var displayPath: String {
+    package var displayPath: String {
         rootDisplayName + "/" + standardizedRelativePath
     }
 
@@ -37,7 +37,7 @@ struct WorkspaceCodemapPresentationRequest {
     let logicalPath: WorkspaceCodemapLogicalPresentationPath
 }
 
-struct WorkspaceCodemapFrozenPresentationBundleID: Hashable {
+package struct WorkspaceCodemapFrozenPresentationBundleID: Hashable {
     private let rawValue: UUID
 
     init(rawValue: UUID = UUID()) {
@@ -90,7 +90,7 @@ struct WorkspaceCodemapRenderedPresentationEntry: Equatable {
     let tokenCount: Int
 }
 
-enum WorkspaceCodemapPresentationFreezeUnavailableReason: Equatable {
+package enum WorkspaceCodemapPresentationFreezeUnavailableReason: Equatable {
     case emptyRequest
     case entryLimitExceeded(limit: Int)
     case retainedBundleLimitExceeded(limit: Int)
@@ -111,7 +111,7 @@ enum WorkspaceCodemapPresentationFreezeDisposition {
     case unavailable(WorkspaceCodemapPresentationFreezeUnavailableReason)
 }
 
-enum WorkspaceCodemapPresentationRenderUnavailableReason: Equatable {
+package enum WorkspaceCodemapPresentationRenderUnavailableReason: Equatable {
     case bundleNotRetained
     case bundleMetadataMismatch
     case staleCurrentness(WorkspaceCodemapArtifactDemandTicket)

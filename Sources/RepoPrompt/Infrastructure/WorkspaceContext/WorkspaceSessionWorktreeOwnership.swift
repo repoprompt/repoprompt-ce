@@ -1,27 +1,27 @@
 import Foundation
 import RepoPromptWorkspaceCore
 
-struct WorkspaceSessionWorktreeOwnershipToken: Hashable {
+package struct WorkspaceSessionWorktreeOwnershipToken: Hashable {
     let ownerID: UUID
     let generation: UInt64
 }
 
 struct WorkspaceSessionWorktreeOwnedRoot: Hashable {
     let rootID: UUID
-    let lifetimeID: UUID
+    package let lifetimeID: UUID
     let standardizedPhysicalPath: String
 }
 
 /// Ephemeral authority for one exact root owned by an Agent session. This value is
 /// request-local and is never persisted or encoded.
-struct WorkspaceSessionRootAuthorization: Hashable {
-    let sessionID: UUID
-    let ownershipGeneration: UInt64
-    let root: WorkspaceRootRef
-    let lifetimeID: UUID
+package struct WorkspaceSessionRootAuthorization: Hashable {
+    package let sessionID: UUID
+    package let ownershipGeneration: UInt64
+    package let root: WorkspaceRootRef
+    package let lifetimeID: UUID
 }
 
-enum WorkspaceSessionRootAuthorizationMismatch: String, Equatable {
+package enum WorkspaceSessionRootAuthorizationMismatch: String, Equatable {
     case token
     case generation
     case rootClaim
@@ -31,13 +31,13 @@ enum WorkspaceSessionRootAuthorizationMismatch: String, Equatable {
     case path
 }
 
-enum WorkspaceAuthorizedSelectionCandidateRoute: String, Equatable {
+package enum WorkspaceAuthorizedSelectionCandidateRoute: String, Equatable {
     case catalogFile
     case materializedFile
     case catalogFolder
 }
 
-enum WorkspaceAuthorizedSelectionCandidateBlock: String, Equatable {
+package enum WorkspaceAuthorizedSelectionCandidateBlock: String, Equatable {
     case invalidPath
     case outsideAuthorizedRoot
     case symbolicLink
@@ -47,7 +47,7 @@ enum WorkspaceAuthorizedSelectionCandidateBlock: String, Equatable {
     case materializationFailed
 }
 
-enum WorkspaceAuthorizedSelectionCandidateResolution: Equatable {
+package enum WorkspaceAuthorizedSelectionCandidateResolution: Equatable {
     case resolved(files: [WorkspaceFileRecord], route: WorkspaceAuthorizedSelectionCandidateRoute)
     case noCandidate
     case blockedOrAmbiguous(WorkspaceAuthorizedSelectionCandidateBlock)
@@ -55,10 +55,10 @@ enum WorkspaceAuthorizedSelectionCandidateResolution: Equatable {
 }
 
 struct WorkspaceRootSeedShadowScope: Hashable {
-    let token: WorkspaceSessionWorktreeOwnershipToken
+    package let token: WorkspaceSessionWorktreeOwnershipToken
     let bindingFingerprint: String
     let rootID: UUID
-    let lifetimeID: UUID
+    package let lifetimeID: UUID
     let standardizedPhysicalPath: String
     let catalogGeneration: UInt64
     let appliedIndexGeneration: UInt64
@@ -71,7 +71,7 @@ struct WorkspaceRootSeedShadowPreparation {
 }
 
 struct WorkspaceSessionWorktreeOwnershipPreparation {
-    let token: WorkspaceSessionWorktreeOwnershipToken
+    package let token: WorkspaceSessionWorktreeOwnershipToken
     let bindingFingerprint: String
     let roots: [WorkspaceSessionWorktreeOwnedRoot]
     let reusesInstalledOwnership: Bool

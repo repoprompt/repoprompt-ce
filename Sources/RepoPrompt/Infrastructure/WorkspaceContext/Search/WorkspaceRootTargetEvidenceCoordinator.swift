@@ -130,7 +130,7 @@ final class WorkspaceRootTargetEvidenceClaim: @unchecked Sendable {
     }
 }
 
-actor WorkspaceRootTargetEvidenceCoordinator {
+package actor WorkspaceRootTargetEvidenceCoordinator {
     typealias Producer = @Sendable (
         WorkspaceRootTargetEvidenceFlightKey,
         WorkspaceRootTargetEvidenceAttemptContext
@@ -164,7 +164,7 @@ actor WorkspaceRootTargetEvidenceCoordinator {
         let flightsCleaned: UInt64
     }
 
-    static let shared = WorkspaceRootTargetEvidenceCoordinator()
+    package static let shared = WorkspaceRootTargetEvidenceCoordinator()
 
     private struct Counters {
         var flightsStarted: UInt64 = 0

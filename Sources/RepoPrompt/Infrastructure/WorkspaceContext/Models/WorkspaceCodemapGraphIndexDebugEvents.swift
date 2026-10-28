@@ -4,7 +4,7 @@ import RepoPromptPersistence
 
     /// Privacy-safe, attachable DEBUG evidence for the live codemap graph-index pipeline.
     /// Entries contain identifiers, ordinals, counts, and monotonic uptime only—never paths or source text.
-    enum WorkspaceCodemapGraphIndexDebugReason: String, Hashable {
+    package enum WorkspaceCodemapGraphIndexDebugReason: String, Hashable {
         case scheduled
         case queued
         case admitted
@@ -35,7 +35,7 @@ import RepoPromptPersistence
         case prioritizeRestart
     }
 
-    enum WorkspaceCodemapManifestFailureReason: String, CaseIterable, Hashable {
+    package enum WorkspaceCodemapManifestFailureReason: String, CaseIterable, Hashable {
         case staleAuthority
         case staleWriterAuthority
         case quotaExceeded
@@ -50,58 +50,58 @@ import RepoPromptPersistence
         case other
     }
 
-    struct WorkspaceCodemapManifestFailureDiagnostic: Equatable {
-        let reason: WorkspaceCodemapManifestFailureReason
-        let operation: String?
-        let currentAuthorityGeneration: UInt64?
-        let observedPredecessorAuthorityGeneration: UInt64?
-        let attemptStartedUptimeNanoseconds: UInt64
-        let attemptCompletedUptimeNanoseconds: UInt64
-        let attemptDurationNanoseconds: UInt64
+    package struct WorkspaceCodemapManifestFailureDiagnostic: Equatable {
+        package let reason: WorkspaceCodemapManifestFailureReason
+        package let operation: String?
+        package let currentAuthorityGeneration: UInt64?
+        package let observedPredecessorAuthorityGeneration: UInt64?
+        package let attemptStartedUptimeNanoseconds: UInt64
+        package let attemptCompletedUptimeNanoseconds: UInt64
+        package let attemptDurationNanoseconds: UInt64
     }
 
-    enum WorkspaceCodemapManifestMeasurementOrigin: String, CaseIterable, Hashable {
+    package enum WorkspaceCodemapManifestMeasurementOrigin: String, CaseIterable, Hashable {
         case page
         case adoption
         case demand
         case seal
     }
 
-    enum WorkspaceCodemapManifestMeasurementRetryKind: String, Hashable {
+    package enum WorkspaceCodemapManifestMeasurementRetryKind: String, Hashable {
         case none
         case authority
         case deferred
         case boundedSubset = "bounded_subset"
     }
 
-    struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {
-        var loadCount: UInt64 = 0
-        var loadDurationNanoseconds: UInt64 = 0
-        var submissionCount: UInt64 = 0
-        var waitCount: UInt64 = 0
-        var storeAttemptCount: UInt64 = 0
-        var writeCount: UInt64 = 0
-        var failureCount: UInt64 = 0
-        var retryAttemptCount: UInt64 = 0
-        var mutationCountVolume: UInt64 = 0
-        var mutationByteVolume: UInt64 = 0
-        var inputSnapshotRecordVolume: UInt64 = 0
-        var inputSnapshotByteVolume: UInt64 = 0
-        var decodedByteVolume: UInt64 = 0
-        var attemptedOutputSnapshotRecordVolume: UInt64 = 0
-        var attemptedOutputSnapshotByteVolume: UInt64 = 0
-        var outputSnapshotRecordVolume: UInt64 = 0
-        var outputSnapshotByteVolume: UInt64 = 0
-        var loadReadDecodeDurationNanoseconds: UInt64 = 0
-        var mergeDurationNanoseconds: UInt64 = 0
-        var sortDurationNanoseconds: UInt64 = 0
-        var encodeDurationNanoseconds: UInt64 = 0
-        var temporaryWriteDurationNanoseconds: UInt64 = 0
-        var temporaryFileSyncDurationNanoseconds: UInt64 = 0
-        var atomicReplaceDurationNanoseconds: UInt64 = 0
-        var manifestDirectorySyncDurationNanoseconds: UInt64 = 0
-        var readbackDecodeDurationNanoseconds: UInt64 = 0
-        var totalDurationNanoseconds: UInt64 = 0
+    package struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {
+        package var loadCount: UInt64 = 0
+        package var loadDurationNanoseconds: UInt64 = 0
+        package var submissionCount: UInt64 = 0
+        package var waitCount: UInt64 = 0
+        package var storeAttemptCount: UInt64 = 0
+        package var writeCount: UInt64 = 0
+        package var failureCount: UInt64 = 0
+        package var retryAttemptCount: UInt64 = 0
+        package var mutationCountVolume: UInt64 = 0
+        package var mutationByteVolume: UInt64 = 0
+        package var inputSnapshotRecordVolume: UInt64 = 0
+        package var inputSnapshotByteVolume: UInt64 = 0
+        package var decodedByteVolume: UInt64 = 0
+        package var attemptedOutputSnapshotRecordVolume: UInt64 = 0
+        package var attemptedOutputSnapshotByteVolume: UInt64 = 0
+        package var outputSnapshotRecordVolume: UInt64 = 0
+        package var outputSnapshotByteVolume: UInt64 = 0
+        package var loadReadDecodeDurationNanoseconds: UInt64 = 0
+        package var mergeDurationNanoseconds: UInt64 = 0
+        package var sortDurationNanoseconds: UInt64 = 0
+        package var encodeDurationNanoseconds: UInt64 = 0
+        package var temporaryWriteDurationNanoseconds: UInt64 = 0
+        package var temporaryFileSyncDurationNanoseconds: UInt64 = 0
+        package var atomicReplaceDurationNanoseconds: UInt64 = 0
+        package var manifestDirectorySyncDurationNanoseconds: UInt64 = 0
+        package var readbackDecodeDurationNanoseconds: UInt64 = 0
+        package var totalDurationNanoseconds: UInt64 = 0
 
         mutating func add(_ keyPath: WritableKeyPath<Self, UInt64>, _ value: UInt64 = 1) {
             let (sum, overflow) = self[keyPath: keyPath].addingReportingOverflow(value)
@@ -151,8 +151,8 @@ import RepoPromptPersistence
         }
     }
 
-    struct WorkspaceCodemapManifestMeasurementSnapshot: Equatable {
-        let byOrigin: [
+    package struct WorkspaceCodemapManifestMeasurementSnapshot: Equatable {
+        package let byOrigin: [
             WorkspaceCodemapManifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementAggregate
         ]
     }
@@ -220,90 +220,90 @@ import RepoPromptPersistence
         }
     }
 
-    struct WorkspaceCodemapGraphIndexDebugEvent: Hashable {
-        let ordinal: UInt64
-        let uptimeNanoseconds: UInt64
-        let kind: WorkspaceCodemapBindingEngineHookKind
-        let rootID: UUID
-        let rootLifetimeID: UUID
-        let jobID: UUID?
-        let phase: WorkspaceCodemapGraphIndexPhase?
-        let workerPresent: Bool?
-        let isQueuedForAdmission: Bool?
-        let queuePosition: Int?
-        let isActiveBatch: Bool?
-        let drainingBatchCount: Int?
-        let admissionWaitAgeMilliseconds: UInt64?
-        let phaseAgeMilliseconds: UInt64?
-        let lastProgressAgeMilliseconds: UInt64?
-        let pageOrdinal: UInt64?
-        let cursorFingerprint: String?
-        let numericValue: UInt64
-        let projectedSupportedCandidateTotal: UInt64?
-        let processedCandidateCount: UInt64?
-        let candidateCount: UInt64?
-        let completedCandidateCount: UInt64?
-        let retryAttempt: UInt64?
-        let retryAfterMilliseconds: UInt64?
-        let reason: WorkspaceCodemapGraphIndexDebugReason?
-        let manifestFailureReason: WorkspaceCodemapManifestFailureReason?
-        let manifestFailureOperation: String?
-        let currentAuthorityGeneration: UInt64?
-        let observedPredecessorAuthorityGeneration: UInt64?
-        let manifestAttemptStartedUptimeNanoseconds: UInt64?
-        let manifestAttemptCompletedUptimeNanoseconds: UInt64?
-        let manifestAttemptDurationNanoseconds: UInt64?
-        let manifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementOrigin?
-        let manifestMeasurementRetryKind: WorkspaceCodemapManifestMeasurementRetryKind?
-        let manifestMutationByteCount: UInt64?
-        let manifestStoreAttempt: CodeMapRootManifestDebugAttemptMetrics?
-        let coalescedCount: UInt64
+    package struct WorkspaceCodemapGraphIndexDebugEvent: Hashable {
+        package let ordinal: UInt64
+        package let uptimeNanoseconds: UInt64
+        package let kind: WorkspaceCodemapBindingEngineHookKind
+        package let rootID: UUID
+        package let rootLifetimeID: UUID
+        package let jobID: UUID?
+        package let phase: WorkspaceCodemapGraphIndexPhase?
+        package let workerPresent: Bool?
+        package let isQueuedForAdmission: Bool?
+        package let queuePosition: Int?
+        package let isActiveBatch: Bool?
+        package let drainingBatchCount: Int?
+        package let admissionWaitAgeMilliseconds: UInt64?
+        package let phaseAgeMilliseconds: UInt64?
+        package let lastProgressAgeMilliseconds: UInt64?
+        package let pageOrdinal: UInt64?
+        package let cursorFingerprint: String?
+        package let numericValue: UInt64
+        package let projectedSupportedCandidateTotal: UInt64?
+        package let processedCandidateCount: UInt64?
+        package let candidateCount: UInt64?
+        package let completedCandidateCount: UInt64?
+        package let retryAttempt: UInt64?
+        package let retryAfterMilliseconds: UInt64?
+        package let reason: WorkspaceCodemapGraphIndexDebugReason?
+        package let manifestFailureReason: WorkspaceCodemapManifestFailureReason?
+        package let manifestFailureOperation: String?
+        package let currentAuthorityGeneration: UInt64?
+        package let observedPredecessorAuthorityGeneration: UInt64?
+        package let manifestAttemptStartedUptimeNanoseconds: UInt64?
+        package let manifestAttemptCompletedUptimeNanoseconds: UInt64?
+        package let manifestAttemptDurationNanoseconds: UInt64?
+        package let manifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementOrigin?
+        package let manifestMeasurementRetryKind: WorkspaceCodemapManifestMeasurementRetryKind?
+        package let manifestMutationByteCount: UInt64?
+        package let manifestStoreAttempt: CodeMapRootManifestDebugAttemptMetrics?
+        package let coalescedCount: UInt64
     }
 
     struct WorkspaceCodemapGraphIndexDebugEventDraft {
-        let uptimeNanoseconds: UInt64
-        let kind: WorkspaceCodemapBindingEngineHookKind
+        package let uptimeNanoseconds: UInt64
+        package let kind: WorkspaceCodemapBindingEngineHookKind
         let rootEpoch: WorkspaceCodemapRootEpoch
-        let jobID: UUID?
-        let phase: WorkspaceCodemapGraphIndexPhase?
-        let workerPresent: Bool?
-        let isQueuedForAdmission: Bool?
-        let queuePosition: Int?
-        let isActiveBatch: Bool?
-        let drainingBatchCount: Int?
-        let admissionWaitAgeMilliseconds: UInt64?
-        let phaseAgeMilliseconds: UInt64?
-        let lastProgressAgeMilliseconds: UInt64?
-        let pageOrdinal: UInt64?
-        let cursorFingerprint: String?
-        let numericValue: UInt64
-        let projectedSupportedCandidateTotal: UInt64?
-        let processedCandidateCount: UInt64?
-        let candidateCount: UInt64?
-        let completedCandidateCount: UInt64?
-        let retryAttempt: UInt64?
-        let retryAfterMilliseconds: UInt64?
-        let reason: WorkspaceCodemapGraphIndexDebugReason?
-        let manifestFailureReason: WorkspaceCodemapManifestFailureReason?
-        let manifestFailureOperation: String?
-        let currentAuthorityGeneration: UInt64?
-        let observedPredecessorAuthorityGeneration: UInt64?
-        let manifestAttemptStartedUptimeNanoseconds: UInt64?
-        let manifestAttemptCompletedUptimeNanoseconds: UInt64?
-        let manifestAttemptDurationNanoseconds: UInt64?
-        let manifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementOrigin?
-        let manifestMeasurementRetryKind: WorkspaceCodemapManifestMeasurementRetryKind?
-        let manifestMutationByteCount: UInt64?
-        let manifestStoreAttempt: CodeMapRootManifestDebugAttemptMetrics?
+        package let jobID: UUID?
+        package let phase: WorkspaceCodemapGraphIndexPhase?
+        package let workerPresent: Bool?
+        package let isQueuedForAdmission: Bool?
+        package let queuePosition: Int?
+        package let isActiveBatch: Bool?
+        package let drainingBatchCount: Int?
+        package let admissionWaitAgeMilliseconds: UInt64?
+        package let phaseAgeMilliseconds: UInt64?
+        package let lastProgressAgeMilliseconds: UInt64?
+        package let pageOrdinal: UInt64?
+        package let cursorFingerprint: String?
+        package let numericValue: UInt64
+        package let projectedSupportedCandidateTotal: UInt64?
+        package let processedCandidateCount: UInt64?
+        package let candidateCount: UInt64?
+        package let completedCandidateCount: UInt64?
+        package let retryAttempt: UInt64?
+        package let retryAfterMilliseconds: UInt64?
+        package let reason: WorkspaceCodemapGraphIndexDebugReason?
+        package let manifestFailureReason: WorkspaceCodemapManifestFailureReason?
+        package let manifestFailureOperation: String?
+        package let currentAuthorityGeneration: UInt64?
+        package let observedPredecessorAuthorityGeneration: UInt64?
+        package let manifestAttemptStartedUptimeNanoseconds: UInt64?
+        package let manifestAttemptCompletedUptimeNanoseconds: UInt64?
+        package let manifestAttemptDurationNanoseconds: UInt64?
+        package let manifestMeasurementOrigin: WorkspaceCodemapManifestMeasurementOrigin?
+        package let manifestMeasurementRetryKind: WorkspaceCodemapManifestMeasurementRetryKind?
+        package let manifestMutationByteCount: UInt64?
+        package let manifestStoreAttempt: CodeMapRootManifestDebugAttemptMetrics?
     }
 
-    struct WorkspaceCodemapGraphIndexDebugEventPage: Equatable {
-        let events: [WorkspaceCodemapGraphIndexDebugEvent]
+    package struct WorkspaceCodemapGraphIndexDebugEventPage: Equatable {
+        package let events: [WorkspaceCodemapGraphIndexDebugEvent]
         /// Bounds of the retained ring, not the returned slice.
-        let firstOrdinal: UInt64
-        let lastOrdinal: UInt64
+        package let firstOrdinal: UInt64
+        package let lastOrdinal: UInt64
         /// Exclusive cursor for the next request: the last event returned by this slice.
-        let nextOrdinal: UInt64?
+        package let nextOrdinal: UInt64?
     }
 
     struct WorkspaceCodemapGraphIndexDebugEventRing {

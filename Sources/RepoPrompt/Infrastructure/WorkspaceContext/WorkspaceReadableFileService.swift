@@ -6,11 +6,11 @@ import RepoPromptWorkspaceCore
     import RepoPromptC
 #endif
 
-protocol WorkspaceExternalReadWorkRecording: Sendable {
+package protocol WorkspaceExternalReadWorkRecording: Sendable {
     func makeRecorder() -> @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void
 }
 
-enum WorkspaceExternalReadWorkHooks {
+package enum WorkspaceExternalReadWorkHooks {
     private final class Storage: @unchecked Sendable {
         let lock = NSLock()
         var provider: (any WorkspaceExternalReadWorkRecording)?
@@ -18,7 +18,7 @@ enum WorkspaceExternalReadWorkHooks {
 
     private static let storage = Storage()
 
-    static func install(_ provider: any WorkspaceExternalReadWorkRecording) {
+    package static func install(_ provider: any WorkspaceExternalReadWorkRecording) {
         storage.lock.lock()
         storage.provider = provider
         storage.lock.unlock()
@@ -33,7 +33,7 @@ enum WorkspaceExternalReadWorkHooks {
     }
 }
 
-enum WorkspaceReadableFileResolution {
+package enum WorkspaceReadableFileResolution {
     case workspace(WorkspaceExactExistingFileMatch)
     case external(WorkspaceExternalReadableFile)
     case folder(displayPath: String)
@@ -41,7 +41,7 @@ enum WorkspaceReadableFileResolution {
     case noCandidate
 }
 
-struct WorkspaceReadableFileService {
+package struct WorkspaceReadableFileService {
     static let externalReadByteLimit = 10_000_000
     private static let externalReadChunkSize = 1_048_576
 
@@ -49,7 +49,7 @@ struct WorkspaceReadableFileService {
     let homeDirectoryURL: URL
     let beforeExternalReadOpenForTesting: (@Sendable (String) throws -> Void)?
 
-    init(
+    package init(
         store: WorkspaceFileContextStore,
         homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser,
         beforeExternalReadOpenForTesting: (@Sendable (String) throws -> Void)? = nil
@@ -59,7 +59,7 @@ struct WorkspaceReadableFileService {
         self.beforeExternalReadOpenForTesting = beforeExternalReadOpenForTesting
     }
 
-    func awaitFreshnessForExplicitRequest(
+    package func awaitFreshnessForExplicitRequest(
         _ userPath: String,
         fallbackScope: WorkspaceLookupRootScope
     ) async throws {
@@ -71,7 +71,7 @@ struct WorkspaceReadableFileService {
         }
     }
 
-    func awaitFreshnessForExplicitRequest(
+    package func awaitFreshnessForExplicitRequest(
         _ userPath: String,
         rootRefs: [WorkspaceRootRef],
         timeout: Duration? = nil
@@ -92,7 +92,7 @@ struct WorkspaceReadableFileService {
         }
     }
 
-    func awaitFreshnessForExplicitRequest(
+    package func awaitFreshnessForExplicitRequest(
         _ input: WorkspaceExactFileInput,
         namespace: WorkspaceExactFileNamespace,
         timeout: Duration
@@ -193,7 +193,7 @@ struct WorkspaceReadableFileService {
         return file
     }
 
-    func resolveReadableFile(
+    package func resolveReadableFile(
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> WorkspaceReadableFileHandle? {
@@ -215,7 +215,7 @@ struct WorkspaceReadableFileService {
         }
     }
 
-    func resolveReadFileRequest(
+    package func resolveReadFileRequest(
         _ input: WorkspaceExactFileInput,
         rootScope: WorkspaceLookupRootScope,
         rootRefs roots: [WorkspaceRootRef],
@@ -286,18 +286,18 @@ struct WorkspaceReadableFileService {
         return displayPath(forExternalPath: absolutePath)
     }
 
-    func displayPath(forExternalPath userPath: String) -> String {
+    package func displayPath(forExternalPath userPath: String) -> String {
         AgentSupportDirectoryCatalog.displayPath(for: normalizedInput(userPath), homeDirectoryURL: homeDirectoryURL)
     }
 
-    func isAlwaysReadableExternalPath(_ userPath: String) -> Bool {
+    package func isAlwaysReadableExternalPath(_ userPath: String) -> Bool {
         let normalized = normalizedInput(userPath)
         guard normalized.hasPrefix("/") else { return false }
         let directories = AgentSupportDirectoryCatalog.effectiveAlwaysReadableDirectories(homeDirectoryURL: homeDirectoryURL)
         return directories.contains { AgentSupportDirectoryCatalog.contains(absolutePath: normalized, in: $0) }
     }
 
-    func readAlwaysReadableExternalFile(_ file: WorkspaceExternalReadableFile) async throws -> String {
+    package func readAlwaysReadableExternalFile(_ file: WorkspaceExternalReadableFile) async throws -> String {
         let path = file.absolutePath
         let homeDirectoryPath = homeDirectoryURL.path
         let byteLimit = Self.externalReadByteLimit

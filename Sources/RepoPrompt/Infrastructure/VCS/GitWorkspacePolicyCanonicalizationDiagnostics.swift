@@ -6,32 +6,32 @@ import RepoPromptVCS
     /// Path-free, bounded evidence describing policy-digest assembly. This value is
     /// diagnostic carriage only; it is deliberately excluded from policy identity
     /// equality and hashing.
-    struct GitWorkspacePolicyCanonicalizationDiagnostics: Hashable {
-        enum CommonAuthorityState: String, Hashable {
+    package struct GitWorkspacePolicyCanonicalizationDiagnostics: Hashable {
+        package enum CommonAuthorityState: String, Hashable {
             case missing
             case directory
             case regular
         }
 
-        enum ExternalAuthorityState: String, Hashable {
+        package enum ExternalAuthorityState: String, Hashable {
             case unset
             case missing
             case present
         }
 
-        enum Completeness: String, Hashable {
+        package enum Completeness: String, Hashable {
             case complete
             case incomplete
         }
 
-        enum ComparisonClassification: String, Hashable {
+        package enum ComparisonClassification: String, Hashable {
             case canonicalEquivalentAfterReachabilityFiltering
             case semanticInputDifference
             case incomplete
             case incoherent
         }
 
-        enum Constituent: String, CaseIterable, Hashable {
+        package enum Constituent: String, CaseIterable, Hashable {
             case rootNeutralPolicyConfig
             case commonInfoExclude
             case canonicalIgnoreFooter
@@ -46,53 +46,53 @@ import RepoPromptVCS
             case committedControls
         }
 
-        struct CommonAuthorityIdentity: Hashable {
-            let state: CommonAuthorityState
-            let digest: String
+        package struct CommonAuthorityIdentity: Hashable {
+            package let state: CommonAuthorityState
+            package let digest: String
         }
 
-        struct CanonicalControlFooterIdentity: Hashable {
-            let digest: String
-            let recordCount: Int
+        package struct CanonicalControlFooterIdentity: Hashable {
+            package let digest: String
+            package let recordCount: Int
         }
 
-        struct ExternalAuthorityIdentity: Hashable {
-            let state: ExternalAuthorityState
-            let identityDigest: String
-            let byteCount: Int
+        package struct ExternalAuthorityIdentity: Hashable {
+            package let state: ExternalAuthorityState
+            package let identityDigest: String
+            package let byteCount: Int
         }
 
-        struct ConstituentComparison: Hashable {
-            let constituent: Constituent
-            let matched: Bool
+        package struct ConstituentComparison: Hashable {
+            package let constituent: Constituent
+            package let matched: Bool
         }
 
-        struct Comparison: Hashable {
-            let classification: ComparisonClassification
-            let constituentComparisons: [ConstituentComparison]
-            let base: GitWorkspacePolicyCanonicalizationDiagnostics?
-            let target: GitWorkspacePolicyCanonicalizationDiagnostics?
+        package struct Comparison: Hashable {
+            package let classification: ComparisonClassification
+            package let constituentComparisons: [ConstituentComparison]
+            package let base: GitWorkspacePolicyCanonicalizationDiagnostics?
+            package let target: GitWorkspacePolicyCanonicalizationDiagnostics?
         }
 
-        let rootNeutralPolicyConfigByteCount: Int
-        let rootNeutralPolicyConfigSHA256: String
-        let commonInfoExclude: CommonAuthorityIdentity
-        let canonicalIgnoreFooter: CanonicalControlFooterIdentity
-        let externalExcludes: ExternalAuthorityIdentity
-        let configuredIgnorePolicyDigest: String
-        let commonInfoAttributes: CommonAuthorityIdentity
-        let canonicalAttributeFooter: CanonicalControlFooterIdentity
-        let externalAttributes: ExternalAuthorityIdentity
-        let attributePolicyDigest: String
-        let sparsePolicyDigest: String
-        let canonicalizationPolicyVersion: String
-        let prunedRootCount: Int
-        let prunedRootSummarySHA256: String
-        let completeness: Completeness
-        let committedControlCount: Int
-        let committedControlSummarySHA256: String
+        package let rootNeutralPolicyConfigByteCount: Int
+        package let rootNeutralPolicyConfigSHA256: String
+        package let commonInfoExclude: CommonAuthorityIdentity
+        package let canonicalIgnoreFooter: CanonicalControlFooterIdentity
+        package let externalExcludes: ExternalAuthorityIdentity
+        package let configuredIgnorePolicyDigest: String
+        package let commonInfoAttributes: CommonAuthorityIdentity
+        package let canonicalAttributeFooter: CanonicalControlFooterIdentity
+        package let externalAttributes: ExternalAuthorityIdentity
+        package let attributePolicyDigest: String
+        package let sparsePolicyDigest: String
+        package let canonicalizationPolicyVersion: String
+        package let prunedRootCount: Int
+        package let prunedRootSummarySHA256: String
+        package let completeness: Completeness
+        package let committedControlCount: Int
+        package let committedControlSummarySHA256: String
 
-        init(
+        package init(
             rootNeutralPolicyConfigByteCount: Int,
             rootNeutralPolicyConfigSHA256: String,
             commonInfoExclude: CommonAuthorityIdentity,
@@ -132,7 +132,7 @@ import RepoPromptVCS
 
         /// Domain-separated fingerprint for repository-relative path bytes. Raw
         /// paths never enter the diagnostic model or exported payload.
-        static func repositoryRelativePathFingerprint(_ path: String) -> String {
+        package static func repositoryRelativePathFingerprint(_ path: String) -> String {
             var material = Data()
             appendLengthPrefixed(Data("rpce-policy-control-path-v1".utf8), to: &material)
             appendLengthPrefixed(Data(path.utf8), to: &material)

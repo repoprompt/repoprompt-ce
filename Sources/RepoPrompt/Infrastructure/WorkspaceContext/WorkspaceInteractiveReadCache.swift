@@ -16,10 +16,10 @@ struct WorkspaceInteractiveReadCacheKey: Hashable {
     }
 }
 
-struct WorkspaceInteractiveReadPreparedContent: Equatable {
+package struct WorkspaceInteractiveReadPreparedContent: Equatable {
     let linesWithEndings: [String]
 
-    var totalLines: Int {
+    package var totalLines: Int {
         linesWithEndings.count
     }
 
@@ -30,22 +30,22 @@ struct WorkspaceInteractiveReadPreparedContent: Equatable {
     }
 }
 
-struct WorkspaceInteractiveReadSlice: Equatable {
-    let content: String
-    let totalLines: Int
-    let firstLine: Int
-    let lastLine: Int
-    let returnedLineCount: Int
-    let startExceededFileLength: Bool
+package struct WorkspaceInteractiveReadSlice: Equatable {
+    package let content: String
+    package let totalLines: Int
+    package let firstLine: Int
+    package let lastLine: Int
+    package let returnedLineCount: Int
+    package let startExceededFileLength: Bool
 }
 
-enum WorkspaceInteractiveReadRangeError: Error, Equatable {
+package enum WorkspaceInteractiveReadRangeError: Error, Equatable {
     case limitWithNegativeStart
     case zeroStart
 }
 
-enum WorkspaceInteractiveReadProcessor {
-    static func prepareOffActor(_ content: String) async -> WorkspaceInteractiveReadPreparedContent {
+package enum WorkspaceInteractiveReadProcessor {
+    package static func prepareOffActor(_ content: String) async -> WorkspaceInteractiveReadPreparedContent {
         let priority = Task.currentPriority
         return await Task.detached(priority: priority) {
             prepare(content)
@@ -71,7 +71,7 @@ enum WorkspaceInteractiveReadProcessor {
         )
     }
 
-    static func slice(
+    package static func slice(
         _ prepared: WorkspaceInteractiveReadPreparedContent,
         startLine1Based: Int?,
         lineCount: Int?
@@ -134,13 +134,13 @@ enum WorkspaceInteractiveReadProcessor {
 }
 
 struct WorkspaceInteractiveReadCacheLookup {
-    let preparedContent: WorkspaceInteractiveReadPreparedContent?
-    let cacheHit: Bool
+    package let preparedContent: WorkspaceInteractiveReadPreparedContent?
+    package let cacheHit: Bool
 }
 
-struct WorkspaceInteractiveReadSnapshot {
-    let preparedContent: WorkspaceInteractiveReadPreparedContent
-    let cacheHit: Bool
+package struct WorkspaceInteractiveReadSnapshot {
+    package let preparedContent: WorkspaceInteractiveReadPreparedContent
+    package let cacheHit: Bool
 }
 
 actor WorkspaceInteractiveReadCache {

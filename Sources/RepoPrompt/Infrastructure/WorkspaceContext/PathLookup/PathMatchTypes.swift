@@ -39,7 +39,7 @@ struct StaticPathMatchData {
     /// Monotonic id to allow callers to compare snapshot generations.
     let id: UInt64
 
-    init(
+    package init(
         filesByFullPath: [String: FileRecord],
         foldersByFullPath: [String: FolderRecord],
         rootFolders: [FolderRecord],
@@ -100,7 +100,7 @@ struct PathMatchSnapshot {
 
     /// Primary initializer used by PathMatchWorker.
     /// Accepts pre-computed indexes from the worker's cache.
-    init(
+    package init(
         staticData: StaticPathMatchData,
         selectedFileFullPaths: Set<String>,
         indexes: PathMatchIndexes
@@ -117,7 +117,7 @@ struct PathMatchSnapshot {
 
     /// Convenience initializer for tests and legacy code.
     /// Builds indexes synchronously (expensive for large file trees).
-    init(
+    package init(
         filesByFullPath: [String: FileRecord],
         foldersByFullPath: [String: FolderRecord],
         rootFolders: [FolderRecord],
@@ -337,7 +337,7 @@ struct PathMatchIndexes {
     }
 }
 
-enum PathLocateProfile: Hashable {
+package enum PathLocateProfile: Hashable {
     case uiAssisted
     case mcpRead
     case mcpSelection
@@ -401,20 +401,20 @@ struct PathLocateOptions: Equatable {
 }
 
 /// Result of finding a path for file creation
-struct FileCreationResult {
-    let rootFolder: FolderRecord
-    let componentsToCreate: [String]
+package struct FileCreationResult {
+    package let rootFolder: FolderRecord
+    package let componentsToCreate: [String]
 }
 
 extension FileCreationResult: Equatable {
-    static func == (lhs: FileCreationResult, rhs: FileCreationResult) -> Bool {
+    package static func == (lhs: FileCreationResult, rhs: FileCreationResult) -> Bool {
         lhs.rootFolder.fullPath == rhs.rootFolder.fullPath &&
             lhs.componentsToCreate == rhs.componentsToCreate
     }
 }
 
 /// Controls how `resolveCreationPath` handles ties between candidate roots.
-enum CreationResolutionMode {
+package enum CreationResolutionMode {
     /// Best-effort heuristic tie-breaking (current behavior): always returns a single winner.
     case bestEffort
     /// Report ambiguity: if multiple roots tie on structural signals, return `.ambiguous`.
@@ -422,7 +422,7 @@ enum CreationResolutionMode {
 }
 
 /// Result of path resolution for file creation with ambiguity detection.
-enum FileCreationResolution: Equatable {
+package enum FileCreationResolution: Equatable {
     /// Unambiguous resolution to a single root.
     case unique(FileCreationResult)
     /// Multiple roots are equally valid candidates; caller should request disambiguation.

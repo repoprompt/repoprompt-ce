@@ -2,11 +2,11 @@ import Foundation
 import RepoPromptInstrumentation
 import RepoPromptVCS
 
-actor WorkspaceRootMaterializationHintEvaluator {
+package actor WorkspaceRootMaterializationHintEvaluator {
     private let gitService: any WorkspaceGitClient
     private let authority: GitWorkspaceStateAuthority
 
-    init(
+    package init(
         gitService: any WorkspaceGitClient,
         authority: GitWorkspaceStateAuthority
     ) {

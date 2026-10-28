@@ -105,13 +105,19 @@ struct WorkspaceCodemapManifestFIFO<Element> {
     }
 }
 
-struct WorkspaceCodemapBindingEngineServices {
+package struct WorkspaceCodemapBindingEngineServices {
     let capability: WorkspaceCodemapRootCapabilityService
     let identity: GitBlobIdentityService
     let materialization: GitBlobSourceMaterializationService
+
+    package init(capability: WorkspaceCodemapRootCapabilityService, identity: GitBlobIdentityService, materialization: GitBlobSourceMaterializationService) {
+        self.capability = capability
+        self.identity = identity
+        self.materialization = materialization
+    }
 }
 
-actor WorkspaceCodemapBindingEngine {
+package actor WorkspaceCodemapBindingEngine {
     private enum GraphIndexPublicationDisposition {
         case accepted(WorkspaceCodemapGraphIndexProgress)
         case exactDuplicate(WorkspaceCodemapGraphIndexProgress)
@@ -813,7 +819,7 @@ actor WorkspaceCodemapBindingEngine {
         ] = [:]
     #endif
 
-    init(
+    package init(
         runtime: CodeMapArtifactRuntime,
         services: WorkspaceCodemapBindingEngineServices,
         sourceReader: WorkspaceCodemapValidatedSourceReaderClient,
@@ -855,7 +861,7 @@ actor WorkspaceCodemapBindingEngine {
         self.accessEpochSeconds = accessEpochSeconds
     }
 
-    func refreshGlobalCodeMapsDisabled() async {
+    package func refreshGlobalCodeMapsDisabled() async {
         // Order setting reads/application across independent window observers. Callers
         // must not resume setup while a newer refresh is still waiting to apply OFF.
         let refreshID = UUID()

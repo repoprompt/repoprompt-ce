@@ -1,13 +1,13 @@
 import Foundation
 
-enum WorkspaceCodemapStructureStatus: String, Codable, Hashable {
+package enum WorkspaceCodemapStructureStatus: String, Codable, Hashable {
     case ok
     case partial
     case pending
     case unavailable
 }
 
-enum WorkspaceCodemapStructureSeedState: String, Codable, Hashable {
+package enum WorkspaceCodemapStructureSeedState: String, Codable, Hashable {
     case covered
     case pending
     case notIndexed = "not_indexed"
@@ -22,34 +22,34 @@ struct WorkspaceCodemapGraphStructureQuery: Hashable {
 }
 
 struct WorkspaceCodemapGraphStructureSeed: Hashable {
-    let fileID: UUID
+    package let fileID: UUID
     let standardizedRelativePath: String?
-    let state: WorkspaceCodemapStructureSeedState
+    package let state: WorkspaceCodemapStructureSeedState
 }
 
 struct WorkspaceCodemapGraphStructureNode: Hashable {
-    let fileID: UUID
+    package let fileID: UUID
     let standardizedRelativePath: String
-    let depth: Int
-    let isSeed: Bool
-    let reachedBy: Set<WorkspaceCodemapStructureTraversalReachDirection>
+    package let depth: Int
+    package let isSeed: Bool
+    package let reachedBy: Set<WorkspaceCodemapStructureTraversalReachDirection>
 }
 
 struct WorkspaceCodemapGraphStructureEdge: Hashable {
     let sourceFileID: UUID
     let targetFileID: UUID
-    let symbols: [String]
-    let ambiguous: Bool
+    package let symbols: [String]
+    package let ambiguous: Bool
 }
 
 struct WorkspaceCodemapGraphStructureUnresolved: Hashable {
     let sourceFileID: UUID
     let referencedName: String
-    let reason: WorkspaceCodemapGraphUnresolvedReason
+    package let reason: WorkspaceCodemapGraphUnresolvedReason
 }
 
-struct WorkspaceCodemapGraphStructureTruncation: Hashable {
-    let droppedNodeCount: Int
+package struct WorkspaceCodemapGraphStructureTruncation: Hashable {
+    package let droppedNodeCount: Int
 }
 
 enum WorkspaceCodemapGraphStructureIssue: Hashable {
@@ -68,60 +68,60 @@ enum WorkspaceCodemapGraphStructureIssue: Hashable {
 }
 
 struct WorkspaceCodemapGraphStructureRootResult: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let status: WorkspaceCodemapStructureStatus
-    let coverage: WorkspaceCodemapGraphCatalogCoverage?
-    let updatesPending: Bool
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let status: WorkspaceCodemapStructureStatus
+    package let coverage: WorkspaceCodemapGraphCatalogCoverage?
+    package let updatesPending: Bool
     let reconciling: Bool
     let receipt: WorkspaceCodemapGraphSnapshotReceipt?
-    let seeds: [WorkspaceCodemapGraphStructureSeed]
-    let nodes: [WorkspaceCodemapGraphStructureNode]
-    let edges: [WorkspaceCodemapGraphStructureEdge]
-    let unresolved: [WorkspaceCodemapGraphStructureUnresolved]
-    let truncation: WorkspaceCodemapGraphStructureTruncation?
-    let issues: [WorkspaceCodemapGraphStructureIssue]
+    package let seeds: [WorkspaceCodemapGraphStructureSeed]
+    package let nodes: [WorkspaceCodemapGraphStructureNode]
+    package let edges: [WorkspaceCodemapGraphStructureEdge]
+    package let unresolved: [WorkspaceCodemapGraphStructureUnresolved]
+    package let truncation: WorkspaceCodemapGraphStructureTruncation?
+    package let issues: [WorkspaceCodemapGraphStructureIssue]
 
-    var hasUsefulData: Bool {
+    package var hasUsefulData: Bool {
         !nodes.isEmpty || !edges.isEmpty || !unresolved.isEmpty
     }
 }
 
-struct WorkspaceCodemapStructureIssueRecord: Hashable {
-    let code: String
-    let phase: String
-    let path: String?
-    let retryable: Bool
-    let retryAfterMilliseconds: Int?
-    let attempted: Int?
-    let limit: Int?
-    let message: String
+package struct WorkspaceCodemapStructureIssueRecord: Hashable {
+    package let code: String
+    package let phase: String
+    package let path: String?
+    package let retryable: Bool
+    package let retryAfterMilliseconds: Int?
+    package let attempted: Int?
+    package let limit: Int?
+    package let message: String
 }
 
-struct WorkspaceCodemapStructureSeedResult: Hashable {
-    let fileID: UUID
-    let path: String
-    let state: WorkspaceCodemapStructureSeedState
+package struct WorkspaceCodemapStructureSeedResult: Hashable {
+    package let fileID: UUID
+    package let path: String
+    package let state: WorkspaceCodemapStructureSeedState
 }
 
-struct WorkspaceCodemapStructureNodeResult: Hashable {
-    let fileID: UUID
-    let path: String
-    let depth: Int
-    let isSeed: Bool
-    let reachedBy: Set<WorkspaceCodemapStructureTraversalReachDirection>
+package struct WorkspaceCodemapStructureNodeResult: Hashable {
+    package let fileID: UUID
+    package let path: String
+    package let depth: Int
+    package let isSeed: Bool
+    package let reachedBy: Set<WorkspaceCodemapStructureTraversalReachDirection>
 }
 
-struct WorkspaceCodemapStructureEdgeResult: Hashable {
-    let fromPath: String
-    let toPath: String
-    let symbols: [String]
-    let ambiguous: Bool
+package struct WorkspaceCodemapStructureEdgeResult: Hashable {
+    package let fromPath: String
+    package let toPath: String
+    package let symbols: [String]
+    package let ambiguous: Bool
 }
 
-struct WorkspaceCodemapStructureUnresolvedResult: Hashable {
-    let fromPath: String
-    let name: String
-    let reason: WorkspaceCodemapGraphUnresolvedReason
+package struct WorkspaceCodemapStructureUnresolvedResult: Hashable {
+    package let fromPath: String
+    package let name: String
+    package let reason: WorkspaceCodemapGraphUnresolvedReason
 }
 
 enum WorkspaceCodemapStructureStopReason: String, Hashable {
@@ -135,48 +135,48 @@ struct WorkspaceCodemapStructureExecutionStop: Hashable {
     let budget: WorkspaceCodemapGraphIndexBudget?
 }
 
-struct WorkspaceCodemapStructureRootResult: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let rootDisplayName: String
-    let status: WorkspaceCodemapStructureStatus
-    let coverage: WorkspaceCodemapGraphCatalogCoverage?
-    let updatesPending: Bool
-    let seeds: [WorkspaceCodemapStructureSeedResult]
-    let nodes: [WorkspaceCodemapStructureNodeResult]
-    let edges: [WorkspaceCodemapStructureEdgeResult]
-    let unresolved: [WorkspaceCodemapStructureUnresolvedResult]
-    let truncation: WorkspaceCodemapGraphStructureTruncation?
-    let issues: [WorkspaceCodemapStructureIssueRecord]
+package struct WorkspaceCodemapStructureRootResult: Hashable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let rootDisplayName: String
+    package let status: WorkspaceCodemapStructureStatus
+    package let coverage: WorkspaceCodemapGraphCatalogCoverage?
+    package let updatesPending: Bool
+    package let seeds: [WorkspaceCodemapStructureSeedResult]
+    package let nodes: [WorkspaceCodemapStructureNodeResult]
+    package let edges: [WorkspaceCodemapStructureEdgeResult]
+    package let unresolved: [WorkspaceCodemapStructureUnresolvedResult]
+    package let truncation: WorkspaceCodemapGraphStructureTruncation?
+    package let issues: [WorkspaceCodemapStructureIssueRecord]
     let receipt: WorkspaceCodemapGraphSnapshotReceipt?
     var executionStop: WorkspaceCodemapStructureExecutionStop?
 
-    var hasUsefulData: Bool {
+    package var hasUsefulData: Bool {
         !nodes.isEmpty || !edges.isEmpty || !unresolved.isEmpty
     }
 }
 
-struct WorkspaceCodemapStructureAggregateResult: Hashable {
-    let status: WorkspaceCodemapStructureStatus
-    let roots: [WorkspaceCodemapStructureRootResult]
-    let issues: [WorkspaceCodemapStructureIssueRecord]
+package struct WorkspaceCodemapStructureAggregateResult: Hashable {
+    package let status: WorkspaceCodemapStructureStatus
+    package let roots: [WorkspaceCodemapStructureRootResult]
+    package let issues: [WorkspaceCodemapStructureIssueRecord]
 
     var orderedNodeFileIDs: [UUID] {
         roots.flatMap { $0.nodes.map(\.fileID) }
     }
 }
 
-enum WorkspaceCodemapStructureGraphRevalidationResult: Hashable {
+package enum WorkspaceCodemapStructureGraphRevalidationResult: Hashable {
     case valid(updatesPending: Bool)
     case invalid(code: String, message: String)
 }
 
-enum WorkspaceCodemapStructureTraversalDirection: String, Hashable {
+package enum WorkspaceCodemapStructureTraversalDirection: String, Hashable {
     case referencedDefinitions
     case referrers
     case both
 }
 
-enum WorkspaceCodemapStructureTraversalReachDirection: String, Hashable {
+package enum WorkspaceCodemapStructureTraversalReachDirection: String, Hashable {
     case referencedDefinitions
     case referrers
 }

@@ -39,12 +39,12 @@ enum GitWorkspaceMetadataMonitorError: LocalizedError, Equatable {
 /// transactional: every requested canonical source is watched or retain fails
 /// without installing a token or partial source set. No Git command or timer
 /// polling is performed.
-actor GitWorkspaceMetadataMonitor {
+package actor GitWorkspaceMetadataMonitor {
     nonisolated static let defaultMaximumRepositoryCount = 128
     nonisolated static let defaultMaximumPathsPerRepository = 32
     nonisolated static let defaultMaximumRetainsPerRepository = 64
 
-    struct RetainToken: Hashable {
+    package struct RetainToken: Hashable {
         fileprivate let id: UUID
         fileprivate let repositoryKey: GitWorkspaceAuthorityRepositoryKey
         fileprivate let coveredTargetKeys: Set<String>

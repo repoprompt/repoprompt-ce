@@ -1,20 +1,20 @@
 import Foundation
 
-struct RepoSearchQuery: Equatable {
-    let raw: String
+package struct RepoSearchQuery: Equatable {
+    package let raw: String
     let lowered: String
     let hasSlash: Bool
     let isWildcard: Bool
 
-    var isEmpty: Bool {
+    package var isEmpty: Bool {
         raw.isEmpty
     }
 }
 
-enum RepoSearchQueryFactory {
+package enum RepoSearchQueryFactory {
     private static let defaultMaxLength = 1000
 
-    static func make(
+    package static func make(
         _ input: String,
         maxLength: Int = defaultMaxLength,
         supportsWildcards: Bool = true

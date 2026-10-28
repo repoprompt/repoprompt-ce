@@ -5,16 +5,16 @@ import RepoPromptSettingsCore
 // Determines how CodeMap definitions are inserted.
 
 /// File tree build result with marker flags
-struct FileTreeResult {
-    let tree: String
-    let usedSelectedMarker: Bool
-    let usedCodeMapMarker: Bool
-    let wasTruncated: Bool
-    let note: String?
-    var usesLegend: Bool {
+package struct FileTreeResult {
+    package let tree: String
+    package let usedSelectedMarker: Bool
+    package let usedCodeMapMarker: Bool
+    package let wasTruncated: Bool
+    package let note: String?
+    package var usesLegend: Bool {
         usedSelectedMarker || usedCodeMapMarker
     }
 }
 
 /// Namespace for immutable file-tree presentation.
-enum CodeMapExtractor {}
+package enum CodeMapExtractor {}

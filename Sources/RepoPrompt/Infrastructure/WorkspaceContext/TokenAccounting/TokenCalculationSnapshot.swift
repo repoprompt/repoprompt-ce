@@ -1,28 +1,28 @@
 import Foundation
 import RepoPromptFoundation
 
-struct PromptFileEntrySnapshot {
-    let fileID: UUID
-    let relativePath: String
-    let renderedDisplayPath: String
-    let isCodemapRequested: Bool
-    let ranges: [LineRange]?
-    let cachedFullTokenCount: Int?
-    let loadedContent: String?
-    let codeMapContent: String?
-    let availableCodeMapTokenCount: Int
+package struct PromptFileEntrySnapshot {
+    package let fileID: UUID
+    package let relativePath: String
+    package let renderedDisplayPath: String
+    package let isCodemapRequested: Bool
+    package let ranges: [LineRange]?
+    package let cachedFullTokenCount: Int?
+    package let loadedContent: String?
+    package let codeMapContent: String?
+    package let availableCodeMapTokenCount: Int
 }
 
-enum TokenCalculationFileTreeInput {
+package enum TokenCalculationFileTreeInput {
     case none
     case rendered(String)
     case snapshot(FileTreeSelectionSnapshot)
 }
 
-struct TokenCalculationSnapshot {
-    let promptText: String
-    let selectedInstructionsText: String
-    let duplicateUserInstructionsAtTop: Bool
-    let promptEntries: [PromptFileEntrySnapshot]
-    let fileTree: TokenCalculationFileTreeInput
+package struct TokenCalculationSnapshot {
+    package let promptText: String
+    package let selectedInstructionsText: String
+    package let duplicateUserInstructionsAtTop: Bool
+    package let promptEntries: [PromptFileEntrySnapshot]
+    package let fileTree: TokenCalculationFileTreeInput
 }

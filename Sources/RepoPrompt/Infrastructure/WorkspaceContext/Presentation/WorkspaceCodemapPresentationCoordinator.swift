@@ -1,9 +1,9 @@
 import Foundation
 
-let workspaceCodemapProductionDemandWaitMilliseconds = 10000
+package let workspaceCodemapProductionDemandWaitMilliseconds = 10000
 
-struct WorkspaceCodemapPresentationRequestPolicy: Equatable {
-    static let `default` = Self()
+package struct WorkspaceCodemapPresentationRequestPolicy: Equatable {
+    package static let `default` = Self()
 
     let maximumReadinessRounds: Int
     let initialBackoffMilliseconds: Int
@@ -11,7 +11,7 @@ struct WorkspaceCodemapPresentationRequestPolicy: Equatable {
     let maximumTotalWait: Duration
     let maximumCandidateDemandCount: Int
 
-    init(
+    package init(
         maximumReadinessRounds: Int = 4096,
         initialBackoffMilliseconds: Int = 25,
         maximumBackoffMilliseconds: Int = 250,
@@ -41,7 +41,7 @@ struct WorkspaceCodemapPresentationRequestPolicy: Equatable {
     }
 }
 
-struct WorkspaceCodemapPresentationWaiter {
+package struct WorkspaceCodemapPresentationWaiter {
     let sleep: @Sendable (Duration) async throws -> Void
 
     static let production = Self { duration in
@@ -112,7 +112,7 @@ private actor WorkspaceCodemapOperationPresentationOwnership {
     }
 }
 
-enum WorkspaceCodemapStructureExecutionPhase: Equatable {
+package enum WorkspaceCodemapStructureExecutionPhase: Equatable {
     case seedResolution
     case graphSnapshot
     case graphTraversal
@@ -123,15 +123,15 @@ enum WorkspaceCodemapStructureExecutionPhase: Equatable {
     case assembly
 }
 
-struct WorkspaceCodemapPresentationAttempt<Context> {
-    let context: Context
-    let intent: WorkspaceCodemapOperationPresentationIntent
-    let rootScope: WorkspaceLookupRootScope
-    let logicalRootDisplayNamesByRootID: [UUID: String]
-    let requestedCodemapCount: Int?
+package struct WorkspaceCodemapPresentationAttempt<Context> {
+    package let context: Context
+    package let intent: WorkspaceCodemapOperationPresentationIntent
+    package let rootScope: WorkspaceLookupRootScope
+    package let logicalRootDisplayNamesByRootID: [UUID: String]
+    package let requestedCodemapCount: Int?
 }
 
-struct WorkspaceCodemapPresentationCoordinator {
+package struct WorkspaceCodemapPresentationCoordinator {
     private struct AutomaticPreparation {
         let candidates: [WorkspaceCodemapOperationPresentationCandidate]
         let issues: [WorkspaceCodemapOperationIssue]
@@ -157,7 +157,7 @@ struct WorkspaceCodemapPresentationCoordinator {
     let structureAttemptDidBegin: @Sendable (Int) -> Void
     let structurePhaseDidChange: @Sendable (WorkspaceCodemapStructureExecutionPhase) async -> Void
 
-    init(
+    package init(
         store: WorkspaceFileContextStore,
         policy: WorkspaceCodemapPresentationRequestPolicy = .default,
         waiter: WorkspaceCodemapPresentationWaiter = .production,
@@ -181,7 +181,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         self.structurePhaseDidChange = structurePhaseDidChange
     }
 
-    func presentation(
+    package func presentation(
         for intent: WorkspaceCodemapOperationPresentationIntent,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         logicalRootDisplayNamesByRootID: [UUID: String] = [:]
@@ -193,7 +193,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         ) { $0 }
     }
 
-    func structureSignaturePresentation(
+    package func structureSignaturePresentation(
         fileIDs: [UUID],
         rootScope: WorkspaceLookupRootScope,
         logicalRootDisplayNamesByRootID: [UUID: String]
@@ -205,7 +205,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         )
     }
 
-    func withPresentation<Value>(
+    package func withPresentation<Value>(
         for intent: WorkspaceCodemapOperationPresentationIntent,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         logicalRootDisplayNamesByRootID: [UUID: String] = [:],
@@ -232,7 +232,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         }
     }
 
-    func withPresentation<Context, Value>(
+    package func withPresentation<Context, Value>(
         prepareAttempt: () async throws -> WorkspaceCodemapPresentationAttempt<Context>,
         operation: (Context, WorkspaceCodemapOperationPresentation) async throws -> Value
     ) async throws -> Value {

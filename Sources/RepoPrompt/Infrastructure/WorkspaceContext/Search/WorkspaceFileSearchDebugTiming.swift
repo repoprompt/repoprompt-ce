@@ -445,7 +445,7 @@
         let codemap: Codemap
     }
 
-    final class WorkspaceFileSearchColdStartCollector: @unchecked Sendable {
+    package final class WorkspaceFileSearchColdStartCollector: @unchecked Sendable {
         private struct SchedulerState {
             var requestCount = 0
             var enqueueCount = 0
@@ -509,15 +509,15 @@
             }
         }
 
-        func recordSchedulerRequest(workload: String) {
+        package func recordSchedulerRequest(workload: String) {
             withSchedulerState(workload: workload) { $0.requestCount += 1 }
         }
 
-        func recordSchedulerEnqueue(workload: String) {
+        package func recordSchedulerEnqueue(workload: String) {
             withSchedulerState(workload: workload) { $0.enqueueCount += 1 }
         }
 
-        func recordSchedulerGrant(workload: String, waitNanoseconds: UInt64) {
+        package func recordSchedulerGrant(workload: String, waitNanoseconds: UInt64) {
             withSchedulerState(workload: workload) {
                 $0.grantCount += 1
                 $0.totalWaitNanoseconds &+= waitNanoseconds
@@ -525,7 +525,7 @@
             }
         }
 
-        func recordSchedulerCompletion(
+        package func recordSchedulerCompletion(
             workload: String,
             executionNanoseconds: UInt64,
             cancelled: Bool,
@@ -663,7 +663,7 @@
         }
     }
 
-    enum WorkspaceFileSearchDebugContext {
+    package enum WorkspaceFileSearchDebugContext {
         @TaskLocal static var collector: WorkspaceFileSearchPhaseCollector?
         @TaskLocal static var catalogBuildObserver: WorkspaceFileSearchCatalogBuildObserver?
         @TaskLocal static var coldStartCollector: WorkspaceFileSearchColdStartCollector?

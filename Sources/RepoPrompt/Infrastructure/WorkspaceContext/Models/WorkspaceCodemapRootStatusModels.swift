@@ -1,6 +1,6 @@
 import Foundation
 
-enum WorkspaceCodemapRootAvailability: String, Hashable {
+package enum WorkspaceCodemapRootAvailability: String, Hashable {
     case notInitialized
     case indexing
     case ready
@@ -10,7 +10,7 @@ enum WorkspaceCodemapRootAvailability: String, Hashable {
     case revoked
 }
 
-enum WorkspaceCodemapRootStatusUnavailableReason: String, Hashable {
+package enum WorkspaceCodemapRootStatusUnavailableReason: String, Hashable {
     /// No usable source authority for this root. A healthy filesystem root never reports this.
     case sourceRootUnavailable
     case setupFailed
@@ -56,29 +56,29 @@ struct WorkspaceCodemapGraphRootDiagnostics: Hashable {
     var observedToAppliedGenerationLag: UInt64 = 0
 }
 
-struct WorkspaceCodemapRootStatusSnapshot: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let availability: WorkspaceCodemapRootAvailability
-    let isGenerationSuspended: Bool
-    let coverage: WorkspaceCodemapGraphCatalogCoverage?
-    let graphRevision: UInt64?
+package struct WorkspaceCodemapRootStatusSnapshot: Hashable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let availability: WorkspaceCodemapRootAvailability
+    package let isGenerationSuspended: Bool
+    package let coverage: WorkspaceCodemapGraphCatalogCoverage?
+    package let graphRevision: UInt64?
     let appliedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
     let observedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
-    let updatesPending: Bool
+    package let updatesPending: Bool
     let reconciliationAttempt: Int?
     let reconciliationDeadlineUptimeNanoseconds: UInt64?
     let commitCadence: WorkspaceCodemapGraphCommitCadence
     let diagnostics: WorkspaceCodemapGraphRootDiagnostics
-    let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason?
+    package let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason?
     var graphIndexBudget: WorkspaceCodemapGraphIndexBudget?
 }
 
-struct WorkspaceCodemapRootStatusUpdate: Hashable {
-    let revision: UInt64
-    let roots: [WorkspaceCodemapRootStatusSnapshot]
+package struct WorkspaceCodemapRootStatusUpdate: Hashable {
+    package let revision: UInt64
+    package let roots: [WorkspaceCodemapRootStatusSnapshot]
 }
 
-enum WorkspaceCodemapRootSuspensionUpdateResult: Hashable {
+package enum WorkspaceCodemapRootSuspensionUpdateResult: Hashable {
     case changed
     case unchanged
     case rootUnavailable

@@ -1,11 +1,11 @@
 import Foundation
 import RepoPromptWorkspaceCore
 
-enum WorkspaceLogicalRootIdentity {
-    struct RootDescriptor {
-        let physicalRootID: UUID
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let preferredName: String
+package enum WorkspaceLogicalRootIdentity {
+    package struct RootDescriptor {
+        package let physicalRootID: UUID
+        package let rootEpoch: WorkspaceCodemapRootEpoch
+        package let preferredName: String
     }
 
     static func relativePath(
@@ -42,7 +42,7 @@ enum WorkspaceLogicalRootIdentity {
         "root@\(rootEpoch.rootID.uuidString.lowercased())+\(rootEpoch.rootLifetimeID.uuidString.lowercased())"
     }
 
-    static func labels(for descriptors: [RootDescriptor]) -> [UUID: String] {
+    package static func labels(for descriptors: [RootDescriptor]) -> [UUID: String] {
         var seenPhysicalRootIDs = Set<UUID>()
         var normalizedDescriptors: [RootDescriptor] = []
         normalizedDescriptors.reserveCapacity(descriptors.count)
@@ -89,7 +89,7 @@ enum WorkspaceLogicalRootIdentity {
     }
 }
 
-extension WorkspaceLookupContext {
+package extension WorkspaceLookupContext {
     func logicalRootDisplayNamesByRootID(
         store: WorkspaceFileContextStore
     ) async -> [UUID: String] {

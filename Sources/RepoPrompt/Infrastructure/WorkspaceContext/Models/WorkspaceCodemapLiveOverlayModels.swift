@@ -5,8 +5,8 @@ import RepoPromptPersistence
 // Explicit checked conformances are intentional actor-boundary contracts.
 // swiftformat:disable redundantSendable
 
-struct WorkspaceCodemapLiveOverlayPolicy: Equatable, Sendable {
-    static let `default` = WorkspaceCodemapLiveOverlayPolicy()
+package struct WorkspaceCodemapLiveOverlayPolicy: Equatable, Sendable {
+    package static let `default` = WorkspaceCodemapLiveOverlayPolicy()
 
     let maximumRootCount: Int
     let maximumEntryCountPerRoot: Int
@@ -107,7 +107,7 @@ enum WorkspaceCodemapLiveOverlayUnavailableReason: Equatable, Sendable {
     case invalidated(WorkspaceCodemapLiveOverlayInvalidationReason)
 }
 
-enum WorkspaceCodemapLiveArtifactOutcome: Equatable, Sendable {
+package enum WorkspaceCodemapLiveArtifactOutcome: Equatable, Sendable {
     case ready
     case readyNoSymbols
     case oversize
@@ -282,7 +282,7 @@ struct WorkspaceCodemapLiveRootSnapshot: Equatable, Sendable {
     let entries: [WorkspaceCodemapLiveEntrySnapshot]
 }
 
-struct WorkspaceCodemapLiveReadySnapshot: Equatable, Sendable {
+package struct WorkspaceCodemapLiveReadySnapshot: Equatable, Sendable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let fileID: UUID
     let standardizedRelativePath: String
@@ -542,7 +542,7 @@ final class WorkspaceCodemapSharedArtifactLease: Sendable {
 
 /// How the overlay rebuilds its root-local graph ledger after a graph-index publication.
 /// `.alwaysFull` exists so tests can prove the path-scoped reconciliation is exact.
-enum WorkspaceCodemapGraphReconcileMode: Hashable {
+package enum WorkspaceCodemapGraphReconcileMode: Hashable {
     case incremental
     case alwaysFull
 }

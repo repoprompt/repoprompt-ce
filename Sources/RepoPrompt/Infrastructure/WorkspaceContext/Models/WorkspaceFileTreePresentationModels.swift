@@ -1,9 +1,9 @@
 import Foundation
 import RepoPromptWorkspaceCore
 
-struct WorkspaceFileTreePresentationSnapshot {
-    let roots: [WorkspaceFileTreeFolderPresentation]
-    let selectedFileIDs: Set<UUID>
+package struct WorkspaceFileTreePresentationSnapshot {
+    package let roots: [WorkspaceFileTreeFolderPresentation]
+    package let selectedFileIDs: Set<UUID>
     let mode: String
     let showFullPaths: Bool
     let onlyIncludeRootsWithSelectedFiles: Bool
@@ -32,10 +32,10 @@ struct WorkspaceFileTreePresentationSnapshot {
     }
 }
 
-struct WorkspaceFileTreeFolderPresentation: Hashable {
+package struct WorkspaceFileTreeFolderPresentation: Hashable {
     let id: UUID
     let name: String
-    let fullPath: String
+    package let fullPath: String
     let standardizedFullPath: String
     let standardizedRootPath: String
     let children: [WorkspaceFileTreeNodePresentation]
@@ -67,10 +67,10 @@ indirect enum WorkspaceFileTreeNodePresentation: Hashable {
     }
 }
 
-struct WorkspaceFileTreePresentation {
-    let content: String
-    let rootCount: Int
-    let usesLegend: Bool
+package struct WorkspaceFileTreePresentation {
+    package let content: String
+    package let rootCount: Int
+    package let usesLegend: Bool
     let codemapCoverage: WorkspaceCodemapOperationPresentationCoverage
     let codemapIssues: [WorkspaceCodemapOperationIssue]
 }

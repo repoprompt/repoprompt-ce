@@ -1,11 +1,11 @@
 import Foundation
 import RepoPromptVCS
 
-struct GitTargetEvidencePathPolicy: Equatable {
+package struct GitTargetEvidencePathPolicy: Equatable {
     let maximumPathBytes: Int
     let maximumDepth: Int
 
-    init(maximumPathBytes: Int = 16 * 1024, maximumDepth: Int = 512) {
+    package init(maximumPathBytes: Int = 16 * 1024, maximumDepth: Int = 512) {
         precondition(maximumPathBytes > 0)
         precondition(maximumDepth > 0)
         self.maximumPathBytes = maximumPathBytes
@@ -28,7 +28,7 @@ struct GitLoadedRootTreeInventoryStreamingParser {
     private let emit: Emit
     private var framer: GitTargetEvidenceNULFramer
 
-    init(
+    package init(
         objectFormat: GitObjectFormat,
         rootPrefix: GitRepositoryRelativeRootPrefix,
         pathPolicy: GitTargetEvidencePathPolicy = .init(),
@@ -40,7 +40,7 @@ struct GitLoadedRootTreeInventoryStreamingParser {
         framer = GitTargetEvidenceNULFramer(maximumFrameBytes: pathPolicy.maximumPathBytes + 4096)
     }
 
-    mutating func consume(_ chunk: Data) async throws {
+    package mutating func consume(_ chunk: Data) async throws {
         var activeFramer = framer
         do {
             try await activeFramer.consume(chunk) { frame in
@@ -53,7 +53,7 @@ struct GitLoadedRootTreeInventoryStreamingParser {
         }
     }
 
-    mutating func finish() async throws {
+    package mutating func finish() async throws {
         try Task.checkCancellation()
         try framer.finish()
     }
@@ -85,8 +85,8 @@ struct GitLoadedRootTreeInventoryStreamingParser {
     }
 }
 
-struct GitTargetTreeDeltaStreamingParser {
-    typealias Emit = @Sendable (GitTargetTreeDeltaEvidenceRecord) async throws -> Void
+package struct GitTargetTreeDeltaStreamingParser {
+    package typealias Emit = @Sendable (GitTargetTreeDeltaEvidenceRecord) async throws -> Void
 
     private enum State {
         case awaitingMetadata
@@ -109,7 +109,7 @@ struct GitTargetTreeDeltaStreamingParser {
     private var framer: GitTargetEvidenceNULFramer
     private var state: State = .awaitingMetadata
 
-    init(
+    package init(
         objectFormat: GitObjectFormat,
         rootPrefix: GitRepositoryRelativeRootPrefix,
         pathPolicy: GitTargetEvidencePathPolicy = .init(),
@@ -121,7 +121,7 @@ struct GitTargetTreeDeltaStreamingParser {
         framer = GitTargetEvidenceNULFramer(maximumFrameBytes: pathPolicy.maximumPathBytes + 4096)
     }
 
-    mutating func consume(_ chunk: Data) async throws {
+    package mutating func consume(_ chunk: Data) async throws {
         var activeFramer = framer
         do {
             try await activeFramer.consume(chunk) { frame in
@@ -134,7 +134,7 @@ struct GitTargetTreeDeltaStreamingParser {
         }
     }
 
-    mutating func finish() async throws {
+    package mutating func finish() async throws {
         try Task.checkCancellation()
         try framer.finish()
         guard case .awaitingMetadata = state else {
@@ -236,15 +236,15 @@ struct GitTargetTreeDeltaStreamingParser {
     }
 }
 
-struct GitTargetIndexStreamingParser {
-    typealias Emit = @Sendable (GitTargetIndexEvidenceRecord) async throws -> Void
+package struct GitTargetIndexStreamingParser {
+    package typealias Emit = @Sendable (GitTargetIndexEvidenceRecord) async throws -> Void
 
     private let objectFormat: GitObjectFormat
     private let validator: GitTargetEvidencePathValidator
     private let emit: Emit
     private var framer: GitTargetEvidenceNULFramer
 
-    init(
+    package init(
         objectFormat: GitObjectFormat,
         rootPrefix: GitRepositoryRelativeRootPrefix,
         pathPolicy: GitTargetEvidencePathPolicy = .init(),
@@ -256,7 +256,7 @@ struct GitTargetIndexStreamingParser {
         framer = GitTargetEvidenceNULFramer(maximumFrameBytes: pathPolicy.maximumPathBytes + 4096)
     }
 
-    mutating func consume(_ chunk: Data) async throws {
+    package mutating func consume(_ chunk: Data) async throws {
         var activeFramer = framer
         do {
             try await activeFramer.consume(chunk) { frame in
@@ -269,7 +269,7 @@ struct GitTargetIndexStreamingParser {
         }
     }
 
-    mutating func finish() async throws {
+    package mutating func finish() async throws {
         try Task.checkCancellation()
         try framer.finish()
     }
@@ -304,8 +304,8 @@ struct GitTargetIndexStreamingParser {
     }
 }
 
-struct GitTargetStatusPorcelainV2StreamingParser {
-    typealias Emit = @Sendable (GitTargetStatusEvidenceRecord) async throws -> Void
+package struct GitTargetStatusPorcelainV2StreamingParser {
+    package typealias Emit = @Sendable (GitTargetStatusEvidenceRecord) async throws -> Void
 
     private struct PendingType2 {
         let kind: GitTargetStatusEvidenceKind
@@ -326,7 +326,7 @@ struct GitTargetStatusPorcelainV2StreamingParser {
     private var framer: GitTargetEvidenceNULFramer
     private var pendingType2: PendingType2?
 
-    init(
+    package init(
         rootPrefix: GitRepositoryRelativeRootPrefix,
         pathPolicy: GitTargetEvidencePathPolicy = .init(),
         emit: @escaping Emit
@@ -336,7 +336,7 @@ struct GitTargetStatusPorcelainV2StreamingParser {
         framer = GitTargetEvidenceNULFramer(maximumFrameBytes: pathPolicy.maximumPathBytes + 4096)
     }
 
-    mutating func consume(_ chunk: Data) async throws {
+    package mutating func consume(_ chunk: Data) async throws {
         var activeFramer = framer
         do {
             try await activeFramer.consume(chunk) { frame in
@@ -349,7 +349,7 @@ struct GitTargetStatusPorcelainV2StreamingParser {
         }
     }
 
-    mutating func finish() async throws {
+    package mutating func finish() async throws {
         try Task.checkCancellation()
         try framer.finish()
         guard pendingType2 == nil else {

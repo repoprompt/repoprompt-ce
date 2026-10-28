@@ -5,7 +5,7 @@ import RepoPromptPersistence
 
 /// Root-local derived graph authority. Overlay generations are freshness metadata; queries always
 /// pin the latest immutable commit and destructive safety is enforced independently by fences.
-actor WorkspaceCodemapSelectionGraph {
+package actor WorkspaceCodemapSelectionGraph {
     private struct CandidateBuild {
         let snapshot: WorkspaceCodemapGraphCommittedSnapshot
         let changedFileCount: Int

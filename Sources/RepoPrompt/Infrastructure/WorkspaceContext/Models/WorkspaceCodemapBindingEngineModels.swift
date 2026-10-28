@@ -5,11 +5,11 @@ import RepoPromptPersistence
 import RepoPromptVCS
 
 #if !DEBUG
-    struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {}
+    package struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {}
 #endif
 
-struct WorkspaceCodemapBindingEnginePolicy: Equatable {
-    static let `default` = WorkspaceCodemapBindingEnginePolicy()
+package struct WorkspaceCodemapBindingEnginePolicy: Equatable {
+    package static let `default` = WorkspaceCodemapBindingEnginePolicy()
 
     let maximumRootCount: Int
     let maximumActiveRequestCountPerRoot: Int
@@ -234,10 +234,10 @@ struct WorkspaceCodemapObservedStaleAuthorityError: Error, Equatable {
     }
 }
 
-struct WorkspaceCodemapManifestWriterRetryWaiter {
+package struct WorkspaceCodemapManifestWriterRetryWaiter {
     let sleep: @Sendable (Duration) async throws -> Void
 
-    static let production = Self { duration in
+    package static let production = Self { duration in
         try await Task.sleep(for: duration)
     }
 }
@@ -271,7 +271,7 @@ struct WorkspaceCodemapManifestBindingCandidate {
     let ingressGeneration: UInt64
 }
 
-struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
+package struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
     let resolveManifestBinding: @Sendable (
         WorkspaceCodemapRootEpoch,
         String
@@ -339,10 +339,10 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
         self.reportRootAuthorityInvalidated = reportRootAuthorityInvalidated
     }
 
-    static let unavailable = WorkspaceCodemapBindingCatalogClient { _, _ in nil }
+    package static let unavailable = WorkspaceCodemapBindingCatalogClient { _, _ in nil }
 }
 
-struct WorkspaceCodemapValidatedSourceReaderClient: @unchecked Sendable {
+package struct WorkspaceCodemapValidatedSourceReaderClient: @unchecked Sendable {
     let read: @Sendable (
         WorkspaceCodemapArtifactBindingIdentity,
         GitBlobLStatFingerprint,
@@ -370,7 +370,7 @@ enum WorkspaceCodemapBindingRegistrationResult {
     case failed
 }
 
-enum WorkspaceCodemapBindingDemandRejection: Equatable {
+package enum WorkspaceCodemapBindingDemandRejection: Equatable {
     case rootNotRegistered
     case capabilityUnavailable
     case rootEpochMismatch
@@ -387,7 +387,7 @@ enum WorkspaceCodemapBindingDemandRejection: Equatable {
     case staleCompletion
 }
 
-enum WorkspaceCodemapBindingDemandUnavailableReason: Equatable {
+package enum WorkspaceCodemapBindingDemandUnavailableReason: Equatable {
     case unsupportedFileType
     case missing
     case securityExcluded
@@ -397,7 +397,7 @@ enum WorkspaceCodemapBindingDemandUnavailableReason: Equatable {
     case terminalArtifact(WorkspaceCodemapLiveArtifactOutcome)
 }
 
-enum WorkspaceCodemapBindingDemandResult {
+package enum WorkspaceCodemapBindingDemandResult {
     case ready(WorkspaceCodemapLiveReadySnapshot)
     case alreadyReady(WorkspaceCodemapLiveReadySnapshot)
     case unavailable(WorkspaceCodemapBindingDemandUnavailableReason)
@@ -453,7 +453,7 @@ struct WorkspaceCodemapBindingInvalidationResult: Equatable {
     let manifestWriteFailed: Bool
 }
 
-enum WorkspaceCodemapBindingEngineHookKind: String, Hashable {
+package enum WorkspaceCodemapBindingEngineHookKind: String, Hashable {
     case capabilityEligible
     case capabilityTerminalUnavailable
     case capabilityTransientRetry
@@ -557,7 +557,7 @@ struct WorkspaceCodemapBindingEngineHookEvent {
     }
 }
 
-struct WorkspaceCodemapBindingEngineHooks {
+package struct WorkspaceCodemapBindingEngineHooks {
     let event: @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void
     let afterManifestRevisionQueuedBeforeWaiterInstall: @Sendable (
         WorkspaceCodemapRootEpoch,
@@ -640,7 +640,7 @@ struct WorkspaceCodemapBindingEngineHooks {
         }
     #endif
 
-    static let none = WorkspaceCodemapBindingEngineHooks()
+    package static let none = WorkspaceCodemapBindingEngineHooks()
 }
 
 struct WorkspaceCodemapBindingEngineCounters: Equatable {
@@ -820,7 +820,7 @@ struct WorkspaceCodemapBindingEngineCounters: Equatable {
     }
 }
 
-enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
+package enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
     case complete
     case budgetLimited
     case cancelled
@@ -857,7 +857,7 @@ enum WorkspaceCodemapGraphIndexWatchdogDisposition: Hashable {
     case unavailable
 }
 
-enum WorkspaceCodemapGraphIndexPrioritizeDisposition: Hashable {
+package enum WorkspaceCodemapGraphIndexPrioritizeDisposition: Hashable {
     case scheduled
     case restarted
     case promoted
@@ -880,43 +880,43 @@ struct WorkspaceCodemapGraphIndexBatchTiming: Hashable {
     var totalPublishDurationNanoseconds: UInt64 = 0
 }
 
-struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
+package struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let jobID: UUID
-    let phase: WorkspaceCodemapGraphIndexPhase
-    let progress: WorkspaceCodemapGraphIndexProgress
-    let workerPresent: Bool
-    let workerRecoveryCount: UInt64
-    let lastWorkerCompletionReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
-    let isPriorityPromoted: Bool
-    let isQueuedForAdmission: Bool
-    let queuePosition: Int?
-    let queuedBatchCount: Int
-    let activeBatchCount: Int
-    let drainingBatchCount: Int
-    let resources: WorkspaceCodemapGraphIndexResourceAccounting
-    let retryAttempt: UInt64
-    let retry: WorkspaceCodemapGraphIndexRetry?
-    let budget: WorkspaceCodemapGraphIndexBudget?
-    let scheduledUptimeNanoseconds: UInt64
-    let admissionWaitStartUptimeNanoseconds: UInt64?
-    let admittedUptimeNanoseconds: UInt64?
-    let phaseEnteredUptimeNanoseconds: UInt64
-    let lastProgressUptimeNanoseconds: UInt64
-    let workerFinishedUptimeNanoseconds: UInt64?
-    let lastProjectedSupportedCandidateTotal: UInt64?
-    let pageStartProcessedCandidateBaseline: UInt64?
-    let pageOrdinal: UInt64
-    let cursorPresent: Bool
-    let cursorFingerprint: String?
-    let inBatchCandidateCount: UInt64?
-    let inBatchResolvedCandidateCount: UInt64?
-    let checkpointPresent: Bool
-    let manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
+    package let jobID: UUID
+    package let phase: WorkspaceCodemapGraphIndexPhase
+    package let progress: WorkspaceCodemapGraphIndexProgress
+    package let workerPresent: Bool
+    package let workerRecoveryCount: UInt64
+    package let lastWorkerCompletionReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
+    package let isPriorityPromoted: Bool
+    package let isQueuedForAdmission: Bool
+    package let queuePosition: Int?
+    package let queuedBatchCount: Int
+    package let activeBatchCount: Int
+    package let drainingBatchCount: Int
+    package let resources: WorkspaceCodemapGraphIndexResourceAccounting
+    package let retryAttempt: UInt64
+    package let retry: WorkspaceCodemapGraphIndexRetry?
+    package let budget: WorkspaceCodemapGraphIndexBudget?
+    package let scheduledUptimeNanoseconds: UInt64
+    package let admissionWaitStartUptimeNanoseconds: UInt64?
+    package let admittedUptimeNanoseconds: UInt64?
+    package let phaseEnteredUptimeNanoseconds: UInt64
+    package let lastProgressUptimeNanoseconds: UInt64
+    package let workerFinishedUptimeNanoseconds: UInt64?
+    package let lastProjectedSupportedCandidateTotal: UInt64?
+    package let pageStartProcessedCandidateBaseline: UInt64?
+    package let pageOrdinal: UInt64
+    package let cursorPresent: Bool
+    package let cursorFingerprint: String?
+    package let inBatchCandidateCount: UInt64?
+    package let inBatchResolvedCandidateCount: UInt64?
+    package let checkpointPresent: Bool
+    package let manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
     let batchTiming: WorkspaceCodemapGraphIndexBatchTiming
 }
 
-struct WorkspaceCodemapBindingEngineAccounting: Equatable {
+package struct WorkspaceCodemapBindingEngineAccounting: Equatable {
     let rootCount: Int
     let eligibleRootCount: Int
     let unavailableRootCount: Int
@@ -988,12 +988,12 @@ struct WorkspaceCodemapBindingEngineAccounting: Equatable {
 /// The pause only coalesces pending publications into fewer commits; the engine interrupts it
 /// whenever a caller needs the graph caught up (for example before reporting graph-index
 /// completion) and when the pull task is cancelled. Tests inject a gated pause to force the path.
-struct WorkspaceCodemapGraphPullPause {
+package struct WorkspaceCodemapGraphPullPause {
     /// Receives the wall-clock nanoseconds the preceding apply took.
     let pause: @Sendable (_ applyNanoseconds: UInt64) async -> Void
 
     /// Pauses for twice the apply time, capped at 250 ms; sub-millisecond commits do not pause.
-    static let production = WorkspaceCodemapGraphPullPause { applyNanoseconds in
+    package static let production = WorkspaceCodemapGraphPullPause { applyNanoseconds in
         let (scaled, overflow) = applyNanoseconds.multipliedReportingOverflow(by: 2)
         let maximum: UInt64 = 250_000_000
         let pause = overflow ? maximum : min(scaled, maximum)

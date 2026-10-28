@@ -1,26 +1,26 @@
 import Foundation
 import RepoPromptFoundation
 
-struct WorkspaceSliceSegment: Equatable {
-    let range: LineRange
-    let text: String
+package struct WorkspaceSliceSegment: Equatable {
+    package let range: LineRange
+    package let text: String
 }
 
-struct WorkspaceSliceAssembly: Equatable {
-    let segments: [WorkspaceSliceSegment]
-    let combinedText: String
+package struct WorkspaceSliceAssembly: Equatable {
+    package let segments: [WorkspaceSliceSegment]
+    package let combinedText: String
     let totalLines: Int
     let detectedLineEnding: String
     let usedRanges: [LineRange]
-    let isFullFile: Bool
+    package let isFullFile: Bool
 
     var totalCharacters: Int {
         combinedText.count
     }
 }
 
-enum SliceAssemblyBuilder {
-    static func build(from content: String, ranges: [LineRange]?) -> WorkspaceSliceAssembly {
+package enum SliceAssemblyBuilder {
+    package static func build(from content: String, ranges: [LineRange]?) -> WorkspaceSliceAssembly {
         let pairs = String.splitContentPreservingAllLineEndings(content)
         let (_, detectedEnding) = String.splitContentPreservingLineEndings(content)
         let totalLines = pairs.count

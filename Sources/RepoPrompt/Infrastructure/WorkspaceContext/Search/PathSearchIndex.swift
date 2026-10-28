@@ -10,9 +10,9 @@ typealias size_t = Int
 ///
 /// The C storage is read-only after initialization, so concurrent readers can safely retain and
 /// query an older generation while a replacement index is built and published elsewhere.
-final class PathSearchIndex: @unchecked Sendable {
-    struct Candidate: Equatable {
-        let index: Int
+package final class PathSearchIndex: @unchecked Sendable {
+    package struct Candidate: Equatable {
+        package let index: Int
         let path: String
         let filename: String
         let score: Int32
@@ -70,14 +70,14 @@ final class PathSearchIndex: @unchecked Sendable {
 
     /// Builds an immutable index from a non-actor async context so UI callers do not perform the
     /// C allocation and sort on `MainActor`.
-    static func build(paths: [String]) async -> PathSearchIndex {
+    package static func build(paths: [String]) async -> PathSearchIndex {
         PathSearchIndex(paths: paths)
     }
 
     /// Returns candidates in the C index's authoritative rank order: descending score, then
     /// ascending lexical tie-break key. The current matcher is boolean, so accepted matches all
     /// have score 1 and retain the historical lexical ordering exactly.
-    func search(_ pattern: String, limit: Int = 300) async -> [Candidate] {
+    package func search(_ pattern: String, limit: Int = 300) async -> [Candidate] {
         searchSynchronously(pattern, limit: limit)
     }
 
@@ -446,7 +446,7 @@ struct WorkspacePathSearchOverlayHistory<Payload>: @unchecked Sendable {
 /// Shard patches share one materialized base index and append immutable overlay payloads.
 /// Every published generation owns an immutable history view whose compacted pages can share older
 /// tails without invalidating retained readers.
-final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
+package final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
     enum BuildKind: Equatable {
         case full
         case overlay
@@ -454,7 +454,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         case projectedReuse
     }
 
-    struct Candidate {
+    package struct Candidate {
         let entry: WorkspaceSearchCatalogEntry
         let score: Int32
         let tieBreakKey: String
@@ -694,7 +694,7 @@ final class WorkspaceSearchRootPathIndex: @unchecked Sendable {
         )
     }
 
-    func search(_ query: String, limit: Int) -> [Candidate] {
+    package func search(_ query: String, limit: Int) -> [Candidate] {
         guard limit > 0 else { return [] }
         if let projectedIndex {
             return projectedIndex.search(query, limit: limit)
@@ -1337,7 +1337,7 @@ final class WorkspaceProjectedPathSearchIndex: @unchecked Sendable {
         )
     }
 
-    func search(_ query: String, limit: Int) -> [Candidate] {
+    package func search(_ query: String, limit: Int) -> [Candidate] {
         guard limit > 0 else { return [] }
         var (candidateLists, suppressedRelativePaths) = overlayCandidateLists(query: query, limit: limit)
         let boundedBaseLimit = min(targetEntriesByBaseIndex.count, limit)

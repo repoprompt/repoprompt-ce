@@ -2,9 +2,9 @@ import Foundation
 import RepoPromptPersistence
 import RepoPromptVCS
 
-struct WorkspaceCodemapRootEpoch: Hashable {
-    let rootID: UUID
-    let rootLifetimeID: UUID
+package struct WorkspaceCodemapRootEpoch: Hashable {
+    package let rootID: UUID
+    package let rootLifetimeID: UUID
 }
 
 struct WorkspaceCodemapRepositoryAuthorityToken: Hashable {
@@ -36,7 +36,7 @@ enum WorkspaceCodemapRootAuthorityToken: Hashable {
     }
 }
 
-enum WorkspaceCodemapRootTerminalUnavailableReason: String, Equatable {
+package enum WorkspaceCodemapRootTerminalUnavailableReason: String, Equatable {
     case nonGit
     case bareRepository
     case unsupportedObjectFormat
@@ -48,7 +48,7 @@ enum WorkspaceCodemapRootTerminalUnavailableReason: String, Equatable {
     case releasedRootEpoch
 }
 
-enum WorkspaceCodemapRootTransientUnavailableReason: String, Equatable {
+package enum WorkspaceCodemapRootTransientUnavailableReason: String, Equatable {
     case gitProcessUnavailable
     case repositoryChanging
     case permissionFailure
@@ -149,19 +149,19 @@ enum WorkspaceCodemapRootAuthorityValidation: Equatable {
 }
 
 /// Source and manifest mode of one eligible root, for truthful status and diagnostics output.
-enum WorkspaceCodemapRootSourceKind: String, Hashable {
+package enum WorkspaceCodemapRootSourceKind: String, Hashable {
     case git
     case filesystem
 }
 
-enum WorkspaceCodemapRootManifestMode: String, Hashable {
+package enum WorkspaceCodemapRootManifestMode: String, Hashable {
     case git
     case notApplicable = "not_applicable"
 }
 
-struct WorkspaceCodemapRootSourceMode: Hashable {
-    let sourceKind: WorkspaceCodemapRootSourceKind
-    let manifestMode: WorkspaceCodemapRootManifestMode
+package struct WorkspaceCodemapRootSourceMode: Hashable {
+    package let sourceKind: WorkspaceCodemapRootSourceKind
+    package let manifestMode: WorkspaceCodemapRootManifestMode
 }
 
 enum WorkspaceCodemapRootCapabilityState: Equatable {
@@ -176,7 +176,7 @@ struct WorkspaceCodemapRootCapabilityRequest: Equatable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let loadedRootURL: URL
 
-    init(rootID: UUID, rootLifetimeID: UUID, loadedRootURL: URL) {
+    package init(rootID: UUID, rootLifetimeID: UUID, loadedRootURL: URL) {
         rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: rootLifetimeID)
         self.loadedRootURL = loadedRootURL.resolvingSymlinksInPath().standardizedFileURL
     }
@@ -188,7 +188,7 @@ enum WorkspaceCodemapGitEligibilityPreflightResult: Equatable {
     case transientUnavailable(WorkspaceCodemapRootTransientUnavailableReason)
 }
 
-struct WorkspaceCodemapGitEligibilityProbe {
+package struct WorkspaceCodemapGitEligibilityProbe {
     let resolve: @Sendable (URL) async -> WorkspaceCodemapGitEligibilityPreflightResult
 
     static func production(gitService: any WorkspaceGitClient) -> Self {

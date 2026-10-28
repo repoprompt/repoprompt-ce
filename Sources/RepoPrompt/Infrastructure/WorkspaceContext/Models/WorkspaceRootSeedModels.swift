@@ -6,7 +6,7 @@ import RepoPromptPersistence
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
-enum FileContentFreshnessPolicy {
+package enum FileContentFreshnessPolicy {
     /// Trust the existing file metadata/cache fast path.
     case cachedMetadata
     /// Validate disk metadata before trusting cached content; never return stale fallback on validation/load failure.
@@ -14,11 +14,11 @@ enum FileContentFreshnessPolicy {
 }
 
 /// Snapshot of file content plus a stable in-memory revision for search cache identity.
-struct FileSearchContentSnapshot {
-    let content: String?
-    let contentRevision: UInt64?
-    let modificationDate: Date
-    let isFresh: Bool
+package struct FileSearchContentSnapshot {
+    package let content: String?
+    package let contentRevision: UInt64?
+    package let modificationDate: Date
+    package let isFresh: Bool
 }
 
 /// Every case carries only String, Bool, or Sendable WorkspaceRootRef values.
@@ -38,7 +38,7 @@ struct WorkspaceContextRootSnapshot: @unchecked Sendable {
     let catalog: WorkspaceSearchCatalogSnapshot
     private let lifetimeTokens: [WorkspaceContextRootLifetimeToken]
 
-    init(
+    package init(
         scope: WorkspaceLookupRootScope,
         roots: [Root],
         catalog: WorkspaceSearchCatalogSnapshot,
@@ -78,24 +78,24 @@ final class WorkspaceContextRootLifetimeToken: @unchecked Sendable {
     }
 }
 
-enum WorkspaceRootSeedDeltaCompatibilitySource: String, CaseIterable, Hashable {
+package enum WorkspaceRootSeedDeltaCompatibilitySource: String, CaseIterable, Hashable {
     case hintEvaluator
     case planner
 }
 
-enum WorkspaceRootSeedDeltaCompatibilityDecision: String, Hashable {
+package enum WorkspaceRootSeedDeltaCompatibilityDecision: String, Hashable {
     case compatible
     case incompatible
 }
 
-enum WorkspaceRootSeedDeltaCompatibilityCorrectionRule: String, Hashable {
+package enum WorkspaceRootSeedDeltaCompatibilityCorrectionRule: String, Hashable {
     case none
     case canonicalMissingResolvedExcludesFileIdentity
     case canonicalMissingResolvedAttributesFileIdentity
     case canonicalMissingResolvedExternalAuthorityIdentities
 }
 
-enum WorkspaceRootSeedDeltaCompatibilityField: String, CaseIterable, Hashable {
+package enum WorkspaceRootSeedDeltaCompatibilityField: String, CaseIterable, Hashable {
     case repositoryNamespace
     case objectFormat
     case repositoryRelativeRootPrefix
@@ -113,33 +113,33 @@ enum WorkspaceRootSeedDeltaCompatibilityField: String, CaseIterable, Hashable {
     case resolvedAttributesFileIdentity
 }
 
-enum WorkspaceRootSeedDeltaCompatibilityFieldDecision: String, Hashable {
+package enum WorkspaceRootSeedDeltaCompatibilityFieldDecision: String, Hashable {
     case match
     case mismatch
 }
 
-enum WorkspaceRootSeedDeltaCompatibilityTreeRelation: String, Hashable {
+package enum WorkspaceRootSeedDeltaCompatibilityTreeRelation: String, Hashable {
     case sameExcludedFromDeltaCompatibility
     case differentExcludedFromDeltaCompatibility
 }
 
-struct WorkspaceRootSeedDeltaCompatibilityFieldEvaluation: Hashable {
-    let field: WorkspaceRootSeedDeltaCompatibilityField
-    let decision: WorkspaceRootSeedDeltaCompatibilityFieldDecision
-    let baseDigest: String
-    let targetDigest: String
+package struct WorkspaceRootSeedDeltaCompatibilityFieldEvaluation: Hashable {
+    package let field: WorkspaceRootSeedDeltaCompatibilityField
+    package let decision: WorkspaceRootSeedDeltaCompatibilityFieldDecision
+    package let baseDigest: String
+    package let targetDigest: String
 }
 
-struct WorkspaceRootSeedDeltaCompatibilityEvaluation: Hashable {
-    let source: WorkspaceRootSeedDeltaCompatibilitySource
-    let decision: WorkspaceRootSeedDeltaCompatibilityDecision
-    let fieldEvaluations: [WorkspaceRootSeedDeltaCompatibilityFieldEvaluation]
-    let mismatchedFields: [WorkspaceRootSeedDeltaCompatibilityField]
-    let correctionRuleApplied: WorkspaceRootSeedDeltaCompatibilityCorrectionRule
-    let treeRelation: WorkspaceRootSeedDeltaCompatibilityTreeRelation
+package struct WorkspaceRootSeedDeltaCompatibilityEvaluation: Hashable {
+    package let source: WorkspaceRootSeedDeltaCompatibilitySource
+    package let decision: WorkspaceRootSeedDeltaCompatibilityDecision
+    package let fieldEvaluations: [WorkspaceRootSeedDeltaCompatibilityFieldEvaluation]
+    package let mismatchedFields: [WorkspaceRootSeedDeltaCompatibilityField]
+    package let correctionRuleApplied: WorkspaceRootSeedDeltaCompatibilityCorrectionRule
+    package let treeRelation: WorkspaceRootSeedDeltaCompatibilityTreeRelation
 }
 
-struct WorkspaceRootSeedCompatibilityKey: Hashable {
+package struct WorkspaceRootSeedCompatibilityKey: Hashable {
     static let currentInventorySchemaVersion = 5
 
     let repositoryNamespace: GitBlobRepositoryNamespace
@@ -149,7 +149,7 @@ struct WorkspaceRootSeedCompatibilityKey: Hashable {
     let inventorySchemaVersion: Int
     let policyIdentity: GitWorkspacePolicyIdentity
 
-    init(
+    package init(
         authority: GitWorkspaceAuthoritySnapshot,
         inventorySchemaVersion: Int = Self.currentInventorySchemaVersion
     ) {
@@ -161,7 +161,7 @@ struct WorkspaceRootSeedCompatibilityKey: Hashable {
         policyIdentity = authority.policyIdentity
     }
 
-    init(
+    package init(
         repositoryNamespace: GitBlobRepositoryNamespace,
         objectFormat: GitObjectFormat,
         treeOID: GitObjectID,
@@ -177,7 +177,7 @@ struct WorkspaceRootSeedCompatibilityKey: Hashable {
         self.policyIdentity = policyIdentity
     }
 
-    var searchABI: GitWorkspaceSearchABIIdentity {
+    package var searchABI: GitWorkspaceSearchABIIdentity {
         policyIdentity.searchABI
     }
 
@@ -309,9 +309,9 @@ struct WorkspaceRootSeedCompatibilityKey: Hashable {
     }
 }
 
-struct WorkspaceRootReusableSnapshotIdentity: Hashable {
-    let sha256: String
-    let searchABI: GitWorkspaceSearchABIIdentity
+package struct WorkspaceRootReusableSnapshotIdentity: Hashable {
+    package let sha256: String
+    package let searchABI: GitWorkspaceSearchABIIdentity
 }
 
 struct RootNeutralTreeInventoryEntry: Hashable {
@@ -334,7 +334,7 @@ struct RootNeutralTreeInventoryEntry: Hashable {
     let provenance: Provenance
     let catalogProjection: CatalogProjection
 
-    init(
+    package init(
         ordinal: Int,
         parentOrdinal: Int?,
         relativePath: String,
@@ -372,13 +372,13 @@ struct RootNeutralTreeInventory: Hashable {
     let entries: [RootNeutralTreeInventoryEntry]
 }
 
-final class WorkspaceSearchRelativePathBase: @unchecked Sendable {
+package final class WorkspaceSearchRelativePathBase: @unchecked Sendable {
     let relativePaths: [String]
     let filenames: [String]
     let stableOrdinals: [Int]
     let index: PathSearchIndex
 
-    init(relativePaths: [String], stableOrdinals: [Int]) {
+    package init(relativePaths: [String], stableOrdinals: [Int]) {
         precondition(relativePaths.count == stableOrdinals.count)
         self.relativePaths = relativePaths.map(StandardizedPath.relative)
         filenames = self.relativePaths.map { ($0 as NSString).lastPathComponent }
@@ -387,12 +387,12 @@ final class WorkspaceSearchRelativePathBase: @unchecked Sendable {
     }
 }
 
-final class WorkspaceRootReusableSnapshot: @unchecked Sendable {
+package final class WorkspaceRootReusableSnapshot: @unchecked Sendable {
     static let contentAddressDomain = "workspace-root-reusable-snapshot-v5"
     static let manifestCompatibilityDomain = "workspace-root-reusable-inventory-v1"
 
-    let identity: WorkspaceRootReusableSnapshotIdentity
-    let compatibilityKey: WorkspaceRootSeedCompatibilityKey
+    package let identity: WorkspaceRootReusableSnapshotIdentity
+    package let compatibilityKey: WorkspaceRootSeedCompatibilityKey
     let inventoryManifest: WorkspaceRootReusableInventoryManifestLease
     let searchBase: WorkspaceSearchRelativePathBase
     let catalogPolicyIdentity: WorkspaceRootCatalogPolicyIdentity
@@ -409,7 +409,7 @@ final class WorkspaceRootReusableSnapshot: @unchecked Sendable {
         }
     #endif
 
-    init(
+    package init(
         compatibilityKey: WorkspaceRootSeedCompatibilityKey,
         inventoryManifest: WorkspaceRootReusableInventoryManifestLease,
         searchBase: WorkspaceSearchRelativePathBase,
@@ -432,7 +432,7 @@ final class WorkspaceRootReusableSnapshot: @unchecked Sendable {
         artifactByteCount = inventoryManifest.artifactByteCount
     }
 
-    func hasValidContentAddress() -> Bool {
+    package func hasValidContentAddress() -> Bool {
         guard (try? inventoryManifest.makeReader()) != nil else { return false }
         return identity.searchABI == compatibilityKey.searchABI
             && inventoryManifest.header.compatibilityDomain == Self.manifestCompatibilityDomain
@@ -579,13 +579,13 @@ private extension Data {
     }
 }
 
-struct WorkspaceRootReusableSnapshotCacheLimits: Equatable {
+package struct WorkspaceRootReusableSnapshotCacheLimits: Equatable {
     let maximumSnapshotCount: Int
     let maximumSnapshotsPerRepository: Int
     let maximumEstimatedBytes: Int
     let maximumArtifactBytes: UInt64
 
-    init(
+    package init(
         maximumSnapshotCount: Int,
         maximumSnapshotsPerRepository: Int,
         maximumEstimatedBytes: Int,
@@ -605,7 +605,7 @@ struct WorkspaceRootReusableSnapshotCacheLimits: Equatable {
     )
 }
 
-struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
+package struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
     let bindingID: String
     let standardizedTargetPath: String
     let creationReceipt: GitWorktreeCreationReceipt
@@ -616,7 +616,7 @@ struct WorkspaceRootMaterializationHint: Equatable, @unchecked Sendable {
     let expectedOwnerBindingGeneration: UInt64
     let validationFallbackReason: WorkspaceRootSeedFallbackReason?
 
-    init(
+    package init(
         bindingID: String,
         standardizedTargetPath: String,
         creationReceipt: GitWorktreeCreationReceipt,

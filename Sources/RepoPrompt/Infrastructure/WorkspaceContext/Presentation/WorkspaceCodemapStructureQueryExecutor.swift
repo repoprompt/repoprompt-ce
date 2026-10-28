@@ -1,15 +1,23 @@
 import Foundation
 import RepoPromptWorkspaceCore
 
-struct WorkspaceCodemapStructureRequest: Equatable {
-    let direction: WorkspaceCodemapStructureTraversalDirection?
-    let maximumDepth: Int
-    let includesSignatures: Bool
-    let size: WorkspaceCodemapGraphOutputSize
-    let budget: WorkspaceCodemapGraphQueryBudget
+package struct WorkspaceCodemapStructureRequest: Equatable {
+    package let direction: WorkspaceCodemapStructureTraversalDirection?
+    package let maximumDepth: Int
+    package let includesSignatures: Bool
+    package let size: WorkspaceCodemapGraphOutputSize
+    package let budget: WorkspaceCodemapGraphQueryBudget
+
+    package init(direction: WorkspaceCodemapStructureTraversalDirection?, maximumDepth: Int, includesSignatures: Bool, size: WorkspaceCodemapGraphOutputSize, budget: WorkspaceCodemapGraphQueryBudget) {
+        self.direction = direction
+        self.maximumDepth = maximumDepth
+        self.includesSignatures = includesSignatures
+        self.size = size
+        self.budget = budget
+    }
 }
 
-enum WorkspaceCodemapStructureExecutionResult {
+package enum WorkspaceCodemapStructureExecutionResult {
     case scopeUnavailable
     case noRequestedFiles
     case completed(
@@ -20,11 +28,15 @@ enum WorkspaceCodemapStructureExecutionResult {
 }
 
 /// Orchestrates the existing scoped graph and presentation owners without retaining authority.
-struct WorkspaceCodemapStructureQueryExecutor {
+package struct WorkspaceCodemapStructureQueryExecutor {
     let store: WorkspaceFileContextStore
 
+    package init(store: WorkspaceFileContextStore) {
+        self.store = store
+    }
+
     @MainActor
-    func execute(
+    package func execute(
         files: [WorkspaceFileRecord],
         request: WorkspaceCodemapStructureRequest,
         includePathNotFoundIssue: Bool,
@@ -91,7 +103,7 @@ struct WorkspaceCodemapStructureQueryExecutor {
         return .completed(aggregate: aggregate, presentation: presentation, revalidation: revalidation)
     }
 
-    static func uniqueScopedFiles(_ files: [WorkspaceFileRecord], roots: [WorkspaceRootRef]) -> [WorkspaceFileRecord] {
+    package static func uniqueScopedFiles(_ files: [WorkspaceFileRecord], roots: [WorkspaceRootRef]) -> [WorkspaceFileRecord] {
         let allowedRootIDs = Set(roots.map(\.id))
         var unique: [String: WorkspaceFileRecord] = [:]
         for file in files where allowedRootIDs.contains(file.rootID) {
@@ -100,7 +112,7 @@ struct WorkspaceCodemapStructureQueryExecutor {
         return Array(unique.values)
     }
 
-    static func orderFiles(
+    package static func orderFiles(
         _ files: [WorkspaceFileRecord], roots: [WorkspaceRootRef], logicalRootNames: [UUID: String]
     ) -> [WorkspaceFileRecord] {
         files.sorted { lhs, rhs in
@@ -115,7 +127,7 @@ struct WorkspaceCodemapStructureQueryExecutor {
         }
     }
 
-    static func mergeRevalidation(
+    package static func mergeRevalidation(
         initial: [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult],
         final: [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult]
     ) -> [WorkspaceCodemapRootEpoch: WorkspaceCodemapStructureGraphRevalidationResult] {

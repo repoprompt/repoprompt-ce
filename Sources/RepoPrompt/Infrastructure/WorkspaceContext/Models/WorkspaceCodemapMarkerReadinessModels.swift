@@ -1,28 +1,28 @@
 import Foundation
 
-enum WorkspaceCodemapMarkerReadinessState: Hashable {
+package enum WorkspaceCodemapMarkerReadinessState: Hashable {
     case ready
     case unavailable
     case securityExcluded
 }
 
-struct WorkspaceCodemapMarkerReadinessChange: Hashable {
-    let fileID: UUID
+package struct WorkspaceCodemapMarkerReadinessChange: Hashable {
+    package let fileID: UUID
     let standardizedRelativePath: String
-    let requestGeneration: UInt64
-    let pathGeneration: UInt64
-    let state: WorkspaceCodemapMarkerReadinessState
+    package let requestGeneration: UInt64
+    package let pathGeneration: UInt64
+    package let state: WorkspaceCodemapMarkerReadinessState
 }
 
 /// Small immutable publication emitted after durable projection state changes.
 /// Consumers validate the root epoch and per-path generation before caching it.
 struct WorkspaceCodemapMarkerReadinessUpdate: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
-    let changes: [WorkspaceCodemapMarkerReadinessChange]
+    package let rootEpoch: WorkspaceCodemapRootEpoch
+    package let changes: [WorkspaceCodemapMarkerReadinessChange]
 }
 
-struct WorkspaceCodemapMarkerReadinessEvent: Hashable {
-    let rootEpoch: WorkspaceCodemapRootEpoch
+package struct WorkspaceCodemapMarkerReadinessEvent: Hashable {
+    package let rootEpoch: WorkspaceCodemapRootEpoch
     let revision: UInt64
-    let changes: [WorkspaceCodemapMarkerReadinessChange]
+    package let changes: [WorkspaceCodemapMarkerReadinessChange]
 }

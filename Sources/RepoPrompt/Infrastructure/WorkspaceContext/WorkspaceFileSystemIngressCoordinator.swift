@@ -7,16 +7,16 @@ import RepoPromptFileSystem
 /// Every accepted publication is queued before the sink returns. One retained drain task per
 /// root applies publications serially, preserving watcher and synthetic publication order while
 /// allowing barriers to await an exact service-publication cut through canonical application.
-final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
+package final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
     struct Subscription: Hashable {
         let rootID: UUID
         let generation: UInt64
     }
 
     struct AppliedSnapshot: Equatable {
-        let acceptedServicePublicationSequence: UInt64
-        let appliedServicePublicationSequence: UInt64
-        let appliedWatcherWatermark: FileSystemWatcherIngressMailbox.Watermark
+        package let acceptedServicePublicationSequence: UInt64
+        package let appliedServicePublicationSequence: UInt64
+        package let appliedWatcherWatermark: FileSystemWatcherIngressMailbox.Watermark
     }
 
     enum TerminationOutcome: String, Equatable {
@@ -31,28 +31,28 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         let stateIdentity: UUID?
         let outcome: TerminationOutcome
         let graceNanoseconds: UInt64
-        let queuedPublicationCount: Int
-        let applyingPublicationCount: Int
-        let waiterCount: Int
-        let acceptedServicePublicationSequence: UInt64
-        let appliedServicePublicationSequence: UInt64
-        let acceptedAppliedSequenceGap: UInt64
-        let appliedWatcherWatermark: UInt64
-        let oldestOutstandingPublicationAgeMilliseconds: UInt64?
+        package let queuedPublicationCount: Int
+        package let applyingPublicationCount: Int
+        package let waiterCount: Int
+        package let acceptedServicePublicationSequence: UInt64
+        package let appliedServicePublicationSequence: UInt64
+        package let acceptedAppliedSequenceGap: UInt64
+        package let appliedWatcherWatermark: UInt64
+        package let oldestOutstandingPublicationAgeMilliseconds: UInt64?
     }
 
     #if DEBUG
-        struct DebugSnapshot: Equatable {
-            let isOpen: Bool
-            let queuedPublicationCount: Int
-            let applyingPublicationCount: Int
-            let outstandingPublicationCount: Int
-            let waiterCount: Int
-            let acceptedServicePublicationSequence: UInt64
-            let appliedServicePublicationSequence: UInt64
-            let acceptedAppliedSequenceGap: UInt64
-            let appliedWatcherWatermark: UInt64
-            let oldestOutstandingPublicationAgeMilliseconds: UInt64?
+        package struct DebugSnapshot: Equatable {
+            package let isOpen: Bool
+            package let queuedPublicationCount: Int
+            package let applyingPublicationCount: Int
+            package let outstandingPublicationCount: Int
+            package let waiterCount: Int
+            package let acceptedServicePublicationSequence: UInt64
+            package let appliedServicePublicationSequence: UInt64
+            package let acceptedAppliedSequenceGap: UInt64
+            package let appliedWatcherWatermark: UInt64
+            package let oldestOutstandingPublicationAgeMilliseconds: UInt64?
         }
     #endif
 

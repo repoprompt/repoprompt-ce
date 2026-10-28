@@ -2,39 +2,39 @@ import Combine
 import Foundation
 import OSLog
 
-struct WorkspaceSelectionIdentity: Hashable {
-    let workspaceID: UUID
-    let tabID: UUID
+package struct WorkspaceSelectionIdentity: Hashable {
+    package let workspaceID: UUID
+    package let tabID: UUID
 }
 
-struct WorkspaceSelectionWorkspace {
-    let id: UUID
-    let activeComposeTabID: UUID?
-    let firstComposeTabID: UUID?
+package struct WorkspaceSelectionWorkspace {
+    package let id: UUID
+    package let activeComposeTabID: UUID?
+    package let firstComposeTabID: UUID?
 }
 
-struct WorkspaceSelectionTab {
-    let id: UUID
-    let selection: StoredSelection
+package struct WorkspaceSelectionTab {
+    package let id: UUID
+    package let selection: StoredSelection
 }
 
-struct MCPSelectionPropagationRegistration: Equatable {
-    let sourceRevision: UInt64
-    let peerHostIDs: Set<UUID>
+package struct MCPSelectionPropagationRegistration: Equatable {
+    package let sourceRevision: UInt64
+    package let peerHostIDs: Set<UUID>
 }
 
-struct MCPSelectionPeerPropagation: Equatable {
-    let identity: WorkspaceSelectionIdentity
-    let selection: StoredSelection
-    let sourceRevision: UInt64
-    let peerHostIDs: Set<UUID>
-    let mirrorToUIIfActive: Bool
+package struct MCPSelectionPeerPropagation: Equatable {
+    package let identity: WorkspaceSelectionIdentity
+    package let selection: StoredSelection
+    package let sourceRevision: UInt64
+    package let peerHostIDs: Set<UUID>
+    package let mirrorToUIIfActive: Bool
 }
 
 /// Identifies the exact peer manager generation allowed to receive one propagation.
 /// The host revalidates registration and closing state at each commit/apply boundary.
-struct MCPSelectionPeerMutationFence: Equatable {
-    let hostID: UUID
+package struct MCPSelectionPeerMutationFence: Equatable {
+    package let hostID: UUID
 }
 
 private struct WorkspaceSelectionMirrorTarget: Equatable {
@@ -52,7 +52,7 @@ private struct WorkspaceSelectionMirrorTarget: Equatable {
 }
 
 @MainActor
-protocol WorkspaceSelectionHost: AnyObject {
+package protocol WorkspaceSelectionHost: AnyObject {
     var activeSelectionWorkspace: WorkspaceSelectionWorkspace? { get }
     var selectionMirrorContextRevision: UInt64 { get }
     var liveUISelectionRevision: UInt64 { get }
@@ -120,8 +120,8 @@ private extension WorkspaceSelectionHost {
 /// Window-scoped coordinator that makes compose-tab `StoredSelection` the runtime
 /// selection source while the WorkspaceFiles UI adapter still owns checkbox state.
 @MainActor
-final class WorkspaceSelectionCoordinator {
-    typealias CommitAuthorization = @MainActor (_ commit: () -> Void) -> Bool
+package final class WorkspaceSelectionCoordinator {
+    package typealias CommitAuthorization = @MainActor (_ commit: () -> Void) -> Bool
 
     #if DEBUG
         var beforeAuthorizedCommitForTesting: (@MainActor () async -> Void)?
@@ -145,26 +145,26 @@ final class WorkspaceSelectionCoordinator {
         category: "SelectionPersistence"
     )
 
-    struct Snapshot: Equatable {
-        let tabID: UUID?
-        let selection: StoredSelection
-        let isVirtual: Bool
+    package struct Snapshot: Equatable {
+        package let tabID: UUID?
+        package let selection: StoredSelection
+        package let isVirtual: Bool
     }
 
-    struct Change: Equatable {
-        let tabID: UUID?
-        let selection: StoredSelection
-        let source: Source
+    package struct Change: Equatable {
+        package let tabID: UUID?
+        package let selection: StoredSelection
+        package let source: Source
     }
 
-    struct TransactionResult: Equatable {
-        let identity: WorkspaceSelectionIdentity
+    package struct TransactionResult: Equatable {
+        package let identity: WorkspaceSelectionIdentity
         let before: StoredSelection
-        let after: StoredSelection
-        let revision: UInt64
+        package let after: StoredSelection
+        package let revision: UInt64
     }
 
-    enum Source: String, Equatable {
+    package enum Source: String, Equatable {
         case uiFlush
         case runtimeMutation
         case virtual
@@ -172,7 +172,7 @@ final class WorkspaceSelectionCoordinator {
         case mcpPeerContext
         case mirror
 
-        var isMCPSelectionSource: Bool {
+        package var isMCPSelectionSource: Bool {
             self == .mcpTabContext || self == .mcpPeerContext
         }
     }
@@ -182,14 +182,14 @@ final class WorkspaceSelectionCoordinator {
     let mutationService: WorkspaceSelectionMutationService
     private let changeSubject = PassthroughSubject<Change, Never>()
     private var applyingSelectionMirrorDepth = 0
-    enum SelectionMirrorOutcome: Equatable {
+    package enum SelectionMirrorOutcome: Equatable {
         case converged
         case deferred
         case invalidated
         case cancelled
     }
 
-    typealias MCPSelectionMirrorDeadlineWait = @MainActor @Sendable (Duration) async throws -> Void
+    package typealias MCPSelectionMirrorDeadlineWait = @MainActor @Sendable (Duration) async throws -> Void
 
     private struct MCPSelectionMirrorDemand {
         let requestID: UInt64
@@ -259,15 +259,15 @@ final class WorkspaceSelectionCoordinator {
 
     static let defaultMCPSelectionMirrorTimeout: Duration = .seconds(10)
 
-    var changes: AnyPublisher<Change, Never> {
+    package var changes: AnyPublisher<Change, Never> {
         changeSubject.eraseToAnyPublisher()
     }
 
-    var isApplyingSelectionMirror: Bool {
+    package var isApplyingSelectionMirror: Bool {
         applyingSelectionMirrorDepth > 0
     }
 
-    init(
+    package init(
         workspaceManager: (any WorkspaceSelectionHost)? = nil,
         store: WorkspaceFileContextStore,
         mutationService: WorkspaceSelectionMutationService? = nil,
@@ -287,18 +287,18 @@ final class WorkspaceSelectionCoordinator {
         self.workspaceManager = workspaceManager
     }
 
-    func activeSelectionIdentity() -> WorkspaceSelectionIdentity? {
+    package func activeSelectionIdentity() -> WorkspaceSelectionIdentity? {
         guard let workspace = workspaceManager?.activeSelectionWorkspace,
               let tabID = workspace.activeComposeTabID ?? workspace.firstComposeTabID
         else { return nil }
         return WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tabID)
     }
 
-    func activeTabID() -> UUID? {
+    package func activeTabID() -> UUID? {
         activeSelectionIdentity()?.tabID
     }
 
-    func activeSelectionSnapshot(flushPendingUI: Bool = true) -> Snapshot {
+    package func activeSelectionSnapshot(flushPendingUI: Bool = true) -> Snapshot {
         if flushPendingUI {
             flushPendingUISelectionToActiveTab()
         }
@@ -319,7 +319,7 @@ final class WorkspaceSelectionCoordinator {
     /// Keeps a canonical MCP selection authoritative while an already-enqueued UI snapshot
     /// still reflects the pre-mutation file-tree state. A genuinely newer UI mutation advances
     /// `liveUISelectionRevision` and is allowed to become canonical, including ABA transitions.
-    func selectionForActiveUISnapshot(_ liveUISelection: StoredSelection, tabID: UUID) -> StoredSelection {
+    package func selectionForActiveUISnapshot(_ liveUISelection: StoredSelection, tabID: UUID) -> StoredSelection {
         guard let workspaceManager,
               let identity = activeSelectionIdentity(),
               identity.tabID == tabID,
@@ -341,7 +341,7 @@ final class WorkspaceSelectionCoordinator {
 
     /// Advances an existing fence after the app programmatically reapplies tab UI state.
     /// This keeps tab-switch/restore work from masquerading as a newer manual UI mutation.
-    func refreshDeferredUISelectionFence(forTabID tabID: UUID) {
+    package func refreshDeferredUISelectionFence(forTabID tabID: UUID) {
         guard let workspaceManager,
               let identity = activeSelectionIdentity(),
               identity.tabID == tabID,
@@ -357,7 +357,7 @@ final class WorkspaceSelectionCoordinator {
     /// Protects an already-persisted MCP selection from UI snapshots that were queued before
     /// the canonical write. This is the generic presentation fence used when a caller has
     /// already written canonical tab state outside `persistSelection`.
-    func protectCanonicalMCPSelectionFromDeferredUISnapshots(
+    package func protectCanonicalMCPSelectionFromDeferredUISnapshots(
         _ selection: StoredSelection,
         for identity: WorkspaceSelectionIdentity
     ) {
@@ -371,7 +371,7 @@ final class WorkspaceSelectionCoordinator {
         )
     }
 
-    func selectionSnapshot(
+    package func selectionSnapshot(
         for identity: WorkspaceSelectionIdentity,
         flushPendingUIIfActive: Bool = true
     ) -> Snapshot? {
@@ -382,7 +382,7 @@ final class WorkspaceSelectionCoordinator {
         return Snapshot(tabID: identity.tabID, selection: selection, isVirtual: true)
     }
 
-    func selectionSnapshot(for tabID: UUID, flushPendingUIIfActive: Bool = true) -> Snapshot? {
+    package func selectionSnapshot(for tabID: UUID, flushPendingUIIfActive: Bool = true) -> Snapshot? {
         guard let workspaceID = workspaceManager?.activeSelectionWorkspace?.id else { return nil }
         return selectionSnapshot(
             for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
@@ -404,7 +404,7 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    func persistActiveSelection(
+    package func persistActiveSelection(
         _ selection: StoredSelection,
         source: Source = .runtimeMutation,
         mirrorToUI: Bool = true
@@ -419,7 +419,7 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    func persistSelection(
+    package func persistSelection(
         _ selection: StoredSelection,
         for identity: WorkspaceSelectionIdentity,
         source: Source = .runtimeMutation,
@@ -585,7 +585,7 @@ final class WorkspaceSelectionCoordinator {
     /// result before any actor suspension. Mirroring and peer propagation happen only after
     /// the canonical commit, so callers never replace a concurrently advanced selection.
     @discardableResult
-    func transformSelection(
+    package func transformSelection(
         for identity: WorkspaceSelectionIdentity,
         source: Source = .runtimeMutation,
         mirrorToUIIfActive: Bool = true,
@@ -655,7 +655,7 @@ final class WorkspaceSelectionCoordinator {
 
     /// Applies an exclusive target state to exact store-derived paths for one captured selection identity.
     @discardableResult
-    func setPreResolvedFilePathsInSelection(
+    package func setPreResolvedFilePathsInSelection(
         _ absolutePaths: [String],
         targetState: WorkspacePreResolvedSelectionTargetState,
         for identity: WorkspaceSelectionIdentity,
@@ -692,7 +692,7 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    func addPathsToActiveSelection(
+    package func addPathsToActiveSelection(
         paths: [String],
         mode: String = "full",
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
@@ -831,7 +831,7 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    func promotePathsInSelection(
+    package func promotePathsInSelection(
         paths: [String],
         for identity: WorkspaceSelectionIdentity,
         expectedCurrentSelection: StoredSelection,
@@ -892,7 +892,7 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    func demotePathsInSelection(
+    package func demotePathsInSelection(
         paths: [String],
         for identity: WorkspaceSelectionIdentity,
         expectedCurrentSelection: StoredSelection,
@@ -964,7 +964,7 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    func clearSlicesInSelection(
+    package func clearSlicesInSelection(
         paths: [String],
         for identity: WorkspaceSelectionIdentity,
         expectedCurrentSelection: StoredSelection,
@@ -1011,7 +1011,7 @@ final class WorkspaceSelectionCoordinator {
         )
     }
 
-    func withApplyingSelectionMirror<T>(_ operation: () async throws -> T) async rethrows -> T {
+    package func withApplyingSelectionMirror<T>(_ operation: () async throws -> T) async rethrows -> T {
         applyingSelectionMirrorDepth += 1
         defer { applyingSelectionMirrorDepth = max(0, applyingSelectionMirrorDepth - 1) }
         return try await operation()
@@ -1024,7 +1024,7 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    func mirrorSelectionToActiveUI(
+    package func mirrorSelectionToActiveUI(
         _ selection: StoredSelection,
         forTabID tabID: UUID
     ) async -> SelectionMirrorOutcome {

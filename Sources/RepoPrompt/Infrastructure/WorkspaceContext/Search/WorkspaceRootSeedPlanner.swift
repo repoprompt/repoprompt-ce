@@ -238,7 +238,7 @@ private actor WorkspaceRootSeedAuthorityFenceResource:
     }
 }
 
-actor WorkspaceRootSeedPlanner {
+package actor WorkspaceRootSeedPlanner {
     private enum PlanningFailure: Error {
         case fallback(WorkspaceRootSeedFallbackReason)
     }
@@ -285,7 +285,7 @@ actor WorkspaceRootSeedPlanner {
     private let evidenceResourcePolicy: GitTargetEvidenceResourcePolicy
     private let planResourcePolicy: WorkspaceRootTargetSeedPlanResourcePolicy
 
-    init(
+    package init(
         gitService: any WorkspaceGitClient,
         authority: GitWorkspaceStateAuthority,
         flightCoordinator: WorkspaceRootTargetEvidenceCoordinator = .shared,

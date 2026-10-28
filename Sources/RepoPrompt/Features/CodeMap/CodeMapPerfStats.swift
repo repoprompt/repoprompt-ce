@@ -513,45 +513,45 @@ enum CodeMapPerfRuntime {
 
 #if DEBUG
     /// Stable, privacy-safe payload model for the attachable `codemap_graph_status` DEBUG MCP operation.
-    struct CodemapGraphStatusStoreEventSnapshot: Equatable {
-        let ordinal: UInt64
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let kind: String
-        let launchPhase: String
-        let uptimeNanoseconds: UInt64
+    package struct CodemapGraphStatusStoreEventSnapshot: Equatable {
+        package let ordinal: UInt64
+        package let rootEpoch: WorkspaceCodemapRootEpoch
+        package let kind: String
+        package let launchPhase: String
+        package let uptimeNanoseconds: UInt64
     }
 
-    struct CodemapGraphStatusStoreEventPage: Equatable {
-        let firstOrdinal: UInt64
-        let lastOrdinal: UInt64
-        let nextOrdinal: UInt64?
-        let events: [CodemapGraphStatusStoreEventSnapshot]
+    package struct CodemapGraphStatusStoreEventPage: Equatable {
+        package let firstOrdinal: UInt64
+        package let lastOrdinal: UInt64
+        package let nextOrdinal: UInt64?
+        package let events: [CodemapGraphStatusStoreEventSnapshot]
     }
 
-    struct CodemapGraphStatusRetrySnapshot: Equatable {
-        let attempt: Int
-        let deadlineUptimeNanoseconds: UInt64
+    package struct CodemapGraphStatusRetrySnapshot: Equatable {
+        package let attempt: Int
+        package let deadlineUptimeNanoseconds: UInt64
     }
 
-    struct CodemapGraphStatusRetryExhaustionSnapshot: Equatable {
-        let attempt: Int
-        let uptimeNanoseconds: UInt64
+    package struct CodemapGraphStatusRetryExhaustionSnapshot: Equatable {
+        package let attempt: Int
+        package let uptimeNanoseconds: UInt64
     }
 
-    struct CodemapGraphStatusLaunchSnapshot: Equatable {
-        let id: UUID
-        let phase: WorkspaceCodemapGraphIndexLaunchPhase
-        let retryAttempt: Int
-        let taskPresent: Bool
-        let createdUptimeNanoseconds: UInt64
-        let phaseEnteredUptimeNanoseconds: UInt64
-        let retry: CodemapGraphStatusRetrySnapshot?
-        let retryExhaustion: CodemapGraphStatusRetryExhaustionSnapshot?
+    package struct CodemapGraphStatusLaunchSnapshot: Equatable {
+        package let id: UUID
+        package let phase: WorkspaceCodemapGraphIndexLaunchPhase
+        package let retryAttempt: Int
+        package let taskPresent: Bool
+        package let createdUptimeNanoseconds: UInt64
+        package let phaseEnteredUptimeNanoseconds: UInt64
+        package let retry: CodemapGraphStatusRetrySnapshot?
+        package let retryExhaustion: CodemapGraphStatusRetryExhaustionSnapshot?
     }
 
-    struct CodemapGraphStatusAdmissionSnapshot: Equatable {
-        let metrics: [String: UInt64]
-        let queueWaitMilliseconds: [UInt64]
+    package struct CodemapGraphStatusAdmissionSnapshot: Equatable {
+        package let metrics: [String: UInt64]
+        package let queueWaitMilliseconds: [UInt64]
     }
 
     struct CodemapManifestWriterTaskSnapshot: Equatable {
@@ -589,41 +589,41 @@ enum CodeMapPerfRuntime {
         let omittedNamespaceCount: Int
     }
 
-    struct CodemapGraphStatusManifestSnapshot: Equatable {
-        let failureCounts: [WorkspaceCodemapManifestFailureReason: UInt64]
-        let lastFailure: WorkspaceCodemapManifestFailureDiagnostic?
-        let measurements: WorkspaceCodemapManifestMeasurementSnapshot
+    package struct CodemapGraphStatusManifestSnapshot: Equatable {
+        package let failureCounts: [WorkspaceCodemapManifestFailureReason: UInt64]
+        package let lastFailure: WorkspaceCodemapManifestFailureDiagnostic?
+        package let measurements: WorkspaceCodemapManifestMeasurementSnapshot
         var writerActivity: CodemapManifestWriterActivitySnapshot?
     }
 
-    struct CodemapGraphStatusRootSnapshot: Equatable {
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let catalogGeneration: UInt64
-        let ingressGeneration: UInt64
-        let rootKind: WorkspaceRootKind
-        let eligibilityFlightPresent: Bool
-        let launch: CodemapGraphStatusLaunchSnapshot?
-        let job: WorkspaceCodemapBindingEngineGraphIndexRootAccounting?
-        let admission: CodemapGraphStatusAdmissionSnapshot?
-        let manifest: CodemapGraphStatusManifestSnapshot?
-        let milestones: [CodemapGraphStatusStoreEventSnapshot]
-        let engineEvents: WorkspaceCodemapGraphIndexDebugEventPage?
+    package struct CodemapGraphStatusRootSnapshot: Equatable {
+        package let rootEpoch: WorkspaceCodemapRootEpoch
+        package let catalogGeneration: UInt64
+        package let ingressGeneration: UInt64
+        package let rootKind: WorkspaceRootKind
+        package let eligibilityFlightPresent: Bool
+        package let launch: CodemapGraphStatusLaunchSnapshot?
+        package let job: WorkspaceCodemapBindingEngineGraphIndexRootAccounting?
+        package let admission: CodemapGraphStatusAdmissionSnapshot?
+        package let manifest: CodemapGraphStatusManifestSnapshot?
+        package let milestones: [CodemapGraphStatusStoreEventSnapshot]
+        package let engineEvents: WorkspaceCodemapGraphIndexDebugEventPage?
     }
 
-    struct CodemapGraphStatusSnapshot: Equatable {
-        let sampledUptimeNanoseconds: UInt64
-        let roots: [CodemapGraphStatusRootSnapshot]
-        let storeEvents: CodemapGraphStatusStoreEventPage?
-        let graphIndexJobCount: Int
-        let queuedGraphIndexBatchCount: Int
-        let activeGraphIndexBatchCount: Int
-        let drainingGraphIndexTaskCount: Int
+    package struct CodemapGraphStatusSnapshot: Equatable {
+        package let sampledUptimeNanoseconds: UInt64
+        package let roots: [CodemapGraphStatusRootSnapshot]
+        package let storeEvents: CodemapGraphStatusStoreEventPage?
+        package let graphIndexJobCount: Int
+        package let queuedGraphIndexBatchCount: Int
+        package let activeGraphIndexBatchCount: Int
+        package let drainingGraphIndexTaskCount: Int
     }
 
 #endif
 
 #if DEBUG
-    enum CodemapFullLoadAggregateState: String, Equatable {
+    package enum CodemapFullLoadAggregateState: String, Equatable {
         case ready
         case pending
         case failed
@@ -631,7 +631,7 @@ enum CodeMapPerfRuntime {
         case incompleteDiagnostics = "incomplete_diagnostics"
     }
 
-    enum CodemapFullLoadRootState: String, Equatable {
+    package enum CodemapFullLoadRootState: String, Equatable {
         case ready
         case terminalIneligible = "terminal_ineligible"
         case excluded
@@ -641,57 +641,57 @@ enum CodeMapPerfRuntime {
     }
 
     struct CodemapFullLoadRootIdentity: Equatable {
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let catalogGeneration: UInt64
-        let ingressGeneration: UInt64
+        package let rootEpoch: WorkspaceCodemapRootEpoch
+        package let catalogGeneration: UInt64
+        package let ingressGeneration: UInt64
         let engineIdentity: ObjectIdentifier?
     }
 
-    struct CodemapFullLoadMilestone: Equatable {
-        let kind: String
-        let uptimeNanoseconds: UInt64
+    package struct CodemapFullLoadMilestone: Equatable {
+        package let kind: String
+        package let uptimeNanoseconds: UInt64
     }
 
-    struct CodemapFullLoadRootSnapshot: Equatable {
-        let rootEpoch: WorkspaceCodemapRootEpoch
-        let catalogGeneration: UInt64
-        let ingressGeneration: UInt64
-        let rootKind: String
+    package struct CodemapFullLoadRootSnapshot: Equatable {
+        package let rootEpoch: WorkspaceCodemapRootEpoch
+        package let catalogGeneration: UInt64
+        package let ingressGeneration: UInt64
+        package let rootKind: String
         /// Real execution mode of the root's Code Map session, or nil before one exists.
         let sourceKind: WorkspaceCodemapRootSourceKind?
         let manifestMode: WorkspaceCodemapRootManifestMode?
-        let state: CodemapFullLoadRootState
+        package let state: CodemapFullLoadRootState
         let reason: String?
-        let launchPhase: String?
+        package let launchPhase: String?
         let graphIndexPhase: String?
         let supportedCandidateCount: UInt64?
         let processedCandidateCount: UInt64?
         let terminalCount: UInt64?
         let lastGraphChangeSequence: UInt64?
-        let readyUptimeNanoseconds: UInt64?
-        let metrics: [String: UInt64]
-        let resources: [String: UInt64]
-        let queueWaitMilliseconds: [UInt64]
-        let milestones: [CodemapFullLoadMilestone]
+        package let readyUptimeNanoseconds: UInt64?
+        package let metrics: [String: UInt64]
+        package let resources: [String: UInt64]
+        package let queueWaitMilliseconds: [UInt64]
+        package let milestones: [CodemapFullLoadMilestone]
     }
 
-    struct CodemapFullLoadAggregateSnapshot: Equatable {
+    package struct CodemapFullLoadAggregateSnapshot: Equatable {
         let expectedWorkspaceID: UUID
-        let state: CodemapFullLoadAggregateState
-        let sampledUptimeNanoseconds: UInt64
-        let visibleRootCount: Int
-        let eligibleRootCount: Int
-        let readyRootCount: Int
-        let terminalIneligibleRootCount: Int
-        let excludedRootCount: Int
-        let pendingRootCount: Int
-        let failedRootCount: Int
-        let supersededRootCount: Int
-        let cohort: String
-        let roots: [CodemapFullLoadRootSnapshot]
-        let metrics: [String: UInt64]
-        let resources: [String: UInt64]
-        let queueWaitMilliseconds: [UInt64]
+        package let state: CodemapFullLoadAggregateState
+        package let sampledUptimeNanoseconds: UInt64
+        package let visibleRootCount: Int
+        package let eligibleRootCount: Int
+        package let readyRootCount: Int
+        package let terminalIneligibleRootCount: Int
+        package let excludedRootCount: Int
+        package let pendingRootCount: Int
+        package let failedRootCount: Int
+        package let supersededRootCount: Int
+        package let cohort: String
+        package let roots: [CodemapFullLoadRootSnapshot]
+        package let metrics: [String: UInt64]
+        package let resources: [String: UInt64]
+        package let queueWaitMilliseconds: [UInt64]
     }
 
     struct CodemapFullLoadSampleStatistics: Equatable {
@@ -707,7 +707,7 @@ enum CodeMapPerfRuntime {
         let reliability: String
     }
 
-    enum CodemapFullLoadDebugSupport {
+    package enum CodemapFullLoadDebugSupport {
         static func universeMatches(
             _ lhs: [CodemapFullLoadRootIdentity],
             _ rhs: [CodemapFullLoadRootIdentity]
@@ -729,7 +729,7 @@ enum CodeMapPerfRuntime {
             return .pending
         }
 
-        static func cohort(metrics: [String: UInt64]) -> String {
+        package static func cohort(metrics: [String: UInt64]) -> String {
             if (metrics["graph_index_artifact_builds_started"] ?? 0) > 0 ||
                 (metrics["materializations"] ?? 0) > 0
             {
@@ -811,7 +811,7 @@ enum CodeMapPerfRuntime {
             return sorted[min(rank - 1, sorted.count - 1)]
         }
 
-        static func graphIndexPhaseName(_ phase: WorkspaceCodemapGraphIndexPhase) -> String {
+        package static func graphIndexPhaseName(_ phase: WorkspaceCodemapGraphIndexPhase) -> String {
             switch phase {
             case .scheduled: "scheduled"
             case .waitingForAdmission: "waiting_for_admission"
@@ -831,7 +831,7 @@ enum CodeMapPerfRuntime {
             }
         }
 
-        static func launchPhaseName(_ phase: WorkspaceCodemapGraphIndexLaunchPhase) -> String {
+        package static func launchPhaseName(_ phase: WorkspaceCodemapGraphIndexLaunchPhase) -> String {
             switch phase {
             case .notScheduled: "not_scheduled"
             case .eligibilityQueued: "eligibility_queued"
@@ -846,7 +846,7 @@ enum CodeMapPerfRuntime {
             }
         }
 
-        static func rootKindName(_ kind: WorkspaceRootKind) -> String {
+        package static func rootKindName(_ kind: WorkspaceRootKind) -> String {
             switch kind {
             case .primaryWorkspace: "primary_workspace"
             case .workspaceGitData: "workspace_git_data"
@@ -855,7 +855,7 @@ enum CodeMapPerfRuntime {
             }
         }
 
-        static func metrics(_ accounting: WorkspaceCodemapBindingEngineAccounting) -> [String: UInt64] {
+        package static func metrics(_ accounting: WorkspaceCodemapBindingEngineAccounting) -> [String: UInt64] {
             let counters = accounting.counters
             return [
                 "classifications": counters.classifications,
@@ -892,7 +892,7 @@ enum CodeMapPerfRuntime {
             ]
         }
 
-        static func resources(_ accounting: WorkspaceCodemapBindingEngineAccounting) -> [String: UInt64] {
+        package static func resources(_ accounting: WorkspaceCodemapBindingEngineAccounting) -> [String: UInt64] {
             let resources = accounting.graphIndexResources
             return [
                 "retained_path_bytes": resources.retainedPathBytes,
@@ -904,7 +904,7 @@ enum CodeMapPerfRuntime {
             ]
         }
 
-        static func privacySafeRootPayload(_ root: CodemapFullLoadRootSnapshot) -> [String: Any] {
+        package static func privacySafeRootPayload(_ root: CodemapFullLoadRootSnapshot) -> [String: Any] {
             [
                 "root_id": root.rootEpoch.rootID.uuidString,
                 "root_lifetime_id": root.rootEpoch.rootLifetimeID.uuidString,

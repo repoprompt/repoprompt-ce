@@ -1,17 +1,17 @@
 import Foundation
 
-struct WorkspaceCodemapArtifactDemandTicket: Hashable {
+package struct WorkspaceCodemapArtifactDemandTicket: Hashable {
     let retainID: UUID
     let requestID: UUID
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let fileID: UUID
+    package let fileID: UUID
     let requestGeneration: UInt64
     let catalogGeneration: UInt64
     let pathGeneration: UInt64
     let ingressGeneration: UInt64
 }
 
-enum WorkspaceCodemapArtifactDemandUnavailableReason: Equatable {
+package enum WorkspaceCodemapArtifactDemandUnavailableReason: Equatable {
     case rootNotLoaded
     case fileNotCataloged
     case unsupportedFileType

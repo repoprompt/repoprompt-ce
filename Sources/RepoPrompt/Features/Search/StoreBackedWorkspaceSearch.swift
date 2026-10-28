@@ -3,23 +3,23 @@ import RepoPromptFileSystem
 import RepoPromptShared
 import RepoPromptWorkspaceCore
 
-protocol WorkspaceSearchReadinessProviding: AnyObject {
+package protocol WorkspaceSearchReadinessProviding: AnyObject {
     @MainActor func waitForSearchReadiness(timeout: Duration) async throws -> WorkspaceSearchReadinessTicket
     func validateSearchReadiness(_ ticket: WorkspaceSearchReadinessTicket) throws
 }
 
-enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
+package enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
     case worktreeScopeUnavailable(missingPhysicalRootPaths: [String])
     case workspaceFreshnessTimedOut
     case workspaceReadinessUnavailable
     case workspaceReadinessTimedOut
     case workspaceReadinessSuperseded
 
-    var retryAfterMilliseconds: Int {
+    package var retryAfterMilliseconds: Int {
         1000
     }
 
-    var suggestion: String {
+    package var suggestion: String {
         switch self {
         case .worktreeScopeUnavailable:
             "Retry after the suggested delay. If the worktree remains unavailable, restore it or rebind the Agent session to an available worktree."
@@ -34,7 +34,7 @@ enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
         }
     }
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .worktreeScopeUnavailable(missingPhysicalRootPaths):
             let count = missingPhysicalRootPaths.count
@@ -56,14 +56,14 @@ enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
 ///
 /// This intentionally works from `WorkspaceFileContextStore` catalog snapshots rather than
 /// `WorkspaceFilesViewModel` tree projections.
-enum StoreBackedWorkspaceSearch {
+package enum StoreBackedWorkspaceSearch {
     #if DEBUG
         @TaskLocal static var readinessWaitTimeoutOverrideForTesting: Duration?
         @TaskLocal static var freshnessWaitTimeoutOverrideForTesting: Duration?
         @TaskLocal static var freshnessWaitOperationOverrideForTesting: (@Sendable ([WorkspaceRootRef], WorkspaceFileContextStore) async -> [WorkspaceIngressBarrierSample])?
     #endif
 
-    static func search(
+    package static func search(
         pattern: String,
         mode: SearchMode = .auto,
         isRegex: Bool = false,

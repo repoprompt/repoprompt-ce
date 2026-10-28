@@ -3,12 +3,12 @@ import RepoPromptFileSystem
 import RepoPromptVCS
 import RepoPromptWorkspaceCore
 
-struct WorkspacePublishedGitArtifactIngressRequest {
-    let root: WorkspaceRootRef
-    let artifacts: [GitDiffPublishedArtifact]
+package struct WorkspacePublishedGitArtifactIngressRequest {
+    package let root: WorkspaceRootRef
+    package let artifacts: [GitDiffPublishedArtifact]
 }
 
-enum WorkspacePublishedGitArtifactIngressOutcomeStatus: Equatable {
+package enum WorkspacePublishedGitArtifactIngressOutcomeStatus: Equatable {
     case cataloged(record: WorkspaceFileRecord)
     case missingOnDisk
     case ineligible(reason: CatalogRegularFileIneligibilityReason)
@@ -24,29 +24,29 @@ enum WorkspacePublishedGitArtifactIngressOutcomeStatus: Equatable {
     }
 }
 
-struct WorkspacePublishedGitArtifactIngressOutcome: Equatable {
-    let artifact: GitDiffPublishedArtifact
-    let status: WorkspacePublishedGitArtifactIngressOutcomeStatus
+package struct WorkspacePublishedGitArtifactIngressOutcome: Equatable {
+    package let artifact: GitDiffPublishedArtifact
+    package let status: WorkspacePublishedGitArtifactIngressOutcomeStatus
 }
 
-struct WorkspacePublishedGitArtifactReadinessFailure: Equatable {
-    let artifact: GitDiffPublishedArtifact
-    let status: WorkspacePublishedGitArtifactIngressOutcomeStatus
+package struct WorkspacePublishedGitArtifactReadinessFailure: Equatable {
+    package let artifact: GitDiffPublishedArtifact
+    package let status: WorkspacePublishedGitArtifactIngressOutcomeStatus
 }
 
-struct WorkspacePublishedGitArtifactReadinessAggregation: Equatable {
-    let selectionReadyArtifacts: [GitDiffPublishedArtifact]
-    let advertisementReadyArtifacts: [GitDiffPublishedArtifact]
-    let selectionReadySnapshotDirectories: Set<String>
-    let failuresBySnapshotDirectory: [String: [WorkspacePublishedGitArtifactReadinessFailure]]
+package struct WorkspacePublishedGitArtifactReadinessAggregation: Equatable {
+    package let selectionReadyArtifacts: [GitDiffPublishedArtifact]
+    package let advertisementReadyArtifacts: [GitDiffPublishedArtifact]
+    package let selectionReadySnapshotDirectories: Set<String>
+    package let failuresBySnapshotDirectory: [String: [WorkspacePublishedGitArtifactReadinessFailure]]
 }
 
-struct WorkspacePublishedGitArtifactIngressResult: Equatable {
+package struct WorkspacePublishedGitArtifactIngressResult: Equatable {
     let outcomes: [WorkspacePublishedGitArtifactIngressOutcome]
     let recordsByAbsolutePath: [String: WorkspaceFileRecord]
     let failuresByArtifact: [GitDiffPublishedArtifact: WorkspacePublishedGitArtifactIngressOutcomeStatus]
 
-    init(outcomes: [WorkspacePublishedGitArtifactIngressOutcome]) {
+    package init(outcomes: [WorkspacePublishedGitArtifactIngressOutcome]) {
         self.outcomes = outcomes
 
         var records: [String: WorkspaceFileRecord] = [:]
@@ -69,7 +69,7 @@ struct WorkspacePublishedGitArtifactIngressResult: Equatable {
         failuresByArtifact = failures
     }
 
-    func selectionReadyArtifacts(
+    package func selectionReadyArtifacts(
         for publishedArtifacts: GitDiffPublishedArtifactSet
     ) -> [GitDiffPublishedArtifact] {
         guard recordsByAbsolutePath[publishedArtifacts.manifest.absolutePath] != nil else { return [] }
@@ -78,7 +78,7 @@ struct WorkspacePublishedGitArtifactIngressResult: Equatable {
         }
     }
 
-    func advertisementReadyArtifacts(
+    package func advertisementReadyArtifacts(
         for publishedArtifacts: GitDiffPublishedArtifactSet
     ) -> [GitDiffPublishedArtifact] {
         guard recordsByAbsolutePath[publishedArtifacts.manifest.absolutePath] != nil else { return [] }
@@ -89,7 +89,7 @@ struct WorkspacePublishedGitArtifactIngressResult: Equatable {
 
     /// Builds all publication readiness projections in published artifact order.
     /// The ingress indexes above are constructed once, so this is O(A) after the O(N) ingress pass.
-    func aggregateReadiness(
+    package func aggregateReadiness(
         for publishedSets: [GitDiffPublishedArtifactSet]
     ) async throws -> WorkspacePublishedGitArtifactReadinessAggregation {
         try Task.checkCancellation()

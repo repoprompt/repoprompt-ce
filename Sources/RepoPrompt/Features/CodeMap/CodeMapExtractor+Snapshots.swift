@@ -1,6 +1,6 @@
 import Foundation
 
-extension CodeMapExtractor {
+package extension CodeMapExtractor {
     static func generateFileTree(using snapshot: FileTreeSelectionSnapshot) -> String {
         WorkspaceFileTreePresentationRenderer.render(snapshot)
     }

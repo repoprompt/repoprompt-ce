@@ -5,8 +5,8 @@ enum BroadSearchAdmissionClass: String {
     case unscopedBoth
 }
 
-enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable {
-    enum QueueScope: String {
+package enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable {
+    package enum QueueScope: String {
         case perStore
     }
 
@@ -14,7 +14,7 @@ enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable {
     case waitExpired(retryAfterMilliseconds: Int)
     case contentReadQueueFull(retryAfterMilliseconds: Int)
 
-    var retryAfterMilliseconds: Int {
+    package var retryAfterMilliseconds: Int {
         switch self {
         case let .queueFull(_, retryAfterMilliseconds),
              let .waitExpired(retryAfterMilliseconds),
@@ -23,11 +23,11 @@ enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable {
         }
     }
 
-    var suggestion: String {
+    package var suggestion: String {
         "Retry after the suggested delay, or use filter.paths to narrow the content search when a smaller scope is acceptable."
     }
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .queueFull:
             "Broad content search capacity is temporarily busy and the per-workspace wait queue is full."
@@ -47,27 +47,27 @@ enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable {
 /// workspace) shares one ingress freshness flight instead of reconstructing it serially per
 /// search. Beyond the active batch, a bounded FIFO wait queue absorbs the rest of the burst;
 /// overflow still fails fast so one workspace cannot monopolize another.
-actor StoreBackedWorkspaceSearchLane {
-    struct Configuration: Equatable {
-        static let production = Configuration(
+package actor StoreBackedWorkspaceSearchLane {
+    package struct Configuration: Equatable {
+        package static let production = Configuration(
             maxActiveLeases: 4,
             maxQueuedWaiters: 4,
             maxQueueWait: .milliseconds(1500),
             retryAfterMilliseconds: 1000
         )
 
-        let maxActiveLeases: Int
-        let maxQueuedWaiters: Int
+        package let maxActiveLeases: Int
+        package let maxQueuedWaiters: Int
         let maxQueueWait: Duration
-        let retryAfterMilliseconds: Int
+        package let retryAfterMilliseconds: Int
 
-        var maxQueueWaitMilliseconds: Int {
+        package var maxQueueWaitMilliseconds: Int {
             let components = maxQueueWait.components
             let milliseconds = components.seconds * 1000 + components.attoseconds / 1_000_000_000_000_000
             return Int(clamping: milliseconds)
         }
 
-        init(
+        package init(
             maxActiveLeases: Int = 1,
             maxQueuedWaiters: Int = 1,
             maxQueueWait: Duration,
@@ -84,7 +84,7 @@ actor StoreBackedWorkspaceSearchLane {
         }
     }
 
-    struct AdmissionClock {
+    package struct AdmissionClock {
         static func continuous() -> AdmissionClock {
             let clock = ContinuousClock()
             let origin = clock.now
@@ -101,23 +101,23 @@ actor StoreBackedWorkspaceSearchLane {
     }
 
     #if DEBUG
-        struct Snapshot: Equatable {
-            let configuration: Configuration
-            let activePermitCount: Int
-            let waiterCount: Int
-            let grantCount: Int
-            let overloadCount: Int
-            let waitExpiryCount: Int
-            let queuedCancellationCount: Int
-            let maximumActivePermitCount: Int
-            let maximumWaiterCount: Int
+        package struct Snapshot: Equatable {
+            package let configuration: Configuration
+            package let activePermitCount: Int
+            package let waiterCount: Int
+            package let grantCount: Int
+            package let overloadCount: Int
+            package let waitExpiryCount: Int
+            package let queuedCancellationCount: Int
+            package let maximumActivePermitCount: Int
+            package let maximumWaiterCount: Int
 
-            var isIdle: Bool {
+            package var isIdle: Bool {
                 activePermitCount == 0 && waiterCount == 0
             }
         }
 
-        enum DebugConfigurationUpdateResult: Equatable {
+        package enum DebugConfigurationUpdateResult: Equatable {
             case applied(Snapshot)
             case busy(Snapshot)
         }
@@ -164,7 +164,7 @@ actor StoreBackedWorkspaceSearchLane {
         private var permitAcquiredHandlerForTesting: (@Sendable () async -> Void)?
     #endif
 
-    init(
+    package init(
         configuration: Configuration = .production,
         clock: AdmissionClock = .continuous()
     ) {

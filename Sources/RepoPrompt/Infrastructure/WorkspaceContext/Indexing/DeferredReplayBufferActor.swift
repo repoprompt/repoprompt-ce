@@ -14,19 +14,19 @@ private struct ImmediatePreparedIngressReservation: Equatable {
     let rootKey: String
 }
 
-struct PreparedImmediateReplay {
+package struct PreparedImmediateReplay {
     fileprivate let reservation: ImmediatePreparedIngressReservation
-    let rootGeneration: UInt64
-    let sourceDeltas: [FileSystemDelta]
-    let preparedBatch: PreparedFileSystemReplayBatch
-    let routingVersion: UInt64
+    package let rootGeneration: UInt64
+    package let sourceDeltas: [FileSystemDelta]
+    package let preparedBatch: PreparedFileSystemReplayBatch
+    package let routingVersion: UInt64
 
-    var rootKey: String {
+    package var rootKey: String {
         reservation.rootKey
     }
 }
 
-enum DeferredReplayIngressResult {
+package enum DeferredReplayIngressResult {
     case preparedImmediate(PreparedImmediateReplay)
     case queued
     case overflowRequiresRefresh(rootKey: String)
@@ -34,18 +34,18 @@ enum DeferredReplayIngressResult {
     case droppedStaleGeneration(rootKey: String)
 }
 
-struct DeferredReplayPendingWorkSnapshot: Equatable {
-    let pendingRootCount: Int
-    let pendingDeltaCount: Int
+package struct DeferredReplayPendingWorkSnapshot: Equatable {
+    package let pendingRootCount: Int
+    package let pendingDeltaCount: Int
     let overflowedRootCount: Int
 }
 
 #if DEBUG
-    struct DeferredReplayBufferDiagnostics: Equatable {
-        let pendingRootCount: Int
-        let pendingDeltaCount: Int
+    package struct DeferredReplayBufferDiagnostics: Equatable {
+        package let pendingRootCount: Int
+        package let pendingDeltaCount: Int
         let overflowedRootCount: Int
-        let routingVersion: UInt64
+        package let routingVersion: UInt64
         let immediatePreparedIngressInFlight: Bool
         let immediateIngressCount: UInt64
         let deferredIngressCount: UInt64
@@ -263,7 +263,7 @@ actor DeferredReplayBufferActor {
         !pendingDeltasByRoot.isEmpty
     }
 
-    func pendingDeltaCount(forRootKey rootKey: String) -> Int {
+    package func pendingDeltaCount(forRootKey rootKey: String) -> Int {
         pendingDeltasByRoot[rootKey]?.count ?? 0
     }
 

@@ -1,23 +1,30 @@
 import Foundation
 import RepoPromptVCS
 
-enum GitPrefixControlEvidenceCacheMode {
+package enum GitPrefixControlEvidenceCacheMode {
     case automatic
     case bypassReadAndAdmission
 }
 
-struct GitLoadedRootTreeInventorySpool: @unchecked Sendable {
-    static let commandFormat = "git-ls-tree-recursive-full-tree-z-v1"
+package struct GitLoadedRootTreeInventorySpool: @unchecked Sendable {
+    package static let commandFormat = "git-ls-tree-recursive-full-tree-z-v1"
 
-    let rawOutput: GitRawOutputSpoolLease
-    let stdoutSHA256: Data
-    let treeOID: GitObjectID
-    let rootPrefix: GitRepositoryRelativeRootPrefix
+    package let rawOutput: GitRawOutputSpoolLease
+    package let stdoutSHA256: Data
+    package let treeOID: GitObjectID
+    package let rootPrefix: GitRepositoryRelativeRootPrefix
+
+    package init(rawOutput: GitRawOutputSpoolLease, stdoutSHA256: Data, treeOID: GitObjectID, rootPrefix: GitRepositoryRelativeRootPrefix) {
+        self.rawOutput = rawOutput
+        self.stdoutSHA256 = stdoutSHA256
+        self.treeOID = treeOID
+        self.rootPrefix = rootPrefix
+    }
 }
 
 /// Workspace-owned Git observations and evidence, supplied by the host's existing Git actor.
 /// Requirements deliberately have no defaults: callers preserve their existing resource policy.
-protocol WorkspaceGitClient: Sendable {
+package protocol WorkspaceGitClient: Sendable {
     /// Preserve concrete Git process error classification without exporting the host actor.
     func isGitProcessError(_ error: Error) -> Bool
     func retainRepositoryLayout(_ layout: GitRepositoryLayout) async

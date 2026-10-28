@@ -4,24 +4,24 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptVCS
 
-enum GitTargetEvidenceFamily: UInt8, Equatable {
+package enum GitTargetEvidenceFamily: UInt8, Equatable {
     case treeDelta = 1
     case index = 2
     case porcelainV2Status = 3
 }
 
-struct GitTargetEvidenceFileSystemIdentity: Equatable {
+package struct GitTargetEvidenceFileSystemIdentity: Equatable {
     let canonicalPathBytes: Data
     let device: UInt64
     let inode: UInt64
 
-    init(canonicalPathBytes: Data, device: UInt64, inode: UInt64) {
+    package init(canonicalPathBytes: Data, device: UInt64, inode: UInt64) {
         self.canonicalPathBytes = canonicalPathBytes
         self.device = device
         self.inode = inode
     }
 
-    init(url: URL) throws {
+    package init(url: URL) throws {
         let physicalURL = url.resolvingSymlinksInPath().standardizedFileURL
         var status = stat()
         guard lstat(physicalURL.path, &status) == 0,
@@ -38,38 +38,38 @@ struct GitTargetEvidenceFileSystemIdentity: Equatable {
     }
 }
 
-struct GitTargetEvidenceAuthorityIdentity: Equatable {
-    let authorityGeneration: UInt64
-    let invalidationGeneration: UInt64
-    let acceptedMetadataWatermark: UInt64
-    let attemptID: UUID
-    let snapshotDigestBytes: Data
+package struct GitTargetEvidenceAuthorityIdentity: Equatable {
+    package let authorityGeneration: UInt64
+    package let invalidationGeneration: UInt64
+    package let acceptedMetadataWatermark: UInt64
+    package let attemptID: UUID
+    package let snapshotDigestBytes: Data
 }
 
 /// Complete ephemeral identity of one Git target-evidence artifact. Every field
 /// is serialized into the authenticated header; artifacts are never reopened
 /// through a persistence-compatibility path.
-struct GitTargetEvidenceArtifactIdentity: Equatable {
-    let physicalWorktree: GitTargetEvidenceFileSystemIdentity
-    let repositoryCommonDirectory: GitTargetEvidenceFileSystemIdentity
-    let repositoryGitDirectory: GitTargetEvidenceFileSystemIdentity
-    let authority: GitTargetEvidenceAuthorityIdentity
-    let commandArguments: [Data]
-    let commandFormatBytes: Data
+package struct GitTargetEvidenceArtifactIdentity: Equatable {
+    package let physicalWorktree: GitTargetEvidenceFileSystemIdentity
+    package let repositoryCommonDirectory: GitTargetEvidenceFileSystemIdentity
+    package let repositoryGitDirectory: GitTargetEvidenceFileSystemIdentity
+    package let authority: GitTargetEvidenceAuthorityIdentity
+    package let commandArguments: [Data]
+    package let commandFormatBytes: Data
     /// SHA-256 over the canonical, service-owned Git environment actually
     /// passed to the evidence subprocess.
-    let environmentIdentityBytes: Data
+    package let environmentIdentityBytes: Data
     /// SHA-256 over the exact raw stdout spool consumed by the parser.
-    let commandOutputDigestBytes: Data
-    let repositoryRelativeRootPrefixBytes: Data
-    let objectFormatBytes: Data
-    let baseObjectIDBytes: Data?
-    let targetObjectIDBytes: Data?
+    package let commandOutputDigestBytes: Data
+    package let repositoryRelativeRootPrefixBytes: Data
+    package let objectFormatBytes: Data
+    package let baseObjectIDBytes: Data?
+    package let targetObjectIDBytes: Data?
     /// Opaque caller-supplied provenance used only to require bundle coherence.
     /// It is authenticated as supplied metadata, never as observed Git authority.
-    let suppliedCreationCutProvenanceBytes: Data?
+    package let suppliedCreationCutProvenanceBytes: Data?
     /// Required for index evidence and nil for the other command families.
-    let sparseCheckoutEnabled: Bool?
+    package let sparseCheckoutEnabled: Bool?
 }
 
 struct GitTargetEvidenceManifestHeader: Equatable {
@@ -79,7 +79,7 @@ struct GitTargetEvidenceManifestHeader: Equatable {
     let family: GitTargetEvidenceFamily
     let identity: GitTargetEvidenceArtifactIdentity
 
-    init(
+    package init(
         schemaVersion: UInt32 = Self.currentSchemaVersion,
         family: GitTargetEvidenceFamily,
         identity: GitTargetEvidenceArtifactIdentity
@@ -105,7 +105,7 @@ struct GitTargetEvidenceManifestStatistics: Equatable {
     let finalByteCount: UInt64
 }
 
-enum GitTargetEvidenceManifestError: Error, Equatable {
+package enum GitTargetEvidenceManifestError: Error, Equatable {
     case invalidConfiguration
     case invalidRecord(String)
     case duplicateRecord
@@ -116,12 +116,12 @@ enum GitTargetEvidenceManifestError: Error, Equatable {
     case io(operation: String, code: Int32)
 }
 
-enum GitTargetEvidenceProcessCaptureFailure: Equatable {
+package enum GitTargetEvidenceProcessCaptureFailure: Equatable {
     case stdoutLimitExceeded
     case stderrLimitExceeded
 }
 
-enum GitTargetEvidenceCollectionError: Error, Equatable {
+package enum GitTargetEvidenceCollectionError: Error, Equatable {
     case authorityChanged
     case admission(GitProcessAdmissionError)
     case processLaunch(domain: String, code: Int)
@@ -143,7 +143,7 @@ enum GitTargetEvidenceReaderValidationState: Equatable {
     case failed
 }
 
-enum GitTargetTreeDeltaEvidenceStatus: UInt8, Equatable {
+package enum GitTargetTreeDeltaEvidenceStatus: UInt8, Equatable {
     case added = 1
     case deleted = 2
     case modified = 3
@@ -156,7 +156,7 @@ enum GitTargetTreeDeltaEvidenceStatus: UInt8, Equatable {
     case unmerged = 8
 }
 
-struct GitTargetTreeDeltaEvidenceRecord: Equatable {
+package struct GitTargetTreeDeltaEvidenceRecord: Equatable {
     let oldModeBytes: Data?
     let newModeBytes: Data?
     let oldObjectIDBytes: Data?
@@ -166,7 +166,7 @@ struct GitTargetTreeDeltaEvidenceRecord: Equatable {
     let sourceRepositoryRelativePathBytes: Data?
     let repositoryRelativePathBytes: Data
 
-    init(
+    package init(
         oldModeBytes: Data?,
         newModeBytes: Data?,
         oldObjectIDBytes: Data?,
@@ -187,7 +187,7 @@ struct GitTargetTreeDeltaEvidenceRecord: Equatable {
     }
 }
 
-struct GitTargetIndexEvidenceRecord: Equatable {
+package struct GitTargetIndexEvidenceRecord: Equatable {
     let modeBytes: Data
     let objectIDBytes: Data
     let stage: UInt8
@@ -196,7 +196,7 @@ struct GitTargetIndexEvidenceRecord: Equatable {
     let skipWorktree: Bool
 }
 
-enum GitTargetStatusEvidenceKind: UInt8, Equatable {
+package enum GitTargetStatusEvidenceKind: UInt8, Equatable {
     case ordinary = 1
     case renamed = 2
     case copied = 3
@@ -205,7 +205,7 @@ enum GitTargetStatusEvidenceKind: UInt8, Equatable {
     case ignored = 6
 }
 
-struct GitTargetStatusEvidenceRecord: Equatable {
+package struct GitTargetStatusEvidenceRecord: Equatable {
     let kind: GitTargetStatusEvidenceKind
     let repositoryRelativePathBytes: Data
     let sourceRepositoryRelativePathBytes: Data?
@@ -228,7 +228,7 @@ struct GitTargetStatusEvidenceRecord: Equatable {
     let conflictStage2ObjectIDBytes: Data?
     let conflictStage3ObjectIDBytes: Data?
 
-    init(
+    package init(
         kind: GitTargetStatusEvidenceKind,
         repositoryRelativePathBytes: Data,
         sourceRepositoryRelativePathBytes: Data? = nil,
@@ -271,7 +271,7 @@ struct GitTargetStatusEvidenceRecord: Equatable {
     }
 }
 
-protocol GitTargetEvidenceRecordCodec: Sendable {
+package protocol GitTargetEvidenceRecordCodec: Sendable {
     associatedtype Record: Equatable, Sendable
 
     static var family: GitTargetEvidenceFamily { get }
@@ -288,7 +288,7 @@ protocol GitTargetEvidenceRecordCodec: Sendable {
     static func pathPayloadByteCount(_ record: Record) throws -> UInt64
 }
 
-extension GitTargetEvidenceRecordCodec {
+package extension GitTargetEvidenceRecordCodec {
     static func validate(_ record: Record, objectFormatBytes _: Data) throws {
         try validate(record)
     }
@@ -627,7 +627,7 @@ struct GitTargetEvidenceByteCursor {
     let data: Data
     var offset = 0
 
-    init(_ data: Data) {
+    package init(_ data: Data) {
         self.data = data
     }
 
@@ -706,11 +706,11 @@ struct GitTargetEvidenceByteCursor {
     }
 }
 
-struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
-    static let family = GitTargetEvidenceFamily.treeDelta
-    static let fileExtension = "tree-delta-evidence"
+package struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
+    package static let family = GitTargetEvidenceFamily.treeDelta
+    package static let fileExtension = "tree-delta-evidence"
 
-    static func validate(_ record: GitTargetTreeDeltaEvidenceRecord) throws {
+    package static func validate(_ record: GitTargetTreeDeltaEvidenceRecord) throws {
         try GitTargetEvidenceManifestCodec.validatePath(record.repositoryRelativePathBytes, label: "target path")
         try record.sourceRepositoryRelativePathBytes.map {
             try GitTargetEvidenceManifestCodec.validatePath($0, label: "source path")
@@ -750,7 +750,7 @@ struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
         }
     }
 
-    static func validate(
+    package static func validate(
         _ record: GitTargetTreeDeltaEvidenceRecord,
         objectFormatBytes: Data
     ) throws {
@@ -761,7 +761,7 @@ struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
         )
     }
 
-    static func encode(_ record: GitTargetTreeDeltaEvidenceRecord) throws -> Data {
+    package static func encode(_ record: GitTargetTreeDeltaEvidenceRecord) throws -> Data {
         try validate(record)
         var data = Data([record.status.rawValue])
         GitTargetEvidenceManifestCodec.appendOptional(record.similarityScore, to: &data)
@@ -774,7 +774,7 @@ struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
         return data
     }
 
-    static func decode(_ payload: Data) throws -> GitTargetTreeDeltaEvidenceRecord {
+    package static func decode(_ payload: Data) throws -> GitTargetTreeDeltaEvidenceRecord {
         var cursor = GitTargetEvidenceByteCursor(payload)
         guard let status = try GitTargetTreeDeltaEvidenceStatus(rawValue: cursor.readUInt8()) else {
             throw GitTargetEvidenceManifestError.corrupt("invalid delta status")
@@ -795,7 +795,7 @@ struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
         return decoded
     }
 
-    static func ordering(
+    package static func ordering(
         _ lhs: GitTargetTreeDeltaEvidenceRecord,
         _ rhs: GitTargetTreeDeltaEvidenceRecord
     ) -> SpillBackedSortedArtifactOrdering {
@@ -807,23 +807,23 @@ struct GitTargetTreeDeltaRecordCodec: GitTargetEvidenceRecordCodec {
         return lhsOrder < rhsOrder ? .ascending : .descending
     }
 
-    static func pathPayloadByteCount(_ record: GitTargetTreeDeltaEvidenceRecord) throws -> UInt64 {
+    package static func pathPayloadByteCount(_ record: GitTargetTreeDeltaEvidenceRecord) throws -> UInt64 {
         try exactPathCount(record.repositoryRelativePathBytes.count + (record.sourceRepositoryRelativePathBytes?.count ?? 0))
     }
 }
 
-struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
-    static let family = GitTargetEvidenceFamily.index
-    static let fileExtension = "index-evidence"
+package struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
+    package static let family = GitTargetEvidenceFamily.index
+    package static let fileExtension = "index-evidence"
 
-    static func validate(_ record: GitTargetIndexEvidenceRecord) throws {
+    package static func validate(_ record: GitTargetIndexEvidenceRecord) throws {
         guard record.stage <= 3 else { throw GitTargetEvidenceManifestError.invalidRecord("invalid stage") }
         try GitTargetEvidenceManifestCodec.validatePath(record.repositoryRelativePathBytes, label: "index path")
         try GitTargetEvidenceManifestCodec.validateMode(record.modeBytes, label: "index mode")
         try GitTargetEvidenceManifestCodec.validateOID(record.objectIDBytes, label: "index object ID")
     }
 
-    static func validate(
+    package static func validate(
         _ record: GitTargetIndexEvidenceRecord,
         objectFormatBytes: Data
     ) throws {
@@ -831,7 +831,7 @@ struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
         try validateObjectFormat(objectFormatBytes, objectIDs: [record.objectIDBytes])
     }
 
-    static func encode(_ record: GitTargetIndexEvidenceRecord) throws -> Data {
+    package static func encode(_ record: GitTargetIndexEvidenceRecord) throws -> Data {
         try validate(record)
         var data = Data([record.stage, record.assumeUnchanged ? 1 : 0, record.skipWorktree ? 1 : 0])
         GitTargetEvidenceManifestCodec.append(record.modeBytes, to: &data)
@@ -840,7 +840,7 @@ struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
         return data
     }
 
-    static func decode(_ payload: Data) throws -> GitTargetIndexEvidenceRecord {
+    package static func decode(_ payload: Data) throws -> GitTargetIndexEvidenceRecord {
         var cursor = GitTargetEvidenceByteCursor(payload)
         let stage = try cursor.readUInt8()
         let assumeUnchanged = try cursor.readBool()
@@ -858,7 +858,7 @@ struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
         return record
     }
 
-    static func ordering(
+    package static func ordering(
         _ lhs: GitTargetIndexEvidenceRecord,
         _ rhs: GitTargetIndexEvidenceRecord
     ) -> SpillBackedSortedArtifactOrdering {
@@ -868,7 +868,7 @@ struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
         return lhs.stage < rhs.stage ? .ascending : .descending
     }
 
-    static func duplicateResolution(
+    package static func duplicateResolution(
         _ existing: GitTargetIndexEvidenceRecord,
         _ candidate: GitTargetIndexEvidenceRecord
     ) throws -> SpillBackedSortedArtifactDuplicateResolution {
@@ -877,16 +877,16 @@ struct GitTargetIndexRecordCodec: GitTargetEvidenceRecordCodec {
         existing == candidate ? .coalesce : .reject
     }
 
-    static func pathPayloadByteCount(_ record: GitTargetIndexEvidenceRecord) throws -> UInt64 {
+    package static func pathPayloadByteCount(_ record: GitTargetIndexEvidenceRecord) throws -> UInt64 {
         try exactPathCount(record.repositoryRelativePathBytes.count)
     }
 }
 
-struct GitTargetStatusRecordCodec: GitTargetEvidenceRecordCodec {
-    static let family = GitTargetEvidenceFamily.porcelainV2Status
-    static let fileExtension = "status-evidence"
+package struct GitTargetStatusRecordCodec: GitTargetEvidenceRecordCodec {
+    package static let family = GitTargetEvidenceFamily.porcelainV2Status
+    package static let fileExtension = "status-evidence"
 
-    static func validate(_ record: GitTargetStatusEvidenceRecord) throws {
+    package static func validate(_ record: GitTargetStatusEvidenceRecord) throws {
         try GitTargetEvidenceManifestCodec.validatePath(record.repositoryRelativePathBytes, label: "status path")
         try record.sourceRepositoryRelativePathBytes.map {
             try GitTargetEvidenceManifestCodec.validatePath($0, label: "status source path")
@@ -954,7 +954,7 @@ struct GitTargetStatusRecordCodec: GitTargetEvidenceRecordCodec {
         }
     }
 
-    static func validate(
+    package static func validate(
         _ record: GitTargetStatusEvidenceRecord,
         objectFormatBytes: Data
     ) throws {
@@ -966,7 +966,7 @@ struct GitTargetStatusRecordCodec: GitTargetEvidenceRecordCodec {
         ])
     }
 
-    static func encode(_ record: GitTargetStatusEvidenceRecord) throws -> Data {
+    package static func encode(_ record: GitTargetStatusEvidenceRecord) throws -> Data {
         try validate(record)
         var data = Data([record.kind.rawValue])
         GitTargetEvidenceManifestCodec.append(record.repositoryRelativePathBytes, to: &data)
@@ -995,7 +995,7 @@ struct GitTargetStatusRecordCodec: GitTargetEvidenceRecordCodec {
         return data
     }
 
-    static func decode(_ payload: Data) throws -> GitTargetStatusEvidenceRecord {
+    package static func decode(_ payload: Data) throws -> GitTargetStatusEvidenceRecord {
         var cursor = GitTargetEvidenceByteCursor(payload)
         guard let kind = try GitTargetStatusEvidenceKind(rawValue: cursor.readUInt8()) else {
             throw GitTargetEvidenceManifestError.corrupt("invalid status kind")
@@ -1026,14 +1026,14 @@ struct GitTargetStatusRecordCodec: GitTargetEvidenceRecordCodec {
         return record
     }
 
-    static func ordering(
+    package static func ordering(
         _ lhs: GitTargetStatusEvidenceRecord,
         _ rhs: GitTargetStatusEvidenceRecord
     ) -> SpillBackedSortedArtifactOrdering {
         compare(lhs.repositoryRelativePathBytes, rhs.repositoryRelativePathBytes)
     }
 
-    static func pathPayloadByteCount(_ record: GitTargetStatusEvidenceRecord) throws -> UInt64 {
+    package static func pathPayloadByteCount(_ record: GitTargetStatusEvidenceRecord) throws -> UInt64 {
         try exactPathCount(record.repositoryRelativePathBytes.count + (record.sourceRepositoryRelativePathBytes?.count ?? 0))
     }
 }
@@ -1085,7 +1085,7 @@ final class GitTargetEvidenceManifestReader<Codec: GitTargetEvidenceRecordCodec>
     private var pathPayloadByteCount: UInt64 = 0
     private let lock = NSLock()
 
-    init(descriptor: Int32, lease: GitTargetEvidenceManifestLease<Codec>) throws {
+    package init(descriptor: Int32, lease: GitTargetEvidenceManifestLease<Codec>) throws {
         self.descriptor = descriptor
         retainedLease = lease
         let headerFrame = try GitTargetEvidenceManifestCodec.readHeaderFrame(from: descriptor)

@@ -148,9 +148,9 @@ enum CodeMapArtifactCoordinatorLocatorPublication: Equatable {
     case failed
 }
 
-struct CodeMapArtifactCoordinatorDurations: Equatable {
-    let buildQueueNanoseconds: UInt64
-    let buildPermitNanoseconds: UInt64
+package struct CodeMapArtifactCoordinatorDurations: Equatable {
+    package let buildQueueNanoseconds: UInt64
+    package let buildPermitNanoseconds: UInt64
     let deterministicBuildNanoseconds: UInt64
     let casPersistenceAndVerificationNanoseconds: UInt64
     let locatorPublicationNanoseconds: UInt64

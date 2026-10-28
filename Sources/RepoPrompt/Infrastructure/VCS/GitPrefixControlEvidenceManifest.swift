@@ -4,8 +4,8 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptVCS
 
-struct GitPrefixControlEvidenceResourcePolicy: Equatable {
-    static let `default` = GitPrefixControlEvidenceResourcePolicy()
+package struct GitPrefixControlEvidenceResourcePolicy: Equatable {
+    package static let `default` = GitPrefixControlEvidenceResourcePolicy()
 
     let maximumBufferedRecordBytes: Int
     let maximumRecordsPerBatch: Int
@@ -13,9 +13,9 @@ struct GitPrefixControlEvidenceResourcePolicy: Equatable {
     let maximumOpenRuns: Int
     let minimumFreeDiskBytes: UInt64
     let maximumAggregateArtifactBytes: UInt64?
-    let maximumAggregateControlBytes: UInt64
+    package let maximumAggregateControlBytes: UInt64
 
-    init(
+    package init(
         maximumBufferedRecordBytes: Int = 16 * 1024 * 1024,
         maximumRecordsPerBatch: Int = 32768,
         maximumRecordByteCount: Int = 1024 * 1024,
@@ -51,29 +51,29 @@ struct GitPrefixControlEvidenceManifestHeader: Equatable {
     let rootPrefixBytes: Data
     let digestDomainBytes: Data
 
-    init(schemaVersion: UInt32 = Self.currentSchemaVersion, rootPrefixBytes: Data, digestDomainBytes: Data) {
+    package init(schemaVersion: UInt32 = Self.currentSchemaVersion, rootPrefixBytes: Data, digestDomainBytes: Data) {
         self.schemaVersion = schemaVersion
         self.rootPrefixBytes = rootPrefixBytes
         self.digestDomainBytes = digestDomainBytes
     }
 }
 
-struct GitPrefixControlEvidenceRecord: Equatable {
-    let repositoryRelativePathBytes: Data
-    let kind: GitWorkspacePrefixControlKind
-    let content: GitWorkspaceAuthorityContentIdentity
+package struct GitPrefixControlEvidenceRecord: Equatable {
+    package let repositoryRelativePathBytes: Data
+    package let kind: GitWorkspacePrefixControlKind
+    package let content: GitWorkspaceAuthorityContentIdentity
 }
 
-struct GitPrefixControlEvidenceManifestFooter: Equatable {
-    let recordCount: UInt64
+package struct GitPrefixControlEvidenceManifestFooter: Equatable {
+    package let recordCount: UInt64
     let recordPayloadByteCount: UInt64
     let pathPayloadByteCount: UInt64
-    let ignoreControlDigest: Data
-    let attributeControlDigest: Data
+    package let ignoreControlDigest: Data
+    package let attributeControlDigest: Data
     let artifactDigest: Data
 }
 
-enum GitPrefixControlEvidenceManifestError: Error, Equatable {
+package enum GitPrefixControlEvidenceManifestError: Error, Equatable {
     case invalidConfiguration
     case invalidRecord
     case duplicateRecord
@@ -84,7 +84,7 @@ enum GitPrefixControlEvidenceManifestError: Error, Equatable {
     case io(operation: String, code: Int32)
 }
 
-enum GitPrefixControlEvidenceReaderValidationState: Equatable { case reading, verified, failed }
+package enum GitPrefixControlEvidenceReaderValidationState: Equatable { case reading, verified, failed }
 
 private final class GitPrefixControlDigestBox: @unchecked Sendable {
     var digest = SHA256()
@@ -197,7 +197,7 @@ private struct GitPrefixControlEvidenceSpillFormat: SpillBackedSortedArtifactFor
     }
 }
 
-final class GitPrefixControlEvidenceManifestStore: @unchecked Sendable {
+package final class GitPrefixControlEvidenceManifestStore: @unchecked Sendable {
     private let spillStore: SpillBackedSortedArtifactStore
     var activeArtifactURLs: [URL] {
         spillStore.activeArtifactURLs
@@ -207,14 +207,14 @@ final class GitPrefixControlEvidenceManifestStore: @unchecked Sendable {
         spillStore.directoryURL
     }
 
-    init(directoryURL: URL? = nil) throws {
+    package init(directoryURL: URL? = nil) throws {
         spillStore = try SpillBackedSortedArtifactStore(
             directoryURL: directoryURL,
             defaultDirectoryStem: "repoprompt-prefix-controls"
         )
     }
 
-    func makeWriter(
+    package func makeWriter(
         rootPrefixBytes: Data,
         digestDomainBytes: Data = Data("git-prefix-control-identities-v1".utf8),
         resourcePolicy: GitPrefixControlEvidenceResourcePolicy = .default
@@ -236,37 +236,37 @@ final class GitPrefixControlEvidenceManifestStore: @unchecked Sendable {
     }
 }
 
-actor GitPrefixControlEvidenceManifestWriter {
+package actor GitPrefixControlEvidenceManifestWriter {
     private let writer: SpillBackedSortedArtifactWriter<GitPrefixControlEvidenceSpillFormat>
     private var closed = false
     fileprivate init(_ writer: SpillBackedSortedArtifactWriter<GitPrefixControlEvidenceSpillFormat>) {
         self.writer = writer
     }
 
-    func append(_ record: GitPrefixControlEvidenceRecord) async throws {
+    package func append(_ record: GitPrefixControlEvidenceRecord) async throws {
         guard !closed else { throw GitPrefixControlEvidenceManifestError.closed }
         do { try await writer.append(record) } catch { closed = true
             throw error
         }
     }
 
-    func finish() async throws -> GitPrefixControlEvidenceManifestLease {
+    package func finish() async throws -> GitPrefixControlEvidenceManifestLease {
         guard !closed else { throw GitPrefixControlEvidenceManifestError.closed }
         closed = true
         return try await GitPrefixControlEvidenceManifestLease(writer.finish())
     }
 
-    func cancel() async {
+    package func cancel() async {
         guard !closed else { return }
         closed = true
         await writer.cancel()
     }
 }
 
-final class GitPrefixControlEvidenceManifestLease: @unchecked Sendable {
+package final class GitPrefixControlEvidenceManifestLease: @unchecked Sendable {
     let fileURL: URL
     let header: GitPrefixControlEvidenceManifestHeader
-    let footer: GitPrefixControlEvidenceManifestFooter
+    package let footer: GitPrefixControlEvidenceManifestFooter
     let statistics: SpillBackedSortedArtifactStatistics
     private let lease: SpillBackedSortedArtifactLease<GitPrefixControlEvidenceSpillFormat>
     fileprivate init(_ lease: SpillBackedSortedArtifactLease<GitPrefixControlEvidenceSpillFormat>) {
@@ -277,7 +277,7 @@ final class GitPrefixControlEvidenceManifestLease: @unchecked Sendable {
         statistics = lease.statistics
     }
 
-    func makeReader() throws -> GitPrefixControlEvidenceManifestReader {
+    package func makeReader() throws -> GitPrefixControlEvidenceManifestReader {
         let descriptor = try lease.openValidatedDescriptor()
         do { return try GitPrefixControlEvidenceManifestReader(descriptor: descriptor, lease: self) }
         catch { Darwin.close(descriptor)
@@ -290,13 +290,13 @@ final class GitPrefixControlEvidenceManifestLease: @unchecked Sendable {
     }
 }
 
-actor GitPrefixControlEvidenceManifestReader {
+package actor GitPrefixControlEvidenceManifestReader {
     private let descriptor: Int32
     private let lease: GitPrefixControlEvidenceManifestLease
     private var digest = SHA256()
     private var accumulator = GitPrefixControlAccumulator()
     private var previous: GitPrefixControlEvidenceRecord?
-    private(set) var validationState: GitPrefixControlEvidenceReaderValidationState = .reading
+    package private(set) var validationState: GitPrefixControlEvidenceReaderValidationState = .reading
 
     fileprivate init(descriptor: Int32, lease: GitPrefixControlEvidenceManifestLease) throws {
         self.descriptor = descriptor
@@ -310,7 +310,7 @@ actor GitPrefixControlEvidenceManifestReader {
 
     deinit { Darwin.close(descriptor) }
 
-    func next() throws -> GitPrefixControlEvidenceRecord? {
+    package func next() throws -> GitPrefixControlEvidenceRecord? {
         guard validationState == .reading else { return nil }
         do {
             try lease.validate(descriptor)

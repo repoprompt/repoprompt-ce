@@ -2,16 +2,16 @@ import Foundation
 import RepoPromptC
 import RepoPromptFileSystem
 
-enum SearchPathClause: Equatable {
+package enum SearchPathClause: Equatable {
     case exactFile(absPath: String, relPath: String, restrictedRootPath: String?)
     case exactFolder(absLower: String, relLower: String, restrictedRootPath: String?)
     case glob(pattern: String, restrictedRootPath: String?)
     case legacyPrefix(candidateLower: String)
 }
 
-struct SearchPathFilterSpec: Equatable {
-    let caseInsensitive: Bool
-    let clauses: [SearchPathClause]
+package struct SearchPathFilterSpec: Equatable {
+    package let caseInsensitive: Bool
+    package let clauses: [SearchPathClause]
 }
 
 struct FileSearchPathSnapshot {
@@ -232,14 +232,14 @@ func normalizedFolderSuffixFragment(_ fragment: String, caseInsensitive: Bool = 
     return caseInsensitive ? trimmed.lowercased() : trimmed
 }
 
-struct SearchFolderSuffixIndexEntry<T> {
+package struct SearchFolderSuffixIndexEntry<T> {
     let folder: T
     let normalizedRelativePath: String
 }
 
-typealias SearchFolderSuffixIndex<T> = [String: [SearchFolderSuffixIndexEntry<T>]]
+package typealias SearchFolderSuffixIndex<T> = [String: [SearchFolderSuffixIndexEntry<T>]]
 
-func buildFolderSuffixIndex<T>(
+package func buildFolderSuffixIndex<T>(
     in foldersByFullPath: [String: T],
     relativePath: (T) -> String,
     caseInsensitive: Bool = true
@@ -263,7 +263,7 @@ func buildFolderSuffixIndex<T>(
     return index
 }
 
-func resolveFoldersBySuffixFragment<T>(
+package func resolveFoldersBySuffixFragment<T>(
     _ fragment: String,
     using suffixIndex: SearchFolderSuffixIndex<T>,
     caseInsensitive: Bool = true
@@ -289,7 +289,7 @@ func resolveFoldersBySuffixFragment<T>(
     return out
 }
 
-func resolveFoldersBySuffixFragment<T>(
+package func resolveFoldersBySuffixFragment<T>(
     _ fragment: String,
     in foldersByFullPath: [String: T],
     relativePath: (T) -> String,

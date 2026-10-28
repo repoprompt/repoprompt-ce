@@ -2,7 +2,7 @@ import Foundation
 import RepoPromptCodeMapCore
 import RepoPromptPersistence
 
-actor WorkspaceCodemapLiveOverlay {
+package actor WorkspaceCodemapLiveOverlay {
     private struct Registration: Equatable {
         let capability: WorkspaceCodemapRootCapability
         let catalogGeneration: UInt64
@@ -293,7 +293,7 @@ actor WorkspaceCodemapLiveOverlay {
     private var busyDropCount: UInt64
     private var staleCompletionDropCount: UInt64
 
-    init(
+    package init(
         policy: WorkspaceCodemapLiveOverlayPolicy = .default,
         graphPolicy: WorkspaceCodemapGraphPolicy = .initial,
         initialAccessOrdinal: UInt64 = 1,

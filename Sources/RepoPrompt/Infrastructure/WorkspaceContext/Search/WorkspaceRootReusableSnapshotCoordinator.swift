@@ -2,7 +2,7 @@ import Foundation
 import RepoPromptFileSystem
 import RepoPromptVCS
 
-actor WorkspaceRootReusableSnapshotCoordinator {
+package actor WorkspaceRootReusableSnapshotCoordinator {
     enum CurrentnessValidation: Equatable {
         case current
         case stale(ObservationFailureCause)
@@ -19,7 +19,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
 
     typealias CatalogBatchEvidenceProvider = @Sendable ([String]) async -> CatalogBatchEvidenceResult
 
-    enum ObservationFailureStage: String, Equatable {
+    package enum ObservationFailureStage: String, Equatable {
         case loadedRootValidation = "loaded_root_validation"
         case initialCurrentness = "initial_currentness"
         case discoveryObservation = "discovery_observation"
@@ -36,7 +36,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
         case finalLoadedRootCurrentness = "final_loaded_root_currentness"
     }
 
-    enum ObservationFailureCause: Equatable {
+    package enum ObservationFailureCause: Equatable {
         case cancelled
         case staleCurrentness
         case loadedRootOwnerStale
@@ -49,7 +49,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
         case admissionRejected
         case unexpectedFailure
 
-        var code: String {
+        package var code: String {
             switch self {
             case .cancelled: "cancelled"
             case .staleCurrentness: "stale_currentness"
@@ -73,12 +73,12 @@ actor WorkspaceRootReusableSnapshotCoordinator {
         }
     }
 
-    struct ObservationFailure: Equatable {
-        let stage: ObservationFailureStage
-        let cause: ObservationFailureCause
+    package struct ObservationFailure: Equatable {
+        package let stage: ObservationFailureStage
+        package let cause: ObservationFailureCause
     }
 
-    enum ObservationResult: Equatable {
+    package enum ObservationResult: Equatable {
         case admitted(WorkspaceRootReusableSnapshotIdentity)
         case nonGit
         case unsupportedRoot
@@ -96,7 +96,7 @@ actor WorkspaceRootReusableSnapshotCoordinator {
         private var preparedAdmissionHandlerForTesting: (@Sendable () async -> Void)?
     #endif
 
-    init(
+    package init(
         gitService: any WorkspaceGitClient,
         authority: GitWorkspaceStateAuthority
     ) {

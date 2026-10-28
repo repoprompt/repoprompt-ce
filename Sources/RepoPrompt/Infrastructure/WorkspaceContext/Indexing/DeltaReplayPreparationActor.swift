@@ -5,41 +5,41 @@ import RepoPromptWorkspaceCore
     import os
 #endif
 
-enum RepoFileReplayPerf {
+package enum RepoFileReplayPerf {
     #if DEBUG || EDIT_FLOW_PERF
-        typealias State = OSSignpostIntervalState
+        package typealias State = OSSignpostIntervalState
         static let signposter = OSSignposter(subsystem: "com.repoprompt.workspace", category: "file-replay")
         static var isEnabled: Bool {
             FileSystemRuntimeHooks.current.preferenceEnabled("enableRepoFileReplaySignposts")
         }
 
-        static func begin(_ name: StaticString) -> State? {
+        package static func begin(_ name: StaticString) -> State? {
             guard isEnabled else { return nil }
             return signposter.beginInterval(name)
         }
 
-        static func end(_ name: StaticString, _ state: State?) {
+        package static func end(_ name: StaticString, _ state: State?) {
             guard isEnabled, let state else { return }
             signposter.endInterval(name, state)
         }
     #else
-        struct State {}
+        package struct State {}
         static var isEnabled: Bool {
             false
         }
 
-        static func begin(_ name: StaticString) -> State? {
+        package static func begin(_ name: StaticString) -> State? {
             nil
         }
 
-        static func end(_ name: StaticString, _ state: State?) {}
+        package static func end(_ name: StaticString, _ state: State?) {}
     #endif
 }
 
-struct PreparedFileSystemDelta {
-    let delta: FileSystemDelta
-    let relativePath: String
-    let absolutePath: String
+package struct PreparedFileSystemDelta {
+    package let delta: FileSystemDelta
+    package let relativePath: String
+    package let absolutePath: String
 
     var isFolderAdded: Bool {
         if case .folderAdded = delta { return true }
@@ -52,46 +52,46 @@ struct PreparedFileSystemDelta {
     }
 }
 
-struct PreparedFolderRenameTransfer: Equatable {
-    let oldAbsolutePath: String
-    let newAbsolutePath: String
+package struct PreparedFolderRenameTransfer: Equatable {
+    package let oldAbsolutePath: String
+    package let newAbsolutePath: String
 }
 
-struct PreparedFileSystemReplayChunkSummary: Equatable {
-    var fileAddedCount: Int = 0
-    var fileRemovedCount: Int = 0
-    var folderAddedCount: Int = 0
-    var folderRemovedCount: Int = 0
+package struct PreparedFileSystemReplayChunkSummary: Equatable {
+    package var fileAddedCount: Int = 0
+    package var fileRemovedCount: Int = 0
+    package var folderAddedCount: Int = 0
+    package var folderRemovedCount: Int = 0
     var fileModifiedCount: Int = 0
     var folderModifiedCount: Int = 0
 
-    var modifiedCount: Int {
+    package var modifiedCount: Int {
         fileModifiedCount + folderModifiedCount
     }
 }
 
-struct PreparedFileSystemReplayChunk: Equatable {
-    let range: Range<Int>
-    let deltaCount: Int
-    let summary: PreparedFileSystemReplayChunkSummary
-    let renameTransfers: [PreparedFolderRenameTransfer]
+package struct PreparedFileSystemReplayChunk: Equatable {
+    package let range: Range<Int>
+    package let deltaCount: Int
+    package let summary: PreparedFileSystemReplayChunkSummary
+    package let renameTransfers: [PreparedFolderRenameTransfer]
 }
 
-struct PreparedFileSystemReplayBatch {
-    let rootKey: String
-    let queuedDeltaCount: Int
-    let coalescedDeltaCount: Int
-    let preparedDeltas: [PreparedFileSystemDelta]
-    let chunks: [PreparedFileSystemReplayChunk]
-    let coalesceDurationMS: Double
-    let preparationDurationMS: Double
+package struct PreparedFileSystemReplayBatch {
+    package let rootKey: String
+    package let queuedDeltaCount: Int
+    package let coalescedDeltaCount: Int
+    package let preparedDeltas: [PreparedFileSystemDelta]
+    package let chunks: [PreparedFileSystemReplayChunk]
+    package let coalesceDurationMS: Double
+    package let preparationDurationMS: Double
 
-    var discardedDeltaCount: Int {
+    package var discardedDeltaCount: Int {
         max(queuedDeltaCount - coalescedDeltaCount, 0)
     }
 }
 
-enum FileSystemDeltaPreparation {
+package enum FileSystemDeltaPreparation {
     private static func timestampMS() -> Double {
         ProcessInfo.processInfo.systemUptime * 1000
     }
@@ -105,7 +105,7 @@ enum FileSystemDeltaPreparation {
         }
     }
 
-    static func standardizedRelativePath(for delta: FileSystemDelta) -> String {
+    package static func standardizedRelativePath(for delta: FileSystemDelta) -> String {
         StandardizedPath.relative(rawRelativePath(for: delta))
     }
 
@@ -127,7 +127,7 @@ enum FileSystemDeltaPreparation {
         return (relativePath, absolutePath)
     }
 
-    static func prepare(
+    package static func prepare(
         _ delta: FileSystemDelta,
         inRoot standardizedRoot: String
     ) -> PreparedFileSystemDelta? {
@@ -139,7 +139,7 @@ enum FileSystemDeltaPreparation {
         )
     }
 
-    static func coalesce(
+    package static func coalesce(
         _ deltas: [FileSystemDelta],
         inRoot standardizedRoot: String? = nil
     ) -> [FileSystemDelta] {
@@ -310,8 +310,8 @@ enum FileSystemDeltaPreparation {
     }
 }
 
-actor DeltaReplayPreparationActor: DeltaReplayPreparing {
-    func prepare(
+package actor DeltaReplayPreparationActor: DeltaReplayPreparing {
+    package func prepare(
         rootKey: String,
         deltas: [FileSystemDelta],
         chunkSize: Int

@@ -1,15 +1,15 @@
 import Foundation
 import RepoPromptC
 
-enum RepoSearchBatchScorer {
-    struct Candidate {
-        let name: String
-        let path: String
-        let nameLower: String
-        let pathLower: String
+package enum RepoSearchBatchScorer {
+    package struct Candidate {
+        package let name: String
+        package let path: String
+        package let nameLower: String
+        package let pathLower: String
     }
 
-    static func scores(
+    package static func scores(
         for candidates: [Candidate],
         query: RepoSearchQuery,
         fuzzyThreshold: Double

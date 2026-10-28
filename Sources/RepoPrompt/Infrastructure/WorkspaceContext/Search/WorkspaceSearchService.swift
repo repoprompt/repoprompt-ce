@@ -5,7 +5,7 @@ import Foundation
 /// Each catalog shard owns one immutable C `PathSearchIndex`. Scope generations retain the
 /// relevant root-index references, and searches merge root-local candidates into the exact
 /// historical global rank order without rebuilding or mutating a shared C index.
-actor WorkspaceSearchService {
+package actor WorkspaceSearchService {
     private struct RefreshFlightToken: Equatable {
         let bindingEpoch: UInt64
         let rebuildSerial: UInt64
@@ -55,15 +55,15 @@ actor WorkspaceSearchService {
     private var discardedAutomaticRebuildCompletions = 0
     private var isReadyIndexUsable = true
     #if DEBUG
-        struct RebuildWorkDiagnosticsSnapshot: Equatable {
-            let rebuildCount: Int
-            let orderMicroseconds: UInt64
-            let materializationMicroseconds: UInt64
-            let cIndexBuildMicroseconds: UInt64
-            let totalMicroseconds: UInt64
-            let debounceCancellationCount: Int
-            let staleDiscardedCount: Int
-            let lastEntryCount: Int
+        package struct RebuildWorkDiagnosticsSnapshot: Equatable {
+            package let rebuildCount: Int
+            package let orderMicroseconds: UInt64
+            package let materializationMicroseconds: UInt64
+            package let cIndexBuildMicroseconds: UInt64
+            package let totalMicroseconds: UInt64
+            package let debounceCancellationCount: Int
+            package let staleDiscardedCount: Int
+            package let lastEntryCount: Int
         }
 
         private var debugRebuildCount = 0
@@ -80,7 +80,7 @@ actor WorkspaceSearchService {
         private var automaticRebuildDidCommitHandler: (@Sendable (UInt64) async -> Void)?
     #endif
 
-    init(automaticIndexBuildDelayNanoseconds: UInt64 = 0) {
+    package init(automaticIndexBuildDelayNanoseconds: UInt64 = 0) {
         self.automaticIndexBuildDelayNanoseconds = automaticIndexBuildDelayNanoseconds
     }
 
@@ -89,36 +89,36 @@ actor WorkspaceSearchService {
         pendingRebuildTask?.cancel()
     }
 
-    var indexedGeneration: UInt64? {
+    package var indexedGeneration: UInt64? {
         currentIndexedGeneration
     }
 
-    var snapshotGeneration: UInt64? {
+    package var snapshotGeneration: UInt64? {
         currentSnapshotGeneration
     }
 
-    var diagnostics: WorkspaceCatalogDiagnostics? {
+    package var diagnostics: WorkspaceCatalogDiagnostics? {
         currentDiagnostics
     }
 
-    var indexedPathCount: Int {
+    package var indexedPathCount: Int {
         readyRootPathIndexes.reduce(0) { $0 + $1.count }
     }
 
-    var pendingGeneration: UInt64? {
+    package var pendingGeneration: UInt64? {
         pendingRebuildGeneration ?? activeRebuildGeneration
     }
 
-    var observedCatalogGeneration: UInt64? {
+    package var observedCatalogGeneration: UInt64? {
         latestObservedCatalogGeneration
     }
 
-    var discardedStaleRebuildCount: Int {
+    package var discardedStaleRebuildCount: Int {
         discardedAutomaticRebuildCompletions
     }
 
     #if DEBUG
-        func workDiagnosticsSnapshot() -> RebuildWorkDiagnosticsSnapshot {
+        package func workDiagnosticsSnapshot() -> RebuildWorkDiagnosticsSnapshot {
             RebuildWorkDiagnosticsSnapshot(
                 rebuildCount: debugRebuildCount,
                 orderMicroseconds: debugOrderMicroseconds,
@@ -181,7 +181,7 @@ actor WorkspaceSearchService {
         }
     #endif
 
-    func startKeepingFresh(
+    package func startKeepingFresh(
         with store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
         debounceNanoseconds: UInt64 = 50_000_000
@@ -254,7 +254,7 @@ actor WorkspaceSearchService {
     }
 
     @discardableResult
-    func rebuildIndex(from snapshot: WorkspaceSearchCatalogSnapshot) async -> UInt64 {
+    package func rebuildIndex(from snapshot: WorkspaceSearchCatalogSnapshot) async -> UInt64 {
         cancelRefreshFlight()
         let serial = rebuildSerial
         activeRebuildGeneration = snapshot.generation
@@ -279,7 +279,7 @@ actor WorkspaceSearchService {
         await rebuildIndex(from: snapshot)
     }
 
-    func reset() async {
+    package func reset() async {
         cancelRefreshFlight()
         bindingEpoch &+= 1
         freshnessListenerSerial &+= 1
@@ -298,7 +298,7 @@ actor WorkspaceSearchService {
         isReadyIndexUsable = true
     }
 
-    func search(_ query: String, limit: Int = 300) async -> WorkspaceSearchQueryResult {
+    package func search(_ query: String, limit: Int = 300) async -> WorkspaceSearchQueryResult {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let boundedLimit = max(0, limit)
         let rootPathIndexesAtSearchStart = readyRootPathIndexes

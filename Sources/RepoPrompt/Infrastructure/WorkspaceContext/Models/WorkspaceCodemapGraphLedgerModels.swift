@@ -149,14 +149,14 @@ enum WorkspaceCodemapGraphCatalogCoverageValidationError: Error, Hashable {
     case completeWithPendingSupportedSlots(UInt64)
 }
 
-struct WorkspaceCodemapGraphCatalogCoverage: Hashable {
+package struct WorkspaceCodemapGraphCatalogCoverage: Hashable {
     let rootEpoch: WorkspaceCodemapRootEpoch
     let catalogWatermark: WorkspaceCodemapGraphIndexCatalogToken?
     let enumerationState: WorkspaceCodemapGraphCatalogEnumerationState
-    let isCatalogSealed: Bool
-    let supportedCount: UInt64
-    let classifiedCount: UInt64
-    let pendingCount: UInt64
+    package let isCatalogSealed: Bool
+    package let supportedCount: UInt64
+    package let classifiedCount: UInt64
+    package let pendingCount: UInt64
     let contributedCount: UInt64
     let emptyCount: UInt64
     let terminalArtifactCount: UInt64
@@ -266,7 +266,7 @@ struct WorkspaceCodemapGraphCatalogCoverage: Hashable {
         terminalArtifactCount + terminalExcludedCount
     }
 
-    var isComplete: Bool {
+    package var isComplete: Bool {
         enumerationState == .complete && pendingCount == 0
     }
 }
@@ -425,7 +425,7 @@ struct WorkspaceCodemapGraphCheckpoint: Hashable {
     }
 }
 
-enum WorkspaceCodemapGraphRevocationReason: Hashable {
+package enum WorkspaceCodemapGraphRevocationReason: Hashable {
     case rootUnloaded
     case rootEpochChanged
     case rootAuthorityChanged

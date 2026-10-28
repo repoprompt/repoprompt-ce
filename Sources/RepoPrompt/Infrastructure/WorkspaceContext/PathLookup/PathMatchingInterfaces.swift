@@ -13,7 +13,7 @@ protocol FileRecord: Sendable {
 /// Represents a folder with essential properties for path matching.
 /// Note: This protocol intentionally excludes `files` to prevent UI type dependencies
 /// and ensure frozen records cannot accidentally traverse live view model graphs.
-protocol FolderRecord: Sendable {
+package protocol FolderRecord: Sendable {
     var name: String { get }
     var displayName: String { get }
     var relativePath: String { get }
