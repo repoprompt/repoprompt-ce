@@ -15,6 +15,16 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
     }
 
+    #if DEBUG
+        func testProductionResolversShareProbeOwnershipButInjectedResolversDoNot() {
+            let first = CursorACPLaunchResolver()
+            let second = CursorACPLaunchResolver()
+            let isolated = makeResolver(path: "/bin")
+            XCTAssertTrue(first.sharesProbeOwnershipForTesting(with: second))
+            XCTAssertFalse(first.sharesProbeOwnershipForTesting(with: isolated))
+        }
+    #endif
+
     func testProductionDefaultFallsBackToVerifiedAgentAlias() async throws {
         let rootDirectory = try makeTemporaryDirectory()
         let packageDirectory = rootDirectory.appendingPathComponent("cursor-package", isDirectory: true)

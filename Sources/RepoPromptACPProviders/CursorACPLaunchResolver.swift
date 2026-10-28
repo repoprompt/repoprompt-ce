@@ -628,6 +628,10 @@ package final class CursorACPLaunchResolver: @unchecked Sendable {
         package func waitForProbeAttemptSettlementForTesting() async {
             await probeOwnership.waitForProbeAttemptSettlementForTesting()
         }
+
+        package func sharesProbeOwnershipForTesting(with other: CursorACPLaunchResolver) -> Bool {
+            probeOwnership === other.probeOwnership
+        }
     #endif
 
     private func resolveLaunchesForProbe(
