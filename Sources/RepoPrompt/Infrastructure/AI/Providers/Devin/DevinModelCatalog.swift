@@ -11,6 +11,11 @@ package struct DevinModelCatalog {
     package struct Thinking: Equatable {
         package let configID: String
         package let choiceRaw: String
+
+        package init(configID: String, choiceRaw: String) {
+            self.configID = configID
+            self.choiceRaw = choiceRaw
+        }
     }
 
     package struct Entry: Equatable {
