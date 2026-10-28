@@ -15,6 +15,7 @@
     "RepoPromptApp": {
       "source_root": "Sources/RepoPrompt",
       "allowed_dependencies": [
+        "RepoPromptACPProviders",
         "RepoPromptAIContracts",
         "CSwiftPCRE2",
         "RepoPromptC",
@@ -54,6 +55,16 @@
       "allowed_dependencies": [
         "RepoPromptCodeMapCore"
       ]
+    },
+    "RepoPromptACPProviders": {
+      "source_root": "Sources/RepoPromptACPProviders",
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptFoundation", "RepoPromptProcess"],
+      "test_target": "RepoPromptACPProvidersTests",
+      "app_free_tests": true
+    },
+    "RepoPromptACPProvidersTests": {
+      "source_root": "Tests/RepoPromptACPProvidersTests",
+      "allowed_dependencies": ["RepoPromptACPProviders", "RepoPromptAIContracts"]
     },
     "RepoPromptAIContracts": {
       "source_root": "Sources/RepoPromptAIContracts",
@@ -265,6 +276,7 @@
     "RepoPromptTests": {
       "source_root": "Tests/RepoPromptTests",
       "allowed_dependencies": [
+        "RepoPromptACPProviders",
         "RepoPromptAIContracts",
         "RepoPromptApp",
         "RepoPromptCodeMapCore",

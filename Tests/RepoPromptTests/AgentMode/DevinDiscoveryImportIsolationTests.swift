@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 @testable import RepoPromptApp
 import RepoPromptProcess
 import XCTest

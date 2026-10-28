@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 
 /// Cursor CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
 /// Runs a fresh ACP session per request, switches to Cursor's official `ask` mode (prompt-only/no tools), and never injects RepoPrompt MCP/tools.

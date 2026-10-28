@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptProcess
 import RepoPromptSecureStorage

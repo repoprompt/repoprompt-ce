@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 @testable import RepoPromptProcess

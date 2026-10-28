@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import MCP
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
