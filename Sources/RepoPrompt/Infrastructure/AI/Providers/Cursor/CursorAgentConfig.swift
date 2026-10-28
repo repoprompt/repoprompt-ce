@@ -1,24 +1,24 @@
 import Foundation
 import RepoPromptProcess
 
-enum CursorAgentCommandSelection: Equatable {
+package enum CursorAgentCommandSelection: Equatable {
     case automatic
     case exact(String)
 }
 
-struct CursorAgentConfig {
-    static let promptOnlySessionModeID = "ask"
+package struct CursorAgentConfig {
+    package static let promptOnlySessionModeID = "ask"
 
-    let commandSelection: CursorAgentCommandSelection
-    let additionalPathHints: [String]
-    let enableDebugLogging: Bool
-    let modelString: String?
-    let includeRepoPromptMCPServer: Bool
-    let cleanupProjectMCPApproval: Bool
-    let sessionModeID: String?
-    let modelOverrides: [CursorModelOverride]
+    package let commandSelection: CursorAgentCommandSelection
+    package let additionalPathHints: [String]
+    package let enableDebugLogging: Bool
+    package let modelString: String?
+    package let includeRepoPromptMCPServer: Bool
+    package let cleanupProjectMCPApproval: Bool
+    package let sessionModeID: String?
+    package let modelOverrides: [CursorModelOverride]
 
-    var commandName: String {
+    package var commandName: String {
         switch commandSelection {
         case .automatic:
             CLILaunchProfiles.cursor.commandName
@@ -27,7 +27,7 @@ struct CursorAgentConfig {
         }
     }
 
-    init(
+    package init(
         commandName: String? = nil,
         additionalPathHints: [String] = CLILaunchProfiles.cursorProviderSpecificPaths,
         enableDebugLogging: Bool = false,

@@ -3,11 +3,11 @@ import RepoPromptAIContracts
 import RepoPromptFoundation
 import RepoPromptProcess
 
-enum CursorACPLaunchCandidate: CaseIterable, Equatable {
+package enum CursorACPLaunchCandidate: CaseIterable, Equatable {
     case cursorAgentACP
     case agentACP
 
-    var command: String {
+    package var command: String {
         switch self {
         case .cursorAgentACP:
             CLILaunchProfiles.cursor.commandName
@@ -16,22 +16,22 @@ enum CursorACPLaunchCandidate: CaseIterable, Equatable {
         }
     }
 
-    var launchArguments: [String] {
+    package var launchArguments: [String] {
         ["--approve-mcps", "acp"]
     }
 
-    var helpArguments: [String] {
+    package var helpArguments: [String] {
         ["acp", "--help"]
     }
 }
 
-struct CursorACPResolvedLaunch: Equatable {
-    let candidate: CursorACPLaunchCandidate
-    let command: String
-    let arguments: [String]
-    let additionalPathHints: [String]
-    let environment: [String: String]
-    let executableIdentity: ExecutableFileIdentity
+package struct CursorACPResolvedLaunch: Equatable {
+    package let candidate: CursorACPLaunchCandidate
+    package let command: String
+    package let arguments: [String]
+    package let additionalPathHints: [String]
+    package let environment: [String: String]
+    package let executableIdentity: ExecutableFileIdentity
 }
 
 private struct CursorACPPathCandidate {
@@ -39,7 +39,7 @@ private struct CursorACPPathCandidate {
     let entrypoint: CursorACPLaunchCandidate
 }
 
-enum CursorACPLaunchResolutionError: Error, Equatable, LocalizedError {
+package enum CursorACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case missingConfiguredCommand
     case unsafeConfiguredCommand(String)
     case exactPathNotFound(String)
@@ -49,7 +49,7 @@ enum CursorACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case unsafeCanonicalBasename(String)
     case unverifiedAgentAlias(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .missingConfiguredCommand:
             "Cursor Agent CLI launch requires `cursor-agent`, a verified `agent`, or an absolute path to either executable."
@@ -74,18 +74,18 @@ enum CursorACPLaunchResolutionError: Error, Equatable, LocalizedError {
     }
 }
 
-final class CursorACPLaunchResolver: @unchecked Sendable {
-    typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
-    typealias SupplementalPathProvider = @Sendable (_ configuredPaths: [String]) -> [String]
-    typealias ProbeRunner = @Sendable (
+package final class CursorACPLaunchResolver: @unchecked Sendable {
+    package typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
+    package typealias SupplementalPathProvider = @Sendable (_ configuredPaths: [String]) -> [String]
+    package typealias ProbeRunner = @Sendable (
         _ launch: CursorACPResolvedLaunch,
         _ config: CursorAgentConfig,
         _ timeout: TimeInterval,
         _ timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy
     ) async throws -> CLIProcessRunner.Result
-    typealias FailureRecorder = @Sendable (_ source: ShellEnvironmentSource?, _ candidateCount: Int) -> Void
-    typealias NowProvider = @Sendable () -> TimeInterval
-    typealias DeadlineWaiter = @Sendable (_ deadline: TimeInterval) async -> Void
+    package typealias FailureRecorder = @Sendable (_ source: ShellEnvironmentSource?, _ candidateCount: Int) -> Void
+    package typealias NowProvider = @Sendable () -> TimeInterval
+    package typealias DeadlineWaiter = @Sendable (_ deadline: TimeInterval) async -> Void
 
     private enum ProbeProducerOutcome: @unchecked Sendable {
         case success(CLIProcessRunner.Result)
@@ -246,7 +246,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
 
     private static let maximumAggregateProbeDuration: TimeInterval = 24 * 60 * 60
 
-    static func defaultDeadlineWaiter(_ deadline: TimeInterval) async {
+    package static func defaultDeadlineWaiter(_ deadline: TimeInterval) async {
         let now = ProcessInfo.processInfo.systemUptime
         guard now.isFinite, deadline.isFinite else { return }
         let remaining = deadline - now
@@ -366,7 +366,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     }
 
     /// App composition supplies policy; physical probe ownership remains with this resolver.
-    convenience init(
+    package convenience init(
         launchEnvironmentProvider: @escaping EnvironmentProvider,
         supplementalPathProvider: @escaping SupplementalPathProvider,
         probeRunner: @escaping ProbeRunner,
@@ -389,7 +389,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     }
 
     #if DEBUG
-        convenience init(
+        package convenience init(
             launchEnvironmentProvider: @escaping EnvironmentProvider,
             supplementalPathProvider: @escaping SupplementalPathProvider,
             probeRunner: @escaping ProbeRunner,
@@ -412,7 +412,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         }
     #endif
 
-    func resolvedLaunch(for config: CursorAgentConfig) throws -> CursorACPResolvedLaunch {
+    package func resolvedLaunch(for config: CursorAgentConfig) throws -> CursorACPResolvedLaunch {
         let key = cacheKey(for: config)
         if let cached = cachedLaunch(forKey: key) {
             do {
@@ -439,7 +439,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         return launch
     }
 
-    func probeSupport(for config: CursorAgentConfig) async throws -> ACPSupportResult {
+    package func probeSupport(for config: CursorAgentConfig) async throws -> ACPSupportResult {
         try await probeOwnership.probeMutex.withLock { [self] in
             try await probeSupportSerially(for: config)
         }
@@ -625,7 +625,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     }
 
     #if DEBUG
-        func waitForProbeAttemptSettlementForTesting() async {
+        package func waitForProbeAttemptSettlementForTesting() async {
             await probeOwnership.waitForProbeAttemptSettlementForTesting()
         }
     #endif
@@ -884,7 +884,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         return ([selectionKey] + config.additionalPathHints).joined(separator: "\u{1F}")
     }
 
-    static func runProbe(
+    package static func runProbe(
         launch: CursorACPResolvedLaunch,
         config: CursorAgentConfig,
         timeout: TimeInterval,

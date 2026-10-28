@@ -118,41 +118,6 @@ final class CursorACPModelDiscoveryTests: XCTestCase {
         XCTAssertTrue(restored.modelParameterSets.isEmpty)
     }
 
-    func testInjectedRegistryWarmsAndPublishesNormalizedSnapshot() async {
-        final class RegistryBox {
-            var snapshot: ACPDiscoveredSessionModels?
-            var warmCount = 0
-        }
-        let box = RegistryBox()
-        let input = ACPDiscoveredSessionModels(
-            options: [.init(rawValue: "input", displayName: "Input", description: nil, isDefault: false)],
-            currentModelRaw: "input"
-        )
-        let normalized = ACPDiscoveredSessionModels(
-            options: [.init(rawValue: "normalized", displayName: "Normalized", description: nil, isDefault: false)],
-            currentModelRaw: "normalized"
-        )
-        let registry = CursorACPModelPollingService.Registry(
-            update: { _ in box.snapshot = normalized
-                return true
-            },
-            snapshot: { box.snapshot },
-            snapshotAfterWarm: { box.warmCount += 1
-                return box.snapshot
-            }
-        )
-        let service = CursorACPModelPollingService(client: RetryingCursorDiscoveryClient(snapshot: input), registry: registry)
-        let initial = await service.latestSnapshot()
-        XCTAssertNil(initial)
-        XCTAssertEqual(box.warmCount, 1)
-        _ = await service.refreshCatalog(workspacePath: nil) // first attempt fails
-        _ = await service.refreshCatalog(workspacePath: nil)
-        let result = await service.latestSnapshot()
-        XCTAssertEqual(result?.models, normalized)
-        XCTAssertEqual(result?.isLiveDiscovery, true)
-        await service.shutdown()
-    }
-
     func testFailedRefreshKeepsSnapshotAndCanRetry() async {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }

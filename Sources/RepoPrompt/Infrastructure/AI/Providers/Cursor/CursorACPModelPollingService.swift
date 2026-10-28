@@ -1,7 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 
-protocol CursorACPModelDiscoveryClient: Sendable {
+package protocol CursorACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels?
 }
 
@@ -11,17 +11,27 @@ protocol CursorACPModelDiscoveryClient: Sendable {
 /// Cursor can expose model metadata through ACP session bootstrap responses. This mirrors the
 /// OpenCode model discovery path while preserving Cursor's static Auto fallback when no
 /// dynamic model metadata is available yet.
-actor CursorACPModelPollingService {
-    struct Registry {
+package actor CursorACPModelPollingService {
+    package struct Registry {
         let update: (ACPDiscoveredSessionModels) -> Bool
         let snapshot: () -> ACPDiscoveredSessionModels?
         let snapshotAfterWarm: () async -> ACPDiscoveredSessionModels?
+
+        package init(
+            update: @escaping (ACPDiscoveredSessionModels) -> Bool,
+            snapshot: @escaping () -> ACPDiscoveredSessionModels?,
+            snapshotAfterWarm: @escaping () async -> ACPDiscoveredSessionModels?
+        ) {
+            self.update = update
+            self.snapshot = snapshot
+            self.snapshotAfterWarm = snapshotAfterWarm
+        }
     }
 
-    struct Snapshot: Equatable {
-        let models: ACPDiscoveredSessionModels
-        let fetchedAt: Date
-        let isLiveDiscovery: Bool
+    package struct Snapshot: Equatable {
+        package let models: ACPDiscoveredSessionModels
+        package let fetchedAt: Date
+        package let isLiveDiscovery: Bool
     }
 
     private let client: any CursorACPModelDiscoveryClient
@@ -29,10 +39,10 @@ actor CursorACPModelPollingService {
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    struct RefreshResult {
-        let isReady: Bool
-        let advertisedCount: Int?
-        let errorMessage: String?
+    package struct RefreshResult {
+        package let isReady: Bool
+        package let advertisedCount: Int?
+        package let errorMessage: String?
     }
 
     private var inFlightRefresh: Task<RefreshResult, Never>?
@@ -44,7 +54,7 @@ actor CursorACPModelPollingService {
     private var preferredWorkspacePath: String?
     private var isShutdown = false
 
-    init(
+    package init(
         client: any CursorACPModelDiscoveryClient,
         registry: Registry,
         intervalNanos: UInt64 = 300_000_000_000
@@ -54,7 +64,7 @@ actor CursorACPModelPollingService {
         self.intervalNanos = intervalNanos
     }
 
-    func latestSnapshot() async -> Snapshot? {
+    package func latestSnapshot() async -> Snapshot? {
         if let latest {
             return latest
         }
@@ -62,7 +72,7 @@ actor CursorACPModelPollingService {
     }
 
     #if DEBUG
-        func test_refreshNowInFlightJoinEvents() -> AsyncStream<Void> {
+        package func test_refreshNowInFlightJoinEvents() -> AsyncStream<Void> {
             let id = UUID()
             let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
             testRefreshNowInFlightJoinObservers[id] = continuation
@@ -73,7 +83,7 @@ actor CursorACPModelPollingService {
         }
     #endif
 
-    func discoverOnce(workspacePath: String?) async throws -> Snapshot? {
+    package func discoverOnce(workspacePath: String?) async throws -> Snapshot? {
         guard !isShutdown else { return nil }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         guard let discovered = try await client.discoverModels(workspacePath: preferredWorkspacePath) else {
@@ -83,7 +93,7 @@ actor CursorACPModelPollingService {
         return await latestSnapshot()
     }
 
-    func subscribe(workspacePath: String?) async -> AsyncStream<Snapshot> {
+    package func subscribe(workspacePath: String?) async -> AsyncStream<Snapshot> {
         guard !isShutdown else {
             return AsyncStream { continuation in
                 continuation.finish()
@@ -117,11 +127,11 @@ actor CursorACPModelPollingService {
     }
 
     @discardableResult
-    func refreshNow(workspacePath: String?) async -> Bool {
+    package func refreshNow(workspacePath: String?) async -> Bool {
         await refreshCatalog(workspacePath: workspacePath).isReady
     }
 
-    func refreshCatalog(workspacePath: String?) async -> RefreshResult {
+    package func refreshCatalog(workspacePath: String?) async -> RefreshResult {
         guard !isShutdown else { return .init(isReady: false, advertisedCount: nil, errorMessage: "Cursor discovery is stopped.") }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
@@ -133,7 +143,7 @@ actor CursorACPModelPollingService {
         return await performRefresh()
     }
 
-    func shutdown(finishSubscribers: Bool = true) async {
+    package func shutdown(finishSubscribers: Bool = true) async {
         isShutdown = true
         pollingTask?.cancel()
         pollingTask = nil
