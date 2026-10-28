@@ -685,6 +685,64 @@ extension AgentModeViewModel {
         let shouldEnableCodexComputerUse: Bool
     }
 
+    /// Request-local save-phase evidence. A thrown saver or later currency failure is NOT proof
+    /// of no write. Switch apply may roll back only while this remains beforeWrite.
+    enum RequiredSavePhase: Equatable {
+        case beforeWrite
+        case writeMayHaveCommitted
+        /// The frozen payload's saver returned, but its live-owner currency may still fail.
+        case writeReturned
+        case durablySaved(AgentSessionRestorationBindingToken)
+    }
+
+    struct ProviderSwitchPhysicalDispatch: Equatable {
+        let dispatchID: AgentSessionLinkPromptDispatchID?
+        let binding: AgentSessionRestorationBindingToken?
+        let admission: ProviderSwitchAdmissionEvidence
+        let acceptedInputID: UUID?
+        let composerAttemptID: UUID?
+        let autoWakeID: UUID?
+        let stopFence: AgentRunStartStopFence
+        /// Value identities only: never retains a task, session, controller, or terminal resource.
+        let runOwnership: AgentRunOwnership?
+        let runID: UUID?
+
+        func bindingDispatch(_ id: AgentSessionLinkPromptDispatchID, runID: UUID) -> Self {
+            .init(
+                dispatchID: id,
+                binding: binding,
+                admission: admission,
+                acceptedInputID: acceptedInputID,
+                composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
+                stopFence: stopFence,
+                runOwnership: runOwnership,
+                runID: runID
+            )
+        }
+
+        func associatingRun(_ ownership: AgentRunOwnership) -> Self? {
+            guard runOwnership == nil, runID == nil, dispatchID == nil,
+                  let binding,
+                  ownership.binding.tabID == binding.bindingIdentity.tabID,
+                  ownership.binding.persistentSessionID == binding.bindingIdentity.sessionID,
+                  ownership.binding.persistentBindingGeneration == binding.bindingIdentity.generation,
+                  ownership.binding.bindingTransitionGeneration == binding.bindingTransitionGeneration
+            else { return nil }
+            return .init(
+                dispatchID: nil,
+                binding: binding,
+                admission: admission,
+                acceptedInputID: acceptedInputID,
+                composerAttemptID: composerAttemptID,
+                autoWakeID: autoWakeID,
+                stopFence: stopFence,
+                runOwnership: ownership,
+                runID: nil
+            )
+        }
+    }
+
     struct PendingHandoffState: Equatable {
         var payload: String?
         var createdAt: Date?
@@ -695,6 +753,10 @@ extension AgentModeViewModel {
         var isStagedForSend: Bool = false
         /// Durable failure/preparation marker; ordinary send cleanup must never clear it.
         var executionLocationFailure: String?
+        /// Nil retains the existing fork/resume-recovery delivery policy.
+        var providerSwitchDelivery: AgentProviderSwitchDelivery?
+        /// Captured by the existing physical fence; never persisted or reused by another dispatch.
+        var providerSwitchDispatch: ProviderSwitchPhysicalDispatch?
 
         var hasPayload: Bool {
             guard let payload else { return false }
@@ -707,6 +769,8 @@ extension AgentModeViewModel {
             sourceItemID = nil
             defersProviderLockUntilSend = false
             isStagedForSend = false
+            providerSwitchDelivery = nil
+            providerSwitchDispatch = nil
         }
     }
 

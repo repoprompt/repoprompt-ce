@@ -131,6 +131,10 @@ extension AgentSessionLinkSteerAdmission {
             return .blocked(.targetRestoreUnavailable)
         case .blocked(.targetCreationIncomplete):
             return .blocked(.targetCreationIncomplete)
+        case .blocked(.providerSwitchUnconfirmed):
+            return .blocked(.providerSwitchUnconfirmed)
+        case .blocked(.providerHandoverNeedsReview):
+            return .blocked(.providerHandoverNeedsReview)
         case .blocked(.targetNotIdle):
             break
         }

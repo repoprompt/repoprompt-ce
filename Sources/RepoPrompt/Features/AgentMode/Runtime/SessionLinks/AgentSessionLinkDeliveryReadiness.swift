@@ -69,6 +69,9 @@ enum AgentSessionLinkDeliveryReadiness {
         /// a new prompt would cancel it. Held off for its settle window like any other target work.
         var backgroundCompactionSettling: Bool = false
 
+        var providerSwitchUnconfirmed = false
+        var providerHandoverNeedsReview = false
+
         // Target interactions. Waiting states are never ready: answering one would be a different
         // capability than sending a new instruction, and `send` never gains it.
         var hasWaitingPrompt: Bool
@@ -100,6 +103,8 @@ enum AgentSessionLinkDeliveryReadiness {
             selfCompactBlocksManagedStop: Bool = false,
             stopInProgress: Bool = false,
             backgroundCompactionSettling: Bool = false,
+            providerSwitchUnconfirmed: Bool = false,
+            providerHandoverNeedsReview: Bool = false,
             hasWaitingPrompt: Bool,
             hasPendingAskUser: Bool,
             hasPendingUserInputRequest: Bool,
@@ -128,6 +133,8 @@ enum AgentSessionLinkDeliveryReadiness {
             self.selfCompactBlocksManagedStop = selfCompactBlocksManagedStop
             self.stopInProgress = stopInProgress
             self.backgroundCompactionSettling = backgroundCompactionSettling
+            self.providerSwitchUnconfirmed = providerSwitchUnconfirmed
+            self.providerHandoverNeedsReview = providerHandoverNeedsReview
             self.hasWaitingPrompt = hasWaitingPrompt
             self.hasPendingAskUser = hasPendingAskUser
             self.hasPendingUserInputRequest = hasPendingUserInputRequest
@@ -187,6 +194,8 @@ enum AgentSessionLinkDeliveryReadiness {
         case targetCreationIncomplete = "target_creation_incomplete"
         /// The target is running, waiting, has a pending interaction, or has queued work.
         case targetNotIdle = "target_not_idle"
+        case providerSwitchUnconfirmed = "provider_switch_unconfirmed"
+        case providerHandoverNeedsReview = "provider_handover_needs_review"
 
         var message: String {
             switch self {
@@ -198,6 +207,10 @@ enum AgentSessionLinkDeliveryReadiness {
                 "This session could not be restored. Retry loading it or create a new session; its saved data has not been replaced."
             case .targetCreationIncomplete:
                 "This session is still being created or has not been saved. Open it in the app to finish creation before sending a turn."
+            case .providerSwitchUnconfirmed:
+                AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message
+            case .providerHandoverNeedsReview:
+                AgentSessionLinkSendFailure.providerHandoverNeedsReview.message
             case .targetNotIdle:
                 "The overseen session is not ready to accept a message. Wait for it with "
                     + "until: \"sendable\" and send when a snapshot reports idle_for_send: true; "
@@ -238,6 +251,8 @@ enum AgentSessionLinkDeliveryReadiness {
         if !snapshot.hasLoadedPersistedState {
             return .blocked(.targetLoading)
         }
+        if snapshot.providerSwitchUnconfirmed { return .blocked(.providerSwitchUnconfirmed) }
+        if snapshot.providerHandoverNeedsReview { return .blocked(.providerHandoverNeedsReview) }
         if isTargetBusy(snapshot) {
             return .blocked(.targetNotIdle)
         }

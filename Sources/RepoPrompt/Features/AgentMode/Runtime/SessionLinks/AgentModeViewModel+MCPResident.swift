@@ -233,8 +233,15 @@ extension AgentModeViewModel {
         )
         let frame = Self.mcpResidentTaskFrame(text)
         switch admission {
-        case .blocked:
-            throw MCPError.invalidParams(Self.mcpResidentBusyError)
+        case let .blocked(failure):
+            // Provider-switch refusals are non-retryable and need user review in the app; surface
+            // the definite reason rather than a busy hint a client would poll past forever.
+            switch failure {
+            case .providerSwitchUnconfirmed, .providerHandoverNeedsReview:
+                throw MCPError.invalidParams("Task input not submitted: provider switch pending. \(failure.message)")
+            default:
+                throw MCPError.invalidParams(Self.mcpResidentBusyError)
+            }
         case let .steer(route):
             let sink = AgentSessionLinkManagedSteerSink()
             let turn = AgentNoncomposerTurn(endpoint: target.endpoint, providerText: frame, sink: sink)
@@ -279,13 +286,19 @@ extension AgentModeViewModel {
                     && self.composerSubmitClaimIsCurrent(claim) && stopFence.permitsStart(of: session)
                     && AgentSessionLinkDeliveryReadiness.failure(snapshot: Self.agentSessionLinkDeliveryReadinessSnapshot(
                         session: session, endpointMatchesGrant: true, isClosing: false,
-                        ignoresComposerSubmissionInFlight: true
+                        ignoresComposerSubmissionInFlight: true,
+                        ignoresProviderSwitchStalenessAfterAcceptance: true
                     )) == nil
             }
             switch outcome {
             case let .delivered(delivery) where delivery.deliveryState == .runStarted: return .startedRun
             case .blocked(.persistenceFailed):
                 throw MCPError.invalidParams("Client task input was not dispatched because its transcript could not be saved. Check the session in the app before retrying.")
+            case let .blocked(failure) where failure == .providerSwitchUnconfirmed
+                || failure == .providerHandoverDoesNotFit || failure == .providerHandoverNeedsReview:
+                // Refused before the row was persisted; the "input was recorded" fallback would
+                // misreport the outcome and hide that only the user can resolve the handover.
+                throw MCPError.invalidParams("Task input not submitted: provider switch pending. \(failure.message)")
             default: throw MCPError.invalidParams(Self.mcpResidentUnconfirmedError)
             }
         }

@@ -159,7 +159,7 @@ enum AgentSessionLinkSendCommitOutcome: Equatable {
 // MARK: - Outcomes
 
 /// Why a send settled without delivering. Raw values are the wire-stable `result` strings.
-enum AgentSessionLinkSendFailure: String, Equatable {
+enum AgentSessionLinkSendFailure: String, Equatable, Error {
     case endpointInvalidated = "endpoint_invalidated"
     case endpointHost = "endpoint_host"
     case endpointProbeHost = "endpoint_probe_host"
@@ -181,6 +181,9 @@ enum AgentSessionLinkSendFailure: String, Equatable {
     case targetRestoreUnavailable = "target_restore_unavailable"
     case targetCreationIncomplete = "target_creation_incomplete"
     case targetNotIdle = "target_not_idle"
+    case providerSwitchUnconfirmed = "provider_switch_unconfirmed"
+    case providerHandoverDoesNotFit = "provider_handover_does_not_fit"
+    case providerHandoverNeedsReview = "provider_handover_needs_review"
     case linkRevoked = "link_revoked"
     case persistenceFailed = "persistence_failed"
     /// The durable write failed *and* its compensating removal could not be durably confirmed, so the
@@ -218,6 +221,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
         case .targetRestoreUnavailable: self = .targetRestoreUnavailable
         case .targetCreationIncomplete: self = .targetCreationIncomplete
         case .targetNotIdle: self = .targetNotIdle
+        case .providerSwitchUnconfirmed: self = .providerSwitchUnconfirmed
+        case .providerHandoverNeedsReview: self = .providerHandoverNeedsReview
         }
     }
 
@@ -278,7 +283,8 @@ enum AgentSessionLinkSendFailure: String, Equatable {
              .endpointReadiness, .endpointStopFence, .endpointPostSession, .endpointPostObserver,
              .endpointPostTarget, .endpointPostWindow, .endpointPostReadiness,
              .linkRevoked, .persistenceIndeterminate, .targetRestoreUnavailable, .targetCreationIncomplete,
-             .shuttingDown, .managementRevoked, .steerUnconfirmed, .notSupported, .targetStopped:
+             .shuttingDown, .managementRevoked, .steerUnconfirmed, .notSupported, .targetStopped,
+             .providerSwitchUnconfirmed, .providerHandoverDoesNotFit, .providerHandoverNeedsReview:
             false
         }
     }
@@ -304,6 +310,12 @@ enum AgentSessionLinkSendFailure: String, Equatable {
             AgentSessionLinkDeliveryReadiness.BlockReason.targetCreationIncomplete.message
         case .targetNotIdle:
             AgentSessionLinkDeliveryReadiness.BlockReason.targetNotIdle.message
+        case .providerSwitchUnconfirmed:
+            "Only the user can resolve this in RepoPrompt; do not retry."
+        case .providerHandoverDoesNotFit:
+            "This message and the pending handover do not fit; a shorter new message may. Only the user can review the handover in RepoPrompt."
+        case .providerHandoverNeedsReview:
+            "Pending handover stale. Only the user can review it in RepoPrompt; do not retry."
         case .linkRevoked:
             "Oversight of this session ended before the message was authorized. Nothing was delivered."
         case .persistenceFailed:

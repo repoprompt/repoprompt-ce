@@ -6115,6 +6115,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     replayTurn.text
                 }
             }
+            // Capture this replay's exact dispatch before transport, independently of whether
+            // supplement monitoring exists. Never reconstruct it from a later pending slot.
+            let replayDispatchContext = replayTurn.monitoringDispatchContext
+                ?? AgentSessionLinkDispatchContext(session: session, dispatchID: replayDispatchID)
             // Ordinary auth replay may compose against an existing dispatching wake. Its local
             // wrapper must retain that cohort through acceptance just like the native send path.
             defer { withExtendedLifetime(monitoring?.quietMarkerProducerLifetime) {} }
@@ -6169,7 +6173,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return receipt
             }
             dispatched = true
-            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext, claim: nil)
+            viewModel?.acceptAgentSessionLinkDispatch(session: session, context: monitoring?.dispatchContext ?? replayDispatchContext, claim: nil)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -8295,6 +8299,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                                   isSelfNote || viewModel?.agentSessionLinkHasCurrentProviderInputRoute(for: session, qualification: routeReadiness) == true
                             else { throw CancellationError() }
                         }
+                        // Read proof can suspend after acquisition. Assert the same frozen switch
+                        // evidence again at this final synchronous release fence, never re-fit it.
+                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                            ?? (session.pendingHandoff.providerSwitchDelivery == nil)
+                        else { throw CancellationError() }
                         // A parked note remains unattempted throughout optional Read proof.
                         // Claim it before synchronous frontier consumption, with no intervening await.
                         if let noteDispatchID {

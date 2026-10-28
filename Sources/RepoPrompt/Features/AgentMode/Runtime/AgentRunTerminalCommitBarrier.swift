@@ -456,6 +456,13 @@ final class AgentRunTerminalCommitBarrier {
         return binding.removeFirstQueuedFollowUp()
     }
 
+    /// Read-only settlement evidence for an idle-only provider transition. An idle label is not
+    /// sufficient while an accepted attempt or any owned teardown for this tab remains.
+    func isSettled(tabID: UUID, lifecycle: AgentRunAttemptLifecycle, hasAcceptedWork: Bool) -> Bool {
+        !lifecycle.terminalCommitInProgress && lifecycle.activeOwnership == nil && !hasAcceptedWork
+            && !terminalTeardownTasks.keys.contains { $0.binding.tabID == tabID }
+    }
+
     func awaitTerminalPublication(
         for ownership: AgentRunOwnership,
         lifecycle: AgentRunAttemptLifecycle

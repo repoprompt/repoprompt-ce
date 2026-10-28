@@ -62,6 +62,19 @@ final class AgentModeRunService {
     private let claudeRunner: ClaudeIntegratedAgentModeRunner
     private let acpRunner: ACPIntegratedAgentModeRunner
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
+
+    /// Forward only; the barrier remains the owner of teardown/settlement evidence.
+    func providerSwitchTerminalIsSettled(_ session: AgentTabSession) -> Bool {
+        terminalCommitBarrier.isSettled(
+            tabID: session.tabID, lifecycle: session.runLifecycle,
+            hasAcceptedWork: session.agentTask != nil || session.mcpFollowUpRunPending
+                || !session.pendingInstructions.isEmpty || !session.pendingClaudeSteeringInstructions.isEmpty
+                || !session.pendingACPSteeringInstructions.isEmpty || !session.codexFallbackQueue.isEmpty
+                || session.codexFallbackDispatchInFlight != nil || session.codexFallbackPumpTask != nil
+                || session.scheduledACPFollowUp != nil
+        )
+    }
+
     private let perfRecorder: any AgentModePerfRecording
 
     #if DEBUG

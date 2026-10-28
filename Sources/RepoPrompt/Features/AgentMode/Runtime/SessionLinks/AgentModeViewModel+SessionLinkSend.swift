@@ -29,7 +29,8 @@ extension AgentModeViewModel {
         endpointMatchesGrant: Bool,
         isClosing: Bool,
         ignoresComposerSubmissionInFlight: Bool = false,
-        ignoresSelfCompactRequestID: UUID? = nil
+        ignoresSelfCompactRequestID: UUID? = nil,
+        ignoresProviderSwitchStalenessAfterAcceptance: Bool = false
     ) -> AgentSessionLinkDeliveryReadiness.Snapshot {
         AgentSessionLinkDeliveryReadiness.Snapshot(
             hasLoadedPersistedState: session.hasLoadedPersistedState,
@@ -37,7 +38,8 @@ extension AgentModeViewModel {
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             isClosing: isClosing,
             endpointMatchesGrant: endpointMatchesGrant,
-            runStateIsActive: session.runState.isActive,
+            runStateIsActive: session.runState.isActive
+                || (!ignoresComposerSubmissionInFlight && providerSwitchHasOwnedCarryingAttempt(session)),
             terminalCommitInProgress: session.terminalCommitInProgress,
             mcpFollowUpRunPending: session.mcpFollowUpRunPending,
             isComposerSubmissionInFlight: ignoresComposerSubmissionInFlight
@@ -55,6 +57,8 @@ extension AgentModeViewModel {
                 && session.selfCompactState.active?.id != ignoresSelfCompactRequestID,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
+            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
+            providerHandoverNeedsReview: !ignoresProviderSwitchStalenessAfterAcceptance && providerSwitchNeedsReview(session),
             hasWaitingPrompt: session.waitingPrompt != nil,
             hasPendingAskUser: session.pendingAskUser != nil,
             hasPendingUserInputRequest: session.pendingUserInputRequest != nil,
@@ -124,6 +128,22 @@ extension AgentModeViewModel {
             return .blocked(failure == .endpointInvalidated ? .endpointReadiness : failure)
         }
 
+        let envelope = AgentSessionLinkMessageEnvelope.render(
+            sourceSessionID: request.observerSessionID, sourceName: request.observerDisplayName,
+            linkID: request.linkID, linkGeneration: request.linkGeneration,
+            message: request.message, framing: request.framing
+        )
+        let providerMessage = AgentSessionLinkMessageEnvelope.providerPayload(
+            envelope: envelope, workflow: request.workflow,
+            includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared.showBuiltInWorkflowCleanupGuidance()
+        )
+        let computerUseArmedAtAdmission = session.isCodexComputerUseArmed
+        let dispatchedMessage = computerUseArmedAtAdmission
+            ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
+        if case let .failure(failure) = await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
+            stopFence.permitsStart(of: session) && liveness().permitsDelivery
+        }) { return .blocked(failure) }
+
         // 3. Local composer claim. Losing it means a local user Send won the race, which is exactly
         //    `target_not_idle` — the observer polls and retries rather than queueing behind the user.
         guard let target = makeComposerSubmitTarget(tabID: candidate.tabID, session: session),
@@ -155,6 +175,24 @@ extension AgentModeViewModel {
         guard commit == .committed else {
             releaseComposerSubmitClaim(claim)
             return .blocked(commit.refusal)
+        }
+
+        // Only a switch carries admission evidence across authorization. Ordinary SEND keeps its
+        // existing postauthorization composition behavior in persistAndStartNoncomposerTurn.
+        if session.pendingHandoff.providerSwitchDelivery != nil,
+           session.isCodexComputerUseArmed != computerUseArmedAtAdmission
+        {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.endpointPostReadiness)
+        }
+        let switchPreparation: ProviderSwitchSendPreparation?
+        switch await providerSwitchSendAdmission(session: session, input: dispatchedMessage, isCurrent: {
+            stopFence.permitsStart(of: session) && liveness().permitsDelivery && self.composerSubmitClaimIsCurrent(claim)
+        }) {
+        case let .failure(failure):
+            releaseComposerSubmitClaim(claim)
+            return .blocked(failure)
+        case let .success(preparation): switchPreparation = preparation
         }
 
         // 5. The commit awaited, so every identity and readiness fact must be re-proven — including
@@ -197,22 +235,6 @@ extension AgentModeViewModel {
             return .blocked(.endpointWorkspace)
         }
 
-        // Freeze the exact provider payload before the durable row so an interrupted ACP turn can
-        // replay its original management envelope rather than unframed attributed words.
-        let envelope = AgentSessionLinkMessageEnvelope.render(
-            sourceSessionID: request.observerSessionID,
-            sourceName: request.observerDisplayName,
-            linkID: request.linkID,
-            linkGeneration: request.linkGeneration,
-            message: request.message,
-            framing: request.framing
-        )
-        let providerMessage = AgentSessionLinkMessageEnvelope.providerPayload(
-            envelope: envelope,
-            workflow: request.workflow,
-            includeBuiltInSessionCleanupGuidance: GlobalSettingsStore.shared
-                .showBuiltInWorkflowCleanupGuidance()
-        )
         return await persistAndStartNoncomposerTurn(
             session: liveSession,
             tabID: candidate.tabID,
@@ -222,7 +244,8 @@ extension AgentModeViewModel {
             providerMessage: providerMessage,
             workflow: request.workflow,
             attribution: request.attribution,
-            stopFence: stopFence
+            stopFence: stopFence,
+            providerSwitchPreparation: switchPreparation
         ) {
             let dispatchLiveness = liveness()
             guard self.agentSessionLinkLiveSession(matching: candidate) === liveSession,
@@ -236,7 +259,8 @@ extension AgentModeViewModel {
                     session: liveSession,
                     endpointMatchesGrant: dispatchLiveness.targetEndpointIsLive,
                     isClosing: dispatchLiveness.targetWindowIsClosing,
-                    ignoresComposerSubmissionInFlight: true
+                    ignoresComposerSubmissionInFlight: true,
+                    ignoresProviderSwitchStalenessAfterAcceptance: true
                 )
             ) == nil
         }
@@ -254,6 +278,7 @@ extension AgentModeViewModel {
         workflow: AgentWorkflowDefinition?,
         attribution: AgentCrossSessionAttribution?,
         stopFence: AgentRunStartStopFence,
+        providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
         dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         // Every noncomposer caller shares this pre-row fence. A completed but failed restoration
@@ -262,6 +287,23 @@ extension AgentModeViewModel {
             releaseComposerSubmitClaim(claim)
             let reason = AgentSessionLinkDeliveryReadiness.restorationBlockReason(liveSession.qualifiedRestorationReadiness)
             return .blocked(AgentSessionLinkSendFailure(reason ?? .targetLoading))
+        }
+        var switchPreparation = providerSwitchPreparation
+        if liveSession.pendingHandoff.providerSwitchDelivery != nil, switchPreparation == nil {
+            let input = liveSession.isCodexComputerUseArmed
+                ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage) : providerMessage
+            switch await providerSwitchSendAdmission(session: liveSession, input: input, isCurrent: {
+                stopFence.permitsStart(of: liveSession) && self.composerSubmitClaimIsCurrent(claim) && dispatchIsCurrent()
+            }) {
+            case let .failure(failure):
+                releaseComposerSubmitClaim(claim)
+                return .blocked(failure)
+            case let .success(preparation): switchPreparation = preparation
+            }
+        }
+        if let switchPreparation, !providerSwitchPreparationIsCurrent(switchPreparation, session: liveSession) {
+            releaseComposerSubmitClaim(claim)
+            return .blocked(.providerHandoverNeedsReview)
         }
         liveSession.noteAcceptedTaskInput()
         // 6. Durable acceptance. The bubble keeps raw words; the exact provider payload is metadata.
@@ -276,6 +318,7 @@ extension AgentModeViewModel {
             crossSessionAttribution: attribution
         )
         let anchorRollback = recordAgentTurnUserAnchor(for: liveSession, userItem: userItem)
+        switchPreparation = switchPreparation?.accepting(userItem.id, session: liveSession)
         liveSession.appendItem(userItem)
         updateBindingsFromSession(liveSession)
         requestUIRefresh(tabID: tabID, urgent: true)
@@ -303,6 +346,7 @@ extension AgentModeViewModel {
         return await startPersistedNoncomposerTurn(
             session: liveSession, tabID: tabID, claim: claim, savedItemID: userItem.id,
             acceptedAt: Date(), providerMessage: providerMessage, stopFence: stopFence,
+            providerSwitchPreparation: switchPreparation,
             dispatchIsCurrent: dispatchIsCurrent
         )
     }
@@ -312,7 +356,9 @@ extension AgentModeViewModel {
     func startPersistedNoncomposerTurn(
         session liveSession: TabSession, tabID: UUID, claim: AgentComposerSubmitClaim,
         savedItemID: UUID, acceptedAt: Date, providerMessage: String,
-        stopFence: AgentRunStartStopFence, dispatchIsCurrent: @MainActor () -> Bool
+        stopFence: AgentRunStartStopFence,
+        providerSwitchPreparation: ProviderSwitchSendPreparation? = nil,
+        dispatchIsCurrent: @MainActor () -> Bool
     ) async -> AgentSessionLinkSendTransactionOutcome {
         let persistedOnly = AgentSessionLinkSendDelivery(
             targetItemID: savedItemID,
@@ -337,7 +383,11 @@ extension AgentModeViewModel {
         // Drift retains the durable delivery and withholds only the provider start: the row is
         // already the target's, so rolling it back here would contradict the linearization point and
         // make the same key deliverable twice.
-        guard liveSession.permitsBoundOperationAndSave, dispatchIsCurrent() else {
+        guard liveSession.permitsBoundOperationAndSave,
+              providerSwitchPreparation.map({ providerSwitchPreparationIsCurrent($0, session: liveSession) })
+              ?? (liveSession.pendingHandoff.providerSwitchDelivery == nil),
+              dispatchIsCurrent()
+        else {
             releaseComposerSubmitClaim(claim)
             return .delivered(persistedOnly)
         }
@@ -350,14 +400,16 @@ extension AgentModeViewModel {
         //    template in front, so that guarantee narrows to exactly the one a local workflow turn
         //    already has — `submitUserTurn` wraps before `startAgentRun` too — and never weakens to
         //    a sender-controlled string, because the sender's words stay inside `<message>`.
-        //    `.crossSessionDelivery`
-        //    additionally leaves any staged handoff untouched, so the target's next *local* send
-        //    still receives the continuity it was staged for. Nothing focuses, activates, or
-        //    switches the target window.
+        //    `.crossSessionDelivery` leaves legacy staged handoffs for the next local input;
+        //    an admitted provider-switch carrier instead accompanies this attributed input.
+        //    Nothing focuses, activates, or switches the target window.
         // Local arming authorizes this tab's turns, including attributed remote input.
-        let dispatchedProviderMessage = liveSession.isCodexComputerUseArmed
-            ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage)
-            : providerMessage
+        let dispatchedProviderMessage = providerSwitchPreparation?.augmentedInput
+            ?? (
+                liveSession.isCodexComputerUseArmed
+                    ? CodexComputerUseWorkflow.renderProviderPrompt(userInstructions: providerMessage)
+                    : providerMessage
+            )
         // The row was durable before dispatch. Mark the exact provider text only after the final
         // dispatch admission, so a persisted-only row cannot masquerade as an interrupted prompt.
         if let index = liveSession.items.firstIndex(where: { $0.id == savedItemID }) {
@@ -375,7 +427,8 @@ extension AgentModeViewModel {
             directStartOptions: AgentDirectRunStartOptions(
                 ignoresPendingHandoff: true, stopFence: stopFence
             ),
-            startOutcome: startRecorder
+            startOutcome: startRecorder,
+            providerSwitchPreparation: providerSwitchPreparation
         )
         releaseComposerSubmitClaim(claim)
         if startRecorder.outcome.didStart {
@@ -428,6 +481,11 @@ extension AgentModeViewModel {
     ) {
         if let index = session.items.firstIndex(where: { $0.id == itemID }) {
             _ = session.removeItem(at: index)
+        }
+        // The accepting() proof pointed at the removed row; a .ready handover must not keep it,
+        // because the proof also participates in pendingHandoff equality and ownership checks.
+        if session.pendingHandoff.providerSwitchDelivery == .ready {
+            session.pendingHandoff.providerSwitchDispatch = nil
         }
         rollbackAgentTurnUserAnchor(anchorRollback, session: session)
         updateBindingsFromSession(session)

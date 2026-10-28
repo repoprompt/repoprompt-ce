@@ -1621,6 +1621,8 @@ extension AgentModeViewModel {
         case stopInProgress = "stop_in_progress"
         case backgroundCompactionSettling = "background_compaction_settling"
         case candidateClosing = "candidate_closing"
+        case providerSwitchUnconfirmed = "provider_switch_unconfirmed"
+        case providerHandoverNeedsReview = "provider_handover_needs_review"
     }
 
     /// One sample of every send-readiness condition. The board and `idleForSend` consume the same
@@ -1643,6 +1645,8 @@ extension AgentModeViewModel {
         var stopInProgress: Bool
         var backgroundCompactionSettling = false
         var isCandidateClosing: Bool
+        var providerSwitchUnconfirmed = false
+        var providerHandoverNeedsReview = false
     }
 
     static func sendReadinessInputs(
@@ -1652,7 +1656,7 @@ extension AgentModeViewModel {
     ) -> SendReadinessInputs {
         SendReadinessInputs(
             status: status,
-            runStateIsActive: session.runState.isActive,
+            runStateIsActive: session.runState.isActive || providerSwitchHasOwnedCarryingAttempt(session),
             hasLoadedPersistedState: session.hasLoadedPersistedState,
             bindingTransitionInProgress: session.bindingTransitionInProgress,
             terminalCommitInProgress: session.terminalCommitInProgress,
@@ -1667,7 +1671,9 @@ extension AgentModeViewModel {
             hasPendingSelfCompact: session.selfCompactState.blocksOverseerDelivery,
             stopInProgress: session.stopState.isStopping(binding: session.persistentSessionBindingIdentity),
             backgroundCompactionSettling: session.isSettlingACPBackgroundCompaction,
-            isCandidateClosing: candidate.isClosing
+            isCandidateClosing: candidate.isClosing,
+            providerSwitchUnconfirmed: providerSwitchUnconfirmed(session),
+            providerHandoverNeedsReview: providerSwitchNeedsReview(session)
         )
     }
 
@@ -1690,6 +1696,8 @@ extension AgentModeViewModel {
         if input.stopInProgress { blockers.append(.stopInProgress) }
         if input.backgroundCompactionSettling { blockers.append(.backgroundCompactionSettling) }
         if input.isCandidateClosing { blockers.append(.candidateClosing) }
+        if input.providerSwitchUnconfirmed { blockers.append(.providerSwitchUnconfirmed) }
+        if input.providerHandoverNeedsReview { blockers.append(.providerHandoverNeedsReview) }
         return blockers.sorted { $0.rawValue < $1.rawValue }
     }
 
