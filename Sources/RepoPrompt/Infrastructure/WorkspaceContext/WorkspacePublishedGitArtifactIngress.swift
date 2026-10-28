@@ -6,6 +6,11 @@ import RepoPromptWorkspaceCore
 package struct WorkspacePublishedGitArtifactIngressRequest {
     package let root: WorkspaceRootRef
     package let artifacts: [GitDiffPublishedArtifact]
+
+    package init(root: WorkspaceRootRef, artifacts: [GitDiffPublishedArtifact]) {
+        self.root = root
+        self.artifacts = artifacts
+    }
 }
 
 package enum WorkspacePublishedGitArtifactIngressOutcomeStatus: Equatable {

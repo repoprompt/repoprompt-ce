@@ -7,6 +7,13 @@ package enum RepoSearchBatchScorer {
         package let path: String
         package let nameLower: String
         package let pathLower: String
+
+        package init(name: String, path: String, nameLower: String, pathLower: String) {
+            self.name = name
+            self.path = path
+            self.nameLower = nameLower
+            self.pathLower = pathLower
+        }
     }
 
     package static func scores(

@@ -69,6 +69,22 @@ package struct TokenComponentBreakdown {
     package var totalNonFile: Int {
         prompt + duplicatePrompt + instructions + fileTree + gitDiff + metadata
     }
+
+    package init(
+        prompt: Int,
+        duplicatePrompt: Int,
+        instructions: Int,
+        fileTree: Int,
+        gitDiff: Int,
+        metadata: Int
+    ) {
+        self.prompt = prompt
+        self.duplicatePrompt = duplicatePrompt
+        self.instructions = instructions
+        self.fileTree = fileTree
+        self.gitDiff = gitDiff
+        self.metadata = metadata
+    }
 }
 
 package struct PromptEntriesEvaluation {
@@ -86,6 +102,23 @@ package struct PromptEntriesEvaluation {
         package let fullTokens: Int
         package let codemapTokens: Int
         package let displayLineCount: Int?
+        package init(
+            fileID: UUID,
+            renderedDisplayPath: String,
+            renderMode: RenderMode,
+            displayTokens: Int,
+            fullTokens: Int,
+            codemapTokens: Int,
+            displayLineCount: Int?
+        ) {
+            self.fileID = fileID
+            self.renderedDisplayPath = renderedDisplayPath
+            self.renderMode = renderMode
+            self.displayTokens = displayTokens
+            self.fullTokens = fullTokens
+            self.codemapTokens = codemapTokens
+            self.displayLineCount = displayLineCount
+        }
     }
 
     package let entryResultsByFileID: [UUID: EntryResult]
@@ -127,6 +160,8 @@ package struct PromptEntriesEvaluation {
 package actor TokenCalculationService {
     /// Hold the currently running calculation task.
     private var currentCalculationTask: Task<TokenCalculationResult, Never>?
+
+    package init() {}
 
     /// Compute tokens from raw text using a cheap UTF-8 byte count plus a safety multiplier.
     @inline(__always)

@@ -42,11 +42,31 @@ package struct GitPrefixControlCollectionDetail: Equatable {
     /// count overflow or an unavailable digest makes the detail invalid rather
     /// than silently truncating diagnostic evidence.
     package let prunedRootSummarySHA256: String
+    package init(
+        collectionCompleted: Bool,
+        ignoreControlCount: Int,
+        attributeControlCount: Int,
+        prunedRootCount: Int,
+        prunedRootSummarySHA256: String
+    ) {
+        self.collectionCompleted = collectionCompleted
+        self.ignoreControlCount = ignoreControlCount
+        self.attributeControlCount = attributeControlCount
+        self.prunedRootCount = prunedRootCount
+        self.prunedRootSummarySHA256 = prunedRootSummarySHA256
+    }
 }
 
 package struct GitPrefixControlCollectedEvidence: Equatable {
     package let footer: GitPrefixControlEvidenceManifestFooter
     package let collectionDetail: GitPrefixControlCollectionDetail?
+    package init(
+        footer: GitPrefixControlEvidenceManifestFooter,
+        collectionDetail: GitPrefixControlCollectionDetail?
+    ) {
+        self.footer = footer
+        self.collectionDetail = collectionDetail
+    }
 }
 
 private final class GitWorkspaceAuthoritySynchronousState: @unchecked Sendable {

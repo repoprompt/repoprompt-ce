@@ -14,6 +14,20 @@ package struct FileTreeResult {
     package var usesLegend: Bool {
         usedSelectedMarker || usedCodeMapMarker
     }
+
+    package init(
+        tree: String,
+        usedSelectedMarker: Bool,
+        usedCodeMapMarker: Bool,
+        wasTruncated: Bool,
+        note: String?
+    ) {
+        self.tree = tree
+        self.usedSelectedMarker = usedSelectedMarker
+        self.usedCodeMapMarker = usedCodeMapMarker
+        self.wasTruncated = wasTruncated
+        self.note = note
+    }
 }
 
 /// Namespace for immutable file-tree presentation.

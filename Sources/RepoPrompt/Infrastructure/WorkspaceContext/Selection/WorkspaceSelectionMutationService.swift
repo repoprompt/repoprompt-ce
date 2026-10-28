@@ -55,6 +55,11 @@ package struct StoredSelection: Codable, Equatable, Hashable {
 package struct WorkspaceSelectionSliceInput: Equatable {
     package let path: String
     package let ranges: [LineRange]
+
+    package init(path: String, ranges: [LineRange]) {
+        self.path = path
+        self.ranges = ranges
+    }
 }
 
 package struct WorkspaceBuildSelectionResult: Equatable {

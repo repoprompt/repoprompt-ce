@@ -129,6 +129,20 @@ package struct WorkspaceCodemapPresentationAttempt<Context> {
     package let rootScope: WorkspaceLookupRootScope
     package let logicalRootDisplayNamesByRootID: [UUID: String]
     package let requestedCodemapCount: Int?
+
+    package init(
+        context: Context,
+        intent: WorkspaceCodemapOperationPresentationIntent,
+        rootScope: WorkspaceLookupRootScope,
+        logicalRootDisplayNamesByRootID: [UUID: String],
+        requestedCodemapCount: Int?
+    ) {
+        self.context = context
+        self.intent = intent
+        self.rootScope = rootScope
+        self.logicalRootDisplayNamesByRootID = logicalRootDisplayNamesByRootID
+        self.requestedCodemapCount = requestedCodemapCount
+    }
 }
 
 package struct WorkspaceCodemapPresentationCoordinator {

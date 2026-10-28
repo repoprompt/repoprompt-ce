@@ -70,7 +70,7 @@ package struct WorkspaceCodemapRootStatusSnapshot: Hashable {
     let commitCadence: WorkspaceCodemapGraphCommitCadence
     let diagnostics: WorkspaceCodemapGraphRootDiagnostics
     package let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason?
-    var graphIndexBudget: WorkspaceCodemapGraphIndexBudget?
+    package var graphIndexBudget: WorkspaceCodemapGraphIndexBudget?
 }
 
 package struct WorkspaceCodemapRootStatusUpdate: Hashable {

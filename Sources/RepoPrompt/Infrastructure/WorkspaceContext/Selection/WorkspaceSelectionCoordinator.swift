@@ -5,22 +5,50 @@ import OSLog
 package struct WorkspaceSelectionIdentity: Hashable {
     package let workspaceID: UUID
     package let tabID: UUID
+
+    package init(workspaceID: UUID, tabID: UUID) {
+        self.workspaceID = workspaceID
+        self.tabID = tabID
+    }
 }
 
 package struct WorkspaceSelectionWorkspace {
     package let id: UUID
     package let activeComposeTabID: UUID?
     package let firstComposeTabID: UUID?
+    package init(
+        id: UUID,
+        activeComposeTabID: UUID?,
+        firstComposeTabID: UUID?
+    ) {
+        self.id = id
+        self.activeComposeTabID = activeComposeTabID
+        self.firstComposeTabID = firstComposeTabID
+    }
 }
 
 package struct WorkspaceSelectionTab {
     package let id: UUID
     package let selection: StoredSelection
+    package init(
+        id: UUID,
+        selection: StoredSelection
+    ) {
+        self.id = id
+        self.selection = selection
+    }
 }
 
 package struct MCPSelectionPropagationRegistration: Equatable {
     package let sourceRevision: UInt64
     package let peerHostIDs: Set<UUID>
+    package init(
+        sourceRevision: UInt64,
+        peerHostIDs: Set<UUID>
+    ) {
+        self.sourceRevision = sourceRevision
+        self.peerHostIDs = peerHostIDs
+    }
 }
 
 package struct MCPSelectionPeerPropagation: Equatable {
@@ -35,6 +63,11 @@ package struct MCPSelectionPeerPropagation: Equatable {
 /// The host revalidates registration and closing state at each commit/apply boundary.
 package struct MCPSelectionPeerMutationFence: Equatable {
     package let hostID: UUID
+    package init(
+        hostID: UUID
+    ) {
+        self.hostID = hostID
+    }
 }
 
 private struct WorkspaceSelectionMirrorTarget: Equatable {

@@ -128,6 +128,15 @@ package struct GitWorkspaceAuthorityContentIdentity: Hashable {
     package let exists: Bool
     package let sha256: String
     package let byteCount: Int
+    package init(
+        exists: Bool,
+        sha256: String,
+        byteCount: Int
+    ) {
+        self.exists = exists
+        self.sha256 = sha256
+        self.byteCount = byteCount
+    }
 }
 
 package enum GitWorkspacePrefixControlKind: String, Hashable {
@@ -141,6 +150,15 @@ package struct GitWorkspacePrefixControlIdentity: Hashable {
     package let repositoryRelativePath: String
     package let kind: GitWorkspacePrefixControlKind
     package let content: GitWorkspaceAuthorityContentIdentity
+    package init(
+        repositoryRelativePath: String,
+        kind: GitWorkspacePrefixControlKind,
+        content: GitWorkspaceAuthorityContentIdentity
+    ) {
+        self.repositoryRelativePath = repositoryRelativePath
+        self.kind = kind
+        self.content = content
+    }
 }
 
 package struct GitWorkspaceAuthorityMetadata {
@@ -157,11 +175,47 @@ package struct GitWorkspaceAuthorityMetadata {
     package let metadataGeneration: String
     package let policyIdentity: GitWorkspacePolicyIdentity
     package let resolvedExternalAuthorityPaths: [URL]
+    package init(
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        objectFormat: GitObjectFormat,
+        headCommitOID: GitObjectID,
+        treeOID: GitObjectID,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
+        indexGeneration: String,
+        checkoutConfigurationGeneration: String,
+        ignoreAuthorityGeneration: String,
+        attributeAuthorityGeneration: String,
+        sparsePolicyGeneration: String,
+        metadataGeneration: String,
+        policyIdentity: GitWorkspacePolicyIdentity,
+        resolvedExternalAuthorityPaths: [URL]
+    ) {
+        self.repositoryKey = repositoryKey
+        self.objectFormat = objectFormat
+        self.headCommitOID = headCommitOID
+        self.treeOID = treeOID
+        self.repositoryRelativeRootPrefix = repositoryRelativeRootPrefix
+        self.indexGeneration = indexGeneration
+        self.checkoutConfigurationGeneration = checkoutConfigurationGeneration
+        self.ignoreAuthorityGeneration = ignoreAuthorityGeneration
+        self.attributeAuthorityGeneration = attributeAuthorityGeneration
+        self.sparsePolicyGeneration = sparsePolicyGeneration
+        self.metadataGeneration = metadataGeneration
+        self.policyIdentity = policyIdentity
+        self.resolvedExternalAuthorityPaths = resolvedExternalAuthorityPaths
+    }
 }
 
 package struct GitWorkspaceAuthorityScopeKey: Hashable {
     package let repositoryKey: GitWorkspaceAuthorityRepositoryKey
     package let repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    package init(
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix
+    ) {
+        self.repositoryKey = repositoryKey
+        self.repositoryRelativeRootPrefix = repositoryRelativeRootPrefix
+    }
 }
 
 package struct GitWorkspaceAuthorityCaptureToken: Hashable {
@@ -188,6 +242,35 @@ package struct GitWorkspaceAuthoritySnapshot: Hashable {
     package let checkoutConfigurationGeneration: String
     package let metadataGeneration: String
     package let policyIdentity: GitWorkspacePolicyIdentity
+    package init(
+        repositoryKey: GitWorkspaceAuthorityRepositoryKey,
+        repositoryNamespace: GitBlobRepositoryNamespace,
+        objectFormat: GitObjectFormat,
+        headCommitOID: GitObjectID,
+        treeOID: GitObjectID,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
+        repositoryBindingEpoch: String,
+        worktreeBindingEpoch: String,
+        layoutGeneration: String,
+        indexGeneration: String,
+        checkoutConfigurationGeneration: String,
+        metadataGeneration: String,
+        policyIdentity: GitWorkspacePolicyIdentity
+    ) {
+        self.repositoryKey = repositoryKey
+        self.repositoryNamespace = repositoryNamespace
+        self.objectFormat = objectFormat
+        self.headCommitOID = headCommitOID
+        self.treeOID = treeOID
+        self.repositoryRelativeRootPrefix = repositoryRelativeRootPrefix
+        self.repositoryBindingEpoch = repositoryBindingEpoch
+        self.worktreeBindingEpoch = worktreeBindingEpoch
+        self.layoutGeneration = layoutGeneration
+        self.indexGeneration = indexGeneration
+        self.checkoutConfigurationGeneration = checkoutConfigurationGeneration
+        self.metadataGeneration = metadataGeneration
+        self.policyIdentity = policyIdentity
+    }
 }
 
 package struct GitWorkspaceAuthorityLease: Hashable {
@@ -339,6 +422,72 @@ package struct GitWorktreeCreationWitnessCoverage: Equatable {
             && endedAtUptimeNanoseconds >= startedAtUptimeNanoseconds
             && endEventID >= startEventID
     }
+
+    package init(
+        startedAtUptimeNanoseconds: UInt64,
+        endedAtUptimeNanoseconds: UInt64,
+        startEventID: UInt64,
+        endEventID: UInt64,
+        stableWatchRootAvailableBeforeMutation: Bool,
+        destinationWasAbsentBeforeMutation: Bool,
+        destinationWasStrictDescendant: Bool,
+        stableWatchRootUnchangedAfterInitialization: Bool,
+        streamCreationSucceeded: Bool,
+        streamStartedBeforeMutation: Bool,
+        activationFlushCompleted: Bool,
+        activationCallbackBarrierCompleted: Bool,
+        streamEndedAfterInitialization: Bool,
+        endingFlushCompleted: Bool,
+        endingCallbackBarrierCompleted: Bool,
+        startAcceptedCallbackWatermark: UInt64,
+        endAcceptedCallbackWatermark: UInt64,
+        acceptedCallbackCount: Int,
+        acceptedEventCount: Int,
+        acceptedDestinationEventCount: Int,
+        acceptedNonDestinationEventCount: Int,
+        mustScanSubDirs: Bool,
+        rootChanged: Bool,
+        userDropped: Bool,
+        kernelDropped: Bool,
+        eventIDsWrapped: Bool,
+        eventIDRegressed: Bool,
+        lifetimeExceeded: Bool,
+        hadGap: Bool,
+        hadDrop: Bool,
+        overflowed: Bool
+    ) {
+        self.startedAtUptimeNanoseconds = startedAtUptimeNanoseconds
+        self.endedAtUptimeNanoseconds = endedAtUptimeNanoseconds
+        self.startEventID = startEventID
+        self.endEventID = endEventID
+        self.stableWatchRootAvailableBeforeMutation = stableWatchRootAvailableBeforeMutation
+        self.destinationWasAbsentBeforeMutation = destinationWasAbsentBeforeMutation
+        self.destinationWasStrictDescendant = destinationWasStrictDescendant
+        self.stableWatchRootUnchangedAfterInitialization = stableWatchRootUnchangedAfterInitialization
+        self.streamCreationSucceeded = streamCreationSucceeded
+        self.streamStartedBeforeMutation = streamStartedBeforeMutation
+        self.activationFlushCompleted = activationFlushCompleted
+        self.activationCallbackBarrierCompleted = activationCallbackBarrierCompleted
+        self.streamEndedAfterInitialization = streamEndedAfterInitialization
+        self.endingFlushCompleted = endingFlushCompleted
+        self.endingCallbackBarrierCompleted = endingCallbackBarrierCompleted
+        self.startAcceptedCallbackWatermark = startAcceptedCallbackWatermark
+        self.endAcceptedCallbackWatermark = endAcceptedCallbackWatermark
+        self.acceptedCallbackCount = acceptedCallbackCount
+        self.acceptedEventCount = acceptedEventCount
+        self.acceptedDestinationEventCount = acceptedDestinationEventCount
+        self.acceptedNonDestinationEventCount = acceptedNonDestinationEventCount
+        self.mustScanSubDirs = mustScanSubDirs
+        self.rootChanged = rootChanged
+        self.userDropped = userDropped
+        self.kernelDropped = kernelDropped
+        self.eventIDsWrapped = eventIDsWrapped
+        self.eventIDRegressed = eventIDRegressed
+        self.lifetimeExceeded = lifetimeExceeded
+        self.hadGap = hadGap
+        self.hadDrop = hadDrop
+        self.overflowed = overflowed
+    }
 }
 
 package struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
@@ -391,6 +540,56 @@ package struct GitWorktreeCreationReceipt: Equatable, @unchecked Sendable {
               targetLayout.workTreeRoot.standardizedFileURL.path == actualTargetPath
         else { return .unsupportedDestination }
         return nil
+    }
+
+    package init(
+        id: UUID,
+        agentSessionID: UUID,
+        correlationID: UUID,
+        standardizedLogicalRootPath: String,
+        expectedOwnerBindingGeneration: UInt64,
+        mutationID: UUID,
+        parentSnapshotIdentity: WorkspaceRootReusableSnapshotIdentity,
+        parentCompatibilityKey: WorkspaceRootSeedCompatibilityKey,
+        parentAuthorityBefore: GitWorkspaceAuthoritySnapshot,
+        targetAuthorityAfter: GitWorkspaceAuthoritySnapshot,
+        requestedBaseRef: String?,
+        resolvedBaseTreeOID: GitObjectID,
+        repositoryRelativeRootPrefix: GitRepositoryRelativeRootPrefix,
+        plannedTargetPath: String,
+        actualTargetPath: String,
+        exactCopiedRelativePaths: [String],
+        includeCopyHadFailures: Bool,
+        includeCopyWasComplete: Bool,
+        destinationIsAppManaged: Bool,
+        worktree: GitWorktreeDescriptor,
+        targetLayout: GitRepositoryLayout,
+        witnessCoverage: GitWorktreeCreationWitnessCoverage,
+        expiresAtUptimeNanoseconds: UInt64
+    ) {
+        self.id = id
+        self.agentSessionID = agentSessionID
+        self.correlationID = correlationID
+        self.standardizedLogicalRootPath = standardizedLogicalRootPath
+        self.expectedOwnerBindingGeneration = expectedOwnerBindingGeneration
+        self.mutationID = mutationID
+        self.parentSnapshotIdentity = parentSnapshotIdentity
+        self.parentCompatibilityKey = parentCompatibilityKey
+        self.parentAuthorityBefore = parentAuthorityBefore
+        self.targetAuthorityAfter = targetAuthorityAfter
+        self.requestedBaseRef = requestedBaseRef
+        self.resolvedBaseTreeOID = resolvedBaseTreeOID
+        self.repositoryRelativeRootPrefix = repositoryRelativeRootPrefix
+        self.plannedTargetPath = plannedTargetPath
+        self.actualTargetPath = actualTargetPath
+        self.exactCopiedRelativePaths = exactCopiedRelativePaths
+        self.includeCopyHadFailures = includeCopyHadFailures
+        self.includeCopyWasComplete = includeCopyWasComplete
+        self.destinationIsAppManaged = destinationIsAppManaged
+        self.worktree = worktree
+        self.targetLayout = targetLayout
+        self.witnessCoverage = witnessCoverage
+        self.expiresAtUptimeNanoseconds = expiresAtUptimeNanoseconds
     }
 }
 

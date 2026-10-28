@@ -191,7 +191,7 @@ package struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
 
 package actor WorkspaceFileContextStore {
     private let restorePerfRecorder: any WorkspaceRestorePerfRecording
-    let perfRecorder: any AgentModePerfRecording
+    package let perfRecorder: any AgentModePerfRecording
 
     enum CodemapGraphIndexBuildStoreEventKind: String, Hashable {
         case rootInventoryAndSearchReady
@@ -7597,7 +7597,7 @@ package actor WorkspaceFileContextStore {
     /// Matches roots() + files(inRoot:) membership, including hidden and system
     /// roots. Read only the catalog-owned summaries; never materialize a catalog
     /// shard or enumerate files as a side effect of token accounting.
-    func allLoadedFileExtensions() -> Set<String> {
+    package func allLoadedFileExtensions() -> Set<String> {
         var extensions = Set<String>()
         for rootID in rootLoadOrder {
             if let summary = fileExtensionSummariesByRootID[rootID],

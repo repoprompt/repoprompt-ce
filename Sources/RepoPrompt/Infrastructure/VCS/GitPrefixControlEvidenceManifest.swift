@@ -62,6 +62,15 @@ package struct GitPrefixControlEvidenceRecord: Equatable {
     package let repositoryRelativePathBytes: Data
     package let kind: GitWorkspacePrefixControlKind
     package let content: GitWorkspaceAuthorityContentIdentity
+    package init(
+        repositoryRelativePathBytes: Data,
+        kind: GitWorkspacePrefixControlKind,
+        content: GitWorkspaceAuthorityContentIdentity
+    ) {
+        self.repositoryRelativePathBytes = repositoryRelativePathBytes
+        self.kind = kind
+        self.content = content
+    }
 }
 
 package struct GitPrefixControlEvidenceManifestFooter: Equatable {

@@ -564,7 +564,7 @@ package struct WorkspaceCodemapGraphIndexBudget: Hashable {
     package let attempted: UInt64
     package let limit: UInt64
 
-    var terminalMessage: String {
+    package var terminalMessage: String {
         "Code Map indexing stopped at the \(dimension) budget (attempted \(attempted), limit \(limit)). This generation cannot be resumed with Retry."
     }
 }

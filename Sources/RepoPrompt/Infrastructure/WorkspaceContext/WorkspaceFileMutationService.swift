@@ -53,6 +53,10 @@ package struct WorkspaceFileMutationWriteResult: Equatable {
 package struct WorkspaceFileMutationService {
     package let store: WorkspaceFileContextStore
 
+    package init(store: WorkspaceFileContextStore) {
+        self.store = store
+    }
+
     package func resolveExactExistingFile(
         _ input: WorkspaceExactFileInput,
         namespace: WorkspaceExactFileNamespace

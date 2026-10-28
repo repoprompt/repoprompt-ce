@@ -109,6 +109,22 @@ package enum FilePathDisplay: String, CaseIterable {
         package let logicalRootID: UUID
         package let repositoryID: String
         package let destinationID: String
+
+        package init(
+            correlationID: UUID,
+            contextID: UUID,
+            agentSessionID: UUID,
+            logicalRootID: UUID,
+            repositoryID: String,
+            destinationID: String
+        ) {
+            self.correlationID = correlationID
+            self.contextID = contextID
+            self.agentSessionID = agentSessionID
+            self.logicalRootID = logicalRootID
+            self.repositoryID = repositoryID
+            self.destinationID = destinationID
+        }
     }
 
     package enum WorkspaceBenchmarkPlannerPhase: String, CaseIterable {
@@ -300,6 +316,10 @@ package enum WorkspaceLookupContextResolutionError: LocalizedError {
 
 package struct WorkspaceSelectedFilesDiagnostics {
     package let perfRecorder: any AgentModePerfRecording
+
+    package init(perfRecorder: any AgentModePerfRecording) {
+        self.perfRecorder = perfRecorder
+    }
 
     package func timestampMSIfEnabled() -> Double? {
         #if DEBUG
@@ -737,6 +757,10 @@ package struct WorkspaceRootBindingProjectionPreparation {
 package struct WorkspaceRootBindingProjectionMaterializer {
     package let store: WorkspaceFileContextStore
 
+    package init(store: WorkspaceFileContextStore) {
+        self.store = store
+    }
+
     package func prepare(
         sessionID: UUID,
         bindings: [WorkspaceSessionWorktreeBinding],
@@ -1124,7 +1148,12 @@ package struct WorkspaceLookupContext: Equatable {
     package let rootScope: WorkspaceLookupRootScope
     package let bindingProjection: WorkspaceRootBindingProjection?
 
-    static let visibleWorkspace = WorkspaceLookupContext(rootScope: .visibleWorkspace, bindingProjection: nil)
+    package init(rootScope: WorkspaceLookupRootScope, bindingProjection: WorkspaceRootBindingProjection?) {
+        self.rootScope = rootScope
+        self.bindingProjection = bindingProjection
+    }
+
+    package static let visibleWorkspace = WorkspaceLookupContext(rootScope: .visibleWorkspace, bindingProjection: nil)
 
     package func translateInputPath(_ path: String) -> String {
         bindingProjection?.translateInputPath(path) ?? path

@@ -12,6 +12,13 @@ package enum SearchPathClause: Equatable {
 package struct SearchPathFilterSpec: Equatable {
     package let caseInsensitive: Bool
     package let clauses: [SearchPathClause]
+    package init(
+        caseInsensitive: Bool,
+        clauses: [SearchPathClause]
+    ) {
+        self.caseInsensitive = caseInsensitive
+        self.clauses = clauses
+    }
 }
 
 struct FileSearchPathSnapshot {

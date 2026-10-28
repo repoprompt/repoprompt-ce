@@ -5,6 +5,11 @@ import RepoPromptVCS
 package struct WorkspaceCodemapRootEpoch: Hashable {
     package let rootID: UUID
     package let rootLifetimeID: UUID
+
+    package init(rootID: UUID, rootLifetimeID: UUID) {
+        self.rootID = rootID
+        self.rootLifetimeID = rootLifetimeID
+    }
 }
 
 struct WorkspaceCodemapRepositoryAuthorityToken: Hashable {
@@ -191,7 +196,7 @@ enum WorkspaceCodemapGitEligibilityPreflightResult: Equatable {
 package struct WorkspaceCodemapGitEligibilityProbe {
     let resolve: @Sendable (URL) async -> WorkspaceCodemapGitEligibilityPreflightResult
 
-    static func production(gitService: any WorkspaceGitClient) -> Self {
+    package static func production(gitService: any WorkspaceGitClient) -> Self {
         Self { rootURL in
             await WorkspaceCodemapRootCapabilityService.eligibilityPreflight(
                 gitService: gitService,

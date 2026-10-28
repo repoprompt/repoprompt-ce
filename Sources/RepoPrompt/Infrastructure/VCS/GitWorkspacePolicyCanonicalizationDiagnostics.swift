@@ -49,17 +49,40 @@ import RepoPromptVCS
         package struct CommonAuthorityIdentity: Hashable {
             package let state: CommonAuthorityState
             package let digest: String
+            package init(
+                state: CommonAuthorityState,
+                digest: String
+            ) {
+                self.state = state
+                self.digest = digest
+            }
         }
 
         package struct CanonicalControlFooterIdentity: Hashable {
             package let digest: String
             package let recordCount: Int
+            package init(
+                digest: String,
+                recordCount: Int
+            ) {
+                self.digest = digest
+                self.recordCount = recordCount
+            }
         }
 
         package struct ExternalAuthorityIdentity: Hashable {
             package let state: ExternalAuthorityState
             package let identityDigest: String
             package let byteCount: Int
+            package init(
+                state: ExternalAuthorityState,
+                identityDigest: String,
+                byteCount: Int
+            ) {
+                self.state = state
+                self.identityDigest = identityDigest
+                self.byteCount = byteCount
+            }
         }
 
         package struct ConstituentComparison: Hashable {

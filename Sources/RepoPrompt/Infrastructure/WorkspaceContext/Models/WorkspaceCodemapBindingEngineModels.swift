@@ -842,7 +842,7 @@ enum WorkspaceCodemapGraphIndexExecutionState: Hashable {
     case exhausted
     case budgetLimited(WorkspaceCodemapGraphIndexBudget)
 
-    var budget: WorkspaceCodemapGraphIndexBudget? {
+    package var budget: WorkspaceCodemapGraphIndexBudget? {
         if case let .budgetLimited(budget) = self { return budget }
         return nil
     }

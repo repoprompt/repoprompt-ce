@@ -19,6 +19,17 @@ package struct FileSearchContentSnapshot {
     package let contentRevision: UInt64?
     package let modificationDate: Date
     package let isFresh: Bool
+    package init(
+        content: String?,
+        contentRevision: UInt64?,
+        modificationDate: Date,
+        isFresh: Bool
+    ) {
+        self.content = content
+        self.contentRevision = contentRevision
+        self.modificationDate = modificationDate
+        self.isFresh = isFresh
+    }
 }
 
 /// Every case carries only String, Bool, or Sendable WorkspaceRootRef values.

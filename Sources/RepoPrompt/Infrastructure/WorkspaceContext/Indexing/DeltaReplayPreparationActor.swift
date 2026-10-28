@@ -311,6 +311,8 @@ package enum FileSystemDeltaPreparation {
 }
 
 package actor DeltaReplayPreparationActor: DeltaReplayPreparing {
+    package init() {}
+
     package func prepare(
         rootKey: String,
         deltas: [FileSystemDelta],

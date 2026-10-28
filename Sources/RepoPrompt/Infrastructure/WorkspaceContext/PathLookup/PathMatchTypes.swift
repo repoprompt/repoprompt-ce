@@ -404,6 +404,13 @@ struct PathLocateOptions: Equatable {
 package struct FileCreationResult {
     package let rootFolder: FolderRecord
     package let componentsToCreate: [String]
+    package init(
+        rootFolder: FolderRecord,
+        componentsToCreate: [String]
+    ) {
+        self.rootFolder = rootFolder
+        self.componentsToCreate = componentsToCreate
+    }
 }
 
 extension FileCreationResult: Equatable {

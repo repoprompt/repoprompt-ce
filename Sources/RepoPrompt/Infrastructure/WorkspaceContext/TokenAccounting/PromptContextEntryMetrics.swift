@@ -8,6 +8,8 @@ package struct PromptContextAccountingIdentitySet {
     private var fileIDs = Set<UUID>()
     private var standardizedFullPaths = Set<String>()
 
+    package init() {}
+
     package mutating func insert(fileID: UUID, standardizedFullPath: String) -> Bool {
         guard !fileIDs.contains(fileID),
               !standardizedFullPaths.contains(standardizedFullPath)
@@ -34,6 +36,23 @@ package struct PromptContextEntryMetric: Equatable {
     package let displayTokenCount: Int
     package let displayPercentage: Double
     package let includedLineCount: Int?
+    package init(
+        fileID: UUID,
+        standardizedFullPath: String,
+        renderedDisplayPath: String,
+        renderMode: PromptEntriesEvaluation.RenderMode,
+        displayTokenCount: Int,
+        displayPercentage: Double,
+        includedLineCount: Int?
+    ) {
+        self.fileID = fileID
+        self.standardizedFullPath = standardizedFullPath
+        self.renderedDisplayPath = renderedDisplayPath
+        self.renderMode = renderMode
+        self.displayTokenCount = displayTokenCount
+        self.displayPercentage = displayPercentage
+        self.includedLineCount = includedLineCount
+    }
 }
 
 package struct PromptContextEntryMetricsSnapshot: Equatable {

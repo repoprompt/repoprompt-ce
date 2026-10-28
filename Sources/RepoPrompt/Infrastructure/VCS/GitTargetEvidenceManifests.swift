@@ -44,6 +44,19 @@ package struct GitTargetEvidenceAuthorityIdentity: Equatable {
     package let acceptedMetadataWatermark: UInt64
     package let attemptID: UUID
     package let snapshotDigestBytes: Data
+    package init(
+        authorityGeneration: UInt64,
+        invalidationGeneration: UInt64,
+        acceptedMetadataWatermark: UInt64,
+        attemptID: UUID,
+        snapshotDigestBytes: Data
+    ) {
+        self.authorityGeneration = authorityGeneration
+        self.invalidationGeneration = invalidationGeneration
+        self.acceptedMetadataWatermark = acceptedMetadataWatermark
+        self.attemptID = attemptID
+        self.snapshotDigestBytes = snapshotDigestBytes
+    }
 }
 
 /// Complete ephemeral identity of one Git target-evidence artifact. Every field
@@ -70,6 +83,37 @@ package struct GitTargetEvidenceArtifactIdentity: Equatable {
     package let suppliedCreationCutProvenanceBytes: Data?
     /// Required for index evidence and nil for the other command families.
     package let sparseCheckoutEnabled: Bool?
+    package init(
+        physicalWorktree: GitTargetEvidenceFileSystemIdentity,
+        repositoryCommonDirectory: GitTargetEvidenceFileSystemIdentity,
+        repositoryGitDirectory: GitTargetEvidenceFileSystemIdentity,
+        authority: GitTargetEvidenceAuthorityIdentity,
+        commandArguments: [Data],
+        commandFormatBytes: Data,
+        environmentIdentityBytes: Data,
+        commandOutputDigestBytes: Data,
+        repositoryRelativeRootPrefixBytes: Data,
+        objectFormatBytes: Data,
+        baseObjectIDBytes: Data?,
+        targetObjectIDBytes: Data?,
+        suppliedCreationCutProvenanceBytes: Data?,
+        sparseCheckoutEnabled: Bool?
+    ) {
+        self.physicalWorktree = physicalWorktree
+        self.repositoryCommonDirectory = repositoryCommonDirectory
+        self.repositoryGitDirectory = repositoryGitDirectory
+        self.authority = authority
+        self.commandArguments = commandArguments
+        self.commandFormatBytes = commandFormatBytes
+        self.environmentIdentityBytes = environmentIdentityBytes
+        self.commandOutputDigestBytes = commandOutputDigestBytes
+        self.repositoryRelativeRootPrefixBytes = repositoryRelativeRootPrefixBytes
+        self.objectFormatBytes = objectFormatBytes
+        self.baseObjectIDBytes = baseObjectIDBytes
+        self.targetObjectIDBytes = targetObjectIDBytes
+        self.suppliedCreationCutProvenanceBytes = suppliedCreationCutProvenanceBytes
+        self.sparseCheckoutEnabled = sparseCheckoutEnabled
+    }
 }
 
 struct GitTargetEvidenceManifestHeader: Equatable {

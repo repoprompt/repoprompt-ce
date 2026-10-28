@@ -662,12 +662,29 @@ package struct ResolvedPromptFileBlockRecord: Equatable {
     package let file: WorkspaceFileRecord
     package let text: String
     package let isCodemap: Bool
+    package init(
+        entry: ResolvedPromptFileEntry,
+        file: WorkspaceFileRecord,
+        text: String,
+        isCodemap: Bool
+    ) {
+        self.entry = entry
+        self.file = file
+        self.text = text
+        self.isCodemap = isCodemap
+    }
 }
 
 package struct ResolvedPromptFileEntryID: Hashable {
     package let fileID: UUID
     package let mode: PromptFileEntryMode
     package let lineRanges: [LineRange]?
+
+    package init(fileID: UUID, mode: PromptFileEntryMode, lineRanges: [LineRange]?) {
+        self.fileID = fileID
+        self.mode = mode
+        self.lineRanges = lineRanges
+    }
 }
 
 package enum PromptFileEntryMode: Hashable {
@@ -886,11 +903,27 @@ package struct WorkspaceRootReconciliationTicket: Hashable {
     package let workspaceID: UUID
     package let activationGeneration: UInt64
     package let rootIntentGeneration: UInt64
+    package init(
+        workspaceID: UUID,
+        activationGeneration: UInt64,
+        rootIntentGeneration: UInt64
+    ) {
+        self.workspaceID = workspaceID
+        self.activationGeneration = activationGeneration
+        self.rootIntentGeneration = rootIntentGeneration
+    }
 }
 
 package struct WorkspacePrimaryRootSnapshot: Equatable {
     package let ticket: WorkspaceRootReconciliationTicket
     package let roots: [WorkspaceRootRef]
+    package init(
+        ticket: WorkspaceRootReconciliationTicket,
+        roots: [WorkspaceRootRef]
+    ) {
+        self.ticket = ticket
+        self.roots = roots
+    }
 }
 
 package struct WorkspaceRootReadinessFailure: Error, Equatable {
@@ -913,6 +946,18 @@ package struct WorkspaceRootReadinessFailure: Error, Equatable {
         case .emptyConfiguration, .invalidConfiguration, .workspaceUnavailable, .wrongRootKind: false
         default: true
         }
+    }
+
+    package init(
+        reason: Reason,
+        expectedCount: Int,
+        loadedCount: Int,
+        missingCount: Int
+    ) {
+        self.reason = reason
+        self.expectedCount = expectedCount
+        self.loadedCount = loadedCount
+        self.missingCount = missingCount
     }
 }
 

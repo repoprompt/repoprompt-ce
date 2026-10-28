@@ -88,37 +88,6 @@ final class WorkspaceContextCompositionTests: XCTestCase {
 }
 
 final class WorkspaceCodemapStructureQueryExecutorTests: XCTestCase {
-    func testScopedDeduplicationAndLogicalOrderingKeepFirstRecord() {
-        let firstRoot = WorkspaceRootRef(id: UUID(), name: "A", fullPath: "/one")
-        let secondRoot = WorkspaceRootRef(id: UUID(), name: "B", fullPath: "/two")
-        let outsider = UUID()
-        func file(_ id: UUID = UUID(), _ root: UUID, _ relative: String, _ full: String) -> WorkspaceFileRecord {
-            WorkspaceFileRecord(id: id, rootID: root, name: relative, relativePath: relative, fullPath: full, parentFolderID: nil)
-        }
-        let first = file(UUID(), firstRoot.id, "z.swift", "/one/z.swift")
-        let duplicate = file(UUID(), firstRoot.id, "z.swift", "/one/./z.swift")
-        let second = file(UUID(), secondRoot.id, "a.swift", "/two/a.swift")
-        let outside = file(UUID(), outsider, "x.swift", "/outside/x.swift")
-        let roots = [firstRoot, secondRoot]
-        let unique = WorkspaceCodemapStructureQueryExecutor.uniqueScopedFiles([first, duplicate, second, outside], roots: roots)
-        let ordered = WorkspaceCodemapStructureQueryExecutor.orderFiles(
-            unique, roots: roots, logicalRootNames: [firstRoot.id: "Z", secondRoot.id: "A"]
-        )
-        XCTAssertEqual(ordered.map(\.id), [second.id, first.id])
-    }
-
-    func testInitialInvalidationRemainsStickyWhileFinalValidUpdatesReplaceValid() {
-        let invalidRoot = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
-        let validRoot = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
-        let invalid: WorkspaceCodemapStructureGraphRevalidationResult = .invalid(code: "stale", message: "old")
-        let merged = WorkspaceCodemapStructureQueryExecutor.mergeRevalidation(
-            initial: [invalidRoot: invalid, validRoot: .valid(updatesPending: false)],
-            final: [invalidRoot: .valid(updatesPending: false), validRoot: .valid(updatesPending: true)]
-        )
-        XCTAssertEqual(merged[invalidRoot], invalid)
-        XCTAssertEqual(merged[validRoot], .valid(updatesPending: true))
-    }
-
     @MainActor
     func testEmptyRequestedFilesStopBeforeGraphButEmptySelectionContinuesWithoutPresentation() async throws {
         let store = WorkspaceFileContextStore()
@@ -688,5 +657,38 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
         values.withUnsafeBufferPointer { buffer in
             buffer.baseAddress.map { UInt(bitPattern: $0) } ?? 0
         }
+    }
+}
+
+final class WorkspaceCodemapStructureQueryExecutorOwningTests: XCTestCase {
+    func testScopedDeduplicationAndLogicalOrderingKeepFirstRecord() {
+        let firstRoot = WorkspaceRootRef(id: UUID(), name: "A", fullPath: "/one")
+        let secondRoot = WorkspaceRootRef(id: UUID(), name: "B", fullPath: "/two")
+        let outsider = UUID()
+        func file(_ id: UUID = UUID(), _ root: UUID, _ relative: String, _ full: String) -> WorkspaceFileRecord {
+            WorkspaceFileRecord(id: id, rootID: root, name: relative, relativePath: relative, fullPath: full, parentFolderID: nil)
+        }
+        let first = file(UUID(), firstRoot.id, "z.swift", "/one/z.swift")
+        let duplicate = file(UUID(), firstRoot.id, "z.swift", "/one/./z.swift")
+        let second = file(UUID(), secondRoot.id, "a.swift", "/two/a.swift")
+        let outside = file(UUID(), outsider, "x.swift", "/outside/x.swift")
+        let roots = [firstRoot, secondRoot]
+        let unique = WorkspaceCodemapStructureQueryExecutor.uniqueScopedFiles([first, duplicate, second, outside], roots: roots)
+        let ordered = WorkspaceCodemapStructureQueryExecutor.orderFiles(
+            unique, roots: roots, logicalRootNames: [firstRoot.id: "Z", secondRoot.id: "A"]
+        )
+        XCTAssertEqual(ordered.map(\.id), [second.id, first.id])
+    }
+
+    func testInitialInvalidationRemainsStickyWhileFinalValidUpdatesReplaceValid() {
+        let invalidRoot = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        let validRoot = WorkspaceCodemapRootEpoch(rootID: UUID(), rootLifetimeID: UUID())
+        let invalid: WorkspaceCodemapStructureGraphRevalidationResult = .invalid(code: "stale", message: "old")
+        let merged = WorkspaceCodemapStructureQueryExecutor.mergeRevalidation(
+            initial: [invalidRoot: invalid, validRoot: .valid(updatesPending: false)],
+            final: [invalidRoot: .valid(updatesPending: false), validRoot: .valid(updatesPending: true)]
+        )
+        XCTAssertEqual(merged[invalidRoot], invalid)
+        XCTAssertEqual(merged[validRoot], .valid(updatesPending: true))
     }
 }

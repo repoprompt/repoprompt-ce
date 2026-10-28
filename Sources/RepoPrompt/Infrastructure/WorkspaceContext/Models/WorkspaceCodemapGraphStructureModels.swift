@@ -124,15 +124,15 @@ package struct WorkspaceCodemapStructureUnresolvedResult: Hashable {
     package let reason: WorkspaceCodemapGraphUnresolvedReason
 }
 
-enum WorkspaceCodemapStructureStopReason: String, Hashable {
+package enum WorkspaceCodemapStructureStopReason: String, Hashable {
     case budgetExhausted = "graph_budget_exhausted"
     case retryExhausted = "graph_retry_exhausted"
     case workerRecoveryExhausted = "graph_worker_recovery_exhausted"
 }
 
-struct WorkspaceCodemapStructureExecutionStop: Hashable {
-    let reason: WorkspaceCodemapStructureStopReason
-    let budget: WorkspaceCodemapGraphIndexBudget?
+package struct WorkspaceCodemapStructureExecutionStop: Hashable {
+    package let reason: WorkspaceCodemapStructureStopReason
+    package let budget: WorkspaceCodemapGraphIndexBudget?
 }
 
 package struct WorkspaceCodemapStructureRootResult: Hashable {
@@ -148,7 +148,7 @@ package struct WorkspaceCodemapStructureRootResult: Hashable {
     package let truncation: WorkspaceCodemapGraphStructureTruncation?
     package let issues: [WorkspaceCodemapStructureIssueRecord]
     let receipt: WorkspaceCodemapGraphSnapshotReceipt?
-    var executionStop: WorkspaceCodemapStructureExecutionStop?
+    package var executionStop: WorkspaceCodemapStructureExecutionStop?
 
     package var hasUsefulData: Bool {
         !nodes.isEmpty || !edges.isEmpty || !unresolved.isEmpty

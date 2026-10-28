@@ -109,6 +109,32 @@ package struct SearchOptions {
     var fuzzySpaceMatching: Bool = true // Enable/disable fuzzy space matching
     var allowLiteralUnescapeFallback: Bool = true // Helpful rescue for over-escaped literals in auto flows
     var contentFreshnessPolicy: FileContentFreshnessPolicy = .cachedMetadata
+
+    package init(
+        mode: SearchMode = .auto,
+        caseInsensitive: Bool = true,
+        wholeWord: Bool = false,
+        includeExtensions: [String] = [],
+        excludePatterns: [String] = [],
+        contextLines: Int = 0,
+        maxResults: Int = 250,
+        countOnly: Bool = false,
+        fuzzySpaceMatching: Bool = true,
+        allowLiteralUnescapeFallback: Bool = true,
+        contentFreshnessPolicy: FileContentFreshnessPolicy = .cachedMetadata
+    ) {
+        self.mode = mode
+        self.caseInsensitive = caseInsensitive
+        self.wholeWord = wholeWord
+        self.includeExtensions = includeExtensions
+        self.excludePatterns = excludePatterns
+        self.contextLines = contextLines
+        self.maxResults = maxResults
+        self.countOnly = countOnly
+        self.fuzzySpaceMatching = fuzzySpaceMatching
+        self.allowLiteralUnescapeFallback = allowLiteralUnescapeFallback
+        self.contentFreshnessPolicy = contentFreshnessPolicy
+    }
 }
 
 /// Codable wrapper for regex pattern errors
@@ -592,6 +618,8 @@ struct OrderedSearchBatchWindow {
 
 /// Ripgrep-style asynchronous searcher, fully cancellable.
 package actor FileSearchActor {
+    package init() {}
+
     static func pathSearchInputPrecedes(_ lhsPath: String, _ rhsPath: String) -> Bool {
         WorkspaceFileContextStore.compareUTF8Binary(lhsPath, rhsPath) == .orderedAscending
     }

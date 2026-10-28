@@ -28,6 +28,8 @@ final class WorkspaceCodemapBindingIntegrationEndpoint: @unchecked Sendable {
 }
 
 package actor WorkspaceCodemapBindingIntegrationRegistry {
+    package init() {}
+
     private final class WeakEndpoint {
         weak var value: WorkspaceCodemapBindingIntegrationEndpoint?
 

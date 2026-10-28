@@ -5,7 +5,7 @@ import RepoPromptShared
 
 /// Compatibility seam for app/MCP consumers; build selection has one authority.
 package enum WorkspaceContextFilesystemIdentity {
-    static let identity = MCPFilesystemIdentity.current
+    package static let identity = MCPFilesystemIdentity.current
 }
 
 public enum SliceMutationMode: Sendable {
