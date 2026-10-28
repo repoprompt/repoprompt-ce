@@ -150,7 +150,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RepoPromptACPProvidersTests",
-            dependencies: ["RepoPromptACPProviders", "RepoPromptAIContracts"],
+            dependencies: ["RepoPromptACPProviders", "RepoPromptAIContracts", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"],
             path: "Tests/RepoPromptACPProvidersTests"
         ),
         .target(

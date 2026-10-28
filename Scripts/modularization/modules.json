@@ -64,7 +64,7 @@
     },
     "RepoPromptACPProvidersTests": {
       "source_root": "Tests/RepoPromptACPProvidersTests",
-      "allowed_dependencies": ["RepoPromptACPProviders", "RepoPromptAIContracts"]
+      "allowed_dependencies": ["RepoPromptACPProviders", "RepoPromptAIContracts", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"]
     },
     "RepoPromptAIContracts": {
       "source_root": "Sources/RepoPromptAIContracts",

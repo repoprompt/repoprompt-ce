@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptAIContracts
 @testable import RepoPromptACPProviders
+import RepoPromptAIContracts
 import XCTest
 
 final class CursorACPModelPollingOwnerTests: XCTestCase {
