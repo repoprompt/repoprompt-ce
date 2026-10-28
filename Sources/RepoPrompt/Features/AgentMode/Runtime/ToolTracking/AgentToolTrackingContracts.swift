@@ -16,6 +16,14 @@ enum AgentToolStreamEvent {
         let toolName: String
         let invocationID: UUID?
         let argsJSON: String?
+        let claudeToolUseID: String?
+
+        init(toolName: String, invocationID: UUID?, argsJSON: String?, claudeToolUseID: String? = nil) {
+            self.toolName = toolName
+            self.invocationID = invocationID
+            self.argsJSON = argsJSON
+            self.claudeToolUseID = claudeToolUseID
+        }
     }
 
     struct ToolResult {
@@ -24,6 +32,16 @@ enum AgentToolStreamEvent {
         let argsJSON: String?
         let resultJSON: String
         let isError: Bool?
+        let claudeToolUseID: String?
+
+        init(toolName: String, invocationID: UUID?, argsJSON: String?, resultJSON: String?, isError: Bool?, claudeToolUseID: String? = nil) {
+            self.toolName = toolName
+            self.invocationID = invocationID
+            self.argsJSON = argsJSON
+            self.resultJSON = resultJSON ?? ""
+            self.isError = isError
+            self.claudeToolUseID = claudeToolUseID
+        }
     }
 
     /// Legacy "Using tool: X" event from headless providers.
@@ -40,7 +58,8 @@ enum AgentToolStreamEvent {
             return .toolCall(.init(
                 toolName: toolName,
                 invocationID: result.toolInvocationID,
-                argsJSON: result.toolArgsJSON ?? result.toolArgs
+                argsJSON: result.toolArgsJSON ?? result.toolArgs,
+                claudeToolUseID: result.claudeToolUseID
             ))
 
         case "tool_result":
@@ -50,7 +69,8 @@ enum AgentToolStreamEvent {
                 invocationID: result.toolInvocationID,
                 argsJSON: result.toolArgsJSON ?? result.toolArgs,
                 resultJSON: result.toolResultJSON ?? result.toolOutput ?? "",
-                isError: result.toolIsError
+                isError: result.toolIsError,
+                claudeToolUseID: result.claudeToolUseID
             ))
 
         case "event":

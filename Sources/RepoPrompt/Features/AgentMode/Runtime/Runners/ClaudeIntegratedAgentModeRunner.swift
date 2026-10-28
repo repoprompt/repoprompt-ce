@@ -353,6 +353,25 @@ final class ClaudeIntegratedAgentModeRunner {
     }
 
     #if DEBUG
+        func testConsumeAndFinalizeQuietEvents(
+            _ events: AsyncStream<NativeAgentRuntimeEvent>,
+            session: AgentTabSession,
+            runID: UUID,
+            owner: AgentRunOwnership
+        ) async -> AgentRunTerminalCommitRevision? {
+            guard case .completed = await consumeEvents(events, session: session, runID: runID, runAttemptID: owner.attemptID) else { return nil }
+            return await finalize(
+                session: session,
+                runID: runID,
+                ownership: owner,
+                attachmentReservationID: nil,
+                terminalState: .completed,
+                errorText: nil,
+                notifyTurnComplete: true,
+                classifiesQuietCheckIn: true
+            )
+        }
+
         @discardableResult
         func testConsumeQuietEvents(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> Bool {
             let stream = AsyncStream<NativeAgentRuntimeEvent> { continuation in
@@ -568,7 +587,9 @@ final class ClaudeIntegratedAgentModeRunner {
         shouldShutdownSession: Bool = false
     ) async -> AgentRunTerminalCommitRevision? {
         await terminalCommitBarrier.commit(.init(
-            binding: hooks.bindTerminalSession(session),
+            binding: claudeCoordinator.bindingQuietDeclarationObservations(
+                hooks.bindTerminalSession(session), session: session, owner: ownership, runID: runID
+            ),
             ownership: ownership,
             expectedRunID: runID,
             terminalState: terminalState,

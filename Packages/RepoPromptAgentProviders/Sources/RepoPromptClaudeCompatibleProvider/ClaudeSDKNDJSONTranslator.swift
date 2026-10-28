@@ -1,6 +1,11 @@
+import CoreFoundation
 import Foundation
 
 public struct ClaudeSDKNDJSONTranslator {
+    /// Existing non-rendering activity channel: retain lost/unparseable input without copying
+    /// opaque provider data into text. Both translation entry points share this contract.
+    private static let unrepresentedActivity = ClaudeProviderStreamResult(type: "event", text: nil)
+
     public private(set) var cliSessionID: String?
     /// The session's main model as `system/init` announced it, in the CLI's own naming (which keeps
     /// variant suffixes such as `[1m]`).
@@ -48,7 +53,7 @@ public struct ClaudeSDKNDJSONTranslator {
             if enableDebugLogging, let snippet = String(data: trimmed.prefix(160), encoding: .utf8) {
                 print("[DEBUG] ClaudeSDKTranslator: Skipping non-object payload: \(snippet)")
             }
-            return []
+            return [Self.unrepresentedActivity]
         }
         return parseMessageDictionary(json)
     }
@@ -91,9 +96,9 @@ public struct ClaudeSDKNDJSONTranslator {
             if let message = firstString(in: json, keys: ["error", "message"]), !message.isEmpty {
                 return [ClaudeProviderStreamResult(type: "error", text: message)]
             }
-            return []
+            return [Self.unrepresentedActivity]
         default:
-            return []
+            return [Self.unrepresentedActivity]
         }
     }
 
@@ -120,7 +125,7 @@ public struct ClaudeSDKNDJSONTranslator {
                     fragments.append(status)
                 }
             }
-            guard !fragments.isEmpty else { return [] }
+            guard !fragments.isEmpty else { return [Self.unrepresentedActivity] }
             return [ClaudeProviderStreamResult(type: "status", text: fragments.joined(separator: " — "))]
         }
 
@@ -165,7 +170,7 @@ public struct ClaudeSDKNDJSONTranslator {
             )?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
-            guard let state, !state.isEmpty else { return [] }
+            guard let state, !state.isEmpty else { return [Self.unrepresentedActivity] }
             return [ClaudeProviderStreamResult(type: "session_state_changed", text: state)]
         }
 
@@ -184,7 +189,7 @@ public struct ClaudeSDKNDJSONTranslator {
                 {
                     return [ClaudeProviderStreamResult(type: "task_progress", text: "Task \(taskID.trimmingCharacters(in: .whitespacesAndNewlines))")]
                 }
-                return []
+                return [Self.unrepresentedActivity]
             }
             return [ClaudeProviderStreamResult(type: "task_progress", text: fragments.joined(separator: " — "))]
         }
@@ -192,11 +197,12 @@ public struct ClaudeSDKNDJSONTranslator {
         if let message = firstString(in: json, keys: ["message"]), !message.isEmpty {
             return [ClaudeProviderStreamResult(type: "system", text: message)]
         }
-        return []
+        return [Self.unrepresentedActivity]
     }
 
     private mutating func parseAssistantMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         let payload = (json["message"] as? [String: Any]) ?? json
+        let unrepresentedStop = Self.hasUnrepresentedStopReason(payload)
         if !isSubagentMessage(json), let messageID = payload["id"] as? String { currentContentMessageID = messageID }
         if !isSubagentMessage(json) {
             if let model = Self.modelName(payload["model"]) { responseModel = model }
@@ -215,26 +221,26 @@ public struct ClaudeSDKNDJSONTranslator {
             )
         }()
         guard let content = payload["content"] as? [Any] else {
-            if let fallback = extractString(payload["content"]), !fallback.isEmpty {
-                var fallbackResults: [ClaudeProviderStreamResult] = []
-                if let usageResult {
-                    fallbackResults.append(usageResult)
-                }
-                fallbackResults.append(ClaudeProviderStreamResult(type: "content", text: fallback, contentMessageID: currentContentMessageID))
-                return fallbackResults
+            var fallbackResults = usageResult.map { [$0] } ?? []
+            if unrepresentedStop { fallbackResults.append(Self.unrepresentedActivity) }
+            if let text = payload["content"] as? String {
+                if !text.isEmpty { fallbackResults.append(ClaudeProviderStreamResult(type: "content", text: text, contentMessageID: currentContentMessageID)) }
+            } else {
+                fallbackResults.append(Self.unrepresentedActivity)
             }
-            if let usageResult {
-                return [usageResult]
-            }
-            return []
+            return fallbackResults
         }
 
         var results: [ClaudeProviderStreamResult] = []
+        if unrepresentedStop { results.append(Self.unrepresentedActivity) }
         if let usageResult {
             results.append(usageResult)
         }
         for item in content {
-            guard let block = item as? [String: Any], let type = block["type"] as? String else { continue }
+            guard let block = item as? [String: Any], let type = block["type"] as? String else {
+                results.append(Self.unrepresentedActivity)
+                continue
+            }
             #if DEBUG
                 if ClaudeReasoningExtractionFeature.isEnabled {
                     reasoningDebug("assistant content block type=\(type) keys=\(block.keys.sorted())")
@@ -242,12 +248,20 @@ public struct ClaudeSDKNDJSONTranslator {
             #endif
             switch type {
             case "text":
-                if let text = block["text"] as? String, !text.isEmpty {
+                guard let text = block["text"] as? String else {
+                    results.append(Self.unrepresentedActivity)
+                    continue
+                }
+                if !text.isEmpty {
                     results.append(ClaudeProviderStreamResult(type: "content", text: text, contentMessageID: currentContentMessageID))
                 }
             case "thinking":
+                guard let text = block["thinking"] as? String else {
+                    results.append(Self.unrepresentedActivity)
+                    continue
+                }
                 guard ClaudeReasoningExtractionFeature.isEnabled else { continue }
-                if let text = block["thinking"] as? String, !text.isEmpty {
+                if !text.isEmpty {
                     reasoningDebug("assistant thinking block mapped len=\(text.count) snippet=\(debugSnippet(text))")
                     results.append(ClaudeProviderStreamResult(type: "reasoning", text: nil, reasoning: text))
                 } else {
@@ -268,7 +282,7 @@ public struct ClaudeSDKNDJSONTranslator {
                         text: nil,
                         toolName: toolName,
                         toolArgs: inputJSON,
-                        toolInvocationID: invocationID,
+                        toolInvocationID: invocationID, claudeToolUseID: toolUseID,
                         toolArgsJSON: inputJSON
                     )
                 )
@@ -287,13 +301,13 @@ public struct ClaudeSDKNDJSONTranslator {
                         text: nil,
                         toolName: toolName,
                         toolOutput: output,
-                        toolInvocationID: invocationID,
+                        toolInvocationID: invocationID, claudeToolUseID: toolUseID,
                         toolResultJSON: output,
                         toolIsError: isError
                     )
                 )
             default:
-                continue
+                results.append(Self.unrepresentedActivity)
             }
         }
         return results
@@ -301,13 +315,22 @@ public struct ClaudeSDKNDJSONTranslator {
 
     private mutating func parseUserMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         let payload = (json["message"] as? [String: Any]) ?? json
-        guard let content = payload["content"] as? [Any] else { return [] }
+        guard let content = payload["content"] as? [Any], !content.isEmpty else { return [Self.unrepresentedActivity] }
+        // Preserve positive harness evidence; only the app's accepted same-run declaration can make it neutral.
+        if let synthetic = json["isSynthetic"] as? NSNumber, CFGetTypeID(synthetic) == CFBooleanGetTypeID(), synthetic.boolValue,
+           content.count == 1, let block = content[0] as? [String: Any], block["type"] as? String == "text",
+           let text = block["text"] as? String,
+           text.utf8.elementsEqual("[Your previous response had no visible output. Please continue and produce a user-visible response.]".utf8)
+        {
+            return [ClaudeProviderStreamResult(type: "harness_empty_output_reprompt_candidate", text: nil)]
+        }
         var results: [ClaudeProviderStreamResult] = []
         for item in content {
             guard let block = item as? [String: Any],
                   let type = block["type"] as? String,
                   type == "tool_result"
             else {
+                results.append(Self.unrepresentedActivity)
                 continue
             }
             let toolUseID = toolUseID(in: block)
@@ -324,7 +347,7 @@ public struct ClaudeSDKNDJSONTranslator {
                     text: nil,
                     toolName: toolName,
                     toolOutput: output,
-                    toolInvocationID: invocationID,
+                    toolInvocationID: invocationID, claudeToolUseID: toolUseID,
                     toolResultJSON: output,
                     toolIsError: isError
                 )
@@ -340,7 +363,7 @@ public struct ClaudeSDKNDJSONTranslator {
                     reasoningDebug("stream_event missing event object keys=\(json.keys.sorted())")
                 }
             #endif
-            return []
+            return [Self.unrepresentedActivity]
         }
         guard let eventType = event["type"] as? String else {
             #if DEBUG
@@ -348,7 +371,7 @@ public struct ClaudeSDKNDJSONTranslator {
                     reasoningDebug("stream_event missing event.type keys=\(event.keys.sorted())")
                 }
             #endif
-            return []
+            return [Self.unrepresentedActivity]
         }
         #if DEBUG
             if ClaudeReasoningExtractionFeature.isEnabled {
@@ -364,7 +387,7 @@ public struct ClaudeSDKNDJSONTranslator {
                         reasoningDebug("content_block_delta missing delta/type keys=\(event.keys.sorted())")
                     }
                 #endif
-                return []
+                return [Self.unrepresentedActivity]
             }
             #if DEBUG
                 if ClaudeReasoningExtractionFeature.isEnabled {
@@ -373,29 +396,45 @@ public struct ClaudeSDKNDJSONTranslator {
             #endif
             switch deltaType {
             case "text_delta":
-                if let text = delta["text"] as? String, !text.isEmpty {
+                guard let text = delta["text"] as? String else { return [Self.unrepresentedActivity] }
+                if !text.isEmpty {
                     return [ClaudeProviderStreamResult(type: "content", text: text, contentMessageID: currentContentMessageID)]
                 }
             case "thinking_delta":
+                guard let text = delta["thinking"] as? String else { return [Self.unrepresentedActivity] }
                 guard ClaudeReasoningExtractionFeature.isEnabled else { return [] }
-                if let text = delta["thinking"] as? String, !text.isEmpty {
+                if !text.isEmpty {
                     reasoningDebug("thinking_delta mapped len=\(text.count) snippet=\(debugSnippet(text))")
                     return [ClaudeProviderStreamResult(type: "reasoning", text: nil, reasoning: text)]
                 }
                 reasoningDebug("thinking_delta missing/empty thinking field deltaKeys=\(delta.keys.sorted())")
+            case "signature_delta":
+                // Known non-text output framing; an absent/malformed signature is not framing.
+                return delta["signature"] is String ? [] : [Self.unrepresentedActivity]
             default:
                 #if DEBUG
                     if ClaudeReasoningExtractionFeature.isEnabled {
                         reasoningDebug("unsupported content_block_delta deltaType=\(deltaType)")
                     }
                 #endif
+                return [Self.unrepresentedActivity]
             }
             return []
 
-        case "message_start":
-            guard !isSubagentMessage(json), let message = event["message"] as? [String: Any] else {
-                return []
+        case "content_block_start":
+            guard let block = event["content_block"] as? [String: Any] else { return [Self.unrepresentedActivity] }
+            switch block["type"] as? String {
+            case "text": return block["text"] is String ? [] : [Self.unrepresentedActivity]
+            case "thinking": return block["thinking"] is String ? [] : [Self.unrepresentedActivity]
+            default: return [Self.unrepresentedActivity]
             }
+
+        case "content_block_stop":
+            return []
+
+        case "message_start":
+            guard let message = event["message"] as? [String: Any] else { return [Self.unrepresentedActivity] }
+            guard !isSubagentMessage(json) else { return [] }
             if let messageID = message["id"] as? String { currentContentMessageID = messageID }
             if let model = Self.modelName(message["model"]) { responseModel = model }
             guard let usage = parseUsage(message["usage"] as? [String: Any]) else {
@@ -424,10 +463,15 @@ public struct ClaudeSDKNDJSONTranslator {
                     )
                 )
             }
+            guard let delta = event["delta"] as? [String: Any] else {
+                return [Self.unrepresentedActivity] + results
+            }
+            if Self.hasUnrepresentedStopReason(delta) {
+                results.append(Self.unrepresentedActivity)
+            }
             // A sub-agent's stop ends its own response, not one of this session's: forwarding it would
             // run this session's turn finalization mid-turn.
             if !isSubagentMessage(json),
-               let delta = event["delta"] as? [String: Any],
                let stopReason = firstString(in: delta, keys: ["stop_reason", "stopReason"]),
                !stopReason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
@@ -440,7 +484,7 @@ public struct ClaudeSDKNDJSONTranslator {
             return [ClaudeProviderStreamResult(type: "message_stop", text: nil)]
 
         default:
-            return []
+            return [Self.unrepresentedActivity]
         }
     }
 
@@ -453,7 +497,7 @@ public struct ClaudeSDKNDJSONTranslator {
         let invocationID = resolveInvocationID(for: toolUseID)
         let args = extractDictionary(json["tool_args"] ?? json["toolArgs"] ?? json["input"] ?? json["arguments"])
         let argsJSON = serializeJSONObjectString(args)
-        return [ClaudeProviderStreamResult(type: "tool_call", text: nil, toolName: toolName, toolArgs: argsJSON, toolInvocationID: invocationID, toolArgsJSON: argsJSON)]
+        return [ClaudeProviderStreamResult(type: "tool_call", text: nil, toolName: toolName, toolArgs: argsJSON, toolInvocationID: invocationID, claudeToolUseID: toolUseID, toolArgsJSON: argsJSON)]
     }
 
     private mutating func parseTopLevelToolResult(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
@@ -471,7 +515,7 @@ public struct ClaudeSDKNDJSONTranslator {
         )
         let invocationID = resolveInvocationID(for: toolUseID)
         let isError = inferToolResultError(from: json, toolName: toolName, resultPayload: resultPayload)
-        return [ClaudeProviderStreamResult(type: "tool_result", text: nil, toolName: toolName, toolOutput: output, toolInvocationID: invocationID, toolResultJSON: output, toolIsError: isError)]
+        return [ClaudeProviderStreamResult(type: "tool_result", text: nil, toolName: toolName, toolOutput: output, toolInvocationID: invocationID, claudeToolUseID: toolUseID, toolResultJSON: output, toolIsError: isError)]
     }
 
     private mutating func parseResultMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
@@ -498,6 +542,14 @@ public struct ClaudeSDKNDJSONTranslator {
             stopReason: stopReason,
             errors: resultErrors
         )
+        // Completion metadata cannot erase an unparseable result or a failed/refused close,
+        // even when a known abort artifact intentionally has no user-facing error string.
+        if resultSubtype != "success" || isError || Self.hasUnrepresentedStopReason(json)
+            || (json["result"] != nil && !(json["result"] is String))
+            || (shouldEmitResultError && shouldSuppressResultError)
+        {
+            results.append(Self.unrepresentedActivity)
+        }
         if shouldEmitResultError,
            !shouldSuppressResultError,
            let errorMessage = resultErrors.first,
@@ -536,7 +588,7 @@ public struct ClaudeSDKNDJSONTranslator {
             }
             return value
         }
-        guard !fragments.isEmpty else { return [] }
+        guard !fragments.isEmpty else { return [Self.unrepresentedActivity] }
         let text = fragments.joined(separator: " — ")
         return [ClaudeProviderStreamResult(type: "tool_progress", text: text, toolName: toolName)]
     }
@@ -567,20 +619,20 @@ public struct ClaudeSDKNDJSONTranslator {
             }
             return value
         }
-        guard !parts.isEmpty else { return [] }
+        guard !parts.isEmpty else { return [Self.unrepresentedActivity] }
         let text = parts.joined(separator: " — ")
         return [ClaudeProviderStreamResult(type: "auth_status", text: text)]
     }
 
     private mutating func parseToolUseSummaryMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
         guard let summary = firstString(in: json, keys: ["summary"]), !summary.isEmpty else {
-            return []
+            return [Self.unrepresentedActivity]
         }
         return [ClaudeProviderStreamResult(type: "system", text: "Tool summary — \(summary)")]
     }
 
     private mutating func parseRateLimitEventMessage(_ json: [String: Any]) -> [ClaudeProviderStreamResult] {
-        guard let info = json["rate_limit_info"] as? [String: Any] else { return [] }
+        guard let info = json["rate_limit_info"] as? [String: Any] else { return [Self.unrepresentedActivity] }
         let status = firstString(in: info, keys: ["status"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -591,8 +643,18 @@ public struct ClaudeSDKNDJSONTranslator {
         let fragments = ["Rate limit", status, rateLimitType, overageStatus]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        guard !fragments.isEmpty else { return [] }
+        guard !fragments.isEmpty else { return [Self.unrepresentedActivity] }
         return [ClaudeProviderStreamResult(type: "system", text: fragments.joined(separator: " — "))]
+    }
+
+    /// Only known normal/intermediate stops are framing. A refusal, truncation or unknown
+    /// provided reason must survive even when an outer result reports success.
+    private static func hasUnrepresentedStopReason(_ payload: [String: Any]) -> Bool {
+        ["stop_reason", "stopReason"].contains { key in
+            guard let value = payload[key], !(value is NSNull) else { return false }
+            guard let reason = value as? String else { return true }
+            return !["end_turn", "stop_sequence", "tool_use"].contains(reason)
+        }
     }
 
     private func firstString(in json: [String: Any], keys: [String]) -> String? {

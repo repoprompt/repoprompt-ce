@@ -257,13 +257,14 @@ final class CodexAppServerFramingTests: XCTestCase {
                 XCTAssertEqual(usage.totalTotalTokens, 456)
                 XCTAssertEqual(usage.modelContextWindow, 1000)
                 if let tokenEvent { await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(tokenEvent, session: session, sourceController: controller) }
+                XCTAssertEqual(session.quietLedger.candidateStartKey(owner: owner) != nil, includesTurnID, "Unscoped replay vetoes before ordinary terminal settlement")
                 _ = await AgentRunTerminalCommitBarrier().commit(.init(
                     binding: harness.hooks.bindTerminalSession(session), ownership: owner, expectedRunID: runID,
                     terminalState: .completed, source: "buffered-token-scope", attachmentDisposition: .deleteFiles,
                     finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: false, classifiesQuietCheckIn: true
                 ))
-                XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: includesTurnID ? 0 : 1))
-                XCTAssertEqual(session.quietLedger.hiddenSourceIDs.contains(wakeID), includesTurnID)
+                XCTAssertEqual(session.quietLedger.facts, .init(settledThrough: 1, ordinaryThrough: 1), "Scoped token replay is not a quiet declaration")
+                XCTAssertFalse(session.quietLedger.hiddenSourceIDs.contains(wakeID))
                 let pending = await client.debugPendingRequestCount()
                 let timers = await client.debugTimeoutTaskCount()
                 XCTAssertEqual(pending, 0)

@@ -1104,6 +1104,14 @@ final class MCPServerViewModel: ObservableObject {
                 await resolveAgentSessionLinkObserverEndpoint(metadata: metadata, targetWindow: targetWindow)
             },
             captureCallOrigin: { AgentSelfMCPCallOrigin.current },
+            enterNoop: { window, origin, invocationID, argumentsAreEmpty in
+                window.agentModeViewModel.enterSelfNoopBody(
+                    origin: origin, invocationID: invocationID, argumentsAreEmpty: argumentsAreEmpty
+                )
+            },
+            acceptNoop: { window, origin, endpoint, invocationID in
+                window.agentModeViewModel.acceptSelfNoopBody(origin: origin, endpoint: endpoint, invocationID: invocationID)
+            },
             readSelf: { window, endpoint, origin in
                 window.agentModeViewModel.agentSelfContextSnapshot(endpoint: endpoint, origin: origin)
             },
@@ -1443,7 +1451,13 @@ final class MCPServerViewModel: ObservableObject {
         },
         executeAgentSelf: { [weak self] args in
             guard let self else {
+                if MCPInvocationContextBridge.current?.toolName == MCPWindowToolName.selfNoop {
+                    throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
+                }
                 throw MCPError.internalError("Window deallocated while executing self_compact")
+            }
+            if MCPInvocationContextBridge.current?.toolName == MCPWindowToolName.selfNoop {
+                return try await agentSelfToolService.executeNoop(args: args)
             }
             return try await agentSelfToolService.execute(args: args)
         },
@@ -3879,6 +3893,7 @@ final class MCPServerViewModel: ObservableObject {
         // `manage_worktree` uses the same proof to defer a session's own worktree switch to the
         // terminal boundary of exactly this turn.
         let selfCallOrigin: AgentSelfMCPCallOrigin? = if name == MCPWindowToolName.agentSelf
+            || name == MCPWindowToolName.selfNoop
             || name == MCPWindowToolName.manageWorktree,
             let context = resolvedContext?.snapshot,
             let runID = context.runID,

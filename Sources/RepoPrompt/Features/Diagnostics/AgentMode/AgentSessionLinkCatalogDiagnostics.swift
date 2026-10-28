@@ -176,6 +176,19 @@ enum AgentSessionLinkCatalogDiagnostics {
         ))
     }
 
+    typealias ReturnedDefinition = AgentSessionLinkReturnedDefinition
+
+    /// One bounded record at an attempt's final qualification; never input to the decision.
+    @discardableResult
+    static func quietQualification(
+        tabID: UUID, reserved: Bool, candidate: Bool, routingGeneration: UInt64?,
+        definition: ReturnedDefinition, serverProof: Bool, ordinary: Bool, qualified: Bool
+    ) -> Bool {
+        guard logger.isEnabled(type: .default) else { return false }
+        logger.notice("event=quiet-qualification tab=\(hashedID(tabID), privacy: .public) reserved=\(reserved, privacy: .public) candidate=\(candidate, privacy: .public) routingGeneration=\(routingGeneration.map(String.init) ?? "nil", privacy: .public) definition=\(definition.rawValue, privacy: .public) serverProof=\(serverProof, privacy: .public) ordinaryOccurrence=\(ordinary, privacy: .public) qualified=\(qualified, privacy: .public)")
+        return true
+    }
+
     static func toolCallReceived(runID: UUID?, tabID: UUID?, connectionID: UUID) {
         emit(Record(
             event: .toolCallReceived,
@@ -235,6 +248,11 @@ struct AppAgentSessionLinkCatalogEventSink: AgentSessionLinkCatalogEventSink {
             AgentSessionLinkCatalogDiagnostics.repairTransition(runID: runID, tabID: tabID, outcome: outcome)
         case let .toolCallReceived(runID, tabID, connectionID):
             AgentSessionLinkCatalogDiagnostics.toolCallReceived(runID: runID, tabID: tabID, connectionID: connectionID)
+        case let .quietQualification(tabID, reserved, candidate, routingGeneration, definition, serverProof, ordinary, qualified):
+            AgentSessionLinkCatalogDiagnostics.quietQualification(
+                tabID: tabID, reserved: reserved, candidate: candidate, routingGeneration: routingGeneration,
+                definition: definition, serverProof: serverProof, ordinary: ordinary, qualified: qualified
+            )
         }
     }
 }

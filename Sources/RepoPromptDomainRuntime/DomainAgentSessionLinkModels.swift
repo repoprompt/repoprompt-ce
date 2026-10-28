@@ -1142,3 +1142,26 @@ package struct DomainAgentSessionLinkAuthoritySnapshot: Equatable, Sendable {
         self.retainedSendOutcomeCount = retainedSendOutcomeCount
     }
 }
+
+/// Process-local cumulative proof. Unknown is represented by nil, never saturated fresh facts.
+package struct AgentRunQuietFacts: Equatable, Hashable, Sendable {
+    package let settledThrough: UInt64
+    package let ordinaryThrough: UInt64
+
+    package init?(settledThrough: UInt64, ordinaryThrough: UInt64) {
+        guard ordinaryThrough <= settledThrough else { return nil }
+        self.settledThrough = settledThrough
+        self.ordinaryThrough = ordinaryThrough
+    }
+
+    package static let zero = AgentRunQuietFacts(settledThrough: 0, ordinaryThrough: 0)!
+}
+
+/// Private, process-local accepted publication. Authority transports facts without interpreting them.
+/// Canonicalization (including idleSince) and source acceptance are one actor transaction.
+package struct DomainAgentSessionLinkObservationEnvelope: Sendable {
+    package let endpoint: DomainAgentSessionLinkEndpointIdentity
+    package let sourcePublicationSequence: UInt64
+    package let snapshot: DomainAgentSessionObservationSnapshot
+    package let runFacts: AgentRunQuietFacts?
+}

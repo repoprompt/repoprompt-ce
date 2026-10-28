@@ -150,6 +150,21 @@ final class AgentRunTerminalCommitBarrier {
             assertionFailure("Terminal commit requires a terminal run state")
             return nil
         }
+        // Await only the existing completed-declaration FIFO before acquiring terminal ownership.
+        // A reentrant Stop must be free to settle through this same lifecycle while delivery is
+        // queued. The full duplicate/owner/run/drain prologue below revalidates after the await;
+        // no pending-terminal queue or retry authority is introduced.
+        var observationCutAllowsQuiet = true
+        if request.terminalState == .completed, request.classifiesQuietCheckIn,
+           !lifecycle.terminalCommitInProgress,
+           lifecycle.lastTerminalCommitRevision?.ownership != request.ownership,
+           validatesOwnership(request),
+           binding.providerDrainGeneration == request.providerDrainGeneration,
+           request.providerBuffersAreDrained(),
+           let flush = binding.hooks.flushQuietToolObservations
+        {
+            observationCutAllowsQuiet = await flush()
+        }
         guard !lifecycle.terminalCommitInProgress else {
             recordRejection("commit_in_progress", request: request)
             return nil
@@ -218,6 +233,18 @@ final class AgentRunTerminalCommitBarrier {
             return nil
         }
 
+        // The pre-acquisition FIFO cut precedes generic cleanup, which could otherwise terminalize
+        // an undelivered native placeholder. Synchronous cleanup cannot confer owner/drain authority.
+        guard validatesOwnership(request),
+              binding.providerDrainGeneration == request.providerDrainGeneration,
+              request.providerBuffersAreDrained()
+        else {
+            lifecycle.abortTerminalCommit()
+            recordTerminalBarrierState(false, request: request)
+            recordRejection("ownership_or_drain_changed_before_commit", request: request)
+            return nil
+        }
+
         binding.hooks.finalizeStreamingItems()
         binding.hooks.finalizePendingToolCalls(request.terminalState)
         if request.finalizeNonCodexUsage {
@@ -260,6 +287,8 @@ final class AgentRunTerminalCommitBarrier {
             binding.appendError(errorText)
         }
 
+        // Cleanup hooks cannot confer seal authority. Repeat the exact owner/provider-drain fence
+        // immediately before the mandatory complete-association check and synchronous classification.
         guard validatesOwnership(request),
               binding.providerDrainGeneration == request.providerDrainGeneration,
               request.providerBuffersAreDrained()
@@ -271,7 +300,8 @@ final class AgentRunTerminalCommitBarrier {
         }
 
         binding.hooks.sealQuietCheckIn(
-            request.ownership, request.terminalState, request.classifiesQuietCheckIn,
+            request.ownership, request.terminalState,
+            request.classifiesQuietCheckIn && observationCutAllowsQuiet && binding.hooks.quietToolObservationsAreComplete(),
             queuedInstruction != nil || providerSuccessor != nil
         )
         let attemptTeardown = lifecycle.claimTerminalTeardown(

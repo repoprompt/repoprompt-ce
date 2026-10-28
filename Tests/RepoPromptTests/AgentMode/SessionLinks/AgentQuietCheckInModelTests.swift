@@ -32,6 +32,11 @@ final class AgentQuietCheckInModelTests: XCTestCase {
     private func replay(_ events: [Event], harness: AgentSessionLinkRunnerHarness) async -> String? {
         typealias Notices = AgentSessionLinkPassiveStatusNotices
         let session = harness.makeSession(agent: .codexExec)
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID()))
+        session.appendItem(.user("Existing ordinary request", sequenceIndex: 0))
+        session.appendItem(.assistant("Existing ordinary conclusion", sequenceIndex: 1))
+        session.runState = .completed
+        harness.host.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
         let observer = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: UUID())
         let target = AgentSessionLinkIdentityTestSupport.endpoint(sessionID: UUID(), windowID: 2)
         let reference = DomainAgentSessionLinkReference(linkID: UUID(), generation: 1)
@@ -59,7 +64,13 @@ final class AgentQuietCheckInModelTests: XCTestCase {
             switch event.operation {
             case 0 ... 5:
                 let previousIDs = session.liveItemIDs
-                _ = await AgentQuietCheckInReplay.settle(session, harness: harness, form: event.operation, wakeID: event.identity)
+                if event.operation < 2 {
+                    if let failure = await settleCertified(session, harness: harness, closingText: event.operation == 1, wakeID: event.identity) {
+                        return failure
+                    }
+                } else {
+                    _ = await AgentQuietCheckInReplay.settle(session, harness: harness, form: event.operation, wakeID: event.identity)
+                }
                 attempts.append(event.identity)
                 if event.operation < 2 {
                     quietRows.formUnion(session.liveItemIDs.subtracting(previousIDs))
@@ -107,7 +118,12 @@ final class AgentQuietCheckInModelTests: XCTestCase {
             } else { return "known baseline position lost" }
             let base = AgentTranscriptProjectionBuilder.build(from: AgentTranscriptIO.buildTranscript(from: session.items, compact: false))
             let snapshot = AgentTranscriptPresentationSnapshot(revision: 1, visibleBlocks: base.workingBlocks, workingBlocks: base.workingBlocks, visibleRows: base.workingRows, workingRows: base.workingRows, rowAnchorIndex: base.rowAnchorIndex, anchorBlockIndex: base.anchorBlockIndex)
-            let mask = AgentTranscriptProjectionBuilder.maskForLocalDisplay(snapshot, archivedBlocks: [], hiddenSourceIDs: session.quietLedger.hiddenSourceIDs)
+            // Saved certification owns exact member rows; the ledger's hiddenSourceIDs now
+            // tracks host-marker producers, not those member identities. Keep this component
+            // oracle independent: expected membership comes from the event's appended IDs.
+            let certifiedRows = Set(session.items.filter { $0.quietCheckInWakeID != nil }.map(\.id))
+            if certifiedRows != quietRows { return "certified members differ from quiet-attempt row identities" }
+            let mask = AgentTranscriptProjectionBuilder.maskForLocalDisplay(snapshot, archivedBlocks: [], hiddenSourceIDs: certifiedRows)
             let expectedVisible = Set(base.workingRows.map(\.id)).subtracting(quietRows)
             if Set(mask.presentation.visibleRows.map(\.id)) != expectedVisible { return "display differs from quiet-attempt row identities" }
         }
@@ -118,6 +134,51 @@ final class AgentQuietCheckInModelTests: XCTestCase {
             reducer.apply(receipt)
         }
         if !reducer.snapshot.entries.isEmpty { return "successful final drain left represented work" }
+        return nil
+    }
+
+    /// Model events use the explicit declaration seam, not the retired silence/ack heuristic.
+    /// The registered-body route has separate integration coverage; this model supplies an exact
+    /// accepted origin/canonical pair and lets the real terminal barrier certify (or reject) it.
+    private func settleCertified(
+        _ session: AgentTabSession,
+        harness: AgentSessionLinkRunnerHarness,
+        closingText: Bool,
+        wakeID: UUID
+    ) async -> String? {
+        if session.runID == nil { session.installRunID(UUID()) }
+        harness.host.refreshDerivedTranscriptState(for: session, publishActivePresentation: false)
+        // Like the authoritative dispatch owner, capture the completed ordinary baseline
+        // before publishing running state; an active turn cannot furnish that baseline.
+        let owner = session.beginRunAttempt(source: "certified-model-replay")
+        guard session.quietLedger.baseline(owner: owner) != nil else { return "completed model baseline unavailable" }
+        session.runState = .running
+        session.quietLedger.recordPhysicalDispatch(owner: owner, wakeID: wakeID, routineQuietCheckIn: true, alreadyAcquired: false, sourceRevision: session.sourceItemsRevision)
+        guard let binding = session.persistentSessionBindingIdentity, let runID = session.runID,
+              let endpoint = try? DomainAgentSessionLinkEndpointIdentity(
+                  windowID: 1, workspaceID: UUID(), tabID: session.tabID, sessionID: binding.sessionID,
+                  persistentBindingGeneration: binding.generation, bindingTransitionGeneration: session.bindingTransitionGeneration
+              )
+        else { return "explicit declaration origin unavailable" }
+        let invocationID = UUID()
+        guard session.quietLedger.enterDeclarationBody(owner: owner, hostInvocationID: invocationID),
+              session.quietLedger.acceptDeclarationBody(
+                  owner: owner, hostInvocationID: invocationID, wakeID: wakeID,
+                  origin: .init(endpoint: endpoint, runID: runID, runAttemptID: owner.attemptID),
+                  currentEndpoint: endpoint, currentRunID: runID
+              )
+        else { return "explicit declaration body rejected" }
+        session.appendItem(.toolCall(name: "self_noop", invocationID: invocationID, argsJSON: "{}", sequenceIndex: session.nextSequenceIndex))
+        session.appendItem(.toolResult(name: "self_noop", invocationID: invocationID, resultJSON: "{\"result\":\"done\"}", isError: false, sequenceIndex: session.nextSequenceIndex))
+        if closingText {
+            session.noteAcceptedStream(.init(type: "content", text: "Certified closing"), owner: owner)
+            session.appendItem(.assistant("Certified closing", sequenceIndex: session.nextSequenceIndex))
+        }
+        _ = await AgentRunTerminalCommitBarrier().commit(.init(
+            binding: harness.hooks.bindTerminalSession(session), ownership: owner, expectedRunID: runID,
+            terminalState: .completed, source: "certified-model-replay", attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false, supportsFollowUp: false, notifyTurnComplete: true, classifiesQuietCheckIn: true
+        ))
         return nil
     }
 

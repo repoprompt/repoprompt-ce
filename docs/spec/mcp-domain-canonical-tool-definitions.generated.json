@@ -2371,6 +2371,21 @@
     },
     {
       "annotations" : {
+
+      },
+      "description" : "Quietly close a routine wake that needs nothing.",
+      "inputSchema" : {
+        "additionalProperties" : false,
+        "properties" : {
+
+        },
+        "type" : "object"
+      },
+      "isEnabledByDefault" : true,
+      "name" : "self_noop"
+    },
+    {
+      "annotations" : {
         "destructiveHint" : false,
         "openWorldHint" : false,
         "readOnlyHint" : false

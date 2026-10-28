@@ -76,6 +76,9 @@ final class AgentSessionLinkRunnerHarness {
     /// view-model seam does. This lets adapter tests exercise required-claim refusal at the physical
     /// provider boundary without duplicating runner logic.
     var forcedAutoWakeID: UUID?
+    /// Fake exact-returned support at reservation and final provider handoff.
+    var routineQuietCheckIn = false
+    var beforeProviderInputProof: (() async -> Void)?
     var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
     private var workspaces: [WorkspaceManagerViewModel] = []
 
@@ -87,7 +90,9 @@ final class AgentSessionLinkRunnerHarness {
         sessionLinkHost: AgentModeViewModel? = nil,
         replayTranscript: Bool = false,
         codexController: (any CodexSessionControlling)? = nil,
-        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil
+        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
+        testWindowID: Int = 1,
+        testMCPServer: MCPServerViewModel? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -109,14 +114,15 @@ final class AgentSessionLinkRunnerHarness {
         }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = { true }
         let host = AgentModeViewModel(
-            testWindowID: 1,
+            testWindowID: testWindowID,
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in codexController },
             claudeControllerFactory: claudeControllerFactory,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             connectionPolicyInstaller: policyInstaller,
-            mcpServerEnabler: serverEnabler
+            mcpServerEnabler: serverEnabler,
+            testMCPServer: testMCPServer
         )
         self.host = host
 
@@ -222,7 +228,8 @@ final class AgentSessionLinkRunnerHarness {
                             dispatchID: effectiveDispatchID,
                             epoch: harnessBox.promptEpoch,
                             inventory: harnessBox.inventory,
-                            passiveNotices: harnessBox.passiveNotices
+                            passiveNotices: harnessBox.passiveNotices,
+                            routineQuietCheckIn: harnessBox.routineQuietCheckIn
                         ) { request in
                             AgentSessionLinkPrompts.rendered(request)
                         }
@@ -247,6 +254,7 @@ final class AgentSessionLinkRunnerHarness {
                     }
                 },
                 proveAgentSessionLinkProviderInput: { session, claim in
+                    await harnessBox?.beforeProviderInputProof?()
                     if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
                         return await host.agentSessionLinkProveProviderInput(for: session, claim: claim)
                     }
@@ -259,7 +267,15 @@ final class AgentSessionLinkRunnerHarness {
                     return AgentSessionLinkProviderInputRelease.handoff(
                         original: claim,
                         proof: proof,
-                        current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed },
+                        current: {
+                            guard let harnessBox else { return .nothingOwed }
+                            let effectiveID = harnessBox.forcedAutoWakeID.map { AgentSessionLinkPromptDispatchID.autoWake(wakeID: $0) } ?? dispatchID
+                            return harnessBox.claimStore.claimOutcome(
+                                dispatchID: effectiveID, epoch: harnessBox.promptEpoch, inventory: harnessBox.inventory,
+                                passiveNotices: harnessBox.passiveNotices, routineQuietCheckIn: harnessBox.routineQuietCheckIn,
+                                render: AgentSessionLinkPrompts.rendered
+                            )
+                        },
                         isPending: { _ in true },
                         consume: { _ in false }
                     )

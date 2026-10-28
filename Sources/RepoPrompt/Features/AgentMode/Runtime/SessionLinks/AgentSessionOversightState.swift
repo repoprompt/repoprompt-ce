@@ -23,7 +23,13 @@ import RepoPromptDomainRuntime
 /// prove no transport call happened.
 struct AgentSessionOversightState {
     /// Session-incarnation opt-in only. Never saved, restored, or cleared by ordinary unlink.
-    var overseerActivation: AgentSessionOverseerActivation?
+    var overseerActivation: AgentSessionOverseerActivation? {
+        willSet {
+            if overseerActivation != newValue {
+                ServerNetworkManager.catalogAdvertisementDidChange()
+            }
+        }
+    }
 
     // MARK: Durable Auto-wake selection
 

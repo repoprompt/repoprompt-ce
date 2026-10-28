@@ -499,6 +499,7 @@ final class CodexNativeSessionController {
             case commandOrProcessOutput = "command-or-process-output"
             case processExited = "process-exited"
             case hookLifecycle = "hook-lifecycle"
+            case protocolMetadata = "protocol-metadata"
             case warning
             case deprecationNotice = "deprecation-notice"
             case serverRequestResolved = "server-request-resolved"
@@ -537,6 +538,13 @@ final class CodexNativeSessionController {
 
     typealias ChatgptAuthTokensRefreshHandler = @Sendable (ChatgptAuthTokensRefreshRequest) async throws -> ChatgptAuthTokensRefreshResponse
 
+    /// Original MCP item.id from the pinned native stream, alongside the local display UUID.
+    struct MCPToolIdentity: Equatable {
+        let callID: String
+        let threadID: String?
+        let turnID: String?
+    }
+
     enum Event {
         case assistantDelta(String)
         case canonicalAssistantDelta(text: String, scope: ItemScope)
@@ -552,8 +560,8 @@ final class CodexNativeSessionController {
         case requestUserInput(AgentRequestUserInputRequest)
         case mcpElicitationRequest(AgentMCPElicitationRequest)
         case serverRequestIssue(ServerRequestIssue)
-        case toolCall(name: String, invocationID: UUID?, argsJSON: String?)
-        case toolResult(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?)
+        case toolCall(name: String, invocationID: UUID?, argsJSON: String?, mcpIdentity: MCPToolIdentity? = nil)
+        case toolResult(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?, mcpIdentity: MCPToolIdentity? = nil)
         case commandExecutionRunning(CommandExecutionRunningUpdate)
         case livenessActivity(LivenessActivity)
         case errorNotification(ErrorNotification)
@@ -3560,8 +3568,35 @@ final class CodexNativeSessionController {
         // Preserve semantic/unknown activity before item/tool deduplication or malformed-payload
         // early returns. Reuse the existing scoped non-rendering liveness channel; no history or
         // extra event registry. The coordinator applies its current controller/turn acceptance.
-        if hasUnrepresentedQuietActivity(method: notification.method, params: params) {
-            await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+        // A validated MCP item is represented by the typed tool event below, not an opaque
+        // warning as well. This is semantic coverage, not a quiet/neutral method exception:
+        // the ordinary coordinator still records toolActivity for that event.
+        let representedMCPToolEvent: ToolLifecycleEvent? = {
+            guard let item = Self.canonicalItem(from: params),
+                  Self.canonicalItemScope(from: params, item: item) != nil,
+                  item["id"] is String,
+                  ["mcptoolcall", "mcp_tool_call"].contains(normalizedTypeString(from: item)),
+                  item["arguments"] is [String: Any] || item["arguments"] is NSNull else { return nil }
+            let status = item["status"] as? String
+            if notification.method == "item/started" {
+                guard status == "inProgress" else { return nil }
+            } else if notification.method == "item/completed" {
+                guard (status == "completed" && (item["result"] as? [String: Any])?["content"] is [Any])
+                    || (status == "failed" && (item["result"] is [String: Any] || item["error"] is [String: Any])) else { return nil }
+            } else { return nil }
+            return parseCanonicalMCPToolLifecycleEvent(method: notification.method, item: item)
+        }()
+        // Ordinary decoding owns positively recognized metadata. Unknown/malformed packets
+        // still fall through to negative evidence; a method namespace is never sufficient.
+        let livenessActivity = Self.parseLivenessActivity(method: notification.method, params: params)
+        if let representedMCPToolEvent, case let .result(_, _, _, _, isError, _) = representedMCPToolEvent, isError != false {
+            // A failed or indeterminate mirror remains evidence even if its successful item
+            // was already rendered and the unchanged lifecycle deduplication drops this update.
+            await emitUnrepresentedActivity(method: notification.method, params: params)
+        } else if representedMCPToolEvent == nil, livenessActivity?.kind != .protocolMetadata,
+                  hasUnrepresentedActivity(method: notification.method, params: params)
+        {
+            await emitUnrepresentedActivity(method: notification.method, params: params)
         }
         switch notification.method {
         case "turn/started", "codex/event/turn_started":
@@ -3679,7 +3714,7 @@ final class CodexNativeSessionController {
                   params["itemId"] == nil || params["itemId"] is String,
                   let scope = Self.canonicalItemScope(from: params)
             else {
-                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                await emitUnrepresentedActivity(method: notification.method, params: params)
                 break
             }
             guard !completedCanonicalItemScopes.contains(scope) else { break }
@@ -3772,7 +3807,7 @@ final class CodexNativeSessionController {
                   params["itemId"] == nil || params["itemId"] is String,
                   let scope = Self.canonicalItemScope(from: params)
             else {
-                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                await emitUnrepresentedActivity(method: notification.method, params: params)
                 break
             }
             guard !completedCanonicalItemScopes.contains(scope) else { break }
@@ -3791,7 +3826,7 @@ final class CodexNativeSessionController {
                   params["itemId"] == nil || params["itemId"] is String,
                   let scope = Self.canonicalItemScope(from: params)
             else {
-                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                await emitUnrepresentedActivity(method: notification.method, params: params)
                 break
             }
             guard !completedCanonicalItemScopes.contains(scope) else { break }
@@ -3850,11 +3885,14 @@ final class CodexNativeSessionController {
                 } else if completedCanonicalItemScopes.contains(scope) {
                     return
                 }
-                if let toolEvent = parseCanonicalMCPToolLifecycleEvent(
+                if let toolEvent = representedMCPToolEvent ?? parseCanonicalMCPToolLifecycleEvent(
                     method: method,
                     item: item ?? [:]
                 ) {
-                    await emitToolLifecycleEvent(toolEvent, method: method)
+                    let mcpIdentity = (item?["id"] as? String).map {
+                        MCPToolIdentity(callID: $0, threadID: Self.notificationThreadID(from: params), turnID: scope.turnID)
+                    }
+                    await emitToolLifecycleEvent(toolEvent, method: method, mcpIdentity: mcpIdentity)
                 }
                 return
             }
@@ -3869,7 +3907,7 @@ final class CodexNativeSessionController {
                 let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
                 Self.logCodexDebug("[CodexNativeController] fileChangeOutputDelta invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) result=\(Self.debugPreview(resultJSON))")
                 guard emitted else {
-                    await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                    await emitUnrepresentedActivity(method: notification.method, params: params)
                     break
                 }
                 await emit(.toolResult(
@@ -3880,7 +3918,7 @@ final class CodexNativeSessionController {
                     isError: isError
                 ))
             } else {
-                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                await emitUnrepresentedActivity(method: notification.method, params: params)
             }
         case "codex/event/exec_command_begin":
             if let beginEvent = parseExecCommandBeginEvent(params: params) {
@@ -3934,7 +3972,7 @@ final class CodexNativeSessionController {
         case "item/commandExecution/outputDelta":
             let itemID = commandExecutionItemID(from: params)
             guard shouldAcceptCommandExecutionEvent(itemID: itemID, family: .normalized) else {
-                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                await emitUnrepresentedActivity(method: notification.method, params: params)
                 break
             }
             if let update = parseCommandExecutionRunningUpdateFromNotification(
@@ -3944,7 +3982,7 @@ final class CodexNativeSessionController {
                 Self.logCodexDebug("[CodexNativeController] runningUpdate method=\(notification.method) invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
                 await emit(.commandExecutionRunning(update))
             } else {
-                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                await emitUnrepresentedActivity(method: notification.method, params: params)
             }
         case "item/commandExecution/terminalInteraction":
             let itemID = commandExecutionItemID(from: params)
@@ -3985,12 +4023,13 @@ final class CodexNativeSessionController {
             {
                 break
             }
+            let mcpIdentity = legacyMCPItemID.map { MCPToolIdentity(callID: $0, threadID: Self.notificationThreadID(from: params), turnID: notifiedTurnID) }
             if let toolEvent = parseRawMCPToolLifecycleEvent(method: notification.method, params: params) {
                 switch toolEvent {
                 case let .call(name, invocationID, argsJSON, dedupKey):
                     let emitted = markToolEventEmitted(key: "call:\(dedupKey)")
                     guard emitted else { break }
-                    await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON))
+                    await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON, mcpIdentity: mcpIdentity))
                 case let .result(name, invocationID, argsJSON, resultJSON, isError, dedupKey):
                     let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
                     guard emitted else { break }
@@ -3999,7 +4038,8 @@ final class CodexNativeSessionController {
                         invocationID: invocationID,
                         argsJSON: argsJSON,
                         resultJSON: resultJSON,
-                        isError: isError
+                        isError: isError,
+                        mcpIdentity: mcpIdentity
                     ))
                     if Self.normalizedExternalToolName(name) != "bash",
                        let runningUpdate = Self.commandExecutionRunningUpdate(
@@ -4040,13 +4080,13 @@ final class CodexNativeSessionController {
                 await emit(.errorNotification(errorNotification))
             }
         default:
-            if let activity = Self.parseLivenessActivity(method: notification.method, params: params) {
-                await emit(.livenessActivity(activity))
+            if let livenessActivity {
+                await emit(.livenessActivity(livenessActivity))
             }
         }
     }
 
-    private func emitUnrepresentedQuietActivity(method: String, params: [String: Any]) async {
+    private func emitUnrepresentedActivity(method: String, params: [String: Any]) async {
         await emit(.livenessActivity(.init(
             kind: .warning, method: method,
             threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
@@ -4054,7 +4094,7 @@ final class CodexNativeSessionController {
         )))
     }
 
-    private func hasUnrepresentedQuietActivity(method: String, params: [String: Any]) -> Bool {
+    private func hasUnrepresentedActivity(method: String, params: [String: Any]) -> Bool {
         if Self.isItemLifecycleNotificationMethod(method) {
             guard let item = Self.canonicalItem(from: params),
                   Self.canonicalItemScope(from: params, item: item) != nil
@@ -4064,18 +4104,16 @@ final class CodexNativeSessionController {
                 // Canonical prompt echo; accepted task input is latched by the host before send.
                 return !(item["content"] is [Any])
             }
-            if method == "item/completed" {
-                switch type {
-                case "agentmessage", "agent_message":
-                    // Required by the pinned schema; rendering fallbacks must not prove silence.
-                    return !(item["text"] is String)
-                case "reasoning":
-                    // Absent arrays default to empty; present arrays must contain only strings.
-                    return ["summary", "content"].contains { key in
-                        item[key] != nil && !(item[key] is [String])
-                    }
-                default: break
+            switch type {
+            case "agentmessage", "agent_message":
+                // Required on both lifecycle phases. Rendering fallbacks cannot prove silence.
+                return !(item["text"] is String)
+            case "reasoning":
+                // Absent arrays default to empty; present arrays must contain only strings.
+                return ["summary", "content"].contains { key in
+                    item[key] != nil && !(item[key] is [String])
                 }
+            default: break
             }
             return !["agentmessage", "agent_message", "reasoning"].contains(type)
         }
@@ -4084,12 +4122,9 @@ final class CodexNativeSessionController {
             let turn = params["turn"] as? [String: Any]
             return turn?["status"] as? String != "completed"
         case "codex/event/agent_message":
+            let message = (params["msg"] as? [String: Any])?["message"]
             return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
-        case "turn/moderationMetadata":
-            // v0.160.1 protocol metadata is arbitrary JSON, not semantic turn activity.
-            // Require the canonical envelope; malformed ingress must remain fail-visible.
-            return Self.turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) == nil
-                || params["metadata"] == nil
+                || !(message is String || params["message"] is String)
         case "rawResponseItem/completed":
             return hasUnrepresentedRawResponseItem(params)
         case "rawResponse/completed":
@@ -4117,9 +4152,11 @@ final class CodexNativeSessionController {
         case "item/mcpToolCall/progress", "item/plan/delta", "turn/diff/updated":
             return Self.parseLivenessActivity(method: method, params: params) == nil
         case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
-            // A valid tool event already reaches typed activity before UI suppression. Only a
-            // malformed envelope needs the uncertainty fallback; preserve the existing first event.
-            return parseRawMCPToolLifecycleEvent(method: method, params: params) == nil
+            // Valid successful events reach typed activity. Preserve malformed or failed evidence
+            // here as well, before completed-scope and tool-result deduplication can discard it.
+            guard let event = parseRawMCPToolLifecycleEvent(method: method, params: params) else { return true }
+            if case let .result(_, _, _, _, isError, _) = event { return isError != false }
+            return false
         case "turn/started", "codex/event/turn_started",
              "codex/event/task_complete", "item/agentMessage/delta",
              "item/reasoning/summaryTextDelta", "item/reasoning/textDelta",
@@ -4266,9 +4303,9 @@ final class CodexNativeSessionController {
             method: method,
             threadID: notificationThreadID(from: params),
             turnID: notificationTurnID(from: params),
-            itemID: notificationItemID(from: params),
-            activeFlags: notificationActiveFlags(from: params),
-            message: firstString(
+            itemID: kind == .protocolMetadata ? nil : notificationItemID(from: params),
+            activeFlags: kind == .protocolMetadata ? [] : notificationActiveFlags(from: params),
+            message: kind == .protocolMetadata ? nil : firstString(
                 in: params,
                 keys: ["message", "warning", "text", "reason", "description", "detail"]
             )
@@ -4277,6 +4314,14 @@ final class CodexNativeSessionController {
 
     private static func livenessActivityKind(for method: String, params: [String: Any]) -> LivenessActivity.Kind? {
         switch method {
+        case "turn/moderationMetadata":
+            // Pinned v0.159.0: this variant carries arbitrary JSON, not a ResponseItem.
+            // Null is valid; missing metadata or scope is not a decoded notification.
+            turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) != nil
+                && params["metadata"] != nil ? .protocolMetadata : nil
+        case "thread/settings/updated":
+            nonEmptyString(params["threadId"] as? String) != nil
+                && isThreadSettingsMetadata(params["threadSettings"]) ? .protocolMetadata : nil
         case "thread/status/changed":
             .threadStatusChanged
         case "turn/plan/updated":
@@ -4302,6 +4347,26 @@ final class CodexNativeSessionController {
         default:
             nil
         }
+    }
+
+    /// Decode the required snapshot structure, not settings policy or model-output content.
+    /// Optional/future settings are not applied here. Incomplete envelopes retain uncertainty.
+    private static func isThreadSettingsMetadata(_ value: Any?) -> Bool {
+        guard let settings = value as? [String: Any],
+              ["cwd", "model", "modelProvider", "approvalsReviewer"].allSatisfy({ nonEmptyString(settings[$0] as? String) != nil }),
+              let approvalPolicy = settings["approvalPolicy"],
+              nonEmptyString(approvalPolicy as? String) != nil || (approvalPolicy as? [String: Any])?.isEmpty == false,
+              let sandbox = settings["sandboxPolicy"] as? [String: Any], nonEmptyString(sandbox["type"] as? String) != nil,
+              let collaboration = settings["collaborationMode"] as? [String: Any], nonEmptyString(collaboration["mode"] as? String) != nil,
+              let collaborationSettings = collaboration["settings"] as? [String: Any], nonEmptyString(collaborationSettings["model"] as? String) != nil
+        else { return false }
+        let optionalStrings = ["serviceTier", "effort", "summary", "personality"]
+        guard optionalStrings.allSatisfy({ settings[$0] == nil || settings[$0] is NSNull || settings[$0] is String }),
+              settings["multiAgentMode"] == nil || settings["multiAgentMode"] is String,
+              settings["disabledPluginIds"] == nil || settings["disabledPluginIds"] is [String],
+              settings["activePermissionProfile"] == nil || settings["activePermissionProfile"] is NSNull || settings["activePermissionProfile"] is [String: Any]
+        else { return false }
+        return true
     }
 
     private static func notificationActiveFlags(from params: [String: Any]) -> [String] {
@@ -6089,9 +6154,9 @@ final class CodexNativeSessionController {
             "reasoningDelta kind=\(payload.kind) chars=\(payload.text.count) itemID=\(payload.itemID ?? "nil") groupID=\(payload.groupID ?? "nil")"
         case let .reasoningCompleted(payload):
             "reasoningCompleted summary=\(payload.summary.count) content=\(payload.content.count) turnID=\(payload.scope.turnID) itemID=\(payload.scope.itemID)"
-        case let .toolCall(name, invocationID, _):
+        case let .toolCall(name, invocationID, _, _):
             "toolCall tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil")"
-        case let .toolResult(name, invocationID, _, resultJSON, isError):
+        case let .toolResult(name, invocationID, _, resultJSON, isError, _):
             "toolResult tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count)"
         case let .commandExecutionRunning(update):
             "commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)"
@@ -6129,13 +6194,13 @@ final class CodexNativeSessionController {
         case result(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?, dedupKey: String)
     }
 
-    private func emitToolLifecycleEvent(_ toolEvent: ToolLifecycleEvent, method: String) async {
+    private func emitToolLifecycleEvent(_ toolEvent: ToolLifecycleEvent, method: String, mcpIdentity: MCPToolIdentity? = nil) async {
         switch toolEvent {
         case let .call(name, invocationID, argsJSON, dedupKey):
             let emitted = markToolEventEmitted(key: "call:\(dedupKey)")
             Self.logCodexDebug("[CodexNativeController] toolCall method=\(method) tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) args=\(Self.debugPreview(argsJSON))")
             guard emitted else { return }
-            await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON))
+            await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON, mcpIdentity: mcpIdentity))
         case let .result(name, invocationID, argsJSON, resultJSON, isError, dedupKey):
             let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
             Self.logCodexDebug("[CodexNativeController] toolResult method=\(method) tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) isError=\(isError.map(String.init(describing:)) ?? "nil") result=\(Self.debugPreview(resultJSON))")
@@ -6145,7 +6210,8 @@ final class CodexNativeSessionController {
                 invocationID: invocationID,
                 argsJSON: argsJSON,
                 resultJSON: resultJSON,
-                isError: isError
+                isError: isError,
+                mcpIdentity: mcpIdentity
             ))
             if Self.normalizedExternalToolName(name) != "bash",
                let runningUpdate = Self.commandExecutionRunningUpdate(
