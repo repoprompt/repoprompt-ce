@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// App convenience boundaries retain the existing lazy persisted-catalog lookup.
 /// The interpretation owners accept that lookup explicitly and never read app storage.

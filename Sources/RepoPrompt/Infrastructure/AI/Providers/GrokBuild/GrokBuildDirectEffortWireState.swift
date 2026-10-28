@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 final class GrokBuildDirectEffortWireState: @unchecked Sendable {
     enum Lookup {

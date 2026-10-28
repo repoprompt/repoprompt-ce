@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptAIContracts
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore

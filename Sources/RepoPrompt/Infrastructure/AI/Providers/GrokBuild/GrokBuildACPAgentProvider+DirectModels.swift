@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 private struct GrokBuildAdvertisedEffortEntry {
     let idRaw: String?

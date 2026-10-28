@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 struct ACPDynamicModelRecord: Codable, Hashable {

@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptApp
+@testable import RepoPromptAIContracts
 import XCTest
 
 final class CodexDynamicModelMapperTests: XCTestCase {

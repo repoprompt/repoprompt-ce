@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptProviderQuota
 import RepoPromptSecureStorage

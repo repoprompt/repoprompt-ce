@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Admission over the already-advertised catalogue, never a discovery or persistence entrypoint.

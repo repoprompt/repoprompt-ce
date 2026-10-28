@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import SwiftAnthropic
 import SwiftOpenAI
 

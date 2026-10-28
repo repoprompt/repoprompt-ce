@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 final class AgentCodexModelRegistry {
     static let shared = AgentCodexModelRegistry()

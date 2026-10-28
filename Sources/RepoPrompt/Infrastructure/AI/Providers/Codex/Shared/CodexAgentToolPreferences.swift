@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 enum CodexAgentToolPreferences {
     enum AppServerRequestValueStyle: CaseIterable {

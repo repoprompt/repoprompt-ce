@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Builds router-owned choices from one provider-authoritative metadata snapshot.
 /// Profile prose is advisory and never admits a model or effort.

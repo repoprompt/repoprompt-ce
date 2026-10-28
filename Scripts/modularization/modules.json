@@ -15,6 +15,7 @@
     "RepoPromptApp": {
       "source_root": "Sources/RepoPrompt",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "CSwiftPCRE2",
         "RepoPromptC",
         "RepoPromptCodeMapCore",
@@ -53,6 +54,16 @@
       "allowed_dependencies": [
         "RepoPromptCodeMapCore"
       ]
+    },
+    "RepoPromptAIContracts": {
+      "source_root": "Sources/RepoPromptAIContracts",
+      "allowed_dependencies": [],
+      "test_target": "RepoPromptAIContractsTests",
+      "app_free_tests": true
+    },
+    "RepoPromptAIContractsTests": {
+      "source_root": "Tests/RepoPromptAIContractsTests",
+      "allowed_dependencies": ["RepoPromptAIContracts"]
     },
     "RepoPromptProviderQuota": {
       "source_root": "Sources/RepoPromptProviderQuota",
@@ -253,6 +264,7 @@
     "RepoPromptTests": {
       "source_root": "Tests/RepoPromptTests",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
         "RepoPromptDomainRuntime",
@@ -312,6 +324,17 @@
     }
   },
   "moved_families": {
+    "AIModelInterpretationKernel": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ReasoningEffort.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ModelCatalogValues.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ModelCatalogMapper.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/ModelCatalogSemantics.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppOnly/CodexModelSpecifier.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexServiceTierVariantCatalog.swift"
+      ]
+    },
     "DomainProviderContent": {
       "owner": "RepoPromptDomainRuntime",
       "former_app_files": [
