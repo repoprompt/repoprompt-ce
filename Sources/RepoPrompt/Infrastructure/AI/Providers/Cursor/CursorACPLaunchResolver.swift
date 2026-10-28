@@ -2,7 +2,6 @@ import Foundation
 import RepoPromptAIContracts
 import RepoPromptFoundation
 import RepoPromptProcess
-import RepoPromptSettingsCore
 
 enum CursorACPLaunchCandidate: CaseIterable, Equatable {
     case cursorAgentACP
@@ -84,6 +83,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         _ timeout: TimeInterval,
         _ timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy
     ) async throws -> CLIProcessRunner.Result
+    typealias FailureRecorder = @Sendable (_ source: ShellEnvironmentSource?, _ candidateCount: Int) -> Void
     typealias NowProvider = @Sendable () -> TimeInterval
     typealias DeadlineWaiter = @Sendable (_ deadline: TimeInterval) async -> Void
 
@@ -246,7 +246,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
 
     private static let maximumAggregateProbeDuration: TimeInterval = 24 * 60 * 60
 
-    private static func defaultDeadlineWaiter(_ deadline: TimeInterval) async {
+    static func defaultDeadlineWaiter(_ deadline: TimeInterval) async {
         let now = ProcessInfo.processInfo.systemUptime
         guard now.isFinite, deadline.isFinite else { return }
         let remaining = deadline - now
@@ -334,6 +334,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
     private let environmentProvider: EnvironmentProvider
     private let supplementalPathProvider: SupplementalPathProvider
     private let probeRunner: ProbeRunner
+    private let failureRecorder: FailureRecorder
     private let nowProvider: NowProvider
     private let deadlineWaiter: DeadlineWaiter
     private let aggregateProbeTimeout: TimeInterval
@@ -348,6 +349,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         launchEnvironmentProvider: @escaping EnvironmentProvider,
         supplementalPathProvider: @escaping SupplementalPathProvider,
         probeRunner: @escaping ProbeRunner,
+        failureRecorder: @escaping FailureRecorder,
         nowProvider: @escaping NowProvider,
         deadlineWaiter: @escaping DeadlineWaiter,
         aggregateProbeTimeout: TimeInterval,
@@ -356,118 +358,52 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         environmentProvider = launchEnvironmentProvider
         self.supplementalPathProvider = supplementalPathProvider
         self.probeRunner = probeRunner
+        self.failureRecorder = failureRecorder
         self.nowProvider = nowProvider
         self.deadlineWaiter = deadlineWaiter
         self.aggregateProbeTimeout = aggregateProbeTimeout
         self.probeOwnership = probeOwnership
     }
 
-    convenience init() {
-        self.init(
-            launchEnvironmentProvider: { enableDebugLogging in
-                let result = await ProcessEnvironmentBuilder.build(
-                    ProcessEnvironmentRequest(
-                        purpose: .acpAgent(providerID: ACPProviderID.cursor.rawValue),
-                        enableDebugLogging: enableDebugLogging
-                    )
-                )
-                return ACPLaunchEnvironment(
-                    environment: result.environment,
-                    shellEnvironmentSource: result.shellEnvironmentSource
-                )
-            },
-            supplementalPathProvider: {
-                CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults($0)
-            },
-            probeRunner: { launch, config, timeout, timeoutCleanupPolicy in
-                try await CursorACPLaunchResolver.runProbe(
-                    launch: launch,
-                    config: config,
-                    timeout: timeout,
-                    timeoutCleanupPolicy: timeoutCleanupPolicy
-                )
-            },
-            nowProvider: { ProcessInfo.processInfo.systemUptime },
-            deadlineWaiter: CursorACPLaunchResolver.defaultDeadlineWaiter,
-            aggregateProbeTimeout: 10,
-            probeOwnership: Self.sharedDefaultProbeOwnership
-        )
-    }
-
-    convenience init(
-        environmentProvider: @escaping @Sendable (_ enableDebugLogging: Bool) async -> [String: String],
-        supplementalPathProvider: @escaping SupplementalPathProvider = {
-            CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults($0)
-        },
-        probeRunner: @escaping ProbeRunner = { launch, config, timeout, timeoutCleanupPolicy in
-            try await CursorACPLaunchResolver.runProbe(
-                launch: launch,
-                config: config,
-                timeout: timeout,
-                timeoutCleanupPolicy: timeoutCleanupPolicy
-            )
-        },
-        nowProvider: @escaping NowProvider = { ProcessInfo.processInfo.systemUptime },
-        deadlineWaiter: @escaping DeadlineWaiter = CursorACPLaunchResolver.defaultDeadlineWaiter,
-        aggregateProbeTimeout: TimeInterval = 10
-    ) {
-        self.init(
-            launchEnvironmentProvider: { enableDebugLogging in
-                await ACPLaunchEnvironment(environment: environmentProvider(enableDebugLogging))
-            },
-            supplementalPathProvider: supplementalPathProvider,
-            probeRunner: probeRunner,
-            nowProvider: nowProvider,
-            deadlineWaiter: deadlineWaiter,
-            aggregateProbeTimeout: aggregateProbeTimeout,
-            probeOwnership: ProbeOwnership()
-        )
-    }
-
+    /// App composition supplies policy; physical probe ownership remains with this resolver.
     convenience init(
         launchEnvironmentProvider: @escaping EnvironmentProvider,
-        supplementalPathProvider: @escaping SupplementalPathProvider = {
-            CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults($0)
-        },
-        probeRunner: @escaping ProbeRunner = { launch, config, timeout, timeoutCleanupPolicy in
-            try await CursorACPLaunchResolver.runProbe(
-                launch: launch,
-                config: config,
-                timeout: timeout,
-                timeoutCleanupPolicy: timeoutCleanupPolicy
-            )
-        },
-        nowProvider: @escaping NowProvider = { ProcessInfo.processInfo.systemUptime },
-        deadlineWaiter: @escaping DeadlineWaiter = CursorACPLaunchResolver.defaultDeadlineWaiter,
-        aggregateProbeTimeout: TimeInterval = 10
+        supplementalPathProvider: @escaping SupplementalPathProvider,
+        probeRunner: @escaping ProbeRunner,
+        failureRecorder: @escaping FailureRecorder,
+        nowProvider: @escaping NowProvider,
+        deadlineWaiter: @escaping DeadlineWaiter,
+        aggregateProbeTimeout: TimeInterval,
+        useSharedProbeOwnership: Bool = false
     ) {
         self.init(
             launchEnvironmentProvider: launchEnvironmentProvider,
             supplementalPathProvider: supplementalPathProvider,
             probeRunner: probeRunner,
+            failureRecorder: failureRecorder,
             nowProvider: nowProvider,
             deadlineWaiter: deadlineWaiter,
             aggregateProbeTimeout: aggregateProbeTimeout,
-            probeOwnership: ProbeOwnership()
+            probeOwnership: useSharedProbeOwnership ? Self.sharedDefaultProbeOwnership : ProbeOwnership()
         )
     }
 
     #if DEBUG
         convenience init(
-            environmentProvider: @escaping @Sendable (_ enableDebugLogging: Bool) async -> [String: String],
+            launchEnvironmentProvider: @escaping EnvironmentProvider,
             supplementalPathProvider: @escaping SupplementalPathProvider,
             probeRunner: @escaping ProbeRunner,
+            failureRecorder: @escaping FailureRecorder,
             nowProvider: @escaping NowProvider,
             deadlineWaiter: @escaping DeadlineWaiter,
-            aggregateProbeTimeout: TimeInterval = 10,
+            aggregateProbeTimeout: TimeInterval,
             sharingProbeOwnershipWith resolver: CursorACPLaunchResolver
         ) {
             self.init(
-                launchEnvironmentProvider: { enableDebugLogging in
-                    await ACPLaunchEnvironment(environment: environmentProvider(enableDebugLogging))
-                },
+                launchEnvironmentProvider: launchEnvironmentProvider,
                 supplementalPathProvider: supplementalPathProvider,
                 probeRunner: probeRunner,
+                failureRecorder: failureRecorder,
                 nowProvider: nowProvider,
                 deadlineWaiter: deadlineWaiter,
                 aggregateProbeTimeout: aggregateProbeTimeout,
@@ -746,11 +682,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             // (exactPathNotFound / unsafeApplicationPath / unsafeCanonicalBasename) and omit the
             // fallback-PATH hint: an exact configured path does not depend on PATH discovery.
             // Still record the same resolution-failure telemetry OpenCode emits for explicit paths.
-            AgentCLILaunchDiagnostics.recordPathResolutionFailure(
-                providerKind: .cursor,
-                shellEnvironmentSource: shellEnvironmentSource,
-                candidateCount: 1
-            )
+            failureRecorder(shellEnvironmentSource, 1)
             throw error
         }
     }
@@ -920,11 +852,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         if failures.isEmpty {
             throw CursorACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
-        AgentCLILaunchDiagnostics.recordPathResolutionFailure(
-            providerKind: .cursor,
-            shellEnvironmentSource: shellEnvironmentSource,
-            candidateCount: candidates.count
-        )
+        failureRecorder(shellEnvironmentSource, candidates.count)
         throw CursorACPLaunchResolutionError.noValidLaunchCandidate(configuredCommand, failures, shellEnvironmentSource)
     }
 
@@ -956,16 +884,17 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         return ([selectionKey] + config.additionalPathHints).joined(separator: "\u{1F}")
     }
 
-    private static func runProbe(
+    static func runProbe(
         launch: CursorACPResolvedLaunch,
         config: CursorAgentConfig,
         timeout: TimeInterval,
-        timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy
+        timeoutCleanupPolicy: ProcessTermination.TimeoutCleanupPolicy,
+        environmentFilter: @escaping CLIProcessConfiguration.EnvironmentFilter
     ) async throws -> CLIProcessRunner.Result {
         let processConfig = CLIProcessConfiguration(
             command: launch.command,
             environment: launch.environment,
-            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .cursor),
+            environmentFilter: environmentFilter,
             additionalPaths: [],
             enableDebugLogging: config.enableDebugLogging,
             shellLookupMode: .fallbackOnly

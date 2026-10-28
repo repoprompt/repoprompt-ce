@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptFileSystem
+import RepoPromptFoundation
 @testable import RepoPromptProcess
 import RepoPromptSettingsCore
 import XCTest
@@ -11,6 +12,52 @@ final class CursorACPLaunchResolverTests: XCTestCase {
     override func setUp() {
         super.setUp()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
+    func testInjectedFailureRecorderReceivesSourceAndCandidateCount() async throws {
+        let directory = try makeTemporaryDirectory()
+        let failures = CursorResolutionFailures()
+        let resolver = CursorACPLaunchResolver(
+            launchEnvironmentProvider: { _ in
+                ACPLaunchEnvironment(environment: ["PATH": directory.path, "SHELL": "/bin/false"], shellEnvironmentSource: .enrichedFallback)
+            },
+            supplementalPathProvider: { $0 },
+            failureRecorder: { source, count in failures.record(source: source, count: count) }
+        )
+        let config = CursorAgentConfig(commandName: directory.appendingPathComponent("cursor-agent").path, additionalPathHints: [])
+
+        let result = try await resolver.probeSupport(for: config)
+        guard case .unsupported = result else { return XCTFail("Expected missing executable") }
+        XCTAssertEqual(failures.snapshot().map(\.source), [.enrichedFallback])
+        XCTAssertEqual(failures.snapshot().map(\.count), [1])
+    }
+
+    func testInjectedFilterReachesPhysicalProbeAndRemovesCredentials() async throws {
+        let directory = try makeTemporaryDirectory()
+        let executable = try makeExecutable(named: "cursor-agent", in: directory)
+        try """
+        #!/bin/sh
+        if [ "$FILTER_WITNESS" = injected ] && [ -z "$CURSOR_API_KEY" ] && [ -z "$CURSOR_AUTH_TOKEN" ]; then
+          printf 'Cursor Agent ACP support\\n'
+        else
+          exit 1
+        fi
+        """.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let resolver = CursorACPLaunchResolver(
+            environmentProvider: { _ in ["PATH": directory.path, "CURSOR_API_KEY": "secret", "CURSOR_AUTH_TOKEN": "secret"] },
+            supplementalPathProvider: { $0 },
+            environmentFilter: { environment, _ in
+                var filtered = environment
+                filtered["FILTER_WITNESS"] = "injected"
+                return filtered
+            }
+        )
+        let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
+        let result = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await resolver.probeSupport(for: config)
+        }
+        XCTAssertEqual(result, .supported)
     }
 
     func testHealthyLegacyDoesNotDiscoverSecondaryEntrypoint() async throws {
@@ -609,6 +656,23 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         try lines.joined(separator: "\n").write(to: executable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
         return executable
+    }
+}
+
+private final class CursorResolutionFailures: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [(source: ShellEnvironmentSource?, count: Int)] = []
+
+    func record(source: ShellEnvironmentSource?, count: Int) {
+        lock.lock()
+        entries.append((source, count))
+        lock.unlock()
+    }
+
+    func snapshot() -> [(source: ShellEnvironmentSource?, count: Int)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
     }
 }
 
