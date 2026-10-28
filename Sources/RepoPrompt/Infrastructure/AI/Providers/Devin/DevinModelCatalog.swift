@@ -1,6 +1,5 @@
 import Foundation
 import RepoPromptAIContracts
-import RepoPromptSettingsCore
 
 /// Devin reasoning effort expressed as effort-encoded model IDs (`gpt-6-sol-high`).
 ///
@@ -43,10 +42,6 @@ struct DevinModelCatalog {
 
     let entries: [Entry]
     private let entriesByNormalizedRaw: [String: Entry]
-
-    static var current: DevinModelCatalog {
-        AgentACPModelRegistry.shared.currentDevinCatalog()
-    }
 
     #if DEBUG
         private static let expansionCountLock = NSLock()

@@ -1,10 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
-import RepoPromptSettingsCore
 
 final class AgentACPModelRegistry {
-    static let shared = AgentACPModelRegistry(dependencies: .app)
-
     struct Dependencies {
         let loadAll: @Sendable () -> [ACPProviderID: ACPDiscoveredSessionModels]
         let load: (ACPProviderID) -> ACPDiscoveredSessionModels?

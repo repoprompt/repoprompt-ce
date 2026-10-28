@@ -2,6 +2,16 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 
+extension AgentACPModelRegistry {
+    static let shared = AgentACPModelRegistry(dependencies: .app)
+}
+
+extension DevinModelCatalog {
+    static var current: DevinModelCatalog {
+        AgentACPModelRegistry.shared.currentDevinCatalog()
+    }
+}
+
 extension AgentACPModelRegistry.Dependencies {
     /// Construct operations without touching the store or advertised catalog until invoked.
     static var app: Self {
