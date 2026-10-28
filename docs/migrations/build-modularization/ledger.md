@@ -1492,3 +1492,52 @@ The existing 32-line dead transcript-filter retirement remains intact, with
 `AgentTranscriptIO` / `AgentTranscriptImportPolicy` surviving; this phase adds no
 broader VM/bridge retirement and does not certify M6/M10. No extraction or ratchet
 change is included, and no readiness issue is closed.
+
+### Stage 0 serialized admission checkpoint (2026-10-28)
+
+The existing discovery fixture now explicitly exercises production Agent admission,
+real socket frames, app tool registration and bootstrap proof for the observer.
+Two controlled native controllers produce actual assistant replies through the
+runtime; they are not vendor processes or packaged/live evidence. The fixture
+enters the ordinary active Agent Mode lifecycle and records foreground workspace,
+tab and draft before activation; it asserts those remain unchanged through the
+journey. It does not establish UI-free or inactive-presentation behavior.
+
+The journey executes returned bare cursors and successors, unknown-cursor recovery,
+real scope request, exact group-order recovery with zero-change satisfaction, scope
+release and lane retirement. The existing foreign/unknown cursor recovery now also
+passes through the canonical domain host; malformed handles remain separate.
+
+- **PASS:** conductor `8d7ab6be-f18c-496f-b848-00394b3d3f33`, request
+  `runtime-contract-20261028-cohesive-formatted`, exit 0, **11 matched and passed**;
+  selected tests 24.932s, build 79.29s, execution 3m01s, global wait 1m37s.
+  This includes the serialized journey, existing discovery route fence, both cursor
+  cases and the seven host/first-save contracts. Tested HEAD is
+  `348bf52c2da0a88c3e3575f22c099448ed16936d` plus two-test-file binary diff
+  SHA-256 `ab03d885a93aa0acb37b2db5e6941822abb52a5488a615c25f9abab21e899ddd`.
+  Logs are in the conductor jobs directory under the ticket UUID.
+- Earlier single journey `bf14f022-8179-4ed3-9f97-4abfb9f36065` passed exit 0,
+  1 matched, before scoped formatting. Earlier failed diagnostics are not passes.
+  Scoped pinned SwiftFormat exit 0, one of two files formatted; scoped strict
+  SwiftLint exit 0, zero violations. Whole-tree combined style remains NOT_PASSED
+  as recorded above; packaged/live/vendor tiers remain NOT_RUN.
+- Focused review found missing persistent fixture cleanup and a permissive changed-
+  cursor oracle. The fixture now deletes its canonical workspace and owned directory
+  on success or failure, and requires changed then timeout on successor replay.
+  Conductor `e527fb45-35c8-4db6-9d7c-233269593612`, request
+  `runtime-contract-20261028-review-fixes-v3`, exit 0, 1 matched and passed in
+  19.458s, build 56.59s, execution 2m07s, global wait 9.5s. Final two-test-file
+  binary diff SHA-256 `5767dc7e25b4b64ec68228562535c3d835c2fa782f880a1672528519620771ed`.
+  The earlier review-fix compile failure and owned-root rejection were corrected,
+  not counted as passes. Final scoped format lint and strict SwiftLint both exit 0,
+  zero drift/violations. The 11-test receipt above predates these focused changes.
+- Readiness investigation found the fixture's inactive Agent Mode left the ordinary
+  workspace-switch fence set, blocking the composer despite an idle public snapshot.
+  Real fixture activation resolves this case without changing production behavior.
+  The coupling of inactive presentation to that fence remains an unresolved M9/M10
+  runtime-ownership finding; neither inactive safety nor no-foreground workspace
+  admission is claimed. Temporary production diagnostics were removed.
+
+This is a bounded partial Stage 0 checkpoint, not #1402 or M6 completion. The
+32-line inherited dead-route retirement and surviving transcript owner are unchanged;
+no new production responsibility, extraction, or ratchet is claimed.

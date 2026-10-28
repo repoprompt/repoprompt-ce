@@ -1845,8 +1845,15 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
         ])
         let foreignCursor = try XCTUnwrap(polled["wait_cursor"])
         let service = fixture.routedService(from: secondObserver.domainEndpoint)
+        let ingress = SessionContractHost(windowID: fixture.window.windowID)
+        addTeardownBlock { @MainActor in await ingress.cleanup() }
+        try await ingress.start([
+            MCPDomainToolBinding(definition: XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: "agent_session_link"))) {
+                try await service.execute(args: $0)
+            }
+        ])
         for cursor in [foreignCursor, .string("w_not_issued_by_this_authority")] {
-            let rejected = try await Self.executeObject(service, args: [
+            let rejected = try await ingress.call("agent_session_link", [
                 "op": .string("wait"), "cursors": .array([cursor]), "timeout_seconds": .int(0)
             ])
             XCTAssertEqual(rejected["result"], .string("cursor_expired"))
@@ -1861,7 +1868,7 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             XCTAssertEqual(nextCall["tool"], .string("agent_session_link"))
             let nextArgs = try XCTUnwrap(nextCall["arguments"]?.objectValue)
             XCTAssertEqual(nextArgs, ["op": .string("list")])
-            let listed = try await Self.executeObject(service, args: nextArgs)
+            let listed = try await ingress.call("agent_session_link", nextArgs)
             let items = try XCTUnwrap(listed["items"]?.arrayValue)
             XCTAssertEqual(items.map { $0.objectValue?["session_id"] }, [targetID])
 
@@ -1869,12 +1876,12 @@ final class AgentSessionLinkToolServiceTests: XCTestCase {
             // replay the actual opaque successor. An earlier poll or a reconstructed record
             // would bypass the public recovery contract this journey is meant to protect.
             let recoveredID = try XCTUnwrap(items.first?.objectValue?["session_id"])
-            let refreshed = try await Self.executeObject(service, args: [
+            let refreshed = try await ingress.call("agent_session_link", [
                 "op": .string("poll"), "session_id": recoveredID
             ])
             var ownCursor = try XCTUnwrap(refreshed["wait_cursor"])
             for _ in 0 ..< 2 {
-                let recovered = try await Self.executeObject(service, args: [
+                let recovered = try await ingress.call("agent_session_link", [
                     "op": .string("wait"), "cursors": .array([ownCursor]), "timeout_seconds": .int(0)
                 ])
                 XCTAssertEqual(recovered["result"], .string("timeout"))
