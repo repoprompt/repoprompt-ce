@@ -1,4 +1,5 @@
 import RepoPromptWorkspaceContext
+
 #if DEBUG
     enum WorkspaceSwitchSearchIndexDiagnostics {
         static func fields(

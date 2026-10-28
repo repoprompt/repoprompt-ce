@@ -10,11 +10,11 @@ final class GitWorkspaceAuthorityLockReentryGuardTests: XCTestCase {
     func testReviewedLockOwnersUseSameThreadReentryCheckedLocks() throws {
         let root = try RepoRoot.url()
         let authoritySource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceStateAuthority.swift",
             root: root
         )
         let watermarksSource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceMetadataMonitor.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceMetadataMonitor.swift",
             root: root
         )
         let authority = try Self.typeSource(named: "GitWorkspaceAuthoritySynchronousState", in: authoritySource)
@@ -29,11 +29,11 @@ final class GitWorkspaceAuthorityLockReentryGuardTests: XCTestCase {
     func testClosureInvocationsInReviewedLockOwnersCarryExplicitMarker() throws {
         let root = try RepoRoot.url()
         let authoritySource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceStateAuthority.swift",
             root: root
         )
         let watermarksSource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceMetadataMonitor.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceMetadataMonitor.swift",
             root: root
         )
         let authority = try Self.typeSource(named: "GitWorkspaceAuthoritySynchronousState", in: authoritySource)
@@ -69,7 +69,7 @@ final class GitWorkspaceAuthorityLockReentryGuardTests: XCTestCase {
     func testInstallAndPublicationPermitKeepMonitorBeforeAuthorityMirrorOrder() throws {
         let root = try RepoRoot.url()
         let authoritySource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceStateAuthority.swift",
             root: root
         )
         let authority = try Self.typeSource(named: "GitWorkspaceStateAuthority", in: authoritySource)

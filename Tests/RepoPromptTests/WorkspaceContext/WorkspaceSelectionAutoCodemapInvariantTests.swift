@@ -156,7 +156,7 @@ final class WorkspaceSelectionAutoCodemapInvariantTests: XCTestCase {
     func testSelectionProductionPathContainsNoLegacyRelationshipCalls() throws {
         let repoRoot = try RepoRoot.url()
         let sourceDirectories = [
-            "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection",
+            "Sources/RepoPromptWorkspaceContext/Selection",
             "Sources/RepoPrompt/Features/WorkspaceFiles"
         ]
         let forbiddenCalls = [
