@@ -40,7 +40,7 @@ package struct DevinModelCatalog {
     /// They stay selectable as advertised, without synthesized siblings.
     private static let nonExpandingPrefixes = ["fusion-", "swe-1-"]
 
-    let entries: [Entry]
+    package let entries: [Entry]
     private let entriesByNormalizedRaw: [String: Entry]
 
     #if DEBUG
