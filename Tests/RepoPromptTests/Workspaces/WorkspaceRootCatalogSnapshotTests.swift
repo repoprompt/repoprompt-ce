@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 #if DEBUG

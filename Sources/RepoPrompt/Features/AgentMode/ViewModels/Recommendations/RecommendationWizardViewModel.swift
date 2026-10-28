@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptSettingsCore
 
 struct RecommendationActionRevisionGuard: Equatable {
     private(set) var durableRevision: UInt64 = 0

@@ -11,7 +11,12 @@ import SwiftUI
 /// each new Window/Scene gets its own WindowState.
 struct WindowContentView: View {
     @EnvironmentObject var versionManager: VersionManager
-    @EnvironmentObject var windowStatesManager: WindowStatesManager
+    /// Not observed: only the lifecycle callbacks below use it, and observing it re-evaluated every
+    /// window root whenever any window opened or closed.
+    private var windowStatesManager: WindowStatesManager {
+        WindowStatesManager.shared
+    }
+
     @EnvironmentObject var sparkleManager: SparkleUpdaterManager
     @Environment(\.openWindow) private var openWindow
 
@@ -25,6 +30,8 @@ struct WindowContentView: View {
             .safeAreaInset(edge: .top) { GlobalSettingsPersistenceBlockBanner(allowsSessionDismissal: true) }
             .debugBuildWindowEdge()
             .environmentObject(windowState) // If your subviews need it
+            .environment(\.windowIsPresentationVisible, windowState.isPresentationVisible)
+            .environment(\.agentModePerfRecorder, windowState.agentModeViewModel.perfRecorder)
             .environmentObject(sparkleManager)
             .environmentObject(versionManager) // Pass versionManager to ContentView
             // Let SwiftUI own the window title. Without this, the scene re-applies the
@@ -41,7 +48,18 @@ struct WindowContentView: View {
             )
             // Once the view appears, register it with WindowStatesManager
             .onAppear {
+                StartupPhaseLog.mark(.windowAppeared, window: windowState.windowID)
                 windowStatesManager.registerWindowState(windowState)
+                MCPExternalEventsMonitor.shared.scheduleCleanupOnce()
+                GlobalKeyboardShortcutsCoordinator.shared.closeMenuShortcut.reconcile()
+
+                GlobalKeyboardShortcutsCoordinator.shared.installUpdateAction { [sparkleManager] in
+                    if sparkleManager.availableUpdate != nil {
+                        sparkleManager.performAvailableUpdateAction()
+                    } else if sparkleManager.canInitiateUpdateCheck {
+                        sparkleManager.checkForUpdates()
+                    }
+                }
 
                 // Install the openWindow action into AppWindowOpener for programmatic window creation
                 AppWindowOpener.shared.install {
@@ -63,6 +81,7 @@ struct WindowContentView: View {
 
                 guard !windowStatesManager.isTerminating else {
                     windowState.aiQueriesService.cancelQuery()
+                    windowState.mcpServer.stopServiceObservation()
                     return
                 }
 

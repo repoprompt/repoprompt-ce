@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 actor DevinModelDiscoveryService {
     static let shared = DevinModelDiscoveryService()
@@ -8,13 +10,14 @@ actor DevinModelDiscoveryService {
         case discovered(modelCount: Int)
         case noModelsAdvertised
         case failed(message: String)
+        case cancelled
 
         /// Transient failures and "not installed" stay uncached so Settings can retry.
         fileprivate var isReusable: Bool {
             switch self {
             case .discovered, .noModelsAdvertised:
                 true
-            case .notInstalled, .failed:
+            case .notInstalled, .failed, .cancelled:
                 false
             }
         }
@@ -73,7 +76,7 @@ actor DevinModelDiscoveryService {
                     try Task.checkCancellation()
                     return .discovered(modelCount: count)
                 } catch is CancellationError {
-                    return .failed(message: "cancelled")
+                    return .cancelled
                 } catch {
                     return .failed(message: error.localizedDescription)
                 }
@@ -101,7 +104,8 @@ actor DevinModelDiscoveryService {
     }
 
     private static func runThrowawaySession(_ config: DevinAgentConfig) async throws -> Int? {
-        let provider = DevinACPAgentProvider(config: config)
+        try ProviderProcessLaunchPolicy.check()
+        let provider = DevinACPAgentProvider(config: config, isolateForeignMCPImports: true)
         let request = ACPRunRequest(
             agentKind: .devin,
             modelString: nil,
@@ -122,7 +126,33 @@ actor DevinModelDiscoveryService {
             try Task.checkCancellation()
             _ = try await controller.bootstrap()
             try Task.checkCancellation()
-            let count = await controller.currentDiscoveredSessionModels()?.options.count
+            guard let initial = await controller.currentDiscoveredSessionModels() else {
+                await controller.shutdown()
+                return nil
+            }
+            var parameterSets: [ACPModelParameterSet] = []
+            var seenModels = Set<String>()
+            for model in initial.options where !model.isPlaceholderDefault {
+                let identity = ACPModelParameterIdentity.canonicalBaseModelRaw(model.rawValue, providerID: .devin)
+                guard seenModels.insert(identity).inserted else { continue }
+                try Task.checkCancellation()
+                let observed = try await controller.discoverSessionModelParameters(for: model.rawValue)
+                let matches = observed.modelParameterSets.filter {
+                    ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .devin) == identity
+                }
+                guard matches.count <= 1 else {
+                    throw AIProviderError.invalidConfiguration(detail: "Devin advertised ambiguous parameters for model '\(model.rawValue)'.")
+                }
+                parameterSets.append(contentsOf: matches)
+            }
+            try Task.checkCancellation()
+            let complete = ACPDiscoveredSessionModels(
+                options: initial.options,
+                currentModelRaw: initial.currentModelRaw,
+                modelParameterSets: parameterSets
+            )
+            _ = AgentACPModelRegistry.shared.updateDiscoveredModels(complete, for: .devin)
+            let count = initial.options.count
             await controller.shutdown()
             return count
         } catch {

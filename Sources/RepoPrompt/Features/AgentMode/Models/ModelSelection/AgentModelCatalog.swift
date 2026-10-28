@@ -1,6 +1,17 @@
 import Foundation
+import RepoPromptSettingsCore
 
 enum AgentModelCatalog {
+    static func cursorEffortOption(_ option: AgentModelOption, configID: String, valueRaw: String) -> AgentModelOption? {
+        guard let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: option.rawValue),
+              let raw = specifier.replacing(configID: configID, valueRaw: valueRaw) else { return nil }
+        return CursorAIModelCatalog.option(matching: raw)
+    }
+
+    static func cursorSelectionIsAvailable(_ raw: String) -> Bool {
+        CursorAIModelCatalog.option(matching: raw) != nil
+    }
+
     struct AvailabilityContext: Equatable {
         let claudeCodeAvailable: Bool
         let codexAvailable: Bool
@@ -351,17 +362,43 @@ enum AgentModelCatalog {
         )
     }
 
+    /// Producing canonical options also refreshes the memory-only admission index. Capture its
+    /// generation before reading provider snapshots so a concurrent invalidation defeats old work.
+    /// Window-local Codex overrides are picker projections, not the list_agents catalogue.
     static func options(
         for agentKind: AgentProviderKind,
         availability: AvailabilityContext = .current,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
+        let generation = AgentAdvertisedModelCatalog.shared.productionGeneration(for: agentKind)
+        let result = uncachedOptions(
+            for: agentKind, availability: availability, codexDynamicModels: codexDynamicModels,
+            includeClaudeEffortVariants: includeClaudeEffortVariants
+        )
+        if includeClaudeEffortVariants,
+           agentKind != .codexExec || codexDynamicModels == nil,
+           isAgentAvailable(agentKind, availability: availability)
+        {
+            AgentAdvertisedModelCatalog.shared.record(result, for: agentKind, generation: generation)
+        }
+        return result
+    }
+
+    private static func uncachedOptions(
+        for agentKind: AgentProviderKind,
+        availability: AvailabilityContext,
+        codexDynamicModels: [CodexAppServerClient.RemoteModel]?,
+        includeClaudeEffortVariants: Bool
+    ) -> [AgentModelOption] {
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
         if agentKind == .cursor {
             return CursorAIModelCatalog.options
         }
-        if agentKind == .antigravity || agentKind == .devin {
+        if agentKind == .devin {
+            return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entries.map(\.option)
+        }
+        if agentKind == .antigravity {
             return resolvedACPDiscoveredModels(for: agentKind)?.options ?? []
         }
         if agentKind == .grokBuild {
@@ -421,7 +458,10 @@ enum AgentModelCatalog {
         {
             return true
         }
-        if agentKind == .antigravity || agentKind == .devin {
+        if agentKind == .devin {
+            return DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entry(matching: normalized) != nil
+        }
+        if agentKind == .antigravity {
             return resolvedACPDiscoveredModels(for: agentKind)?.contains(rawModel: normalized) == true
         }
         if let discoveredModels = resolvedACPDiscoveredModels(for: agentKind) {
@@ -476,6 +516,13 @@ enum AgentModelCatalog {
                 return known.displayName
             }
             return raw
+        }
+
+        // The encoded effort is part of a Devin model's identity, so it is never dropped.
+        if agentKind == .devin,
+           let entry = DevinModelCatalog(snapshot: resolvedACPDiscoveredModels(for: .devin)).entry(matching: effectiveRaw)
+        {
+            return entry.option.displayName
         }
 
         if agentKind.usesClaudeTooling {
@@ -1660,7 +1707,14 @@ enum AgentModelCatalog {
             displayName: displayName,
             description: description,
             isPlaceholderDefault: model == .defaultModel,
-            isProviderDefault: false
+            isProviderDefault: false,
+            effortVariant: agentKind == .codexExec
+                ? CodexModelSpecifier(raw: model.rawValue).reasoningEffort.flatMap { effort in
+                    CodexModelSpecifier(raw: model.rawValue).baseModel.map {
+                        AgentModelEffortVariant(baseModelRaw: $0, reasoningEffort: effort)
+                    }
+                }
+                : nil
         )
     }
 
@@ -1880,16 +1934,16 @@ enum AgentModelCatalog {
         availability: AvailabilityContext
     ) -> [SelectionCandidate] {
         let lunaLow = preferredCodexFamilyModelRaw("luna", effort: .low, availability: availability)
-            ?? AgentModel.gpt56LunaLow.rawValue
+            ?? AgentModel.gpt6LunaLow.rawValue
         let solMedium = preferredCodexFamilyModelRaw("sol", effort: .medium, availability: availability)
-            ?? AgentModel.gpt56SolMedium.rawValue
+            ?? AgentModel.gpt61SolMedium.rawValue
         let solHigh = preferredCodexFamilyModelRaw("sol", effort: .high, availability: availability)
-            ?? AgentModel.gpt56SolHigh.rawValue
+            ?? AgentModel.gpt61SolHigh.rawValue
         return switch kind {
         case .explore:
             [
                 SelectionCandidate(agent: .codexExec, modelRaw: lunaLow),
-                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt56SolLow.rawValue),
+                SelectionCandidate(agent: .codexExec, modelRaw: AgentModel.gpt61SolLow.rawValue),
                 SelectionCandidate(agent: .claudeCode, modelRaw: ClaudeModelSpecifier.encodedRaw(baseModelRaw: AgentModel.claudeSonnet.rawValue, effort: .high)),
                 SelectionCandidate(agent: .claudeCode, modelRaw: AgentModel.claudeHaiku.rawValue),
                 SelectionCandidate(agent: .claudeCodeGLM, modelRaw: AgentModel.claudeHaiku.rawValue),

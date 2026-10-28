@@ -1,9 +1,18 @@
 import Foundation
+import RepoPromptProcess
 
+/// Devin provider for non-agent use (chat, Oracle, AI queries).
+///
+/// Text-only requests use the sandboxed one-shot `devin -p` CLI. Requests that carry
+/// transient images are routed through `devin acp`, the only Devin transport with an
+/// image channel (`promptCapabilities.image`); the one-shot CLI has no attachment input.
 final class DevinCLIProvider: AIProvider {
+    typealias HeadlessProviderFactory = @Sendable (_ config: DevinAgentConfig, _ workspacePath: String?) -> DevinACPHeadlessAgentProvider
+
     private let config: DevinAgentConfig
     private let launchResolver: DevinACPLaunchResolver
     private let requestTimeout: TimeInterval
+    private let headlessProviderFactory: HeadlessProviderFactory
     private let activeRuns = ActiveDevinOneShotRunStore()
 
     init(
@@ -12,11 +21,15 @@ final class DevinCLIProvider: AIProvider {
             includeRepoPromptMCPServer: false
         ),
         launchResolver: DevinACPLaunchResolver = DevinACPLaunchResolver(),
-        requestTimeout: TimeInterval = 6000
+        requestTimeout: TimeInterval = 6000,
+        headlessProviderFactory: @escaping HeadlessProviderFactory = { config, workspacePath in
+            DevinACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+        }
     ) {
         self.config = config
         self.launchResolver = launchResolver
         self.requestTimeout = requestTimeout
+        self.headlessProviderFactory = headlessProviderFactory
     }
 
     #if DEBUG
@@ -26,6 +39,14 @@ final class DevinCLIProvider: AIProvider {
 
         static func test_promptText(from message: AIMessage) -> String {
             promptText(from: message)
+        }
+
+        static func test_makeImageAgentMessage(from message: AIMessage) -> AgentMessage {
+            makeImageAgentMessage(from: message)
+        }
+
+        func test_makeImageHeadlessConfig(modelName: String?) -> DevinAgentConfig {
+            makeImageHeadlessConfig(modelName: modelName)
         }
     #endif
 
@@ -39,9 +60,18 @@ final class DevinCLIProvider: AIProvider {
             let task = Task { [self] in
                 defer { activeRuns.remove(runID) }
                 do {
-                    let text = try await runOneShot(aiMessage, modelName: devinModelName(for: model))
-                    continuation.yield(AIStreamResult(type: "content", text: text))
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil))
+                    let modelName = devinModelName(for: model)
+                    if aiMessage.attachments.isEmpty {
+                        let text = try await runOneShot(aiMessage, modelName: modelName)
+                        continuation.yield(AIStreamResult(type: "content", text: text))
+                        continuation.yield(AIStreamResult(type: "message_stop", text: nil))
+                    } else {
+                        try await runImageRequestThroughACP(
+                            aiMessage,
+                            modelName: modelName,
+                            continuation: continuation
+                        )
+                    }
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish(throwing: CancellationError())
@@ -61,8 +91,19 @@ final class DevinCLIProvider: AIProvider {
     ) async throws -> AICompletionResult {
         let stream = try await streamMessage(aiMessage, model: model, maxTokens: maxTokens)
         var text = ""
-        for try await result in stream where result.type == "content" {
-            text += result.text ?? ""
+        var finalContent: String?
+        for try await result in stream {
+            switch result.type {
+            case "content":
+                text += result.text ?? ""
+            case "final_content":
+                if let value = result.text, !value.isEmpty { finalContent = value }
+            default:
+                continue
+            }
+        }
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let finalContent {
+            text = finalContent
         }
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AIProviderError.invalidResponse(detail: "Devin returned no completion")
@@ -76,6 +117,83 @@ final class DevinCLIProvider: AIProvider {
         for task in tasks {
             await task.value
         }
+    }
+
+    /// Streams one image-bearing request through a fresh, tool-less `devin acp` session
+    /// rooted in a private temporary directory. Tool approvals are declined by the headless
+    /// bridge, and the per-request timeout matches the one-shot path.
+    private func runImageRequestThroughACP(
+        _ message: AIMessage,
+        modelName: String?,
+        continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
+    ) async throws {
+        try Task.checkCancellation()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("rp-devin-oracle-acp-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let provider = headlessProviderFactory(makeImageHeadlessConfig(modelName: modelName), directory.path)
+        let timeout = requestTimeout
+        do {
+            try await withTaskCancellationHandler {
+                let upstream = try await provider.streamAgentMessage(
+                    Self.makeImageAgentMessage(from: message),
+                    runID: nil
+                )
+                try await withThrowingTaskGroup(of: Void.self) { group in
+                    group.addTask {
+                        for try await result in upstream {
+                            continuation.yield(result)
+                        }
+                    }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                        throw AIProviderError.apiError(
+                            source: NSError(
+                                domain: "DevinCLI",
+                                code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "Devin timed out after \(Int(timeout))s."]
+                            )
+                        )
+                    }
+                    try await group.next()
+                    group.cancelAll()
+                }
+            } onCancel: {
+                Task { await provider.dispose() }
+            }
+        } catch {
+            await provider.dispose()
+            throw error
+        }
+        await provider.dispose()
+    }
+
+    private func makeImageHeadlessConfig(modelName: String?) -> DevinAgentConfig {
+        DevinAgentConfig(
+            commandName: config.commandName,
+            additionalPathHints: config.additionalPathHints,
+            enableDebugLogging: config.enableDebugLogging,
+            includeRepoPromptMCPServer: false,
+            modelString: modelName
+        )
+    }
+
+    private static func makeImageAgentMessage(from message: AIMessage) -> AgentMessage {
+        let systemPrompt = message.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return AgentMessage(
+            systemPrompt: systemPrompt.isEmpty
+                ? noToolsInstruction
+                : systemPrompt + "\n\n" + noToolsInstruction,
+            userMessage: conversationText(from: message),
+            attachments: message.attachments,
+            resumeSessionID: nil
+        )
     }
 
     private func runOneShot(_ message: AIMessage, modelName: String?) async throws -> String {
@@ -122,6 +240,7 @@ final class DevinCLIProvider: AIProvider {
             command: launch.command,
             workingDirectory: directory.path,
             environment: launch.environment.merging(integration.environment) { _, overlay in overlay },
+            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .devin, explicitOverrides: integration.environment),
             additionalPaths: [],
             enableDebugLogging: config.enableDebugLogging,
             resolveCandidates: [(launch.command as NSString).lastPathComponent],
@@ -173,6 +292,12 @@ final class DevinCLIProvider: AIProvider {
 
     private static func promptText(from message: AIMessage) -> String {
         let systemPrompt = message.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [systemPrompt, noToolsInstruction, conversationText(from: message)]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+    }
+
+    private static func conversationText(from message: AIMessage) -> String {
         let tail = message.buildTail(embedSystemPrompt: false)
         var conversation = ""
         let lastUserIndex = message.conversationMessages.lastIndex { $0.role == .user }
@@ -187,9 +312,7 @@ final class DevinCLIProvider: AIProvider {
         if message.conversationMessages.isEmpty, !tail.isEmpty {
             conversation = "User: \(tail)"
         }
-        return [systemPrompt, noToolsInstruction, conversation]
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n\n")
+        return conversation
     }
 
     private func devinModelName(for model: AIModel) -> String? {

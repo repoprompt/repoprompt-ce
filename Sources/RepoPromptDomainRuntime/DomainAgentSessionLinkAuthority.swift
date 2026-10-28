@@ -1,5 +1,28 @@
 import Foundation
 
+/// Revocable evidence, issued and revoked only by the app's single authorization owner, that an
+/// observer's links are authorized at every capability (Overseer full access). The link authority only
+/// reads membership here; it never infers full access from grants, settings, or arguments. Stored link
+/// capabilities are never changed. Process-local and never persisted.
+package final class DomainAgentSessionLinkCapabilityElevation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var observers: Set<UUID> = []
+
+    package init() {}
+
+    package func elevate(observer: UUID) {
+        lock.withLock { _ = observers.insert(observer) }
+    }
+
+    package func revokeAll() {
+        lock.withLock { observers.removeAll() }
+    }
+
+    package func isElevated(observer: UUID) -> Bool {
+        lock.withLock { observers.contains(observer) }
+    }
+}
+
 /// Process-wide, never-persisted authority for cross-window Agent session oversight links.
 ///
 /// This actor is the single execution-time choke point for every oversight operation. It owns link
@@ -13,11 +36,52 @@ import Foundation
 /// - At most one active link per `(observer session incarnation, target session incarnation)` pair.
 /// - Multiple independent observers may oversee one target; there is no artificial link-count cap.
 /// - A revoked link ID/generation never resurrects; re-adding creates a new ID and generation.
-/// - Grant capabilities are fixed at creation and never inferred from role or parentage. The one
-///   in-place change is the user's explicit management delegation on one exact link generation
-///   (`setManagement`); nothing inherits it, and a relink starts without it.
-/// - No date-based expiry: only explicit/lifecycle revocation and runtime shutdown end a link.
+/// - Grant capabilities are fixed at creation and never inferred from role or parentage. New links
+///   are managed; an explicitly restricted live grant is not silently upgraded.
+/// - Ordinary explicit links have no date-based expiry. A derived exact-target link also requires
+///   its owning user consent to remain live; storage availability is never an input.
 package actor DomainAgentSessionLinkAuthority {
+    private var scopeConsent: DomainDelegationScopeLinkConsent?
+    private var capabilityElevation: DomainAgentSessionLinkCapabilityElevation?
+
+    /// Installs the single app decision owner's read-only input, never a second authority owner.
+    package func installScopeConsent(_ consent: DomainDelegationScopeLinkConsent) -> Bool {
+        guard scopeConsent == nil || scopeConsent === consent else { return false }
+        scopeConsent = consent
+        return true
+    }
+
+    private func hasSourceConsent(scopeID: UUID?, observer: UUID, target: UUID) -> Bool {
+        guard let scopeID else { return true }
+        return scopeConsent?.permits(scopeID: scopeID, observer: observer, target: target, at: now()) == true
+    }
+
+    private func hasSourceConsent(_ grant: DomainAgentSessionLinkGrant) -> Bool {
+        hasSourceConsent(scopeID: grant.sourceScopeID, observer: grant.observer.sessionID, target: grant.target.sessionID)
+    }
+
+    /// The capabilities a grant authorizes now: its stored capabilities, or every capability while the
+    /// app's authorization owner has elevated this observer (`DomainAgentSessionLinkCapabilityElevation`).
+    /// The stored grant is never upgraded; revoking the elevation removes it from every fence at once.
+    private func effectiveCapabilities(of grant: DomainAgentSessionLinkGrant) -> Set<DomainAgentSessionLinkCapability> {
+        guard capabilityElevation?.isElevated(observer: grant.observer.sessionID) == true else {
+            return grant.capabilities
+        }
+        return Set(DomainAgentSessionLinkCapability.allCases)
+    }
+
+    package func installCapabilityElevation(_ elevation: DomainAgentSessionLinkCapabilityElevation) {
+        capabilityElevation = elevation
+    }
+
+    package func revokeLinks(sourceScopeIDs: Set<UUID>) -> [DomainAgentSessionLinkRevocationNotice] {
+        let ids = Set(links.values.compactMap { record -> UUID? in
+            guard let id = record.grant.sourceScopeID, sourceScopeIDs.contains(id) else { return nil }
+            return record.grant.id
+        })
+        return revokeLinks(withIDs: ids, reason: .userRequested)
+    }
+
     // MARK: - Bounds
 
     /// Bounded opaque read-cursor records per link (LRU). Evicted handles return `cursor_expired`.
@@ -52,7 +116,7 @@ package actor DomainAgentSessionLinkAuthority {
     /// This is deliberately not `DomainAgentSessionLinkLease`: that lease represents an
     /// observer-origin monitor operation and carries a monitor capability. An attention request runs in
     /// the inverse direction, and the exact active grant is its whole authority.
-    package struct RequestAttentionAuthorization: Hashable, Sendable {
+    package struct RequestAttentionAuthorization: Hashable {
         package let runtimeID: UUID
         package let runtimeGeneration: UInt64
         package let reference: DomainAgentSessionLinkReference
@@ -88,7 +152,7 @@ package actor DomainAgentSessionLinkAuthority {
         }
     }
 
-    package enum RequestAttentionAuthorizationError: Error, Equatable, Sendable {
+    package enum RequestAttentionAuthorizationError: Error, Equatable {
         /// Indistinguishable absence, stale routing, or authorization denial.
         case denied
         /// More than one exact live grant can satisfy the request.
@@ -105,6 +169,7 @@ package actor DomainAgentSessionLinkAuthority {
     // MARK: - Internal records
 
     private struct LinkRecord {
+        let revocationFence = DomainAgentSessionLinkRevocationFence()
         var grant: DomainAgentSessionLinkGrant
         /// Authority revision at activation. Used so a stale lifecycle observation cannot revoke a
         /// link that was activated after that observation was taken.
@@ -115,10 +180,6 @@ package actor DomainAgentSessionLinkAuthority {
         var waitCursorOrder: [String] = []
         /// At most one active waiter per link generation.
         var activeWaiterID: UUID?
-        /// Sequence of the newest capability-change notice ever recorded for this generation. A
-        /// claimed notice is current only while it is still this one, whichever channel took the
-        /// newer ones, so an older notice can never be restored or pushed after a newer change.
-        var latestCapabilityNoticeSequence: UInt64 = 0
     }
 
     private enum RequestAttentionSelection {
@@ -145,6 +206,7 @@ package actor DomainAgentSessionLinkAuthority {
     private struct Waiter {
         let id: UUID
         let observerSessionID: UUID
+        let observerInput: DomainAgentSessionLinkWaitInput?
         let predicate: DomainAgentSessionLinkWaitPredicate
         let registrations: [WaitRegistration]
         let continuation: CheckedContinuation<DomainAgentSessionLinkWaitResult, Never>
@@ -157,15 +219,22 @@ package actor DomainAgentSessionLinkAuthority {
         let idempotencyKey: String
     }
 
+    private enum RetainedReceipt {
+        case send(DomainAgentSessionLinkSendReceipt)
+        case stop(DomainAgentSessionLinkStopReceipt)
+    }
+
     private struct SendLedgerEntry {
         let reservation: DomainAgentSessionLinkSendReservation
         var isCommitted: Bool
-        var receipt: DomainAgentSessionLinkSendReceipt?
+        var receipt: RetainedReceipt?
         /// Terminal tombstone: the delivery's durable outcome could not be determined, so this key is
         /// permanently spent and has no receipt to replay.
         var isIndeterminate: Bool = false
 
-        var isSettled: Bool { receipt != nil || isIndeterminate }
+        var isSettled: Bool {
+            receipt != nil || isIndeterminate
+        }
     }
 
     // MARK: - State
@@ -181,6 +250,15 @@ package actor DomainAgentSessionLinkAuthority {
     private var isShutDown = false
 
     private var links: [UUID: LinkRecord] = [:]
+    private struct AuthorizationKey: Hashable {
+        let observer: DomainAgentSessionLinkEndpointIdentity
+        let targetSessionID: UUID
+    }
+
+    // Derived at activation/revocation, never discovered during authorization. A duplicate pair
+    // fails closed until ordinary lifecycle removal resolves it.
+    private var authorizationLinks: [AuthorizationKey: Set<UUID>] = [:]
+    private var outboundLinksByEndpoint: [DomainAgentSessionLinkEndpointIdentity: Set<UUID>] = [:]
     private var pendingReservations: [UUID: DomainAgentSessionLinkPendingReservation] = [:]
     private var targets: [UUID: TargetRecord] = [:]
     /// Monotonic per-target-session change sequence that survives target record replacement.
@@ -198,14 +276,7 @@ package actor DomainAgentSessionLinkAuthority {
     private var recentRevocationNoticeOrder: [DomainAgentSessionLinkEndpointIdentity] = []
 
     private var waiters: [UUID: Waiter] = [:]
-    /// Undelivered capability-change notices, latest per link, keyed by the exact observer endpoint
-    /// the changed grant names. Process-local like the capability itself.
-    private var capabilityNotices:
-        [DomainAgentSessionLinkEndpointIdentity: [UUID: DomainAgentSessionLinkCapabilityNotice]] = [:]
-    private var nextCapabilityNoticeSequence: UInt64 = 1
-    /// Highest observer link-set revision an accepted inventory block has stated, per exact observer
-    /// endpoint. A notice at or below it is already known to the model and is never restored.
-    private var capabilityNoticeAcknowledgedRevisions: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
+    private var localInputGenerations: [DomainAgentSessionLinkEndpointIdentity: UInt64] = [:]
     private var sendLedger: [SendLedgerKey: SendLedgerEntry] = [:]
     private var sendLedgerOrder: [SendLedgerKey] = []
     private var subscribers: [UUID: AsyncStream<DomainAgentSessionLinkChangeEvent>.Continuation] = [:]
@@ -236,9 +307,17 @@ package actor DomainAgentSessionLinkAuthority {
             observedTargetCount: targets.count,
             parkedWaiterCount: waiters.count,
             readCursorCount: links.values.reduce(0) { $0 + $1.readCursors.count },
-            inFlightSendCount: sendLedger.values.filter { !$0.isSettled }.count,
+            inFlightSendCount: sendLedger.values.count(where: { !$0.isSettled }),
             retainedSendOutcomeCount: sendLedger.values.filter(\.isSettled).count
         )
+    }
+
+    /// One actor turn for retirement's both-direction relationship cutoff. UUID-scoped rather
+    /// than exact-endpoint-scoped so a stale grant on another incarnation also blocks stash.
+    package func relationshipInventories(
+        forSessionID sessionID: UUID
+    ) -> (inbound: DomainAgentSessionLinkInventory, outbound: DomainAgentSessionLinkInventory) {
+        (links(forTarget: sessionID), links(forObserver: sessionID))
     }
 
     // MARK: - Change feed
@@ -295,8 +374,10 @@ package actor DomainAgentSessionLinkAuthority {
     package func reserveLink(
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity,
-        capabilities: Set<DomainAgentSessionLinkCapability> = DomainAgentSessionLinkCapability.version1,
-        requiresExistingOutboundLink: Bool = false
+        capabilities: Set<DomainAgentSessionLinkCapability> = DomainAgentSessionLinkCapability.managed,
+        requiresExistingOutboundLink: Bool = false,
+        requiresExistingDirectLink: Bool = false,
+        sourceScopeID: UUID? = nil
     ) -> DomainAgentSessionLinkReservationDisposition {
         guard !isDraining, !isShutDown else { return .rejected(.shuttingDown) }
         guard observer.sessionID != target.sessionID, observer != target else {
@@ -305,11 +386,17 @@ package actor DomainAgentSessionLinkAuthority {
         guard observer.hasResolvedPersistentBinding else { return .rejected(.observerBindingUnresolved) }
         guard target.hasResolvedPersistentBinding else { return .rejected(.targetBindingUnresolved) }
 
+        guard hasSourceConsent(scopeID: sourceScopeID, observer: observer.sessionID, target: target.sessionID) else {
+            return .rejected(.sourceScopeUnavailable)
+        }
         if let existing = activeLink(observer: observer, target: target) {
             return .existing(existing.grant)
         }
         guard !requiresExistingOutboundLink || hasActiveOutboundLink(observerEndpoint: observer) else {
             return .rejected(.observerHasNoActiveOutboundLink)
+        }
+        guard !requiresExistingDirectLink || hasActiveLink(endpoint: observer) else {
+            return .rejected(.observerHasNoActiveLink)
         }
         if pendingReservations.values.contains(where: { $0.observer == observer && $0.target == target }) {
             return .rejected(.reservationAlreadyPending)
@@ -342,9 +429,11 @@ package actor DomainAgentSessionLinkAuthority {
             target: target,
             capabilities: capabilities,
             requiresExistingOutboundLink: requiresExistingOutboundLink,
+            requiresExistingDirectLink: requiresExistingDirectLink,
             provisionallyInstallsTargetObservation: targets[target.sessionID] == nil
                 && !hasPendingInboundReservation,
-            reservedAtAuthorityRevision: advanceAuthorityRevision()
+            reservedAtAuthorityRevision: advanceAuthorityRevision(),
+            sourceScopeID: sourceScopeID
         )
         nextLinkGeneration &+= 1
         pendingReservations[reservation.linkID] = reservation
@@ -364,6 +453,10 @@ package actor DomainAgentSessionLinkAuthority {
         }
         guard let pending = pendingReservations[reservation.linkID], pending == reservation else {
             return .rejected(.unknownReservation)
+        }
+        guard hasSourceConsent(scopeID: reservation.sourceScopeID, observer: reservation.observer.sessionID, target: reservation.target.sessionID) else {
+            pendingReservations.removeValue(forKey: reservation.linkID)
+            return .rejected(.sourceScopeUnavailable)
         }
         guard initialSnapshot.sessionID == reservation.target.sessionID else {
             pendingReservations.removeValue(forKey: reservation.linkID)
@@ -385,6 +478,12 @@ package actor DomainAgentSessionLinkAuthority {
             pendingReservations.removeValue(forKey: reservation.linkID)
             return .rejected(.observerHasNoActiveOutboundLink)
         }
+        if reservation.requiresExistingDirectLink,
+           !hasActiveLink(endpoint: reservation.observer)
+        {
+            pendingReservations.removeValue(forKey: reservation.linkID)
+            return .rejected(.observerHasNoActiveLink)
+        }
 
         pendingReservations.removeValue(forKey: reservation.linkID)
         let revision = advanceAuthorityRevision()
@@ -394,9 +493,12 @@ package actor DomainAgentSessionLinkAuthority {
             observer: reservation.observer,
             target: reservation.target,
             createdAt: now(),
-            capabilities: reservation.capabilities
+            capabilities: reservation.capabilities,
+            sourceScopeID: reservation.sourceScopeID
         )
         links[grant.id] = LinkRecord(grant: grant, activationAuthorityRevision: revision)
+        authorizationLinks[AuthorizationKey(observer: grant.observer, targetSessionID: grant.target.sessionID), default: []].insert(grant.id)
+        outboundLinksByEndpoint[grant.observer, default: []].insert(grant.id)
 
         // The installer role belongs to the activation that actually creates the target record, not
         // to whichever reservation was provisionally elected. An elected reservation can be abandoned
@@ -447,187 +549,6 @@ package actor DomainAgentSessionLinkAuthority {
         pendingReservations.removeValue(forKey: reservation.linkID)
     }
 
-    // MARK: - Management delegation
-
-    /// Adds or removes the user's management delegation on one exact link generation, in place.
-    ///
-    /// The link keeps its ID and generation, so its cursors, waiters, queued send, and Auto-wake lane
-    /// survive. What changes is authority: every lease already issued for `.manage` fails
-    /// `validate(lease:)` the moment the capability is gone, and every management commit fence
-    /// re-reads the grant, so revocation takes effect at the next fence rather than at the next call.
-    ///
-    /// The observer's link-set revision advances because the advertised capability set is part of
-    /// what that observer is told about its links: the next accepted dispatch must carry a fresh
-    /// inventory instead of the one that described the old authority. The target's inbound revision
-    /// is left alone, because its inbound grant set did not change and it fences the inverse
-    /// attention path.
-    package func setManagement(
-        _ enabled: Bool,
-        reference: DomainAgentSessionLinkReference,
-        observer: DomainAgentSessionLinkEndpointIdentity,
-        target: DomainAgentSessionLinkEndpointIdentity
-    ) -> DomainAgentSessionLinkManagementDisposition {
-        guard !isDraining, !isShutDown else { return .shuttingDown }
-        guard var record = links[reference.linkID],
-              record.grant.generation == reference.generation,
-              record.grant.observer == observer,
-              record.grant.target == target
-        else {
-            return .notFound
-        }
-        let current = record.grant.capabilities
-        let next = enabled ? current.union([.manage]) : current.subtracting([.manage])
-        guard next != current else { return .unchanged(record.grant) }
-        let grant = DomainAgentSessionLinkGrant(
-            id: record.grant.id,
-            generation: record.grant.generation,
-            observer: record.grant.observer,
-            target: record.grant.target,
-            createdAt: record.grant.createdAt,
-            capabilities: next
-        )
-        let revision = advanceAuthorityRevision()
-        let linkSetRevision = advanceObserverLinkSetRevision(grant.observer.sessionID)
-        // Recorded in the same actor turn as the grant change and before any waiter resumes, so the
-        // woken `wait` claims the notice it was woken for.
-        let notice = DomainAgentSessionLinkCapabilityNotice(
-            linkID: grant.id,
-            linkGeneration: grant.generation,
-            targetSessionID: grant.target.sessionID,
-            managed: enabled,
-            observerLinkSetRevision: linkSetRevision,
-            sequence: nextCapabilityNoticeSequence,
-            changedAt: now()
-        )
-        nextCapabilityNoticeSequence &+= 1
-        record.grant = grant
-        record.latestCapabilityNoticeSequence = notice.sequence
-        links[grant.id] = record
-        capabilityNotices[grant.observer, default: [:]][grant.id] = notice
-        wakeWaitersForCapabilityChange(observer: grant.observer, targetSessionID: grant.target.sessionID)
-        publish(DomainAgentSessionLinkChangeEvent(
-            kind: .capabilitiesChanged,
-            authorityRevision: revision,
-            linkID: grant.id,
-            linkGeneration: grant.generation,
-            observerSessionID: grant.observer.sessionID,
-            targetSessionID: grant.target.sessionID,
-            observerLinkSetRevision: linkSetRevision
-        ))
-        return .changed(grant, observerInventory: links(forObserverEndpoint: grant.observer))
-    }
-
-    // MARK: - Capability-change notices
-
-    /// Ends every wait this exact observer endpoint has parked, on any of its links.
-    ///
-    /// A wait on a *different* target is woken too: the model blocked in it is the running model that
-    /// must learn what it may now do, and the notice it returns names only a session this observer
-    /// holds a grant for. Successor cursors consume no target change.
-    private func wakeWaitersForCapabilityChange(
-        observer: DomainAgentSessionLinkEndpointIdentity,
-        targetSessionID: UUID
-    ) {
-        let candidates = waiters.values.filter { waiter in
-            waiter.registrations.contains { links[$0.reference.linkID]?.grant.observer == observer }
-        }
-        // The first woken wait claims every owed notice in this same actor turn, so no other channel
-        // can take it in between and leave a `capabilities_changed` result without its notice. Any
-        // sibling wait of the same observer reports the wake; the notice is delivered once.
-        var claimed = candidates.isEmpty ? [] : takeCapabilityNotices(for: observer)
-        for waiter in candidates.sorted(by: { $0.id.uuidString < $1.id.uuidString }) {
-            resumeWaiter(
-                waiter.id,
-                outcome: .capabilitiesChanged(sessionID: targetSessionID),
-                includeTargets: true,
-                capabilityNotices: claimed
-            )
-            claimed = []
-        }
-    }
-
-    /// Notices still owed to this exact observer endpoint, without claiming them.
-    package func pendingCapabilityNotices(
-        for observer: DomainAgentSessionLinkEndpointIdentity
-    ) -> [DomainAgentSessionLinkCapabilityNotice] {
-        pruneCapabilityNotices(for: observer)
-        return (capabilityNotices[observer] ?? [:]).values.sorted { $0.sequence < $1.sequence }
-    }
-
-    /// Claims every notice owed to this exact observer endpoint, atomically.
-    ///
-    /// A notice is returned only while its exact link generation is live, still names this observer,
-    /// and still has the management state the notice reports. Everything else is dropped rather than
-    /// delivered: a revoked or relinked link's notice would describe authority that no longer exists.
-    /// The caller either delivers what it took or hands it back through `restoreCapabilityNotices`.
-    package func takeCapabilityNotices(
-        for observer: DomainAgentSessionLinkEndpointIdentity
-    ) -> [DomainAgentSessionLinkCapabilityNotice] {
-        let taken = pendingCapabilityNotices(for: observer)
-        capabilityNotices.removeValue(forKey: observer)
-        return taken
-    }
-
-    /// Returns notices whose delivery failed, unless a newer change on the same link superseded them
-    /// (whether or not that newer notice is still pending), an accepted inventory already stated
-    /// them, or the link generation they describe is gone.
-    package func restoreCapabilityNotices(
-        _ notices: [DomainAgentSessionLinkCapabilityNotice],
-        for observer: DomainAgentSessionLinkEndpointIdentity
-    ) {
-        let acknowledged = capabilityNoticeAcknowledgedRevisions[observer] ?? 0
-        for notice in notices where notice.observerLinkSetRevision > acknowledged {
-            guard noticeIsLatest(notice, for: observer) else { continue }
-            capabilityNotices[observer, default: [:]][notice.linkID] = notice
-        }
-        pruneCapabilityNotices(for: observer)
-    }
-
-    /// Exact-generation, exact-observer, newest-change, and matching-state check for one notice.
-    private func noticeIsLatest(
-        _ notice: DomainAgentSessionLinkCapabilityNotice,
-        for observer: DomainAgentSessionLinkEndpointIdentity
-    ) -> Bool {
-        guard let record = links[notice.linkID] else { return false }
-        return record.grant.generation == notice.linkGeneration
-            && record.grant.observer == observer
-            && record.latestCapabilityNoticeSequence == notice.sequence
-            && record.grant.capabilities.contains(.manage) == notice.managed
-    }
-
-    /// Whether claimed notices still describe exactly the current grants: each link generation is
-    /// live for this observer with the reported management state, and no newer change on the same
-    /// link has been recorded since the claim. A push re-checks this as its last step before the
-    /// provider call, so it never tells a model about authority that moved in between.
-    package func capabilityNoticesAreCurrent(
-        _ notices: [DomainAgentSessionLinkCapabilityNotice],
-        for observer: DomainAgentSessionLinkEndpointIdentity
-    ) -> Bool {
-        guard !isDraining, !isShutDown else { return false }
-        return notices.allSatisfy { noticeIsLatest($0, for: observer) }
-    }
-
-    /// Settles notices an accepted inventory block has already stated: that block described every
-    /// link at `observerLinkSetRevision` or later, so the same fact need not be pushed again.
-    package func acknowledgeCapabilityNotices(
-        for observer: DomainAgentSessionLinkEndpointIdentity,
-        throughObserverLinkSetRevision revision: UInt64
-    ) {
-        capabilityNoticeAcknowledgedRevisions[observer] = max(
-            capabilityNoticeAcknowledgedRevisions[observer] ?? 0,
-            revision
-        )
-        guard var notices = capabilityNotices[observer] else { return }
-        notices = notices.filter { $0.value.observerLinkSetRevision > revision }
-        capabilityNotices[observer] = notices.isEmpty ? nil : notices
-    }
-
-    private func pruneCapabilityNotices(for observer: DomainAgentSessionLinkEndpointIdentity) {
-        guard var notices = capabilityNotices[observer] else { return }
-        notices = notices.filter { _, notice in noticeIsLatest(notice, for: observer) }
-        capabilityNotices[observer] = notices.isEmpty ? nil : notices
-    }
-
     private func allocateChangeSequence(for sessionID: UUID) -> UInt64 {
         let sequence = nextChangeSequenceBySession[sessionID] ?? 1
         nextChangeSequenceBySession[sessionID] = sequence &+ 1
@@ -638,7 +559,7 @@ package actor DomainAgentSessionLinkAuthority {
         observer: DomainAgentSessionLinkEndpointIdentity,
         target: DomainAgentSessionLinkEndpointIdentity
     ) -> LinkRecord? {
-        links.values.first { $0.grant.observer == observer && $0.grant.target == target }
+        links.values.first { $0.grant.observer == observer && $0.grant.target == target && hasSourceConsent($0.grant) }
     }
 
     /// Returns the active grant recorded for one exact link generation.
@@ -650,7 +571,7 @@ package actor DomainAgentSessionLinkAuthority {
         for reference: DomainAgentSessionLinkReference
     ) -> DomainAgentSessionLinkGrant? {
         guard let record = links[reference.linkID],
-              record.grant.generation == reference.generation
+              record.grant.generation == reference.generation, hasSourceConsent(record.grant)
         else {
             return nil
         }
@@ -684,21 +605,24 @@ package actor DomainAgentSessionLinkAuthority {
         )
     }
 
+    /// Cap accounting is UUID-scoped, unlike caller authorization. Keep the grant's exact target
+    /// incarnation so a second live binding with the same session UUID cannot hide its slot.
+    package func linkedTargetEndpoints(
+        forObserverSessionID sessionID: UUID
+    ) -> (endpoints: [DomainAgentSessionLinkEndpointIdentity], authorityRevision: UInt64) {
+        let endpoints = links.values.compactMap { record in
+            record.grant.observer.sessionID == sessionID ? record.grant.target : nil
+        }
+        return (endpoints, authorityRevision)
+    }
+
     private func inventory(
         forObserver observerSessionID: UUID,
         matching predicate: (LinkRecord) -> Bool
     ) -> DomainAgentSessionLinkInventory {
         var items: [DomainAgentSessionLinkInventoryItem] = []
-        for record in links.values where predicate(record) {
-            let targetSessionID: UUID = record.grant.target.sessionID
-            items.append(DomainAgentSessionLinkInventoryItem(
-                linkID: record.grant.id,
-                generation: record.grant.generation,
-                observerSessionID: record.grant.observer.sessionID,
-                targetSessionID: targetSessionID,
-                displayName: targets[targetSessionID]?.snapshot.displayName,
-                capabilities: record.grant.capabilities
-            ))
+        for record in links.values where predicate(record) && hasSourceConsent(record.grant) {
+            items.append(inventoryItem(record, outbound: true))
         }
         items.sort(by: Self.orderedByTarget)
         return DomainAgentSessionLinkInventory(
@@ -731,15 +655,8 @@ package actor DomainAgentSessionLinkAuthority {
         matching predicate: (LinkRecord) -> Bool
     ) -> DomainAgentSessionLinkInventory {
         var items: [DomainAgentSessionLinkInventoryItem] = []
-        for record in links.values where predicate(record) {
-            items.append(DomainAgentSessionLinkInventoryItem(
-                linkID: record.grant.id,
-                generation: record.grant.generation,
-                observerSessionID: record.grant.observer.sessionID,
-                targetSessionID: record.grant.target.sessionID,
-                displayName: nil,
-                capabilities: record.grant.capabilities
-            ))
+        for record in links.values where predicate(record) && hasSourceConsent(record.grant) {
+            items.append(inventoryItem(record, outbound: false))
         }
         items.sort(by: Self.orderedByObserver)
         return DomainAgentSessionLinkInventory(
@@ -804,7 +721,7 @@ package actor DomainAgentSessionLinkAuthority {
             inbound: inbound,
             outboundTargetEndpoints: outboundTargetEndpoints,
             inboundObserverEndpoints: inboundObserverEndpoints,
-            activeOutboundObserverEndpoints: Set(links.values.map { $0.grant.observer }),
+            activeOutboundObserverEndpoints: Set(links.values.map(\.grant.observer)),
             notices: recentRevocationNotices[endpoint] ?? []
         )
     }
@@ -815,6 +732,67 @@ package actor DomainAgentSessionLinkAuthority {
 
     package func targetLinkSetRevision(_ targetSessionID: UUID) -> UInt64 {
         targetLinkSetRevisions[targetSessionID] ?? 0
+    }
+
+    /// Groups exact membership once, sharing inventory ordering and revision semantics with the
+    /// ordinary inventory queries. Additional endpoints receive real empty inventories for final
+    /// agent publications, but never become retained catalog keys merely by being requested.
+    package func presentationSnapshot(
+        additionalEndpoints: Set<DomainAgentSessionLinkEndpointIdentity> = []
+    ) -> DomainAgentSessionLinkPresentationSnapshot {
+        var outbound: [DomainAgentSessionLinkEndpointIdentity: [DomainAgentSessionLinkInventoryItem]] = [:]
+        var inbound: [DomainAgentSessionLinkEndpointIdentity: [DomainAgentSessionLinkInventoryItem]] = [:]
+        var targetEndpoints: [DomainAgentSessionLinkEndpointIdentity: [UUID: DomainAgentSessionLinkEndpointIdentity]] = [:]
+        var observerEndpoints: [DomainAgentSessionLinkEndpointIdentity: [UUID: DomainAgentSessionLinkEndpointIdentity]] = [:]
+        for record in links.values where hasSourceConsent(record.grant) {
+            let grant = record.grant
+            outbound[grant.observer, default: []].append(inventoryItem(record, outbound: true))
+            inbound[grant.target, default: []].append(inventoryItem(record, outbound: false))
+            targetEndpoints[grant.observer, default: [:]][grant.id] = grant.target
+            observerEndpoints[grant.target, default: [:]][grant.id] = grant.observer
+        }
+        let activeObservers = Set(outbound.keys)
+        let endpoints = activeObservers.union(inbound.keys).union(recentRevocationNotices.keys)
+        var inputs: [DomainAgentSessionLinkEndpointIdentity: DomainAgentSessionLinkEndpointProjectionInputs] = [:]
+        for endpoint in endpoints.union(additionalEndpoints) {
+            inputs[endpoint] = DomainAgentSessionLinkEndpointProjectionInputs(
+                outbound: DomainAgentSessionLinkInventory(
+                    sessionID: endpoint.sessionID,
+                    linkSetRevision: observerLinkSetRevisions[endpoint.sessionID] ?? 0,
+                    authorityRevision: authorityRevision,
+                    items: (outbound[endpoint] ?? []).sorted(by: Self.orderedByTarget)
+                ),
+                inbound: DomainAgentSessionLinkInventory(
+                    sessionID: endpoint.sessionID,
+                    linkSetRevision: targetLinkSetRevisions[endpoint.sessionID] ?? 0,
+                    authorityRevision: authorityRevision,
+                    items: (inbound[endpoint] ?? []).sorted(by: Self.orderedByObserver)
+                ),
+                outboundTargetEndpoints: targetEndpoints[endpoint] ?? [:],
+                inboundObserverEndpoints: observerEndpoints[endpoint] ?? [:],
+                activeOutboundObserverEndpoints: activeObservers,
+                notices: recentRevocationNotices[endpoint] ?? []
+            )
+        }
+        return DomainAgentSessionLinkPresentationSnapshot(
+            authorityRevision: authorityRevision,
+            endpoints: endpoints,
+            activeOutboundObserverEndpoints: activeObservers,
+            inputs: inputs
+        )
+    }
+
+    private func inventoryItem(_ record: LinkRecord, outbound: Bool) -> DomainAgentSessionLinkInventoryItem {
+        DomainAgentSessionLinkInventoryItem(
+            linkID: record.grant.id,
+            generation: record.grant.generation,
+            observerSessionID: record.grant.observer.sessionID,
+            targetSessionID: record.grant.target.sessionID,
+            displayName: outbound ? targets[record.grant.target.sessionID]?.snapshot.displayName : nil,
+            capabilities: record.grant.capabilities,
+            createdAt: record.grant.createdAt,
+            sourceScopeID: record.grant.sourceScopeID
+        )
     }
 
     /// Whether one exact observer incarnation currently holds an outbound link.
@@ -830,12 +808,39 @@ package actor DomainAgentSessionLinkAuthority {
     package func hasActiveOutboundLink(
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Bool {
-        links.values.contains { $0.grant.observer == observerEndpoint }
+        (outboundLinksByEndpoint[observerEndpoint] ?? []).contains { id in
+            guard let record = links[id] else { return false }
+            return record.grant.observer == observerEndpoint && hasSourceConsent(record.grant)
+        }
+    }
+
+    /// Exact indexed relationship sample for a caller that must exclude its own unsettled
+    /// activation-backed creations. Ordinary inbound grants cannot be those creations: the private
+    /// bootstrap proof is restricted to a freshly allocated lane target, never the ordinary caller.
+    package func activeDirectGrant(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        excludingOutboundTargets: Set<DomainAgentSessionLinkEndpointIdentity>
+    ) -> DomainAgentSessionLinkGrant? {
+        for id in outboundLinksByEndpoint[endpoint] ?? [] {
+            if let grant = links[id]?.grant, grant.observer == endpoint, hasSourceConsent(grant),
+               !excludingOutboundTargets.contains(grant.target)
+            {
+                return grant
+            }
+        }
+        guard let target = targets[endpoint.sessionID], target.endpoint == endpoint else { return nil }
+        for id in target.inboundLinkIDs {
+            if let grant = links[id]?.grant, grant.target == endpoint, hasSourceConsent(grant) { return grant }
+        }
+        return nil
     }
 
     package func hasActiveLink(endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
-        links.values.contains { record in
-            record.grant.observer == endpoint || record.grant.target == endpoint
+        if hasActiveOutboundLink(observerEndpoint: endpoint) { return true }
+        guard let target = targets[endpoint.sessionID], target.endpoint == endpoint else { return false }
+        return target.inboundLinkIDs.contains { id in
+            guard let record = links[id] else { return false }
+            return record.grant.target == endpoint && hasSourceConsent(record.grant)
         }
     }
 
@@ -956,7 +961,7 @@ package actor DomainAgentSessionLinkAuthority {
 
         guard !liveRecords.isEmpty else { return .denied }
         guard liveRecords.count == 1 else {
-            let allCandidateIDs = Set(liveRecords.map { $0.grant.observer.sessionID })
+            let allCandidateIDs = Set(liveRecords.map(\.grant.observer.sessionID))
                 .sorted { $0.uuidString < $1.uuidString }
             let candidateIDs = Array(allCandidateIDs.prefix(Self.requestAttentionObserverCandidateLimit))
             return .ambiguous(
@@ -992,12 +997,17 @@ package actor DomainAgentSessionLinkAuthority {
         else {
             return .failure(.capabilityDenied)
         }
-        guard let record = links.values.first(where: {
-            $0.grant.observer == observerEndpoint && $0.grant.target.sessionID == targetSessionID
-        }) else {
+        let key = AuthorizationKey(observer: observerEndpoint, targetSessionID: targetSessionID)
+        let ids = (authorizationLinks[key] ?? []).filter { id in
+            links[id].map { hasSourceConsent($0.grant) } ?? false
+        }
+        guard ids.count == 1, let id = ids.first,
+              let record = links[id], record.grant.observer == observerEndpoint,
+              record.grant.target.sessionID == targetSessionID
+        else {
             return .failure(.noActiveLink)
         }
-        guard record.grant.capabilities.contains(capability) else {
+        guard effectiveCapabilities(of: record.grant).contains(capability) else {
             return .failure(.capabilityDenied)
         }
         return .success(DomainAgentSessionLinkLease(
@@ -1009,7 +1019,8 @@ package actor DomainAgentSessionLinkAuthority {
             capability: capability,
             observer: record.grant.observer,
             target: record.grant.target,
-            issuedAt: now()
+            issuedAt: now(),
+            sourceScopeID: record.grant.sourceScopeID
         ))
     }
 
@@ -1024,6 +1035,7 @@ package actor DomainAgentSessionLinkAuthority {
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     ) -> Result<DomainAgentSessionLinkInventory, DomainAgentSessionLinkError> {
         guard !isDraining, !isShutDown else { return .failure(.runtimeShuttingDown) }
+        guard operation == .monitorList else { return .failure(.invalidRequest) }
         let decision = DomainAgentSessionOperationAuthorizer.authorizeObserverScoped(
             operation: operation,
             caller: .agentSession(observerEndpoint.sessionID),
@@ -1045,8 +1057,53 @@ package actor DomainAgentSessionLinkAuthority {
         guard record.grant.observer == lease.observer, record.grant.target == lease.target else {
             return .endpointInvalidated
         }
-        guard record.grant.capabilities.contains(lease.capability) else { return .capabilityDenied }
+        guard record.grant.sourceScopeID == lease.sourceScopeID, hasSourceConsent(record.grant) else { return .linkRevoked }
+        guard effectiveCapabilities(of: record.grant).contains(lease.capability) else { return .capabilityDenied }
         return nil
+    }
+
+    /// Issues an exact-grant publication fence while this actor still owns lease validation.
+    package func commitAuthorization(for lease: DomainAgentSessionLinkLease) -> DomainAgentSessionLinkCommitAuthorization? {
+        guard validate(lease: lease) == nil, let record = links[lease.linkID] else { return nil }
+        return DomainAgentSessionLinkCommitAuthorization(
+            lease: lease, fence: record.revocationFence, grant: record.grant,
+            consent: scopeConsent, elevation: capabilityElevation, now: now
+        )
+    }
+
+    /// One all-or-none actor transition at optional provider disclosure. Reuses the exact operation
+    /// authorizer and Read-cursor lease validator; allocates no cursor and mutates no authority state.
+    package func validateReadDisclosures(_ requirements: [DomainAgentSessionReadDisclosureRequirement]) -> Bool {
+        guard !isDraining, !isShutDown else { return false }
+        return requirements.allSatisfy { requirement in
+            guard case let .success(lease) = authorize(
+                operation: .monitorRead, observerEndpoint: requirement.observer,
+                targetSessionID: requirement.target.sessionID
+            ), lease.linkID == requirement.reference.linkID,
+            lease.linkGeneration == requirement.reference.generation,
+            lease.target == requirement.target,
+            lease.capability == .read,
+            validate(lease: lease) == nil else { return false }
+            return true
+        }
+    }
+
+    /// Fences an observer-local batch before pending prompt disclosure. Every observation lease
+    /// must still be exact; only grants with Manage may reveal a prompt body. A revoked member
+    /// denies the whole batch rather than releasing a surviving sibling's prompt.
+    package func managedObservationTargetsIfValid(
+        leases: [DomainAgentSessionLinkLease]
+    ) -> Set<UUID>? {
+        var managed: Set<UUID> = []
+        for lease in leases {
+            guard validate(lease: lease) == nil,
+                  let record = links[lease.linkID]
+            else { return nil }
+            if effectiveCapabilities(of: record.grant).contains(.manage) {
+                managed.insert(lease.target.sessionID)
+            }
+        }
+        return managed
     }
 
     // MARK: - Target publication
@@ -1103,6 +1160,7 @@ package actor DomainAgentSessionLinkAuthority {
             displayName: incoming.displayName,
             providerDisplayName: incoming.providerDisplayName,
             status: incoming.status,
+            board: incoming.board,
             idleForSend: incoming.idleForSend,
             idleSince: idleSince,
             waitingOn: incoming.waitingOn,
@@ -1127,8 +1185,47 @@ package actor DomainAgentSessionLinkAuthority {
         return makeTargetState(linkID: lease.linkID)
     }
 
+    /// Resolves retained wait handles only within the exact observer's current grants. The result
+    /// supplies routing identities, not leases; execution must still authorize and validate each
+    /// cursor. Lookup neither mints successors nor extends the lifetime of a retained handle.
+    package func resolveWaitCursorTargets(
+        observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        cursors: [String]
+    ) -> Result<[UUID], DomainAgentSessionLinkError> {
+        guard !isDraining, !isShutDown else { return .failure(.runtimeShuttingDown) }
+        guard !cursors.isEmpty, cursors.count <= Self.waitFanOutLimit,
+              Set(cursors).count == cursors.count
+        else { return .failure(.invalidRequest) }
+
+        let linkIDs = outboundLinksByEndpoint[observerEndpoint] ?? []
+        var sessionIDs: [UUID] = []
+        var seenSessionIDs: Set<UUID> = []
+        for cursor in cursors {
+            let matches = linkIDs.compactMap { id -> LinkRecord? in
+                guard let record = links[id], record.grant.observer == observerEndpoint,
+                      record.waitCursors[cursor] != nil
+                else { return nil }
+                return record
+            }
+            guard matches.count == 1, let record = matches.first,
+                  case let .success(lease) = authorize(
+                      operation: .monitorWait,
+                      observerEndpoint: observerEndpoint,
+                      targetSessionID: record.grant.target.sessionID
+                  ),
+                  lease.linkID == record.grant.id,
+                  lease.linkGeneration == record.grant.generation
+            else { return .failure(.cursorExpired) }
+            guard seenSessionIDs.insert(lease.target.sessionID).inserted else {
+                return .failure(.invalidRequest)
+            }
+            sessionIDs.append(lease.target.sessionID)
+        }
+        return .success(sessionIDs)
+    }
+
     private func makeTargetState(linkID: UUID) -> DomainAgentSessionLinkTargetState? {
-        guard var record = links[linkID],
+        guard var record = links[linkID], hasSourceConsent(record.grant),
               let target = targets[record.grant.target.sessionID]
         else {
             return nil
@@ -1162,6 +1259,32 @@ package actor DomainAgentSessionLinkAuthority {
 
     // MARK: - Wait
 
+    /// Input supersedes only observational waits captured before it, never mutations or providers.
+    package func acceptLocalInput(_ input: DomainAgentSessionLinkWaitInput) {
+        let generation = max(localInputGenerations[input.endpoint, default: 0], input.generation)
+        localInputGenerations[input.endpoint] = generation
+        let ids = waiters.values.filter {
+            $0.observerInput?.endpoint == input.endpoint
+                && ($0.observerInput?.generation ?? generation) < generation
+        }.map(\.id)
+        for id in ids {
+            resumeWaiter(id, outcome: .cancelled, includeTargets: false, interruptedByLocalInput: true)
+        }
+    }
+
+    /// Lifecycle-only cleanup: an active grant or newer input keeps its generation fence.
+    package func forgetLocalInput(_ input: DomainAgentSessionLinkWaitInput) -> Bool {
+        guard localInputGenerations[input.endpoint] == input.generation,
+              !hasActiveOutboundLink(observerEndpoint: input.endpoint) else { return false }
+        localInputGenerations.removeValue(forKey: input.endpoint)
+        return true
+    }
+
+    private func wasInterrupted(_ input: DomainAgentSessionLinkWaitInput?) -> Bool {
+        guard let input else { return false }
+        return input.generation < localInputGenerations[input.endpoint, default: 0]
+    }
+
     /// Bounded, event-driven waiting. Never busy-polls and never runs a timer between events.
     ///
     /// Collection authorization is all-or-nothing, and the waiter slot on every included link is
@@ -1169,7 +1292,8 @@ package actor DomainAgentSessionLinkAuthority {
     package func wait(
         requests: [DomainAgentSessionLinkWaitRequest],
         until predicate: DomainAgentSessionLinkWaitPredicate = .change,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        observerInput: DomainAgentSessionLinkWaitInput? = nil
     ) async -> DomainAgentSessionLinkWaitResult {
         guard !isDraining, !isShutDown else {
             return DomainAgentSessionLinkWaitResult(outcome: .shuttingDown, targets: [])
@@ -1197,6 +1321,9 @@ package actor DomainAgentSessionLinkAuthority {
                     outcome: .linkUnavailable(sessionID: request.lease.target.sessionID),
                     targets: []
                 )
+            }
+            if let observerInput, request.lease.observer != observerInput.endpoint {
+                return DomainAgentSessionLinkWaitResult(outcome: .invalidRequest, targets: [])
             }
         }
 
@@ -1235,6 +1362,11 @@ package actor DomainAgentSessionLinkAuthority {
             ))
         }
 
+        if wasInterrupted(observerInput) {
+            return DomainAgentSessionLinkWaitResult(
+                outcome: .cancelled, targets: [], interruptedByLocalInput: true
+            )
+        }
         // 3. Immediate resolution in request order.
         if let outcome = firstSatisfiedOutcome(registrations: registrations, predicate: predicate) {
             return waitResult(outcome: outcome, registrations: registrations)
@@ -1281,6 +1413,12 @@ package actor DomainAgentSessionLinkAuthority {
                         return
                     }
                 }
+                if wasInterrupted(observerInput) {
+                    continuation.resume(returning: DomainAgentSessionLinkWaitResult(
+                        outcome: .cancelled, targets: [], interruptedByLocalInput: true
+                    ))
+                    return
+                }
                 if let outcome = firstSatisfiedOutcome(registrations: registrations, predicate: predicate) {
                     continuation.resume(returning: waitResult(outcome: outcome, registrations: registrations))
                     return
@@ -1298,6 +1436,7 @@ package actor DomainAgentSessionLinkAuthority {
                 waiters[waiterID] = Waiter(
                     id: waiterID,
                     observerSessionID: observerSessionID,
+                    observerInput: observerInput,
                     predicate: predicate,
                     registrations: registrations,
                     continuation: continuation,
@@ -1423,7 +1562,7 @@ package actor DomainAgentSessionLinkAuthority {
         _ waiterID: UUID,
         outcome: DomainAgentSessionLinkWaitOutcome,
         includeTargets: Bool,
-        capabilityNotices notices: [DomainAgentSessionLinkCapabilityNotice] = []
+        interruptedByLocalInput: Bool = false
     ) {
         guard let waiter = waiters.removeValue(forKey: waiterID) else { return }
         for registration in waiter.registrations
@@ -1432,14 +1571,11 @@ package actor DomainAgentSessionLinkAuthority {
             links[registration.reference.linkID]?.activeWaiterID = nil
         }
         waiter.timeoutTask?.cancel()
-        let base = includeTargets
+        let result = includeTargets
             ? waitResult(outcome: outcome, registrations: waiter.registrations)
-            : DomainAgentSessionLinkWaitResult(outcome: outcome, targets: [])
-        let result = notices.isEmpty ? base : DomainAgentSessionLinkWaitResult(
-            outcome: base.outcome,
-            targets: base.targets,
-            capabilityNotices: notices
-        )
+            : DomainAgentSessionLinkWaitResult(
+                outcome: outcome, targets: [], interruptedByLocalInput: interruptedByLocalInput
+            )
         waiter.continuation.resume(returning: result)
     }
 
@@ -1528,14 +1664,17 @@ package actor DomainAgentSessionLinkAuthority {
             guard existing.reservation.messageDigest == messageDigest else { return .conflict }
             // Checked before the receipt so a tombstone is never mistaken for an undelivered retry.
             if existing.isIndeterminate { return .indeterminate }
-            if let receipt = existing.receipt { return .duplicate(receipt.markedDuplicate()) }
+            if let receipt = existing.receipt {
+                guard case let .send(sendReceipt) = receipt else { return .conflict }
+                return .duplicate(sendReceipt.markedDuplicate())
+            }
             return .inProgress
         }
 
         // Reported separately: saturation clears on its own as sends settle, exhaustion does not clear
         // until a link generation is revoked or the runtime restarts. Collapsing them would tell a
         // caller to retry a rejection that can only ever be re-rejected.
-        let inFlight = sendLedger.values.filter { !$0.isSettled }.count
+        let inFlight = sendLedger.values.count(where: { !$0.isSettled })
         guard inFlight < Self.inFlightSendLimit else { return .inFlightLimitReached }
         let retained = sendLedger.values.filter(\.isSettled).count
         guard retained < Self.retainedSendOutcomeLimit else { return .retainedOutcomeLimitReached }
@@ -1553,6 +1692,67 @@ package actor DomainAgentSessionLinkAuthority {
         sendLedgerOrder.append(key)
         return .reserved(reservation)
     }
+
+    /// Reserves a Manage-gated stop in the same link-generation ledger used by send and steer.
+    package func beginStop(
+        lease: DomainAgentSessionLinkLease,
+        idempotencyKey: String
+    ) -> DomainAgentSessionLinkStopReservationDisposition {
+        guard lease.capability == .manage else { return .rejected(.capabilityDenied) }
+        switch beginSend(
+            lease: lease,
+            idempotencyKey: idempotencyKey,
+            messageDigest: Self.stopMessageDigest
+        ) {
+        case let .reserved(reservation): return .reserved(reservation)
+        case .duplicate: return .conflict
+        case .inProgress: return .inProgress
+        case .indeterminate: return .indeterminate
+        case .conflict:
+            let key = SendLedgerKey(
+                linkID: lease.linkID,
+                linkGeneration: lease.linkGeneration,
+                idempotencyKey: idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+            if let entry = sendLedger[key],
+               entry.reservation.messageDigest == Self.stopMessageDigest,
+               case let .stop(receipt)? = entry.receipt
+            {
+                return .duplicate(receipt.markedDuplicate())
+            }
+            return .conflict
+        case .inFlightLimitReached: return .inFlightLimitReached
+        case .retainedOutcomeLimitReached: return .retainedOutcomeLimitReached
+        case let .rejected(error): return .rejected(error)
+        }
+    }
+
+    /// Retains a stop answer only for the original reservation and exact authorized target.
+    package func completeStop(
+        reservation: DomainAgentSessionLinkSendReservation,
+        receipt: DomainAgentSessionLinkStopReceipt
+    ) {
+        let key = ledgerKey(for: reservation)
+        guard var entry = sendLedger[key],
+              entry.reservation == reservation,
+              reservation.messageDigest == Self.stopMessageDigest,
+              receipt.requestID == reservation.id,
+              receipt.targetSessionID == reservation.targetSessionID,
+              entry.isCommitted,
+              !entry.isSettled
+        else { return }
+        entry.receipt = .stop(receipt)
+        guard links[reservation.linkID]?.grant.generation == reservation.linkGeneration else {
+            sendLedger.removeValue(forKey: key)
+            sendLedgerOrder.removeAll { $0 == key }
+            return
+        }
+        sendLedger[key] = entry
+    }
+
+    private static let stopMessageDigest = DomainContentDigest.sha256(
+        Data("agent_session_link.stop/v1".utf8)
+    )
 
     /// Non-mutating ledger lookup for one exact lease, key, and digest.
     ///
@@ -1587,7 +1787,10 @@ package actor DomainAgentSessionLinkAuthority {
         // Checked before the receipt for the same reason `beginSend` does it: a tombstone must never
         // be mistaken for an undelivered retry.
         if existing.isIndeterminate { return .indeterminate }
-        if let receipt = existing.receipt { return .duplicate(receipt.markedDuplicate()) }
+        if let receipt = existing.receipt {
+            guard case let .send(sendReceipt) = receipt else { return .conflict }
+            return .duplicate(sendReceipt.markedDuplicate())
+        }
         return .inProgress
     }
 
@@ -1618,7 +1821,7 @@ package actor DomainAgentSessionLinkAuthority {
         // rather than an unknown reservation.
         guard reservation.linkGeneration == linkGeneration,
               let record = links[reservation.linkID],
-              record.grant.generation == linkGeneration
+              record.grant.generation == linkGeneration, hasSourceConsent(record.grant)
         else {
             if let entry = sendLedger[key], entry.reservation.id == reservation.id, !entry.isCommitted {
                 sendLedger.removeValue(forKey: key)
@@ -1626,7 +1829,7 @@ package actor DomainAgentSessionLinkAuthority {
             }
             return .linkRevoked
         }
-        if requiresManagement, !record.grant.capabilities.contains(.manage) {
+        if requiresManagement, !effectiveCapabilities(of: record.grant).contains(.manage) {
             if let entry = sendLedger[key], entry.reservation.id == reservation.id, !entry.isCommitted {
                 sendLedger.removeValue(forKey: key)
                 sendLedgerOrder.removeAll { $0 == key }
@@ -1650,8 +1853,10 @@ package actor DomainAgentSessionLinkAuthority {
         receipt: DomainAgentSessionLinkSendReceipt
     ) {
         let key = ledgerKey(for: reservation)
-        guard var entry = sendLedger[key], entry.reservation.id == reservation.id else { return }
-        entry.receipt = receipt
+        guard var entry = sendLedger[key], entry.reservation.id == reservation.id,
+              !entry.isSettled, entry.reservation.messageDigest != Self.stopMessageDigest
+        else { return }
+        entry.receipt = .send(receipt)
         guard links[reservation.linkID]?.grant.generation == reservation.linkGeneration else {
             sendLedger.removeValue(forKey: key)
             sendLedgerOrder.removeAll { $0 == key }
@@ -1703,7 +1908,10 @@ package actor DomainAgentSessionLinkAuthority {
     package func storedSendReceipt(
         reservation: DomainAgentSessionLinkSendReservation
     ) -> DomainAgentSessionLinkSendReceipt? {
-        sendLedger[ledgerKey(for: reservation)]?.receipt
+        guard case let .send(receipt)? = sendLedger[ledgerKey(for: reservation)]?.receipt else {
+            return nil
+        }
+        return receipt
     }
 
     private func ledgerKey(for reservation: DomainAgentSessionLinkSendReservation) -> SendLedgerKey {
@@ -1834,8 +2042,17 @@ package actor DomainAgentSessionLinkAuthority {
         let revokedAt = now()
 
         for linkID in linkIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
-            guard let record = links.removeValue(forKey: linkID) else { continue }
+            guard let record = links[linkID] else { continue }
+            record.revocationFence.revoke()
+            links.removeValue(forKey: linkID)
+            let key = AuthorizationKey(observer: record.grant.observer, targetSessionID: record.grant.target.sessionID)
+            authorizationLinks[key]?.remove(linkID)
+            if authorizationLinks[key]?.isEmpty == true { authorizationLinks.removeValue(forKey: key) }
             let grant = record.grant
+            outboundLinksByEndpoint[grant.observer]?.remove(linkID)
+            if outboundLinksByEndpoint[grant.observer]?.isEmpty == true {
+                outboundLinksByEndpoint.removeValue(forKey: grant.observer)
+            }
             touchedObservers.insert(grant.observer.sessionID)
             touchedTargets.insert(grant.target.sessionID)
             // Captured before teardown so the last inbound revocation still names its target.
@@ -1854,16 +2071,6 @@ package actor DomainAgentSessionLinkAuthority {
             // Read cursors die with the record; uncommitted reservations and retained outcomes for
             // this generation are released here.
             releaseSendLedger(forLinkID: linkID, generation: grant.generation)
-            // A capability notice for a revoked link describes authority that no longer exists; the
-            // revocation reaches the observer through its own wait result and closing inventory.
-            capabilityNotices[grant.observer]?.removeValue(forKey: linkID)
-            if capabilityNotices[grant.observer]?.isEmpty == true {
-                capabilityNotices.removeValue(forKey: grant.observer)
-            }
-            if !links.values.contains(where: { $0.grant.observer == grant.observer }) {
-                capabilityNoticeAcknowledgedRevisions.removeValue(forKey: grant.observer)
-            }
-
             let notice = DomainAgentSessionLinkRevocationNotice(
                 linkID: grant.id,
                 generation: grant.generation,
@@ -1983,8 +2190,14 @@ package actor DomainAgentSessionLinkAuthority {
         for waiterID in waiters.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
             resumeWaiter(waiterID, outcome: .shuttingDown, includeTargets: false)
         }
+        for record in links.values {
+            record.revocationFence.revoke()
+        }
         isShutDown = true
+        localInputGenerations.removeAll()
         links.removeAll()
+        authorizationLinks.removeAll()
+        outboundLinksByEndpoint.removeAll()
         pendingReservations.removeAll()
         targets.removeAll()
         nextChangeSequenceBySession.removeAll()

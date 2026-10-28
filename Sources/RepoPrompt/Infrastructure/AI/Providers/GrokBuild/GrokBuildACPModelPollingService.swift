@@ -4,33 +4,34 @@ protocol GrokBuildACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels?
 }
 
-/// Discovery client that reuses one verified Grok session per standardized workspace so
+/// Discovery client that reuses one verified Grok session in a neutral directory so
 /// 5-minute polling does not accumulate persistent sessions under `~/.grok/sessions`.
 /// `session/load` returns fresh `models` metadata on grok 1.0.3, so load-based discovery
 /// observes remote catalog changes.
 actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClient {
-    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
+    typealias ProviderFactory = @Sendable (_ config: GrokBuildAgentConfig) async throws -> (any ACPAgentProvider)?
     typealias ControllerFactory = @Sendable (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
 
     private let providerFactory: ProviderFactory
     private let controllerFactory: ControllerFactory
-    private var retainedSessionIDByWorkspaceKey: [String: String] = [:]
+    private var retainedSessionID: String?
 
     init(
-        providerFactory: @escaping ProviderFactory = { agent, modelString in
-            if agent == .grokBuild {
-                // Discovery sessions never inject the RepoPrompt MCP server — polling every
-                // 300s must not spawn tool servers for nothing.
-                return try await GrokBuildACPAgentProvider(
-                    config: GrokBuildAgentConfig(
-                        enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-                        modelString: modelString,
-                        includeRepoPromptMCPServer: false,
-                        apiKey: KeyManager().getAPIKey(for: .grok)
-                    )
+        providerFactory: @escaping ProviderFactory = { config in
+            // Keep credential lookup inside the default factory so injected factories
+            // can observe discovery routing without touching secure storage.
+            try await GrokBuildACPAgentProvider(
+                config: GrokBuildAgentConfig(
+                    commandName: config.commandName,
+                    additionalPathHints: config.additionalPathHints,
+                    enableDebugLogging: config.enableDebugLogging,
+                    modelString: config.modelString,
+                    includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
+                    alwaysApproveTools: config.alwaysApproveTools,
+                    apiKey: KeyManager().getAPIKey(for: .grok),
+                    backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
                 )
-            }
-            return try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
+            )
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
@@ -40,18 +41,24 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         self.controllerFactory = controllerFactory
     }
 
-    func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels? {
-        let workspaceKey = Self.discoveryWorkspaceKey(for: workspacePath)
-        let retainedSessionID = retainedSessionIDByWorkspaceKey[workspaceKey]
+    func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+        // Catalog discovery does not need the user's project. Keep project .mcp.json and
+        // project-local Cursor imports out of polling, without changing HOME/GROK_HOME.
         let request = ACPRunRequest(
             agentKind: .grokBuild,
             modelString: nil,
-            workspacePath: workspacePath ?? Self.stableDiscoveryWorkspacePath(),
+            workspacePath: Self.stableDiscoveryWorkspacePath(),
             resumeSessionID: retainedSessionID,
             attachments: [],
             taskLabelKind: nil
         )
-        guard let provider = try await providerFactory(.grokBuild, nil) else { return nil }
+        // Polling every 300s must not spawn tool servers for nothing.
+        let config = GrokBuildAgentConfig(
+            enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
+            includeRepoPromptMCPServer: false,
+            backgroundFeatureEnvironment: GrokBuildAgentConfig.managedBackgroundFeatureEnvironment
+        )
+        guard let provider = try await providerFactory(config) else { return nil }
         let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(
@@ -62,7 +69,7 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         let controller = try controllerFactory(provider, request)
         do {
             _ = try await controller.bootstrap()
-            await retainVerifiedIdentity(controller.currentProviderSessionIdentity(), workspaceKey: workspaceKey)
+            await retainVerifiedIdentity(controller.currentProviderSessionIdentity())
             let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .grokBuild)
             await controller.shutdown()
             return snapshot
@@ -72,7 +79,7 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         }
     }
 
-    private func retainVerifiedIdentity(_ identity: ACPProviderSessionIdentity, workspaceKey: String) {
+    private func retainVerifiedIdentity(_ identity: ACPProviderSessionIdentity) {
         // Only verified load IDs may be retained; a candidate ID would defeat the
         // controller's load→new recovery contract.
         guard identity.loadSessionIDConfidence == .verified,
@@ -83,17 +90,10 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         }
         // On a load→new recovery the verified identity is the fresh session, so this
         // assignment also replaces an invalidated retained ID.
-        retainedSessionIDByWorkspaceKey[workspaceKey] = loadID
+        retainedSessionID = loadID
     }
 
-    private static func discoveryWorkspaceKey(for workspacePath: String?) -> String {
-        guard let trimmed = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
-            return stableDiscoveryWorkspacePath()
-        }
-        return URL(fileURLWithPath: trimmed, isDirectory: true).standardizedFileURL.path
-    }
-
-    /// One stable provider-specific directory key for nil-workspace discovery so repeated
+    /// One stable provider-specific directory for discovery so repeated
     /// polls reuse the same retained session instead of leaking `~/.grok/sessions` entries.
     private static func stableDiscoveryWorkspacePath() -> String {
         let url = FileManager.default.temporaryDirectory
@@ -112,6 +112,15 @@ actor GrokBuildACPModelPollingService {
         client: GrokBuildACPControllerModelDiscoveryClient()
     )
 
+    enum RefreshOutcome: Equatable {
+        case updated
+        case unchanged
+        case noModelsAdvertised
+        case skipped
+        case failed
+        case cancelled
+    }
+
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date
@@ -122,7 +131,7 @@ actor GrokBuildACPModelPollingService {
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    private var inFlightRefresh: Task<Bool, Never>?
+    private var inFlightRefresh: Task<RefreshOutcome, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     #if DEBUG
         private var testRefreshNowInFlightJoinObservers: [UUID: AsyncStream<Void>.Continuation] = [:]
@@ -199,9 +208,8 @@ actor GrokBuildACPModelPollingService {
         return stream
     }
 
-    @discardableResult
-    func refreshNow(workspacePath: String?) async -> Bool {
-        guard !isShutdown else { return false }
+    func refreshNow(workspacePath: String?) async -> RefreshOutcome {
+        guard !isShutdown else { return .skipped }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
             #if DEBUG
@@ -273,30 +281,37 @@ actor GrokBuildACPModelPollingService {
         }
     #endif
 
-    private func performRefresh() async -> Bool {
-        guard !isShutdown else { return false }
+    private func performRefresh() async -> RefreshOutcome {
+        guard !isShutdown else { return .skipped }
         if let existing = inFlightRefresh {
             return await existing.value
         }
 
         let workspacePath = preferredWorkspacePath
-        let task = Task<Bool, Never> { [weak self, workspacePath] in
-            guard let self else { return false }
+        let previous = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+        let task = Task<RefreshOutcome, Never> { [weak self, workspacePath] in
+            guard let self else { return .cancelled }
             do {
                 let discovered = try await client.discoverModels(workspacePath: workspacePath)
-                guard !Task.isCancelled else { return false }
-                if let discovered {
-                    await applyRefreshResult(discovered)
-                } else {
+                guard !Task.isCancelled else { return .cancelled }
+                guard let discovered, !discovered.options.isEmpty else {
                     await publishLiveReadinessWithoutModels()
+                    return .noModelsAdvertised
                 }
-                return true
+                let didChange = await applyRefreshResult(discovered)
+                guard !Task.isCancelled else { return .cancelled }
+                guard didChange else { return .unchanged }
+                return previous == AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+                    ? .unchanged
+                    : .updated
+            } catch is CancellationError {
+                return .cancelled
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
                 if AgentRuntimeProviderService.enableDebugLogging {
                     print("[GrokBuildACPModelPolling] refresh failed: \(error.localizedDescription)")
                 }
-                return false
+                return Task.isCancelled ? .cancelled : .failed
             }
         }
         inFlightRefresh = task
@@ -317,22 +332,23 @@ actor GrokBuildACPModelPollingService {
         }
     }
 
-    private func applyRefreshResult(_ discovered: ACPDiscoveredSessionModels) {
-        guard !isShutdown else { return }
+    private func applyRefreshResult(_ discovered: ACPDiscoveredSessionModels) -> Bool {
+        guard !isShutdown else { return false }
         // A discovery response with no usable models publishes readiness but never writes a
         // fake snapshot; the static "default" option comes from the catalog, not the registry.
         guard !discovered.options.isEmpty else {
             publishLiveReadinessWithoutModels()
-            return
+            return false
         }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .grokBuild)
-        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild) else { return }
+        let didChange = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .grokBuild)
+        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild) else { return false }
         let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
-        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
+        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return didChange }
         latest = snapshot
         for continuation in continuations.values {
             continuation.yield(snapshot)
         }
+        return didChange
     }
 
     private func registrySnapshotAfterWarmingStore() async -> Snapshot? {

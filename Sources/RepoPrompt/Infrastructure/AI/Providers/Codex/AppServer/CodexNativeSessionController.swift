@@ -1,5 +1,7 @@
 import Foundation
 import OSLog
+import RepoPromptFoundation
+import RepoPromptInstrumentation
 
 private actor CodexInboundStreamTaskStartGate {
     private var continuation: CheckedContinuation<Void, Never>?
@@ -95,6 +97,13 @@ enum CodexTurnSteerError: Error, LocalizedError, Equatable {
         failure: CodexAppServerClient.RequestFailure
     )
 
+    /// When returned by `steerUserTurn`, these cases are rejected RPCs, not ambiguous transport failures.
+    var definitivelyRejectsInput: Bool {
+        switch self {
+        case .noActiveTurn, .expectedTurnMismatch, .activeTurnNotSteerable: true
+        }
+    }
+
     var errorDescription: String? {
         switch self {
         case let .noActiveTurn(failure):
@@ -124,6 +133,7 @@ enum CodexTurnInterruptError: Error, LocalizedError, Equatable {
 protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
     var currentSessionReference: CodexNativeSessionController.SessionRef? { get }
+    func routingProcessID() async -> pid_t?
     var events: AsyncStream<CodexNativeSessionController.Event> { get }
 
     func ensureEventsStreamReady()
@@ -152,14 +162,14 @@ protocol CodexSessionControlling: AnyObject {
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt
     func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
@@ -186,11 +196,18 @@ protocol CodexSessionControlling: AnyObject {
     func cancelCurrentTurn() async
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
     func shutdown() async
+    func revokeComputerUseAutoApproval()
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async
 }
 
 extension CodexSessionControlling {
+    func revokeComputerUseAutoApproval() {}
+
     var currentSessionReference: CodexNativeSessionController.SessionRef? {
+        nil
+    }
+
+    func routingProcessID() async -> pid_t? {
         nil
     }
 
@@ -221,6 +238,19 @@ final class CodexNativeSessionController {
         let task: Task<Void, Never>
     }
 
+    private let perfRecorder: any AgentModePerfRecording
+
+    #if DEBUG
+        func debugRecordLifecyclePhaseForTesting() async {
+            await recordLifecyclePhase(
+                .runtimeResolution,
+                outcome: .succeeded,
+                startMS: perfRecorder.timestampMSIfEnabled(),
+                includeTransportGeneration: false
+            )
+        }
+    #endif
+
     private static let logger = Logger(
         subsystem: "com.repoprompt.agents",
         category: "CodexNativeSessionController"
@@ -234,13 +264,13 @@ final class CodexNativeSessionController {
     }
 
     #if DEBUG
-        private static func lifecycleOutcome(for error: Error) -> AgentModePerfDiagnostics.CodexLifecycleOutcome {
+        private static func lifecycleOutcome(for error: Error) -> AgentPerfCodexLifecycleOutcome {
             error is CancellationError ? .cancelled : .failed
         }
 
         private func recordLifecyclePhase(
-            _ phase: AgentModePerfDiagnostics.CodexLifecyclePhase,
-            outcome: AgentModePerfDiagnostics.CodexLifecycleOutcome,
+            _ phase: AgentPerfCodexLifecyclePhase,
+            outcome: AgentPerfCodexLifecycleOutcome,
             startMS: Double?,
             includeTransportGeneration: Bool
         ) async {
@@ -250,7 +280,7 @@ final class CodexNativeSessionController {
             } else {
                 nil
             }
-            AgentModePerfDiagnostics.recordCodexLifecyclePhase(
+            perfRecorder.recordCodexLifecyclePhase(
                 phase,
                 outcome: outcome,
                 startMS: startMS,
@@ -266,7 +296,13 @@ final class CodexNativeSessionController {
     private static let maxPendingTurnFailures = 64
     private static let hookTrustWriteMutex = AsyncMutex()
     private static let maxHookTrustWriteSettlementDeadline: TimeInterval = 30
-    private static let computerUseMCPServerName = "computer-use"
+    private static let computerUseMCPServerName = MCPIntegrationHelper.computerUseMCPServerName
+    // Controller-scoped: never follows a live settings toggle while requests are outstanding.
+    private var computerUseRequiresUserReview = false
+    private var computerUseAutoApprovalRevoked = false
+    private var computerUseScopePrepared = false
+    private var computerUseAcceptedClientPath: String?
+    private var effectiveComputerUseServerNames: [String] = []
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
     private static let removedSyntheticNotificationMethods: Set<String> = [
         "item/file_change/output_delta",
@@ -672,6 +708,8 @@ final class CodexNativeSessionController {
         var reasoningSummariesEnabledProvider: @MainActor () -> Bool = { false }
         var memoriesEnabledProvider: (@MainActor () -> Bool)?
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
+        var computerUseClientPathProvider: () -> String? = { CodexNativeSessionController.computerUseClientPath() }
+        var mcpServerEntriesProvider: () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
         var skillExtraRootsProvider: () -> [URL] = { [] }
 
         /// Fail-closed RepoPrompt MCP provisioning validator, applied by `startOrResume` only for a
@@ -703,7 +741,9 @@ final class CodexNativeSessionController {
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             reasoningSummariesEnabledProvider: @escaping @MainActor () -> Bool = { false },
             memoriesEnabledProvider: @escaping @MainActor () -> Bool = { false },
-            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            computerUseClientPathProvider: @escaping () -> String? = { CodexNativeSessionController.computerUseClientPath() },
+            mcpServerEntriesProvider: @escaping () -> [MCPIntegrationHelper.CodexServerEntry] = { MCPIntegrationHelper.codexMCPServerEntries() }
         ) -> Options {
             Options(
                 requestTimeout: 120,
@@ -724,7 +764,9 @@ final class CodexNativeSessionController {
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         reasoningSummariesEnabled: featurePolicy.reasoningSummariesEnabled,
                         memoriesEnabled: featurePolicy.memoriesEnabled,
-                        computerUseEnabled: featurePolicy.computerUseEnabled
+                        computerUseEnabled: featurePolicy.computerUseEnabled,
+                        computerUseClientPath: computerUseClientPathProvider(),
+                        serverEntries: mcpServerEntriesProvider()
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -737,6 +779,8 @@ final class CodexNativeSessionController {
                 reasoningSummariesEnabledProvider: reasoningSummariesEnabledProvider,
                 memoriesEnabledProvider: memoriesEnabledProvider,
                 computerUseEnabledProvider: computerUseEnabledProvider,
+                computerUseClientPathProvider: computerUseClientPathProvider,
+                mcpServerEntriesProvider: mcpServerEntriesProvider,
                 skillExtraRootsProvider: {
                     [AgentSupportDirectoryCatalog.globalRootURLs().agentsSkills]
                 }
@@ -829,6 +873,7 @@ final class CodexNativeSessionController {
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
+    private let serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)?
     private let hookTrustFaultInjection: HookTrustFaultInjection
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
@@ -866,6 +911,10 @@ final class CodexNativeSessionController {
 
     var hasActiveThread: Bool {
         threadID?.isEmpty == false
+    }
+
+    func routingProcessID() async -> pid_t? {
+        await client.activeExpectedAgentPID(for: runID)
     }
 
     var currentSessionReference: SessionRef? {
@@ -1124,7 +1173,7 @@ final class CodexNativeSessionController {
         recordRetiredHookTrustGeneration(generation)
         Self.logger.error("Codex hook-trust mutation unsettled; retiring transport generation=\(generation, privacy: .public)")
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "provider.codex.hookTrust.transportRetiring",
                 tabID: tabID,
                 fields: [
@@ -1161,7 +1210,7 @@ final class CodexNativeSessionController {
         guard let generation else { return }
         Self.logger.notice("Codex hook-trust settlement recovery finished; generation=\(generation, privacy: .public) succeeded=\(succeeded, privacy: .public)")
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "provider.codex.hookTrust.settlementRecoveryFinished",
                 tabID: tabID,
                 fields: [
@@ -1174,7 +1223,8 @@ final class CodexNativeSessionController {
 
     private static func isMissingFreshThreadResumeError(
         _ error: Error,
-        threadID: String
+        threadID: String,
+        rolloutPath: String?
     ) -> Bool {
         guard case let CodexAppServerClient.ClientError.requestFailed(failure) = error,
               failure.method == "thread/resume",
@@ -1189,6 +1239,10 @@ final class CodexNativeSessionController {
         return normalized == "no rollout found for thread id \(normalizedThreadID)"
             || normalized == "thread not found: \(normalizedThreadID)"
             || normalized == "thread not loaded: \(normalizedThreadID)"
+            || CodexAppServerClient.isMissingRolloutPathResolutionMessage(
+                failure.message,
+                expectedRolloutPath: rolloutPath
+            )
     }
 
     private func prepareHookTrustThreadBindingRestoration() async throws -> ThreadSnapshot {
@@ -1222,7 +1276,12 @@ final class CodexNativeSessionController {
             }
         }
 
-        let configOverrides = await options.configOverridesProvider()
+        // Armed scopes must re-detect effective collisions on the recovered transport before
+        // re-binding, rather than trusting server names captured by the original start.
+        if computerUseRequiresUserReview {
+            try await inspectComputerUseEffectiveConfiguration()
+        }
+        let configOverrides = try await runtimeConfigOverrides()
         let result: [String: Any]
         var startedFreshReplacement = false
         do {
@@ -1237,7 +1296,11 @@ final class CodexNativeSessionController {
             )
         } catch {
             guard binding.existing == nil,
-                  Self.isMissingFreshThreadResumeError(error, threadID: priorThreadID)
+                  Self.isMissingFreshThreadResumeError(
+                      error,
+                      threadID: priorThreadID,
+                      rolloutPath: priorReference.rolloutPath
+                  )
             else {
                 throw error
             }
@@ -1343,12 +1406,12 @@ final class CodexNativeSessionController {
     func listHooksForCurrentWorkspace() async throws -> CodexHookInventory {
         let service = hookTrustService()
         #if DEBUG
-            let lockWaitStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let lockWaitStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         do {
             return try await hookOperationMutex.withLock {
                 #if DEBUG
-                    AgentModePerfDiagnostics.durationEvent(
+                    perfRecorder.durationEvent(
                         "provider.codex.hookTrust.localLockWait",
                         startMS: lockWaitStartMS,
                         tabID: tabID
@@ -1371,21 +1434,21 @@ final class CodexNativeSessionController {
     ) async throws -> CodexHookInventory {
         let service = hookTrustService()
         #if DEBUG
-            let localLockWaitStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let localLockWaitStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         do {
             return try await hookOperationMutex.withLock {
                 #if DEBUG
-                    AgentModePerfDiagnostics.durationEvent(
+                    perfRecorder.durationEvent(
                         "provider.codex.hookTrust.localLockWait",
                         startMS: localLockWaitStartMS,
                         tabID: tabID
                     )
-                    let globalLockWaitStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                    let globalLockWaitStartMS = perfRecorder.timestampMSIfEnabled()
                 #endif
                 return try await Self.hookTrustWriteMutex.withLock {
                     #if DEBUG
-                        AgentModePerfDiagnostics.durationEvent(
+                        perfRecorder.durationEvent(
                             "provider.codex.hookTrust.globalLockWait",
                             startMS: globalLockWaitStartMS,
                             tabID: tabID
@@ -1430,7 +1493,9 @@ final class CodexNativeSessionController {
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
-        hookTrustFaultInjection: HookTrustFaultInjection = .init()
+        serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)? = nil,
+        hookTrustFaultInjection: HookTrustFaultInjection = .init(),
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.client = client
         self.runID = runID
@@ -1441,7 +1506,9 @@ final class CodexNativeSessionController {
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
+        self.serverRequestResponseExecutor = serverRequestResponseExecutor
         self.hookTrustFaultInjection = hookTrustFaultInjection
+        self.perfRecorder = perfRecorder
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
         rawEventLogFileThreadID = nil
@@ -1745,9 +1812,9 @@ final class CodexNativeSessionController {
                 timeout: timeout
             ) { requestValueStyle in
                 var requestParams = params
-                requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
                 requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-                requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
                 return requestParams
             }
         }
@@ -1771,9 +1838,9 @@ final class CodexNativeSessionController {
             timeout: timeout
         ) { requestValueStyle in
             var requestParams = params
-            requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
+            requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
             requestParams["sandbox"] = options.sandboxModeProvider().appServerRequestValue(style: requestValueStyle)
-            requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+            requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
             return requestParams
         }
     }
@@ -1828,7 +1895,7 @@ final class CodexNativeSessionController {
             // provisioning. The same client-held runtime is reused at process launch, including when
             // the bundled package is unavailable and a valid override exists only in the login shell.
             #if DEBUG
-                let runtimeResolutionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let runtimeResolutionStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             let runtime: CodexRuntimeAuthority.Runtime
             do {
@@ -1859,7 +1926,7 @@ final class CodexNativeSessionController {
             // before `client.startIfNeeded()` or any thread/start or thread/resume request.
             if let expectedMCPClientName {
                 #if DEBUG
-                    let provisioningStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                    let provisioningStartMS = perfRecorder.timestampMSIfEnabled()
                 #endif
                 do {
                     try await options.repoPromptMCPProvisioner(runtime)
@@ -1889,11 +1956,11 @@ final class CodexNativeSessionController {
                 )
             }
             await client.updateProcessLaunchDirectory(workspacePaths.processLaunchDirectory)
-            await updateClientProcessLaunchPolicy()
+            try await updateClientProcessLaunchPolicy()
             // Re-check: the pre-launch setup above has suspension points after the first check.
             try Task.checkCancellation()
             #if DEBUG
-                let spawnInitializeStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let spawnInitializeStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             do {
                 try await client.startIfNeeded()
@@ -1915,6 +1982,11 @@ final class CodexNativeSessionController {
                     )
                 #endif
                 throw error
+            }
+            // Armed scopes must reject effective collisions before thread creation initializes MCP.
+            // Ordinary starts retain their existing configuration path without an extra RPC.
+            if computerUseRequiresUserReview {
+                try await inspectComputerUseEffectiveConfiguration()
             }
             await ensureInboundStreamsStarted()
 
@@ -1941,13 +2013,13 @@ final class CodexNativeSessionController {
                 }
             }
 
-            let configOverrides = await options.configOverridesProvider()
+            let configOverrides = try await runtimeConfigOverrides()
             let result: [String: Any]
             #if DEBUG
-                let threadPhase: AgentModePerfDiagnostics.CodexLifecyclePhase = resumeThreadID == nil
+                let threadPhase: AgentPerfCodexLifecyclePhase = resumeThreadID == nil
                     ? .threadStart
                     : .threadResume
-                let threadRequestStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let threadRequestStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
 
             do {
@@ -2070,7 +2142,7 @@ final class CodexNativeSessionController {
     }
 
     func getThreadGoal() async throws -> ThreadGoal? {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/get",
@@ -2086,7 +2158,7 @@ final class CodexNativeSessionController {
     }
 
     func setThreadGoalObjective(_ objective: String) async throws -> ThreadGoal {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let trimmedObjective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedObjective.isEmpty else {
@@ -2105,7 +2177,7 @@ final class CodexNativeSessionController {
     }
 
     func setThreadGoalStatus(_ status: ThreadGoalStatus) async throws -> ThreadGoal {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/set",
@@ -2119,7 +2191,7 @@ final class CodexNativeSessionController {
     }
 
     func clearThreadGoal() async throws -> Bool {
-        await updateClientProcessFeaturePolicy()
+        try await updateClientProcessFeaturePolicy()
         try await client.startIfNeeded()
         let result = try await client.request(
             method: "thread/goal/clear",
@@ -2147,13 +2219,13 @@ final class CodexNativeSessionController {
 
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
 
         var params: [String: Any] = [
             "threadId": threadID,
@@ -2174,7 +2246,7 @@ final class CodexNativeSessionController {
         #endif
         let sandboxMode = options.sandboxModeProvider()
         #if DEBUG
-            let turnAcceptanceStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let turnAcceptanceStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         do {
             // turn/start can block for extended model reasoning — no timeout.
@@ -2184,8 +2256,8 @@ final class CodexNativeSessionController {
                 useDefaultTimeout: false
             ) { requestValueStyle in
                 var requestParams = params
-                requestParams["approvalPolicy"] = options.approvalPolicyProvider().appServerRequestValue(style: requestValueStyle)
-                requestParams["approvalsReviewer"] = options.approvalReviewerProvider().appServerRequestValue
+                requestParams["approvalPolicy"] = effectiveApprovalPolicy.appServerRequestValue(style: requestValueStyle)
+                requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
                 requestParams["sandboxPolicy"] = Self.appServerTurnSandboxPolicyPayload(
                     mode: sandboxMode,
                     executionDirectory: workspacePaths.executionDirectory
@@ -2223,14 +2295,14 @@ final class CodexNativeSessionController {
 
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
         guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
         do {
             let result = try await performRequest(
                 method: "turn/steer",
@@ -2424,12 +2496,12 @@ final class CodexNativeSessionController {
 
     private static func turnInput(
         text: String,
-        images: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) throws -> [[String: Any]] {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var input: [[String: Any]] = []
-        for image in images {
-            switch image.source {
+        for attachment in attachments where attachment.kind == .image {
+            switch attachment.source {
             case let .localFile(path):
                 guard let path = nonEmptyString(path) else { continue }
                 input.append([
@@ -2568,7 +2640,12 @@ final class CodexNativeSessionController {
         return nil
     }
 
+    func revokeComputerUseAutoApproval() {
+        withEventsStateLock { computerUseAutoApprovalRevoked = true }
+    }
+
     func shutdown() async {
+        revokeComputerUseAutoApproval()
         withEventsStateLock {
             if lifecycleState != .terminated {
                 lifecycleState = .shuttingDown
@@ -2595,7 +2672,7 @@ final class CodexNativeSessionController {
         }
         if clientShutdownBehavior == .stopOnShutdown {
             #if DEBUG
-                let shutdownStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+                let shutdownStartMS = perfRecorder.timestampMSIfEnabled()
             #endif
             await client.stop()
             #if DEBUG
@@ -2767,11 +2844,26 @@ final class CodexNativeSessionController {
         )
     }
 
-    private func updateClientProcessFeaturePolicy() async {
-        await updateClientProcessLaunchPolicy()
+    private func updateClientProcessFeaturePolicy() async throws {
+        try await updateClientProcessLaunchPolicy()
     }
 
-    private func updateClientProcessLaunchPolicy() async {
+    private func updateClientProcessLaunchPolicy() async throws {
+        if !computerUseScopePrepared {
+            // Admission is immutable for this controller. Readiness must never downgrade its
+            // approval policy to a permissive ordinary-turn preference.
+            computerUseRequiresUserReview = await MainActor.run { options.computerUseEnabledProvider() }
+            if computerUseRequiresUserReview {
+                guard !Self.hasReservedComputerUseEntry(options.mcpServerEntriesProvider()) else {
+                    throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+                }
+                guard let path = options.computerUseClientPathProvider() else {
+                    throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.unavailableMessage)
+                }
+                computerUseAcceptedClientPath = path
+            }
+            computerUseScopePrepared = true
+        }
         let featurePolicy = await currentFeaturePolicy()
         await client.updateProcessLaunchPolicy(
             featurePolicy: featurePolicy,
@@ -2784,10 +2876,37 @@ final class CodexNativeSessionController {
             .resolved(
                 goalsEnabled: options.goalSupportEnabledProvider(),
                 memoriesEnabled: options.memoriesEnabledProvider?() ?? false,
-                computerUseEnabled: options.computerUseEnabledProvider(),
-                capabilities: options.capabilitiesProvider()
+                computerUseEnabled: computerUseRequiresUserReview && computerUseAcceptedClientPath != nil,
+                capabilities: computerUseRequiresUserReview ? .computerUse : options.capabilitiesProvider()
             )
         }
+    }
+
+    private func inspectComputerUseEffectiveConfiguration() async throws {
+        guard computerUseRequiresUserReview else { return }
+        var params: [String: Any] = ["includeLayers": false]
+        if let executionDirectory = workspacePaths.executionDirectory { params["cwd"] = executionDirectory }
+        let config = try await performRequest(method: "config/read", params: params, timeout: options.requestTimeout)
+        effectiveComputerUseServerNames = try Self.reservedComputerUseServerNames(config)
+        if computerUseRequiresUserReview { try Self.validateComputerUseConfiguration(config) }
+    }
+
+    private func runtimeConfigOverrides() async throws -> [String: Any] {
+        let overrides = await options.configOverridesProvider()
+        return try Self.computerUseRuntimeConfigOverrides(
+            overrides,
+            computerUseEnabled: computerUseRequiresUserReview,
+            acceptedClientPath: computerUseAcceptedClientPath,
+            effectiveServerNames: effectiveComputerUseServerNames
+        )
+    }
+
+    private var effectiveApprovalPolicy: CodexAgentToolPreferences.ApprovalPolicy {
+        computerUseRequiresUserReview ? .onRequest : options.approvalPolicyProvider()
+    }
+
+    private var effectiveApprovalReviewer: CodexAgentToolPreferences.ApprovalReviewer {
+        computerUseRequiresUserReview ? .user : options.approvalReviewerProvider()
     }
 
     private static func parseThreadGoalResponse(from result: [String: Any]) throws -> ThreadGoal {
@@ -3438,6 +3557,12 @@ final class CodexNativeSessionController {
         {
             markTurnActivity(notifiedTurnID, makeCurrent: true)
         }
+        // Preserve semantic/unknown activity before item/tool deduplication or malformed-payload
+        // early returns. Reuse the existing scoped non-rendering liveness channel; no history or
+        // extra event registry. The coordinator applies its current controller/turn acceptance.
+        if hasUnrepresentedQuietActivity(method: notification.method, params: params) {
+            await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+        }
         switch notification.method {
         case "turn/started", "codex/event/turn_started":
             emittedToolEventDedupKeys.removeAll(keepingCapacity: true)
@@ -3550,20 +3675,23 @@ final class CodexNativeSessionController {
                 await emit(.contextCompacted(turnID: compactionTurnID))
             }
         case "item/agentMessage/delta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                var state = assistantEmittedTextByTurnID[scope.turnID]
-                    ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
-                if state.itemID != scope.itemID {
-                    state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
-                } else {
-                    state.text.append(delta)
-                }
-                assistantEmittedTextByTurnID[scope.turnID] = state
-                await emit(.canonicalAssistantDelta(text: delta, scope: scope))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            var state = assistantEmittedTextByTurnID[scope.turnID]
+                ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
+            if state.itemID != scope.itemID {
+                state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
+            } else {
+                state.text.append(delta)
+            }
+            assistantEmittedTextByTurnID[scope.turnID] = state
+            await emit(.canonicalAssistantDelta(text: delta, scope: scope))
         case "codex/event/agent_message":
             let legacyTurnID = Self.notificationTurnID(from: params)
             let legacyItemID = Self.notificationItemID(
@@ -3640,37 +3768,43 @@ final class CodexNativeSessionController {
                 }
             }
         case "item/reasoning/summaryTextDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
-                let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .summary,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: summaryIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
+            let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .summary,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: summaryIndex,
+                scope: scope
+            )))
         case "item/reasoning/textDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
-                let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .text,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: contentIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
+            let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .text,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: contentIndex,
+                scope: scope
+            )))
         case let method where Self.isItemLifecycleNotificationMethod(method):
             let item = Self.canonicalItem(from: params)
             let typeRaw = item.map { normalizedTypeString(from: $0) } ?? ""
@@ -3734,7 +3868,10 @@ final class CodexNativeSessionController {
             {
                 let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
                 Self.logCodexDebug("[CodexNativeController] fileChangeOutputDelta invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) result=\(Self.debugPreview(resultJSON))")
-                guard emitted else { break }
+                guard emitted else {
+                    await emitUnrepresentedQuietActivity(method: notification.method, params: params)
+                    break
+                }
                 await emit(.toolResult(
                     name: name,
                     invocationID: invocationID,
@@ -3742,6 +3879,8 @@ final class CodexNativeSessionController {
                     resultJSON: resultJSON,
                     isError: isError
                 ))
+            } else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
             }
         case "codex/event/exec_command_begin":
             if let beginEvent = parseExecCommandBeginEvent(params: params) {
@@ -3795,6 +3934,7 @@ final class CodexNativeSessionController {
         case "item/commandExecution/outputDelta":
             let itemID = commandExecutionItemID(from: params)
             guard shouldAcceptCommandExecutionEvent(itemID: itemID, family: .normalized) else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
                 break
             }
             if let update = parseCommandExecutionRunningUpdateFromNotification(
@@ -3803,6 +3943,8 @@ final class CodexNativeSessionController {
             ) {
                 Self.logCodexDebug("[CodexNativeController] runningUpdate method=\(notification.method) invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
                 await emit(.commandExecutionRunning(update))
+            } else {
+                await emitUnrepresentedQuietActivity(method: notification.method, params: params)
             }
         case "item/commandExecution/terminalInteraction":
             let itemID = commandExecutionItemID(from: params)
@@ -3901,6 +4043,144 @@ final class CodexNativeSessionController {
             if let activity = Self.parseLivenessActivity(method: notification.method, params: params) {
                 await emit(.livenessActivity(activity))
             }
+        }
+    }
+
+    private func emitUnrepresentedQuietActivity(method: String, params: [String: Any]) async {
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
+    private func hasUnrepresentedQuietActivity(method: String, params: [String: Any]) -> Bool {
+        if Self.isItemLifecycleNotificationMethod(method) {
+            guard let item = Self.canonicalItem(from: params),
+                  Self.canonicalItemScope(from: params, item: item) != nil
+            else { return true }
+            let type = normalizedTypeString(from: item)
+            if type == "usermessage" || type == "user_message" {
+                // Canonical prompt echo; accepted task input is latched by the host before send.
+                return !(item["content"] is [Any])
+            }
+            if method == "item/completed" {
+                switch type {
+                case "agentmessage", "agent_message":
+                    // Required by the pinned schema; rendering fallbacks must not prove silence.
+                    return !(item["text"] is String)
+                case "reasoning":
+                    // Absent arrays default to empty; present arrays must contain only strings.
+                    return ["summary", "content"].contains { key in
+                        item[key] != nil && !(item[key] is [String])
+                    }
+                default: break
+                }
+            }
+            return !["agentmessage", "agent_message", "reasoning"].contains(type)
+        }
+        switch method {
+        case "turn/completed", "codex/event/turn_completed":
+            let turn = params["turn"] as? [String: Any]
+            return turn?["status"] as? String != "completed"
+        case "codex/event/agent_message":
+            return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+        case "turn/moderationMetadata":
+            // v0.160.1 protocol metadata is arbitrary JSON, not semantic turn activity.
+            // Require the canonical envelope; malformed ingress must remain fail-visible.
+            return Self.turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) == nil
+                || params["metadata"] == nil
+        case "rawResponseItem/completed":
+            return hasUnrepresentedRawResponseItem(params)
+        case "rawResponse/completed":
+            guard Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) != nil,
+                  Self.firstString(in: params, keys: ["responseId"]) != nil,
+                  params["usageMetadata"] == nil || params["usageMetadata"] is NSNull || params["usageMetadata"] is [String: Any]
+            else { return true }
+            if params["usage"] is NSNull { return false }
+            guard let usage = params["usage"] as? [String: Any] else { return true }
+            return Self.parseTokenUsagePayload(from: ["tokenUsage": ["last": usage]]) == nil
+        case "item/reasoning/summaryPartAdded":
+            return Self.canonicalItemScope(from: params) == nil || (intValue(params["summaryIndex"]) ?? -1) < 0
+        case "thread/tokenUsage/updated":
+            return Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) == nil
+                || Self.parseTokenUsagePayload(from: params) == nil
+        case "account/rateLimits/updated":
+            return !(params["rateLimits"] is [String: Any])
+        case "account/updated":
+            return !(params["authMode"] is NSNull || params["authMode"] is String)
+                || !(params["planType"] is NSNull || params["planType"] is String)
+        case "item/commandExecution/outputDelta", "item/fileChange/outputDelta":
+            // Their handlers preserve uncertainty on parse/dedup failure using the actual result.
+            // In particular, never invoke the stateful file-change parser a second time here.
+            return false
+        case "item/mcpToolCall/progress", "item/plan/delta", "turn/diff/updated":
+            return Self.parseLivenessActivity(method: method, params: params) == nil
+        case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
+            // A valid tool event already reaches typed activity before UI suppression. Only a
+            // malformed envelope needs the uncertainty fallback; preserve the existing first event.
+            return parseRawMCPToolLifecycleEvent(method: method, params: params) == nil
+        case "turn/started", "codex/event/turn_started",
+             "codex/event/task_complete", "item/agentMessage/delta",
+             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta",
+             "thread/status/changed", "deprecationNotice":
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func hasUnrepresentedRawResponseItem(_ params: [String: Any]) -> Bool {
+        guard let item = Self.canonicalItem(from: params),
+              let scope = Self.canonicalItemScope(from: params, item: item),
+              Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: scope.turnID) != nil
+        else { return true }
+        switch item["type"] as? String {
+        case "message":
+            guard let content = item["content"] as? [[String: Any]] else { return true }
+            switch item["role"] as? String {
+            case "user":
+                // Harness-owned v0.160.1 wire annotation (outside exported schema), not text or
+                // version inference. Missing/new/mixed/misaligned kinds stay ordinary and visible.
+                guard let metadata = item["internal_chat_message_metadata_passthrough"] as? [String: Any],
+                      let kinds = metadata["content_item_kinds"] as? [String],
+                      let kind = kinds.first, kinds.count == content.count,
+                      ["user.text", "user.image", "user.audio"].contains(kind),
+                      kinds.allSatisfy({ $0 == kind })
+                else { return true }
+                return !content.allSatisfy { part in
+                    switch (kind, part["type"] as? String) {
+                    case ("user.text", "input_text"), ("user.text", "output_text"):
+                        part["text"] is String
+                    case ("user.image", "input_image"):
+                        Self.nonEmptyString(part["image_url"] as? String) != nil
+                            || Self.nonEmptyString(part["file_id"] as? String) != nil
+                    case ("user.audio", "input_audio"):
+                        Self.nonEmptyString(part["audio_url"] as? String) != nil
+                    default: false
+                    }
+                }
+            case "assistant":
+                // Core emits canonical completion before recording this raw model-output mirror.
+                // Its exact existing scope, not its text, proves the final replacement is represented.
+                return !completedCanonicalItemScopes.contains(scope) || !content.allSatisfy {
+                    ["input_text", "output_text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }
+            default: return true
+            }
+        case "reasoning":
+            guard completedCanonicalItemScopes.contains(scope),
+                  let summary = item["summary"] as? [[String: Any]],
+                  summary.allSatisfy({ $0["type"] as? String == "summary_text" && $0["text"] is String })
+            else { return true }
+            if let content = item["content"], !(content is NSNull) {
+                guard let parts = content as? [[String: Any]], parts.allSatisfy({
+                    ["reasoning_text", "text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }) else { return true }
+            }
+            if let encrypted = item["encrypted_content"], !(encrypted is NSNull), !(encrypted is String) { return true }
+            return false
+        default: return true
         }
     }
 
@@ -4431,6 +4711,21 @@ final class CodexNativeSessionController {
             pendingTurnFailureScopeOrder.removeAll(keepingCapacity: true)
         }
 
+        func test_handleServerRequest(method: String, params: [String: CodexJSONValue]) async {
+            await handleServerRequest(.init(id: .int(42), method: method, params: params))
+        }
+
+        func test_computerUseApprovalPolicy() async throws -> (CodexAgentToolPreferences.ApprovalPolicy, CodexAgentToolPreferences.ApprovalReviewer) {
+            try await updateClientProcessLaunchPolicy()
+            return (effectiveApprovalPolicy, effectiveApprovalReviewer)
+        }
+
+        func test_computerUseStartupConfig() async throws -> [String: Any] {
+            try await updateClientProcessLaunchPolicy()
+            try await inspectComputerUseEffectiveConfiguration()
+            return try await runtimeConfigOverrides()
+        }
+
         func test_handleNotification(
             method: String,
             params: [String: CodexJSONValue]
@@ -4690,7 +4985,11 @@ final class CodexNativeSessionController {
         case .authTokensRefresh:
             await handleChatgptAuthTokensRefreshServerRequest(request.id, method: method, params: params)
         case .mcpElicitation:
-            if Self.isRepoPromptMCPElicitationRequest(params: params) {
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
+            if autoApproveHost || autoApproveCompanion {
+                logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4699,10 +4998,6 @@ final class CodexNativeSessionController {
                         "_meta": [String: Any]()
                     ]
                 )
-                return
-            }
-            if let autoAcceptResult = await computerUseMCPElicitationAutoAcceptResult(params: params) {
-                await respondToServerRequest(id: request.id, result: autoAcceptResult)
                 return
             }
             guard let elicitationRequest = Self.parseMCPElicitationRequest(
@@ -4721,9 +5016,30 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "surface")
             await emit(.mcpElicitationRequest(elicitationRequest))
         case .permissions:
-            if let approvalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params) {
+            let autoApproveCompanion = shouldAutoApproveComputerUseCompanion(params: params)
+            let hostApprovalResult = Self.repoPromptPermissionsAutoApprovalResult(params: params)
+            if autoApproveCompanion,
+               let permission = Self.parsePermissionsRequest(
+                   requestID: request.id,
+                   method: method,
+                   params: params,
+                   activeThreadID: threadID,
+                   currentTurnID: routingCurrentTurnID
+               )
+            {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
+                await respondToServerRequest(id: request.id, result: [
+                    "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
+                ])
+                return
+            }
+            if let approvalResult = hostApprovalResult {
+                logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -4743,6 +5059,7 @@ final class CodexNativeSessionController {
                 )
                 return
             }
+            logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "surface")
             await emit(.permissionsRequest(permissionsRequest))
         case .dynamicToolUnsupported:
             await emitServerRequestIssue(
@@ -4764,6 +5081,16 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func emitAutoApprovedServerRequestActivity(method: String, params: [String: Any]) async {
+        // Automatic consent is still interaction, even with no surfaced request or later tool.
+        // Reuse raw scope parsing; the coordinator owns current-controller/turn acceptance.
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
         #if DEBUG
             writeRawEventLogRecord(
@@ -4775,7 +5102,11 @@ final class CodexNativeSessionController {
             )
         #endif
         do {
-            try await client.respondToServerRequest(id: id, result: result)
+            if let serverRequestResponseExecutor {
+                try await serverRequestResponseExecutor(id, result)
+            } else {
+                try await client.respondToServerRequest(id: id, result: result)
+            }
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
         }
@@ -4836,6 +5167,7 @@ final class CodexNativeSessionController {
             )
             return
         }
+        await emitAutoApprovedServerRequestActivity(method: method, params: params)
         do {
             try await client.respondToServerRequest(id: requestID, result: response.payload)
         } catch {
@@ -4843,50 +5175,28 @@ final class CodexNativeSessionController {
         }
     }
 
-    private static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
+    private func logComputerUseApprovalDecision(path: CodexComputerUseWorkflow.ApprovalDecisionPath, params: [String: Any], outcome: String) {
+        guard computerUseRequiresUserReview else { return }
+        CodexComputerUseWorkflow.logApprovalDecision(
+            path: path, server: params["serverName"] as? String, armed: computerUseRequiresUserReview,
+            approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider(), outcome: outcome
+        )
+    }
+
+    private func shouldAutoApproveComputerUseCompanion(params: [String: Any]) -> Bool {
+        !withEventsStateLock { computerUseAutoApprovalRevoked }
+            && computerUseScopePrepared && computerUseAcceptedClientPath != nil
+            && CodexComputerUseWorkflow.automaticallyApprovesCompanion(
+                armed: computerUseRequiresUserReview,
+                approvalPolicy: options.approvalPolicyProvider(), sandboxMode: options.sandboxModeProvider()
+            ) && MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
+    }
+
+    static func isRepoPromptMCPElicitationRequest(params: [String: Any]) -> Bool {
         MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
             requestToolName: nil,
             requestPayload: params
         ) != nil
-    }
-
-    private func computerUseMCPElicitationAutoAcceptResult(params: [String: Any]) async -> [String: Any]? {
-        let computerUseEnabled = await MainActor.run { options.computerUseEnabledProvider() }
-        guard computerUseEnabled,
-              options.approvalPolicyProvider() == .never,
-              options.sandboxModeProvider() == .dangerFullAccess,
-              Self.isComputerUseMCPElicitationRequest(params: params)
-        else {
-            return nil
-        }
-        return [
-            "action": "accept",
-            "content": [String: Any](),
-            "_meta": [
-                "repoPromptAutoAccepted": true,
-                "reason": "explicit_computer_use_full_access"
-            ]
-        ]
-    }
-
-    private static func isComputerUseMCPElicitationRequest(params: [String: Any]) -> Bool {
-        let serverCandidates = [
-            "server",
-            "serverName",
-            "server_name",
-            "mcpServer",
-            "mcp_server",
-            "mcpServerName",
-            "mcp_server_name"
-        ]
-        guard let serverName = firstString(in: params, keys: serverCandidates)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !serverName.isEmpty
-        else {
-            return false
-        }
-        return serverName == computerUseMCPServerName
     }
 
     static func parseMCPElicitationRequest(
@@ -5152,7 +5462,9 @@ final class CodexNativeSessionController {
             threadID: threadID,
             turnID: turnID,
             itemID: itemID,
-            questions: parsedQuestions
+            questions: parsedQuestions,
+            repoPromptAutoApprovalVerified: MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(requestToolName: nil, requestPayload: params) != nil,
+            computerUseCompanionVerified: MCPIntegrationHelper.isComputerUseCompanionPermissionRequest(params)
         )
     }
 
@@ -5296,6 +5608,29 @@ final class CodexNativeSessionController {
             return .fileChange
         }()
 
+        // This authority is top-level only: nested fields must never resurrect legacy choices.
+        let availableDecisions: [AgentApprovalDecision]? = {
+            guard let value = params["availableDecisions"], !(value is NSNull) else { return nil }
+            guard let entries = value as? [Any] else { return [] }
+            return entries.compactMap { entry in
+                if let name = entry as? String {
+                    switch name {
+                    case "accept": return .accept
+                    case "acceptForSession": return .acceptForSession
+                    case "decline": return .decline
+                    case "cancel": return .cancel
+                    default: return nil
+                    }
+                }
+                guard let object = entry as? [String: Any], object.count == 1,
+                      let amendment = object["acceptWithExecpolicyAmendment"] as? [String: Any],
+                      let values = amendment["execpolicy_amendment"] as? [String], !values.isEmpty,
+                      let data = try? JSONSerialization.data(withJSONObject: values)
+                else { return nil }
+                return .acceptWithExecpolicyAmendment(String(decoding: data, as: UTF8.self))
+            }
+        }()
+
         let approvalID = AgentApprovalRequest.stableID(
             requestID: .codex(requestID),
             method: method,
@@ -5304,6 +5639,25 @@ final class CodexNativeSessionController {
             turnID: stableTurnID,
             itemID: itemID
         )
+        func makeRequest(details: [AgentApprovalDetail]) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                id: approvalID,
+                requestID: .codex(requestID),
+                method: method,
+                kind: kind,
+                threadID: threadID,
+                turnID: turnID,
+                itemID: itemID,
+                reason: reason,
+                command: command,
+                cwd: cwd,
+                grantRoot: grantRoot,
+                proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
+                availableDecisions: availableDecisions,
+                details: details
+            )
+        }
+        let presentedAmendment = makeRequest(details: []).presentedExecpolicyAmendmentJSON
         let detailSeed = approvalID.uuidString
         var details: [AgentApprovalDetail] = []
         var detailIndex = 0
@@ -5339,28 +5693,14 @@ final class CodexNativeSessionController {
         if let commandActionsJSON, !commandActionsJSON.isEmpty {
             appendDetail(label: "Command Actions", value: commandActionsJSON, isCode: true)
         }
-        if let proposedExecpolicyAmendmentJSON, !proposedExecpolicyAmendmentJSON.isEmpty {
-            appendDetail(label: "Execpolicy Amendment", value: proposedExecpolicyAmendmentJSON, isCode: true)
+        if let presentedAmendment, !presentedAmendment.isEmpty {
+            appendDetail(label: "Execpolicy Amendment", value: presentedAmendment, isCode: true)
         }
         if details.isEmpty {
             appendDetail(label: "Method", value: method, isCode: true)
         }
 
-        return AgentApprovalRequest(
-            id: approvalID,
-            requestID: .codex(requestID),
-            method: method,
-            kind: kind,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID,
-            reason: reason,
-            command: command,
-            cwd: cwd,
-            grantRoot: grantRoot,
-            proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
-            details: details
-        )
+        return makeRequest(details: details)
     }
 
     private static func firstString(in value: Any, keys: [String]) -> String? {
@@ -8488,6 +8828,22 @@ final class CodexNativeSessionController {
         return false
     }
 
+    /// Server identity attested by the provider payload. Populated aliases must agree:
+    /// a conflicting payload yields multiple names and fails closed downstream.
+    private func attestedMCPServerNames(in candidate: [String: Any]) -> Set<String> {
+        var names = Set<String>()
+        for key in [
+            "server", "serverName", "server_name", "mcpServer", "mcp_server", "mcpServerName", "mcp_server_name"
+        ] {
+            guard let value = stringValue(from: candidate, keys: [key])?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                !value.isEmpty
+            else { continue }
+            names.insert(value.lowercased().replacingOccurrences(of: "_", with: "-"))
+        }
+        return names
+    }
+
     private func normalizedToolName(from candidate: [String: Any]) -> String? {
         let explicitName = stringValue(from: candidate, keys: [
             "name", "toolName", "tool_name", "functionName", "function_name", "callName", "call_name"
@@ -8495,6 +8851,21 @@ final class CodexNativeSessionController {
         let typeRaw = normalizedTypeString(from: candidate)
         let raw = (explicitName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
         let lowered = raw.lowercased()
+
+        // The provider-attested server outranks generic action aliases, so companion
+        // calls keep provenance even when the action name resembles a shell or web tool.
+        let attestedServers = attestedMCPServerNames(in: candidate)
+        if !raw.isEmpty, attestedServers == [Self.computerUseMCPServerName] {
+            // Already-qualified names carry their own provenance.
+            if lowered.hasPrefix("mcp__") { return raw }
+            return "mcp__\(MCPIntegrationHelper.computerUseMCPServerName)__\(raw)"
+        }
+        // Anything short of an exact companion attestation — foreign, conflicting, or
+        // absent — carrying a companion-looking name must never group: strip the
+        // claimed prefix and fail closed.
+        if let stripped = MCPIntegrationHelper.computerUseCompanionToolName(raw) {
+            return stripped
+        }
 
         if lowered == "local_shell"
             || lowered == "shell"
@@ -9113,6 +9484,81 @@ final class CodexNativeSessionController {
         )
     }
 
+    /// Inspect the app-server's effective configuration before installing the companion.
+    /// This also catches trusted project/managed layers, not just the owned home's file.
+    static func reservedComputerUseServerNames(_ response: [String: Any]) throws -> [String] {
+        guard let config = response["config"] as? [String: Any] else { throw CodexAppServerClient.ClientError.invalidResponse }
+        guard let rawServers = config["mcp_servers"] else { return [] }
+        guard let servers = rawServers as? [String: Any] else { throw CodexAppServerClient.ClientError.invalidResponse }
+        return servers.keys.filter { $0.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }.sorted()
+    }
+
+    static func validateComputerUseConfiguration(_ response: [String: Any]) throws {
+        guard try reservedComputerUseServerNames(response).isEmpty else {
+            throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+        }
+    }
+
+    /// Preserve the ordinary static overlay without discovering or rewriting companion entries.
+    /// For armed scopes, the actual thread boundary remains authoritative even when an
+    /// injected/default override provider evaluated readiness differently.
+    static func computerUseRuntimeConfigOverrides(
+        _ proposed: [String: Any],
+        computerUseEnabled: Bool,
+        acceptedClientPath: String?,
+        effectiveServerNames: [String]
+    ) throws -> [String: Any] {
+        guard computerUseEnabled else { return proposed }
+        let prefixes = ["mcp_servers.computer-use", "mcp_servers.\"computer-use\""]
+        var overrides = proposed.filter { key, _ in
+            let lower = key.lowercased()
+            return !prefixes.contains { lower == $0 || lower.hasPrefix("\($0).") }
+        }
+        if var servers = overrides["mcp_servers"] as? [String: Any] {
+            servers = servers.filter { $0.key.caseInsensitiveCompare(computerUseMCPServerName) != .orderedSame }
+            overrides["mcp_servers"] = servers
+        }
+        overrides["features.computer_use"] = computerUseEnabled
+        if computerUseEnabled {
+            guard effectiveServerNames.isEmpty else {
+                throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+            }
+            guard let acceptedClientPath else {
+                throw CodexAppServerClient.ClientError.executableUnavailable(CodexComputerUseWorkflow.unavailableMessage)
+            }
+            overrides["mcp_servers.computer-use"] = ["command": acceptedClientPath, "args": ["mcp"], "enabled": true] as [String: Any]
+            overrides["approval_policy"] = "on-request"
+            overrides["approvals_reviewer"] = "user"
+        } else {
+            for name in effectiveServerNames {
+                let component = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: name)
+                overrides["mcp_servers.\(component).enabled"] = false
+            }
+        }
+        return overrides
+    }
+
+    static func hasReservedComputerUseEntry(_ entries: [MCPIntegrationHelper.CodexServerEntry]) -> Bool {
+        entries.contains { $0.normalizedName.caseInsensitiveCompare(computerUseMCPServerName) == .orderedSame }
+    }
+
+    /// Locate only the installed companion executable; never import a personal Codex home.
+    static func computerUseClientPath(fileManager: FileManager = .default) -> String? {
+        let applications = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true)
+        ]
+        let suffix = "Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+        for directory in applications {
+            for appName in ["ChatGPT.app", "Codex.app"] {
+                let path = directory.appendingPathComponent(appName, isDirectory: true)
+                    .appendingPathComponent(suffix).path
+                if fileManager.isExecutableFile(atPath: path) { return path }
+            }
+        }
+        return nil
+    }
+
     static func defaultAppServerConfigOverrides(
         shellToolEnabled: Bool? = nil,
         suppressThirdPartyMCPServers: Bool = false,
@@ -9120,9 +9566,11 @@ final class CodexNativeSessionController {
         goalSupportEnabled: Bool = false,
         reasoningSummariesEnabled: Bool? = nil,
         memoriesEnabled: Bool = false,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        computerUseClientPath: String? = computerUseClientPath(),
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry] = MCPIntegrationHelper.codexMCPServerEntries()
     ) -> [String: Any] {
-        let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
+        let readyComputerUse = computerUseEnabled && computerUseClientPath != nil && !hasReservedComputerUseEntry(serverEntries)
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
         let modelReasoningSummary = reasoningSummariesEnabled.map {
             $0 ? CodexOverrides.ReasoningSummary.auto : .none
@@ -9137,18 +9585,23 @@ final class CodexNativeSessionController {
             featurePolicy: .resolved(
                 goalsEnabled: goalSupportEnabled,
                 memoriesEnabled: memoriesEnabled,
-                computerUseEnabled: computerUseEnabled,
-                capabilities: capabilities
+                computerUseEnabled: readyComputerUse,
+                capabilities: computerUseEnabled ? .computerUse : capabilities
             )
         )
         let mcpOverrides = appServerMCPServerOverrides(
             serverEntries: serverEntries,
             enabledMCPServerNames: preferences.enabledMCPServerNames,
             suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
-            computerUseEnabled: computerUseEnabled
+            computerUseEnabled: readyComputerUse,
+            computerUseClientPath: computerUseClientPath
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
+        }
+        if readyComputerUse {
+            overrides["approval_policy"] = "on-request"
+            overrides["approvals_reviewer"] = "user"
         }
         overrides["features.code_mode.direct_only_tool_namespaces"] = ["mcp__RepoPromptCE"]
         return overrides
@@ -9158,19 +9611,17 @@ final class CodexNativeSessionController {
         serverEntries: [MCPIntegrationHelper.CodexServerEntry],
         enabledMCPServerNames: Set<String>,
         suppressThirdPartyMCPServers: Bool,
-        computerUseEnabled: Bool
+        computerUseEnabled: Bool,
+        computerUseClientPath: String? = computerUseClientPath()
     ) -> [String: Any] {
         var effectiveEnabledNames = suppressThirdPartyMCPServers
             ? Set([MCPIntegrationHelper.repoPromptMCPServerName])
             : enabledMCPServerNames
-        if computerUseEnabled,
-           serverEntries.contains(where: {
-               $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame
-           })
-        {
-            effectiveEnabledNames.insert(Self.computerUseMCPServerName)
+        // A saved enabled entry never grants computer use to an ordinary turn.
+        effectiveEnabledNames = effectiveEnabledNames.filter {
+            $0.caseInsensitiveCompare(Self.computerUseMCPServerName) != .orderedSame
         }
-        return CodexOverrides.appServerMCPServerMap(
+        var overrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .enableSelected(
                 enabledNormalizedNames: effectiveEnabledNames,
@@ -9178,6 +9629,24 @@ final class CodexNativeSessionController {
                 exceptBroken: []
             )
         )
+        // Optional servers can be omitted from the first turn while discovery is pending.
+        // Require only RepoPrompt for these app-owned threads; leave global/third-party policy alone.
+        let repoPromptKey = MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: MCPIntegrationHelper.repoPromptMCPServerName)
+        overrides["mcp_servers.\(repoPromptKey).required"] = true
+        let companionKey = "mcp_servers.\(MCPIntegrationHelper.codexCLIPathComponent(forNormalizedServerName: computerUseMCPServerName))"
+        if computerUseEnabled, let computerUseClientPath, !hasReservedComputerUseEntry(serverEntries) {
+            // Codex recursively merges config layers. Only introduce a full definition when
+            // the reserved name is absent; never overlay a saved transport or approval policy.
+            overrides[companionKey] = [
+                "command": computerUseClientPath,
+                "args": ["mcp"],
+                "enabled": true
+            ] as [String: Any]
+            overrides.removeValue(forKey: "\(companionKey).enabled")
+        }
+        // Existing entries were disabled above. Do not synthesize an enabled=false-only
+        // entry: Codex validates transport even for disabled servers.
+        return overrides
     }
 }
 
@@ -9284,14 +9753,14 @@ enum CommandExecutionOutputSanitizer {
 }
 
 enum CodexSessionControllerError: LocalizedError {
-    case imageAttachmentsUnsupported
+    case attachmentsUnsupported
     case emptyUserTurn
     case invalidResumeReferenceMissingThreadID
     case invalidLifecycleState(String)
 
     var errorDescription: String? {
         switch self {
-        case .imageAttachmentsUnsupported:
+        case .attachmentsUnsupported:
             "This Codex session controller does not support image attachments."
         case .emptyUserTurn:
             "Cannot send an empty user turn."

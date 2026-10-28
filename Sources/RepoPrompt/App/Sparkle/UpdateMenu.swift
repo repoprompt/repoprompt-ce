@@ -14,27 +14,26 @@ import SwiftUI
 /// Main Commands implementation – now identical in behaviour to the Settings UI
 struct UpdateMenu: Commands {
     @ObservedObject var sparkleManager: SparkleUpdaterManager
+    @ObservedObject private var shortcutDisplay = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
 
     var body: some Commands {
         CommandGroup(after: .appInfo) {
             if let availableUpdate = sparkleManager.availableUpdate {
                 if sparkleManager.canInstallAvailableUpdate {
-                    Button(availableUpdate.menuInstallTitle) {
+                    Button(shortcutDisplay.title(availableUpdate.menuInstallTitle, for: .checkForUpdates)) {
                         sparkleManager.installUpdate()
                     }
-                    .keyboardShortcut("u", modifiers: [.command, .option])
+
                 } else if sparkleManager.manualUpdateDownloadURL != nil {
-                    Button(availableUpdate.menuManualDownloadTitle) {
+                    Button(shortcutDisplay.title(availableUpdate.menuManualDownloadTitle, for: .checkForUpdates)) {
                         sparkleManager.performAvailableUpdateAction()
                     }
-                    .keyboardShortcut("u", modifiers: [.command, .option])
                 }
             } else {
-                Button(sparkleManager.updateCheckMenuTitle) {
+                Button(shortcutDisplay.title(sparkleManager.updateCheckMenuTitle, for: .checkForUpdates)) {
                     sparkleManager.checkForUpdates()
                 }
                 .disabled(!sparkleManager.canInitiateUpdateCheck)
-                .keyboardShortcut("u", modifiers: [.command, .option])
             }
 
             if sparkleManager.migrationRecoveryDownloadsURL != nil {

@@ -1,5 +1,9 @@
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptPersistence
+import RepoPromptVCS
 
 struct GitPrefixControlEvidenceCacheLimits: Equatable {
     static let production = GitPrefixControlEvidenceCacheLimits(
@@ -1566,6 +1570,10 @@ actor GitWorkspaceStateAuthority {
         records[key] = record
         updateSynchronousState(repositoryKey: key, record: record)
         return token
+    }
+
+    nonisolated func acceptedMetadataWatermark(for repositoryKey: GitWorkspaceAuthorityRepositoryKey) -> UInt64 {
+        metadataMonitor.acceptedWatermark(for: repositoryKey)
     }
 
     func metadataObservationIsCurrent(

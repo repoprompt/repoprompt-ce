@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Settings → General → Notifications. Every toggle is driven by `NotificationSettingDescriptor`, the

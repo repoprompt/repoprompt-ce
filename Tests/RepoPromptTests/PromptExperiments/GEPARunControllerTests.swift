@@ -929,7 +929,7 @@ import XCTest
         }
 
         func testBuiltInCandidateRendersThroughTheProductionOracleComposition() throws {
-            let registry = BuiltInPromptRegistry.shared
+            let registry = AppDomainRuntimeComposition.shared.builtInPromptRegistry
             let baseline = try registry.resource(.oraclePlan).text
             // Pinned production hash of the Oracle Plan system prompt (BuiltInPromptRegistryTests).
             let rendered = try ConnectedModelHarness.renderSystemPrompt(candidate: baseline, promptID: .oraclePlan, registry: registry)

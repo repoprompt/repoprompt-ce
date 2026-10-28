@@ -240,13 +240,20 @@ import XCTest
                 do {
                     let tools = await server.windowMCPTools
                     let tool = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.contextBuilder })
-                    server.setRequestMetadataOverrideForTesting(.init(
+                    let metadata = MCPRequestMetadata(
                         connectionID: connection.connectionID, clientName: nil, windowID: owner.windowID,
                         runPurpose: .agentModeRun,
                         tabContextHint: .init(tabID: owner.tabID, workspaceID: owner.workspaceID, windowID: owner.windowID)
-                    ))
+                    )
+                    server.setRequestMetadataOverrideForTesting(metadata)
                     defer { server.setRequestMetadataOverrideForTesting(nil) }
-                    _ = try await tool(["instructions": .string("prerequisite regression"), "response_type": .string("clarify")])
+                    let invocation = ToolInvocationContext.trustedLocal(
+                        toolName: MCPWindowToolName.contextBuilder,
+                        metadata: metadata
+                    )
+                    _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                        try await tool(["instructions": .string("prerequisite regression"), "response_type": .string("clarify")])
+                    }
                     XCTFail("An unsatisfied prerequisite must reject discovery")
                     return UnexpectedAdmission()
                 } catch {

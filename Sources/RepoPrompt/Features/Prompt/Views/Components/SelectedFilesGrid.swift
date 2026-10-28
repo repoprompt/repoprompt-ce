@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 // MARK: - Selected Files Grid View

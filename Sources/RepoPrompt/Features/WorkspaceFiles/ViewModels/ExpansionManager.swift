@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 // File: RepoPrompt/ViewModels/ExpansionManager.swift
 import Combine
 import Foundation

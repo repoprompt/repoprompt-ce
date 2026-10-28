@@ -2,6 +2,10 @@ import CryptoKit
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptPersistence
+import RepoPromptVCS
 import XCTest
 
 enum CodemapGraphIndexHarnessError: Error {
@@ -56,7 +60,7 @@ final class CodemapGraphIndexHarness {
     private let seed: UInt8
 
     /// Registers a synthetic root. Pass `overlay` to share one overlay between several roots and
-    /// `capability` to register a capability issued by a real `WorkspaceCodemapGitCapabilityService`.
+    /// `capability` to register a capability issued by a real `WorkspaceCodemapRootCapabilityService`.
     init(
         seed: UInt8,
         mode: WorkspaceCodemapGraphReconcileMode = .incremental,
@@ -128,7 +132,7 @@ final class CodemapGraphIndexHarness {
             graphPolicy: graphPolicy,
             applyBuildHook: { await gate?.pass() }
         )
-        let registration = await overlay.register(capability: .eligible(capability), catalogGeneration: 3)
+        let registration = await overlay.register(capability: .eligible(.git(capability)), catalogGeneration: 3)
         guard case .registered = registration else {
             throw CodemapGraphIndexHarnessError.unexpectedDisposition("\(registration)")
         }
@@ -347,7 +351,7 @@ func assertSameGraph(
     line: UInt = #line
 ) {
     XCTAssertEqual(lhs.rootEpoch, rhs.rootEpoch, message(), file: file, line: line)
-    XCTAssertEqual(lhs.repositoryAuthority, rhs.repositoryAuthority, message(), file: file, line: line)
+    XCTAssertEqual(lhs.rootAuthority, rhs.rootAuthority, message(), file: file, line: line)
     XCTAssertEqual(lhs.catalogWatermark, rhs.catalogWatermark, message(), file: file, line: line)
     XCTAssertEqual(lhs.schemaVersion, rhs.schemaVersion, message(), file: file, line: line)
     XCTAssertEqual(lhs.policyVersion, rhs.policyVersion, message(), file: file, line: line)

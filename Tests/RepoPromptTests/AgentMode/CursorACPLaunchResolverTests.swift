@@ -1,9 +1,17 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+@testable import RepoPromptProcess
+import RepoPromptSettingsCore
 import XCTest
 
 final class CursorACPLaunchResolverTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testHealthyLegacyDoesNotDiscoverSecondaryEntrypoint() async throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(named: "cursor-agent", in: directory)
@@ -15,7 +23,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         XCTAssertEqual(support, .supported)
         XCTAssertEqual(try resolver.resolvedLaunch(for: config).command, try canonicalExecutablePath(executable))
@@ -60,7 +68,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         XCTAssertEqual(support, .supported)
         XCTAssertEqual(try resolver.resolvedLaunch(for: config).command, currentPath)
@@ -92,7 +100,9 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let reader = DispatchSource.makeReadSource(fileDescriptor: enteredDescriptor, queue: .global())
         reader.setEventHandler {
             var byte: UInt8 = 0
-            if Darwin.read(enteredDescriptor, &byte, 1) == 1 { entered.fulfill() }
+            if Darwin.read(enteredDescriptor, &byte, 1) == 1 {
+                entered.fulfill()
+            }
         }
         reader.setCancelHandler { close(enteredDescriptor) }
         reader.resume()
@@ -122,7 +132,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             }
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-        let supportTask = Task { try await resolver.probeSupport(for: config) }
+        let supportTask = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
 
         // This timeout is a deadlock guard, not a performance oracle.
         await fulfillment(of: [entered], timeout: 30)
@@ -157,7 +167,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: binDirectory.path)
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard support == .supported else {
             return XCTFail("Expected supported Cursor entrypoint: \(support)")
         }
@@ -178,7 +188,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: directory.path)
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected an unverified generic agent executable to be unsupported")
@@ -207,7 +217,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: binDirectory.path)
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected cursor-agent resolving to a generic agent executable to be unsupported")
@@ -243,7 +253,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let resolver = makeResolver(path: binDirectory.path)
         let config = CursorAgentConfig(additionalPathHints: [])
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard support == .supported else {
             return XCTFail("Expected supported Cursor entrypoint: \(support)")
         }
@@ -270,7 +280,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected a timed-out probe to be unsupported")
@@ -314,7 +324,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             aggregateProbeTimeout: 10
         )
 
-        let support = try await resolver.probeSupport(for: CursorAgentConfig(additionalPathHints: []))
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: CursorAgentConfig(additionalPathHints: [])) }
 
         guard case .unsupported = support else {
             return XCTFail("Expected aggregate deadline exhaustion to be unsupported")
@@ -345,7 +355,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         guard case let .unsupported(reason) = support else {
             return XCTFail("Expected an expired clock to reject the successful producer result")
@@ -407,7 +417,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             sharingProbeOwnershipWith: firstResolver
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-        let firstProbe = Task { try await firstResolver.probeSupport(for: config) }
+        let firstProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await firstResolver.probeSupport(for: config) } }
 
         await producer.waitUntilEntered()
         await firstDeadline.waitUntilEntered()
@@ -420,7 +430,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         XCTAssertTrue(reason.contains("aggregate timeout"))
         await producer.waitUntilCancellation()
 
-        let pendingSupport = try await secondResolver.probeSupport(for: config)
+        let pendingSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await secondResolver.probeSupport(for: config) }
         guard case let .unsupported(pendingReason) = pendingSupport else {
             return XCTFail("Expected a retry to be rejected while the producer drains")
         }
@@ -435,7 +445,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         await firstResolver.waitForProbeAttemptSettlementForTesting()
         XCTAssertThrowsError(try secondResolver.resolvedLaunch(for: config))
 
-        let recoveredSupport = try await secondResolver.probeSupport(for: config)
+        let recoveredSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await secondResolver.probeSupport(for: config) }
         XCTAssertEqual(recoveredSupport, .supported)
         let recoveredCallCount = await secondCalls.count()
         XCTAssertEqual(recoveredCallCount, 1)
@@ -477,7 +487,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             aggregateProbeTimeout: 10
         )
         let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [])
-        let firstProbe = Task { try await resolver.probeSupport(for: config) }
+        let firstProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
 
         await producer.waitUntilEntered()
         firstProbe.cancel()
@@ -489,7 +499,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         }
         await producer.waitUntilCancellation()
 
-        let pendingSupport = try await resolver.probeSupport(for: config)
+        let pendingSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         guard case let .unsupported(pendingReason) = pendingSupport else {
             return XCTFail("Expected a retry to be rejected while the canceled producer drains")
         }
@@ -502,7 +512,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         await resolver.waitForProbeAttemptSettlementForTesting()
         XCTAssertThrowsError(try resolver.resolvedLaunch(for: config))
 
-        let recoveredSupport = try await resolver.probeSupport(for: config)
+        let recoveredSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         XCTAssertEqual(recoveredSupport, .supported)
         let recoveredCallCount = await calls.count()
         XCTAssertEqual(recoveredCallCount, 2)
@@ -541,7 +551,9 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             supplementalPathProvider: { $0 },
             probeRunner: { launch, _, timeout, _ in
                 await probes.record(launch.command, timeout: timeout)
-                if launch.command == legacyPath { clock.advance(by: 6) }
+                if launch.command == legacyPath {
+                    clock.advance(by: 6)
+                }
                 return CLIProcessRunner.Result(
                     stdout: Data("Cursor Agent ACP support".utf8), stderr: Data(),
                     status: launch.command == legacyPath ? 2 : 0, timedOut: false
@@ -554,7 +566,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
         let config = CursorAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false)
 
-        let support = try await resolver.probeSupport(for: config)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: lookupMarker.path))
         XCTAssertEqual(support, .supported)
@@ -805,7 +817,9 @@ private actor CursorProbeCommands {
 
     func record(_ command: String, timeout: TimeInterval? = nil) {
         commands.append(command)
-        if let timeout { timeouts.append(timeout) }
+        if let timeout {
+            timeouts.append(timeout)
+        }
     }
 }
 
@@ -828,5 +842,114 @@ private final class CursorDiscoveryClock: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return elapsedProbeTime + (FileManager.default.fileExists(atPath: lookupMarker.path) ? 20 : 0)
+    }
+}
+
+/// Cross-provider final launch-boundary witnesses share the existing launch test import seam.
+final class ProviderEnvironmentFilteringTests: XCTestCase {
+    func testDefaultPolicyPreservesAuthenticationAndToolchainValues() {
+        let environment = ["OPENAI_API_KEY": "fixture", "CUSTOM_BACKEND_AUTH": "fixture", "SSH_AUTH_SOCK": "/fixture/socket", "NODE_PATH": "/fixture/runtime"]
+        XCTAssertEqual(ProviderEnvironmentFiltering.applying(removedNames: [], to: environment), environment)
+    }
+
+    func testEachProviderUsesItsDeclaredPassThroughWithoutBackendGuessing() async {
+        for provider in AgentProviderKind.allCases {
+            let ambient = ["RPCE_TEST_TOKEN": "fixture", "RPCE_TEST_SOCKET": "/fixture/socket", "PATH": "/usr/bin"]
+            let filtered = await ProviderEnvironmentFiltering.filter(
+                ambient,
+                for: provider,
+                removedNamesProvider: { requestedProvider in
+                    XCTAssertEqual(requestedProvider, provider.rawValue)
+                    // Synthetic per-provider exception: no model/backend introspection.
+                    return Set(["RPCE_TEST_TOKEN", "RPCE_TEST_SOCKET"]).subtracting(["RPCE_TEST_TOKEN"])
+                }
+            )
+            XCTAssertEqual(filtered["RPCE_TEST_TOKEN"], "fixture")
+            XCTAssertNil(filtered["RPCE_TEST_SOCKET"])
+            XCTAssertEqual(filtered["PATH"], "/usr/bin")
+        }
+    }
+
+    func testACPProvenanceDoesNotExemptCopiedAmbientSnapshot() async {
+        let providers: [(ACPProviderID, AgentProviderKind)] = [(.openCode, .openCode), (.cursor, .cursor), (.grokBuild, .grokBuild), (.antigravity, .antigravity), (.devin, .devin)]
+        for (id, provider) in providers {
+            let configuration = ACPLaunchConfiguration(
+                providerID: id, command: "/fixture/provider", arguments: [],
+                environment: ["COPIED_TOKEN": "ambient", "APP_TOKEN": "explicit"],
+                workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false,
+                explicitEnvironmentKeys: ["APP_TOKEN"]
+            )
+            let filtered = await ProviderEnvironmentFiltering.filterACP(
+                ["COPIED_TOKEN": "ambient", "APP_TOKEN": "ambient"],
+                launchConfiguration: configuration, for: provider,
+                removedNamesProvider: { _ in ["COPIED_TOKEN", "APP_TOKEN"] }
+            )
+            XCTAssertNil(filtered["COPIED_TOKEN"])
+            XCTAssertEqual(filtered["APP_TOKEN"], "explicit")
+        }
+        let undeclared = ACPLaunchConfiguration(
+            providerID: .devin, command: "/fixture/provider", arguments: [], environment: ["COPIED_TOKEN": "ambient"],
+            workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false
+        )
+        XCTAssertTrue(undeclared.explicitEnvironmentKeys.isEmpty)
+        let filtered = await ProviderEnvironmentFiltering.filterACP(
+            undeclared.environment, launchConfiguration: undeclared, for: .devin,
+            removedNamesProvider: { _ in ["COPIED_TOKEN"] }
+        )
+        XCTAssertNil(filtered["COPIED_TOKEN"])
+    }
+
+    func testExplicitOverridesSurviveButDynamicLoaderSanitizationStillWins() {
+        let filtered = ProviderEnvironmentFiltering.applying(
+            removedNames: ["TOKEN", "SSH_AUTH_SOCK"],
+            to: ["TOKEN": "ambient", "SSH_AUTH_SOCK": "/fixture/socket", "token": "case-sensitive"],
+            explicitOverrides: ["TOKEN": "explicit", "DYLD_INSERT_LIBRARIES": "/fixture/library"]
+        )
+        XCTAssertEqual(filtered["TOKEN"], "explicit")
+        XCTAssertEqual(filtered["token"], "case-sensitive")
+        XCTAssertNil(filtered["SSH_AUTH_SOCK"])
+        XCTAssertNil(filtered["DYLD_INSERT_LIBRARIES"])
+    }
+
+    func testFinalRunnerFilterCannotBeUndoneByAmbientReconstructionOrCopiedSnapshot() async throws {
+        let filter = ProviderEnvironmentFiltering.cliFilter(
+            for: .openCode,
+            explicitOverrides: ["RPCE_TEST_EXPLICIT": "configured"],
+            removedNamesProvider: { _ in ["RPCE_TEST_AMBIENT", "RPCE_TEST_EXPLICIT", "RPCE_TEST_REMOVED"] }
+        )
+        let config = CLIProcessConfiguration(
+            command: "/bin/sh",
+            processPurpose: .tool,
+            environment: ["RPCE_TEST_AMBIENT": "copied-snapshot", "RPCE_TEST_EXPLICIT": "copied-snapshot"],
+            environmentFilter: filter,
+            additionalPaths: [],
+            shellLookupMode: .disabled
+        )
+        let result = try await CLIProcessRunner(config: config).run(
+            args: ["-c", "printf '%s|%s|%s' \"${RPCE_TEST_AMBIENT-unset}\" \"${RPCE_TEST_EXPLICIT-unset}\" \"${RPCE_TEST_REMOVED-unset}\""],
+            stdin: nil,
+            outputMode: .none,
+            timeout: 10,
+            additionalEnvironment: ["RPCE_TEST_EXPLICIT": "runtime", "RPCE_TEST_REMOVED": "runtime"],
+            additionalRemovedKeys: ["RPCE_TEST_REMOVED"]
+        )
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "unset|runtime|unset")
+    }
+
+    func testUnconfiguredToolRunnerRemainsUnfiltered() async throws {
+        let config = CLIProcessConfiguration(
+            command: "/bin/sh",
+            processPurpose: .tool,
+            environment: ["RPCE_TEST_AMBIENT": "unchanged"],
+            additionalPaths: [],
+            shellLookupMode: .disabled
+        )
+        XCTAssertNil(config.environmentFilter)
+        let result = try await CLIProcessRunner(config: config).run(
+            args: ["-c", "printf '%s' \"$RPCE_TEST_AMBIENT\""], stdin: nil, outputMode: .none, timeout: 10
+        )
+        XCTAssertEqual(result.status, 0)
+        XCTAssertEqual(String(data: result.stdout, encoding: .utf8), "unchanged")
     }
 }

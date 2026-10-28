@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  AgentOnboardingWizardView.swift
 //  RepoPrompt

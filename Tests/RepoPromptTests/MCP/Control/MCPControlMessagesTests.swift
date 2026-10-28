@@ -1,5 +1,4 @@
 import Foundation
-@testable import RepoPromptApp
 import RepoPromptShared
 import XCTest
 

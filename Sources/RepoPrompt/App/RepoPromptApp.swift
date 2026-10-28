@@ -2,6 +2,11 @@ import AppKit
 import Darwin
 import Foundation
 import Logging
+import RepoPromptFileSystem
+import RepoPromptProcess
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
+import RepoPromptShared
 import Sparkle
 import SwiftUI
 
@@ -56,6 +61,8 @@ struct RepoPromptFileLogHandler: LogHandler {
 
 struct RepoPromptSwiftUIApp: App {
     init() {
+        let appInitSpan = StartupPhaseLog.begin(.appInit)
+        defer { appInitSpan.end() }
         LoggingSystem.bootstrap { label in
             var handler = RepoPromptFileLogHandler(label: label)
             #if DEBUG
@@ -65,6 +72,10 @@ struct RepoPromptSwiftUIApp: App {
             #endif
             return handler
         }
+        // Do not initialize the settings-backed property before the state boundary
+        // check (stored-property default initializers run before this init body).
+        _fontScale = StateObject(wrappedValue: FontScaleManager.shared)
+        _shortcutDisplay = ObservedObject(wrappedValue: GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay)
         // Avoid process-killing SIGPIPE when the child closes stdin while we're still writing.
         signal(SIGPIPE, SIG_IGN)
 
@@ -75,6 +86,13 @@ struct RepoPromptSwiftUIApp: App {
         }
 
         SentryTelemetryBootstrap.start()
+
+        AgentSessionDataService.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
+        AgentSessionDataService.shared.installPerfRecorder(AppAgentModePerfRecorder())
+        AgentRunCoordinator.shared.installPerfRecorder(AppAgentModePerfRecorder())
+        AIProviderFactory.installPerfRecorder(AppAgentModePerfRecorder())
+        AgentSessionDeletionRegistry.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
+        AgentSessionLinkRuntimeBridge.shared.installRestorePerfRecorder(AppWorkspaceRestorePerfRecorder())
 
         ProcessDebugLogging.log(
             prefix: "MCPStartup",
@@ -89,6 +107,10 @@ struct RepoPromptSwiftUIApp: App {
                 flushStdout: true
             )
             do {
+                await ServerNetworkManager.shared.installPerfRecorder(AppAgentModePerfRecorder())
+                await ServerNetworkManager.shared.installCatalogDiagnosticsSink(AppAgentSessionLinkCatalogEventSink())
+                await ServerNetworkManager.shared.installExecutionDiagnosticsSink(AppMCPToolExecutionEventSink())
+                await ServerNetworkManager.shared.installPhaseRecorderFactory(AppMCPToolExecutionHandlerPhaseRecorderFactory())
                 try await ServerController.shared.startServer()
                 SentryTelemetryBootstrap.addBreadcrumb(.mcpBootstrap, action: .mcpServerStarted)
             } catch {
@@ -111,11 +133,17 @@ struct RepoPromptSwiftUIApp: App {
     /// Global version manager for the entire app
     @StateObject private var versionManager = VersionManager()
 
-    /// Tracks all WindowState objects across multiple windows (singleton)
-    @StateObject private var windowStatesManager = WindowStatesManager.shared
+    /// Tracks all WindowState objects across multiple windows (singleton).
+    /// Deliberately not observed: the scene and commands only read it inside actions, and observing
+    /// it here re-evaluated the whole App scene body on every window open/close. Computed rather than
+    /// stored so the singleton is still first created after `init()` bootstraps logging/telemetry.
+    private var windowStatesManager: WindowStatesManager {
+        WindowStatesManager.shared
+    }
 
     /// Root font scaling source so inherited SwiftUI text updates when the preset changes.
-    @StateObject private var fontScale = FontScaleManager.shared
+    @StateObject private var fontScale: FontScaleManager
+    @ObservedObject private var shortcutDisplay: KeyboardShortcutBindingDisplay
 
     // MARK: - Body
 
@@ -148,28 +176,27 @@ struct RepoPromptSwiftUIApp: App {
         .commands {
             UpdateMenu(sparkleManager: appDelegate.sparkleManager)
 
+            // Replace SwiftUI's automatic Cmd-N; otherwise it keeps reserving the key after a remap.
+            CommandGroup(replacing: .newItem) {
+                Button(shortcutDisplay.title("New Workspace Window", for: .newWorkspaceWindow)) {
+                    AppWindowOpener.shared.requestMainWindowFromDock()
+                }
+            }
+
             // macOS standard "Settings…" (⌘,) menu item
             CommandGroup(replacing: .appSettings) {
-                Button("Settings…") {
-                    // Identify the currently focused window (or fall back to latest)
-                    if let target = windowStatesManager
-                        .allWindows.first(where: { $0.isCurrentlyFocused })
-                        ?? windowStatesManager.latestWindowState
-                    {
-                        SettingsWindowCoordinator.shared.open(windowState: target)
-                    }
+                Button(shortcutDisplay.title("Settings…", for: .showAppSettings)) {
+                    GlobalKeyboardShortcutsCoordinator.shared.openSettings()
                 }
-                .keyboardShortcut(",", modifiers: .command)
             }
 
             // ➜ New File-menu commands (Save Workspace / Exit Workspace)
             WorkspaceCommands(windowStatesManager: windowStatesManager)
 
             CommandGroup(before: .saveItem) {
-                Button("Close Window") {
+                Button(shortcutDisplay.title("Close Window", for: .closeAppWindow)) {
                     NSApplication.shared.keyWindow?.performClose(nil)
                 }
-                .keyboardShortcut("w", modifiers: [.command, .shift])
             }
 
             CommandGroup(replacing: .help) {
@@ -187,7 +214,47 @@ struct RepoPromptSwiftUIApp: App {
 
 @MainActor
 public enum RepoPromptApplication {
+    /// Each attempt re-runs the full bootstrap: exclusive profile lease, running-app guard,
+    /// verified publication, and debug preferences replaced only after a successful publish.
+    /// The existing debug profile is never silently reused while release may be writing.
+    private static func checkDebugStateBoundary() {
+        var startEmpty = false
+        while true {
+            do {
+                try DebugStateBootstrap.runIfNeeded(forceCleanSlate: startEmpty)
+                return
+            } catch {
+                let cleanRequested = startEmpty || ProcessInfo.processInfo.arguments.contains(DebugStateBootstrap.cleanSlateArgument)
+                let offerStartEmpty = !cleanRequested && DebugStateBootstrap.startEmptyCanRecover(from: error)
+                let alert = NSAlert()
+                alert.messageText = "Debug state snapshot could not be prepared"
+                var details = "\(error.localizedDescription)\nProduction and prior debug state were preserved."
+                if offerStartEmpty {
+                    details += "\n\nRetry attempts another capture. If production changed during capture, a retry may succeed once its writes pause briefly."
+                        + "\n\nStart Empty opens this launch with an isolated, empty debug profile. The current debug profile and"
+                        + " its preferences are archived, not deleted, under “RepoPrompt CE Debug Recovery”. Production state is"
+                        + " never modified, and the next normal launch captures production again."
+                }
+                alert.informativeText = details
+                alert.addButton(withTitle: "Quit")
+                alert.addButton(withTitle: "Retry")
+                if offerStartEmpty { alert.addButton(withTitle: "Start Empty") }
+                switch alert.runModal() {
+                case .alertSecondButtonReturn: continue
+                case .alertThirdButtonReturn where offerStartEmpty: startEmpty = true
+                default: exit(EXIT_FAILURE)
+                }
+            }
+        }
+    }
+
     public static func main() {
+        if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
+        // Before defaults migration, provider launch snapshots, property wrappers,
+        // or any settings/session singleton can observe or normalize this profile.
+        Self.checkDebugStateBoundary()
+        let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
         let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {
         case .skipped: .skipped
@@ -210,6 +277,9 @@ public enum RepoPromptApplication {
         CodexRuntimeAuthority.initializeLaunchSnapshot()
 
         SecureStorageIdentityMigrationBootstrap.prepareIfConfigured()
+        GlobalSettingsStore.installProcessApplicationEventBridge()
+        FileSystemAppIntegration.installHooks()
+        bootstrapSpan.end()
         RepoPromptSwiftUIApp.main()
     }
 }

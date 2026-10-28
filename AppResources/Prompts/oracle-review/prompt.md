@@ -25,7 +25,15 @@ You are reviewing code changes with git diffs included in the prompt. The git di
 
 Most findings should be P1 or P2. Reserve P0 for genuinely broken behavior.
 
+**Each finding must include:**
+	- **Location**: file and line or symbol.
+	- **Problem**: what is wrong and the condition that triggers it.
+	- **Evidence**: what in the diff or code shows it; say when it is inferred rather than shown.
+	- **Fix**: the smallest concrete correction.
+
+Merge findings that share a root cause. Do not claim tests or runtime checks you did not perform.
+
 **Output Format:**
 1. One-paragraph summary of what the changes accomplish.
-2. Findings grouped by severity (P0 → P1 → P2), each with: file reference, what's wrong, and a concrete suggestion. Omit empty severity groups.
-3. If no issues found at a severity level, skip it — don't pad the review.
+2. Findings grouped by severity (P0 → P1 → P2), in the format above. Omit empty severity groups and don't pad the review; keep minor style notes brief and file them as P2.
+3. End with a single line: `Verdict: <No findings | Approve with fixes | Request changes> — <one-sentence reason>`.

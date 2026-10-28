@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import OSLog
+import RepoPromptInstrumentation
 
 /// Low-volume, always-on local diagnostics for oversight catalog convergence.
 /// Accepts only closed enums, booleans, generations, revisions, and hashed identifiers.
@@ -26,22 +27,7 @@ enum AgentSessionLinkCatalogDiagnostics {
         case toolCallReceived = "tool-call-received"
     }
 
-    enum Outcome: String, Equatable {
-        case accepted
-        case rejectedEndpointMismatch = "rejected-endpoint-mismatch"
-        case rejectedMissingSession = "rejected-missing-session"
-        case rejectedEndpointRebind = "rejected-endpoint-rebind"
-        case rejectedRunMismatch = "rejected-run-mismatch"
-        case rejectedStaleRevision = "rejected-stale-revision"
-        case coalescedDuplicate = "coalesced-duplicate"
-        case opened
-        case closedCatalogPresent = "closed-catalog-present"
-        case closedOutboundLost = "closed-outbound-lost"
-        case closedProviderChanged = "closed-provider-changed"
-        case closedToolDisabled = "closed-tool-disabled"
-        case spentReplaced = "spent-replaced"
-        case spentStrandedRunRetired = "spent-stranded-run-retired"
-    }
+    typealias Outcome = AgentSessionLinkCatalogOutcome
 
     struct Record: Equatable {
         let event: Event
@@ -127,8 +113,12 @@ enum AgentSessionLinkCatalogDiagnostics {
 
     static func catalogPublished(
         runID: UUID,
-        routeToken: AgentSessionLinkRunCatalogRouteToken?,
+        tabID: UUID?,
+        connectionID: UUID?,
         revision: UInt64,
+        routingGeneration: UInt64?,
+        lifecycleGeneration: UInt64?,
+        routePresent: Bool,
         catalog: Bool?,
         outbound: Bool?
     ) {
@@ -136,12 +126,12 @@ enum AgentSessionLinkCatalogDiagnostics {
             event: .catalogPublished,
             outcome: nil,
             run: hashedID(runID),
-            tab: hashedID(routeToken?.observerEndpoint.tabID),
-            connection: hashedID(routeToken?.connectionID),
+            tab: hashedID(tabID),
+            connection: hashedID(connectionID),
             revision: revision,
-            routingGeneration: routeToken?.routingAuthorityGeneration,
-            lifecycleGeneration: routeToken?.connectionLifecycleGeneration,
-            routePresent: routeToken != nil,
+            routingGeneration: routingGeneration,
+            lifecycleGeneration: lifecycleGeneration,
+            routePresent: routePresent,
             catalog: Presence(catalog),
             outbound: Presence(outbound)
         ))
@@ -213,5 +203,38 @@ enum AgentSessionLinkCatalogDiagnostics {
         guard let id else { return "nil" }
         let digest = SHA256.hash(data: Data(id.uuidString.utf8))
         return digest.prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// App-owned synchronous implementation; the extracted contract never sees unhashed output.
+struct AppAgentSessionLinkCatalogEventSink: AgentSessionLinkCatalogEventSink {
+    func record(_ event: AgentSessionLinkCatalogEvent) {
+        switch event {
+        case let .catalogPublished(runID, tabID, connectionID, revision, routingGeneration, lifecycleGeneration, routePresent, catalog, outbound):
+            AgentSessionLinkCatalogDiagnostics.catalogPublished(
+                runID: runID,
+                tabID: tabID,
+                connectionID: connectionID,
+                revision: revision,
+                routingGeneration: routingGeneration,
+                lifecycleGeneration: lifecycleGeneration,
+                routePresent: routePresent,
+                catalog: catalog,
+                outbound: outbound
+            )
+        case let .projectionEvaluated(runID, tabID, revision, catalog, outbound, outcome):
+            AgentSessionLinkCatalogDiagnostics.projectionEvaluated(
+                runID: runID,
+                tabID: tabID,
+                revision: revision,
+                catalog: catalog,
+                outbound: outbound,
+                outcome: outcome
+            )
+        case let .repairTransition(runID, tabID, outcome):
+            AgentSessionLinkCatalogDiagnostics.repairTransition(runID: runID, tabID: tabID, outcome: outcome)
+        case let .toolCallReceived(runID, tabID, connectionID):
+            AgentSessionLinkCatalogDiagnostics.toolCallReceived(runID: runID, tabID: tabID, connectionID: connectionID)
+        }
     }
 }

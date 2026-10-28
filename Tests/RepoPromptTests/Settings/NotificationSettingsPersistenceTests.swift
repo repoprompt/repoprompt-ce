@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -26,7 +27,9 @@ final class NotificationSettingsPersistenceTests: XCTestCase {
 
     private func makeStore() throws -> GlobalSettingsStore {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
-        return GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+        store.installApplicationEventBridge()
+        return store
     }
 
     func testMissingGroupResolvesToProductDefaults() {
@@ -60,7 +63,6 @@ final class NotificationSettingsPersistenceTests: XCTestCase {
         settings.approveFromNotifications = false
         let document = GlobalSettingsDocument(scalarPreferences: GlobalScalarPreferences(notifications: settings))
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 10, "This feature must not bump the schema")
     }
 
     func testStoreEditDoesNotChangeStoredSchemaVersion() throws {

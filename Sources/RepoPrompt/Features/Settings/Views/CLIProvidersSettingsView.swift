@@ -1,7 +1,22 @@
 import AppKit
+import RepoPromptProcess
 import SwiftUI
 
 struct CLIProvidersSettingsView: View {
+    private func compatibleHTTPConsentView(for id: ClaudeCodeCompatibleBackendID) -> some View {
+        ProviderHTTPConsentView(
+            endpoint: viewModel.compatibleBackendConfig(for: id).baseURL,
+            consentEndpoint: Binding(
+                get: { viewModel.compatibleBackendConfig(for: id).httpCredentialConsentEndpoint },
+                set: { endpoint in
+                    var updated = viewModel.compatibleBackendConfig(for: id)
+                    updated.httpCredentialConsentEndpoint = endpoint
+                    viewModel.saveCompatibleBackendConfig(updated)
+                }
+            )
+        )
+    }
+
     @ObservedObject var viewModel: APISettingsViewModel
     @ObservedObject var promptViewModel: PromptViewModel
     @ObservedObject private var codexSessionFence = CodexManagedSessionFence.shared
@@ -51,7 +66,6 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoadingGrokBuild = false
     @State private var isLoadingAntigravity = false
     @State private var isTestingAntigravity = false
-    @State private var isAntigravityInstalled = false
     @State private var isAntigravityExpanded = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
@@ -69,10 +83,16 @@ struct CLIProvidersSettingsView: View {
     @State private var isKimiCodeExpanded: Bool = false
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
+    @State private var confirmsCodexMCPImport = false
+    @State private var isImportingCodexMCP = false
+    @State private var codexMCPImportStatus: String?
+    @State private var codexMCPPendingImport: String?
     @State private var isCodexRuntimeAdvancedExpanded: Bool = false
     @State private var codexRuntimePendingSelection = CodexRuntimePreferences.selection()
     @State private var codexRuntimePreflight: CodexProviderHelpers.CodexRuntimeSettingsPreflight?
     @State private var isLoadingCodexRuntimePreflight = false
+    @State private var detectedCodexExecutables: [CLIExecutableDiscovery.DetectedExecutable]?
+    @State private var isDetectingCodexExecutables = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
     @State private var isGrokBuildExpanded: Bool = false
@@ -91,12 +111,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isKimiAdvancedExpanded: Bool = false
 
     private var shouldShowStatusBanner: Bool {
-        viewModel.isClaudeCodeConnected
-            || viewModel.isCodexConnected
-            || viewModel.isOpenCodeConnected
-            || viewModel.isCursorConnected
-            || viewModel.isGrokBuildConnected
-            || DevinRuntimeLocator.isInstalledSync()
+        !viewModel.directConnectedCLIProviders.isEmpty
     }
 
     private var codexStatusText: String? {
@@ -164,10 +179,10 @@ struct CLIProvidersSettingsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
+            viewModel.refreshDirectCLIProviderConnectionState()
             viewModel.refreshDevinModels()
             Task {
                 await viewModel.loadCompatibleBackendState()
-                isAntigravityInstalled = AntigravityRuntimeManager.installedRuntimeSync() != nil
                 await viewModel.refreshClaudeCodeBinaryStatus()
             }
         }
@@ -434,7 +449,7 @@ struct CLIProvidersSettingsView: View {
             title: "Claude Code CLI",
             subtitle: "Uses your Claude Code CLI login for Anthropic models. Compatible backends below only need the `claude` binary and their own API keys.",
             infoURL: "https://docs.claude.com/en/docs/claude-code/setup",
-            isConnected: viewModel.isClaudeCodeConnected,
+            isConnected: viewModel.directConnectedCLIProviders.contains(.claudeCode),
             isExpanded: $isClaudeCodeExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
@@ -463,6 +478,8 @@ struct CLIProvidersSettingsView: View {
                     }
 
                     directProviderInlineControls(for: .claude)
+
+                    ProviderUsageQuotaSection(provider: .claude)
 
                     Text("Routing GLM models through claude? See CC Zai below.")
                         .font(.caption)
@@ -1075,6 +1092,10 @@ struct CLIProvidersSettingsView: View {
                 .textFieldStyle(RoundedBorderTextFieldStyle())
             }
 
+            customBackendLimitField("Request timeout (milliseconds)", keyPath: \.requestTimeoutMilliseconds, isTimeout: true)
+            customBackendLimitField("Context window (tokens)", keyPath: \.contextWindowTokens)
+            compatibleHTTPConsentView(for: .custom)
+
             // Auth style picker
             HStack(spacing: 8) {
                 Text("Auth header")
@@ -1369,6 +1390,21 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    private func customBackendLimitField(
+        _ title: String,
+        keyPath: WritableKeyPath<ClaudeCodeCompatibleBackendConfig, Int?>,
+        isTimeout: Bool = false
+    ) -> some View {
+        CompatibleBackendLimitField(title: title, isTimeout: isTimeout, value: Binding(
+            get: { viewModel.compatibleBackendConfig(for: .custom)[keyPath: keyPath] },
+            set: { value in
+                var config = viewModel.compatibleBackendConfig(for: .custom)
+                config[keyPath: keyPath] = value
+                viewModel.saveCompatibleBackendConfig(config)
+            }
+        ))
+    }
+
     // MARK: Advanced disclosure (base URL + auth style) for presets
 
     @ViewBuilder
@@ -1449,6 +1485,8 @@ struct CLIProvidersSettingsView: View {
                         ))
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                     }
+
+                    compatibleHTTPConsentView(for: backendID)
 
                     HStack(spacing: 8) {
                         Text("Auth header")
@@ -1718,15 +1756,59 @@ struct CLIProvidersSettingsView: View {
                     }
 
                     HStack(spacing: 8) {
-                        Button("Choose Custom Executable…", action: chooseLocalCodexExecutable)
-                            .buttonStyle(CustomButtonStyle())
-
-                        if codexCustomRuntimeIsConfigured {
-                            Button("Restore Included Runtime") {
+                        Menu {
+                            Button {
                                 setCodexRuntimeSelection(.bundled)
+                            } label: {
+                                let title = "Included Codex \(CodexRuntimeAuthority.bundledVersion)"
+                                if CodexRuntimePreferences.areSemanticallyEquivalent(codexRuntimePendingSelection, .bundled) {
+                                    Label(title, systemImage: "checkmark")
+                                } else {
+                                    Text(title)
+                                }
                             }
-                            .buttonStyle(CustomButtonStyle())
+
+                            if isDetectingCodexExecutables, detectedCodexExecutables == nil {
+                                Text("Detecting Codex executables…")
+                            }
+
+                            ForEach(detectedCodexExecutables ?? [], id: \.path) { detected in
+                                Button {
+                                    setCodexRuntimeSelection(.external(path: detected.path))
+                                } label: {
+                                    let title = CodexExecutableDetection.menuItemTitle(for: detected.path)
+                                    if CodexExecutableDetection.isSelected(
+                                        externalPath: codexRuntimeExecutablePath(codexRuntimePendingSelection),
+                                        detected: detected
+                                    ) {
+                                        Label(title, systemImage: "checkmark")
+                                    } else {
+                                        Text(title)
+                                    }
+                                }
+                            }
+
+                            if let customPath = CodexExecutableDetection.undetectedCustomPath(
+                                pendingExternalPath: codexRuntimeExecutablePath(codexRuntimePendingSelection),
+                                detected: detectedCodexExecutables ?? []
+                            ) {
+                                Button {
+                                    setCodexRuntimeSelection(.external(path: customPath))
+                                } label: {
+                                    Label(
+                                        CodexExecutableDetection.menuItemTitle(for: customPath),
+                                        systemImage: "checkmark"
+                                    )
+                                }
+                            }
+
+                            Divider()
+
+                            Button("Choose…", action: chooseLocalCodexExecutable)
+                        } label: {
+                            Text(codexRuntimeMenuLabel)
                         }
+                        .buttonStyle(CustomButtonStyle())
                     }
 
                     Text("Runtime changes apply after the next RepoPrompt launch and then refresh the model list. Existing saved model selections are not changed.")
@@ -1736,11 +1818,31 @@ struct CLIProvidersSettingsView: View {
                 }
                 .padding(.top, 2)
                 .transition(.opacity.combined(with: .move(edge: .top)))
+                .task { await loadDetectedCodexExecutables() }
             }
         }
         .task(id: codexRuntimeSelectionTaskID) {
             await refreshCodexRuntimePreflight()
         }
+    }
+
+    private var codexRuntimeMenuLabel: String {
+        switch codexRuntimePendingSelection {
+        case .inherited, .bundled:
+            "Included Codex \(CodexRuntimeAuthority.bundledVersion)"
+        case let .external(path):
+            CodexExecutableDetection.abbreviatedPath(path)
+        case .invalidExternalPreference:
+            "Invalid custom executable"
+        }
+    }
+
+    private func loadDetectedCodexExecutables() async {
+        guard detectedCodexExecutables == nil, !isDetectingCodexExecutables else { return }
+        isDetectingCodexExecutables = true
+        defer { isDetectingCodexExecutables = false }
+        let detected = await CodexExecutableDetection.detectOnSystem()
+        detectedCodexExecutables = detected
     }
 
     private var codexRuntimeProjection: CodexRuntimePreferences.RuntimeSelectionProjection {
@@ -1820,12 +1922,56 @@ struct CLIProvidersSettingsView: View {
         isLoadingCodexRuntimePreflight = false
     }
 
+    private var codexMCPImportControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(isImportingCodexMCP ? "Importing MCP servers…" : "Import user Codex MCP servers…") {
+                confirmsCodexMCPImport = true
+            }
+            .disabled(isImportingCodexMCP)
+            .confirmationDialog("Import user Codex MCP servers?", isPresented: $confirmsCodexMCPImport, titleVisibility: .visible) {
+                Button("Import MCP servers") {
+                    isImportingCodexMCP = true
+                    Task { @MainActor in
+                        codexMCPImportStatus = await Task.detached(priority: .userInitiated) {
+                            do {
+                                let source = CodexUserMCPImport.sourceConfigURL()
+                                let result = try CodexIntegrationConfiguration.importUserMCPServers(sourceURL: source)
+                                return result.summary + " Existing and reserved entries were preserved. New entries are disabled. Review MCP permissions below, then start a new session."
+                            } catch {
+                                // Only our sanitized, content-free errors may reach the UI.
+                                return (error as? CodexUserMCPImport.Failure)?.localizedDescription
+                                    ?? "MCP import failed. No server definitions are included in this message."
+                            }
+                        }.value
+                        isImportingCodexMCP = false
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Copies only new [mcp_servers.name] tables from $CODEX_HOME/config.toml (default ~/.codex/config.toml), including any credentials stored in those tables, into CE's private configuration. The source is not changed. Existing CE entries and permission choices are preserved; new entries are reset to disabled. This is a one-time snapshot, not automatic synchronization.")
+            }
+            Text(codexMCPImportStatus ?? codexMCPPendingImport ?? "User Codex MCP servers are not imported automatically. Import a snapshot to make them available in CE's MCP permission controls.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .task {
+            codexMCPPendingImport = await Task.detached(priority: .utility) {
+                do {
+                    return try CodexUserMCPImport.pendingSummary(sourceURL: CodexUserMCPImport.sourceConfigURL(), destinationURL: CodexIntegrationConfiguration.configURL())
+                } catch {
+                    return "Could not inspect user Codex MCP server names. Use Import to inspect the source configuration."
+                }
+            }.value
+        }
+    }
+
     private var codexCard: some View {
         providerCard(
             title: "Codex CLI",
             subtitle: "Runs RepoPrompt CE's managed Codex runtime with a separate sign-in from ~/.codex.",
             infoURL: "https://developers.openai.com/codex/cli/",
-            isConnected: viewModel.isCodexConnected,
+            isConnected: viewModel.directConnectedCLIProviders.contains(.codexExec),
             isExpanded: $isCodexExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
@@ -1855,6 +2001,10 @@ struct CLIProvidersSettingsView: View {
                                 .fontWeight(.semibold)
                             codexAccountSummary(account)
                         }
+
+                        Divider()
+                        // Account-scoped plan usage. Distinct from per-session context usage.
+                        ProviderUsageQuotaSection(provider: .codex)
                     }
 
                     HStack(spacing: 8) {
@@ -1898,6 +2048,7 @@ struct CLIProvidersSettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
+                    codexMCPImportControls
                     directProviderInlineControls(for: .codex)
                 } else {
                     Text("Permissions and runtime controls appear here after Codex is connected.")
@@ -2016,7 +2167,7 @@ struct CLIProvidersSettingsView: View {
             title: "OpenCode CLI",
             subtitle: "Uses OpenCode's ACP runtime for Agent Mode; headless OpenCode runs use a managed no-native-tools mode.",
             infoURL: "https://opencode.ai/",
-            isConnected: viewModel.isOpenCodeConnected,
+            isConnected: viewModel.directConnectedCLIProviders.contains(.openCode),
             isExpanded: $isOpenCodeExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
@@ -2099,7 +2250,7 @@ struct CLIProvidersSettingsView: View {
             title: "Google Antigravity",
             subtitle: "Managed official Antigravity ACP runtime with Google OAuth authentication.",
             infoURL: "https://antigravity.google/",
-            isConnected: isAntigravityInstalled,
+            isConnected: viewModel.directConnectedCLIProviders.contains(.antigravity),
             isExpanded: $isAntigravityExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
@@ -2110,7 +2261,7 @@ struct CLIProvidersSettingsView: View {
                             do {
                                 _ = try await AntigravityRuntimeManager.shared.install()
                                 await MainActor.run {
-                                    isAntigravityInstalled = true
+                                    viewModel.refreshDirectCLIProviderConnectionState()
                                     isLoadingAntigravity = false
                                     alertMessage = "Antigravity runtime installed. It will be authenticated when you start the first session."
                                     showAlert = true
@@ -2127,7 +2278,7 @@ struct CLIProvidersSettingsView: View {
                         if isLoadingAntigravity {
                             ProgressView().scaleEffect(0.6).frame(height: 16)
                         } else {
-                            Label(isAntigravityInstalled ? "Update Runtime" : "Install Runtime", systemImage: "arrow.down.circle")
+                            Label(viewModel.isAntigravityRuntimeInstalled ? "Update Runtime" : "Install Runtime", systemImage: "arrow.down.circle")
                         }
                     }
                     .disabled(isLoadingAntigravity)
@@ -2160,10 +2311,10 @@ struct CLIProvidersSettingsView: View {
                         if isTestingAntigravity { ProgressView().scaleEffect(0.6).frame(height: 16) }
                         else { Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right") }
                     }
-                    .disabled(isTestingAntigravity || !isAntigravityInstalled)
+                    .disabled(isTestingAntigravity || !viewModel.isAntigravityRuntimeInstalled)
                     .buttonStyle(CustomButtonStyle())
 
-                    Text(isAntigravityInstalled ? "Runtime ready. Google login will be requested by ACP." : "Runtime not installed.")
+                    Text(viewModel.isAntigravityRuntimeInstalled ? "Runtime ready. Google login will be requested by ACP." : "Runtime not installed.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -2172,7 +2323,7 @@ struct CLIProvidersSettingsView: View {
     }
 
     private var devinCard: some View {
-        let isInstalled = DevinRuntimeLocator.isInstalledSync()
+        let isInstalled = viewModel.directConnectedCLIProviders.contains(.devin)
         return providerCard(
             title: "Devin CLI",
             subtitle: "Uses the installed `devin acp` runtime for interactive Agent Mode and Oracle.",
@@ -2224,10 +2375,15 @@ struct CLIProvidersSettingsView: View {
             title: "Grok Build",
             subtitle: "Uses xAI's Grok Build ACP runtime (`grok agent stdio`) for Agent Mode and headless tasks. RepoPrompt MCP tools are added through the ACP session.",
             infoURL: "https://docs.x.ai/build/overview",
-            isConnected: viewModel.isGrokBuildConnected,
+            isConnected: viewModel.directConnectedCLIProviders.contains(.grokBuild),
             isExpanded: $isGrokBuildExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
+                Text("A Grok (xAI) API key saved under Settings → API Providers is also passed to Grok Build for Agent Mode, Context Builder, Oracle and Chat, and model discovery (including Connect), even when you're signed in with `grok login`. Grok chooses which credential each request uses; requests to the xAI API that use the key are billed to the xAI API account.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 if viewModel.isGrokBuildConnected {
                     HStack(spacing: 8) {
                         Button(action: { testGrokBuildConnection() }) {
@@ -2277,7 +2433,7 @@ struct CLIProvidersSettingsView: View {
                                 .foregroundColor(.red)
                                 .fixedSize(horizontal: false, vertical: true)
                         } else {
-                            Text("Install with `npm i -g @xai-official/grok` or the xAI installer. Authenticate with `grok login` or a Grok API key (stored under API Keys).")
+                            Text("Install with `npm i -g @xai-official/grok` or the xAI installer. Authenticate with `grok login` or a Grok API key (stored under API Providers).")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -2303,7 +2459,7 @@ struct CLIProvidersSettingsView: View {
             title: "Cursor CLI",
             subtitle: "Uses Cursor's ACP runtime for Agent Mode, headless tasks, and chat. RepoPrompt MCP tools are added only for agent/headless runs.",
             infoURL: "https://cursor.com/cli",
-            isConnected: viewModel.isCursorConnected,
+            isConnected: viewModel.directConnectedCLIProviders.contains(.cursor),
             isExpanded: $isCursorExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
@@ -2318,7 +2474,7 @@ struct CLIProvidersSettingsView: View {
                                 Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
                             }
                         }
-                        .disabled(isLoadingCursor)
+                        .disabled(isLoadingCursor || viewModel.isDiscoveringCursorModels)
                         .buttonStyle(CustomButtonStyle())
 
                         Spacer()
@@ -2328,6 +2484,26 @@ struct CLIProvidersSettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                         .buttonStyle(CustomButtonStyle())
+                    }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            viewModel.refreshCursorModels()
+                        } label: {
+                            if viewModel.isDiscoveringCursorModels {
+                                ProgressView().scaleEffect(0.6).frame(height: 16)
+                            } else {
+                                Label("Refresh Models", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(viewModel.isDiscoveringCursorModels || isLoadingCursor)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let message = viewModel.cursorModelDiscoveryMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
 
                     Text(cursorModelSummary)
@@ -2347,7 +2523,7 @@ struct CLIProvidersSettingsView: View {
                                 Label("Connect", systemImage: "link")
                             }
                         }
-                        .disabled(isLoadingCursor)
+                        .disabled(isLoadingCursor || viewModel.isDiscoveringCursorModels)
                         .buttonStyle(CustomButtonStyle())
 
                         if let error = viewModel.cursorError, !error.isEmpty {
@@ -2594,6 +2770,7 @@ struct CLIProvidersSettingsView: View {
     }
 
     private func signOutFromClaudeCode() {
+        Task { await WindowStatesManager.shared.providerQuotaRuntime.claude.invalidate() }
         viewModel.isClaudeCodeConnected = false
         viewModel.claudeCodeError = nil
         UserDefaults.standard.set(false, forKey: "ClaudeCodeConnected")
@@ -2631,16 +2808,11 @@ struct CLIProvidersSettingsView: View {
 
     private func chooseLocalCodexExecutable() {
         let panel = NSOpenPanel()
-        panel.title = "Choose Codex Executable"
-        panel.message = "Select an installed Codex CLI executable. RepoPrompt validates its version before use."
-        panel.prompt = "Choose"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.resolvesAliases = false
-        if let pendingPath = codexRuntimeExecutablePath(codexRuntimePendingSelection) {
-            panel.directoryURL = URL(fileURLWithPath: pendingPath).deletingLastPathComponent()
-        }
+        CodexExecutableDetection.configureExecutablePanel(
+            panel,
+            detected: detectedCodexExecutables ?? [],
+            pendingExternalPath: codexRuntimeExecutablePath(codexRuntimePendingSelection)
+        )
         guard panel.runModal() == .OK, let url = panel.url else { return }
         setCodexRuntimeSelection(.external(path: url.path))
     }
@@ -2889,5 +3061,69 @@ struct CLIProvidersSettingsView: View {
         showGrokBuildTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
+    }
+}
+
+private struct CompatibleBackendLimitField: View {
+    let title: String
+    let isTimeout: Bool
+    @Binding var value: Int?
+    @State private var input = ""
+
+    private var trimmedInput: String {
+        input.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var allowedRange: ClosedRange<Int> {
+        isTimeout ? ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds : ClaudeCompatibleBackendLimits.contextWindowTokens
+    }
+
+    private var isValid: Bool {
+        trimmedInput.isEmpty || Int(trimmedInput).map(allowedRange.contains) == true
+    }
+
+    private var helpText: String {
+        guard isValid else {
+            return isTimeout
+                ? "Enter 1000–2147483647 milliseconds. For 10 minutes enter 600000, not 600. Change not saved."
+                : "Enter 1–2147483647 tokens. Change not saved."
+        }
+        if isTimeout {
+            return "Default: 600000 ms (10 min). Values are milliseconds, not seconds. Applies to new launches."
+        }
+        return "Default for unrecognized IDs: 200K tokens. One window applies to all three slots on new launches. IDs with [1m], bare claude- names, and recognized Claude models follow Claude Code’s own window rules."
+    }
+
+    private var unusualWindow: Bool {
+        guard !isTimeout, let window = Int(trimmedInput), isValid else { return false }
+        return !(4096 ... 1_000_000).contains(window)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            TextField(isTimeout ? "600000 ms (10 min)" : "200000 tokens (200K)", text: $input)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .onAppear { input = value.map(String.init) ?? "" }
+                .onChange(of: input) { _, _ in
+                    guard isValid else { return }
+                    value = Int(trimmedInput)
+                }
+                .onChange(of: value) { _, newValue in
+                    input = newValue.map(String.init) ?? ""
+                }
+            Text(helpText + " Leave blank to use the default.")
+                .font(.caption)
+                .foregroundColor(isValid ? .secondary : .red)
+                .fixedSize(horizontal: false, vertical: true)
+            if unusualWindow {
+                Text("Outside the typical 4K–1M range; verify the server’s real context limit. This does not set an auto-compaction threshold.")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }

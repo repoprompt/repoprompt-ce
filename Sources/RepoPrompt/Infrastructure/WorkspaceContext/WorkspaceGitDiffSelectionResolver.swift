@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 enum SelectedGitDiffFolderPolicy {
     case filesOnly

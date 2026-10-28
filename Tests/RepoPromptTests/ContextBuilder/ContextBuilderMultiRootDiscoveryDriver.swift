@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
 import XCTest
 
 #if DEBUG
@@ -60,10 +61,13 @@ import XCTest
         }
 
         static func withDriver(
-            rootNames: [String] = ["A", "B"], routedRuntime: Bool = false,
+            rootNames: [String] = ["A", "B"], routedRuntime: Bool = false, readmeContent: String = "fixture",
+            configuration: @escaping ([String]) -> [String] = { Array($0.prefix(2)) },
             _ body: @escaping (ContextBuilderMultiRootDiscoveryDriver) async throws -> Void
         ) async throws {
-            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: rootNames, configuration: { Array($0.prefix(2)) }) { fixture in
+            try await WorkspaceAuthorityRootTestFixture.withFixture(
+                rootNames: rootNames, configuration: configuration, readmeContent: readmeContent
+            ) { fixture in
                 let driver = ContextBuilderMultiRootDiscoveryDriver(fixture: fixture)
                 let operation = {
                     do {
@@ -203,6 +207,14 @@ import XCTest
                 reason: "isolated invoking Agent Mode run", ttl: 30, purpose: .agentModeRun,
                 requiresExpectedAgentPID: agent.requiresExpectedPIDOwnedAgentModeMCPRouting
             ))
+            // These in-process parents share the XCTest PID, unlike distinct provider processes.
+            // Once routed, their connection/run bindings are authoritative; keeping the old
+            // bootstrap PID would make the next parent correctly fail as ambiguous_run_policy.
+            for prior in parentRuns where connections.contains(where: {
+                window.mcpServer.connectionBindingSnapshot(forConnection: $0.connectionID).runID == prior.runID
+            }) {
+                await ServerNetworkManager.shared.clearExpectedAgentPID(getpid(), for: prior.clientName, runID: prior.runID)
+            }
             parentRuns.append((lease, runID, name))
             let acquired = await lease.acquire()
             XCTAssertTrue(acquired)

@@ -17,9 +17,9 @@ private struct SettingsSidebarMaterialView: NSViewRepresentable {
 }
 
 struct SettingsView: View {
-    @ObservedObject var fileManager: WorkspaceFilesViewModel
-    @ObservedObject var promptViewModel: PromptViewModel
-    @ObservedObject var apiSettingsViewModel: APISettingsViewModel
+    let fileManager: WorkspaceFilesViewModel
+    let promptViewModel: PromptViewModel
+    let apiSettingsViewModel: APISettingsViewModel
     let windowState: WindowState
     var onAPIKeyUpdated: (() -> Void)?
 
@@ -39,7 +39,7 @@ struct SettingsView: View {
     /// preferences), MCP, models/providers, workspaces, and the copy-&-chat
     /// workflow.
     static let sidebarSectionOrder: [TabSection] = [
-        .agentMode, .router, .general, .mcp, .api, .workspaces, .copyChat
+        .agentMode, .general, .mcp, .api, .workspaces, .copyChat
     ]
 
     /// Legacy alias tabs that are kept in the enum for deep-link and
@@ -106,7 +106,7 @@ struct SettingsView: View {
 
             // Right side with content
             VStack(spacing: 0) {
-                contentView
+                selectedDetailContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .id(selectedTab)
             }
@@ -245,9 +245,7 @@ struct SettingsView: View {
             // Overview (formerly "Behavior") is the top-level entry point that
             // deep-links into each of the other Agent Mode settings surfaces, so
             // it sits first in the sidebar.
-            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .contextBuilder]
-        case .router:
-            [.modelRouter]
+            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .modelRouter, .contextBuilder]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
@@ -263,6 +261,30 @@ struct SettingsView: View {
             // in a sensible place (see `contentView`).
             [.chatSettings, .workflowPresets, .promptOrder]
         }
+    }
+
+    @ViewBuilder
+    private var selectedDetailContent: some View {
+        if selectedTab == .modelRouter {
+            routerSettingsContent
+        } else {
+            SettingsObservingContent(
+                fileManager: fileManager,
+                promptViewModel: promptViewModel,
+                apiSettingsViewModel: apiSettingsViewModel
+            ) {
+                nonRouterContentView
+            }
+        }
+    }
+
+    private var nonRouterContentView: some View {
+        contentView
+    }
+
+    private var routerSettingsContent: some View {
+        RouterSettingsView(viewModel: windowState.routerSettingsViewModel, onNavigate: { selectedTab = $0 })
+            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
     }
 
     @ViewBuilder
@@ -401,8 +423,7 @@ struct SettingsView: View {
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .modelRouter:
-            RouterSettingsView(viewModel: windowState.routerSettingsViewModel, onNavigate: { selectedTab = $0 })
-                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            routerSettingsContent
         case .agentModels:
             AgentModelsSettingsView(
                 promptVM: promptViewModel,
@@ -411,7 +432,10 @@ struct SettingsView: View {
                 workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 workspaceName: windowState.workspaceManager.activeWorkspace?.name,
                 settingsManager: windowState.settingsManager,
-                onNavigate: { tab in selectedTab = tab }
+                onNavigate: { tab in selectedTab = tab },
+                repromptCurrentProvider: { [weak agentModeVM = windowState.agentModeViewModel] in
+                    agentModeVM?.activeSession?.selectedAgent ?? agentModeVM?.selectedAgent
+                }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .agentPermissions:
@@ -456,9 +480,12 @@ struct SettingsView: View {
                 guard let agentModeVM else { return }
                 agentModeVM.providerPreferenceDidChange(providerID, bumpProviderBindingRevision: false)
             },
-            // Route Claude effort changes through `AgentModeViewModel.setClaudeEffortLevel(_:)`
-            // so active sessions pick up the new effort via the same scheduling path that
-            // `AgentInputBar` uses.
+            claudeEffortLevelProvider: { [weak agentModeVM] in
+                guard let agentModeVM, let session = agentModeVM.activeSession,
+                      session.selectedAgent.usesClaudeTooling else { return nil }
+                return agentModeVM.claudeCoordinator.currentClaudeEffortLevel(for: session)
+            },
+            // Settings and the composer edit the same active conversation's effort.
             onClaudeEffortLevelChanged: { [weak agentModeVM] level in
                 agentModeVM?.setClaudeEffortLevel(level)
             }
@@ -488,9 +515,31 @@ struct SettingsView: View {
     }
 }
 
+private struct SettingsObservingContent<Content: View>: View {
+    @ObservedObject private var fileManager: WorkspaceFilesViewModel
+    @ObservedObject private var promptViewModel: PromptViewModel
+    @ObservedObject private var apiSettingsViewModel: APISettingsViewModel
+    private let content: () -> Content
+
+    init(
+        fileManager: WorkspaceFilesViewModel,
+        promptViewModel: PromptViewModel,
+        apiSettingsViewModel: APISettingsViewModel,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        _fileManager = ObservedObject(wrappedValue: fileManager)
+        _promptViewModel = ObservedObject(wrappedValue: promptViewModel)
+        _apiSettingsViewModel = ObservedObject(wrappedValue: apiSettingsViewModel)
+        self.content = content
+    }
+
+    var body: some View {
+        content()
+    }
+}
+
 enum TabSection: String, Identifiable {
     case agentMode
-    case router
     case mcp
     case api
     case workspaces
@@ -504,7 +553,6 @@ enum TabSection: String, Identifiable {
     var title: String {
         switch self {
         case .agentMode: "Agent Mode"
-        case .router: "Router"
         case .mcp: "MCP Server"
         case .api: "Models & Providers"
         case .workspaces: "Workspaces"
@@ -541,7 +589,7 @@ enum SettingsTab: String, CaseIterable {
     case chatPresets // Chat presets management (legacy deep-link → workflowPresets with Chat scope)
     case contextBuilder // Context builder settings
     case agentMode // Agent Mode "Overview" tab (formerly labeled "Agent Mode Behavior")
-    case modelRouter // Optional backend-neutral fresh-task model routing
+    case modelRouter // Agent Decisions settings (Model Router, Auto Effort, decision services)
     case agentModels // NEW: Unified model config shell (Phase 1 IA scaffolding)
     case agentPermissions // NEW: Unified permissions shell (Phase 1 IA scaffolding)
     case agentWorkflows // Agent Mode workflow prompts and featured/custom workflows
@@ -572,7 +620,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "Chat Presets"
         case .contextBuilder: "Context Builder"
         case .agentMode: "Overview"
-        case .modelRouter: "Model Router"
+        case .modelRouter: "Agent Decisions"
         case .agentModels: "Agent Models"
         case .agentPermissions: "Agent Permissions"
         case .agentWorkflows: "Agent Workflows"
@@ -605,7 +653,7 @@ enum SettingsTab: String, CaseIterable {
         case .chatPresets: "bubble.left.and.bubble.right"
         case .contextBuilder: "sparkles"
         case .agentMode: "brain.head.profile"
-        case .modelRouter: "arrow.triangle.branch"
+        case .modelRouter: "point.3.connected.trianglepath.dotted"
         case .agentModels: "brain"
         case .agentPermissions: "lock.shield"
         case .agentWorkflows: "bolt.fill"
@@ -619,13 +667,10 @@ enum SettingsTab: String, CaseIterable {
              .agentModels,
              .agentPermissions,
              .agentWorkflows,
+             .modelRouter,
              .contextBuilder,
              .agentMode:
             .agentMode
-
-        // Optional model routing
-        case .modelRouter:
-            .router
 
         // MCP Server
         case .mcp, .mcpTools, .permissions, .modelPresets:
@@ -1120,6 +1165,7 @@ enum SettingsTab: String, CaseIterable {
             ]
         case .modelRouter:
             [
+                "agent decisions",
                 "model router",
                 "router",
                 "jev",

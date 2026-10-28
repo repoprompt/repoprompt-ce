@@ -5,7 +5,7 @@
     /// Only the native controls here (or in the Studio) can approve an experiment.
     struct PromptExperimentResultCard: View {
         let item: AgentChatItem
-        @ObservedObject private var service = PromptExperimentService.shared
+        @ObservedObject private var service = WindowStatesManager.shared.promptExperimentService
         @State private var isExpanded = true
         @State private var showsStudio = false
         @State private var reviewedProposal: PromptExperimentProposalSelection?

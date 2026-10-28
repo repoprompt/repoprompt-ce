@@ -10,20 +10,22 @@
     /// them. The window is modeless, reused across opens, and persists its frame.
     @MainActor
     final class PromptExperimentStudioWindowCoordinator: NSObject, NSWindowDelegate {
-        static let shared = PromptExperimentStudioWindowCoordinator()
-
         private static let frameAutosaveName = "RepoPrompt.PromptExperimentStudioWindow"
         private static let defaultContentSize = NSSize(width: 1080, height: 760)
         private static let minContentSize = NSSize(width: 920, height: 650)
 
+        private let service: PromptExperimentService
         private var windowController: NSWindowController?
         private var hostingController: NSHostingController<PromptExperimentStudioWindowRootView>?
 
-        override private init() {}
+        init(service: PromptExperimentService) {
+            self.service = service
+            super.init()
+        }
 
         /// Opens (or brings forward) the Studio window, optionally selecting one experiment.
         func open(selecting experimentID: UUID? = nil) {
-            let rootView = PromptExperimentStudioWindowRootView(initialSelection: experimentID)
+            let rootView = PromptExperimentStudioWindowRootView(initialSelection: experimentID, service: service)
 
             if let hostingController, let windowController {
                 if experimentID != nil {
@@ -69,7 +71,7 @@
     /// Hosts the Studio with the shared service and the app's font-scale environment.
     struct PromptExperimentStudioWindowRootView: View {
         var initialSelection: UUID?
-        @ObservedObject private var service = PromptExperimentService.shared
+        @ObservedObject var service: PromptExperimentService
         @ObservedObject private var fontScale = FontScaleManager.shared
 
         var body: some View {

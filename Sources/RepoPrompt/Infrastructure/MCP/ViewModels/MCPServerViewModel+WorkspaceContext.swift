@@ -3,7 +3,7 @@ import Foundation
 extension MCPServerViewModel {
     @MainActor
     func buildTabWorkspaceContext(
-        context: TabContextSnapshot,
+        context: MCPTabContextSnapshot,
         include: Set<String>,
         display: FilePathDisplay,
         copyPresetOverride: CopyPreset? = nil,
@@ -199,8 +199,8 @@ extension MCPServerViewModel {
 
     @MainActor
     private func resolvedContextForExportSelectedFiles(
-        _ resolvedContext: ResolvedTabContextSnapshot?
-    ) async throws -> ResolvedTabContextSnapshot? {
+        _ resolvedContext: MCPResolvedTabContextSnapshot?
+    ) async throws -> MCPResolvedTabContextSnapshot? {
         if let resolvedContext { return resolvedContext }
         let metadata = await captureRequestMetadata()
         return try resolveTabContextSnapshot(
@@ -211,7 +211,7 @@ extension MCPServerViewModel {
 
     @MainActor
     func buildExportSelectedFileInfos(
-        resolvedContext: ResolvedTabContextSnapshot? = nil,
+        resolvedContext: MCPResolvedTabContextSnapshot? = nil,
         cfg: PromptContextResolved,
         selectionOverride: StoredSelection? = nil,
         display: FilePathDisplay
@@ -277,7 +277,7 @@ extension MCPServerViewModel {
     @MainActor
     func buildTabClipboardContent(
         cfg: PromptContextResolved,
-        context: TabContextSnapshot
+        context: MCPTabContextSnapshot
     ) async -> String {
         // Use the resolved tab-scoped context directly.
         // Run-bound sessions and explicitly bound tabs should export from their bound tab

@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 enum AgentMCPModelParameterSupport {
     /// Source of one-shot demand-scoped OpenCode model-parameter observations. Tests inject a

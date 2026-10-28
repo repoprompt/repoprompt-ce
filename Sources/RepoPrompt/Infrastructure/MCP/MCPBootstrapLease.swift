@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptInstrumentation
 
 private func acpLeaseLog(_ message: @autoclosure () -> String) {
     guard AgentRuntimeProviderService.enableDebugLogging else { return }
@@ -164,10 +165,12 @@ actor MCPBootstrapLease {
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
     private var spec: MCPBootstrapLeaseSpec
+    private let perfRecorder: any AgentModePerfRecording
     private let mcpServerEnabler: (() async -> Bool)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
+    private let routingStateOwner: (@MainActor @Sendable () -> Bool)?
     private let routeAuthorityResolver: (MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision
 
     private var hasAcquired = false
@@ -184,6 +187,7 @@ actor MCPBootstrapLease {
     private var routingTerminalOutcome: MCPRoutingWaitOutcome?
     // Memoized in-flight cleanup operations backing the joinable clear/teardown (see clearPolicyOnce()).
     private var policyClearOperation: Task<Void, Never>?
+    private var policyReinstallOperation: Task<Void, Never>?
     private var routingCleanupOperation: Task<Void, Never>?
     #if DEBUG
         // Test-only observability for the join probe (see debugWaitForPolicyClearJoiner()).
@@ -204,22 +208,33 @@ actor MCPBootstrapLease {
     ///     Defaults to calling `ServerNetworkManager.shared.revokeClientConnectionPolicy(...)`, which
     ///     also tears down the run's live routing and catalog observation through
     ///     `cleanupRunRoutingState(for:)` — not merely the pending policy queue.
+    ///   - routingStateOwner: Optional attempt fence for shared run state; gate ownership is independent.
     ///   - routeAuthorityResolver: Decides whether the run's route is committed on a live connection.
     ///     Defaults to `ServerNetworkManager.shared.confirmCommittedRunRouteOrFenceRevocation(...)`.
     init(
         spec: MCPBootstrapLeaseSpec,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder(),
         mcpServerEnabler: (() async -> Bool)? = nil,
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
+        routingStateOwner: (@MainActor @Sendable () -> Bool)? = nil,
         routeAuthorityResolver: ((MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision)? = nil
     ) {
         self.spec = spec
+        self.perfRecorder = perfRecorder
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
+        self.routingStateOwner = routingStateOwner
         self.routeAuthorityResolver = routeAuthorityResolver ?? Self.defaultRouteAuthorityResolver
+    }
+
+    /// Default callers own their run scope; cold resumes additionally fence replacement state.
+    private func ownsRoutingState() async -> Bool {
+        guard let routingStateOwner else { return true }
+        return await routingStateOwner()
     }
 
     // MARK: - Core Lifecycle
@@ -367,6 +382,39 @@ actor MCPBootstrapLease {
         }
     }
 
+    /// Re-arms this run's pending connection policy for a replacement provider process.
+    ///
+    /// `acquire()` installs exactly one one-shot policy, which the first provider process's MCP
+    /// child consumes (or would consume) at admission. When a caller retires that process before
+    /// dispatch and launches a replacement for the *same* run, the replacement's child needs its own
+    /// pending policy or it is refused admission. Installation keeps the one-shot shape: the
+    /// installer collapses any unreserved pending policy for this run, so at most one stays queued.
+    ///
+    /// Valid only between a successful `acquire()` and any release or cleanup; returns `false`
+    /// otherwise, or when an expected-PID policy could not be re-armed. Full cleanup joins an
+    /// in-flight installation before its final revoke, so a replacement policy cannot outlive Stop.
+    func reinstallPolicyForReplacementProcess() async -> Bool {
+        guard hasAcquired, !shouldAbortAcquire,
+              policyReinstallOperation == nil, policyClearOperation == nil
+        else { return false }
+        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) reinstalling connection policy for a replacement provider process")
+        let operation = Task { await self.policyInstaller(self.spec) }
+        policyReinstallOperation = operation
+        await operation.value
+        policyReinstallOperation = nil
+        policyInstalled = true
+        guard !shouldAbortAcquire else { return false }
+        if spec.requiresExpectedAgentPID {
+            let policyArmed = await expectedPIDPolicyArmer(spec)
+            await recordDiagnosticEvent(
+                "lease_expected_pid_policy_rearmed",
+                fields: ["armed": String(policyArmed)]
+            )
+            guard policyArmed, !shouldAbortAcquire else { return false }
+        }
+        return true
+    }
+
     // MARK: - Release Strategies
 
     private enum RoutingWaitSelection {
@@ -438,6 +486,12 @@ actor MCPBootstrapLease {
             return .failed(.cleanedUp)
         }
         hasReleased = true
+        guard await ownsRoutingState() else {
+            let outcome: MCPRoutingWaitOutcome = Task.isCancelled ? .cancelled : .failed(.signalled)
+            routingTerminalOutcome = outcome
+            await releaseOwnedGate(reason: "routing_superseded")
+            return outcome
+        }
 
         let timeoutMs: Int
         let waitPolicy: MCPRoutingWaitPolicy?
@@ -486,6 +540,9 @@ actor MCPBootstrapLease {
         let releaseResult = await pendingReleaseResult
         ownsGate = false
         var outcome = releaseResult.routingOutcome
+        if await !ownsRoutingState() {
+            outcome = Task.isCancelled ? .cancelled : .failed(.signalled)
+        }
 
         // A committed route can cross the waiter deadline before its notification is delivered.
         // Resolve that race through the route owner's conditional revocation fence. A fenced
@@ -598,7 +655,18 @@ actor MCPBootstrapLease {
             await existing.value
             return
         }
-        let operation = Task { await self.policyClearer(self.spec) }
+        let ownsState = await ownsRoutingState()
+        // The ownership hop may have let another caller start the single-flight clear.
+        if policyClearOperation != nil {
+            await clearPolicyOnce()
+            return
+        }
+        guard ownsState else { return }
+        let reinstall = policyReinstallOperation
+        let operation = Task {
+            await reinstall?.value
+            await self.policyClearer(self.spec)
+        }
         policyClearOperation = operation
         await operation.value
     }
@@ -610,6 +678,12 @@ actor MCPBootstrapLease {
             await existing.value
             return
         }
+        let ownsState = await ownsRoutingState()
+        if let existing = routingCleanupOperation {
+            await existing.value
+            return
+        }
+        guard ownsState else { return }
         let operation = Task { await AgentRunCoordinator.shared.cleanupRouting(runID: self.spec.runID) }
         routingCleanupOperation = operation
         await operation.value
@@ -682,6 +756,10 @@ actor MCPBootstrapLease {
     func failAndRelease() async {
         if hasReleased {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() ignored because lease already released")
+            return
+        }
+        guard await ownsRoutingState() else {
+            await failAndCleanup()
             return
         }
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() signaling routing failure")
@@ -788,7 +866,7 @@ actor MCPBootstrapLease {
                 event: event,
                 fields: diagnosticFields
             )
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "mcp.routing.\(event)",
                 tabID: spec.tabID,
                 fields: diagnosticFields
@@ -808,6 +886,12 @@ actor MCPBootstrapLease {
                 ]
             )
         #endif
+        guard await ownsRoutingState() else {
+            await releaseOwnedGate(reason: reason)
+            if let operation = policyClearOperation { await operation.value }
+            if let operation = routingCleanupOperation { await operation.value }
+            return
+        }
         if routingRegistered, !didSignalRoutingFailure {
             didSignalRoutingFailure = true
             await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
@@ -858,7 +942,9 @@ actor MCPBootstrapLease {
     /// rather than second-guessed. Not read-only: when the route is not committed the resolver fences
     /// the run, and the caller must then perform the full revoke.
     private func cancellationFindsCommittedAgentModeRoute() async -> Bool {
-        guard spec.purpose == .agentModeRun, policyClearOperation == nil else { return false }
+        guard spec.purpose == .agentModeRun, policyClearOperation == nil,
+              await ownsRoutingState()
+        else { return false }
         let decision = await routeAuthorityResolver(spec)
         return decision == .committed && policyClearOperation == nil
     }

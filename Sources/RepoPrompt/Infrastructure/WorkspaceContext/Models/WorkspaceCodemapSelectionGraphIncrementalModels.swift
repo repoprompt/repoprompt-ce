@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptPersistence
 
 struct WorkspaceCodemapGraphSizeAccounting: Hashable {
     static let zero = Self(nodes: 0, postings: 0, edges: 0, bytes: 0)
@@ -37,7 +39,7 @@ struct WorkspaceCodemapGraphCommittedSnapshot: Hashable {
     let snapshotID: UUID
     let graphRevision: UInt64
     let rootEpoch: WorkspaceCodemapRootEpoch
-    let repositoryAuthority: WorkspaceCodemapRepositoryAuthorityToken
+    let rootAuthority: WorkspaceCodemapRootAuthorityToken
     let catalogWatermark: WorkspaceCodemapGraphIndexCatalogToken
     let coverage: WorkspaceCodemapGraphCatalogCoverage
     let appliedGeneration: WorkspaceCodemapSelectionGraphContributionGeneration
@@ -66,7 +68,7 @@ struct WorkspaceCodemapGraphCommittedSnapshot: Hashable {
 
 enum WorkspaceCodemapGraphApplyRejection: Error, Hashable {
     case rootEpochMismatch
-    case repositoryAuthorityMismatch
+    case rootAuthorityMismatch
     case schemaMismatch
     case policyMismatch
     case staleGeneration

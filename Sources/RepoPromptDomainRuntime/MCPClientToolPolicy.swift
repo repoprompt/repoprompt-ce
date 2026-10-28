@@ -47,6 +47,7 @@ package enum MCPClientToolPolicyCatalog {
         .agentExternalControl,
         .agentExploreControl,
         .agentSessionLinkControl,
+        .agentSessionAdmin,
         .agentReasoningControl,
         .promptExperimentControl,
         .statusPublication,
@@ -66,6 +67,7 @@ package enum MCPClientToolPolicyCatalog {
         .userInteraction,
         .agentReasoningControl,
         .promptExperimentControl,
+        .agentSelfControl,
         .statusPublication,
         .agentConversationSend,
         .conversationLog,
@@ -74,6 +76,7 @@ package enum MCPClientToolPolicyCatalog {
     package static let agentModeNativeGrantedCapabilities: Set<MCPToolCapability> = [
         .userInteraction,
         .promptExperimentControl,
+        .agentSelfControl,
         .statusPublication,
         .agentConversationSend,
         .conversationLog,
@@ -87,6 +90,10 @@ package enum MCPClientToolPolicyCatalog {
     /// active links in either direction. Catalog reachability grants no outbound oversight authority;
     /// each operation still authorizes its direction independently, and the tool disappears after the
     /// exact endpoint's final inbound or outbound link is revoked.
+    ///
+    /// `agentSessionAdmin` follows the same rule: no profile grants it. Its grant is computed live
+    /// for an exact Agent Mode run that holds a live delegation scope (or, for `request_scope` only,
+    /// an orchestrator/overseer run). Administrative principals never receive it.
     package static let policyGatedCapabilities: Set<MCPToolCapability> = [
         .userInteraction,
         .agentReasoningControl,
@@ -95,6 +102,8 @@ package enum MCPClientToolPolicyCatalog {
         .agentConversationSend,
         .conversationLog,
         .agentSessionLinkControl,
+        .agentSelfControl,
+        .agentSessionAdmin,
     ]
 
     package static let classifications: [MCPClientToolPolicyProfile: MCPClientToolPolicyClassification] = [

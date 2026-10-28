@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 final class AgentACPModelRegistry {
     static let shared = AgentACPModelRegistry()
@@ -7,6 +8,10 @@ final class AgentACPModelRegistry {
     private var liveSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
     private var liveSignaturesByProvider: [ACPProviderID: ACPDynamicProviderRecord] = [:]
     private var persistedSnapshotsByProvider: [ACPProviderID: ACPDiscoveredSessionModels] = [:]
+    // Derived from the complete effective snapshot, including labels and parameter choices.
+    // Both values are replaced under `lock`; readers never perform derivation or store I/O.
+    private var devinCatalogSnapshot: ACPDiscoveredSessionModels?
+    private var devinCatalog = DevinModelCatalog(snapshot: nil)
     private var standardStoreWarmTask: Task<[ACPProviderID: ACPDiscoveredSessionModels], Never>?
     private var didWarmStandardStore = false
     private var standardStoreWarmGeneration: UInt64 = 0
@@ -34,11 +39,19 @@ final class AgentACPModelRegistry {
             liveSignaturesByProvider[providerID] = providerRecord
         }
         persistedSnapshotsByProvider[providerID] = normalizedSnapshot
+        if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
         lock.unlock()
 
         guard didChange else { return false }
+        invalidateAdvertisedModels(for: providerID)
         ACPDynamicModelStore.save(normalizedSnapshot, for: providerID)
         return true
+    }
+
+    private func invalidateAdvertisedModels(for providerID: ACPProviderID) {
+        for agent in AgentProviderKind.allCases where agent.acpProviderID == providerID {
+            AgentAdvertisedModelCatalog.shared.invalidate(agent)
+        }
     }
 
     func currentSnapshot(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
@@ -51,7 +64,19 @@ final class AgentACPModelRegistry {
         snapshotFromMemory(for: providerID)
     }
 
-    func warmStandardStoreIfNeeded() async {
+    func currentDevinCatalog() -> DevinModelCatalog {
+        lock.withLock { devinCatalog }
+    }
+
+    /// Caller holds `lock`. Build and publication are atomic with snapshot mutation.
+    private func refreshDevinCatalogIfNeededLocked() {
+        let snapshot = liveSnapshotsByProvider[.devin] ?? persistedSnapshotsByProvider[.devin]
+        guard snapshot != devinCatalogSnapshot else { return }
+        devinCatalog = DevinModelCatalog(snapshot: snapshot)
+        devinCatalogSnapshot = snapshot
+    }
+
+    func warmStandardStoreIfNeeded(beforeCompleting: (@Sendable () async -> Void)? = nil) async {
         let plan: StandardStoreWarmPlan? = lock.withLock {
             guard !didWarmStandardStore else { return nil }
 
@@ -73,10 +98,16 @@ final class AgentACPModelRegistry {
 
         guard let plan else { return }
         let loadedSnapshots = await plan.task.value
+        // Per-call scheduling seam for the shared-task completion race regression.
+        if let beforeCompleting { await beforeCompleting() }
 
         lock.withLock {
-            guard plan.generation == standardStoreWarmGeneration else { return }
+            guard !didWarmStandardStore, plan.generation == standardStoreWarmGeneration else { return }
+            for providerID in loadedSnapshots.keys {
+                invalidateAdvertisedModels(for: providerID)
+            }
             persistedSnapshotsByProvider = loadedSnapshots
+            refreshDevinCatalogIfNeededLocked()
             didWarmStandardStore = true
             standardStoreWarmTask = nil
         }
@@ -85,6 +116,11 @@ final class AgentACPModelRegistry {
     private struct StandardStoreWarmPlan {
         let task: Task<[ACPProviderID: ACPDiscoveredSessionModels], Never>
         let generation: UInt64
+    }
+
+    /// Reads saved data when memory is empty, without installing it or changing warm state.
+    func resolvedSnapshotIncludingStandardStore(for providerID: ACPProviderID) -> ACPDiscoveredSessionModels? {
+        snapshotFromMemory(for: providerID) ?? ACPDynamicModelStore.load(providerID: providerID)
     }
 
     func resolvedSnapshotAfterWarmingStandardStore(
@@ -105,30 +141,40 @@ final class AgentACPModelRegistry {
 
     #if DEBUG
         @_spi(TestSupport)
-        public func test_reset(providerID: ACPProviderID) {
+        public func test_reset(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
+            invalidateAdvertisedModels(for: providerID)
+            beforeClearingMemory?()
             lock.lock()
             liveSnapshotsByProvider.removeValue(forKey: providerID)
             liveSignaturesByProvider.removeValue(forKey: providerID)
             persistedSnapshotsByProvider.removeValue(forKey: providerID)
+            if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
             standardStoreWarmTask?.cancel()
             standardStoreWarmTask = nil
             didWarmStandardStore = false
             standardStoreWarmGeneration &+= 1
             lock.unlock()
             ACPDynamicModelStore.remove(providerID: providerID)
+            // Fence producers that read the old snapshot after the first invalidation.
+            invalidateAdvertisedModels(for: providerID)
         }
 
         @_spi(TestSupport)
-        public func test_clearMemoryPreservingStore(providerID: ACPProviderID) {
+        public func test_clearMemoryPreservingStore(providerID: ACPProviderID, beforeClearingMemory: (() -> Void)? = nil) {
+            invalidateAdvertisedModels(for: providerID)
+            beforeClearingMemory?()
             lock.lock()
             liveSnapshotsByProvider.removeValue(forKey: providerID)
             liveSignaturesByProvider.removeValue(forKey: providerID)
             persistedSnapshotsByProvider.removeValue(forKey: providerID)
+            if providerID == .devin { refreshDevinCatalogIfNeededLocked() }
             standardStoreWarmTask?.cancel()
             standardStoreWarmTask = nil
             didWarmStandardStore = false
             standardStoreWarmGeneration &+= 1
             lock.unlock()
+            // Fence producers that read the old snapshot after the first invalidation.
+            invalidateAdvertisedModels(for: providerID)
         }
 
         @_spi(TestSupport)

@@ -1,3 +1,5 @@
+import RepoPromptWorkspaceCore
+
 enum WorkspaceRecentOrdering {
     nonisolated static func sorted(_ workspaces: [WorkspaceModel]) -> [WorkspaceModel] {
         workspaces.sorted {

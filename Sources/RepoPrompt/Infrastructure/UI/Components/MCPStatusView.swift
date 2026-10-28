@@ -5,6 +5,7 @@
 //  Created by RepoPrompt MCP integration
 //
 
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// A comprehensive MCP server status dashboard view.
@@ -373,6 +374,16 @@ struct MCPStatusView: View {
 
     // MARK: - Auto-Approve Section
 
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+
+    private var approvalModeDescription: String {
+        if globalSettings.mcpStrictConnectionApproval() {
+            return "Strict connection approval is enabled. Saved names do not skip approval."
+        }
+        return "Always allow trusts apps by name. Any program using an approved app's name is let in. "
+            + "Enable Strict connection approval in Settings → MCP to prompt once per run instead."
+    }
+
     private var autoApproveSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
@@ -394,18 +405,22 @@ struct MCPStatusView: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
 
-            // Always-allowed clients list
+            Text(approvalModeDescription)
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+            // Strict mode leaves the persistent list intact but never uses it for admission.
             let allowedClients = server.dashboard?.alwaysAllowedClients ?? []
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("Trusted Clients")
+                Text(globalSettings.mcpStrictConnectionApproval() ? "Always-Allowed Clients (Inactive)" : "Always-Allowed Clients")
                     .font(.subheadline.weight(.medium))
 
                 if allowedClients.isEmpty {
                     HStack {
                         Image(systemName: "person.crop.circle.badge.questionmark")
                             .foregroundColor(.secondary)
-                        Text("No clients in the persistent allow-list")
+                        Text("No saved client names")
                             .foregroundColor(.secondary)
                     }
                     .font(.caption)
@@ -425,8 +440,8 @@ struct MCPStatusView: View {
 
     private func allowedClientRow(_ client: String) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: "checkmark.seal.fill")
-                .foregroundColor(.green)
+            Image(systemName: "person.crop.circle")
+                .foregroundColor(.secondary)
 
             Text(client)
                 .font(.subheadline)
@@ -435,13 +450,8 @@ struct MCPStatusView: View {
 
             if server.isBuiltInAlwaysAllowedClient(client) {
                 Text("Built-in")
-                    .font(.caption.weight(.medium))
+                    .font(.caption)
                     .foregroundColor(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(Color.secondary.opacity(0.12)))
-                    .hoverTooltip("Built-in clients are always trusted and can't be removed")
-                    .accessibilityHint("Always trusted and cannot be removed")
             } else {
                 Button(action: { server.setAlwaysAllowed(clientID: client, allowed: false) }) {
                     Text("Remove")

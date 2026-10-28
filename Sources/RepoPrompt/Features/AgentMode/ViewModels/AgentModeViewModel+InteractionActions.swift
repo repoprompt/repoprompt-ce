@@ -17,7 +17,8 @@ extension AgentModeViewModel {
     /// overload for any caller that captured the request earlier (cards, notifications).
     func submitApprovalDecision(tabID: UUID, decision: AgentApprovalDecision) {
         guard let session = sessions[tabID],
-              let request = session.pendingApproval
+              let request = session.pendingApproval,
+              decision != .accept || request.supportsPlainApprove
         else {
             return
         }
@@ -60,6 +61,17 @@ extension AgentModeViewModel {
 
     func isCodexHookApprovalStrictModeEnabled() -> Bool {
         codexCoordinator.isCodexHookApprovalStrictModeEnabled()
+    }
+
+    func codexRememberedApprovalAllowed(for tabID: UUID?) -> Bool {
+        guard let tabID else { return true }
+        return sessions[tabID]?.codexControllerFeatureState?.computerUseEnabled != true
+    }
+
+    func submitPermissionsDecision(tabID: UUID, requestID: UUID, decision: AgentApprovalDecision) {
+        guard let session = sessions[tabID], let request = session.pendingPermissionsRequest,
+              request.id == requestID else { return }
+        codexCoordinator.submitPermissionsDecision(session: session, request: request, decision: decision)
     }
 
     func submitMCPElicitationResponse(

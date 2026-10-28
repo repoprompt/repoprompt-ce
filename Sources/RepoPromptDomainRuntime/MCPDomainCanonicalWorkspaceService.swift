@@ -81,9 +81,11 @@ package struct DomainCanonicalWorkspaceAdapter {
 /// mutation admission, and response shapes are owned here.
 package struct MCPDomainCanonicalWorkspaceService {
     private let adapter: DomainCanonicalWorkspaceAdapter
+    private let fileReadSlotDirectory: URL?
 
-    package init(adapter: DomainCanonicalWorkspaceAdapter) {
+    package init(adapter: DomainCanonicalWorkspaceAdapter, fileReadSlotDirectory: URL? = nil) {
         self.adapter = adapter
+        self.fileReadSlotDirectory = fileReadSlotDirectory
     }
 
     package func mutateSelection(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
@@ -175,21 +177,18 @@ package struct MCPDomainCanonicalWorkspaceService {
             throw MCPError.invalidParams("missing path")
         }
         let url = try adapter.resolvePath(rawPath, snapshot.roots, false)
-        let text = try String(contentsOf: url, encoding: .utf8)
-        let lines = text.components(separatedBy: .newlines)
-        let start = args["start_line"]?.intValue
-        let limit = args["limit"]?.intValue
-        let selected: ArraySlice<String>
-        if let start, start < 0 {
-            selected = lines.suffix(min(lines.count, abs(start)))
-        } else if let start {
-            let index = max(0, start - 1)
-            guard index < lines.count else { return try .mcp(.string("")) }
-            selected = lines[index ..< min(lines.count, index + max(0, limit ?? lines.count))]
-        } else {
-            selected = lines[...]
+        do {
+            let text = try await MCPDomainHeadlessFileReader.read(
+                at: url,
+                startLine: args["start_line"]?.intValue,
+                limit: args["limit"]?.intValue,
+                slotDirectory: fileReadSlotDirectory
+            )
+            return try .mcp(.string(text))
+        } catch let error as POSIXError {
+            // Tool errors describe the requested operation, not hidden physical aliases.
+            throw MCPError.invalidParams("Cannot read requested file (POSIX \(error.code.rawValue): \(String(cString: strerror(error.code.rawValue))))")
         }
-        return try .mcp(.string(selected.joined(separator: "\n")))
     }
 
     package func searchFiles(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
@@ -212,10 +211,10 @@ package struct MCPDomainCanonicalWorkspaceService {
         guard ["auto", "path", "content", "both"].contains(mode) else {
             throw MCPError.invalidParams("mode must be auto, path, content, or both")
         }
-        let filter = Self.searchFilter(args)
+        let relativeRoots = Self.relativeRoots(snapshot.roots)
+        let filter = searchFilter(args, roots: snapshot.roots, canonicalRoots: relativeRoots.map(\.canonicalPath))
         let searchesPaths = mode == "path" || mode == "both" || (mode == "auto" && pattern.contains("*"))
         let searchesContent = mode == "content" || mode == "both" || (mode == "auto" && !searchesPaths)
-        let relativeRoots = Self.relativeRoots(snapshot.roots)
         var results: [Value] = []
         for file in Self.files(under: snapshot.roots) {
             try Task.checkCancellation()
@@ -261,19 +260,47 @@ package struct MCPDomainCanonicalWorkspaceService {
         return try .object(response)
     }
 
+    private enum SearchPathFilter {
+        case relative(String)
+        case absolute(AbsoluteSearchPathFilter?)
+    }
+
+    /// A canonical bound-root prefix is literal and case-sensitive, even when its suffix is a glob.
+    /// Kept value-only so root identity can be tested without relying on the host volume's case mode.
+    package struct AbsoluteSearchPathFilter {
+        private let rootPrefix: String
+        private let suffix: String
+
+        package init?(canonicalPath: String, canonicalRoots: [String]) {
+            guard let root = canonicalRoots.filter({ root in
+                canonicalPath == root || canonicalPath.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+            }).max(by: { $0.count < $1.count }) else { return nil }
+            rootPrefix = root.hasSuffix("/") ? root : root + "/"
+            suffix = canonicalPath == root ? "" : String(canonicalPath.dropFirst(rootPrefix.count))
+        }
+
+        package func matches(canonicalFilePath: String) -> Bool {
+            guard canonicalFilePath.hasPrefix(rootPrefix) else { return false }
+            let relative = String(canonicalFilePath.dropFirst(rootPrefix.count))
+            if suffix.isEmpty || relative == suffix || relative.hasPrefix(suffix + "/") { return true }
+            guard MCPDomainCanonicalWorkspaceService.containsWildcard(suffix) else { return false }
+            return MCPDomainCanonicalWorkspaceService.globMatches(suffix, relative, caseInsensitive: false)
+        }
+    }
+
     private struct SearchFilter {
         let extensions: Set<String>
-        let paths: [String]
+        let paths: [SearchPathFilter]
         let excludes: [String]
     }
 
-    private static func searchFilter(_ args: [String: Value]) -> SearchFilter {
+    private func searchFilter(_ args: [String: Value], roots: [URL], canonicalRoots: [String]) -> SearchFilter {
         let object = args["filter"]?.objectValue ?? [:]
-        let extensions = Set(strings(object["extensions"]).map {
+        let extensions = Set(Self.strings(object["extensions"]).map {
             let normalized = $0.lowercased()
             return normalized.hasPrefix(".") ? normalized : "." + normalized
         })
-        var paths = strings(object["paths"])
+        var paths = Self.strings(object["paths"])
         if let path = args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
            !path.isEmpty
         {
@@ -281,8 +308,16 @@ package struct MCPDomainCanonicalWorkspaceService {
         }
         return SearchFilter(
             extensions: extensions,
-            paths: paths,
-            excludes: strings(object["exclude"])
+            paths: paths.map { path in
+                guard path.hasPrefix("/") else { return .relative(path) }
+                // Keep unresolved/unauthorized filters as nonmatches, not an empty filter list.
+                // The adapter owns canonicalization and the bound-workspace path fence.
+                let resolved = try? adapter.resolvePath(path, roots, false)
+                return .absolute(resolved.flatMap {
+                    AbsoluteSearchPathFilter(canonicalPath: $0.path, canonicalRoots: canonicalRoots)
+                })
+            },
+            excludes: Self.strings(object["exclude"])
         )
     }
 
@@ -308,24 +343,28 @@ package struct MCPDomainCanonicalWorkspaceService {
             guard filter.extensions.contains(fileExtension) else { return false }
         }
         if !filter.paths.isEmpty,
-           !filter.paths.contains(where: { matchesPathFilter($0, relativePath: relativePath) })
+           !filter.paths.contains(where: { matchesPathFilter($0, relativePath: relativePath, file: file) })
         {
             return false
         }
         return !filter.excludes.contains(where: { matchesExclude($0, relativePath: relativePath) })
     }
 
-    private static func matchesPathFilter(_ rawPattern: String, relativePath: String) -> Bool {
-        let pattern = rawPattern
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !pattern.isEmpty else { return true }
-        if containsWildcard(pattern) {
-            return globMatches(pattern, relativePath)
+    private static func matchesPathFilter(_ filter: SearchPathFilter, relativePath: String, file: URL) -> Bool {
+        switch filter {
+        case let .relative(rawPattern):
+            let pattern = rawPattern.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !pattern.isEmpty else { return true }
+            if containsWildcard(pattern) {
+                return globMatches(pattern, relativePath)
+            }
+            let candidate = pattern.lowercased()
+            let path = relativePath.lowercased()
+            return path == candidate || path.hasPrefix(candidate + "/")
+        case let .absolute(absolute):
+            guard let absolute else { return false }
+            return absolute.matches(canonicalFilePath: file.standardizedFileURL.resolvingSymlinksInPath().path)
         }
-        let candidate = pattern.lowercased()
-        let relative = relativePath.lowercased()
-        return relative == candidate || relative.hasPrefix(candidate + "/")
     }
 
     private static func matchesExclude(_ pattern: String, relativePath: String) -> Bool {
@@ -339,10 +378,10 @@ package struct MCPDomainCanonicalWorkspaceService {
         pattern.contains("*") || pattern.contains("?") || pattern.contains("[")
     }
 
-    private static func globMatches(_ pattern: String, _ path: String) -> Bool {
+    private static func globMatches(_ pattern: String, _ path: String, caseInsensitive: Bool = true) -> Bool {
         let wildstar: UInt32 = 0x40
         let casefold: UInt32 = 0x10
-        let flags = (pattern.contains("**") ? wildstar : 0) | casefold
+        let flags = (pattern.contains("**") ? wildstar : 0) | (caseInsensitive ? casefold : 0)
         return pattern.withCString { patternCString in
             path.withCString { pathCString in
                 repo_wildmatch(patternCString, pathCString, flags) == 0

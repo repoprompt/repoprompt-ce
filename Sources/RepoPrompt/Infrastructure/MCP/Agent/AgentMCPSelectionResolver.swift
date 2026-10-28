@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptSettingsCore
 
 // SEARCH-HELPER: model_id, compound identifier, task label, agent+model resolution, MCP parsing, global role defaults
 // Related:
@@ -36,6 +37,8 @@ enum AgentMCPSelectionResolver {
         /// drops the user's choice and runs at the provider default; `agent_explore` shipped that
         /// bug. Capture it with the resolution — never re-read role settings after awaited setup.
         let modelParameterSelections: [ACPModelParameterSelection]
+        /// Captured with role resolution. Explicit IDs and stored role overrides are not rebalanced.
+        var usageBalancingEligible = false
     }
 
     /// Resolves a `model_id` string into agent + model components.
@@ -65,7 +68,8 @@ enum AgentMCPSelectionResolver {
                     agentRaw: resolved.selection.agent.rawValue,
                     modelRaw: resolved.selection.modelRaw,
                     taskLabelKind: defaultKind,
-                    modelParameterSelections: resolved.modelParameters
+                    modelParameterSelections: resolved.modelParameters,
+                    usageBalancingEligible: resolved.usageBalancingEligible
                 )
             }
             return ResolvedSelection(
@@ -87,7 +91,8 @@ enum AgentMCPSelectionResolver {
                     agentRaw: resolved.selection.agent.rawValue,
                     modelRaw: resolved.selection.modelRaw,
                     taskLabelKind: entry.kind,
-                    modelParameterSelections: resolved.modelParameters
+                    modelParameterSelections: resolved.modelParameters,
+                    usageBalancingEligible: resolved.usageBalancingEligible
                 )
             }
             let knownLabels = AgentModelCatalog.taskLabels.map(\.label).joined(separator: ", ")
@@ -145,14 +150,14 @@ enum AgentMCPSelectionResolver {
         workspaceID: UUID?,
         roleSelectionProvider: RoleSelectionProvider?,
         surface: AgentModelCatalog.AgentSelectionSurface
-    ) throws -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection])? {
+    ) throws -> (selection: AgentModelCatalog.NormalizedAgentSelection, modelParameters: [ACPModelParameterSelection], usageBalancingEligible: Bool)? {
         if let providerSelection = roleSelectionProvider?(role, availability) {
             guard surface.allows(providerSelection.agent) else {
                 throw MCPError.invalidParams(
                     "Agent '\(providerSelection.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
                 )
             }
-            return (providerSelection, [])
+            return (providerSelection, [], false)
         }
         if let resolution = MCPAgentRoleDefaultsService.effectiveSelection(
             for: role,
@@ -164,7 +169,15 @@ enum AgentMCPSelectionResolver {
                     "Agent '\(resolution.effective.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
                 )
             }
-            return (resolution.effective, resolution.modelParameters)
+            return (resolution.effective, resolution.modelParameters, !resolution.hasStoredOverride)
+        }
+        if let stored = MCPAgentRoleDefaultsService.executableStoredSelection(
+            for: role,
+            overrides: GlobalSettingsStore.shared.mcpAgentRoleOverrides(workspaceID: workspaceID),
+            roleModelParameters: GlobalSettingsStore.shared.mcpAgentRoleModelParameters(workspaceID: workspaceID),
+            availability: availability
+        ), surface.allows(stored.selection.agent) {
+            return (stored.selection, stored.modelParameters, false)
         }
         guard let fallback = AgentModelCatalog.resolveTaskLabelKind(role, availability: availability) else {
             return nil
@@ -174,6 +187,6 @@ enum AgentMCPSelectionResolver {
                 "Agent '\(fallback.agent.rawValue)' selected for role '\(role.rawValue)' is available only in interactive Agent Mode and cannot run headlessly. Choose a headless-capable model for this role in Agent Models settings or use interactive Agent Mode."
             )
         }
-        return (fallback, [])
+        return (fallback, [], true)
     }
 }

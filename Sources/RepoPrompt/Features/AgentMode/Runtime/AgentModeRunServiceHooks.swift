@@ -34,9 +34,9 @@ extension AgentModeRunService {
     ///
     /// Authority: persistence/durable turn resources.
     struct AttachmentLifecycleHooks {
-        let reserveAttachmentsForTurn: ([AgentImageAttachment], AgentTabSession) -> UUID?
+        let reserveAttachmentsForTurn: ([AgentFileAttachment], AgentTabSession) -> UUID?
         let markAttachmentsConsumed: (AgentTabSession, UUID?) -> Void
-        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentTabSession) -> Void
+        let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentFileAttachment], AgentTabSession) -> Void
         let consumeDeferredAttachmentCleanup: (AgentTabSession, Bool) -> Void
         let finalizeAttachmentsForTurn: (AgentTabSession, UUID?, DomainAgentRunAttachmentTurnDisposition) -> Void
     }
@@ -70,6 +70,18 @@ extension AgentModeRunService {
     /// Authority: queued-work recovery projection.
     struct QueuedWorkRecoveryHooks {
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
+        var isCurrentSessionBinding: @MainActor (AgentTabSession, AgentRunStartStopFence) -> Bool = { session, fence in
+            fence.binding == session.persistentSessionBindingIdentity
+        }
+
+        /// Withdraws a run's initial user row whose send was refused by route verification before
+        /// any provider dispatch, restoring its text to an empty composer (see
+        /// `AgentModeViewModel.restoreRouteRefusedUnsentTurn`). Hosts without a composer keep the row.
+        var restoreRouteRefusedUnsentTurn: @MainActor (
+            _ session: AgentTabSession,
+            _ userItemID: UUID,
+            _ message: String
+        ) -> Void = { _, _, _ in }
     }
 
     /// Host persistence scheduling for session/tab state.
@@ -95,13 +107,14 @@ extension AgentModeRunService {
     ///
     /// Authority: provider capability inputs.
     struct ProviderInputAssemblyHooks {
-        let buildHeadlessAgentMessage: (AgentTabSession, String, UUID, [AgentImageAttachment]) -> AgentMessage
+        let buildHeadlessAgentMessage: (AgentTabSession, String, UUID, [AgentFileAttachment]) -> AgentMessage
         /// Augment queued steering text with skill context, tagged files, and attachment rendering before submit.
         let augmentUserMessageForProviderSend: (
             _ text: String,
-            _ attachments: [AgentImageAttachment],
+            _ attachments: [AgentFileAttachment],
             _ taggedFileAttachments: [AgentTaggedFileAttachment],
-            _ session: AgentTabSession?
+            _ session: AgentTabSession?,
+            _ skipsSlashExpansion: Bool
         ) async -> String
         /// Stages a transcript handoff for fresh-session resume recovery.
         let stageResumeRecoveryHandoffIfNeeded: (_ session: AgentTabSession) async -> Void
@@ -139,6 +152,14 @@ extension AgentModeRunService {
         /// respective owners settle them behind this one runner-neutral call.
         let acceptAgentSessionLinkPrompt: (AgentTabSession, AgentSessionLinkDispatchContext?, AgentSessionLinkOutboundPromptClaim?) -> Void
 
+        var proveAgentSessionLinkProviderInput: @MainActor (AgentTabSession, AgentSessionLinkOutboundPromptClaim?) async -> AgentSessionLinkProviderInputRelease.Proof = { _, claim in
+            await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+        }
+
+        var handoffAgentSessionLinkProviderInput: @MainActor (AgentTabSession, AgentSessionLinkPromptDispatchID, AgentSessionLinkOutboundPromptClaim?, AgentSessionLinkProviderInputRelease.Proof) -> AgentSessionLinkProviderInputRelease.ReleasedDispatchContext = { _, _, claim, proof in
+            AgentSessionLinkProviderInputRelease.handoff(original: claim, proof: proof, current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed }, isPending: { _ in false }, consume: { _ in false })
+        }
+
         /// Attaches the cross-window oversight supplement to an already-built provider message.
         ///
         /// Applied after history, handoff, attachment, workflow, and file-map composition, so the
@@ -154,6 +175,7 @@ extension AgentModeRunService {
             let captured = AgentSessionLinkDispatchContext(session: session, dispatchID: dispatchID)
             let outcome = claimAgentSessionLinkPrompt(session, dispatchID)
             return AgentSessionLinkDecoratedAgentMessage(
+                quietMarkerProducerLifetime: session.retainQuietMarkerProducer(for: outcome.claim),
                 dispatchContext: captured,
                 message: AgentSessionLinkPromptComposer.decorated(message, with: outcome.claim),
                 claim: outcome.claim,
@@ -167,6 +189,7 @@ extension AgentModeRunService {
     /// Named for the same reason its text-shaped sibling is: a tuple would let a call site keep
     /// compiling while silently ignoring the abort.
     struct AgentSessionLinkDecoratedAgentMessage {
+        var quietMarkerProducerLifetime: AgentQuietMarkerProducerLifetime?
         var dispatchContext: AgentSessionLinkDispatchContext?
         let message: AgentMessage
         let claim: AgentSessionLinkOutboundPromptClaim?
@@ -203,13 +226,20 @@ extension AgentModeRunService {
             AgentRunTerminalCommitRevision,
             AgentRunEpochTransitionKind?
         ) async -> AgentRunTerminalPublicationResult
+        var onSelfCompactTerminalSettled: @MainActor (
+            AgentTabSession,
+            AgentRunTerminalCommitRevision,
+            AgentRunTerminalPublicationResult,
+            @escaping @MainActor () -> Bool
+        ) -> Void = { _, _, _, _ in }
     }
 
     /// Continuation of a settled or steered run (follow-up starts, MCP wakes).
     ///
     /// Authority: lifecycle command issuance back into the host.
     struct RunContinuationHooks {
-        let startFollowUpRun: (AgentTabSession, String) -> Void
+        let startFollowUpRun: (AgentTabSession, AgentTabSession.PendingInstruction) -> Void
+        let startTypedACPFollowUpRun: (AgentTabSession, AgentTabSession.PendingInstruction) -> Void
         /// Wakes MCP waiters once a steering instruction has actually been delivered to the provider.
         let signalMCPInstructionDelivered: (_ session: AgentTabSession) async -> Void
     }
@@ -227,6 +257,10 @@ extension AgentModeRunService {
         let interactions: RunInteractionHooks
         let terminalSettlement: TerminalSettlementHooks
         let continuation: RunContinuationHooks
+        /// Host-owned synchronous deferred-work cleanup, before the terminal shortcut.
+        var prepareForCancellation: (
+            AgentTabSession, DomainAgentRunCancellationIntent, AgentModeRunService.CancellationOrigin
+        ) -> Void = { _, _, _ in }
     }
 }
 
@@ -246,6 +280,9 @@ extension AgentModeRunService.Hooks {
             tabID: tabID,
             lifecycle: session.runLifecycle,
             hooks: .init(
+                sealQuietCheckIn: { owner, state, normal, successor in
+                    session.sealQuietCheckIn(owner: owner, terminalState: state, normal: normal, hasSuccessor: successor)
+                },
                 flushPendingAssistantDelta: {
                     transcript.flushPendingAssistantDelta(session)
                 },
@@ -303,6 +340,11 @@ extension AgentModeRunService.Hooks {
                 },
                 startFollowUpRun: { instruction in
                     continuation.startFollowUpRun(session, instruction)
+                },
+                onSelfCompactTerminalSettled: { revision, result, teardownSettled in
+                    terminalSettlement.onSelfCompactTerminalSettled(
+                        session, revision, result, teardownSettled
+                    )
                 }
             ),
             validatesOwnership: { ownership, expectedRunID in
@@ -318,7 +360,7 @@ extension AgentModeRunService.Hooks {
                 session.items.last(where: { $0.kind == .user })?.id
             },
             queuedFollowUp: {
-                session.pendingInstructions.first
+                session.pendingInstructions.first?.providerText
             },
             setFollowUpPending: { pending in
                 session.mcpFollowUpRunPending = pending

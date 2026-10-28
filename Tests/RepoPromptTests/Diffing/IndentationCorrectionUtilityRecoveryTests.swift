@@ -1,4 +1,4 @@
-@testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class IndentationCorrectionUtilityRecoveryTests: XCTestCase {

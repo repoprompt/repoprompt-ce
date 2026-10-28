@@ -58,6 +58,20 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         XCTAssertEqual(snapshot.fingerprintsByToolName.count, installedNames.count)
         XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(installedNames))
 
+        // Delegation scopes are app-owned Agent-session authority: direct-headless keeps the canonical
+        // catalog complete but fails closed even when a caller names the tool.
+        let sessionAdminCandidate = await runtime.toolRegistry.resolve(
+            toolName: MCPWindowToolName.sessionAdmin,
+            scope: .standalone(id: scopeID)
+        )
+        let sessionAdminResolution = try XCTUnwrap(sessionAdminCandidate)
+        do {
+            _ = try await sessionAdminResolution.binding(["op": .string("request_scope")])
+            XCTFail("Standalone session_admin must fail closed")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("session_admin is not available"), "\(error)")
+        }
+
         let protectedCandidate = await runtime.toolRegistry.resolve(
             toolName: MCPWindowToolName.manageSelection,
             scope: .standalone(id: scopeID)
@@ -68,6 +82,22 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
             XCTFail("Standalone protected mutation must deny without an invocation principal")
         } catch let error as DomainMutationPolicyError {
             XCTAssertEqual(error, .principalMissing)
+        }
+
+        let bootstrapCandidate = await runtime.toolRegistry.resolve(
+            toolName: MCPWindowToolName.becomeOverseer,
+            scope: .standalone(id: scopeID)
+        )
+        let bootstrap = try XCTUnwrap(bootstrapCandidate).binding
+        do {
+            _ = try await bootstrap([:])
+            XCTFail("Standalone bootstrap must fail closed without an app-owned Agent session")
+        } catch let error as MCPError {
+            XCTAssertEqual(error.code, -32602)
+            guard case let .invalidParams(message) = error else {
+                return XCTFail("Expected unavailable-session denial, got \(error)")
+            }
+            XCTAssertEqual(message, "become_overseer is not available for this session.")
         }
 
         await MCPDomainStandaloneToolInstaller.uninstall(installation, runtime: runtime)
@@ -109,13 +139,13 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         let binding = try XCTUnwrap(candidate).binding
         let securityContext = standaloneAskOracleSecurityContext(identity: runtime.identity)
 
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
             try await binding(["message": .string("start")])
         }
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
             try await binding(["message": .string("continue"), "chat_id": .string("chat-1")])
         }
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
             try await binding([
                 "message": .string("restart"),
                 "chat_id": .string("chat-1"),
@@ -164,7 +194,7 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         ]
         for (label, arguments, expectedMessage) in malformedCases {
             do {
-                _ = try await MCPDomainInvocationSecurityContext.$current.withValue(securityContext) {
+                _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(securityContext) {
                     try await binding(arguments)
                 }
                 XCTFail("Expected invalid params for malformed \(label)")
@@ -184,7 +214,7 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         _ = await runtime.shutdown()
     }
 
-    func testCanonicalBindContextIsGlobalAndHasNoWindowSelector() throws {
+    func testCanonicalBindContextIsGlobalWithQualifiedWindowAndBothRootForms() throws {
         let definition = try XCTUnwrap(
             MCPDomainCanonicalToolDefinitions.definition(named: MCPGlobalToolName.bindContext)
         )
@@ -192,7 +222,11 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         let properties = try XCTUnwrap(schema["properties"]?.objectValue)
         XCTAssertNotNil(properties["context_id"])
         XCTAssertNotNil(properties["working_dirs"])
-        XCTAssertNil(properties["window_id"])
+        XCTAssertEqual(properties["window_id"]?.objectValue?["type"], .string("integer"))
+        XCTAssertTrue(definition.description.contains("Headless"))
+        let alternatives = try XCTUnwrap(properties["working_dirs"]?.objectValue?["anyOf"]?.arrayValue)
+        XCTAssertEqual(alternatives.map { $0.objectValue?["type"] }, [.string("array"), .string("string")])
+        XCTAssertEqual(alternatives.first?.objectValue?["items"]?.objectValue?["type"], .string("string"))
         XCTAssertTrue(MCPGlobalToolName.orderedToolNames.contains(definition.name))
         XCTAssertFalse(MCPWindowToolName.orderedToolNames.contains(definition.name))
     }

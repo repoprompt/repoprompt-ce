@@ -84,7 +84,7 @@ final class AgentNotificationActionResolverTests: XCTestCase {
         target.sessions[tabID] = session
     }
 
-    private func installApproval(command: String = "swift test", id: UUID = UUID()) -> UUID {
+    private func installApproval(command: String = "swift test", id: UUID = UUID(), plainApproveAvailable: Bool = true) -> UUID {
         session.pendingApproval = AgentApprovalRequest(
             id: id,
             requestID: .acp("req"),
@@ -93,7 +93,8 @@ final class AgentNotificationActionResolverTests: XCTestCase {
             threadID: "t",
             turnID: "t",
             itemID: "i",
-            command: command
+            command: command,
+            plainApproveAvailable: plainApproveAvailable
         )
         return id
     }
@@ -154,6 +155,23 @@ final class AgentNotificationActionResolverTests: XCTestCase {
 
         XCTAssertEqual(resolve(.approve, reference: reference), .stale, "A second press finds nothing pending")
         XCTAssertEqual(target.approvals.count, 1)
+    }
+
+    func testApproveUnavailableWhenACPHasNoOneTimeOption() throws {
+        _ = installApproval(plainApproveAvailable: false)
+        let reference = try reference()
+        let pending = session.pendingApproval
+        XCTAssertEqual(resolve(.approve, reference: reference), .ineligible)
+        XCTAssertEqual(session.pendingApproval, pending)
+        XCTAssertTrue(target.approvals.isEmpty)
+    }
+
+    func testChangedOneTimeAvailabilityInvalidatesTheNotification() throws {
+        let id = installApproval()
+        let reference = try reference()
+        _ = installApproval(id: id, plainApproveAvailable: false)
+        XCTAssertEqual(resolve(.approve, reference: reference), .stale)
+        XCTAssertTrue(target.approvals.isEmpty)
     }
 
     func testApproveNeverReachesAReplacementInteraction() throws {

@@ -129,6 +129,7 @@ final class AgentSessionLinkObserverCapabilityTests: XCTestCase {
             displayName: "Build API",
             providerDisplayName: "Codex CLI",
             status: .running,
+            board: .empty,
             idleForSend: false,
             pendingInteractionKind: nil,
             latestVisibleAssistantPreview: preview,
@@ -187,7 +188,7 @@ final class AgentSessionLinkObserverCapabilityTests: XCTestCase {
             let candidate = makeStatusCandidate(tabID: tabID)
 
             let projection = AgentModeViewModel.statusProjection(for: session)
-            let snapshot = AgentModeViewModel.observationSnapshot(for: session, candidate: candidate)
+            let snapshot = AgentModeViewModel.observationSnapshot(for: session, candidate: candidate, subagentCounts: (running: 0, finished: 0))
 
             XCTAssertEqual(projection.status, snapshot.status, label)
             XCTAssertEqual(projection.pendingInteractionKind, snapshot.pendingInteractionKind, label)

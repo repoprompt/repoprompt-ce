@@ -90,6 +90,7 @@ final class AgentRunLifecycleContractsTests: XCTestCase {
         )
         let providerDrainGeneration: UInt64 = 7
         var publicationCount = 0
+        var selfCompactTerminalObservations = 0
         let hooks = AgentRunTerminalSessionBinding.Hooks(
             flushPendingAssistantDelta: {},
             finalizeStreamingItems: {},
@@ -107,7 +108,13 @@ final class AgentRunLifecycleContractsTests: XCTestCase {
                 publicationCount += 1
                 return .accepted(successorEpoch: nil)
             },
-            startFollowUpRun: { _ in }
+            startFollowUpRun: { _ in },
+            onSelfCompactTerminalSettled: { _, result, teardownSettled in
+                XCTAssertEqual(result, .accepted(successorEpoch: nil))
+                XCTAssertFalse(lifecycle.terminalCommitInProgress)
+                XCTAssertTrue(teardownSettled())
+                selfCompactTerminalObservations += 1
+            }
         )
         let binding = AgentRunTerminalSessionBinding(
             tabID: tabID,
@@ -155,11 +162,13 @@ final class AgentRunLifecycleContractsTests: XCTestCase {
         let firstCandidate = await barrier.commit(request(drainGeneration: providerDrainGeneration))
         let firstRevision = try XCTUnwrap(firstCandidate)
         XCTAssertEqual(publicationCount, 1)
+        XCTAssertEqual(selfCompactTerminalObservations, 1)
         XCTAssertEqual(lifecycle.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
 
         let repeatedCandidate = await barrier.commit(request(drainGeneration: providerDrainGeneration))
         let repeatedRevision = try XCTUnwrap(repeatedCandidate)
         XCTAssertEqual(repeatedRevision, firstRevision)
         XCTAssertEqual(publicationCount, 1)
+        XCTAssertEqual(selfCompactTerminalObservations, 2, "duplicate path must notify idempotent scheduler")
     }
 }

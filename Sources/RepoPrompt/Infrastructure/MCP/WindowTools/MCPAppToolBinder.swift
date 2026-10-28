@@ -52,7 +52,7 @@ final class MCPAppToolBinder {
         )
     }
 
-    func context(for toolName: String) -> MCPAppToolInvocation {
-        MCPAppToolInvocation(toolName: toolName, windowID: windowID)
+    func context(for toolName: String, invocationContext: ToolInvocationContext) -> MCPAppToolInvocation {
+        MCPAppToolInvocation(toolName: toolName, windowID: windowID, context: invocationContext)
     }
 }

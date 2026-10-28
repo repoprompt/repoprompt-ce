@@ -1,6 +1,10 @@
 import AppKit
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+import RepoPromptShared
+import RepoPromptWorkspaceCore
 import XCTest
 
 #if DEBUG
@@ -19,9 +23,10 @@ import XCTest
             originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("WindowStateOpenFolderCommandTests-\(UUID().uuidString)", isDirectory: true)
+            storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
@@ -36,7 +41,7 @@ import XCTest
                 _ = await runtime.shutdown()
             }
             domainRuntimes.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -1486,7 +1491,9 @@ import XCTest
             )
             XCTAssertEqual(dirty.disposition, .applied)
             XCTAssertNotNil(dirty.after?.dirtyRevision)
-            if unreadable { try FileManager.default.removeItem(at: fileURL) }
+            if unreadable {
+                try FileManager.default.removeItem(at: fileURL)
+            }
             return working
         }
 
@@ -1643,6 +1650,15 @@ import XCTest
             )
             XCTAssertEqual(initialSwitch, .switched)
             window.promptManager.promptText = "before"
+            // The race uses saveState: false switches, which restore the stored compose tab.
+            // Publish the fixture now instead of depending on debounced prompt observation.
+            let fixtureTabID = try XCTUnwrap(window.promptManager.activeComposeTabID)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, alternate.id)
+            window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true)
+            let fixtureTab = try XCTUnwrap(
+                window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == fixtureTabID }
+            )
+            XCTAssertEqual(fixtureTab.promptText, "before")
             window.setAutomaticCommandProcessingForTesting(false)
             window.stopDomainWorkspaceProjectionForTesting()
             let storedPromptTitle = "Final Admission Active Stored Prompt \(UUID().uuidString)"

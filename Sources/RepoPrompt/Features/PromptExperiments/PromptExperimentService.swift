@@ -53,18 +53,6 @@
         static let defaultReflectionRole = "design"
         static let defaultJudgeRole = "pair"
 
-        private static var sharedInstance: PromptExperimentService?
-
-        static var shared: PromptExperimentService {
-            if let sharedInstance { return sharedInstance }
-            let service = PromptExperimentService(
-                store: PromptExperimentStore(rootURL: PromptExperimentStore.liveRootURL()),
-                runtime: GEPARunController.live()
-            )
-            sharedInstance = service
-            return service
-        }
-
         @Published private(set) var experiments: [PromptExperiment] = []
         @Published private(set) var loadError: String?
         @Published private(set) var persistenceError: String?
@@ -100,7 +88,7 @@
         init(
             store: PromptExperimentStore,
             runtime: PromptExperimentRuntime,
-            registry: BuiltInPromptRegistry = .shared,
+            registry: BuiltInPromptRegistry = AppDomainRuntimeComposition.shared.builtInPromptRegistry,
             patchProposer: PromptPatchProposer = PromptPatchProposer(),
             resolveTarget: @escaping @MainActor (String) throws -> PromptExperimentResolvedTarget = { try PromptExperimentTargetCatalog.resolve($0) },
             availableTargets: @escaping @MainActor () -> [PromptExperimentResolvedTarget] = { PromptExperimentTargetCatalog.availableTargets() },

@@ -2,8 +2,6 @@
 import Foundation
 import PackageDescription
 
-let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
-
 // Telemetry (Sentry) is resolved deterministically but linked only when explicitly
 // requested. The official Developer ID release pipeline sets
 // REPOPROMPT_ENABLE_SENTRY=1; local builds use the same gate for intentional
@@ -47,6 +45,15 @@ var packageDependencies: [Package.Dependency] = [
 
 var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptDomainRuntime",
+    "RepoPromptFoundation",
+    "RepoPromptProcess",
+    "RepoPromptInstrumentation",
+    "RepoPromptSecureStorage",
+    "RepoPromptFileSystem",
+    "RepoPromptVCS",
+    "RepoPromptPersistence",
+    "RepoPromptSettingsCore",
+    "RepoPromptProviderQuota",
     "RepoPromptCodeMapCore",
     "RepoPromptRegexCore",
     "RepoPromptWorkspaceCore",
@@ -69,19 +76,30 @@ var repoPromptAppDependencies: [Target.Dependency] = [
 
 var repoPromptAppSwiftSettings: [SwiftSetting] = [
     .define("DEBUG", .when(configuration: .debug)),
-    .enableUpcomingFeature("BareSlashRegexLiterals"),
-    .unsafeFlags([
-        "-import-objc-header", "\(packageRoot)/Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
-        "-disable-bridging-pch"
-    ])
+    .enableUpcomingFeature("BareSlashRegexLiterals")
+]
+
+var repoPromptSettingsCoreSwiftSettings: [SwiftSetting] = [
+    .define("DEBUG", .when(configuration: .debug))
 ]
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
+    "RepoPromptFoundation",
+    "RepoPromptProcess",
+    "RepoPromptInstrumentation",
+    "RepoPromptSecureStorage",
+    "RepoPromptFileSystem",
+    "RepoPromptVCS",
+    "RepoPromptPersistence",
+    "RepoPromptSettingsCore",
+    "RepoPromptProviderQuota",
     "RepoPromptDomainRuntime",
     "RepoPromptCodeMapCore",
-    "RepoPromptMCP",
+    "RepoPromptMCPCore",
     "RepoPromptShared",
+    "RepoPromptTestSupport",
+    "RepoPromptWorkspaceCore",
     .product(name: "Markdown", package: "swift-markdown")
 ]
 
@@ -97,6 +115,7 @@ if sentryEnabled {
     let sentryDependency = Target.Dependency.product(name: "Sentry", package: "sentry-cocoa")
     repoPromptAppDependencies.append(sentryDependency)
     repoPromptAppSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
+    repoPromptSettingsCoreSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
     repoPromptTestDependencies.append(sentryDependency)
     repoPromptTestSwiftSettings.append(.define("REPOPROMPT_SENTRY_ENABLED"))
 }
@@ -120,6 +139,18 @@ let package = Package(
             path: "Sources/RepoPromptExecutable"
         ),
         .target(
+            name: "RepoPromptProviderQuota",
+            dependencies: [],
+            path: "Sources/RepoPromptProviderQuota",
+            swiftSettings: swift6LanguageMode
+        ),
+        .testTarget(
+            name: "RepoPromptProviderQuotaTests",
+            dependencies: ["RepoPromptProviderQuota"],
+            path: "Tests/RepoPromptProviderQuotaTests",
+            swiftSettings: swift6LanguageMode
+        ),
+        .target(
             name: "RepoPromptDomainRuntime",
             dependencies: [
                 "RepoPromptShared",
@@ -135,7 +166,90 @@ let package = Package(
             ]
         ),
         .target(
+            name: "RepoPromptFoundation",
+            dependencies: [
+                "RepoPromptWorkspaceCore",
+                "RepoPromptCodeMapCore"
+            ],
+            path: "Sources/RepoPromptFoundation",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .target(
+            name: "RepoPromptProcess",
+            dependencies: ["RepoPromptFoundation", "RepoPromptShared"],
+            path: "Sources/RepoPromptProcess",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .testTarget(
+            name: "RepoPromptFileSystemTests",
+            dependencies: ["RepoPromptFileSystem"],
+            path: "Tests/RepoPromptFileSystemTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptFileSystem",
+            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptWorkspaceCore", "RepoPromptC", .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"), .product(name: "Cuchardet", package: "UniversalCharsetDetection")],
+            path: "Sources/RepoPromptFileSystem",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptVCSTests",
+            dependencies: ["RepoPromptVCS"],
+            path: "Tests/RepoPromptVCSTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptVCS",
+            dependencies: ["RepoPromptFoundation", "RepoPromptProcess", "RepoPromptInstrumentation", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptWorkspaceCore"],
+            path: "Sources/RepoPromptVCS",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptPersistenceTests",
+            dependencies: ["RepoPromptPersistence", "RepoPromptCodeMapCore", "RepoPromptFoundation", "RepoPromptFileSystem", "RepoPromptVCS"],
+            path: "Tests/RepoPromptPersistenceTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptPersistence",
+            dependencies: ["RepoPromptCodeMapCore", "RepoPromptFileSystem", "RepoPromptVCS", "RepoPromptShared", "RepoPromptC"],
+            path: "Sources/RepoPromptPersistence",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .testTarget(
+            name: "RepoPromptSettingsCoreTests",
+            dependencies: ["RepoPromptSettingsCore", "RepoPromptProviderQuota"],
+            path: "Tests/RepoPromptSettingsCoreTests",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptSettingsCore",
+            dependencies: ["RepoPromptFoundation", "RepoPromptDomainRuntime", "RepoPromptProviderQuota", "RepoPromptShared"],
+            path: "Sources/RepoPromptSettingsCore",
+            swiftSettings: repoPromptSettingsCoreSwiftSettings
+        ),
+        .target(
+            name: "RepoPromptSecureStorage",
+            path: "Sources/RepoPromptSecureStorage",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .target(
+            name: "RepoPromptInstrumentation",
+            dependencies: ["RepoPromptFoundation", "RepoPromptShared"],
+            path: "Sources/RepoPromptInstrumentation",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .target(
             name: "RepoPromptWorkspaceCore",
+            dependencies: [.product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptWorkspaceCore"
         ),
         .target(
@@ -176,8 +290,14 @@ let package = Package(
         ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: ["RepoPromptMCPCore", "RepoPromptShared", "RepoPromptDomainRuntime", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
+            name: "RepoPromptMCPCore",
+            dependencies: ["RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore", "RepoPromptProcess", "RepoPromptVCS", "RepoPromptC", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            path: "Sources/RepoPromptMCPCore",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(
@@ -188,7 +308,7 @@ let package = Package(
             ]
         ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
-        .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")]),
+        .target(name: "RepoPromptC", path: "Sources/RepoPromptC", publicHeadersPath: "include", cSettings: [.headerSearchPath("include")], linkerSettings: [.linkedLibrary("sqlite3")]),
         // Exact-snapshot scanner ABI fallback for the JavaScript/Python manifests, whose
         // FileManager source probe evaluates false in this root package graph.
         .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
@@ -201,6 +321,55 @@ let package = Package(
             ],
             path: "Tests/RepoPromptDomainRuntimeTests",
             swiftSettings: swift6LanguageMode
+        ),
+        .testTarget(
+            name: "RepoPromptMCPCoreTests",
+            dependencies: [
+                "RepoPromptMCPCore",
+                "RepoPromptDomainRuntime",
+                "RepoPromptShared",
+                "RepoPromptTestSupport",
+                "RepoPromptVCS",
+                .product(name: "MCP", package: "swift-sdk")
+            ],
+            path: "Tests/RepoPromptMCPCoreTests"
+        ),
+        // Test-only helpers shared across test targets. Production targets must never depend on it.
+        .target(
+            name: "RepoPromptTestSupport",
+            path: "Tests/RepoPromptTestSupport"
+        ),
+        .testTarget(
+            name: "RepoPromptFoundationTests",
+            dependencies: ["RepoPromptFoundation"],
+            path: "Tests/RepoPromptFoundationTests",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .testTarget(
+            name: "RepoPromptProcessTests",
+            dependencies: ["RepoPromptProcess"],
+            path: "Tests/RepoPromptProcessTests",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .testTarget(
+            name: "RepoPromptSecureStorageTests",
+            dependencies: ["RepoPromptSecureStorage", "RepoPromptTestSupport"],
+            path: "Tests/RepoPromptSecureStorageTests",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
+        ),
+        .testTarget(
+            name: "RepoPromptInstrumentationTests",
+            dependencies: ["RepoPromptInstrumentation", "RepoPromptTestSupport"],
+            path: "Tests/RepoPromptInstrumentationTests",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug))
+            ]
         ),
         .testTarget(
             name: "RepoPromptWorkspaceCoreTests",

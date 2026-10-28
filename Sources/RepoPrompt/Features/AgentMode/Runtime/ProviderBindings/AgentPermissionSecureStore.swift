@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSecureStorage
 
 // SEARCH-HELPER: Secure Agent Permission Storage, Keychain-backed permission documents, fail-closed permissions
 

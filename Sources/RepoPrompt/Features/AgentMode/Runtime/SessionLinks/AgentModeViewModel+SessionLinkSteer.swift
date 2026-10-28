@@ -61,11 +61,11 @@ extension AgentModeViewModel {
 
         // 1. Exact endpoint incarnations.
         guard let session = agentSessionLinkLiveSession(matching: candidate) else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointSession)
         }
         let admissionLiveness = liveness()
         guard admissionLiveness.permitsDelivery else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.invalidated(admissionLiveness))
         }
 
         // 2. Pure admission. Nothing has suspended since step 1, so the send transaction's own
@@ -79,7 +79,7 @@ extension AgentModeViewModel {
                 commitAuthorization: commitAuthorization
             )
         case let .blocked(failure):
-            return .blocked(failure)
+            return .blocked(failure == .endpointInvalidated ? .endpointReadiness : failure)
         case .steer:
             break
         }
@@ -96,11 +96,18 @@ extension AgentModeViewModel {
         //    workspace its grant was not given for.
         let postCommitLiveness = liveness()
         guard let liveSession = agentSessionLinkLiveSession(matching: candidate),
-              liveSession === session,
-              postCommitLiveness.permitsDelivery,
-              workspaceManager?.activeWorkspace?.id == candidate.workspaceID
+              liveSession === session
         else {
-            return .blocked(.endpointInvalidated)
+            return .blocked(.endpointPostSession)
+        }
+        guard postCommitLiveness.permitsDelivery else {
+            return .blocked(.invalidated(postCommitLiveness, postCommit: true))
+        }
+        guard let workspaceID = workspaceManager?.activeWorkspace?.id else {
+            return .blocked(.endpointMissingWorkspace)
+        }
+        guard workspaceID == candidate.workspaceID else {
+            return .blocked(.endpointWorkspace)
         }
         let route: AgentSessionLinkManagedSteerRoute
         switch agentSessionLinkSteerAdmission(for: liveSession, liveness: postCommitLiveness) {

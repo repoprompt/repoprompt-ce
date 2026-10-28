@@ -2,6 +2,8 @@ import SwiftUI
 
 struct AgentApprovalCard: View {
     let request: AgentApprovalRequest
+    var allowsRememberedDecision = true
+    var titleOverride: String?
     let onDecision: (_ decision: AgentApprovalDecision) -> Void
 
     var body: some View {
@@ -35,7 +37,7 @@ struct AgentApprovalCard: View {
                 .font(.title2)
                 .foregroundColor(.orange)
             VStack(alignment: .leading, spacing: 2) {
-                Text(request.title)
+                Text(titleOverride ?? request.title)
                     .font(.headline)
                 Text("Needs your approval")
                     .font(.caption)
@@ -72,17 +74,23 @@ struct AgentApprovalCard: View {
 
     private var actionButtons: some View {
         HStack {
-            Button(action: { onDecision(.decline) }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "xmark")
-                    Text("Decline")
+            if request.allows(.decline) {
+                Button(action: { onDecision(.decline) }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "xmark")
+                        Text("Decline")
+                    }
                 }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
+            if case .codex = request.requestID, request.availableDecisions != nil, request.allows(.cancel) {
+                Button("Cancel", action: { onDecision(.cancel) })
+                    .buttonStyle(.bordered)
+            }
 
             Spacer()
 
-            if request.supportsAlwaysAllow {
+            if allowsRememberedDecision, request.supportsAlwaysAllow {
                 Button(action: alwaysAllowDecision) {
                     HStack(spacing: 6) {
                         Image(systemName: "checkmark.seal")
@@ -92,30 +100,54 @@ struct AgentApprovalCard: View {
                 .buttonStyle(.bordered)
             }
 
-            Button(action: { onDecision(.accept) }) {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
-                    Text("Approve")
+            if request.availableDecisions == nil || request.supportsPlainApprove {
+                Button(action: { onDecision(.accept) }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                        Text("Approve")
+                    }
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(!request.supportsPlainApprove)
+                .keyboardShortcut(.return, modifiers: [])
             }
-            .buttonStyle(.borderedProminent)
-            .keyboardShortcut(.return, modifiers: [])
         }
     }
 
     private var alwaysAllowLabel: String {
-        if request.proposedExecpolicyAmendmentJSON != nil {
+        if case .acceptWithExecpolicyAmendment? = request.rememberedDecision {
             return "Approve & Remember"
         }
-        return "Always Allow"
+        return request.sessionApprovalLabel
     }
 
     private func alwaysAllowDecision() {
-        if let amendment = request.proposedExecpolicyAmendmentJSON, !amendment.isEmpty {
-            onDecision(.acceptWithExecpolicyAmendment(amendment))
-        } else {
-            onDecision(.acceptForSession)
-        }
+        if let decision = request.rememberedDecision { onDecision(decision) }
+    }
+}
+
+struct AgentPermissionsApprovalCard: View {
+    let request: AgentPermissionsRequest
+    let onDecision: (_ decision: AgentApprovalDecision) -> Void
+
+    var body: some View {
+        AgentApprovalCard(
+            request: AgentApprovalRequest(
+                id: request.id,
+                requestID: .codex(request.requestID),
+                method: request.method,
+                kind: .fileChange,
+                threadID: request.threadID,
+                turnID: request.turnID,
+                itemID: request.itemID,
+                reason: request.reason,
+                cwd: request.cwd,
+                details: request.details
+            ),
+            allowsRememberedDecision: false,
+            titleOverride: "Permission Approval",
+            onDecision: onDecision
+        )
     }
 }
 

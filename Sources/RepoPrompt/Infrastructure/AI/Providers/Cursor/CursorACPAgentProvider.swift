@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct CursorACPAgentProvider: ACPAgentProvider {
     private let config: CursorAgentConfig
@@ -102,7 +104,8 @@ struct CursorACPAgentProvider: ACPAgentProvider {
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
             cleanupArtifact: cleanupArtifact,
-            expectedExecutableIdentity: resolvedLaunch.executableIdentity
+            expectedExecutableIdentity: resolvedLaunch.executableIdentity,
+            explicitEnvironmentKeys: Set(environment.keys)
         )
     }
 
@@ -144,7 +147,8 @@ struct CursorACPAgentProvider: ACPAgentProvider {
 
         return try ACPPromptContentBuilder.blocks(
             text: text,
-            attachments: request.attachments
+            attachments: request.attachments,
+            oracleAttachments: message.attachments
         )
     }
 

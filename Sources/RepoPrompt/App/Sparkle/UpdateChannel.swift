@@ -1,11 +1,12 @@
 import Foundation
+import RepoPromptSecureStorage
 import Sparkle
 
 enum UpdateChannel: String, CaseIterable, Identifiable {
     case stable
     case tip
 
-    static let userDefaultsKey = "RepoPromptUpdateChannel"
+    static let userDefaultsKey = IdentityTransitionDiagnostics.updateChannelUserDefaultsKey
 
     var id: String {
         rawValue
@@ -32,6 +33,15 @@ enum UpdateChannel: String, CaseIterable, Identifiable {
         case .tip:
             SecurityObfuscation.decode(SecurityObfuscation.tipFeedURLEncoded)
         }
+    }
+
+    var historyRepository: TipHistoryRepository? {
+        guard self == .tip else { return nil }
+        return TipHistoryRepository(feedURL: URL(string: feedURLString))
+    }
+
+    var historyCatalogURL: URL? {
+        historyRepository?.headURL
     }
 
     static func load(defaults: UserDefaults = .standard) -> UpdateChannel {

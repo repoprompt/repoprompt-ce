@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 /// Runner-level harness for the cross-window oversight prompt supplement.
@@ -34,6 +35,7 @@ final class AgentSessionLinkRunnerHarness {
     /// Runs immediately before `prepareForNextTurn()` on the ACP path, inside the window the old
     /// (buggy) composition point sat in. A test uses it to prove composition reads membership *after*
     /// that suspension.
+    var onTurnComplete: (() -> Void)?
     var onAttachmentsConsumed: (@MainActor () -> Void)?
 
     /// Runs while the message is being built, i.e. the last synchronous MainActor point before the
@@ -72,13 +74,18 @@ final class AgentSessionLinkRunnerHarness {
     /// view-model seam does. This lets adapter tests exercise required-claim refusal at the physical
     /// provider boundary without duplicating runner logic.
     var forcedAutoWakeID: UUID?
+    var localInputFixture: AgentSessionLinkTransportLocalInputFixture?
+    private var workspaces: [WorkspaceManagerViewModel] = []
 
     init(
         stubSystemPrompt: String = "BASE INSTRUCTIONS",
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
         acpProviderFactory: @escaping AgentModeViewModel.ACPProviderFactory = { _, _ in nil },
         workspacePath: String = FileManager.default.currentDirectoryPath,
-        sessionLinkHost: AgentModeViewModel? = nil
+        sessionLinkHost: AgentModeViewModel? = nil,
+        replayTranscript: Bool = false,
+        codexController: (any CodexSessionControlling)? = nil,
+        claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil
     ) {
         self.stubSystemPrompt = stubSystemPrompt
         self.headlessProviderFactory = headlessProviderFactory
@@ -90,17 +97,20 @@ final class AgentSessionLinkRunnerHarness {
             items: []
         )
 
-        let codexController = LifecycleNoopCodexController(recorder: recorder)
+        let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
             // No MCP infrastructure in these suites: signal routing immediately so the bootstrap lease
             // resolves instead of waiting for a connection that will never arrive.
-            if let runID { await MCPRoutingWaiter.notifyRouted(runID: runID) }
+            if let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
         }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = { true }
         let host = AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: workspacePath,
             codexControllerFactory: { _, _, _, _, _, _ in codexController },
+            claudeControllerFactory: claudeControllerFactory,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             connectionPolicyInstaller: policyInstaller,
@@ -113,7 +123,7 @@ final class AgentSessionLinkRunnerHarness {
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: { provider, request in
-                try ACPAgentSessionController(provider: provider, runRequest: request)
+                try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             },
             connectionPolicyInstaller: policyInstaller,
             expectedPIDPolicyArmer: { _ in true },
@@ -154,7 +164,7 @@ final class AgentSessionLinkRunnerHarness {
             presentation: .init(
                 setAgentRunActive: { _, _ in },
                 requestUIRefresh: { _, _ in },
-                notifyAgentTurnComplete: { _ in }
+                notifyAgentTurnComplete: { _ in harnessBox?.onTurnComplete?() }
             ),
             bindingObservation: .init(
                 updateBindings: { _ in }
@@ -166,11 +176,13 @@ final class AgentSessionLinkRunnerHarness {
                 scheduleSave: { _ in }
             ),
             transcript: .init(
-                handleHeadlessStreamResult: { _, _, _, _ in },
-                finalizeStreamingItems: { _ in },
+                handleHeadlessStreamResult: { result, session, runID, attemptID in
+                    if replayTranscript { await harnessBox?.host.test_handleStreamResult(result, session: session, runID: runID, runAttemptID: attemptID) }
+                },
+                finalizeStreamingItems: { session in if replayTranscript { harnessBox?.host.finalizeStreamingItems(in: session) } },
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
-                flushPendingAssistantDelta: { _ in },
+                flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) } },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(
@@ -183,7 +195,7 @@ final class AgentSessionLinkRunnerHarness {
                         )
                     }
                 },
-                augmentUserMessageForProviderSend: { text, _, _, _ in text },
+                augmentUserMessageForProviderSend: { text, _, _, _, _ in text },
                 stageResumeRecoveryHandoffIfNeeded: { _ in },
                 prependPendingHandoffIfNeeded: { text, session in
                     sessionLinkHost?.prependPendingHandoffIfNeeded(text, session: session) ?? text
@@ -191,7 +203,7 @@ final class AgentSessionLinkRunnerHarness {
                 recordPendingHandoffSendOutcome: { _, _ in },
                 claimAgentSessionLinkPrompt: { session, dispatchID in
                     MainActor.assumeIsolated {
-                        if let sessionLinkHost {
+                        if let sessionLinkHost = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
                             return sessionLinkHost.agentSessionLinkPromptClaimOutcome(for: session, dispatchID: dispatchID)
                         }
                         guard let harnessBox else {
@@ -226,11 +238,29 @@ final class AgentSessionLinkRunnerHarness {
                 acceptAgentSessionLinkPrompt: { session, context, claim in
                     MainActor.assumeIsolated {
                         harnessBox?.acceptedDispatchCount += 1
-                        sessionLinkHost?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
+                        (harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost)?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
                         guard let claim else { return }
                         harnessBox?.claimStore.accept(claim)
                         harnessBox?.acceptedClaims.append(claim)
                     }
+                },
+                proveAgentSessionLinkProviderInput: { session, claim in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return await host.agentSessionLinkProveProviderInput(for: session, claim: claim)
+                    }
+                    return await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+                },
+                handoffAgentSessionLinkProviderInput: { session, dispatchID, claim, proof in
+                    if let host = harnessBox?.localInputFixture?.viewModel ?? sessionLinkHost {
+                        return host.agentSessionLinkHandoffProviderInput(for: session, dispatchID: dispatchID, claim: claim, proof: proof)
+                    }
+                    return AgentSessionLinkProviderInputRelease.handoff(
+                        original: claim,
+                        proof: proof,
+                        current: { claim.map(AgentSessionLinkPromptClaimOutcome.claimed) ?? .nothingOwed },
+                        isPending: { _ in true },
+                        consume: { _ in false }
+                    )
                 }
             ),
             interactions: .init(
@@ -246,6 +276,7 @@ final class AgentSessionLinkRunnerHarness {
             ),
             continuation: .init(
                 startFollowUpRun: { _, _ in },
+                startTypedACPFollowUpRun: { _, _ in },
                 signalMCPInstructionDelivered: { _ in }
             )
         )
@@ -313,6 +344,19 @@ final class AgentSessionLinkRunnerHarness {
         )
     }
 
+    func makeBoundSession(agent: AgentProviderKind) throws -> AgentModeViewModel.TabSession {
+        let tabID = UUID()
+        workspaces.append(AgentSessionLinkEndpointTestSupport.installWorkspace(on: host, tabID: tabID, name: "Positive runner authority"))
+        let session = host.session(for: tabID)
+        session.selectedAgent = agent
+        session.hasLoadedPersistedState = true
+        _ = try XCTUnwrap(host.test_installPersistentSessionBinding(
+            sessionID: UUID(), on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        return session
+    }
+
     func makeSession(agent: AgentProviderKind) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = agent
@@ -361,6 +405,9 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
     let providerID: ACPProviderID
     let commandPath: String
     var environment: [String: String] = [:]
+    /// Normalizes session updates with the shipped default normalizer instead of dropping them, so
+    /// `usage_update` reaches the usage estimator in view-model-level suites.
+    var usesDefaultNormalizer = false
 
     private let lock = NSLock()
     private var captured: [AgentMessage] = []
@@ -375,6 +422,14 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         lock.lock()
         defer { lock.unlock() }
         return captured
+    }
+
+    var supportsParameterizedModelPicker: Bool {
+        providerID == .devin
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        providerID == .devin && input.category == "thought_level" ? .thinking : nil
     }
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
@@ -398,7 +453,7 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
         ACPSessionConfiguration(
-            mode: environment["ACP_FAIL_LOAD"] == "1"
+            mode: environment["ACP_FAIL_LOAD"] == "1" || environment["ACP_LOAD"] == "1"
                 ? request.resumeSessionID.map { .load(existingSessionID: $0) } ?? .new : .new,
             workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path,
             mcpServers: []
@@ -416,10 +471,12 @@ final class AgentSessionLinkCapturingACPProvider: ACPAgentProvider, @unchecked S
     }
 
     func normalizeSessionUpdate(
-        _: [String: Any],
+        _ payload: [String: Any],
         sessionID _: String
     ) -> [NormalizedAgentRuntimeEvent] {
-        []
+        usesDefaultNormalizer
+            ? ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: providerID)
+            : []
     }
 
     func normalizeError(_ error: Error) -> Error {
@@ -457,7 +514,9 @@ final class AgentSessionLinkACPResponseGate {
     }
 
     deinit {
-        if !released { try? handle.write(contentsOf: Data([1])) }
+        if !released {
+            try? handle.write(contentsOf: Data([1]))
+        }
         try? handle.close()
     }
 }
@@ -465,6 +524,24 @@ final class AgentSessionLinkACPResponseGate {
 enum AgentSessionLinkACPServerScript {
     /// Minimal ACP server. `ACP_FAIL_PROMPTS_CONTAINING` makes `session/prompt` return an error when
     /// the prompt text contains that marker, which is how a test forces a failed steer.
+    ///
+    /// Synthetic slash-command fixtures, modelled on the ACP spec's shapes (no provider-recorded
+    /// traffic exists yet, so these are live-unverified):
+    /// - `ACP_ADVERTISE_COMMANDS` (comma list): an `available_commands_update` right after
+    ///   `session/new`; `__malformed__` sends a non-list `availableCommands`.
+    /// - `ACP_ADVERTISE_BEFORE_NEW_RESPONSE` (`1`): delivers the bootstrap advertisement before
+    ///   the `session/new` response, while the controller's session identity is still unopened.
+    /// - `ACP_ADVERTISE_AFTER_PROMPT` (comma list, may be empty): a replacement list during each prompt.
+    /// - `ACP_PROMPT_LOG` (path): each `session/prompt` `prompt` array, one JSON line per prompt.
+    /// - `ACP_RPC_LOG` (path): actual JSON-RPC requests and successful responses.
+    /// - `ACP_DEVIN_FIXTURE` (`1`): advertises SWE-2 with medium/high/max thinking choices.
+    /// - `ACP_USAGE_UPDATE_ON_PROMPT` (`used,size`): a `usage_update` during each prompt.
+    /// - `ACP_FOREIGN_ADVERTISE_AFTER_PROMPT` (comma list): a list for another session during each prompt.
+    /// - `ACP_UNMATCHED_RESPONSE_ON_PROMPT`: a response with an unknown id during each prompt (a protocol
+    ///   violation that fails the controller).
+    /// - `ACP_ADVERTISE_ON_CANCEL` (comma list): a list for the cancelled session on each `session/cancel`.
+    /// - `ACP_LOAD` (`1`): open the request's `resumeSessionID` with a successful `session/load`, which
+    ///   also advertises `ACP_ADVERTISE_COMMANDS`.
     static func write(to directory: URL) throws -> URL {
         let scriptURL = directory.appendingPathComponent("monitor_acp_server.py")
         let script = #"""
@@ -474,20 +551,29 @@ enum AgentSessionLinkACPServerScript {
         import sys
 
         fail_marker = os.environ.get("ACP_FAIL_PROMPTS_CONTAINING")
-        current_model = "model-a"
+        prompt_log = os.environ.get("ACP_PROMPT_LOG")
+        devin_fixture = os.environ.get("ACP_DEVIN_FIXTURE") == "1"
+        current_model = "swe-2-high" if devin_fixture else "model-a"
+        current_thinking = "high"
         current_mode = "ask"
+
+        def trace(direction, payload):
+            path = os.environ.get("ACP_RPC_LOG")
+            if path:
+                with open(path, "a") as log:
+                    log.write(json.dumps({"direction": direction, "payload": payload}) + "\n")
 
         def config_options():
             # The controller refuses to run against a runtime that does not advertise a modern
             # session-mode select, so both selects are required here.
-            return [
+            options = [
                 {
                     "id": "model",
                     "name": "Model",
                     "category": "model",
                     "type": "select",
                     "currentValue": current_model,
-                    "options": [{"value": "model-a", "name": "Model A"}]
+                    "options": [{"value": "swe-2-high", "name": "SWE-2"}] if devin_fixture else [{"value": "model-a", "name": "Model A"}]
                 },
                 {
                     "id": "mode",
@@ -498,13 +584,43 @@ enum AgentSessionLinkACPServerScript {
                     "options": [
                         {"value": "ask", "name": "Ask"},
                         {"value": "repoprompt_acp", "name": "RepoPrompt"},
-                        {"value": "repoprompt_acp_full_access", "name": "RepoPrompt Full Access"}
+                        {"value": "repoprompt_acp_full_access", "name": "RepoPrompt Full Access"},
+                        {"value": "auto_edit", "name": "Auto Edit"}
                     ]
                 }
             ]
+            if devin_fixture:
+                options.append({
+                    "id": "thought_level", "name": "Thinking", "category": "thought_level",
+                    "type": "select", "currentValue": current_thinking,
+                    "options": [{"value": value, "name": value} for value in ["medium", "high", "max"]]
+                })
+            return options
+
+        def notify_update(session_id, update):
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {"sessionId": session_id, "update": update}
+            }), flush=True)
+
+        def advertise(session_id, raw):
+            if raw == "__malformed__":
+                commands = "not-a-list"
+            else:
+                commands = [
+                    {"name": name, "description": name + " command", "input": None}
+                    for name in raw.split(",") if name
+                ]
+            notify_update(session_id, {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": commands
+            })
 
         def respond(request_id, result=None):
-            print(json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result or {}}), flush=True)
+            response = {"jsonrpc": "2.0", "id": request_id, "result": result or {}}
+            trace("response", response)
+            print(json.dumps(response), flush=True)
 
         def respond_error(request_id, message):
             print(json.dumps({
@@ -518,6 +634,7 @@ enum AgentSessionLinkACPServerScript {
                 request = json.loads(line)
             except Exception:
                 continue
+            trace("request", request)
             method = request.get("method")
             params = request.get("params") or {}
             if method == os.environ.get("ACP_HOLD_METHOD"):
@@ -530,18 +647,47 @@ enum AgentSessionLinkACPServerScript {
                 respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
             elif method == "session/load" and os.environ.get("ACP_FAIL_LOAD"):
                 respond_error(request.get("id"), "session not found: invalid params")
+            elif method == "session/load":
+                respond(request.get("id"), {"configOptions": config_options()})
+                if os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                    advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_COMMANDS"])
             elif method == "session/new":
+                advertises_before = os.environ.get("ACP_ADVERTISE_BEFORE_NEW_RESPONSE") == "1"
+                if advertises_before and os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                    advertise("monitor-acp-session", os.environ["ACP_ADVERTISE_COMMANDS"])
                 respond(request.get("id"), {
                     "sessionId": "monitor-acp-session",
                     "configOptions": config_options()
                 })
+                if not advertises_before and os.environ.get("ACP_ADVERTISE_COMMANDS") is not None:
+                    advertise("monitor-acp-session", os.environ["ACP_ADVERTISE_COMMANDS"])
+            elif method == "session/cancel" and os.environ.get("ACP_ADVERTISE_ON_CANCEL") is not None:
+                advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_ON_CANCEL"])
             elif method == "session/set_config_option":
                 if params.get("configId") == "model":
                     current_model = params.get("value")
                 elif params.get("configId") == "mode":
                     current_mode = params.get("value")
+                elif params.get("configId") == "thought_level":
+                    current_thinking = params.get("value")
                 respond(request.get("id"), {"configOptions": config_options()})
             elif method == "session/prompt":
+                if prompt_log:
+                    with open(prompt_log, "a") as log:
+                        log.write(json.dumps(params.get("prompt")) + "\n")
+                if os.environ.get("ACP_UNMATCHED_RESPONSE_ON_PROMPT"):
+                    respond(987654, {})
+                if os.environ.get("ACP_ADVERTISE_AFTER_PROMPT") is not None:
+                    advertise(params.get("sessionId"), os.environ["ACP_ADVERTISE_AFTER_PROMPT"])
+                if os.environ.get("ACP_FOREIGN_ADVERTISE_AFTER_PROMPT") is not None:
+                    advertise("foreign-session", os.environ["ACP_FOREIGN_ADVERTISE_AFTER_PROMPT"])
+                if os.environ.get("ACP_USAGE_UPDATE_ON_PROMPT"):
+                    used, size = os.environ["ACP_USAGE_UPDATE_ON_PROMPT"].split(",")
+                    notify_update(params.get("sessionId"), {
+                        "sessionUpdate": "usage_update",
+                        "used": int(used),
+                        "size": int(size)
+                    })
                 text = json.dumps(params)
                 if fail_marker and fail_marker in text:
                     respond_error(request.get("id"), "prompt rejected")

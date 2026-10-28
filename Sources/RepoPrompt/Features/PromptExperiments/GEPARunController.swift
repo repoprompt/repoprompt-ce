@@ -141,7 +141,7 @@
         static func live() -> GEPARunController {
             GEPARunController(environment: Environment(
                 storeRoot: PromptExperimentStore.liveRootURL(),
-                registry: .shared,
+                registry: AppDomainRuntimeComposition.shared.builtInPromptRegistry,
                 makeWorker: { PromptExperimentGEPAWorker() },
                 preflightWorker: { try await PromptExperimentGEPAWorker.preflight(pythonExecutable: $0) },
                 completer: PromptExperimentConnectedModelRunner()

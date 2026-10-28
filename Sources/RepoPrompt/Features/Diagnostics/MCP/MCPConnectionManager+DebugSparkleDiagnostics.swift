@@ -2,6 +2,7 @@
 
 import Foundation
 import MCP
+import RepoPromptFoundation
 
 #if DEBUG
     extension ServerNetworkManager {
@@ -52,6 +53,9 @@ import MCP
                 payload["appcast_task_present"] = NSNull()
                 payload["appcast_task_cancelled"] = NSNull()
             }
+
+            let historySnapshot = await MainActor.run { SparkleUpdaterManager.shared?.tipHistoryStore?.debugPublishedSnapshot() }
+            payload["tip_history"] = historySnapshot ?? ["store_present": false]
 
             return debugDiagnosticsResult(payload)
         }

@@ -21,7 +21,17 @@ protocol NativeAgentRuntimeControlling: Actor {
         systemPromptOverride: String?
     ) async throws -> NativeAgentRuntimeSessionRef
     func currentSessionRef() async -> NativeAgentRuntimeSessionRef
+    /// Cached command metadata from this runtime's initialize response; never starts a process.
+    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand]
     func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws
+    /// Unlike the legacy live-update helper, this proves the complete requested configuration.
+    func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication
+    /// Begins fallback only if the failed application is still current, consuming its intent.
+    func applyModelAndEffortWithProof(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure) async throws -> NativeAgentRuntimeConfigurationApplication
+    /// Turn-scoped Auto application; fallback consumes only a still-current failure token.
+    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> NativeAgentRuntimeTurnConfigurationOutcome
+    func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID
+    /// Maintenance commands intentionally do not require an ordinary-turn configuration proof.
     func sendUserMessage(_ text: String) async throws -> UUID
     /// Sends a reasoned interrupt request to the provider runtime.
     /// - Parameter reason: "interrupt" for steering (graceful), "cancel" for forceful stop.
@@ -32,6 +42,33 @@ protocol NativeAgentRuntimeControlling: Actor {
 }
 
 extension NativeAgentRuntimeControlling {
+    func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
+        []
+    }
+
+    /// Fail closed for runtimes that have not implemented application proof. In particular,
+    /// an old no-op fake must not accidentally certify provider application.
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        .notReady
+    }
+
+    /// A runtime without atomic failure-token validation must not recertify an older turn.
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?, replacingFailure _: NativeAgentRuntimeConfigurationFailure) async throws -> NativeAgentRuntimeConfigurationApplication {
+        .superseded
+    }
+
+    /// Runtimes must implement failure-token ownership to support conditional fallback.
+    /// A legacy Void update alone cannot authorize restoring a failed turn's configuration.
+    func applyModelAndEffortForTurn(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?) async throws -> NativeAgentRuntimeTurnConfigurationOutcome {
+        guard replacingFailure == nil else { return .superseded }
+        try await applyModelAndEffort(model: model, effortLevel: effortLevel)
+        return .applied
+    }
+
+    func sendUserMessage(_: String, configuration _: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        throw NativeAgentRuntimeControllerError.configurationNotCurrent
+    }
+
     func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
         .unsupported(message: "Native runtime has no local API for \(action.rawValue) cleanup of conversations.")
     }
@@ -49,6 +86,7 @@ typealias NativeAgentRuntimeEvent = ClaudeNativeProcessSessionController.Event
 typealias NativeAgentRuntimeSessionRef = ClaudeNativeProcessSessionController.SessionRef
 typealias NativeAgentRuntimeTurnStatus = ClaudeNativeProcessSessionController.TurnStatus
 typealias NativeAgentRuntimeRuntimeInitStatus = ClaudeNativeProcessSessionController.RuntimeInitStatus
+typealias NativeAgentRuntimeSlashCommand = ClaudeNativeProcessSessionController.RuntimeInitStatus.InitializeResponseSnapshot.Command
 typealias NativeAgentRuntimeInterruptOutcome = ClaudeNativeProcessSessionController.InterruptOutcome
 typealias NativeAgentRuntimeControllerError = ClaudeNativeProcessSessionController.ControllerError
 typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel

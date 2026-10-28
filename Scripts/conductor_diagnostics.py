@@ -133,6 +133,7 @@ def process_resource_snapshot() -> Dict[int, Tuple[int, int, str]]:
     try:
         result = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,rss=,command="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -298,6 +299,7 @@ class _FocusedBuildParser:
                 "RepoPromptExecutable": "RepoPrompt",
                 "RepoPromptShared": "RepoPromptShared",
                 "RepoPromptMCP": "RepoPromptMCP",
+                "RepoPromptMCPCore": "RepoPromptMCPCore",
                 "RepoPromptC": "RepoPromptC",
                 "CSwiftPCRE2": "CSwiftPCRE2",
                 "TreeSitterScannerSupport": "TreeSitterScannerSupport",

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptVCS
 
 enum MCPContextBuilderGitReviewOperation: String {
     case status, diff, log, show, blame
@@ -13,6 +14,20 @@ struct MCPContextBuilderGitReviewAdmission {
     let implicitRepositories: [GitRepoDescriptor]?
     let preferredDefaultRepository: GitRepoDescriptor?
     let publicationFence: MCPContextBuilderGitPublicationFence?
+}
+
+extension MCPContextBuilderGitReviewAdmission {
+    /// Default for an omitted or relative selector under an available frozen Context Builder target: its
+    /// primary checkout, never the ambient workspace election. A target whose primary checkout is no longer
+    /// discovered is a discovery refusal. Nil when no frozen target governs the request (no Context Builder
+    /// run, or a deferred/unavailable target admitting explicit read-only inspection), leaving the election.
+    func frozenDefaultRepository() throws -> GitRepoDescriptor? {
+        guard target != nil else { return nil }
+        guard let preferredDefaultRepository else {
+            throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(.checkoutIdentityChanged)
+        }
+        return preferredDefaultRepository
+    }
 }
 
 struct MCPContextBuilderGitPublishedOutcome {
@@ -34,7 +49,14 @@ enum MCPContextBuilderGitReviewPolicyError: Equatable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .targetDeferred:
-            "Context Builder review target election is deferred until discovery completes and freezes its review target."
+            // Discovery agents are told to publish review artifacts, so this refusal must name the
+            // read-only path that remains admitted while the review target is still unelected.
+            """
+            Context Builder review target election is deferred until discovery completes and freezes its review target. \
+            Inspect Git read-only instead: pass repo_root or repo_key and omit artifacts \
+            (e.g. {"op":"diff","repo_root":"<root>","detail":"full"}). Diff artifacts cannot be published or selected \
+            for this run; select the changed source files with manage_selection.
+            """
         case let .targetUnavailable(reason):
             reason.localizedDescription
         case .publicationOutsideFrozenTarget:
@@ -71,18 +93,11 @@ struct MCPContextBuilderGitReviewPolicy {
             )
         }
 
-        let target: ContextBuilderReviewTarget
-        switch resolution {
-        case let .available(availableTarget):
-            if let reason = await ContextBuilderReviewTargetResolver().revalidate(
-                availableTarget,
-                store: store
-            ) {
-                throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
-            }
-            target = availableTarget
-        case .deferred:
+        if resolution.restrictsGitToExplicitReadOnly {
             guard hasExplicitSelector, !requestsArtifactPublication else {
+                if case let .unavailable(reason) = resolution {
+                    throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
+                }
                 throw MCPContextBuilderGitReviewPolicyError.targetDeferred
             }
             return MCPContextBuilderGitReviewAdmission(
@@ -91,16 +106,12 @@ struct MCPContextBuilderGitReviewPolicy {
                 preferredDefaultRepository: nil,
                 publicationFence: nil
             )
-        case let .unavailable(reason):
-            guard hasExplicitSelector, !requestsArtifactPublication else {
-                throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
-            }
-            return MCPContextBuilderGitReviewAdmission(
-                target: nil,
-                implicitRepositories: nil,
-                preferredDefaultRepository: nil,
-                publicationFence: nil
-            )
+        }
+        guard let target = resolution.availableTarget else {
+            throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(.missingFrozenTarget)
+        }
+        if let reason = await ContextBuilderReviewTargetResolver().revalidate(target, store: store) {
+            throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
         }
 
         let preferredDefaultRepository = allRepositories.first(where: target.primaryCheckout.matches)

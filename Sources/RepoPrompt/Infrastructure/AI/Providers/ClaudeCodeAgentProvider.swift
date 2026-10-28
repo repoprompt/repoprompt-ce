@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptProcess
 
 struct HeadlessAgentContext {
     let runID: UUID
@@ -123,12 +125,21 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging, let model = context.launchEnvironment?.effectiveModel {
             print("[DEBUG] ClaudeCodeAgent: Using model: \(model)")
         }
-        let args = ClaudeCompatibleProviderRuntimeBridge.buildHeadlessArguments(
+        var args = ClaudeCompatibleProviderRuntimeBridge.buildHeadlessArguments(
             config: config,
             context: context,
             resumeSessionID: resumeSessionID,
             systemPromptOverride: systemPromptOverride
         )
+        if config.toolContext == .promptOnly {
+            args += [
+                "--input-format", "stream-json",
+                // --safe-mode also suppresses explicit MCP servers, breaking the old
+                // run-scoped routing lease. Isolate customizations without disabling MCP.
+                "--setting-sources", "", "--settings", "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false,\"claudeMdExcludes\":[\"**\"]}",
+                "--disable-slash-commands", "--no-session-persistence"
+            ]
+        }
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Built arguments (count: \(args.count))")
         }
@@ -351,6 +362,28 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         }
     }
 
+    /// File-mention suppression is available from Claude Code 2.1.299. Fail closed
+    /// for old, forked, or unparseable version output instead of disclosing local context.
+    static func validatePromptOnlyRuntimeVersion(_ output: String) throws {
+        let token = output.split(whereSeparator: \.isWhitespace).first ?? ""
+        let parts = token.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3,
+              parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isASCII && $0.isNumber } }),
+              let major = Int(parts[0]), let minor = Int(parts[1]), let patch = Int(parts[2]),
+              ![major, minor, patch].lexicographicallyPrecedes([2, 1, 299])
+        else {
+            throw AIProviderError.invalidConfiguration(detail: "Prompt-only callbacks require Claude Code 2.1.299 or newer for opaque file-mention input.")
+        }
+    }
+
+    static func promptOnlyStreamInput(_ text: String) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "type": "user",
+            "message": ["role": "user", "content": [["type": "text", "text": text]]]
+        ])
+        return String(decoding: data, as: UTF8.self) + "\n"
+    }
+
     // MARK: - Streaming
 
     func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
@@ -363,16 +396,35 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                         if self.enableDebugLogging {
                             print("[DEBUG] ClaudeCodeAgent: Starting streamAgentMessage with runID: \(runID?.uuidString ?? "auto-generated")")
                         }
+                        if self.config.toolContext == .promptOnly {
+                            guard !message.systemPrompt.contains("\u{0}"), message.resumeSessionID == nil else {
+                                throw AIProviderError.invalidConfiguration(detail: "Prompt-only callbacks require a fresh session and system text without NUL.")
+                            }
+                            // A stream-json envelope alone still expands @file. Older CLIs silently
+                            // ignore the suppression switch, so qualify before provider/auth setup.
+                            let version = try await self.runner.run(args: ["--version"], stdin: nil, outputMode: .none, timeout: 5)
+                            guard version.status == 0 else {
+                                throw AIProviderError.invalidConfiguration(detail: "Cannot verify Claude prompt-only file-mention isolation.")
+                            }
+                            try Self.validatePromptOnlyRuntimeVersion(String(decoding: version.stdout, as: UTF8.self))
+                            try Task.checkCancellation()
+                        }
                         let context = try await self.prepare(runID: runID)
                         try await AsyncScope.withCleanup({}, cleanup: {
                             await self.cleanup(context: context)
                         }) {
-                            let nativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
-                            let userMessage = ClaudeCompatibleProviderRuntimeBridge.providerBoundUserMessage(
-                                message.userMessage,
-                                instructions: message.systemPrompt,
-                                delivery: nativePromptMode
-                            )
+                            let nativePromptMode: ClaudeAgentToolPreferences.AgentModePromptDelivery = self.config.toolContext == .promptOnly
+                                ? .nativeSystemPrompt
+                                : ClaudeAgentToolPreferences.agentModePromptDelivery()
+                            let userMessage: String = if self.config.toolContext == .promptOnly {
+                                try Self.promptOnlyStreamInput(message.userMessage)
+                            } else {
+                                ClaudeCompatibleProviderRuntimeBridge.providerBoundUserMessage(
+                                    message.userMessage,
+                                    instructions: message.systemPrompt,
+                                    delivery: nativePromptMode
+                                )
+                            }
                             if self.enableDebugLogging {
                                 print("[DEBUG] ClaudeCodeAgent: User message length: \(userMessage.count)")
                             }
@@ -385,9 +437,12 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                             if self.enableDebugLogging {
                                 print("[DEBUG] ClaudeCodeAgent: Running CLI process")
                             }
-                            let additionalEnvironment = self.config.effortEnvironmentOverrides.merging(
+                            var additionalEnvironment = self.config.effortEnvironmentOverrides.merging(
                                 context.launchEnvironment?.environmentOverrides ?? [:]
                             ) { _, resolverValue in resolverValue }
+                            if self.config.toolContext == .promptOnly {
+                                additionalEnvironment["CLAUDE_CODE_DISABLE_FILE_MENTIONS"] = "1"
+                            }
                             let expectedPIDRunID = context.runID
                             let expectedPIDClientName = self.config.runtimeVariant.agentKind.mcpClientNameHint
                             let stream = try await self.runner.runStreaming(

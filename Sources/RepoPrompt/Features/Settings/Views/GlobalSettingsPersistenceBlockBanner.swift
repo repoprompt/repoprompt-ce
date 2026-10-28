@@ -1,4 +1,5 @@
 import AppKit
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Surfaces a blocked global-settings file (e.g. an on-disk schema newer than this build

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptFileSystem
 
 enum StableUserInteractionIdentity {
     static func uuid(from seed: String) -> UUID {
@@ -601,6 +602,15 @@ enum AgentJSONValue: Hashable {
 struct AgentRequestUserInputOption: Hashable {
     let label: String
     let description: String
+
+    /// Legacy MCP approval answers have only display labels, not typed permission scopes.
+    /// CU therefore accepts known one-shot/refusal labels only; unknown scopes fail closed.
+    var isComputerUseOneShotApprovalOption: Bool {
+        switch label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "allow", "allow once", "deny", "decline", "reject", "cancel": true
+        default: false
+        }
+    }
 }
 
 struct AgentRequestUserInputQuestion: Hashable {
@@ -615,6 +625,10 @@ struct AgentRequestUserInputQuestion: Hashable {
 
     var isOtherOptionEnabled: Bool {
         isOther && !options.isEmpty
+    }
+
+    var isLegacyMCPToolApproval: Bool {
+        id.hasPrefix("mcp_tool_call_approval")
     }
 }
 
@@ -643,6 +657,9 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
     let itemID: String
     let askedAt: Date
     let questions: [AgentRequestUserInputQuestion]
+    /// Established from structured provider metadata, never the displayed question or bare tool name.
+    let computerUseCompanionVerified: Bool
+    let repoPromptAutoApprovalVerified: Bool
 
     init(
         id: UUID? = nil,
@@ -652,7 +669,9 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         turnID: String,
         itemID: String,
         askedAt: Date = Date(),
-        questions: [AgentRequestUserInputQuestion]
+        questions: [AgentRequestUserInputQuestion],
+        repoPromptAutoApprovalVerified: Bool = false,
+        computerUseCompanionVerified: Bool = false
     ) {
         self.id = id ?? Self.stableID(
             requestID: requestID,
@@ -668,6 +687,8 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         self.itemID = itemID
         self.askedAt = askedAt
         self.questions = questions
+        self.repoPromptAutoApprovalVerified = repoPromptAutoApprovalVerified
+        self.computerUseCompanionVerified = computerUseCompanionVerified
     }
 
     static func stableID(
@@ -680,6 +701,61 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
         StableUserInteractionIdentity.uuid(
             from: "request-user-input|\(requestID.displayValue)|\(method)|\(threadID)|\(turnID)|\(itemID)"
         )
+    }
+
+    /// Preserve request identity while removing persistent/unknown answers from CU consent UI
+    /// and from other pending-interaction projections. Ordinary requests are never transformed.
+    var computerUseReviewRequest: AgentRequestUserInputRequest {
+        guard questions.contains(where: \.isLegacyMCPToolApproval) else { return self }
+        return .init(
+            id: id, requestID: requestID, method: method, threadID: threadID,
+            turnID: turnID, itemID: itemID, askedAt: askedAt,
+            questions: questions.map { question in
+                guard question.isLegacyMCPToolApproval else { return question }
+                return .init(
+                    id: question.id, header: question.header, question: question.question,
+                    isOther: false, isSecret: question.isSecret,
+                    options: question.options.filter(\.isComputerUseOneShotApprovalOption)
+                )
+            },
+            repoPromptAutoApprovalVerified: repoPromptAutoApprovalVerified,
+            computerUseCompanionVerified: computerUseCompanionVerified
+        )
+    }
+
+    /// Armed chats may retain normal approval of verified host tools, but never remember consent.
+    var repoPromptOneShotAutoApprovalResponse: AgentRequestUserInputResponse? {
+        guard repoPromptAutoApprovalVerified else { return nil }
+        return oneShotMCPApprovalResponse
+    }
+
+    var companionOneShotAutoApprovalResponse: AgentRequestUserInputResponse? {
+        guard computerUseCompanionVerified else { return nil }
+        return oneShotMCPApprovalResponse
+    }
+
+    private var oneShotMCPApprovalResponse: AgentRequestUserInputResponse? {
+        guard !questions.isEmpty, questions.allSatisfy(\.isLegacyMCPToolApproval) else { return nil }
+        var answers: [String: [String]] = [:]
+        for question in questions {
+            guard let option = question.options.first(where: {
+                ["allow", "allow once"].contains($0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            }) else { return nil }
+            answers[question.id] = [option.label]
+        }
+        return .init(answersByQuestionID: answers)
+    }
+
+    func allowsComputerUseResponse(_ response: AgentRequestUserInputResponse) -> Bool {
+        let approvals = questions.filter(\.isLegacyMCPToolApproval)
+        guard !approvals.isEmpty else { return true }
+        guard Set(response.answersByQuestionID.keys).isSubset(of: Set(questions.map(\.id))) else { return false }
+        return approvals.allSatisfy { question in
+            guard let answers = response.answersByQuestionID[question.id], answers.count == 1 else { return false }
+            return question.options.contains { option in
+                option.isComputerUseOneShotApprovalOption && option.label == answers[0]
+            }
+        }
     }
 
     func buildResponse(from drafts: [String: AgentRequestUserInputQuestionDraft]) -> AgentRequestUserInputResponse {
@@ -855,6 +931,13 @@ enum AgentApprovalDecision: Hashable {
     case acceptWithExecpolicyAmendment(String)
     case decline
     case cancel
+
+    static func parseExecpolicyAmendment(_ json: String) -> [String]? {
+        guard let values = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String],
+              !values.isEmpty
+        else { return nil }
+        return values
+    }
 }
 
 enum AgentApprovalRequestID: Hashable {
@@ -942,6 +1025,12 @@ struct AgentPermissionsRequest: Identifiable, Hashable {
     }
 }
 
+/// Provider-projected scope of the session decision; nil preserves legacy presentation.
+enum AgentApprovalSessionScope: Hashable {
+    case oneTime
+    case editsSession
+}
+
 struct AgentApprovalRequest: Identifiable, Hashable {
     let id: UUID
     let requestID: AgentApprovalRequestID
@@ -955,6 +1044,14 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     let cwd: String?
     let grantRoot: String?
     let proposedExecpolicyAmendmentJSON: String?
+    /// Codex's top-level advertised choices. Nil preserves legacy behavior; empty permits nothing.
+    let availableDecisions: [AgentApprovalDecision]?
+    /// ACP-only snapshot of genuine one-time allow availability; submission rechecks the live request.
+    let overseerOneTimeAllowAvailable: Bool?
+    /// ACP-only availability of the ordinary one-time decision, derived from live provider options.
+    let plainApproveAvailable: Bool?
+    /// Live request scope only; this does not store or grant consent.
+    let sessionApprovalScope: AgentApprovalSessionScope?
     let details: [AgentApprovalDetail]
 
     init(
@@ -970,6 +1067,10 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         cwd: String? = nil,
         grantRoot: String? = nil,
         proposedExecpolicyAmendmentJSON: String? = nil,
+        availableDecisions: [AgentApprovalDecision]? = nil,
+        overseerOneTimeAllowAvailable: Bool? = nil,
+        plainApproveAvailable: Bool? = nil,
+        sessionApprovalScope: AgentApprovalSessionScope? = nil,
         details: [AgentApprovalDetail] = []
     ) {
         self.id = id ?? Self.stableID(
@@ -991,6 +1092,10 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         self.cwd = cwd
         self.grantRoot = grantRoot
         self.proposedExecpolicyAmendmentJSON = proposedExecpolicyAmendmentJSON
+        self.availableDecisions = availableDecisions
+        self.overseerOneTimeAllowAvailable = overseerOneTimeAllowAvailable
+        self.plainApproveAvailable = plainApproveAvailable
+        self.sessionApprovalScope = sessionApprovalScope
         self.details = details
     }
 
@@ -1016,7 +1121,73 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         }
     }
 
+    /// Request authority only. The coordinator additionally intersects the live Computer Use rule.
+    func allows(_ decision: AgentApprovalDecision) -> Bool {
+        guard case .codex = requestID else {
+            switch decision {
+            case .accept: return supportsPlainApprove
+            case .acceptForSession: return sessionApprovalScope != .oneTime
+            case .acceptWithExecpolicyAmendment: return kind == .commandExecution && sessionApprovalScope == nil
+            case .decline, .cancel: return true
+            }
+        }
+        if case let .acceptWithExecpolicyAmendment(json) = decision {
+            guard kind == .commandExecution,
+                  let amendment = AgentApprovalDecision.parseExecpolicyAmendment(json)
+            else { return false }
+            guard let availableDecisions else { return true }
+            return availableDecisions.contains { advertised in
+                guard case let .acceptWithExecpolicyAmendment(value) = advertised else { return false }
+                guard let advertised = AgentApprovalDecision.parseExecpolicyAmendment(value) else { return false }
+                return advertised.elementsEqual(amendment) { $0.utf8.elementsEqual($1.utf8) }
+            }
+        }
+        return availableDecisions?.contains(decision) ?? true
+    }
+
+    var rememberedDecision: AgentApprovalDecision? {
+        if case .codex = requestID, let availableDecisions {
+            if let amendment = availableDecisions.first(where: {
+                if case .acceptWithExecpolicyAmendment = $0 { return allows($0) }
+                return false
+            }) { return amendment }
+        } else if let json = proposedExecpolicyAmendmentJSON, !json.isEmpty {
+            let decision = AgentApprovalDecision.acceptWithExecpolicyAmendment(json)
+            if allows(decision) { return decision }
+        }
+        return allows(.acceptForSession) ? .acceptForSession : nil
+    }
+
+    /// The amendment shown alongside Remember, without letting legacy metadata override a list.
+    var presentedExecpolicyAmendmentJSON: String? {
+        if case .codex = requestID, availableDecisions != nil {
+            guard case let .acceptWithExecpolicyAmendment(json)? = rememberedDecision else { return nil }
+            return json
+        }
+        return proposedExecpolicyAmendmentJSON
+    }
+
+    var supportsExecpolicyAmendment: Bool {
+        guard kind == .commandExecution, sessionApprovalScope == nil else { return false }
+        guard case .codex = requestID, availableDecisions != nil else { return true }
+        if case .acceptWithExecpolicyAmendment? = rememberedDecision { return true }
+        return false
+    }
+
+    var supportsPlainApprove: Bool {
+        switch requestID {
+        case .codex: allows(.accept)
+        case .acp: plainApproveAvailable == true
+        case .claudeControl: true
+        }
+    }
+
     var supportsAlwaysAllow: Bool {
-        true
+        if case .codex = requestID { return rememberedDecision != nil }
+        return sessionApprovalScope != .oneTime
+    }
+
+    var sessionApprovalLabel: String {
+        sessionApprovalScope == .editsSession ? "Allow edits this session" : "Always Allow"
     }
 }

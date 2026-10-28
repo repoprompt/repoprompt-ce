@@ -90,6 +90,7 @@
             session.assistantDeltaFlushTask = nil
             session.pendingInstructions = []
             session.pendingClaudeSteeringInstructions = []
+            session.settlePendingManagedACPSteeringAsNotAccepted()
             session.pendingACPSteeringInstructions = []
             session.codexFallbackPumpTask?.cancel()
             session.codexFallbackPumpTask = nil

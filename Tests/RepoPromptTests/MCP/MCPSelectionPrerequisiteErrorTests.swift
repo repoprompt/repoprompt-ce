@@ -500,13 +500,17 @@ import XCTest
                 do {
                     let tools = await server.windowMCPTools
                     let tool = try XCTUnwrap(tools.first { $0.name == toolName }, "\(toolName) is not a registered window tool")
-                    server.setRequestMetadataOverrideForTesting(.init(
+                    let metadata = MCPRequestMetadata(
                         connectionID: connection.connectionID, clientName: nil, windowID: owner.windowID,
                         runPurpose: .agentModeRun,
                         tabContextHint: .init(tabID: owner.tabID, workspaceID: owner.workspaceID, windowID: owner.windowID)
-                    ))
+                    )
+                    server.setRequestMetadataOverrideForTesting(metadata)
                     defer { server.setRequestMetadataOverrideForTesting(nil) }
-                    _ = try await tool(arguments)
+                    let invocation = ToolInvocationContext.trustedLocal(toolName: toolName, metadata: metadata)
+                    _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                        try await tool(arguments)
+                    }
                     XCTFail("An unsatisfied selection prerequisite must reject \(toolName)")
                     return UnexpectedAdmission()
                 } catch {

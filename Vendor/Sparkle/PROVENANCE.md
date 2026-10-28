@@ -9,7 +9,7 @@ RepoPrompt CE vendors the Sparkle `2.9.2` Swift Package Manager distribution fro
 
 Vendored contents:
 
-- `Sparkle.xcframework`
+- `Sparkle.xcframework`, including `macos-arm64_x86_64/dSYMs`
 - `bin/BinaryDelta`
 - `bin/generate_appcast`
 - `bin/generate_keys`
@@ -17,6 +17,17 @@ Vendored contents:
 - `LICENSE`
 
 The vendored binaries are copied without source modification from the upstream release asset.
+
+The upstream `dSYMs` directory (five `.dSYM` bundles, about 20.8 MB) was
+initially omitted because the repository `.gitignore` rule `*.dSYM/` silently
+excluded it when Sparkle was vendored. The XCFramework `Info.plist` declares
+`DebugSymbolsPath = dSYMs`, and Xcode 27 fails builds when that declared path is
+missing, so the unmodified upstream bundles were restored from the verified
+release asset above and a narrow `.gitignore` exception keeps them tracked.
+`SHA256SUMS` lists the release asset checksum followed by per-file checksums for
+the restored dSYM files. `Scripts/xcframework_declared_paths_guardrails.sh`
+fails `make guardrails` if a vendored XCFramework declares a path that does not
+exist on disk.
 
 [`INSTALLED_MANIFEST.tsv`](INSTALLED_MANIFEST.tsv) records the complete installed
 framework and trusted command-line tool tree, including entry types, symlink

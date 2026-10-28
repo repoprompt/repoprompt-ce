@@ -1,4 +1,6 @@
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptFoundation
 import XCTest
 
 final class AgentFileTagWorktreeResolutionTests: XCTestCase {
@@ -567,6 +569,16 @@ private actor AgentFileTagTestAsyncGate {
 @MainActor
 private final class FileTagSelectionHost: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
+    var activeSelectionWorkspace: WorkspaceSelectionWorkspace? {
+        activeWorkspace.map { workspace in
+            WorkspaceSelectionWorkspace(
+                id: workspace.id,
+                activeComposeTabID: workspace.activeComposeTabID,
+                firstComposeTabID: workspace.composeTabs.first?.id
+            )
+        }
+    }
+
     var selectionMirrorContextRevision: UInt64 = 0
 
     init(selection: StoredSelection) {
@@ -588,6 +600,21 @@ private final class FileTagSelectionHost: WorkspaceSelectionHost {
     func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState? {
         guard activeWorkspace?.id == identity.workspaceID else { return nil }
         return activeWorkspace?.composeTabs.first { $0.id == identity.tabID }
+    }
+
+    func selectionTab(for identity: WorkspaceSelectionIdentity) -> WorkspaceSelectionTab? {
+        composeTab(for: identity).map { WorkspaceSelectionTab(id: $0.id, selection: $0.selection) }
+    }
+
+    func storeSelection(
+        _ selection: StoredSelection,
+        modifiedAt: Date,
+        for identity: WorkspaceSelectionIdentity
+    ) -> Bool {
+        guard var tab = composeTab(for: identity) else { return false }
+        tab.selection = selection
+        tab.lastModified = modifiedAt
+        return updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID)
     }
 
     func publishActiveComposeTabSnapshot(commitToMemory _: Bool, touchModified _: Bool) {}

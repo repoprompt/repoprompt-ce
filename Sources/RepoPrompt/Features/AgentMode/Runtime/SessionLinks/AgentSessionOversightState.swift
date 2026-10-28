@@ -22,6 +22,9 @@ import RepoPromptDomainRuntime
 /// slot (see `pendingAutoWakeOwnsTransportBoundary`), so nothing may clear it except a path that can
 /// prove no transport call happened.
 struct AgentSessionOversightState {
+    /// Session-incarnation opt-in only. Never saved, restored, or cleared by ordinary unlink.
+    var overseerActivation: AgentSessionOverseerActivation?
+
     // MARK: Durable Auto-wake selection
 
     /// Master Auto-wake preference, persisted with the session. New sessions default on and remain
@@ -95,7 +98,29 @@ struct AgentSessionOversightState {
     /// never recur. Keeping only the current one means suppression is released by exactly the events
     /// that should release it — the failed content being acknowledged, removed, or replaced by a
     /// genuinely new transition — instead of surviving indefinitely in a set nothing prunes.
-    var suppressedWakeFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
+    private struct WakeSuppression {
+        let fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint
+        let producerWakeID: UUID
+    }
+
+    private var wakeSuppression: WakeSuppression?
+    var suppressedWakeFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint? {
+        wakeSuppression?.fingerprint
+    }
+
+    mutating func suppressWake(_ fingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?, producerWakeID: UUID) {
+        guard let fingerprint else { return } // Missing failure proof never clears another producer.
+        wakeSuppression = WakeSuppression(fingerprint: fingerprint, producerWakeID: producerWakeID)
+    }
+
+    mutating func clearWakeSuppression() {
+        wakeSuppression = nil
+    }
+
+    mutating func clearWakeSuppression(ifProducedBy wakeID: UUID) {
+        guard wakeSuppression?.producerWakeID == wakeID else { return }
+        wakeSuppression = nil
+    }
 
     // MARK: Per-lane snooze policy
 

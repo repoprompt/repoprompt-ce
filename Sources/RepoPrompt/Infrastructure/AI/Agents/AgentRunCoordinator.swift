@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptInstrumentation
 
 /// Identifies the type of headless agent run.
 enum AgentRunType {
@@ -35,6 +36,12 @@ final class AgentRunCoordinator {
     }
 
     static let shared = AgentRunCoordinator()
+
+    private let perfRecorderBox = AgentModePerfRecorderBox()
+
+    func installPerfRecorder(_ recorder: any AgentModePerfRecording) {
+        perfRecorderBox.install(recorder)
+    }
 
     private let log = Logger(subsystem: "com.repoprompt.agents", category: "AgentRunCoordinator")
 
@@ -91,7 +98,7 @@ final class AgentRunCoordinator {
             requiresExpectedAgentPID: spec.agentKind.requiresExpectedPIDOwnedAgentModeMCPRouting
         )
 
-        let lease = MCPBootstrapLease(spec: leaseSpec)
+        let lease = MCPBootstrapLease(spec: leaseSpec, perfRecorder: perfRecorderBox.snapshot())
         let acquired = await lease.acquire()
         guard acquired else { throw CancellationError() }
         return lease

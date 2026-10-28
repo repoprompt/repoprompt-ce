@@ -1,6 +1,8 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class MCPPromptContextToolProvider {
@@ -59,7 +61,7 @@ final class MCPPromptContextToolProvider {
         let includeArr = args["include"]?.arrayValue?.compactMap { $0.stringValue?.lowercased() } ?? ["prompt", "selection", "code", "tokens"]
         let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
         let overridePreset = try await resolveCopyPresetOverride(args["copy_preset"])
-        let metadata: MCPServerViewModel.RequestMetadata
+        let metadata: MCPRequestMetadata
         let lookupContext: WorkspaceLookupContext
         if let appContext {
             metadata = appContext.metadata
@@ -74,7 +76,7 @@ final class MCPPromptContextToolProvider {
         if includeArr.contains("files") {
             _ = await dependencies.context.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
         }
-        let resolvedTabContext: MCPServerViewModel.ResolvedTabContextSnapshot = if let appContext {
+        let resolvedTabContext: MCPResolvedTabContextSnapshot = if let appContext {
             selectionRefreshedContext(appContext.resolvedTabContext)
         } else {
             try await dependencies.context.resolveTabContextSnapshot(
@@ -115,12 +117,12 @@ final class MCPPromptContextToolProvider {
         if operation == .listPresets {
             return try Value(ToolResultDTOs.PromptToolEnvelope.forPresetsList(dependencies.prompt.buildCopyPresetsListDTO()))
         }
-        let metadata: MCPServerViewModel.RequestMetadata = if let appContext {
+        let metadata: MCPRequestMetadata = if let appContext {
             appContext.metadata
         } else {
             await dependencies.context.captureRequestMetadata()
         }
-        let resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot = if operation == .export {
+        let resolvedContext: MCPResolvedTabContextSnapshot = if operation == .export {
             try await withPromptExportPhase(.promptExportSelectionDrain) {
                 try await MCPServerViewModel.requireReadFileAutoSelectionPrerequisite {
                     try await dependencies.files.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
@@ -151,7 +153,7 @@ final class MCPPromptContextToolProvider {
         )
     }
 
-    private func executeTabScopedPrompt(operation: MCPPromptContextOperation, args: [String: Value], resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot) async throws -> Value {
+    private func executeTabScopedPrompt(operation: MCPPromptContextOperation, args: [String: Value], resolvedContext: MCPResolvedTabContextSnapshot) async throws -> Value {
         let tabContext = resolvedContext.snapshot
         switch operation {
         case .get:
@@ -159,19 +161,17 @@ final class MCPPromptContextToolProvider {
         case .set:
             guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for set") }
             try await MCPDomainMutationCommitContext.willCommit()
-            try await dependencies.context.updateCurrentTabContext(MCPWindowToolName.prompt) { $0.promptText = text }
-            let context = try await dependencies.execution.requireCurrentTabContext(MCPWindowToolName.prompt)
-            return try Value(simplePromptReply(context.promptText, op: operation.rawValue))
+            let prompt = try await dependencies.context.updateCurrentTabPrompt(MCPWindowToolName.prompt) { $0 = text }
+            return try Value(simplePromptReply(prompt, op: operation.rawValue))
         case .append:
             guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for append") }
             try await MCPDomainMutationCommitContext.willCommit()
-            try await dependencies.context.updateCurrentTabContext(MCPWindowToolName.prompt) { $0.promptText += text }
-            let context = try await dependencies.execution.requireCurrentTabContext(MCPWindowToolName.prompt)
-            return try Value(simplePromptReply(context.promptText, op: operation.rawValue))
+            let prompt = try await dependencies.context.updateCurrentTabPrompt(MCPWindowToolName.prompt) { $0 += text }
+            return try Value(simplePromptReply(prompt, op: operation.rawValue))
         case .clear:
             try await MCPDomainMutationCommitContext.willCommit()
-            try await dependencies.context.updateCurrentTabContext(MCPWindowToolName.prompt) { $0.promptText = "" }
-            return try Value(simplePromptReply("", op: operation.rawValue))
+            let prompt = try await dependencies.context.updateCurrentTabPrompt(MCPWindowToolName.prompt) { $0 = "" }
+            return try Value(simplePromptReply(prompt, op: operation.rawValue))
         case .export:
             return try await exportPrompt(args: args, resolvedContext: resolvedContext, tabContext: tabContext)
         case .selectPreset:
@@ -191,8 +191,8 @@ final class MCPPromptContextToolProvider {
     /// drains. Routing, prompt, worktree, and lookup authority remain the invocation snapshot;
     /// this avoids a second heavyweight tab-routing resolution on MainActor.
     private func selectionRefreshedContext(
-        _ captured: MCPServerViewModel.ResolvedTabContextSnapshot
-    ) -> MCPServerViewModel.ResolvedTabContextSnapshot {
+        _ captured: MCPResolvedTabContextSnapshot
+    ) -> MCPResolvedTabContextSnapshot {
         guard let workspaceID = captured.snapshot.workspaceID,
               let manager = dependencies.context.workspaceManager,
               let tab = manager.composeTab(for: WorkspaceSelectionIdentity(
@@ -269,8 +269,8 @@ final class MCPPromptContextToolProvider {
 
     private func exportPrompt(
         args: [String: Value],
-        resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
-        tabContext: MCPServerViewModel.TabContextSnapshot?
+        resolvedContext: MCPResolvedTabContextSnapshot,
+        tabContext: MCPTabContextSnapshot?
     ) async throws -> Value {
         guard let rawPath = args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !rawPath.isEmpty else {
             throw MCPError.invalidParams("path required for export")
@@ -300,7 +300,7 @@ final class MCPPromptContextToolProvider {
         let exportMetadata = try await withPromptExportPhase(.promptExportMetadataAssembly) {
             let pathDisplay = dependencies.context.promptVM.filePathDisplayOption
             let rootRefs = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
-            let effectiveContext = tabContext.map { MCPServerViewModel.ResolvedTabContextSnapshot(snapshot: $0) } ?? resolvedContext
+            let effectiveContext = tabContext.map { MCPResolvedTabContextSnapshot(snapshot: $0) } ?? resolvedContext
             let files = try await dependencies.prompt.buildExportSelectedFileInfos(
                 effectiveContext,
                 preset.cfg,

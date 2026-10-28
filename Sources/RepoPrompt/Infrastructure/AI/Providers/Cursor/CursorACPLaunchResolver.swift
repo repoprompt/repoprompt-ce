@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 enum CursorACPLaunchCandidate: CaseIterable, Equatable {
     case cursorAgentACP
@@ -961,6 +964,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         let processConfig = CLIProcessConfiguration(
             command: launch.command,
             environment: launch.environment,
+            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .cursor),
             additionalPaths: [],
             enableDebugLogging: config.enableDebugLogging,
             shellLookupMode: .fallbackOnly

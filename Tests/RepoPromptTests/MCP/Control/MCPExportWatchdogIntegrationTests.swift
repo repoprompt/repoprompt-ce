@@ -4,6 +4,8 @@ import JSONSchema
 import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import RepoPromptShared
 import XCTest
 
@@ -64,6 +66,706 @@ import XCTest
                     throw error
                 }
             }
+        }
+
+        func testCanonicalNetworkContextSurvivesMainActorContinuationAndInverseCompletion() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let manager = fixture.networkManager
+                let endpointA = try fixture.endpointA()
+                let gateA = MCPExecutionIgnoringCancellationGate()
+                let gateB = MCPExecutionIgnoringCancellationGate()
+                let enteredA = expectation(description: "A reached canonical MainActor resolver")
+                let enteredB = expectation(description: "B reached canonical MainActor resolver")
+                let probeA = PR4CanonicalInvocationProbe()
+                let probeB = PR4CanonicalInvocationProbe()
+                var endpointB: PersistentMCPTestEndpoint?
+                var taskA: Task<PersistentMCPTestRPCResponse, Error>?
+                var taskB: Task<PersistentMCPTestRPCResponse, Error>?
+                var pendingError: Error?
+
+                @MainActor
+                func cleanup() async throws {
+                    fixture.contextA.window.mcpServer.setBeforeDomainReadContextResolutionForTesting(nil)
+                    fixture.contextB.window.mcpServer.setBeforeDomainReadContextResolutionForTesting(nil)
+                    await gateA.release()
+                    await gateB.release()
+                    taskA?.cancel()
+                    taskB?.cancel()
+                    if let taskA { _ = try? await taskA.value }
+                    if let taskB { _ = try? await taskB.value }
+                    MCPLifecycleDiagnostics.shared.endCapture(connectionID: endpointA.connectionID)
+                    if let endpointB {
+                        MCPLifecycleDiagnostics.shared.endCapture(connectionID: endpointB.connectionID)
+                        await manager.clearClientConnectionPolicy(for: endpointB.clientName)
+                        await Self.cleanupEndpoint(endpointB, manager: manager)
+                    }
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+
+                do {
+                    let sibling = try await PersistentMCPTestEndpoint.make(
+                        label: "pr4-context-inverse-b", networkManager: manager
+                    )
+                    endpointB = sibling
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpointA, context: fixture.contextA)
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: sibling, context: fixture.contextB)
+                    MCPLifecycleDiagnostics.shared.beginCapture(connectionID: endpointA.connectionID)
+                    MCPLifecycleDiagnostics.shared.beginCapture(connectionID: sibling.connectionID)
+                    let authorityA = try XCTUnwrap(
+                        fixture.contextA.window.mcpServer.tabContextByConnectionID[endpointA.connectionID]?.frozenFileToolAuthority
+                    )
+                    let authorityB = try XCTUnwrap(
+                        fixture.contextB.window.mcpServer.tabContextByConnectionID[sibling.connectionID]?.frozenFileToolAuthority
+                    )
+                    let rootsA = await fixture.contextA.window.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+                    let rootsB = await fixture.contextB.window.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+                    XCTAssertEqual(authorityA.canonicalRoots, Set(rootsA))
+                    XCTAssertEqual(authorityB.canonicalRoots, Set(rootsB))
+                    XCTAssertFalse(authorityA.canonicalRoots.isEmpty)
+                    XCTAssertFalse(authorityB.canonicalRoots.isEmpty)
+                    XCTAssertTrue(authorityA.canonicalRoots.isDisjoint(with: authorityB.canonicalRoots))
+                    fixture.contextA.window.mcpServer.setBeforeDomainReadContextResolutionForTesting { packet in
+                        // Resolver entry follows manager -> DomainHost -> materialized
+                        // binding -> runTool start gate/context restoration. Unlike the
+                        // worktree-cache hook, it also reaches frozen-authority reads.
+                        MainActor.assertIsolated()
+                        Self.assertCanonicalPacket(packet, endpoint: endpointA, context: fixture.contextA)
+                        probeA.capture(toolName: MCPWindowToolName.readFile, windowID: fixture.contextA.window.windowID)
+                        await Self.assertCanonicalReadAuthority(authorityA, packet: packet, context: fixture.contextA)
+                        enteredA.fulfill()
+                        await gateA.enterAndWait()
+                        probeA.capture(toolName: MCPWindowToolName.readFile, windowID: fixture.contextA.window.windowID)
+                        if let resumed = probeA.packets().last { Self.assertSameCanonicalPacket(packet, resumed) }
+                        await Self.assertCanonicalReadAuthority(authorityA, packet: packet, context: fixture.contextA)
+                    }
+                    fixture.contextB.window.mcpServer.setBeforeDomainReadContextResolutionForTesting { packet in
+                        MainActor.assertIsolated()
+                        Self.assertCanonicalPacket(packet, endpoint: sibling, context: fixture.contextB)
+                        probeB.capture(toolName: MCPWindowToolName.readFile, windowID: fixture.contextB.window.windowID)
+                        await Self.assertCanonicalReadAuthority(authorityB, packet: packet, context: fixture.contextB)
+                        enteredB.fulfill()
+                        await gateB.enterAndWait()
+                        probeB.capture(toolName: MCPWindowToolName.readFile, windowID: fixture.contextB.window.windowID)
+                        if let resumed = probeB.packets().last { Self.assertSameCanonicalPacket(packet, resumed) }
+                        await Self.assertCanonicalReadAuthority(authorityB, packet: packet, context: fixture.contextB)
+                    }
+                    let activeA = Task {
+                        try await endpointA.callTool(name: MCPWindowToolName.readFile, arguments: [
+                            "path": fixture.contextA.fileURL.path,
+                            "context_id": fixture.contextA.tabID.uuidString
+                        ])
+                    }
+                    taskA = activeA
+                    await fulfillment(of: [enteredA], timeout: 5)
+                    let activeB = Task {
+                        try await sibling.callTool(name: MCPWindowToolName.readFile, arguments: [
+                            "path": fixture.contextB.fileURL.path,
+                            "context_id": fixture.contextB.tabID.uuidString
+                        ])
+                    }
+                    taskB = activeB
+                    await fulfillment(of: [enteredB], timeout: 5)
+                    XCTAssertTrue(probeA.failures().isEmpty)
+                    XCTAssertTrue(probeB.failures().isEmpty)
+                    let beforeA = try XCTUnwrap(probeA.packets().first)
+                    let beforeB = try XCTUnwrap(probeB.packets().first)
+                    Self.assertCanonicalPacket(beforeA, endpoint: endpointA, context: fixture.contextA)
+                    Self.assertCanonicalPacket(beforeB, endpoint: sibling, context: fixture.contextB)
+                    XCTAssertNotEqual(beforeA.invocationID, beforeB.invocationID)
+                    XCTAssertNotEqual(beforeA.dispatchAuthorization?.connectionIdentity, beforeB.dispatchAuthorization?.connectionIdentity)
+
+                    // Resume a checked continuation in the opposite order to request
+                    // entry. B must settle while A still owns its original context.
+                    await gateB.release()
+                    let responseB = try await activeB.value
+                    taskB = nil
+                    let textB = try Self.toolResultText(responseB)
+                    XCTAssertTrue(textB.contains(fixture.contextB.sentinel), textB)
+                    XCTAssertFalse(textB.contains(fixture.contextA.sentinel), textB)
+                    let aStillActive = await manager.hasInFlightCalls(for: endpointA.connectionID)
+                    XCTAssertTrue(aStillActive)
+                    XCTAssertEqual(probeA.packets().count, 1)
+                    XCTAssertEqual(beforeB.requestID, .number(Int64(responseB.id)))
+                    XCTAssertEqual(
+                        MCPLifecycleDiagnostics.shared.snapshot(connectionID: sibling.connectionID).map(\.phase),
+                        [.requestEntered, .providerEntered, .providerReturning, .handlerReturning]
+                    )
+                    await gateA.release()
+                    let responseA = try await activeA.value
+                    taskA = nil
+                    let textA = try Self.toolResultText(responseA)
+                    XCTAssertTrue(textA.contains(fixture.contextA.sentinel), textA)
+                    XCTAssertFalse(textA.contains(fixture.contextB.sentinel), textA)
+                    XCTAssertEqual(beforeA.requestID, .number(Int64(responseA.id)))
+                    for (probe, endpoint, context) in [
+                        (probeA, endpointA, fixture.contextA), (probeB, sibling, fixture.contextB)
+                    ] {
+                        XCTAssertTrue(probe.failures().isEmpty)
+                        let packets = probe.packets()
+                        XCTAssertEqual(packets.count, 2)
+                        let before = try XCTUnwrap(packets.first)
+                        let after = try XCTUnwrap(packets.last)
+                        Self.assertCanonicalPacket(after, endpoint: endpoint, context: context)
+                        Self.assertSameCanonicalPacket(before, after)
+                        let lifecycle = MCPLifecycleDiagnostics.shared.snapshot(connectionID: endpoint.connectionID)
+                        XCTAssertEqual(Set(lifecycle.map(\.invocationID)), [before.invocationID])
+                        XCTAssertEqual(lifecycle.map(\.phase), [.requestEntered, .providerEntered, .providerReturning, .handlerReturning])
+                    }
+                } catch {
+                    pendingError = error
+                }
+                do { try await cleanup() } catch {
+                    if pendingError == nil { pendingError = error }
+                }
+                if let pendingError { throw pendingError }
+            }
+        }
+
+        private static func assertCanonicalReadAuthority(
+            _ expected: MCPFrozenFileToolAuthority,
+            packet: ToolInvocationContext,
+            context: PersistentMCPTestContext,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            do {
+                let connectionID = try XCTUnwrap(packet.connectionID, file: file, line: line)
+                let bound = try XCTUnwrap(
+                    context.window.mcpServer.tabContextByConnectionID[connectionID]?.frozenFileToolAuthority,
+                    file: file, line: line
+                )
+                XCTAssertTrue(bound.hasSameRoutingAuthority(as: expected), file: file, line: line)
+                // Exercise the existing frozen-authority consumer with the captured
+                // packet metadata; no cache-miss path or synthetic local scope.
+                let consumed = try await context.window.mcpServer.requiredFileToolLookupContext(from: packet.metadata)
+                XCTAssertTrue(consumed.hasSameRoutingAuthority(as: expected), file: file, line: line)
+                XCTAssertEqual(consumed.rootCatalogSnapshot, expected.rootCatalogSnapshot, file: file, line: line)
+                XCTAssertEqual(consumed.canonicalRoots, expected.canonicalRoots, file: file, line: line)
+                XCTAssertEqual(consumed.sourceIdentity, expected.sourceIdentity, file: file, line: line)
+            } catch {
+                XCTFail("Canonical read lost its bound frozen authority: \(error)", file: file, line: line)
+            }
+        }
+
+        private static func assertCanonicalPacket(
+            _ packet: ToolInvocationContext,
+            endpoint: PersistentMCPTestEndpoint,
+            context: PersistentMCPTestContext,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            switch packet.origin {
+            case .network: break
+            case .trustedLocal: XCTFail("Canonical socket dispatch must never manufacture trusted-local authority", file: file, line: line)
+            }
+            XCTAssertEqual(packet.toolName, MCPWindowToolName.readFile, file: file, line: line)
+            XCTAssertEqual(packet.connectionID, endpoint.connectionID, file: file, line: line)
+            XCTAssertEqual(packet.metadata.clientName, endpoint.clientName, file: file, line: line)
+            XCTAssertEqual(packet.metadata.runPurpose, .unknown, file: file, line: line)
+            XCTAssertEqual(packet.metadata.windowID, context.window.windowID, file: file, line: line)
+            XCTAssertEqual(packet.metadata.invocationID, packet.invocationID, file: file, line: line)
+            XCTAssertEqual(packet.metadata.requestID, packet.requestID, file: file, line: line)
+            XCTAssertNotNil(packet.requestID, file: file, line: line)
+            XCTAssertEqual(packet.metadata.tabContextHint, MCPTabContextHint(
+                tabID: context.tabID, workspaceID: context.workspaceID, windowID: context.window.windowID
+            ), file: file, line: line)
+            XCTAssertEqual(packet.dispatchAuthorization?.connectionID, endpoint.connectionID, file: file, line: line)
+            XCTAssertEqual(packet.dispatchAuthorization?.windowIdentity?.windowID, context.window.windowID, file: file, line: line)
+            XCTAssertEqual(packet.dispatchAuthorization?.windowIdentity?.windowStateIdentity, ObjectIdentifier(context.window), file: file, line: line)
+            XCTAssertEqual(packet.dispatchAuthorization?.windowIdentity?.serverViewModelIdentity, ObjectIdentifier(context.window.mcpServer), file: file, line: line)
+        }
+
+        private static func assertSameCanonicalPacket(
+            _ before: ToolInvocationContext,
+            _ after: ToolInvocationContext,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            XCTAssertEqual(before.invocationID, after.invocationID, file: file, line: line)
+            XCTAssertEqual(before.requestID, after.requestID, file: file, line: line)
+            XCTAssertEqual(before.toolName, after.toolName, file: file, line: line)
+            XCTAssertEqual(before.metadata.connectionID, after.metadata.connectionID, file: file, line: line)
+            XCTAssertEqual(before.metadata.clientName, after.metadata.clientName, file: file, line: line)
+            XCTAssertEqual(before.metadata.windowID, after.metadata.windowID, file: file, line: line)
+            XCTAssertEqual(before.metadata.runPurpose, after.metadata.runPurpose, file: file, line: line)
+            XCTAssertEqual(before.metadata.invocationID, after.metadata.invocationID, file: file, line: line)
+            XCTAssertEqual(before.metadata.requestID, after.metadata.requestID, file: file, line: line)
+            XCTAssertEqual(before.metadata.tabContextHint, after.metadata.tabContextHint, file: file, line: line)
+            XCTAssertEqual(before.metadata.explicitWindowRoutingHint, after.metadata.explicitWindowRoutingHint, file: file, line: line)
+            XCTAssertEqual(before.dispatchAuthorization?.connectionID, after.dispatchAuthorization?.connectionID, file: file, line: line)
+            XCTAssertEqual(before.dispatchAuthorization?.connectionIdentity, after.dispatchAuthorization?.connectionIdentity, file: file, line: line)
+            XCTAssertEqual(before.dispatchAuthorization?.windowIdentity?.windowID, after.dispatchAuthorization?.windowIdentity?.windowID, file: file, line: line)
+            XCTAssertEqual(before.dispatchAuthorization?.windowIdentity?.windowStateIdentity, after.dispatchAuthorization?.windowIdentity?.windowStateIdentity, file: file, line: line)
+            XCTAssertEqual(before.dispatchAuthorization?.windowIdentity?.serverViewModelIdentity, after.dispatchAuthorization?.windowIdentity?.serverViewModelIdentity, file: file, line: line)
+            XCTAssertEqual(before.dispatchAuthorization?.lifecycleGeneration, after.dispatchAuthorization?.lifecycleGeneration, file: file, line: line)
+            XCTAssertEqual(before.dispatchAuthorization?.windowIdentity?.catalogRegistrationHandle, after.dispatchAuthorization?.windowIdentity?.catalogRegistrationHandle, file: file, line: line)
+        }
+
+        func testCancellationBeforeCanonicalProviderEntryPreservesParkedSiblingAndConnection() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let manager = fixture.networkManager
+                let endpoint = try fixture.endpointA()
+                let admissionGate = MCPExecutionIgnoringCancellationGate()
+                let siblingGate = MCPExecutionIgnoringCancellationGate()
+                let admitted = expectation(description: "cancelled request owns its admission permit")
+                let siblingParked = expectation(description: "canonical sibling read reached formatting")
+                var siblingEndpoint: PersistentMCPTestEndpoint?
+                var cancelledTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var siblingTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var pendingError: Error?
+
+                @MainActor
+                func cleanup() async throws {
+                    await manager.debugSetAfterConnectionCallPermitAcquiredForTesting(nil)
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await admissionGate.release()
+                    await siblingGate.release()
+                    if let cancelledTask {
+                        cancelledTask.cancel()
+                        _ = try? await cancelledTask.value
+                    }
+                    if let siblingTask {
+                        siblingTask.cancel()
+                        _ = try? await siblingTask.value
+                    }
+                    MCPLifecycleDiagnostics.shared.endCapture(connectionID: endpoint.connectionID)
+                    if let siblingEndpoint {
+                        MCPLifecycleDiagnostics.shared.endCapture(connectionID: siblingEndpoint.connectionID)
+                        await manager.clearClientConnectionPolicy(for: siblingEndpoint.clientName)
+                        await Self.cleanupEndpoint(siblingEndpoint, manager: manager)
+                    }
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+
+                do {
+                    try await Self.prepareProtectedExportFixture(fixture, endpoint: endpoint)
+                    let sibling = try await PersistentMCPTestEndpoint.make(
+                        label: "pr4-pre-entry-sibling",
+                        networkManager: manager
+                    )
+                    siblingEndpoint = sibling
+                    try await Self.prepareCanonicalReadFixture(
+                        fixture, endpoint: sibling, context: fixture.contextB
+                    )
+                    MCPLifecycleDiagnostics.shared.beginCapture(connectionID: endpoint.connectionID)
+                    MCPLifecycleDiagnostics.shared.beginCapture(connectionID: sibling.connectionID)
+                    await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
+                        guard connectionID == sibling.connectionID,
+                              toolName == MCPWindowToolName.readFile
+                        else { return }
+                        siblingParked.fulfill()
+                        await siblingGate.enterAndWait()
+                    }
+                    let activeSibling = Task {
+                        try await sibling.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: ["path": fixture.contextB.fileURL.path]
+                        )
+                    }
+                    siblingTask = activeSibling
+                    await fulfillment(of: [siblingParked], timeout: 5)
+                    let siblingPhasesBeforeCancellation = MCPLifecycleDiagnostics.shared
+                        .snapshot(connectionID: sibling.connectionID).map(\.phase)
+                    XCTAssertEqual(siblingPhasesBeforeCancellation, [.requestEntered, .providerEntered, .providerReturning])
+                    await manager.debugSetAfterConnectionCallPermitAcquiredForTesting { connectionID in
+                        guard connectionID == endpoint.connectionID else { return }
+                        admitted.fulfill()
+                        await admissionGate.enterAndWait()
+                        // Cancel the real request owner after permit acquisition but before
+                        // canonical host/provider entry, not merely the test client's waiter.
+                        withUnsafeCurrentTask { $0?.cancel() }
+                    }
+                    let activeCancelled = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: ["path": fixture.contextA.fileURL.path, "_rawJSON": true]
+                        )
+                    }
+                    cancelledTask = activeCancelled
+                    await fulfillment(of: [admitted], timeout: 5)
+                    await admissionGate.release()
+                    let cancelledResponse = try await activeCancelled.value
+                    cancelledTask = nil
+                    let payload = try Self.toolResultObject(cancelledResponse)
+                    XCTAssertEqual(payload["code"] as? String, "tool_execution_connection_terminal")
+                    let cancelledPhases = MCPLifecycleDiagnostics.shared
+                        .snapshot(connectionID: endpoint.connectionID).map(\.phase)
+                    XCTAssertEqual(cancelledPhases, [.requestEntered, .handlerReturning])
+                    let siblingStillActive = await manager.hasInFlightCalls(for: sibling.connectionID)
+                    XCTAssertTrue(siblingStillActive)
+                    XCTAssertEqual(
+                        MCPLifecycleDiagnostics.shared.snapshot(connectionID: sibling.connectionID).map(\.phase),
+                        siblingPhasesBeforeCancellation
+                    )
+
+                    await manager.debugSetAfterConnectionCallPermitAcquiredForTesting(nil)
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await siblingGate.release()
+                    let siblingResponse = try await activeSibling.value
+                    siblingTask = nil
+                    let siblingText = try Self.toolResultText(siblingResponse)
+                    XCTAssertTrue(siblingText.contains(fixture.contextB.sentinel), siblingText)
+                    XCTAssertFalse(siblingText.contains(fixture.contextA.sentinel), siblingText)
+                    XCTAssertEqual(
+                        MCPLifecycleDiagnostics.shared.snapshot(connectionID: sibling.connectionID).map(\.phase),
+                        [.requestEntered, .providerEntered, .providerReturning, .handlerReturning]
+                    )
+                    let followUp = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": fixture.contextA.fileURL.path]
+                    )
+                    let followUpText = try Self.toolResultText(followUp)
+                    XCTAssertTrue(followUpText.contains(fixture.contextA.sentinel), followUpText)
+                    XCTAssertFalse(followUpText.contains(fixture.contextB.sentinel), followUpText)
+                } catch {
+                    pendingError = error
+                }
+                do { try await cleanup() } catch {
+                    if pendingError == nil { pendingError = error }
+                }
+                if let pendingError { throw pendingError }
+            }
+        }
+
+        func testQueuedSessionAdminScopeRequestsUseExactPolicyAdmission() async throws {
+            for change in QueuedSessionAdminPolicyChange.scopeRequestCases {
+                try await assertQueuedSessionAdminPolicy(change, rename: false)
+            }
+        }
+
+        func testQueuedSessionAdminRenamePreservesPolicyAndScopeAuthority() async throws {
+            for change in [QueuedSessionAdminPolicyChange.unchanged, .restricted, .scopeRevoked, .policyChangedAfterProvider] {
+                try await assertQueuedSessionAdminPolicy(change, rename: true)
+            }
+        }
+
+        private enum QueuedSessionAdminPolicyChange: String {
+            case unchanged, rehydrated, restricted, explore, restrictionABA, seededPolicyChange, unrelated, removed, scopeRevoked, policyChangedAfterProvider
+
+            static let scopeRequestCases: [Self] = [
+                .unchanged, .rehydrated, .restricted, .explore, .restrictionABA, .seededPolicyChange, .unrelated, .removed
+            ]
+
+            var rejectsPolicy: Bool {
+                self == .restricted || self == .explore || self == .restrictionABA || self == .seededPolicyChange
+            }
+        }
+
+        @MainActor
+        private struct QueuedSessionAdminAgent {
+            let context: PersistentMCPTestContext
+            let endpoint: PersistentMCPTestEndpoint
+            let runID: UUID
+            let sessionID: UUID
+            let originalName: String
+        }
+
+        private func assertQueuedSessionAdminPolicy(
+            _ change: QueuedSessionAdminPolicyChange,
+            rename: Bool
+        ) async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime
+                )
+                let manager = fixture.networkManager
+                let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+                let gate = MCPQueuedPolicyAdmissionGate()
+                var agents: [QueuedSessionAdminAgent] = []
+                var pendingCall: Task<PersistentMCPTestRPCResponse, Error>?
+                var removalTask: Task<Void, Never>?
+                var failure: Error?
+
+                @MainActor
+                func cleanup() async throws {
+                    await manager.debugSetAfterConnectionCallPermitAcquiredForTesting(nil)
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await gate.release()
+                    pendingCall?.cancel()
+                    if let pendingCall { _ = try? await pendingCall.value }
+                    await removalTask?.value
+                    for agent in agents {
+                        MCPLifecycleDiagnostics.shared.endCapture(connectionID: agent.endpoint.connectionID)
+                        for request in scopes.pendingRequests(forTab: agent.context.tabID, sessionID: agent.sessionID) {
+                            _ = scopes.withdrawRequest(id: request.id, requesterSessionID: agent.sessionID)
+                        }
+                        scopes.revokeAll(involving: agent.sessionID)
+                        await manager.clearClientConnectionPolicy(
+                            for: agent.endpoint.clientName, windowID: agent.context.window.windowID, runID: agent.runID
+                        )
+                        await Self.cleanupEndpoint(agent.endpoint, manager: manager)
+                        await manager.cleanupRunRoutingState(for: agent.runID, windowID: agent.context.window.windowID)
+                    }
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+
+                do {
+                    let a = try await Self.prepareQueuedSessionAdminAgent(fixture, context: fixture.contextA)
+                    agents.append(a)
+                    let b = try await Self.prepareQueuedSessionAdminAgent(fixture, context: fixture.contextB)
+                    agents.append(b)
+                    XCTAssertTrue(scopes.pendingRequests(forTab: a.context.tabID, sessionID: a.sessionID).isEmpty)
+                    XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID))
+                    var scopeID: UUID?
+                    if rename {
+                        // Cross the real service for the request, then the real card's explicit
+                        // presentation check for approval. The test never invents an authority lease.
+                        let requested = try await Self.toolResultObject(a.endpoint.callTool(
+                            name: MCPWindowToolName.sessionAdmin,
+                            arguments: Self.queuedScopeRequestArguments(a, key: "approval-\(UUID())")
+                        ))
+                        XCTAssertEqual(requested["result"] as? String, "pending_user_approval")
+                        let requestID = try XCTUnwrap((requested["request_id"] as? String).flatMap(UUID.init(uuidString:)))
+                        let grant = try scopes.approve(
+                            requestID: requestID, presentedWindowID: a.context.window.windowID,
+                            presentedTabID: a.context.tabID, presentedSessionID: a.sessionID,
+                            capabilities: [.observe, .organize]
+                        ).get()
+                        scopeID = grant.id
+                    }
+                    var arguments = Self.queuedScopeRequestArguments(a, key: "queued-\(UUID())")
+                    if rename {
+                        arguments = try [
+                            "op": "rename", "session_id": a.sessionID.uuidString,
+                            "scope_id": XCTUnwrap(scopeID).uuidString,
+                            "name": "Renamed by admitted policy", "idempotency_key": "rename-\(UUID())",
+                            "_rawJSON": true
+                        ]
+                    }
+                    let callArguments = arguments
+                    let entered = expectation(description: "\(change.rawValue) reached its exact policy-change boundary")
+                    let removalStarted = change == .removed
+                        ? expectation(description: "Exact connection removal crossed its terminal fence") : nil
+                    MCPLifecycleDiagnostics.shared.beginCapture(connectionID: a.endpoint.connectionID) { event in
+                        if event.phase == .removalStarted { removalStarted?.fulfill() }
+                    }
+                    if change == .policyChangedAfterProvider {
+                        await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
+                            guard connectionID == a.endpoint.connectionID, toolName == MCPWindowToolName.sessionAdmin else { return }
+                            await gate.hold { entered.fulfill() }
+                        }
+                    } else {
+                        await manager.debugSetAfterConnectionCallPermitAcquiredForTesting { connectionID in
+                            guard connectionID == a.endpoint.connectionID else { return }
+                            await gate.hold { entered.fulfill() }
+                        }
+                    }
+                    let call = Task {
+                        try await a.endpoint.callTool(name: MCPWindowToolName.sessionAdmin, arguments: callArguments)
+                    }
+                    pendingCall = call
+                    await fulfillment(of: [entered], timeout: 5)
+                    // Fail before changing policy if the intended queue boundary was not reached.
+                    let held = await gate.isHolding
+                    XCTAssertTrue(held, change.rawValue)
+                    guard held else { throw MCPQueuedPolicyFixtureError.admissionNotReached }
+                    XCTAssertEqual(
+                        MCPLifecycleDiagnostics.shared.snapshot(connectionID: a.endpoint.connectionID)
+                            .contains { $0.phase == .providerEntered },
+                        change == .policyChangedAfterProvider,
+                        change.rawValue
+                    )
+
+                    if change == .policyChangedAfterProvider {
+                        XCTAssertEqual(a.context.window.workspaceManager.activeWorkspace?.composeTabs.first {
+                            $0.id == a.context.tabID
+                        }?.name, "Renamed by admitted policy", "The receipt control changes policy only after the real effect")
+                    }
+                    switch change {
+                    case .unchanged:
+                        break
+                    case .rehydrated:
+                        let restored = await manager.rehydrateRunTabContextForConnectionIfPossible(a.endpoint.connectionID)
+                        XCTAssertTrue(restored, "The positive control must execute the real cached policy rehydration path")
+                    case .restricted, .restrictionABA, .policyChangedAfterProvider:
+                        await Self.renewQueuedSessionAdminPolicy(a, restricted: true)
+                        let withdrawn = await manager.debugRunPolicyState(for: a.runID)
+                        XCTAssertTrue(try XCTUnwrap(withdrawn).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                        if change == .restrictionABA {
+                            await Self.renewQueuedSessionAdminPolicy(a)
+                            let restored = await manager.debugRunPolicyState(for: a.runID)
+                            XCTAssertFalse(try XCTUnwrap(restored).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                        }
+                    case .explore:
+                        await Self.renewQueuedSessionAdminPolicy(a, explore: true)
+                        let current = await manager.debugEffectivePolicyState(for: a.endpoint.connectionID)
+                        XCTAssertEqual(current.taskLabelKind, .explore)
+                    case .seededPolicyChange:
+                        let sampled = await manager.debugRunPolicyState(for: a.runID)
+                        let cached = try XCTUnwrap(sampled)
+                        // Existing seed owner defaults allowsAgentExternalControlTools to false.
+                        // This changes semantic run policy without reinstalling or advancing the
+                        // run routing generation; all visible routing and tool sets stay the same.
+                        await manager.debugSeedRunPolicyState(
+                            runID: a.runID, windowID: cached.windowID, workspaceID: cached.workspaceID,
+                            tabID: a.context.tabID, restrictedTools: cached.restrictedTools,
+                            additionalTools: cached.additionalTools, purpose: cached.purpose
+                        )
+                    case .unrelated:
+                        await Self.renewQueuedSessionAdminPolicy(b, restricted: true)
+                        let changedB = await manager.debugRunPolicyState(for: b.runID)
+                        let unchangedA = await manager.debugRunPolicyState(for: a.runID)
+                        XCTAssertTrue(try XCTUnwrap(changedB).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                        XCTAssertFalse(try XCTUnwrap(unchangedA).restrictedTools.contains(MCPWindowToolName.sessionAdmin))
+                    case .removed:
+                        removalTask = Task { await manager.debugRemoveConnection(a.endpoint.connectionID) }
+                        try await fulfillment(of: [XCTUnwrap(removalStarted)], timeout: 5)
+                    case .scopeRevoked:
+                        try scopes.revoke(scopeID: XCTUnwrap(scopeID))
+                        XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID))
+                    }
+                    if change != .removed {
+                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                        let current = await manager.debugRunPolicyState(for: a.runID)
+                        XCTAssertEqual(try XCTUnwrap(current).purpose, .agentModeRun)
+                    }
+                    await gate.release()
+                    if change == .removed {
+                        // Removal closes the actual socket. It need not deliver a tool result.
+                        do {
+                            let response = try await call.value
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["code"] as? String, "tool_execution_connection_terminal")
+                        } catch PersistentMCPTestSocketClient.ClientError.closed {
+                            // Exact connection teardown is the expected alternative.
+                        }
+                    } else {
+                        let response = try await call.value
+                        if change.rejectsPolicy {
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["code"] as? String, "tool_execution_policy_changed", change.rawValue)
+                        } else if change == .scopeRevoked {
+                            // Revocation remains a domain denial even though MCP policy is unchanged.
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["result"] as? String, "denied", response.rawJSON)
+                            XCTAssertEqual(object["code"] as? String, "scope_revoked", response.rawJSON)
+                        } else {
+                            let object = try Self.toolResultObject(response)
+                            XCTAssertEqual(object["result"] as? String, rename ? "applied" : "pending_user_approval", change.rawValue)
+                            if rename {
+                                XCTAssertEqual(object["changed_count"] as? Int, 1)
+                            } else {
+                                let requestID = try XCTUnwrap((object["request_id"] as? String).flatMap(UUID.init(uuidString:)))
+                                XCTAssertEqual(scopes.pendingRequests(forTab: a.context.tabID, sessionID: a.sessionID).map(\.id), [requestID])
+                            }
+                        }
+                    }
+                    pendingCall = nil
+                    let enteredProvider = MCPLifecycleDiagnostics.shared.snapshot(connectionID: a.endpoint.connectionID)
+                        .filter { $0.phase == .providerEntered }
+                    XCTAssertEqual(enteredProvider.count, change.rejectsPolicy || change == .removed ? 0 : 1, change.rawValue)
+                    if rename {
+                        let tab = try XCTUnwrap(a.context.window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == a.context.tabID })
+                        XCTAssertEqual(tab.name, change == .unchanged || change == .policyChangedAfterProvider ? "Renamed by admitted policy" : a.originalName, change.rawValue)
+                        XCTAssertEqual(tab.activeAgentSessionID, a.sessionID)
+                    } else {
+                        XCTAssertFalse(scopes.hasLiveScope(grantedTo: a.sessionID), "Discovery never approves a scope")
+                        if change.rejectsPolicy || change == .removed {
+                            XCTAssertTrue(scopes.pendingRequests(forTab: a.context.tabID, sessionID: a.sessionID).isEmpty, change.rawValue)
+                        }
+                    }
+                    await manager.debugSetAfterConnectionCallPermitAcquiredForTesting(nil)
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    if change != .removed {
+                        let read = try await a.endpoint.callTool(
+                            name: MCPWindowToolName.readFile, arguments: ["path": a.context.fileURL.path]
+                        )
+                        XCTAssertTrue(try Self.toolResultText(read).contains(a.context.sentinel), "Policy denial must preserve this connection's allowed reads")
+                        XCTAssertEqual(a.context.window.mcpServer.connectionIDByRunID[a.runID], a.endpoint.connectionID)
+                    }
+                } catch {
+                    failure = error
+                }
+                do { try await cleanup() } catch {
+                    if failure == nil { failure = error }
+                }
+                if let failure { throw failure }
+            }
+        }
+
+        private static func queuedScopeRequestArguments(_ agent: QueuedSessionAdminAgent, key: String) -> [String: Any] {
+            [
+                "op": "request_scope", "kind": "workspace", "workspace": agent.context.workspaceID.uuidString,
+                "capabilities": ["observe", "organize"], "idempotency_key": key, "_rawJSON": true
+            ]
+        }
+
+        private static func renewQueuedSessionAdminPolicy(
+            _ agent: QueuedSessionAdminAgent, restricted: Bool = false, explore: Bool = false
+        ) async {
+            await ServerNetworkManager.shared.installClientConnectionPolicy(
+                for: agent.endpoint.clientName, windowID: agent.context.window.windowID,
+                restrictedTools: restricted ? [MCPWindowToolName.sessionAdmin] : [],
+                reason: "Queued session administration regression", ttl: 60,
+                tabID: agent.context.tabID, runID: agent.runID, additionalTools: [], purpose: .agentModeRun,
+                taskLabelKind: explore ? .explore : nil, allowsAgentExternalControlTools: true
+            )
+        }
+
+        private static func prepareQueuedSessionAdminAgent(
+            _ fixture: PersistentMCPTestFixture, context: PersistentMCPTestContext
+        ) async throws -> QueuedSessionAdminAgent {
+            try await fixture.registerDomainWorkspace(context)
+            try await activateWorkspace(for: context)
+            let window = context.window
+            let vm = window.agentModeViewModel
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tab = try XCTUnwrap(workspace.composeTabs.first { $0.id == context.tabID })
+            let session = vm.session(for: context.tabID)
+            let sessionID = UUID()
+            // Install runtime and carrier together. Prewriting the carrier would conflict
+            // with a runtime already materialized by workspace activation.
+            _ = try XCTUnwrap(vm.test_installPersistentSessionBinding(
+                sessionID: sessionID, on: session, compareAndSetInWorkspaceID: workspace.id
+            ))
+            let boundWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            XCTAssertEqual(boundWorkspace.composeTabs.first { $0.id == context.tabID }?.activeAgentSessionID, sessionID)
+            window.promptManager.loadComposeTabsFromWorkspace(boundWorkspace, syncPromptText: true)
+            let name = tab.name
+            let entry = AgentSessionIndexEntry(
+                id: sessionID, tabID: context.tabID, name: name, savedAt: Date(timeIntervalSince1970: 0),
+                itemCount: 0, autoEditEnabled: false, hasUnknownConversationContent: false,
+                isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+            )
+            let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+            vm.test_installSessionIndexSnapshot([sessionID: entry], owner: owner, latestOwner: owner, activeWorkspace: boundWorkspace)
+            session.selectedAgent = .claudeCode
+            session.hasLoadedPersistedState = true
+            session.oversight.autoWakeOnUpdates = false
+            // This fixture starts at an explicitly restored session; it does not model
+            // fresh creation or use a missing payload as evidence of a new session.
+            session.recordRestorationAuthoritative(.persistedPayloadApplied)
+            XCTAssertTrue(session.permitsBoundOperationAndSave)
+            XCTAssertEqual(vm.mcpSpawnParentSessionID(sourceTabID: context.tabID), sessionID)
+            let runID = UUID()
+            session.installRunID(runID)
+            WindowStatesManager.shared.attachAgentSessionLinkBridge()
+            let clientName = "queued-policy-\(UUID())"
+            await fixture.networkManager.installClientConnectionPolicy(
+                for: clientName, windowID: window.windowID, restrictedTools: [],
+                reason: "Queued session administration fixture", ttl: 60,
+                tabID: context.tabID, runID: runID, additionalTools: [], purpose: .agentModeRun,
+                allowsAgentExternalControlTools: true
+            )
+            let endpoint = try await PersistentMCPTestEndpoint.make(
+                label: "queued-policy", networkManager: fixture.networkManager, clientName: clientName,
+                requiredToolNames: [MCPWindowToolName.sessionAdmin, MCPWindowToolName.readFile]
+            )
+            XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], endpoint.connectionID)
+            let resolved = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: context.tabID)
+            XCTAssertEqual(resolved.sessionID, sessionID)
+            return QueuedSessionAdminAgent(context: context, endpoint: endpoint, runID: runID, sessionID: sessionID, originalName: name)
         }
 
         func testExpiredClientEnvelopeRejectsBeforeProviderAndJournalForBothPublicTools() async throws {
@@ -535,6 +1237,17 @@ import XCTest
                     let observerProbe = MCPToolEventObserverProbe()
                     let recorder = MCPExecutionTraceRecorder()
                     let operationID = "provider-entry-cancellation-\(toolName)-\(UUID().uuidString)"
+                    let invocationProbe = PR4CanonicalInvocationProbe()
+                    let installationEntered = expectation(description: "canonical provider entry owns installation gap")
+                    let physicalProviderEntered = expectation(description: "physical provider reached pre-write continuation")
+                    let installationCancelled = expectation(description: "request cancelled inside installation gap")
+                    let watchdogCancelled = expectation(description: "watchdog retained request cancellation")
+                    let settlementPublished = expectation(description: "physical cancellation settlement published once")
+                    let providerResumed = expectation(description: "cancelled physical provider resumed its continuation")
+                    let siblingGate = MCPExecutionIgnoringCancellationGate()
+                    let siblingParked = expectation(description: "canonical sibling remains parked during cancellation settlement")
+                    var siblingEndpoint: PersistentMCPTestEndpoint?
+                    var siblingTask: Task<PersistentMCPTestRPCResponse, Error>?
                     let exportURL = context.rootURL.appendingPathComponent("\(operationID).md")
                     let runID = UUID()
                     let initialHostActiveInvocationCount = await domainHost.snapshot().activeInvocationCount
@@ -551,6 +1264,17 @@ import XCTest
                             _ = try? await responseTask.value
                         }
                         await manager.debugSetAfterPromptExportProviderEntryForTesting(nil)
+                        await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                        await siblingGate.release()
+                        if let siblingTask {
+                            siblingTask.cancel()
+                            _ = try? await siblingTask.value
+                        }
+                        if let siblingEndpoint {
+                            MCPLifecycleDiagnostics.shared.endCapture(connectionID: siblingEndpoint.connectionID)
+                            await manager.clearClientConnectionPolicy(for: siblingEndpoint.clientName)
+                            await Self.cleanupEndpoint(siblingEndpoint, manager: manager)
+                        }
                         MCPAppPhysicalCapabilityAdapters.setPromptExportPhaseHookForTesting(nil)
                         MCPToolExecutionTracer.setTestSink(nil)
                         if let observerToken {
@@ -592,17 +1316,34 @@ import XCTest
                             guard hookedConnectionID == connectionID,
                                   hookedToolName == toolName
                             else { return }
+                            installationEntered.fulfill()
                             await watchdogInstallationGate.enterAndWait()
                             // This hook runs inline on the server handler, placing cancellation
                             // after provider entry and before watchdog construction.
                             withUnsafeCurrentTask { $0?.cancel() }
                             await cancellationProbe.recordEntry()
+                            installationCancelled.fulfill()
                         }
                         MCPAppPhysicalCapabilityAdapters.setPromptExportPhaseHookForTesting { phase in
                             guard phase == .beforeDurableWrite else { return }
+                            MainActor.assertIsolated()
+                            invocationProbe.capture(toolName: toolName, windowID: context.window.windowID)
+                            physicalProviderEntered.fulfill()
                             await providerGate.enterAndWait()
+                            invocationProbe.capture(toolName: toolName, windowID: context.window.windowID)
+                            providerResumed.fulfill()
                         }
-                        MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                        MCPToolExecutionTracer.setTestSink { event in
+                            recorder.append(event)
+                            guard event.connectionID == connectionID,
+                                  event.toolName == toolName,
+                                  event.cancellationOrigin == .requestCancellation
+                            else { return }
+                            if event.phase == .cancellationRequested { watchdogCancelled.fulfill() }
+                            if event.phase == .handlerCompleted,
+                               event.cancellationOutcome == MCPToolExecutionSettlement.cancellation.rawValue
+                            { settlementPublished.fulfill() }
+                        }
                         await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
 
                         let activeResponseTask = Task {
@@ -612,31 +1353,57 @@ import XCTest
                                     "op": "export",
                                     "path": exportURL.path,
                                     "operation_id": operationID,
+                                    "context_id": context.tabID.uuidString,
                                     "_rawJSON": true
                                 ]
                             )
                         }
                         responseTask = activeResponseTask
-                        try await watchdogInstallationGate.waitUntilEntered(count: 1)
-                        try await providerGate.waitUntilEntered(count: 1)
+                        await fulfillment(of: [installationEntered, physicalProviderEntered], timeout: 5)
                         let preWatchdogSleeperCount = await clock.sleeperCount()
                         XCTAssertEqual(preWatchdogSleeperCount, 0)
+                        XCTAssertTrue(invocationProbe.failures().isEmpty)
+                        let admittedPacket = try XCTUnwrap(invocationProbe.packets().first)
+                        switch admittedPacket.origin {
+                        case .network: break
+                        case .trustedLocal: XCTFail("Physical export must retain the admitted network packet")
+                        }
+                        XCTAssertEqual(admittedPacket.connectionID, connectionID)
+                        XCTAssertEqual(admittedPacket.toolName, toolName)
+                        XCTAssertEqual(admittedPacket.metadata.invocationID, admittedPacket.invocationID)
+                        XCTAssertEqual(admittedPacket.metadata.clientName, endpoint.clientName)
+                        XCTAssertEqual(admittedPacket.metadata.windowID, context.window.windowID)
+                        XCTAssertEqual(admittedPacket.metadata.tabContextHint?.tabID, context.tabID)
+                        XCTAssertEqual(admittedPacket.metadata.tabContextHint?.workspaceID, context.workspaceID)
+                        XCTAssertEqual(admittedPacket.dispatchAuthorization?.connectionID, connectionID)
+                        let sibling = try await PersistentMCPTestEndpoint.make(
+                            label: "pr4-post-entry-sibling-\(toolName)", networkManager: manager
+                        )
+                        siblingEndpoint = sibling
+                        try await Self.prepareCanonicalReadFixture(
+                            fixture, endpoint: sibling, context: fixture.contextB
+                        )
+                        MCPLifecycleDiagnostics.shared.beginCapture(connectionID: sibling.connectionID)
+                        await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, observedToolName in
+                            guard connectionID == sibling.connectionID,
+                                  observedToolName == MCPWindowToolName.readFile
+                            else { return }
+                            siblingParked.fulfill()
+                            await siblingGate.enterAndWait()
+                        }
+                        let activeSibling = Task {
+                            try await sibling.callTool(
+                                name: MCPWindowToolName.readFile,
+                                arguments: ["path": fixture.contextB.fileURL.path]
+                            )
+                        }
+                        siblingTask = activeSibling
+                        await fulfillment(of: [siblingParked], timeout: 5)
 
                         await watchdogInstallationGate.release()
-                        let cancellationReachedInstallationGap = await Self.waitUntil {
-                            await cancellationProbe.entryCount() == 1
-                        }
-                        XCTAssertTrue(cancellationReachedInstallationGap)
-
-                        let watchdogOwnedCancellation = await Self.waitUntil {
-                            recorder.snapshot().contains {
-                                $0.connectionID == connectionID
-                                    && $0.toolName == toolName
-                                    && $0.phase == .cancellationRequested
-                                    && $0.cancellationOrigin == .requestCancellation
-                            }
-                        }
-                        XCTAssertTrue(watchdogOwnedCancellation)
+                        await fulfillment(of: [installationCancelled, watchdogCancelled], timeout: 5)
+                        let cancellationReachedInstallationGap = await cancellationProbe.entryCount()
+                        XCTAssertEqual(cancellationReachedInstallationGap, 1)
                         XCTAssertFalse(FileManager.default.fileExists(atPath: exportURL.path))
                         _ = try? await activeResponseTask.value
                         responseTask = nil
@@ -644,33 +1411,24 @@ import XCTest
                         XCTAssertEqual(cancellationCompletionCount, 1)
 
                         await providerGate.release()
+                        await fulfillment(of: [providerResumed], timeout: 5)
+                        XCTAssertTrue(invocationProbe.failures().isEmpty)
+                        XCTAssertEqual(invocationProbe.packets().count, 2)
+                        let resumedPacket = try XCTUnwrap(invocationProbe.packets().last)
+                        Self.assertSameCanonicalPacket(admittedPacket, resumedPacket)
 
-                        let hostDrained = await Self.waitUntil {
-                            await domainHost.snapshot().activeInvocationCount == initialHostActiveInvocationCount
-                        }
-                        XCTAssertTrue(hostDrained)
-                        let settlementPublished = await Self.waitUntil {
-                            recorder.snapshot().contains {
-                                $0.connectionID == connectionID
-                                    && $0.toolName == toolName
-                                    && $0.phase == .handlerCompleted
-                                    && $0.cancellationOrigin == .requestCancellation
-                                    && $0.cancellationOutcome == MCPToolExecutionSettlement.cancellation.rawValue
-                            }
-                        }
-                        XCTAssertTrue(settlementPublished)
+                        await fulfillment(of: [settlementPublished], timeout: 5)
+                        let settledHostActiveCount = await domainHost.snapshot().activeInvocationCount
+                        XCTAssertEqual(settledHostActiveCount, initialHostActiveInvocationCount)
                         let lifecycle = MCPLifecycleDiagnostics.shared.snapshot(connectionID: connectionID)
                         let invocation = try XCTUnwrap(lifecycle.first { $0.phase == .providerEntered }?.invocationID)
+                        XCTAssertEqual(invocation, admittedPacket.invocationID)
                         let phases = lifecycle.filter { $0.invocationID == invocation }.map(\.phase)
                         XCTAssertEqual(phases.count { $0 == .requestCancellation }, 1)
                         XCTAssertEqual(phases.count { $0 == .abandonedSettlement }, 1)
                         XCTAssertTrue(phases.contains(.handlerReturning))
                         XCTAssertLessThan(try XCTUnwrap(phases.firstIndex(of: .providerEntered)), try XCTUnwrap(phases.firstIndex(of: .requestCancellation)))
                         XCTAssertLessThan(try XCTUnwrap(phases.firstIndex(of: .providerReturning)), try XCTUnwrap(phases.firstIndex(of: .abandonedSettlement)))
-                        let completionPublished = await Self.waitUntil {
-                            await observerProbe.completedCount() == 1
-                        }
-                        XCTAssertTrue(completionPublished)
                         let calledCount = await observerProbe.calledCount()
                         let completedCount = await observerProbe.completedCount()
                         XCTAssertEqual(calledCount, 1)
@@ -689,16 +1447,31 @@ import XCTest
                         }
                         XCTAssertEqual(requestCancellationEvents, 1)
                         XCTAssertEqual(settlementEvents, 1)
+                        let siblingStillActive = await manager.hasInFlightCalls(for: sibling.connectionID)
+                        XCTAssertTrue(siblingStillActive)
+                        XCTAssertEqual(
+                            MCPLifecycleDiagnostics.shared.snapshot(connectionID: sibling.connectionID).map(\.phase),
+                            [.requestEntered, .providerEntered, .providerReturning]
+                        )
+                        await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                        await siblingGate.release()
+                        let siblingResponse = try await activeSibling.value
+                        siblingTask = nil
+                        let siblingText = try Self.toolResultText(siblingResponse)
+                        XCTAssertTrue(siblingText.contains(fixture.contextB.sentinel), siblingText)
+                        XCTAssertFalse(siblingText.contains(fixture.contextA.sentinel), siblingText)
+                        XCTAssertEqual(
+                            MCPLifecycleDiagnostics.shared.snapshot(connectionID: sibling.connectionID).map(\.phase),
+                            [.requestEntered, .providerEntered, .providerReturning, .handlerReturning]
+                        )
                         XCTAssertFalse(FileManager.default.fileExists(atPath: exportURL.path))
                         let record = try await Self.journalRecord(operationID: operationID)
                         XCTAssertEqual(
                             record.status.rawValue,
                             DomainMutationJournalStatus.cancelledBeforeCommit.rawValue
                         )
-                        let sleepersDrained = await Self.waitUntil {
-                            await clock.sleeperCount() == 0
-                        }
-                        XCTAssertTrue(sleepersDrained)
+                        let remainingSleepers = await clock.sleeperCount()
+                        XCTAssertEqual(remainingSleepers, 0)
                     } catch {
                         pendingError = error
                     }
@@ -1676,7 +2449,7 @@ import XCTest
                     try await MCPDomainProtectedMutationSettlementContext.$observer.withValue(
                         { settlementProbe.record($0) }
                     ) {
-                        try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+                        try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                             try await protectedBinding([
                                 "op": .string("export"),
                                 "operation_id": .string(operationID)
@@ -3105,6 +3878,30 @@ import XCTest
             "prompt_export.publication:completed"
         ]
 
+        private static func prepareCanonicalReadFixture(
+            _ fixture: PersistentMCPTestFixture,
+            endpoint: PersistentMCPTestEndpoint,
+            context: PersistentMCPTestContext
+        ) async throws {
+            try await fixture.registerDomainWorkspace(context)
+            await fixture.networkManager.debugSetDomainPeerIdentityForTesting(
+                connectionID: endpoint.connectionID,
+                identity: .verified(
+                    processID: Int(getpid()),
+                    fingerprint: "test:verified:pr4-canonical-read"
+                )
+            )
+            try await activateWorkspace(for: context)
+            let bind = try await endpoint.callTool(
+                name: "bind_context",
+                arguments: ["op": "bind", "context_id": context.tabID.uuidString]
+            )
+            let object = try responseObject(from: bind)
+            let result = try XCTUnwrap(object["result"] as? [String: Any])
+            XCTAssertNotEqual(result["isError"] as? Bool, true)
+            await context.window.mcpServer.domainRoutingPublishTask?.value
+        }
+
         private static func prepareProtectedExportFixture(
             _ fixture: PersistentMCPTestFixture,
             endpoint: PersistentMCPTestEndpoint
@@ -3520,6 +4317,33 @@ import XCTest
         }
     }
 
+    private final class PR4CanonicalInvocationProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var capturedPackets: [ToolInvocationContext] = []
+        private var capturedFailures: [MCPInvocationContextFailure] = []
+
+        func capture(toolName: String, windowID: Int) {
+            do {
+                let packet = try MCPInvocationContextBridge.require(toolName: toolName, expectedWindowID: windowID)
+                lock.withLock { capturedPackets.append(packet) }
+            } catch {
+                if let failure = error as? MCPInvocationContextFailure {
+                    lock.withLock { capturedFailures.append(failure) }
+                } else {
+                    XCTFail("Unexpected invocation capture error: \(error)")
+                }
+            }
+        }
+
+        func packets() -> [ToolInvocationContext] {
+            lock.withLock { capturedPackets }
+        }
+
+        func failures() -> [MCPInvocationContextFailure] {
+            lock.withLock { capturedFailures }
+        }
+    }
+
     private final class MCPExecutionTraceRecorder: @unchecked Sendable {
         private let lock = NSLock()
         private var events: [MCPToolExecutionTraceEvent] = []
@@ -3618,6 +4442,36 @@ import XCTest
         func completedCount() -> Int {
             completed
         }
+    }
+
+    /// The entered signal is emitted only after the release continuation exists.
+    /// This deliberately has no polling or sleeps; the caller owns its XCTest deadline.
+    private actor MCPQueuedPolicyAdmissionGate {
+        private var waiter: CheckedContinuation<Void, Never>?
+        private var released = false
+
+        var isHolding: Bool {
+            waiter != nil
+        }
+
+        func hold(onRegistered: @Sendable () -> Void) async {
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                waiter = continuation
+                onRegistered()
+            }
+        }
+
+        func release() {
+            released = true
+            let registered = waiter
+            waiter = nil
+            registered?.resume()
+        }
+    }
+
+    private enum MCPQueuedPolicyFixtureError: Error {
+        case admissionNotReached
     }
 
     actor MCPExecutionIgnoringCancellationGate {
@@ -3839,6 +4693,8 @@ import XCTest
         ) async throws -> PersistentMCPTestFixture {
             _ = lease
             try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            await ServerNetworkManager.shared.installExecutionDiagnosticsSink(AppMCPToolExecutionEventSink())
+            await ServerNetworkManager.shared.installPhaseRecorderFactory(AppMCPToolExecutionHandlerPhaseRecorderFactory())
 
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentMCPDistinctConnectionConcurrencyTests", isDirectory: true)
@@ -4134,6 +4990,8 @@ import XCTest
             label: String,
             networkManager: ServerNetworkManager,
             clientName overrideClientName: String? = nil,
+            useProductionAgentAdmission: Bool = false,
+            sessionToken overrideSessionToken: String? = nil,
             requiredToolNames: Set<String> = [
                 MCPWindowToolName.readFile,
                 MCPWindowToolName.search,
@@ -4141,9 +4999,9 @@ import XCTest
             ]
         ) async throws -> PersistentMCPTestEndpoint {
             let connectionID = UUID()
-            let sessionToken = "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
+            let sessionToken = overrideSessionToken ?? "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
             let clientName = overrideClientName ?? "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
-            await networkManager.debugClearPersistedRoutingState(for: clientName)
+            if !useProductionAgentAdmission { await networkManager.debugClearPersistedRoutingState(for: clientName) }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
                 throw PersistentMCPTestSocketClient.ClientError.posix(operation: "socketpair", code: errno)
@@ -4186,9 +5044,28 @@ import XCTest
                 sessionToken: sessionToken,
                 bootstrapPeerPID: Int(getpid())
             )
+            let catalogChanges = AsyncStream<Void>.makeStream()
+            defer { catalogChanges.continuation.finish() }
+            if useProductionAgentAdmission {
+                client.observeNotifications { data in
+                    if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       object["method"] as? String == "notifications/tools/list_changed"
+                    {
+                        catalogChanges.continuation.yield(())
+                    }
+                }
+            }
             let startTask = Task {
                 try await manager.start { clientInfo in
                     guard clientInfo.name == clientName else { return false }
+                    if useProductionAgentAdmission {
+                        // Substitute only the human socket approval. Readiness, lifecycle,
+                        // run-policy admission and route installation are production-owned.
+                        return await networkManager.debugCompleteApprovedAgentInitialization(
+                            clientName: clientName, connectionID: connectionID,
+                            sessionToken: sessionToken, clientPid: Int(getpid())
+                        )
+                    }
                     _ = await networkManager.debugApplyPendingPolicy(
                         clientName: clientName,
                         connectionID: connectionID,
@@ -4216,7 +5093,25 @@ import XCTest
                 let tools = try await client.request(method: "tools/list", params: [:])
                 let names = try Set(Self.toolNames(from: tools))
                 let missing = requiredToolNames.subtracting(names)
-                guard missing.isEmpty else {
+                if !missing.isEmpty, useProductionAgentAdmission {
+                    // A real MCP client relists on server notifications, not a blind retry.
+                    // Keep the final required-tool assertion strict across held-turn refresh.
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask {
+                            for await _ in catalogChanges.stream {
+                                let refreshed = try await client.request(method: "tools/list", params: [:])
+                                if try requiredToolNames.isSubset(of: Set(Self.toolNames(from: refreshed))) { return }
+                            }
+                            throw ClientFixtureError.requiredToolsMissing(missing.sorted())
+                        }
+                        group.addTask {
+                            try await Task.sleep(for: .seconds(10))
+                            throw ClientFixtureError.requiredToolsMissing(missing.sorted())
+                        }
+                        defer { group.cancelAll() }
+                        _ = try await group.next()
+                    }
+                } else if !missing.isEmpty {
                     throw ClientFixtureError.requiredToolsMissing(missing.sorted())
                 }
                 return endpoint
@@ -4225,7 +5120,7 @@ import XCTest
                 client.close()
                 await manager.stop()
                 await networkManager.debugRemoveConnection(connectionID)
-                await networkManager.debugClearPersistedRoutingState(for: clientName)
+                if !useProductionAgentAdmission { await networkManager.debugClearPersistedRoutingState(for: clientName) }
                 _ = try? await startTask.value
                 throw error
             }
@@ -4284,6 +5179,11 @@ import XCTest
         private var responseInterceptors: [Int: @Sendable (String) async throws -> String] = [:]
         private var interceptingResponses: [Int: InterceptingResponse] = [:]
         private var isClosed = false
+        private var notificationObserver: (@Sendable (Data) -> Void)?
+
+        func observeNotifications(_ observer: @escaping @Sendable (Data) -> Void) {
+            withStateLock { notificationObserver = observer }
+        }
 
         init(fd: Int32) {
             self.fd = fd
@@ -4492,6 +5392,8 @@ import XCTest
                 guard object["method"] as? String != nil else {
                     throw ClientError.invalidResponse
                 }
+                let observer = withStateLock { notificationObserver }
+                observer?(line)
                 return true
             } catch {
                 close(with: error)

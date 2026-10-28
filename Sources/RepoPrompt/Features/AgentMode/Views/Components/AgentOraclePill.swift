@@ -1,4 +1,6 @@
 import AppKit
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - Oracle Pill
@@ -91,12 +93,7 @@ enum AgentOraclePillLogic {
             let sameAgentLegacyRunMatches = renderable.filter { matchesAgent($0) && $0.agentModeSessionID != nil && $0.agentModeRunID == nil }
             if !sameAgentLegacyRunMatches.isEmpty { return sameAgentLegacyRunMatches }
 
-            if let activeAgentSessionID,
-               renderable.contains(where: { $0.agentModeSessionID == activeAgentSessionID })
-            {
-                return []
-            }
-            return renderable.filter(isUnownedLegacy)
+            // A new process run must not hide completed Oracle results from the same agent session.
         }
 
         if let activeAgentSessionID {
@@ -195,40 +192,12 @@ enum AgentOraclePillLogic {
         guard matches.count == 1 else { return nil }
         return matches[0]
     }
-
-    enum LaneDotState: Equatable {
-        case streaming
-        case failed
-        case completed
-    }
-
-    static func lastAssistantContent(
-        liveMessages: [AIChatMessage],
-        storedMessages: [StoredMessage]
-    ) -> String? {
-        if let last = liveMessages.last(where: { !$0.isUser }) {
-            return last.content
-        }
-        return storedMessages.last(where: { !$0.isUser })?.rawText
-    }
-
-    static func assistantContentIndicatesFailure(_ content: String?) -> Bool {
-        guard let content else { return false }
-        if content.contains("\n--\nError:\n") { return true }
-        let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.hasPrefix("Error:")
-    }
-
-    static func laneDotState(isStreaming: Bool, lastAssistantContent: String?) -> LaneDotState {
-        if isStreaming { return .streaming }
-        if assistantContentIndicatesFailure(lastAssistantContent) { return .failed }
-        return .completed
-    }
 }
 
 /// Pill that appears when there are oracle chat sessions for the current tab.
 /// More prominent when streaming. Clicking opens a wide popover with chat transcript.
 struct AgentOraclePill: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @ObservedObject var oracleViewModel: OracleViewModel
     let windowID: Int
     let currentTabID: UUID?
@@ -319,17 +288,17 @@ struct AgentOraclePill: View {
         return session.name
     }
 
+    func memberDotState(for session: ChatSession) -> OracleMemberPresentation.Status {
+        oracleViewModel.oracleMemberPresentation(for: session).status
+    }
+
     private func laneDotColor(for session: ChatSession) -> Color {
-        switch AgentOraclePillLogic.laneDotState(
-            isStreaming: oracleViewModel.streamingSessions.contains(session.id),
-            lastAssistantContent: AgentOraclePillLogic.lastAssistantContent(
-                liveMessages: oracleViewModel.messagesSnapshot(for: session.id),
-                storedMessages: session.messages
-            )
-        ) {
+        switch memberDotState(for: session) {
         case .streaming: Color.purple
         case .failed: Color.red
         case .completed: Color.green
+        case .cancelled: Color.orange
+        case .unknown: Color.secondary
         }
     }
 
@@ -339,7 +308,7 @@ struct AgentOraclePill: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.oracle")
+            let _ = perfRecorder.increment("ui.body.statusPills.oracle")
         #endif
         Group {
             if hasAnySessions {
@@ -475,6 +444,8 @@ struct AgentOraclePill: View {
                     HStack(spacing: 6) {
                         ForEach(members) { member in
                             let laneIndex = member.oracleLaneIndex ?? 0
+                            let status = oracleViewModel.oracleMemberPresentation(for: member)
+                            let label = OracleViewModel.oracleLabel(laneIndex: laneIndex)
                             Button {
                                 openRequestGeneration &+= 1
                                 present(
@@ -488,14 +459,24 @@ struct AgentOraclePill: View {
                                     Circle()
                                         .fill(laneDotColor(for: member))
                                         .frame(width: 6, height: 6)
-                                    Text(OracleViewModel.oracleLabel(laneIndex: laneIndex))
+                                    Text("\(label) · \(status.status.rawValue)")
                                         .lineLimit(1)
                                 }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
-                            .hoverTooltip(member.oracleModelRaw ?? "Oracle model")
+                            .accessibilityLabel("\(label): \(status.status.rawValue)")
+                            .hoverTooltip(
+                                [member.oracleModelRaw, status.status.rawValue, status.errorMessage]
+                                    .compactMap(\.self).joined(separator: "\n")
+                            )
                         }
+                    }
+                    if let errorMessage = oracleViewModel.oracleMemberPresentation(for: presented).errorMessage {
+                        Text(errorMessage)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
                 }
             }
@@ -568,12 +549,20 @@ struct AgentOraclePill: View {
         actionPolicy: ChatTranscriptActionPolicy,
         generation: UInt64
     ) {
+        let session = currentTabSessions.first { $0.id == sessionID }
+        let previousKey = presentedPopover.flatMap { presentedSession(for: $0) }
+            .flatMap(OracleGroupPresentation.Key.init(session:))
+        let nextKey = session.flatMap(OracleGroupPresentation.Key.init(session:))
+        let shouldLoad = presentedPopover == nil || previousKey != nextKey
         presentedPopover = PopoverPresentation(
             id: generation,
             sessionID: sessionID,
             isExplicit: isExplicit,
             actionPolicy: actionPolicy
         )
+        if shouldLoad, nextKey != nil, let session {
+            Task { await oracleViewModel.loadOracleGroupPresentation(containing: session) }
+        }
     }
 
     private func openLatestStreamingPopover() {

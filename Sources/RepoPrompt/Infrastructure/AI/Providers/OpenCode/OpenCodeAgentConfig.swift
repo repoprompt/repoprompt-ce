@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Configuration for the OpenCode ACP agent provider.
 ///

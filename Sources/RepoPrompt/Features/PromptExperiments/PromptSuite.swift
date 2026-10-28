@@ -160,7 +160,7 @@ enum PromptSuiteValidationError: Error, Equatable, LocalizedError {
 enum PromptSuiteLoader {
     static func load(
         promptID: BuiltInPromptID,
-        registry: BuiltInPromptRegistry = .shared
+        registry: BuiltInPromptRegistry = AppDomainRuntimeComposition.shared.builtInPromptRegistry
     ) throws -> PromptSuite {
         let directory = try registry.directory(for: promptID)
         let url = directory.appendingPathComponent(PromptSuite.fileName)

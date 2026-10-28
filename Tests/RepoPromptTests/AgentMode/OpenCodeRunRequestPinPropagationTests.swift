@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 /// Guards the ACP run-request builder against being re-narrowed to Cursor.
@@ -8,6 +9,11 @@ import XCTest
 /// pins: the run started fine, the pin simply never reached `session/set_config_option`. Nothing
 /// failed loudly, so only a test at this boundary catches a regression.
 final class OpenCodeRunRequestPinPropagationTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     @MainActor
     func testRunRequestCarriesEffortPinForNonCursorACPProvider() throws {
         let modelRaw = "ollama-cloud/glm-5.3"

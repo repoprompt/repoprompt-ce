@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 struct ACPDynamicModelRecord: Codable, Hashable {
     let rawValue: String
@@ -11,6 +12,7 @@ struct ACPDynamicModelRecord: Codable, Hashable {
     /// Variant provenance for synthesized effort options. Optional so records persisted
     /// before effort support decode unchanged.
     var effortVariant: AgentModelEffortVariant? = nil
+    var contextWindowTokens: Int? = nil
 }
 
 struct ACPDynamicProviderRecord: Codable, Hashable {
@@ -28,7 +30,7 @@ struct ACPDynamicProviderRecord: Codable, Hashable {
         currentModelRaw: String?,
         currentEffortRaw: String? = nil,
         options: [ACPDynamicModelRecord],
-        modelParameterSets: [ACPModelParameterSet] = []
+        modelParameterSets: [ACPModelParameterSet]? = []
     ) {
         self.providerID = providerID
         self.currentModelRaw = currentModelRaw
@@ -105,7 +107,8 @@ enum ACPDynamicModelStore {
             currentModelRaw: normalizedCurrentModelRaw(snapshot.currentModelRaw, options: options),
             currentEffortRaw: snapshot.currentEffortRaw,
             options: options,
-            modelParameterSets: canonicalParameterSets(snapshot.modelParameterSets, options: options)
+            modelParameterSets: snapshot.hasModelParameterMetadata
+                ? canonicalParameterSets(snapshot.modelParameterSets, options: options) : nil
         )
     }
 
@@ -117,7 +120,8 @@ enum ACPDynamicModelStore {
             options: options,
             currentModelRaw: currentModelRaw,
             currentEffortRaw: record.currentEffortRaw,
-            modelParameterSets: canonicalParameterSets(record.modelParameterSets ?? [], options: record.options)
+            modelParameterSets: canonicalParameterSets(record.modelParameterSets ?? [], options: record.options),
+            hasModelParameterMetadata: record.modelParameterSets != nil
         )
     }
 
@@ -197,7 +201,10 @@ enum ACPDynamicModelStore {
         guard !rawValue.isEmpty else { return nil }
         let displayName = option.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         let description = normalizedOptionalString(option.description)
-        let supportedReasoningEfforts = normalizedReasoningEffortRaws(option.supportedReasoningEfforts)
+        let supportedReasoningEfforts = normalizedRawEffortValues(
+            option.supportedReasoningEffortRawValues
+                + normalizedReasoningEffortRaws(option.supportedReasoningEfforts)
+        )
         return ACPDynamicModelRecord(
             rawValue: rawValue,
             displayName: displayName.isEmpty ? rawValue : displayName,
@@ -205,8 +212,9 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: option.isPlaceholderDefault,
             isProviderDefault: option.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
-            defaultReasoningEffort: option.defaultReasoningEffort?.rawValue,
-            effortVariant: option.effortVariant
+            defaultReasoningEffort: option.defaultReasoningEffortRawValue ?? option.defaultReasoningEffort?.rawValue,
+            effortVariant: option.effortVariant,
+            contextWindowTokens: option.contextWindowTokens
         )
     }
 
@@ -223,8 +231,13 @@ enum ACPDynamicModelStore {
             isPlaceholderDefault: record.isPlaceholderDefault,
             isProviderDefault: record.isProviderDefault,
             supportedReasoningEfforts: supportedReasoningEfforts,
+            supportedReasoningEffortRawValues: normalizedRawEffortValues(
+                record.supportedReasoningEfforts + [record.defaultReasoningEffort].compactMap(\.self)
+            ),
             defaultReasoningEffort: CodexReasoningEffort.parse(record.defaultReasoningEffort),
-            effortVariant: record.effortVariant
+            defaultReasoningEffortRawValue: record.defaultReasoningEffort,
+            effortVariant: record.effortVariant,
+            contextWindowTokens: record.contextWindowTokens
         )
     }
 
@@ -265,9 +278,9 @@ enum ACPDynamicModelStore {
     ) -> ACPDynamicModelRecord {
         let metadataRecord = preferredMetadataRecord(existing, candidate)
         let fallbackRecord = metadataRecord == existing ? candidate : existing
-        let supportedReasoningEfforts = normalizedReasoningEfforts(
+        let supportedReasoningEfforts = normalizedRawEffortValues(
             existing.supportedReasoningEfforts + candidate.supportedReasoningEfforts
-        ).map(\.rawValue)
+        )
         return ACPDynamicModelRecord(
             rawValue: preferredRawValue(existing.rawValue, candidate.rawValue),
             displayName: metadataRecord.displayName,
@@ -278,7 +291,8 @@ enum ACPDynamicModelStore {
             defaultReasoningEffort: metadataRecord.defaultReasoningEffort ?? fallbackRecord.defaultReasoningEffort,
             // Variant provenance is semantic identity, not metadata: keep it only when both
             // records agree, so a real base (nil) never inherits stale variant provenance.
-            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil
+            effortVariant: existing.effortVariant == candidate.effortVariant ? existing.effortVariant : nil,
+            contextWindowTokens: metadataRecord.contextWindowTokens ?? fallbackRecord.contextWindowTokens
         )
     }
 
@@ -338,6 +352,13 @@ enum ACPDynamicModelStore {
         return trimmed
     }
 
+    private static func normalizedRawEffortValues(_ efforts: [String]) -> [String] {
+        var seen: Set<String> = []
+        return efforts.filter {
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && seen.insert($0).inserted
+        }
+    }
+
     private static func normalizedReasoningEffortRaws(_ efforts: [CodexReasoningEffort]) -> [String] {
         let unique = Set(efforts)
         return CodexReasoningEffort.displayOrder
@@ -378,7 +399,7 @@ enum ACPAIModelCatalog {
     }
 
     static func devinModelOptionsFromStore() -> [AgentModelOption] {
-        AgentACPModelRegistry.shared.resolvedSnapshot(for: .devin)?.options ?? []
+        DevinModelCatalog.current.entries.map(\.option)
     }
 
     static func devinModelsFromStore() -> [AIModel] {
@@ -422,9 +443,7 @@ enum ACPAIModelCatalog {
             .replacingOccurrences(of: " ", with: "-")
     }
 
-    /// Cursor discovery remains runtime authority for applying a selected model and
-    /// its parameters, but is deliberately not picker authority. The release-gated
-    /// catalog makes the non-Agent picker immediately available without an ACP session.
+    /// All Cursor surfaces use the same discovered membership, with Auto before discovery.
     private static func cursorModelOptionsForPicker() -> [AgentModelOption] {
         CursorAIModelCatalog.options
     }

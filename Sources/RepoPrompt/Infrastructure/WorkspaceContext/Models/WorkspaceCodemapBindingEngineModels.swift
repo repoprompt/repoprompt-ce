@@ -1,5 +1,8 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptPersistence
+import RepoPromptVCS
 
 #if !DEBUG
     struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {}
@@ -240,7 +243,7 @@ struct WorkspaceCodemapManifestWriterRetryWaiter {
 }
 
 struct WorkspaceCodemapBindingRootRegistration: Equatable {
-    let capabilityRequest: WorkspaceCodemapGitCapabilityRequest
+    let capabilityRequest: WorkspaceCodemapRootCapabilityRequest
     let catalogGeneration: UInt64
     let ingressGeneration: UInt64
 
@@ -251,7 +254,7 @@ struct WorkspaceCodemapBindingRootRegistration: Equatable {
         catalogGeneration: UInt64,
         ingressGeneration: UInt64
     ) {
-        capabilityRequest = WorkspaceCodemapGitCapabilityRequest(
+        capabilityRequest = WorkspaceCodemapRootCapabilityRequest(
             rootID: rootID,
             rootLifetimeID: rootLifetimeID,
             loadedRootURL: loadedRootURL
@@ -283,6 +286,18 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
     let publishMarkerReadiness: @Sendable (
         WorkspaceCodemapMarkerReadinessUpdate
     ) async -> Bool
+    /// Reports that the root authority behind one registration is no longer current, so the owner
+    /// can fence mutations and schedule cleanup and re-resolution. Routed like
+    /// `publishMarkerReadiness`, so a detached route drops the notification instead of needing a
+    /// second session callback channel.
+    ///
+    /// The payload is the originating registration rather than the root epoch alone. Same-epoch
+    /// authority replacement reuses the epoch, so an epoch-keyed route lookup can hand a delayed
+    /// report to the registration that already replaced the reporting one; carrying the
+    /// registration lets the recipient reject exactly that case.
+    let reportRootAuthorityInvalidated: @Sendable (
+        WorkspaceCodemapBindingRootRegistration
+    ) async -> Void
 
     init(
         _ resolveManifestBinding: @escaping @Sendable (
@@ -312,12 +327,16 @@ struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
         ) async -> WorkspaceCodemapGraphIndexCatalogTokenDisposition,
         publishMarkerReadiness: @escaping @Sendable (
             WorkspaceCodemapMarkerReadinessUpdate
-        ) async -> Bool = { _ in false }
+        ) async -> Bool = { _ in false },
+        reportRootAuthorityInvalidated: @escaping @Sendable (
+            WorkspaceCodemapBindingRootRegistration
+        ) async -> Void = { _ in }
     ) {
         self.resolveManifestBinding = resolveManifestBinding
         self.readGraphIndexCatalogPage = readGraphIndexCatalogPage
         self.revalidateGraphIndexCatalogToken = revalidateGraphIndexCatalogToken
         self.publishMarkerReadiness = publishMarkerReadiness
+        self.reportRootAuthorityInvalidated = reportRootAuthorityInvalidated
     }
 
     static let unavailable = WorkspaceCodemapBindingCatalogClient { _, _ in nil }
@@ -346,7 +365,7 @@ struct WorkspaceCodemapBindingDemand: Equatable {
 enum WorkspaceCodemapBindingRegistrationResult {
     case registered(adoptedReadyCount: Int)
     case exactDuplicate
-    case unavailable(WorkspaceCodemapGitCapabilityState)
+    case unavailable(WorkspaceCodemapRootCapabilityState)
     case busy
     case failed
 }
@@ -816,9 +835,17 @@ enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
     case prioritizeRestart
 }
 
-enum WorkspaceCodemapGraphIndexWorkerRecoveryState: Hashable {
+/// Terminal execution blockers are independent of graph coverage. `available` means that
+/// execution has no terminal blocker, not that the graph has finished indexing.
+enum WorkspaceCodemapGraphIndexExecutionState: Hashable {
     case available
     case exhausted
+    case budgetLimited(WorkspaceCodemapGraphIndexBudget)
+
+    var budget: WorkspaceCodemapGraphIndexBudget? {
+        if case let .budgetLimited(budget) = self { return budget }
+        return nil
+    }
 }
 
 enum WorkspaceCodemapGraphIndexWatchdogDisposition: Hashable {

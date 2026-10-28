@@ -1,59 +1,12 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
+import RepoPromptProcess
+import RepoPromptProviderQuota
 
-enum CodexJSONValue: Equatable {
-    case string(String)
-    case number(Double)
-    case bool(Bool)
-    case object([String: CodexJSONValue])
-    case array([CodexJSONValue])
-    case null
-
-    func toAny() -> Any {
-        switch self {
-        case let .string(value):
-            value
-        case let .number(value):
-            value
-        case let .bool(value):
-            value
-        case let .object(value):
-            value.mapValues { $0.toAny() }
-        case let .array(value):
-            value.map { $0.toAny() }
-        case .null:
-            NSNull()
-        }
-    }
-
-    static func from(_ value: Any) -> CodexJSONValue? {
-        switch value {
-        case let string as String:
-            return .string(string)
-        case let number as NSNumber:
-            if CFGetTypeID(number) == CFBooleanGetTypeID() {
-                return .bool(number.boolValue)
-            }
-            return .number(number.doubleValue)
-        case let dict as [String: Any]:
-            var output: [String: CodexJSONValue] = [:]
-            for (key, value) in dict {
-                if let converted = CodexJSONValue.from(value) {
-                    output[key] = converted
-                }
-            }
-            return .object(output)
-        case let array as [Any]:
-            let converted = array.compactMap { CodexJSONValue.from($0) }
-            return .array(converted)
-        case _ as NSNull:
-            return .null
-        default:
-            return nil
-        }
-    }
-}
+/// Preserve the app's transport vocabulary while sharing the same typed boundary value
+/// with the app-free quota runtime. Encoding/decoding behavior is unchanged.
+typealias CodexJSONValue = RepoPromptProviderQuota.CodexJSONValue
 
 enum CodexAppServerRequestID: Hashable {
     case int(Int)
@@ -136,6 +89,7 @@ actor CodexAppServerClient {
         let isDefault: Bool
         let supportedReasoningEfforts: [RemoteReasoningEffort]
         let defaultReasoningEffort: String?
+        var serviceTiers: [CodexModelServiceTier] = []
     }
 
     struct ServerRequest {
@@ -224,6 +178,7 @@ actor CodexAppServerClient {
         case processExited(ProcessExitEvidence)
         case invalidResponse
         case jsonDecodeFailed
+        case stdoutFrameBudgetExceeded(limitBytes: Int)
         case requestFailed(RequestFailure)
         case executableUnavailable(String)
         case transportWriteFailed(message: String, errno: Int32?)
@@ -239,6 +194,8 @@ actor CodexAppServerClient {
                 "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
                 "Failed to decode Codex app-server JSON response."
+            case let .stdoutFrameBudgetExceeded(limitBytes):
+                "Codex app-server response exceeded the \(limitBytes / (1024 * 1024)) MiB frame budget; the transport was closed without decoding a truncated response."
             case let .requestFailed(failure):
                 failure.userFacingMessage
             case let .executableUnavailable(message):
@@ -281,6 +238,7 @@ actor CodexAppServerClient {
         case explicitStop
         case livenessCheckFailed(method: String?)
         case decodeRecoveryBudgetExceeded(generation: UInt64)
+        case stdoutFrameBudgetExceeded(limitBytes: Int)
         case readSourceSetupFailed(stream: String, errno: Int32?)
         case observedProcessExit(status: ProcessExitStatus)
     }
@@ -345,6 +303,40 @@ actor CodexAppServerClient {
         let processFamilyCleanupWasCompleted: Bool
     }
 
+    /// Only the Codex rollout-path lookup diagnostic is eligible for a fresh fallback.
+    /// Generic missing-file errors can describe unrelated configuration or workspace files.
+    static func isMissingRolloutPathResolutionMessage(
+        _ message: String,
+        expectedRolloutPath: String? = nil
+    ) -> Bool {
+        guard let reportedPath = missingRolloutPathResolutionPath(message) else { return false }
+        guard let expectedRolloutPath else { return true }
+        return URL(fileURLWithPath: reportedPath).standardizedFileURL.path
+            == URL(fileURLWithPath: expectedRolloutPath).standardizedFileURL.path
+    }
+
+    private static func missingRolloutPathResolutionPath(_ message: String) -> String? {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = trimmed.lowercased()
+        let prefix = "failed to resolve rollout path"
+        guard normalized.hasPrefix(prefix) else { return nil }
+        let detail = trimmed.dropFirst(prefix.count)
+        guard detail.first == " " || detail.first == ":" else { return nil }
+        let reason = "file does not exist"
+        let suffix = normalized.hasSuffix("\(reason).") ? "\(reason)." : reason
+        guard normalized.hasSuffix(suffix) else { return nil }
+        var reportedPath = String(detail.dropLast(suffix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard reportedPath.hasSuffix(":") else { return nil }
+        reportedPath.removeLast()
+        reportedPath = reportedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if reportedPath.hasPrefix(":") { reportedPath.removeFirst() }
+        reportedPath = reportedPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        reportedPath = reportedPath.trimmingCharacters(in: CharacterSet(charactersIn: "'\"`"))
+        guard reportedPath.hasPrefix("/") else { return nil }
+        return reportedPath
+    }
+
     static func isTimeoutError(_ error: Error) -> Bool {
         if let clientError = error as? ClientError,
            case let .requestFailed(failure) = clientError
@@ -363,6 +355,18 @@ actor CodexAppServerClient {
 
     static func isAmbiguousMutationError(_ error: Error) -> Bool {
         error is AmbiguousMutationError
+    }
+
+    /// True when the transport was closed because a single stdout frame exceeded the
+    /// frame budget. Matching is typed: the overflowing response is never decoded, so
+    /// there is no server message to inspect.
+    static func isStdoutFrameBudgetExceededError(_ error: Error) -> Bool {
+        guard let clientError = error as? ClientError,
+              case .stdoutFrameBudgetExceeded = clientError
+        else {
+            return false
+        }
+        return true
     }
 
     private static func isTimeoutErrorMessage(_ message: String) -> Bool {
@@ -416,7 +420,7 @@ actor CodexAppServerClient {
     private var notificationContinuations: [UUID: AsyncStream<Notification>.Continuation] = [:]
     private var serverRequestContinuations: [UUID: AsyncStream<ServerRequest>.Continuation] = [:]
     private var isInitialized = false
-    private var stdoutFramer = LineFramer()
+    private var stdoutFramer = LineFramer(limits: CodexAppServerClient.stdoutFrameLimits)
     private var stdoutTail = Data()
     private var didTerminateTransport = false
     private var lastTransportTerminationReason: TransportTerminationReason?
@@ -437,11 +441,19 @@ actor CodexAppServerClient {
     private var registeredExpectedAgentPID: RegisteredExpectedAgentPID?
     private var preparedRuntimeLaunchContext: PreparedRuntimeLaunchContext?
     private static let maxDecodeRecoveryAttemptsPerGeneration = 128
+    /// Full-history thread/resume results can exceed the shared framer's 8 MiB
+    /// default. This finite Codex-only envelope never permits suffix recovery.
+    private static let stdoutFrameLimits = LineFramer.Limits(
+        maxLineBytes: 64 * 1024 * 1024,
+        maxCarryBytes: 64 * 1024 * 1024,
+        tailRetainBytes: 0
+    )
     private static let stderrTailLimit = 8 * 1024
     private static let exitDiagnosticSettlementWindow: TimeInterval = 0.25
     private let writeFrameHandler: @Sendable (Int32, Data) throws -> Void
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let processSpawnPreparation: @Sendable () async throws -> Void
+    private let computerUseRuntimeUnavailableMessage: @Sendable (URL) -> String?
     private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
     private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
@@ -465,6 +477,7 @@ actor CodexAppServerClient {
             CodexAppServerClient.defaultProcessAppearsAlive(process)
         },
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
+        computerUseRuntimeUnavailableMessage: @escaping @Sendable (URL) -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: $0) },
         processEnvironmentBuilder: @escaping @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult = {
             await ProcessEnvironmentBuilder.build($0)
         },
@@ -474,7 +487,7 @@ actor CodexAppServerClient {
         launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
-            ChildProcessExitObserver(pid: $0)
+            ChildProcessExitObserver.observe(pid: $0)
         },
         expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager,
         faultInjection: FaultInjection = .init()
@@ -482,6 +495,7 @@ actor CodexAppServerClient {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
         self.processSpawnPreparation = processSpawnPreparation
+        self.computerUseRuntimeUnavailableMessage = computerUseRuntimeUnavailableMessage
         self.processEnvironmentBuilder = processEnvironmentBuilder
         self.runtimeStatePreparer = runtimeStatePreparer
         self.launchSnapshot = launchSnapshot
@@ -518,9 +532,10 @@ actor CodexAppServerClient {
             )
         )
         var environment = environmentResult.environment
+        let probeEnvironment = await ProviderEnvironmentFiltering.filter(environment, for: .codexExec)
         let resolution = CodexProviderHelpers.resolveCodexExecutable(
             commandName: config.commandName,
-            environment: environment,
+            environment: probeEnvironment,
             additionalPathHints: config.additionalPathHints,
             launchSnapshot: launchSnapshot,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
@@ -580,6 +595,15 @@ actor CodexAppServerClient {
     func clearExpectedAgentPIDRegistration() async {
         expectedAgentPIDRegistration = nil
         await clearRegisteredExpectedAgentPIDIfNeeded()
+    }
+
+    /// Returns only the PID currently registered for this run and live transport.
+    func activeExpectedAgentPID(for runID: UUID) -> pid_t? {
+        guard let registeredExpectedAgentPID,
+              registeredExpectedAgentPID.runID == runID,
+              activeTransport?.process.pid == registeredExpectedAgentPID.pid
+        else { return nil }
+        return registeredExpectedAgentPID.pid
     }
 
     private func registerExpectedAgentPIDIfNeeded(for pid: pid_t) async {
@@ -958,7 +982,7 @@ actor CodexAppServerClient {
         )
         activeTransport = nil
 
-        stdoutFramer = LineFramer()
+        stdoutFramer = LineFramer(limits: Self.stdoutFrameLimits)
         stdoutTail.removeAll(keepingCapacity: false)
         decodeRecoveryAttemptsByGeneration.removeValue(forKey: transportGeneration)
         return terminatingTransport
@@ -1469,6 +1493,7 @@ actor CodexAppServerClient {
                         let effortDescription = (effortEntry["description"] as? String) ?? ""
                         return RemoteReasoningEffort(reasoningEffort: reasoningEffort, description: effortDescription)
                     }
+                let serviceTiers = CodexServiceTierVariantCatalog.advertisedTiers(from: entry)
                 models.append(
                     RemoteModel(
                         id: id,
@@ -1477,7 +1502,8 @@ actor CodexAppServerClient {
                         description: description,
                         isDefault: isDefault,
                         supportedReasoningEfforts: supportedReasoningEfforts,
-                        defaultReasoningEffort: defaultReasoningEffort
+                        defaultReasoningEffort: defaultReasoningEffort,
+                        serviceTiers: serviceTiers
                     )
                 )
             }
@@ -1564,13 +1590,34 @@ actor CodexAppServerClient {
         }
     }
 
+    static func computerUseProcessConfigArgs(
+        computerUseEnabled: Bool,
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry]
+    ) throws -> [String] {
+        let reserved = serverEntries.filter { $0.normalizedName.caseInsensitiveCompare("computer-use") == .orderedSame }
+        guard !computerUseEnabled || reserved.isEmpty else {
+            throw ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
+        }
+        var args = reserved.flatMap { ["-c", "mcp_servers.\($0.cliPathComponent).enabled=false"] }
+        if computerUseEnabled {
+            args += ["-c", "approval_policy=\"on-request\"", "-c", "approvals_reviewer=\"user\""]
+        }
+        return args
+    }
+
     private func startProcess(startupAuthority: UInt64) async throws {
+        try ProviderProcessLaunchPolicy.check()
         let runtime = try await prepareRuntimeForLaunch()
         guard let launchContext = preparedRuntimeLaunchContext else {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
-        let environment = Self.processEnvironmentForCurrentLaunch(launchContext.environment)
         let resolution = launchContext.resolution
+        let filtered = await ProviderEnvironmentFiltering.filter(
+            launchContext.environment,
+            for: .codexExec,
+            explicitOverrides: resolution.environmentOverrides
+        )
+        let environment = Self.processEnvironmentForCurrentLaunch(filtered)
         if provisionsRepoPromptMCPOnStart {
             let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
             guard provisioning.success else {
@@ -1579,27 +1626,49 @@ actor CodexAppServerClient {
                 )
             }
         }
-        let processOverrides = CodexOverrides.cliConfigArgs(
+        var processOverrides = CodexOverrides.cliConfigArgs(
             toolPolicy: .init(
                 toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
                 modelReasoningSummary: config.processModelReasoningSummary
             ),
             featurePolicy: config.processFeaturePolicy
         )
+        try await processSpawnPreparation()
+        try Task.checkCancellation()
+        try ensureStartupAuthority(startupAuthority)
+        if config.processFeaturePolicy.computerUseEnabled {
+            // Probe the actual executable afresh, including external selections. Do not
+            // infer its signer from DEBUG, bundle provenance, or cached UI admission.
+            if let message = computerUseRuntimeUnavailableMessage(runtime.executableURL) {
+                throw ClientError.executableUnavailable(message)
+            }
+            // No suspension between presence-dependent overrides and spawn. This does not
+            // claim atomicity against independent writers of the owned configuration.
+            // Read the actual armed launch runtime, not a personal/default home. A reserved
+            // saved definition cannot be safely cleared through recursively merged overrides.
+            let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
+            let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
+                try String(contentsOf: runtimeConfigURL, encoding: .utf8)
+            } else {
+                ""
+            }
+            processOverrides += try Self.computerUseProcessConfigArgs(
+                computerUseEnabled: true,
+                serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
+            )
+        }
         let args = processOverrides + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
             config.processLaunchDirectory
         )
         let spawned: SpawnedProcess
         do {
-            try await processSpawnPreparation()
-            try Task.checkCancellation()
-            try ensureStartupAuthority(startupAuthority)
             spawned = try ProcessLauncher.spawn(
                 command: resolution.resolvedCommand,
                 arguments: args,
                 environment: environment,
-                workingDirectory: launchDirectory
+                workingDirectory: launchDirectory,
+                purpose: .provider
             )
         } catch let error as ProcessLauncherError {
             guard let mappedError = Self.executableUnavailableSpawnError(error) else {
@@ -1615,7 +1684,7 @@ actor CodexAppServerClient {
         let exitObserver = processExitObserverFactory(spawned.pid)
         let capture = CodexProcessStderrCapture(byteLimit: Self.stderrTailLimit)
 
-        stdoutFramer = LineFramer()
+        stdoutFramer = LineFramer(limits: Self.stdoutFrameLimits)
         stdoutTail.removeAll(keepingCapacity: false)
         didTerminateTransport = false
         lastTransportTerminationReason = nil
@@ -1738,11 +1807,19 @@ actor CodexAppServerClient {
     private func handleStdoutChunk(_ data: Data, generation: UInt64) async {
         guard activeTransport?.generation == generation, !didTerminateTransport else { return }
         appendTail(&stdoutTail, chunk: data, limit: 128 * 1024)
-        stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
+        let overflow = stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
             handleStdoutFramerDiagnostic(diagnostic)
         }, onLine: { [self] lineData in
             handleJSONLine(lineData)
         })
+        if let overflow {
+            await terminateTransport(
+                flushStdout: false,
+                expectedGeneration: generation,
+                requestFailure: .stdoutFrameBudgetExceeded(limitBytes: overflow.limitBytes),
+                reason: .stdoutFrameBudgetExceeded(limitBytes: overflow.limitBytes)
+            )
+        }
     }
 
     /// Called when the stdout consumer task's channel stream ends (EOF or explicit finish).
@@ -2320,6 +2397,10 @@ actor CodexAppServerClient {
             return decodeRecoveryAttemptsByGeneration[key, default: 0]
         }
 
+        func debugIngestStdoutChunk(_ chunk: Data, generation: UInt64) async {
+            await handleStdoutChunk(chunk, generation: generation)
+        }
+
         func debugIngestRawStdoutLine(_ line: Data) {
             handleJSONLine(line)
         }
@@ -2371,6 +2452,7 @@ actor CodexAppServerClient {
                 ),
                 exitObservation: nil
             )
+            stdoutFramer = LineFramer(limits: Self.stdoutFrameLimits)
             isInitialized = true
             didTerminateTransport = false
             lastTransportTerminationReason = nil

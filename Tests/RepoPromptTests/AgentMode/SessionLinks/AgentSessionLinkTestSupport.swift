@@ -127,7 +127,7 @@ extension CodexSessionControllerTurnDispatchTestDefaults {
 
     func startUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         model _: String?,
         reasoningEffort _: String?,
         serviceTier _: String?
@@ -137,7 +137,7 @@ extension CodexSessionControllerTurnDispatchTestDefaults {
 
     func steerUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
@@ -278,10 +278,18 @@ final class LifecycleRecorder: @unchecked Sendable {
 
 final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     private let recorder: LifecycleRecorder
+    private let resumeGate: TestReleaseFence?
+    private let snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus?
     private(set) var hasActiveThread = false
 
-    init(recorder: LifecycleRecorder) {
+    init(
+        recorder: LifecycleRecorder,
+        resumeGate: TestReleaseFence? = nil,
+        snapshotLatestTurnStatus: CodexNativeSessionController.TurnStatus? = nil
+    ) {
         self.recorder = recorder
+        self.resumeGate = resumeGate
+        self.snapshotLatestTurnStatus = snapshotLatestTurnStatus
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -325,6 +333,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
         reasoningEffort: String?,
         serviceTier _: String?
     ) async throws -> CodexNativeSessionController.SessionRef {
+        await resumeGate?.enterAndWait()
         hasActiveThread = true
         return CodexNativeSessionController.SessionRef(
             conversationID: "lifecycle",
@@ -346,7 +355,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
             runtimeStatus: .idle,
             currentTurnID: nil,
             activeTurnIDs: [],
-            latestTurnStatus: nil
+            latestTurnStatus: snapshotLatestTurnStatus
         )
     }
 
@@ -354,7 +363,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
 
     func startUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         model _: String?,
         reasoningEffort _: String?,
         serviceTier _: String?
@@ -365,7 +374,7 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
 
     func steerUserTurn(
         text _: String,
-        images _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         recorder.record("codex:send")
@@ -377,7 +386,9 @@ final class LifecycleNoopCodexController: CodexSessionControllerTurnDispatchTest
         return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
 
-    func compactThread() async throws {}
+    func compactThread() async throws {
+        recorder.record("codex:compact")
+    }
 
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil

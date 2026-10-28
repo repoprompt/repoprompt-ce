@@ -6,21 +6,25 @@ struct AutoEffortTurnSelection: Equatable {
     let selectedModelRaw: String
     let manualEffortRaw: String?
     let effortRaw: String
+    let backendID: DecisionServiceID
+    let autoEffortRevision: UInt64
 
     func isCurrent(
         provider currentProvider: AgentProviderKind,
         selectedModelRaw currentModelRaw: String,
         manualEffortRaw currentManualEffortRaw: String?,
-        enabled: Bool
+        configuration: AutoEffortConfiguration
     ) -> Bool {
-        enabled
+        configuration.enabled
+            && configuration.revision == autoEffortRevision
+            && configuration.selectedBackendID == backendID
             && provider == currentProvider
             && selectedModelRaw == currentModelRaw
             && manualEffortRaw == currentManualEffortRaw
     }
 }
 
-/// UI-only record of a Jev choice for a submitted user turn. It is not persisted and does not
+/// UI-only record of a decision-service choice for a submitted user turn. It is not persisted and does not
 /// claim that the provider cached or completed the turn.
 struct AutoEffortTurnFeedback: Equatable {
     enum Direction: Equatable {
@@ -40,7 +44,7 @@ struct AutoEffortTurnFeedback: Equatable {
             $0.provider == selection.provider && $0.selectedModelRaw == selection.selectedModelRaw
                 ? $0.effortRaw : nil
         } ?? selection.manualEffortRaw
-        let order = ["low", "medium", "high", "xhigh", "max"]
+        let order = ["low", "medium", "high", "xhigh", "max", "ultra"]
         if let before = previousEffort.flatMap({ order.firstIndex(of: $0) }),
            let after = order.firstIndex(of: selection.effortRaw)
         {
@@ -54,9 +58,9 @@ struct AutoEffortTurnFeedback: Equatable {
 /// Conservative exact-model admission. The provider's live effort catalog supplies the choices;
 /// a model name alone never authorizes an effort that the active runtime does not advertise.
 enum AutoEffortModelPolicy {
-    private static let codexModels: Set<String> = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+    private static let codexModels: Set<String> = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
     private static let claudeModels: Set<String> = [
-        "claude-opus-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"
+        "claude-sonnet-5-5", "claude-opus-5", "claude-opus-5-5", "claude-fable-5-1", "claude-mythos-5-1"
     ]
 
     /// Custom workflow templates are user-authored and may contain private content. The

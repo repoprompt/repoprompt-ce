@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import os
 @testable import RepoPromptDomainRuntime
 import XCTest
 
@@ -84,7 +85,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         do {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(unverified) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(unverified) {
                 try await binding(["op": .string("set")])
             }
             XCTFail("Expected unverified-principal denial")
@@ -97,12 +98,40 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             assurance: .verifiedProcess,
             ephemeralGrantedToolNames: []
         )
-        let result = try await MCPDomainInvocationSecurityContext.$current.withValue(verified) {
+        let result = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(verified) {
             try await binding(["op": .string("set")])
         }
         XCTAssertEqual(result.stringValue, "ok")
         let appCallCount = await calls.value
         XCTAssertEqual(appCallCount, 1)
+    }
+
+    func testAppProxyWhoseExecutableWasDeletedIsDeniedWithReconnectRemedy() async throws {
+        let fixture = try RuntimeFixture(mode: .app)
+        let calls = CallCounter()
+        let binding = fixture.protectedBinding(toolName: "prompt", calls: calls)
+        // An app update deleted the bundle this still-running helper was launched from.
+        let replacedHelper = fixture.context(
+            kind: .appProxy,
+            assurance: .displayNameOnly,
+            observedProcessID: 4242,
+            verificationFailure: .executableMissing,
+            ephemeralGrantedToolNames: []
+        )
+        do {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(replacedHelper) {
+                try await binding(["op": .string("set")])
+            }
+            XCTFail("Expected replaced-helper denial")
+        } catch let error as DomainMutationPolicyError {
+            XCTAssertEqual(error, .peerExecutableMissing(processID: 4242))
+            // MCP tool failures reach the client as the interpolated error.
+            let rendered = "\(error)"
+            XCTAssertTrue(rendered.contains("pid 4242"), rendered)
+            XCTAssertTrue(rendered.contains("Reconnect the MCP server"), rendered)
+        }
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 0)
     }
 
     func testRunScopedGrantIsRevalidatedBeforeBackendExecution() async throws {
@@ -115,7 +144,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         do {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(denied) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(denied) {
                 try await binding(["op": .string("bind")])
             }
             XCTFail("Expected missing-grant denial")
@@ -128,11 +157,258 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             assurance: .verifiedProcess,
             ephemeralGrantedToolNames: ["bind_context"]
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(allowed) {
             try await binding(["op": .string("bind")])
         }
         let runCallCount = await calls.value
         XCTAssertEqual(runCallCount, 1)
+    }
+
+    func testWorktreePhysicalAdmissionAuthorizesResolvedCanonicalScopeNotRawSelector() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-worktree-scope-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        let foreignRoot = container.appendingPathComponent("foreign", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot, foreignRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+
+        // The raw repo_root is outside the workspace. Only the backend's resolved mapping
+        // can establish that it belongs to the canonical repository authorized for this run.
+        for action in ["create", "apply", "continue", "abort"] {
+            for scenario in ["mapped", "foreign", "no-grant", "no-admission"] {
+                let fixture = try RuntimeFixture(
+                    mode: .app,
+                    storage: container.appendingPathComponent("policy-\(action)-\(scenario)", isDirectory: true)
+                )
+                let calls = CallCounter()
+                let binding = MCPDomainToolBinding(
+                    definition: MCPDomainToolDefinition(
+                        name: "manage_worktree",
+                        description: "fixture",
+                        inputSchema: .object(["type": .string("object")]),
+                        annotations: .init(readOnlyHint: false, destructiveHint: true)
+                    ),
+                    operation: { _ in
+                        if scenario != "no-admission" {
+                            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                                [physicalRoot.path],
+                                rootMappings: [.init(
+                                    canonicalRoot: scenario == "foreign" ? foreignRoot.path : canonicalRoot.path,
+                                    physicalRoot: physicalRoot.path
+                                )]
+                            )
+                        }
+                        try await MCPDomainMutationCommitContext.willCommit()
+                        await calls.increment()
+                        return .string("applied")
+                    }
+                )
+                let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+                let context = fixture.context(
+                    kind: .runScoped,
+                    assurance: .verifiedProcess,
+                    authorizedCanonicalRoots: [canonicalRoot.path],
+                    ephemeralGrantedToolNames: scenario == "no-grant" ? [] : ["manage_worktree"]
+                )
+                do {
+                    _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                        try await protectedBinding(["op": .string(action), "repo_root": .string(physicalRoot.path)])
+                    }
+                    XCTAssertEqual(scenario, "mapped", action)
+                } catch {
+                    if scenario == "no-admission" {
+                        XCTAssertEqual(error as? DomainMutationPathFenceError, .scopeUnavailable, action)
+                    } else {
+                        XCTAssertNotEqual(scenario, "mapped", action)
+                        XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing, "\(action): \(scenario)")
+                    }
+                }
+                let callCount = await calls.value
+                XCTAssertEqual(callCount, scenario == "mapped" ? 1 : 0, "\(action): \(scenario)")
+            }
+        }
+    }
+
+    func testOnlyBackendFencedWorktreeCreateSeesAdmittedGuardBeforeCommit() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-worktree-guard-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+
+        // Creation commits at its backend's final fence, but must evaluate admitted targets (clone
+        // eligibility, the spawn of `git worktree add`) under their path fence before that point.
+        for action in ["create", "apply"] {
+            let fixture = try RuntimeFixture(
+                mode: .app,
+                storage: container.appendingPathComponent("policy-\(action)", isDirectory: true)
+            )
+            let observations = GuardObservations()
+            let binding = Self.worktreeBinding { _ in
+                let beforeAdmission = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+                await observations.record("beforeAdmission", beforeAdmission != nil)
+                try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                    [physicalRoot.path],
+                    rootMappings: [.init(canonicalRoot: canonicalRoot.path, physicalRoot: physicalRoot.path)]
+                )
+                let admitted = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+                await observations.record("admittedBeforeCommit", admitted != nil)
+                try await MCPDomainMutationCommitContext.willCommit()
+                let committed = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+                await observations.record("afterCommit", committed != nil)
+                return .string("applied")
+            }
+            let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+            let context = fixture.context(
+                kind: .runScoped,
+                assurance: .verifiedProcess,
+                authorizedCanonicalRoots: [canonicalRoot.path],
+                ephemeralGrantedToolNames: ["manage_worktree"]
+            )
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                try await protectedBinding(["op": .string(action)])
+            }
+            let seen = await observations.values
+            XCTAssertEqual(
+                seen,
+                ["beforeAdmission": false, "admittedBeforeCommit": action == "create", "afterCommit": true],
+                action
+            )
+        }
+    }
+
+    func testRefusalReceiptFailurePreservesUnknownSettlementAndReportsOperationID() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-refusal-receipt-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+        let storage = container.appendingPathComponent("runtime", isDirectory: true)
+        let fixture = try RuntimeFixture(mode: .app, storage: storage)
+        let journalURL = storage
+            .appendingPathComponent(DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: "m4-test"))
+            .appendingPathComponent("settings/protected-mutation-journal.json")
+        let committedJournalURL = journalURL.appendingPathExtension("committing")
+        let binding = Self.worktreeBinding { _ in
+            try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                [physicalRoot.path],
+                rootMappings: [.init(canonicalRoot: canonicalRoot.path, physicalRoot: physicalRoot.path)]
+            )
+            try await MCPDomainMutationCommitContext.willCommit()
+            // Preserve the actual committing receipt, then make durable settlement fail via
+            // real filesystem I/O rather than pretending the refusal was durably recorded.
+            try FileManager.default.moveItem(at: journalURL, to: committedJournalURL)
+            try FileManager.default.createDirectory(at: journalURL, withIntermediateDirectories: false)
+            throw DomainMutationRefusedBeforeEffects(BackendRefusal())
+        }
+        let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+        let context = fixture.context(
+            kind: .runScoped, assurance: .verifiedProcess,
+            authorizedCanonicalRoots: [canonicalRoot.path], ephemeralGrantedToolNames: ["manage_worktree"]
+        )
+        let operationID = "refused-receipt-write-failure"
+        let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+        do {
+            _ = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                settlementState.withLock { $0 = settlement.state }
+            }) {
+                try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                    try await protectedBinding([
+                        "op": .string("create"), "branch": .string("taken"), "operation_id": .string(operationID)
+                    ])
+                }
+            }
+            XCTFail("An unconfirmed refusal receipt must not report completion")
+        } catch let error as MCPError {
+            guard case let .internalError(rawMessage) = error else {
+                return XCTFail("Expected a receipt settlement error, got \(error)")
+            }
+            let message = try XCTUnwrap(rawMessage)
+            XCTAssertTrue(message.contains("No backend effects occurred"), message)
+            XCTAssertTrue(message.contains("durable refusal settlement could not be confirmed"), message)
+            XCTAssertTrue(message.contains(operationID), message)
+            XCTAssertFalse(message.contains(container.path), message)
+        }
+        XCTAssertEqual(settlementState.withLock { $0 }, .unknown)
+        let data = try Data(contentsOf: committedJournalURL)
+        let document = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let records = try XCTUnwrap(document["records"] as? [String: [String: Any]])
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.values.first?["status"] as? String, "committing")
+    }
+
+    func testBackendFencedWorktreeCreateSettlesPreFenceRefusalAsNotApplied() async throws {
+        let container = FileManager.default.temporaryDirectory
+            .appendingPathComponent("m4-worktree-refusal-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: container) }
+        let canonicalRoot = container.appendingPathComponent("canonical", isDirectory: true)
+        let physicalRoot = container.appendingPathComponent("bound-worktree", isDirectory: true)
+        for root in [canonicalRoot, physicalRoot] {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+
+        // A deterministic backend refusal before the fence is the backend's own error and not
+        // applied; the same refusal after the fence remains indeterminate.
+        for (refuseAfterFence, provenNoEffects) in [(false, false), (true, false), (true, true)] {
+            let fixture = try RuntimeFixture(
+                mode: .app,
+                storage: container.appendingPathComponent("policy-\(refuseAfterFence)-\(provenNoEffects)", isDirectory: true)
+            )
+            let binding = Self.worktreeBinding { _ in
+                try await MCPDomainMutationCommitContext.admitPhysicalTargets(
+                    [physicalRoot.path],
+                    rootMappings: [.init(canonicalRoot: canonicalRoot.path, physicalRoot: physicalRoot.path)]
+                )
+                if refuseAfterFence {
+                    try await MCPDomainMutationCommitContext.willCommit()
+                }
+                if provenNoEffects { throw DomainMutationRefusedBeforeEffects(BackendRefusal()) }
+                throw BackendRefusal()
+            }
+            let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+            let context = fixture.context(
+                kind: .runScoped,
+                assurance: .verifiedProcess,
+                authorizedCanonicalRoots: [canonicalRoot.path],
+                ephemeralGrantedToolNames: ["manage_worktree"]
+            )
+            let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+            await XCTAssertThrowsErrorAsync(
+                try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                    settlementState.withLock { $0 = settlement.state }
+                }) {
+                    try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                        try await protectedBinding(["op": .string("create"), "branch": .string("taken")])
+                    }
+                }
+            ) { error in
+                if refuseAfterFence, !provenNoEffects {
+                    guard case .partialSuccessAfterCommit = error as? DomainProtectedMutationError else {
+                        return XCTFail("Expected partialSuccessAfterCommit, got \(error)")
+                    }
+                } else {
+                    XCTAssertEqual(error as? BackendRefusal, BackendRefusal())
+                }
+            }
+            XCTAssertEqual(
+                settlementState.withLock { $0 },
+                refuseAfterFence && !provenNoEffects ? .indeterminateAfterCommit : .notApplied
+            )
+            let journal = try await fixture.runtime.mutationJournal.snapshot()
+            XCTAssertEqual(
+                journal.recordSnapshots.map(\.status),
+                [refuseAfterFence && !provenNoEffects ? .indeterminateAfterCommit : .failedBeforeCommit]
+            )
+        }
     }
 
     func testUnsupportedProtectedPhysicalMutationFinishesBeforeCommitWithoutCreatingParent() async throws {
@@ -180,7 +456,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                 try await protectedBinding([
                     "action": .string("delete"),
                     "path": .string(target.path)
@@ -261,7 +537,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                 try await protectedBinding([
                     "op": .string("export"),
                     "path": .string("export.md")
@@ -293,11 +569,11 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedOperations: ["prompt.set"]
         )
 
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(exactOperation) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(exactOperation) {
             try await binding(["op": .string("set")])
         }
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(exactOperation) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(exactOperation) {
                 try await binding(["op": .string("append")])
             }
         ) { error in
@@ -337,7 +613,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             stableKey: "client:test",
             ephemeralGrantedToolNames: []
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(principal) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(principal) {
             try await binding(["op": .string("set")])
         }
         let grantedCallCount = await calls.value
@@ -352,7 +628,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
         XCTAssertEqual(revoked.revision, 2)
         do {
-            _ = try await MCPDomainInvocationSecurityContext.$current.withValue(principal) {
+            _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(principal) {
                 try await binding(["op": .string("set")])
             }
             XCTFail("Expected revoked-grant denial")
@@ -372,7 +648,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             expectedRevision: 2,
             administrator: administrator
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(principal) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(principal) {
             try await binding(["op": .string("set")])
         }
         let replacementCallCount = await calls.value
@@ -407,7 +683,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: []
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(spoofed) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(spoofed) {
                 try await binding(["op": .string("set")])
             }
         ) { error in
@@ -421,7 +697,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             verifiedIdentityFingerprint: "verified:fingerprint:one",
             ephemeralGrantedToolNames: []
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(verified) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(verified) {
             try await binding(["op": .string("set")])
         }
         let callCount = await calls.value
@@ -444,18 +720,19 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             authorizedCanonicalRoots: [allowedRoot],
             ephemeralGrantedToolNames: ["manage_workspaces"]
         )
-        _ = try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+        _ = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(allowed) {
             try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
         }
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(allowed) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(allowed) {
                 try await binding(["action": .string("add_folder"), "folder_path": .string(outside)])
             }
         ) { error in
             XCTAssertEqual(error as? DomainMutationPolicyError, .grantMissing)
         }
 
-        let staleRouting = fixture.context(
+        // An unresolved run-scoped binding fails closed without assuming publication is pending.
+        let unavailableBinding = fixture.context(
             kind: .runScoped,
             assurance: .hostLaunchToken,
             authorizedCanonicalRoots: [allowedRoot],
@@ -463,11 +740,11 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             ephemeralGrantedToolNames: ["manage_workspaces"]
         )
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(staleRouting) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(unavailableBinding) {
                 try await binding(["action": .string("add_folder"), "folder_path": .string(inside)])
             }
         ) { error in
-            XCTAssertEqual(error as? DomainMutationPolicyError, .routingContextUnavailable)
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingUnavailable)
         }
         let callCount = await calls.value
         XCTAssertEqual(callCount, 1)
@@ -509,7 +786,7 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         )
 
         await XCTAssertThrowsErrorAsync(
-            try await MCPDomainInvocationSecurityContext.$current.withValue(context) {
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
                 try await binding(["op": .string("set")])
             }
         ) { error in
@@ -564,6 +841,158 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
         }
     }
 
+    func testMissingRunScopedBindingAndNonRunScopedRoutingFailClosed() async throws {
+        let fixture = try RuntimeFixture(mode: .standalone)
+        let calls = CallCounter()
+        let binding = fixture.protectedBinding(toolName: "bind_context", calls: calls)
+
+        // Missing routing is not evidence of an in-flight publish, including in headless mode.
+        let runScopedUnavailable = fixture.context(
+            kind: .runScoped,
+            assurance: .verifiedProcess,
+            hasAuthoritativeRoutingContext: false,
+            ephemeralGrantedToolNames: ["bind_context"]
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(runScopedUnavailable) {
+                try await binding(["op": .string("bind")])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingBindingUnavailable)
+            let rendered = error.localizedDescription
+            XCTAssertTrue(rendered.contains("unavailable"), rendered)
+            XCTAssertFalse(rendered.contains("has not been published yet"), rendered)
+            XCTAssertFalse(rendered.contains("Retry after"), rendered)
+        }
+
+        // Non-run-scoped connections retain their existing fail-closed denial.
+        let appProxyNoRouting = fixture.context(
+            kind: .appProxy,
+            assurance: .verifiedProcess,
+            hasAuthoritativeRoutingContext: false,
+            ephemeralGrantedToolNames: []
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(appProxyNoRouting) {
+                try await binding(["op": .string("bind")])
+            }
+        ) { error in
+            XCTAssertEqual(error as? DomainMutationPolicyError, .routingContextUnavailable)
+        }
+
+        let callCount = await calls.value
+        XCTAssertEqual(callCount, 0)
+    }
+
+    func testPartialSuccessAfterCommitCarriesUnderlyingErrorCategory() async throws {
+        let fixture = try RuntimeFixture(mode: .standalone)
+        // manage_worktree.select is a durable mutation that does not require physical admission,
+        // so willCommit() succeeds and the binding can fail post-commit to exercise the category.
+        let context = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            authorizedCanonicalRoots: [],
+            ephemeralGrantedToolNames: ["manage_worktree"]
+        )
+        let binding = MCPDomainToolBinding(
+            definition: MCPDomainToolDefinition(
+                name: "manage_worktree",
+                description: "fixture",
+                inputSchema: .object(["type": .string("object")]),
+                annotations: .init(readOnlyHint: false, destructiveHint: true)
+            ),
+            operation: { _ in
+                try await MCPDomainMutationCommitContext.willCommit()
+                // Fail after commit has begun; settlement must be indeterminate and carry
+                // a bounded error category derived from the underlying error type.
+                throw DomainMutationPolicyError.routingBindingUnavailable
+            }
+        )
+        let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+
+        let settlementState = OSAllocatedUnfairLock<DomainProtectedMutationState?>(initialState: nil)
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                settlementState.withLock { $0 = settlement.state }
+            }) {
+                try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                    try await protectedBinding(["op": .string("select"), "name": .string("main")])
+                }
+            }
+        ) { error in
+            guard let mutationError = error as? DomainProtectedMutationError,
+                  case let .partialSuccessAfterCommit(_, category) = mutationError
+            else {
+                XCTFail("Expected partialSuccessAfterCommit, got \(error)")
+                return
+            }
+            XCTAssertEqual(category, "policyError")
+            let rendered = "\(mutationError)"
+            XCTAssertTrue(rendered.contains("policyError"), rendered)
+            XCTAssertTrue(rendered.contains("Inspect state"), rendered)
+            XCTAssertEqual(rendered, error.localizedDescription)
+            XCTAssertEqual("\(error)", rendered)
+        }
+        XCTAssertEqual(settlementState.withLock { $0 }, .indeterminateAfterCommit)
+
+        let journal = try await fixture.runtime.mutationJournal.snapshot()
+        let record = try XCTUnwrap(journal.recordSnapshots.first)
+        XCTAssertEqual(record.toolName, "manage_worktree")
+        XCTAssertEqual(record.status, .indeterminateAfterCommit)
+    }
+
+    func testJournalErrorCategoryInPartialSuccessAfterCommit() async throws {
+        // A post-commit journal error retains a bounded category without leaking error internals.
+        let fixture = try RuntimeFixture(mode: .standalone)
+        let context = fixture.context(
+            kind: .runScoped,
+            assurance: .hostLaunchToken,
+            authorizedCanonicalRoots: [],
+            ephemeralGrantedToolNames: ["manage_worktree"]
+        )
+        var capturedCategory: String?
+        let binding = MCPDomainToolBinding(
+            definition: MCPDomainToolDefinition(
+                name: "manage_worktree",
+                description: "fixture",
+                inputSchema: .object(["type": .string("object")]),
+                annotations: .init(readOnlyHint: false, destructiveHint: true)
+            ),
+            operation: { _ in
+                try await MCPDomainMutationCommitContext.willCommit()
+                throw DomainMutationJournalError.writerConflict
+            }
+        )
+        let protectedBinding = fixture.runtime.protectedMutationProvider.protectedBinding(binding)
+        await XCTAssertThrowsErrorAsync(
+            try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(context) {
+                try await protectedBinding(["op": .string("select"), "name": .string("main")])
+            }
+        ) { error in
+            if let mutationError = error as? DomainProtectedMutationError,
+               case let .partialSuccessAfterCommit(_, category) = mutationError
+            {
+                capturedCategory = category
+            }
+        }
+        // Journal errors map to "journalError" category.
+        XCTAssertEqual(capturedCategory, "journalError")
+    }
+
+    private static func worktreeBinding(
+        _ operation: @escaping @Sendable ([String: Value]) async throws -> Value
+    ) -> MCPDomainToolBinding {
+        MCPDomainToolBinding(
+            definition: MCPDomainToolDefinition(
+                name: "manage_worktree",
+                description: "fixture",
+                inputSchema: .object(["type": .string("object")]),
+                annotations: .init(readOnlyHint: false, destructiveHint: true)
+            ),
+            operation: operation
+        )
+    }
+
     private func operation(_ toolName: String, _ arguments: [String: Value]) -> DomainProtectedMutationOperation? {
         MCPDomainProtectedMutationToolProvider.operation(
             toolName: toolName,
@@ -582,6 +1011,16 @@ final class DomainProtectedMutationSecurityTests: XCTestCase {
             runID: nil,
             provider: nil
         )
+    }
+}
+
+private struct BackendRefusal: Error, Equatable {}
+
+private actor GuardObservations {
+    private(set) var values: [String: Bool] = [:]
+
+    func record(_ key: String, _ value: Bool) {
+        values[key] = value
     }
 }
 
@@ -631,6 +1070,8 @@ private final class RuntimeFixture: @unchecked Sendable {
         assurance: DomainClientPrincipalAssurance,
         stableKey: String? = "client:test",
         verifiedIdentityFingerprint: String? = nil,
+        observedProcessID: Int32? = nil,
+        verificationFailure: DomainClientPrincipalVerificationFailure? = nil,
         authorizedCanonicalRoots: Set<String> = [],
         hasAuthoritativeRoutingContext: Bool = true,
         ephemeralGrantedToolNames: Set<String>,
@@ -643,12 +1084,13 @@ private final class RuntimeFixture: @unchecked Sendable {
                 displayName: "test client",
                 kind: kind,
                 assurance: assurance,
-                processID: assurance == .displayNameOnly ? nil : 42,
+                processID: assurance == .displayNameOnly ? observedProcessID : 42,
                 runID: UUID(),
                 provider: "test",
                 verifiedIdentityFingerprint: assurance == .displayNameOnly
                     ? nil
-                    : (verifiedIdentityFingerprint ?? stableKey)
+                    : (verifiedIdentityFingerprint ?? stableKey),
+                verificationFailure: verificationFailure
             ),
             connectionID: UUID(),
             connectionGeneration: 1,

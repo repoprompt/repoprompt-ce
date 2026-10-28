@@ -15,6 +15,7 @@ import ctypes
 import dataclasses
 import errno
 import fcntl
+import functools
 import hashlib
 import itertools
 import json
@@ -30,16 +31,52 @@ import socketserver
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 16
+INDEX_SOURCE_FINGERPRINT = Path(".build/modularization/app-source-sha256.json")
+
+
+def app_source_hashes(repo_root: Path) -> Dict[str, str]:
+    source_root = repo_root / "Sources/RepoPrompt"
+    return {
+        path.relative_to(source_root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(source_root.rglob("*.swift"))
+    }
+
+
+def job_builds_app_index(operation: str, args: Dict[str, Any]) -> bool:
+    if args.get("scratch") or (operation == "test" and args.get("module")):
+        return False
+    return operation in {"build", "run", "test", "ci-build-tests", "install-debug-cli"} or (
+        operation == "swift-build" and args.get("product") in {"RepoPrompt", "all"}
+    ) or (operation == "package" and args.get("config") == "debug")
+
+
+def save_app_index_fingerprint(repo_root: Path, before: Dict[str, str]) -> bool:
+    """Publish only if source bytes were stable across a successful coordinated build."""
+    if app_source_hashes(repo_root) != before:
+        return False
+    path = repo_root / INDEX_SOURCE_FINGERPRINT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps({"source_sha256": before}, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+    return True
+
+
+PROTOCOL_VERSION = 18
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 JOB_PHASES = {
     "queued",
@@ -66,6 +103,60 @@ BUILD_CACHE_CLONE_SECONDS_PER_ENTRY = 0.005
 BUILD_CACHE_CLONE_SECONDS_PER_GIB = 5.0
 BUILD_CACHE_RETRY_OVERHEAD_SECONDS = 30.0
 BUILD_CACHE_FORCE_STOP_WAIT_SECONDS = 4 * BUILD_CACHE_CLONE_MAX_SECONDS + BUILD_CACHE_RETRY_OVERHEAD_SECONDS
+CONDUCTOR_JOB_TICKET_ENV = "REPOPROMPT_CONDUCTOR_JOB_TICKET"
+OPERATION_RUNNER_ARG = "__operation_runner"
+# SwiftPM keys its manifest cache on the full process environment, so any per-job value
+# exported to a SwiftPM process forces every package manifest to be re-evaluated and the
+# build to be re-planned (~30 s per job on this package). The job ticket is therefore
+# delivered only to conductor's own operation runner, which consumes it before spawning
+# anything else.
+_CURRENT_JOB_TICKET: Optional[str] = None
+
+
+def argv_is_operation_runner(argv: Sequence[str]) -> bool:
+    return OPERATION_RUNNER_ARG in list(argv)[:4]
+
+
+def capture_job_ticket(environ: Dict[str, str]) -> Optional[str]:
+    global _CURRENT_JOB_TICKET
+    _CURRENT_JOB_TICKET = environ.pop(CONDUCTOR_JOB_TICKET_ENV, None)
+    return _CURRENT_JOB_TICKET
+
+
+def current_job_ticket() -> Optional[str]:
+    return _CURRENT_JOB_TICKET
+
+
+# Measurement builds (build-modularization P0.5): `swift-build` and aggregate `test` accept
+# `--scratch <label>` plus extra compiler or linker flags. They build in `.build/measure/<label>`,
+# never in the shared `.build`, so a flag change cannot invalidate ordinary jobs' outputs.
+MEASURE_SCRATCH_RELATIVE = Path(".build") / "measure"
+MEASURE_LABEL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def measurement_scratch_path(repo_root: Path, label: str) -> Path:
+    if not MEASURE_LABEL_PATTERN.fullmatch(label) or ".." in label:
+        raise ConductorError("--scratch must be a short label of letters, digits, '.', '_', or '-'")
+    return repo_root / MEASURE_SCRATCH_RELATIVE / label
+
+
+def measurement_build_args(repo_root: Path, args: Dict[str, Any]) -> List[str]:
+    """SwiftPM arguments for an opt-in measurement build; empty for ordinary jobs."""
+    label = args.get("scratch")
+    swiftc_flags = [str(flag) for flag in args.get("swiftcFlags") or []]
+    linker_flags = [str(flag) for flag in args.get("linkerFlags") or []]
+    if not label:
+        if swiftc_flags or linker_flags:
+            raise ConductorError("--swiftc-flag and --linker-flag require --scratch <label>")
+        return []
+    result = ["--scratch-path", str(measurement_scratch_path(repo_root, str(label)))]
+    for flag in swiftc_flags:
+        result.extend(["-Xswiftc", flag])
+    for flag in linker_flags:
+        result.extend(["-Xlinker", flag])
+    return result
+
+
 BUILD_CACHE_ELIGIBLE_OPERATIONS = {"swift-build", "build", "package", "test", "install-debug-cli"}
 BUILD_CACHE_ENV_KEYS = (
     "ARCHS",
@@ -116,6 +207,8 @@ APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS = 25.0
 GLOBAL_HEAVY_SLOT_POLL_SECONDS = 0.2
 MACHINE_LOCK_POLL_SECONDS = 0.2
 MAX_GLOBAL_HEAVY_SLOTS = 64
+HEAVY_RSS_UNIT_BYTES = 1536 * 1024 * 1024
+HEAVY_RSS_HISTORY_LIMIT = 20
 EXTERNAL_IO_QUEUE_DEPTH = 4096
 MAX_INFRASTRUCTURE_WARNINGS = 16
 INFRASTRUCTURE_WARNING_TTL_SECONDS = 5 * 60.0
@@ -168,6 +261,8 @@ IMPLEMENTED_OPERATIONS = {
     "build",
     "package",
     "test",
+    "ci-build-tests",
+    "ci-shard",
     "provider-test",
     "install-debug-cli",
     "debug-cli-status",
@@ -210,9 +305,14 @@ Operation commands:
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp --scratch <label> [--swiftc-flag=<flag>]... [--linker-flag=<flag>]...
+    measurement build in .build/measure/<label>; never touches the shared .build or the build cache
   ./conductor build
   ./conductor package debug|release
-  ./conductor test [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test [--module <TestTarget>] [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor ci-build-tests                         # one clean bundle build with import/type-check gates
+  ./conductor ci-shard --shard-count N --shard-index I # run transferred bundle without build
+  ./conductor test [--filter <filter>] --scratch <label> [--swiftc-flag=<flag>]... [--linker-flag=<flag>]...   # aggregate-path measurement build
   ./conductor provider-test [--filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
@@ -278,6 +378,117 @@ XCTEST_PROGRESS_RE = re.compile(
     r"^Test Case '(.+)' (started|passed|failed|skipped)(?: \([^)]*\))?\.\s*$"
 )
 XCTEST_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9:;]*m")
+# Structured per-job phase timing (build-modularization P0.1). Marks are wall-clock epoch
+# seconds; output-derived marks are the time conductor received the line.
+JOB_TIMING_SCHEMA_VERSION = 1
+JOB_TIMING_RECORD_SUFFIX = ".timing.json"
+JOB_TIMING_MARKS = (
+    "queued",
+    "laneAdmitted",
+    "buildCachePrepareStarted",
+    "buildCachePrepareFinished",
+    "heavySlotWaitStarted",
+    "heavySlotAcquired",
+    "processStarted",
+    "cacheColdRetryStarted",
+    "buildCompleted",
+    "firstTestStarted",
+    "processFinished",
+    "cachePublicationStarted",
+    "cachePublicationFinished",
+    "finished",
+)
+TIMING_BUILD_COMPLETE_RE = re.compile(r"Build complete!\s*\((\d+(?:\.\d+)?)s\)")
+TIMING_FIRST_TEST_RE = re.compile(r"^(?:Test Suite '.+' started\b|.{0,4}Test run started\b)")
+TIMING_COLD_RETRY_TEXT = "seeded build failed; removing the proven seeded .build and retrying cold once"
+# Optional per-job peak RSS (build-modularization P0.5, input to admission v2). Heavy-slot jobs
+# sample `ps` once per interval and sum RSS over the job's process tree. The tree sum counts
+# shared pages once per process (an upper bound); sampling can miss short peaks (a lower bound).
+JOB_RSS_SAMPLE_INTERVAL_SECONDS = 1.0
+
+
+def parse_process_rss_table(text: str) -> Dict[int, Tuple[int, int, str]]:
+    """Parse `ps -axo pid=,ppid=,rss=,comm=` into pid -> (ppid, rss bytes, command name)."""
+    table: Dict[int, Tuple[int, int, str]] = {}
+    for line in text.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) < 3:
+            continue
+        try:
+            pid, ppid, rss_kib = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        # `ps` wraps the name in parentheses once a process is exiting and its arguments are gone.
+        raw_name = parts[3].strip() if len(parts) == 4 else ""
+        if raw_name.startswith("(") and raw_name.endswith(")"):
+            raw_name = raw_name[1:-1]
+        name = os.path.basename(raw_name)
+        table[pid] = (ppid, rss_kib * 1024, name)
+    return table
+
+
+def process_rss_snapshot() -> Optional[Dict[int, Tuple[int, int, str]]]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,rss=,comm="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            text=True,
+            capture_output=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_process_rss_table(completed.stdout)
+
+
+def process_tree_rss(table: Dict[int, Tuple[int, int, str]], root_pid: int) -> Optional[Dict[str, Any]]:
+    """Sum RSS over `root_pid` and its descendants; None when the root is gone or a zombie."""
+    root = table.get(root_pid)
+    if root is None or root[1] <= 0:
+        return None
+    children: Dict[int, List[int]] = {}
+    for pid, (ppid, _, _) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    total = 0
+    count = 0
+    largest_bytes = -1
+    largest_name = ""
+    pending = [root_pid]
+    seen: set[int] = set()
+    while pending:
+        pid = pending.pop()
+        if pid in seen or pid not in table:
+            continue
+        seen.add(pid)
+        _, rss, name = table[pid]
+        total += rss
+        count += 1
+        if rss > largest_bytes:
+            largest_bytes, largest_name = rss, name
+        pending.extend(children.get(pid, ()))
+    return {"treeBytes": total, "processes": count, "largestBytes": largest_bytes, "largestName": largest_name}
+
+
+def run_process_tree_rss_sampler(
+    root_pid: int,
+    is_running: Callable[[], bool],
+    record: Callable[[Dict[str, Any]], None],
+    *,
+    snapshot: Callable[[], Optional[Dict[int, Tuple[int, int, str]]]] = process_rss_snapshot,
+    wait: Callable[[float], None] = time.sleep,
+    interval: float = JOB_RSS_SAMPLE_INTERVAL_SECONDS,
+) -> None:
+    """Sample until the root exits. Read-only: it never signals or waits on the job's processes."""
+    while is_running():
+        table = snapshot()
+        if table is not None:
+            sample = process_tree_rss(table, root_pid)
+            if sample is None:
+                return
+            record(sample)
+        wait(interval)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -909,7 +1120,12 @@ class BuildCacheManager:
 
     @staticmethod
     def eligible(operation: str, args: Dict[str, Any]) -> bool:
-        del args
+        # Module-scoped tests build in their own Swift Build scratch path, not the seeded `.build`.
+        if operation == "test" and args.get("module"):
+            return False
+        # Measurement builds use `.build/measure/<label>`, not the seeded `.build`.
+        if args.get("scratch"):
+            return False
         return operation in BUILD_CACHE_ELIGIBLE_OPERATIONS
 
     @staticmethod
@@ -1257,7 +1473,7 @@ class BuildCacheManager:
     @staticmethod
     def _sanitize_seed(build_dir: Path) -> None:
         deadline = BuildCacheManager._tree_deadline_seconds(build_dir)
-        for relative in ("xcode", "xcode-custom", ".conductor-cache-provenance.json"):
+        for relative in ("xcode", "xcode-custom", "measure", "swiftbuild", ".conductor-cache-provenance.json"):
             target = build_dir / relative
             if target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target, ignore_errors=True)
@@ -1482,10 +1698,20 @@ def machine_lock_dir() -> Path:
     return Path("/tmp") / f"repoprompt-ce-dev-locks-{uid}"
 
 
+@functools.lru_cache(maxsize=1)
+def default_global_heavy_slots() -> int:
+    try:
+        physical = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, stderr=subprocess.DEVNULL))
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        # Never opt into parallel heavy jobs when physical capacity is unknown.
+        return 1
+    return max(1, min(4, physical // (2 * HEAVY_RSS_UNIT_BYTES)))
+
+
 def configured_global_heavy_slots(env: Optional[Dict[str, str]] = None) -> int:
     raw = (env or os.environ).get("REPOPROMPT_DEV_HEAVY_SLOTS")
     if raw is None or raw == "":
-        return 1
+        return default_global_heavy_slots()
     try:
         slots = int(raw)
     except ValueError as exc:
@@ -1493,6 +1719,73 @@ def configured_global_heavy_slots(env: Optional[Dict[str, str]] = None) -> int:
     if slots < 1 or slots > MAX_GLOBAL_HEAVY_SLOTS:
         raise ConductorError(f"REPOPROMPT_DEV_HEAVY_SLOTS must be between 1 and {MAX_GLOBAL_HEAVY_SLOTS}")
     return slots
+
+
+def heavy_job_class(operation: str, args: Dict[str, Any]) -> str:
+    if operation == "test" and args.get("module"):
+        return f"module:{args['module']}"
+    if operation == "provider-test":
+        return "module:provider"
+    return "app-or-aggregate"
+
+
+def heavy_rss_history_path() -> Path:
+    return machine_lock_dir() / "heavy-rss-history.json"
+
+
+def read_heavy_rss_history() -> Dict[str, List[int]]:
+    try:
+        data = json.loads(heavy_rss_history_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("classes"), dict):
+        return {}
+    return {
+        name: [value for value in values if type(value) is int and value > 0][-HEAVY_RSS_HISTORY_LIMIT:]
+        for name, values in data["classes"].items()
+        if isinstance(name, str) and isinstance(values, list)
+    }
+
+
+def heavy_estimated_rss(operation: str, args: Dict[str, Any]) -> int:
+    samples = sorted(read_heavy_rss_history().get(heavy_job_class(operation, args), []))
+    if samples:
+        # Deterministic nearest-rank p90 with 384 MiB safety headroom.
+        return samples[math.ceil(0.9 * len(samples)) - 1] + HEAVY_RSS_UNIT_BYTES // 4
+    return HEAVY_RSS_UNIT_BYTES if heavy_job_class(operation, args).startswith("module:") else 5 * 1024**3
+
+
+def heavy_required_slots(operation: str, args: Dict[str, Any], env: Optional[Dict[str, str]]) -> int:
+    return max(1, min(configured_global_heavy_slots(env), math.ceil(
+        heavy_estimated_rss(operation, args) / HEAVY_RSS_UNIT_BYTES
+    )))
+
+
+def record_heavy_rss_sample(operation: str, args: Dict[str, Any], tree_bytes: int) -> None:
+    if tree_bytes <= 0:
+        return
+    root = machine_lock_dir()
+    ensure_private_dir(root)
+    lock_path = root / "heavy-rss-history.lock"
+    with lock_path.open("a+") as lock_file:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        classes = read_heavy_rss_history()
+        key = heavy_job_class(operation, args)
+        classes[key] = (classes.get(key, []) + [tree_bytes])[-HEAVY_RSS_HISTORY_LIMIT:]
+        temporary = root / f".heavy-rss-history.{uuid.uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "classes": classes}, stream, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, heavy_rss_history_path())
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def global_heavy_slot_paths(env: Optional[Dict[str, str]] = None) -> List[Path]:
@@ -1608,6 +1901,7 @@ class FairHeavyLease:
     lock_file: Any
     lock_path: Path
     waiter_id: str
+    extra_locks: Tuple[Tuple[Any, Path], ...] = ()
 
     def release(self) -> None:
         self.coordinator.release(self)
@@ -1627,6 +1921,10 @@ class FairHeavyAdmission:
     ) -> None:
         self.metadata = dict(metadata)
         self.env = dict(env or {})
+        self.required_slots = max(1, min(
+            configured_global_heavy_slots(self.env), int(self.metadata.get("requiredSlots") or configured_global_heavy_slots(self.env))
+        ))
+        self.reservation_bytes = int(self.metadata.get("reservationBytes") or self.required_slots * HEAVY_RSS_UNIT_BYTES)
         self._clock = clock
         self._on_warning = on_warning or (lambda _kind, _message: None)
         self._remote_process_snapshot: Optional[Dict[int, Tuple[int, str]]] = None
@@ -1857,10 +2155,25 @@ class FairHeavyAdmission:
                     "worktree": self.metadata.get("worktree"),
                     "enqueuedAt": now(),
                     "acquiredSlotPath": None,
+                    "acquiredSlotPaths": [],
+                    "requiredSlots": self.required_slots,
+                    "reservationBytes": self.reservation_bytes,
                     "notifySocketPath": str(self.notify_path),
                 }
             )
             self._write_queue(payload)
+
+    def _slots_for_waiter(self, waiter: Dict[str, Any]) -> int:
+        capacity = configured_global_heavy_slots(self.env)
+        reservation = waiter.get("reservationBytes")
+        if type(reservation) is int and reservation > 0:
+            return min(capacity, math.ceil(reservation / HEAVY_RSS_UNIT_BYTES))
+        # Legacy queue records used a single exclusive slot, regardless of
+        # how many slots the new daemon now advertises.
+        return capacity
+
+    def _weighted_eligible(self, ordered: List[Dict[str, Any]], index: int) -> bool:
+        return sum(self._slots_for_waiter(item) for item in ordered[:index + 1]) <= configured_global_heavy_slots(self.env)
 
     def _queue_snapshot(self) -> Tuple[Dict[str, Any], Dict[str, Any], int, List[Dict[str, Any]]]:
         with self._queue_lock():
@@ -1969,7 +2282,7 @@ class FairHeavyAdmission:
                 }
                 for item in ordered[: max(0, position - 1)]
             ]
-            eligible = position <= configured_global_heavy_slots(self.env)
+            eligible = self._weighted_eligible(ordered, position - 1)
             if eligible:
                 observed_at = self._clock()
                 if self._eligible_since is None:
@@ -1987,49 +2300,66 @@ class FairHeavyAdmission:
                 self._legacy_slot_holder_observed_at = None
             update(position, earlier)
             if eligible:
-                explained_slots = {
-                    str(item.get("acquiredSlotPath"))
-                    for item in ordered[: max(0, position - 1)]
-                    if item.get("state") == "acquired" and item.get("acquiredSlotPath")
-                }
-                observed_unexplained_holder = False
-                for slot_path in slot_paths:
-                    lock_file = slot_path.open("a+", encoding="utf-8")
-                    try:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
-                        lock_file.close()
-                        if str(slot_path) not in explained_slots and not observed_unexplained_holder:
-                            self._observe_legacy_slot_holder(slot_path)
-                            observed_unexplained_holder = True
-                        continue
-                    except OSError as exc:
-                        lock_file.close()
-                        if exc.errno == errno.EINTR:
-                            continue
-                        raise
-                    with self._queue_lock():
-                        payload = self._load_queue()
-                        ordered_now = sorted(payload["waiters"], key=lambda item: int(item.get("sequence", 0)))
-                        matching = [item for item in ordered_now if item.get("waiterID") == self.waiter_id]
-                        eligible = bool(
-                            matching
-                            and matching[0].get("ownerPID") == self.owner_pid
-                            and matching[0].get("ownerStartToken") == self.owner_start
-                            and ordered_now.index(matching[0]) < configured_global_heavy_slots(self.env)
-                        )
-                        if eligible:
-                            matching[0]["state"] = "acquired"
-                            matching[0]["acquiredSlotPath"] = str(slot_path)
-                            payload["generation"] += 1
-                            self._write_queue(payload)
-                            write_display_lock_metadata(lock_file, self.metadata)
-                            self.legacy_slot_holder = None
-                            self._legacy_slot_holder_observed_at = None
-                            return FairHeavyLease(self, lock_file, slot_path, self.waiter_id)
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-                    lock_file.close()
-                if observed_unexplained_holder:
+                # Claim all reservation units under the queue lock. Partial flocks are
+                # released before another waiter can inspect the queue. An unexplained
+                # holder (older conductor or direct lock user) fences *all* new work.
+                with self._queue_lock():
+                    payload = self._load_queue()
+                    ordered_now = sorted(payload["waiters"], key=lambda item: int(item.get("sequence", 0)))
+                    matching = [item for item in ordered_now if item.get("waiterID") == self.waiter_id]
+                    still_eligible = bool(
+                        matching
+                        and matching[0].get("ownerPID") == self.owner_pid
+                        and matching[0].get("ownerStartToken") == self.owner_start
+                        and self._weighted_eligible(ordered_now, ordered_now.index(matching[0]))
+                    )
+                    if still_eligible:
+                        explained = {
+                            path
+                            for item in ordered_now
+                            if item.get("state") == "acquired"
+                            for path in (item.get("acquiredSlotPaths") or [item.get("acquiredSlotPath")])
+                            if path
+                        }
+                        held: List[Tuple[Any, Path]] = []
+                        unexplained = False
+                        committed = False
+                        try:
+                            for slot_path in slot_paths:
+                                lock_file = slot_path.open("a+", encoding="utf-8")
+                                try:
+                                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                except BlockingIOError:
+                                    lock_file.close()
+                                    if str(slot_path) not in explained:
+                                        self._observe_legacy_slot_holder(slot_path)
+                                        unexplained = True
+                                    continue
+                                held.append((lock_file, slot_path))
+                            if not unexplained and len(held) >= self.required_slots:
+                                selected = held[:self.required_slots]
+                                for extra_file, _ in held[self.required_slots:]:
+                                    fcntl.flock(extra_file.fileno(), fcntl.LOCK_UN)
+                                    extra_file.close()
+                                held = selected
+                                matching[0]["state"] = "acquired"
+                                matching[0]["acquiredSlotPath"] = str(selected[0][1])
+                                matching[0]["acquiredSlotPaths"] = [str(path) for _, path in selected]
+                                payload["generation"] += 1
+                                self._write_queue(payload)
+                                for lock_file, _ in selected:
+                                    write_display_lock_metadata(lock_file, self.metadata)
+                                self.legacy_slot_holder = None
+                                self._legacy_slot_holder_observed_at = None
+                                committed = True
+                                return FairHeavyLease(self, selected[0][0], selected[0][1],
+                                                      self.waiter_id, tuple(selected[1:]))
+                        finally:
+                            if not committed:
+                                for lock_file, _ in held:
+                                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                                    lock_file.close()
+                if self.legacy_slot_holder:
                     update(position, earlier)
             self.notify_socket.settimeout(self.current_rescan_seconds)
             with contextlib.suppress(socket.timeout, BlockingIOError, OSError):
@@ -2049,14 +2379,15 @@ class FairHeavyAdmission:
     def release(self, lease: FairHeavyLease) -> None:
         if lease.waiter_id != self.waiter_id:
             raise ConductorError("refusing to release a different global-heavy waiter")
-        with contextlib.suppress(OSError):
-            lease.lock_file.seek(0)
-            lease.lock_file.truncate()
-            lease.lock_file.flush()
-        with contextlib.suppress(OSError):
-            fcntl.flock(lease.lock_file.fileno(), fcntl.LOCK_UN)
-        with contextlib.suppress(OSError):
-            lease.lock_file.close()
+        for lock_file, _ in ((lease.lock_file, lease.lock_path), *lease.extra_locks):
+            with contextlib.suppress(OSError):
+                lock_file.seek(0)
+                lock_file.truncate()
+                lock_file.flush()
+            with contextlib.suppress(OSError):
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                lock_file.close()
         try:
             self._remove_own_waiter()
         finally:
@@ -2262,6 +2593,7 @@ def process_start_token(pid: int) -> Optional[str]:
     try:
         completed = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2278,6 +2610,7 @@ def process_table_snapshot() -> Optional[Dict[int, Tuple[int, str]]]:
     try:
         completed = subprocess.run(
             ["ps", "-axo", "pid=,ppid=,lstart="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2308,6 +2641,7 @@ def process_command_snapshot(pids: Sequence[int]) -> Dict[int, str]:
     try:
         completed = subprocess.run(
             ["ps", "-ww", "-p", ",".join(str(pid) for pid in selected), "-o", "pid=,command="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2336,6 +2670,7 @@ def process_command(pid: int) -> str:
     try:
         completed = subprocess.run(
             ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
             timeout=2.0,
@@ -2399,6 +2734,52 @@ def iso_timestamp(ts: Optional[float]) -> Optional[str]:
     if ts is None:
         return None
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts))
+
+
+def job_timing_record_path(log_path: Path) -> Path:
+    return log_path.with_suffix(JOB_TIMING_RECORD_SUFFIX)
+
+
+def job_timing_record_log_name(name: str) -> Optional[str]:
+    """Return the job log name that owns a `<ticket>.timing.json` record, else None."""
+    if not name.endswith(JOB_TIMING_RECORD_SUFFIX):
+        return None
+    return name[: -len(JOB_TIMING_RECORD_SUFFIX)] + ".log"
+
+
+def phase_timing_segments(marks: Dict[str, float], build_reported_seconds: Optional[float]) -> Dict[str, float]:
+    """Derive per-phase durations (seconds) from phase marks; segments with a missing endpoint are omitted."""
+    segments: Dict[str, float] = {}
+
+    def span(name: str, start: Optional[float], end: Optional[float]) -> None:
+        if start is not None and end is not None:
+            segments[name] = round(max(0.0, end - start), 3)
+
+    get = marks.get
+    span("queueSeconds", get("queued"), get("laneAdmitted"))
+    span("buildCachePrepareSeconds", get("buildCachePrepareStarted"), get("buildCachePrepareFinished"))
+    span("heavySlotWaitSeconds", get("heavySlotWaitStarted"), get("heavySlotAcquired"))
+    launch_from = [
+        value
+        for value in (get("laneAdmitted"), get("buildCachePrepareFinished"), get("heavySlotAcquired"))
+        if value is not None
+    ]
+    span("launchSeconds", max(launch_from) if launch_from else None, get("processStarted"))
+    span("processToBuildCompleteSeconds", get("processStarted"), get("buildCompleted"))
+    if build_reported_seconds is not None:
+        segments["buildReportedSeconds"] = round(build_reported_seconds, 3)
+        if "processToBuildCompleteSeconds" in segments:
+            segments["preBuildSeconds"] = round(
+                max(0.0, segments["processToBuildCompleteSeconds"] - build_reported_seconds), 3
+            )
+    span("buildCompleteToFirstTestSeconds", get("buildCompleted"), get("firstTestStarted"))
+    span("processToFirstTestSeconds", get("processStarted"), get("firstTestStarted"))
+    span("testSeconds", get("firstTestStarted"), get("processFinished"))
+    span("processSeconds", get("processStarted"), get("processFinished"))
+    span("finalizeSeconds", get("processFinished"), get("cachePublicationStarted") or get("finished"))
+    span("cachePublicationSeconds", get("cachePublicationStarted"), get("cachePublicationFinished"))
+    span("totalSeconds", get("queued"), get("finished"))
+    return segments
 
 
 def terminal_exit_code(payload: Dict[str, Any]) -> int:
@@ -2840,7 +3221,7 @@ def job_consumes_unlaned_capacity(operation: str, lanes: Sequence[str]) -> bool:
 
 
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
+    if operation in {"swift-build", "build", "package", "test", "ci-build-tests", "provider-test", "install-debug-cli"}:
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
@@ -2932,6 +3313,7 @@ class Job:
     global_heavy_legacy_slot_holder: Optional[Dict[str, Any]] = None
     global_heavy_admission_state: str = "notRequired"
     global_heavy_queue_position: Optional[int] = None
+    global_heavy_required_slots: Optional[int] = None
     global_heavy_waiter_id: Optional[str] = None
     global_heavy_rescan_seconds: Optional[float] = None
     exit_code: Optional[int] = None
@@ -2972,6 +3354,97 @@ class Job:
     tail_bytes: int = 0
     build_cache: Dict[str, Any] = dataclasses.field(default_factory=dict)
     tail: Deque[str] = dataclasses.field(default_factory=lambda: deque(maxlen=LOG_TAIL_LINES))
+    phase_marks: Dict[str, float] = dataclasses.field(default_factory=dict)
+    build_reported_seconds: Optional[float] = None
+    build_complete_count: int = 0
+    peak_rss: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def observe_rss_sample(self, sample: Dict[str, Any]) -> None:
+        """Fold one process-tree RSS sample into the job's peaks."""
+        peak = self.peak_rss
+        peak["samples"] = int(peak.get("samples", 0)) + 1
+        peak["sampleIntervalSeconds"] = JOB_RSS_SAMPLE_INTERVAL_SECONDS
+        if int(sample["treeBytes"]) > int(peak.get("treeBytes", -1)):
+            peak["treeBytes"] = int(sample["treeBytes"])
+            peak["treeProcesses"] = int(sample["processes"])
+        if int(sample["largestBytes"]) > int(peak.get("largestProcessBytes", -1)):
+            peak["largestProcessBytes"] = int(sample["largestBytes"])
+            peak["largestProcessName"] = str(sample["largestName"])
+
+    def mark_phase(self, name: str, at: Optional[float] = None) -> None:
+        """Record the first time a timing mark is reached; later calls keep the original time."""
+        if name not in JOB_TIMING_MARKS:
+            raise ConductorError(f"invalid job timing mark '{name}'")
+        self.phase_marks.setdefault(name, now() if at is None else at)
+
+    def observe_output_timing(self, text: str, at: Optional[float] = None) -> None:
+        """Derive build/test marks from process output lines as conductor receives them.
+
+        `buildCompleted` tracks the last `Build complete!` before the first test starts, so a
+        cold cache retry or a second build step reports the build that the tests actually used.
+        """
+        if "firstTestStarted" in self.phase_marks:
+            return
+        if "Build complete!" not in text and "started" not in text and "retrying cold" not in text:
+            return
+        observed_at = now() if at is None else at
+        for raw_line in text.splitlines():
+            line = XCTEST_ANSI_SGR_RE.sub("", raw_line).strip()
+            build = TIMING_BUILD_COMPLETE_RE.search(line)
+            if build is not None:
+                self.phase_marks["buildCompleted"] = observed_at
+                self.build_reported_seconds = float(build.group(1))
+                self.build_complete_count += 1
+            elif TIMING_FIRST_TEST_RE.match(line):
+                self.mark_phase("firstTestStarted", observed_at)
+                return
+            elif TIMING_COLD_RETRY_TEXT in line:
+                self.mark_phase("cacheColdRetryStarted", observed_at)
+
+    def phase_timings(self) -> Dict[str, Any]:
+        marks: Dict[str, float] = {}
+        derived = {
+            "queued": self.created_at,
+            "laneAdmitted": self.started_at,
+            "processStarted": self.process_started_at,
+            "processFinished": self.process_finished_at,
+            "finished": self.finished_at,
+        }
+        for name in JOB_TIMING_MARKS:
+            value = derived.get(name) if name in derived else self.phase_marks.get(name)
+            if value is not None:
+                marks[name] = value
+        timings: Dict[str, Any] = {
+            "schemaVersion": JOB_TIMING_SCHEMA_VERSION,
+            "marks": marks,
+            "segments": phase_timing_segments(marks, self.build_reported_seconds),
+            "buildCompleteCount": self.build_complete_count,
+            "outputMarksAreReceiptTimes": True,
+        }
+        if self.peak_rss:
+            timings["peakRss"] = dict(self.peak_rss)
+        return timings
+
+    def timing_record(self) -> Dict[str, Any]:
+        """Compact persisted record (`<ticket>.timing.json`) for retroactive timing analysis."""
+        build_cache = {
+            key: self.build_cache[key]
+            for key in ("state", "seeded", "cloneSeconds")
+            if key in self.build_cache
+        }
+        publication = self.build_cache.get("publication")
+        if isinstance(publication, dict) and "state" in publication:
+            build_cache["publicationState"] = publication["state"]
+        return {
+            "schemaVersion": JOB_TIMING_SCHEMA_VERSION,
+            "ticket": self.ticket,
+            "operation": self.operation,
+            "operationLabel": operation_display_name(self.operation, self.args),
+            "state": self.state,
+            "exitCode": self.exit_code,
+            "buildCache": build_cache,
+            "phaseTimings": self.phase_timings(),
+        }
 
     def to_payload(self, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         queue_wait_seconds = None
@@ -3017,6 +3490,7 @@ class Job:
                 "displayOnly": True,
                 "state": self.global_heavy_admission_state,
                 "configuredSlots": configured_global_heavy_slots(self.env),
+                "requiredSlots": self.global_heavy_required_slots,
                 "queuePosition": self.global_heavy_queue_position,
                 "waiterID": self.global_heavy_waiter_id,
                 "rescanSeconds": self.global_heavy_rescan_seconds,
@@ -3051,6 +3525,7 @@ class Job:
             "lastProgressObservedAt": self.xctest_last_progress_observed_at,
             "diagnosticPaths": [str(path) for path in self.diagnostic_paths],
             "buildCache": dict(self.build_cache),
+            "phaseTimings": self.phase_timings(),
         }
         if self.diagnostics:
             payload["diagnostics"] = list(self.diagnostics)
@@ -3087,6 +3562,7 @@ class OperationRegistry:
         "REPOPROMPT_DEBUG_CLI_INSTALL_PATH",
     ]
     BUILD_ENV_KEYS = [
+        "TYPECHECK_RATCHET_ENFORCE",
         "PATH",
         "DEVELOPER_DIR",
         "TOOLCHAINS",
@@ -3119,6 +3595,8 @@ class OperationRegistry:
     TEST_ENV_KEYS = [
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
+        "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT",
+        "REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_CYCLES",
     ]
     CONDUCTOR_ENV_KEYS = [
         "REPOPROMPT_DEV_HEAVY_SLOTS",
@@ -3222,17 +3700,33 @@ class OperationRegistry:
         if operation == "swift-build":
             product = args.get("product")
             lanes = ["build"]
+            measurement = measurement_build_args(self.repo_root, args)
             if product == "all":
+                if measurement:
+                    raise ConductorError("measurement builds need a single --product")
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            return ["swift", "build", "--product", str(product), *measurement], lanes, cwd, env, effective_timeout
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
             config = str(args.get("config"))
             lanes = ["build", "debugArtifact"] + (["release"] if config == "release" else [])
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
+        if operation == "ci-build-tests":
+            return [sys.executable, script("modularization_ci_build.py")], ["build"], cwd, env, effective_timeout
+        if operation == "ci-shard":
+            return [sys.executable, script("ci_app_test_runner.py"), "--skip-build",
+                    "--shard-count", str(args["shardCount"]), "--shard-index", str(args["shardIndex"])], ["build"], cwd, env, effective_timeout
         if operation == "test":
             argv = [sys.executable, script("ci_app_test_runner.py"), "--local"]
+            measurement = measurement_build_args(self.repo_root, args)
+            if measurement and args.get("module"):
+                raise ConductorError("--scratch applies to the aggregate path; --module has its own scratch path")
+            if measurement:
+                argv.extend(["--scratch-path", measurement[1]])
+                argv.extend(f"--build-arg={value}" for value in measurement[2:])
+            if args.get("module"):
+                argv.extend(["--module", str(args["module"])])
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("filter"):
@@ -4027,6 +4521,7 @@ class DaemonState:
             job = self.jobs.get(ticket)
             if job is None:
                 return None
+            job.mark_phase("heavySlotWaitStarted", wait_start)
             env = dict(job.env)
             lease = self._job_lease(job)
             metadata = display_lock_metadata(
@@ -4037,6 +4532,8 @@ class DaemonState:
                 repo_root=self.paths.repo_root,
                 repo_hash=self.paths.repo_hash,
             )
+            metadata["reservationBytes"] = heavy_estimated_rss(job.operation, job.args)
+            metadata["requiredSlots"] = heavy_required_slots(job.operation, job.args, env)
         def admission_warning(kind: str, message: str) -> None:
             with self.condition:
                 current = self._job_matches_lease_locked(lease)
@@ -4052,6 +4549,7 @@ class DaemonState:
             current = self._job_matches_lease_locked(lease)
             if current is not None:
                 current.global_heavy_waiter_id = coordinator.waiter_id
+                current.global_heavy_required_slots = coordinator.required_slots
 
         def cancel_check() -> bool:
             with self.condition:
@@ -4096,7 +4594,8 @@ class DaemonState:
                 self._terminalize_canceled_global_heavy_wait_locked(current)
             else:
                 current.global_heavy_slot_wait_seconds = waited
-                current.global_heavy_slot_path = str(acquired.lock_path)
+                current.mark_phase("heavySlotAcquired", wait_start + waited)
+                current.global_heavy_slot_path = ",".join(str(path) for _, path in ((acquired.lock_file, acquired.lock_path), *acquired.extra_locks))
                 current.global_heavy_slot_holder = None
                 current.global_heavy_legacy_slot_holder = None
                 current.global_heavy_admission_state = "acquired"
@@ -4104,7 +4603,8 @@ class DaemonState:
                 self._set_phase_locked(current, "startingProcess")
                 self._append_system_line_locked(
                     current,
-                    f"acquired fair global heavy slot {acquired.lock_path} after {format_duration(waited)}\n",
+                    f"acquired fair global heavy reservation {current.global_heavy_required_slots}/"
+                    f"{configured_global_heavy_slots(env)} slots after {format_duration(waited)}\n",
                 )
                 self.condition.notify_all()
         if release_stale_acquisition:
@@ -4204,6 +4704,7 @@ class DaemonState:
         cache_publish_after_success = False
         cache_wrapper_gate_read = -1
         cache_wrapper_gate_write = -1
+        app_index_source_before: Optional[Dict[str, str]] = None
         try:
             with self.lock:
                 job = self.jobs[ticket]
@@ -4223,8 +4724,12 @@ class DaemonState:
                     self._append_system_line_locked(job, "job canceled before process start\n")
                     return
             argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
-            env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
+            env.pop(CONDUCTOR_JOB_TICKET_ENV, None)
+            if argv_is_operation_runner(argv):
+                env[CONDUCTOR_JOB_TICKET_ENV] = job.ticket
             if BuildCacheManager.eligible(job.operation, job.args) and (self.paths.repo_root / "Package.swift").is_file():
+                with self.condition:
+                    job.mark_phase("buildCachePrepareStarted")
                 with self._cache_write_lock:
                     cache_manager = self._build_cache_manager(env)
                 cache_context = cache_manager.prepare(job.operation, job.args, env)
@@ -4248,6 +4753,7 @@ class DaemonState:
                             "cache_retry",
                             {
                                 "argv": argv,
+                                "testBuildReceipt": job.operation == "test",
                                 "key": cache_context.snapshot.key,
                                 "outcomePath": str(cache_context.outcome_path),
                                 "attemptTimeout": attempt_timeout,
@@ -4264,10 +4770,16 @@ class DaemonState:
                             job.build_cache["attemptTimeoutSeconds"] = attempt_timeout
                             job.build_cache["cleanupTimeoutSeconds"] = cleanup_timeout
                             job.build_cache["retryEnvelopeTimeoutSeconds"] = effective_timeout
+                with self.condition:
+                    job.mark_phase("buildCachePrepareFinished")
             if operation_requires_global_heavy_slot(job.operation, job.args):
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
                     return
+            if job_builds_app_index(job.operation, job.args):
+                app_index_source_before = app_source_hashes(self.paths.repo_root)
+                with contextlib.suppress(FileNotFoundError):
+                    (self.paths.repo_root / INDEX_SOURCE_FINGERPRINT).unlink()
             start_line = f"$ {format_argv(argv)}\n"
             with self.condition:
                 self._append_system_line_locked(job, start_line)
@@ -4335,6 +4847,12 @@ class DaemonState:
                     daemon=True,
                 )
                 watchdog.start()
+            if global_heavy_slot is not None:
+                threading.Thread(
+                    target=self._sample_job_rss,
+                    args=(job, process),
+                    daemon=True,
+                ).start()
             try:
                 exit_code = process.wait(timeout=effective_timeout)
             except subprocess.TimeoutExpired:
@@ -4436,6 +4954,9 @@ class DaemonState:
                         self._append_system_line_locked(job, job.error + "\n")
             with self.condition:
                 self._finalize_process_exit_locked(job, exit_code)
+                if job.state == "completed" and app_index_source_before is not None:
+                    if not save_app_index_fingerprint(self.paths.repo_root, app_index_source_before):
+                        self._append_system_line_locked(job, "index freshness unknown: app sources changed during build\n")
                 cache_publish_after_success = bool(
                     job.state == "completed" and cache_context is not None and cache_manager is not None
                 )
@@ -4477,6 +4998,13 @@ class DaemonState:
             # build lane through immutable publication. Coordinated mutators of
             # this checkout's .build remain blocked without stalling unrelated
             # worktrees behind the global heavy slot.
+            if (global_heavy_slot is not None and job is not None and
+                    (job.state == "completed" or cache_publish_after_success) and job.peak_rss.get("treeBytes")):
+                try:
+                    record_heavy_rss_sample(job.operation, job.args, int(job.peak_rss["treeBytes"]))
+                except (OSError, ValueError) as exc:
+                    with self.condition:
+                        self._append_system_line_locked(job, f"heavy RSS history not recorded: {exc}\n")
             self._release_global_heavy_slot(global_heavy_slot)
             released_heavy_slot = global_heavy_slot is not None
             global_heavy_slot = None
@@ -4493,6 +5021,8 @@ class DaemonState:
                 with contextlib.suppress(FileNotFoundError):
                     cache_context.outcome_path.unlink()
             if job is not None and cache_publish_after_success and cache_context is not None and cache_manager is not None:
+                with self.condition:
+                    job.mark_phase("cachePublicationStarted")
                 try:
                     with self._cache_write_lock:
                         with self.condition:
@@ -4515,6 +5045,7 @@ class DaemonState:
                         self._warn_job_locked(job, "buildCachePublicationFailed", str(exc))
                 finally:
                     with self.condition:
+                        job.mark_phase("cachePublicationFinished")
                         job.state = "completed"
                         job.exit_code = 0
                         job.result_summary = (
@@ -4545,6 +5076,24 @@ class DaemonState:
                 self.condition.notify_all()
             if job is not None and refresh_after_release:
                 threading.Thread(target=self._refresh_output_summary, args=(job,), daemon=True).start()
+            if job is not None:
+                self._submit_job_timing_record(job)
+
+    def _submit_job_timing_record(self, job: Job) -> None:
+        with self.condition:
+            if job.state not in TERMINAL_STATES:
+                return
+            record = job.timing_record()
+            path = job_timing_record_path(job.log_path)
+        if not self._io_worker.submit(_atomic_write_json, path, record):
+            with self.condition:
+                self._daemon_infrastructure_warnings.append(
+                    {
+                        "kind": "timingRecordQueueFull",
+                        "message": f"timing record for {job.ticket} dropped because the state-I/O queue is full",
+                        "observedAt": now(),
+                    }
+                )
 
     def _submit_process_output_chunk(self, ticket: str, chunk: bytes) -> None:
         with self.condition:
@@ -4558,6 +5107,7 @@ class DaemonState:
             job = self.jobs.get(ticket)
             if job:
                 self._append_tail_locked(job, text)
+                job.observe_output_timing(text)
                 self._record_xctest_progress_locked(job, text)
                 self.condition.notify_all()
 
@@ -4575,7 +5125,10 @@ class DaemonState:
         job.timed_out = True
         job.state = "failed"
         job.exit_code = 124
-        job.error = f"{attempt} cache build attempt timed out{suffix}"
+        if not cold_attempted and outcome.get("testBuildSucceeded"):
+            job.error = f"post-build test execution timed out{suffix}"
+        else:
+            job.error = f"{attempt} cache build attempt timed out{suffix}"
         job.result_summary = job.error
 
     def _finalize_process_exit_locked(self, job: Job, exit_code: int) -> None:
@@ -4674,6 +5227,17 @@ class DaemonState:
             wake_probe=bool(job.args.get("xctestStallWakeProbe")),
             triggered_at=timestamp,
         )
+
+    def _sample_job_rss(self, job: Job, process: subprocess.Popen[bytes]) -> None:
+        def record(sample: Dict[str, Any]) -> None:
+            with self.condition:
+                job.observe_rss_sample(sample)
+
+        try:
+            run_process_tree_rss_sampler(process.pid, lambda: process.returncode is None, record)
+        except Exception:
+            # Sampling is advisory; it must never affect the job.
+            return
 
     def _monitor_xctest_stall(self, ticket: str) -> None:
         while True:
@@ -5482,6 +6046,11 @@ class DaemonState:
                 for path in self.paths.jobs_dir.glob("*.xctest-stall.*")
                 if path.name not in retained_diagnostics
             )
+            candidates.extend(
+                path
+                for path in self.paths.jobs_dir.glob(f"*{JOB_TIMING_RECORD_SUFFIX}")
+                if job_timing_record_log_name(path.name) not in retained_logs
+            )
         for path in candidates:
             try:
                 stale = path.stat().st_mtime < cutoff
@@ -5498,7 +6067,7 @@ class DaemonState:
                     for job in self.jobs.values()
                     for diagnostic_path in job.diagnostic_paths
                 )
-                if path.name in current_names:
+                if path.name in current_names or job_timing_record_log_name(path.name) in current_names:
                     continue
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()
@@ -7356,7 +7925,7 @@ def package_debug_app_under_heavy(repo_root: Path, operation_label: str) -> Tupl
     staged_bundle = staging_parent / live_bundle.name
     metadata = display_lock_metadata(
         lock_kind="global-heavy",
-        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        ticket=current_job_ticket(),
         operation=operation_label,
         operation_label=operation_label,
         repo_root=repo_root,
@@ -7448,7 +8017,7 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
         return 1
     metadata = display_lock_metadata(
         lock_kind="live-app",
-        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        ticket=current_job_ticket(),
         operation="app launch-existing" if staged_bundle is None else "app activate-staged-and-launch",
         operation_label="app launch-existing" if staged_bundle is None else "app activate staged and launch",
         repo_root=repo_root,
@@ -7543,7 +8112,7 @@ def operation_app_status(repo_root: Path) -> int:
 def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
     metadata = display_lock_metadata(
         lock_kind="live-app",
-        ticket=os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET"),
+        ticket=current_job_ticket(),
         operation="app stop",
         operation_label="app stop",
         repo_root=repo_root,
@@ -7875,6 +8444,7 @@ def _run_cache_attempt(
     attempt_timeout: Optional[float],
     attempt_record_path: Path,
     ticket: str,
+    env: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, bool]:
     wrapper_start = process_start_token(os.getpid())
     if not wrapper_start:
@@ -7895,6 +8465,7 @@ def _run_cache_attempt(
         process = subprocess.Popen(
             gate_argv,
             cwd=str(repo_root),
+            env=env,
             stdin=subprocess.DEVNULL,
             pass_fds=(read_fd,),
             start_new_session=True,
@@ -8032,13 +8603,25 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
     if not math.isfinite(cleanup_timeout) or cleanup_timeout < 0:
         raise ConductorError("cache retry cleanup timeout must be a finite non-negative number")
 
-    first_code, first_timed_out = _run_cache_attempt(
-        argv,
-        repo_root,
-        attempt_timeout,
-        attempt_record_path,
-        ticket,
-    )
+    # A test invocation contains both compilation and execution. Only failures before
+    # its successful build boundary are candidates for seeded-cache recovery. Use a
+    # private per-attempt receipt, not log matching or an inherited/stale .build file.
+    with contextlib.ExitStack() as stack:
+        test_build_receipt = None
+        attempt_env = dict(os.environ)
+        if args.get("testBuildReceipt"):
+            directory = stack.enter_context(tempfile.TemporaryDirectory(prefix="conductor-cache-attempt-"))
+            test_build_receipt = Path(directory) / "test-build-succeeded"
+            attempt_env["REPOPROMPT_CONDUCTOR_TEST_BUILD_RECEIPT"] = str(test_build_receipt)
+        first_code, first_timed_out = _run_cache_attempt(
+            argv,
+            repo_root,
+            attempt_timeout,
+            attempt_record_path,
+            ticket,
+            env=attempt_env,
+        )
+        test_build_succeeded = test_build_receipt is not None and test_build_receipt.is_file()
     if first_code == 0:
         return 0
     build_dir = repo_root / ".build"
@@ -8048,8 +8631,14 @@ def operation_cache_retry(repo_root: Path, args: Dict[str, Any]) -> int:
         "cleanupTimeoutSeconds": cleanup_timeout,
         "seededExitCode": first_code,
         "seededTimedOut": first_timed_out,
+        "testBuildSucceeded": test_build_succeeded,
         "coldRetryAttempted": False,
     }
+    if test_build_succeeded:
+        outcome["reason"] = "test build succeeded; post-build failure is not a seeded-cache failure"
+        if outcome_path.parent.is_dir():
+            _atomic_write_json(outcome_path, outcome)
+        return first_code
     if not (
         provenance
         and provenance.get("key") == key
@@ -8176,6 +8765,29 @@ def parse_no_args(prog: str, argv: List[str]) -> None:
     parser.parse_args(argv)
 
 
+def add_measurement_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--scratch", help="measurement build in .build/measure/<label> (plan P0.5)")
+    parser.add_argument(
+        "--swiftc-flag", action="append", default=[],
+        help="extra -Xswiftc argument for a --scratch build; write --swiftc-flag=<flag>",
+    )
+    parser.add_argument(
+        "--linker-flag", action="append", default=[],
+        help="extra -Xlinker argument for a --scratch build; write --linker-flag=<flag>",
+    )
+
+
+def apply_measurement_arguments(ns: argparse.Namespace, args: Dict[str, Any]) -> None:
+    if ns.scratch:
+        args["scratch"] = ns.scratch
+    if ns.swiftc_flag:
+        args["swiftcFlags"] = list(ns.swiftc_flag)
+    if ns.linker_flag:
+        args["linkerFlags"] = list(ns.linker_flag)
+    # Validate on the client too, so a bad label fails before enqueueing.
+    measurement_build_args(Path("."), args)
+
+
 def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     global_flags, rest = split_operation_flags(argv)
     if global_flags.timeout is not None and global_flags.timeout < 0:
@@ -8187,6 +8799,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "guardrails",
         "codex-schema-check",
         "build",
+        "ci-build-tests",
         "install-debug-cli",
         "debug-cli-status",
         "format",
@@ -8197,11 +8810,24 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "install-format-tools",
     }:
         parse_no_args(f"conductor {operation}", rest)
+    elif operation == "ci-shard":
+        parser = argparse.ArgumentParser(prog="conductor ci-shard")
+        parser.add_argument("--shard-count", type=int, required=True)
+        parser.add_argument("--shard-index", type=int, required=True)
+        ns = parser.parse_args(rest)
+        if ns.shard_count < 1 or not 1 <= ns.shard_index <= ns.shard_count:
+            raise ConductorError("ci-shard requires 1 <= --shard-index <= --shard-count")
+        args["shardCount"] = ns.shard_count
+        args["shardIndex"] = ns.shard_index
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        add_measurement_arguments(parser)
         ns = parser.parse_args(rest)
         args["product"] = ns.product
+        apply_measurement_arguments(ns, args)
+        if args.get("scratch") and ns.product == "all":
+            raise ConductorError("measurement builds need a single --product")
     elif operation == "package":
         parser = argparse.ArgumentParser(prog="conductor package")
         parser.add_argument("config", choices=["debug", "release"])
@@ -8211,9 +8837,20 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         parser.add_argument("--filter")
         parser.add_argument("--test-product")
+        if operation == "test":
+            parser.add_argument(
+                "--module",
+                help="build and run only this test target's closure with the Swift Build engine",
+            )
         parser.add_argument("--xctest-stall-seconds", type=float)
         parser.add_argument("--xctest-stall-wake-probe", action="store_true")
+        if operation == "test":
+            add_measurement_arguments(parser)
         ns = parser.parse_args(rest)
+        if operation == "test":
+            apply_measurement_arguments(ns, args)
+            if args.get("scratch") and ns.module:
+                raise ConductorError("--scratch applies to the aggregate path; --module has its own scratch path")
         if ns.xctest_stall_seconds is not None and (
             not math.isfinite(ns.xctest_stall_seconds) or ns.xctest_stall_seconds <= 0
         ):
@@ -8224,6 +8861,12 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             args["filter"] = ns.filter
         if ns.test_product:
             args["testProduct"] = ns.test_product
+        if getattr(ns, "module", None):
+            if ns.test_product:
+                raise ConductorError("--module cannot be combined with --test-product")
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*Tests", ns.module):
+                raise ConductorError("--module must name a test target, for example RepoPromptMCPCoreTests")
+            args["module"] = ns.module
         if ns.xctest_stall_seconds is not None:
             args["xctestStallSeconds"] = ns.xctest_stall_seconds
         if ns.xctest_stall_wake_probe:
@@ -8339,9 +8982,10 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
 def main(argv: List[str]) -> int:
     repo_root = resolve_repo_root()
 
-    if argv and argv[0] == "__operation_runner":
+    if argv and argv[0] == OPERATION_RUNNER_ARG:
         if len(argv) != 2:
             raise ConductorError("__operation_runner requires one JSON payload argument")
+        capture_job_ticket(os.environ)
         return run_operation_runner(argv[1])
     if argv and argv[0] == "__cache_attempt_gate":
         if len(argv) != 3:

@@ -1,3 +1,6 @@
+import RepoPromptFileSystem
+import RepoPromptVCS
+
 // MARK: - DEBUG MCP Read/Search Latency Diagnostics
 
 import Foundation

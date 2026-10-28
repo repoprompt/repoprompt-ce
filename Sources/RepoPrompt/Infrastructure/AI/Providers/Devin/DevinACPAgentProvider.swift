@@ -1,22 +1,36 @@
 import Foundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct DevinACPAgentProvider: ACPAgentProvider {
     private let config: DevinAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: DevinACPLaunchResolver
+    private let isolateForeignMCPImports: Bool
 
     init(
         config: DevinAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: DevinACPLaunchResolver = DevinACPLaunchResolver()
+        launchResolver: DevinACPLaunchResolver = DevinACPLaunchResolver(),
+        isolateForeignMCPImports: Bool = false
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
+        self.isolateForeignMCPImports = isolateForeignMCPImports
     }
 
     var providerID: ACPProviderID {
         .devin
+    }
+
+    var supportsParameterizedModelPicker: Bool {
+        true
+    }
+
+    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+        input.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "thought_level"
+            ? .thinking : nil
     }
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
@@ -42,7 +56,8 @@ struct DevinACPAgentProvider: ACPAgentProvider {
             mcpServers: config.includeRepoPromptMCPServer
                 ? .mergeRepoPrompt(repoPromptMCPConfiguration)
                 : .disableAll,
-            sourceEnvironment: resolvedLaunch.environment
+            sourceEnvironment: resolvedLaunch.environment,
+            isolateForeignMCPImports: isolateForeignMCPImports
         )
         return ACPLaunchConfiguration(
             providerID: providerID,
@@ -53,7 +68,8 @@ struct DevinACPAgentProvider: ACPAgentProvider {
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
             cleanupArtifact: integration.cleanupArtifact,
-            expectedExecutableIdentity: resolvedLaunch.executableIdentity
+            expectedExecutableIdentity: resolvedLaunch.executableIdentity,
+            explicitEnvironmentKeys: Set(integration.environment.keys)
         )
     }
 
@@ -93,7 +109,11 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         } else {
             "\(systemPrompt)\n\n\(userMessage)"
         }
-        return try ACPPromptContentBuilder.blocks(text: text, attachments: request.attachments)
+        return try ACPPromptContentBuilder.blocks(
+            text: text,
+            attachments: request.attachments,
+            oracleAttachments: message.attachments
+        )
     }
 
     func normalizeSessionUpdate(

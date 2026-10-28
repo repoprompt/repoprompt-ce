@@ -42,7 +42,9 @@ final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
                     modelString: config.modelString,
                     includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
                     alwaysApproveTools: config.alwaysApproveTools,
-                    apiKey: KeyManager().getAPIKey(for: .grok)
+                    discoveryMode: config.discoveryMode,
+                    apiKey: KeyManager().getAPIKey(for: .grok),
+                    backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
                 )
             )
         }

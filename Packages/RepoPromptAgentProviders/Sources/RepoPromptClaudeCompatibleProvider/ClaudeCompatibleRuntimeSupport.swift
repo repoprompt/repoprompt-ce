@@ -159,7 +159,9 @@ public extension ClaudeCompatibleBackendID {
                     haiku: "glm-4.5-air",
                     sonnet: "glm-5.2[1m]",
                     opus: "glm-5.2[1m]"
-                ))
+                )),
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .kimi:
             ClaudeCompatibleBackendConfig(
@@ -168,7 +170,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "https://api.kimi.com/coding/",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         case .custom:
             ClaudeCompatibleBackendConfig(
@@ -177,7 +181,9 @@ public extension ClaudeCompatibleBackendID {
                 displayName: defaultDisplayName,
                 baseURL: "",
                 auth: .anthropicAPIKey,
-                modelBehavior: .noModel
+                modelBehavior: .noModel,
+                requestTimeoutMilliseconds: nil,
+                contextWindowTokens: nil
             )
         }
     }
@@ -206,16 +212,7 @@ public extension ClaudeCompatibleBackendConfig {
     }
 
     var normalizedBaseURL: String? {
-        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              let components = URLComponents(string: trimmed),
-              let scheme = components.scheme?.lowercased(),
-              ["http", "https"].contains(scheme),
-              components.host?.isEmpty == false
-        else {
-            return nil
-        }
-        return trimmed
+        ProviderEndpointConsentPolicy.endpointIdentity(baseURL)
     }
 
     var normalized: ClaudeCompatibleBackendConfig {
@@ -231,12 +228,17 @@ public extension ClaudeCompatibleBackendConfig {
             displayName: normalizedDisplayName,
             baseURL: baseURL.trimmingCharacters(in: .whitespacesAndNewlines),
             auth: auth,
-            modelBehavior: normalizedBehavior
+            modelBehavior: normalizedBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 
     var isValid: Bool {
-        guard normalizedBaseURL != nil else { return false }
+        guard normalizedBaseURL != nil,
+              requestTimeoutMilliseconds.map(ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains) ?? true,
+              contextWindowTokens.map(ClaudeCompatibleBackendLimits.contextWindowTokens.contains) ?? true else { return false }
         switch modelBehavior {
         case .noModel:
             return true
@@ -277,7 +279,10 @@ public extension ClaudeCompatibleBackendConfig {
             displayName: displayName,
             baseURL: baseURL,
             auth: auth,
-            modelBehavior: overrideBehavior
+            modelBehavior: overrideBehavior,
+            requestTimeoutMilliseconds: requestTimeoutMilliseconds,
+            contextWindowTokens: contextWindowTokens,
+            httpCredentialConsentEndpoint: httpCredentialConsentEndpoint
         )
     }
 }
@@ -336,10 +341,18 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
         config: ClaudeCompatibleBackendConfig,
         apiKey: String,
         selectedBackendModelID: String? = nil
-    ) -> [String: String] {
+    ) throws -> [String: String] {
         let normalizedConfig = config.normalized
+        try ProviderEndpointConsentPolicy.validate(
+            normalizedConfig.baseURL,
+            credentialBearing: !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            consentEndpoint: normalizedConfig.httpCredentialConsentEndpoint
+        )
+        guard let baseURL = normalizedConfig.normalizedBaseURL else {
+            throw ProviderEndpointConsentPolicy.ValidationError.invalidEndpoint
+        }
         var environment: [String: String] = [
-            "ANTHROPIC_BASE_URL": normalizedConfig.normalizedBaseURL ?? normalizedConfig.baseURL,
+            "ANTHROPIC_BASE_URL": baseURL,
             normalizedConfig.auth.environmentVariableName: apiKey
         ]
 
@@ -348,6 +361,14 @@ public enum ClaudeCompatibleBackendEnvironmentBuilder {
             if ClaudeCompatibleModelNormalizer.contextWindowTokens(forBackendModelID: selectedBackendModelID) == 1_000_000 {
                 environment["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = glmAutoCompactWindow
             }
+        }
+
+        if let timeout = normalizedConfig.requestTimeoutMilliseconds, ClaudeCompatibleBackendLimits.requestTimeoutMilliseconds.contains(timeout) {
+            environment["API_TIMEOUT_MS"] = String(timeout)
+        }
+        if let window = normalizedConfig.contextWindowTokens, ClaudeCompatibleBackendLimits.contextWindowTokens.contains(window) {
+            // The auto-compact threshold cannot raise an unknown model's assumed context window.
+            environment["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = String(window)
         }
 
         if case let .claudeSlotMapping(mapping) = normalizedConfig.modelBehavior {
@@ -659,7 +680,7 @@ public struct ClaudeCompatibleLaunchEnvironmentResolver: Sendable {
             throw ClaudeCompatibleProviderError.invalidConfiguration(detail: "\(config.normalizedDisplayName) requires a configured API key.")
         }
 
-        return ClaudeCompatibleLaunchEnvironment(
+        return try ClaudeCompatibleLaunchEnvironment(
             effectiveModel: effectiveModel,
             environmentOverrides: ClaudeCompatibleBackendEnvironmentBuilder.environment(
                 config: environmentConfig,

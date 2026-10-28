@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 struct CodexHookReviewCardState: Equatable {

@@ -1,5 +1,4 @@
 import Foundation
-@testable import RepoPromptApp
 
 final class ReviewGitRepositoryFixture {
     let sandbox: URL

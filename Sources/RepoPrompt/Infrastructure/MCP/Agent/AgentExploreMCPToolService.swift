@@ -1,19 +1,22 @@
 import Foundation
 import MCP
+import RepoPromptInstrumentation
+import RepoPromptVCS
 
 @MainActor
 struct AgentExploreMCPToolService {
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
+    typealias RequestMetadata = MCPRequestMetadata
     typealias HeartbeatOperation = AgentRunMCPToolService.HeartbeatOperation
     typealias StartRun = AgentRunMCPToolService.StartRun
 
     let toolName: String
-    let captureRequestMetadata: () async -> RequestMetadata
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
+    let captureRequestMetadata: () async -> MCPRequestMetadata
     let requireTargetWindow: () throws -> WindowState
-    let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
-    let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
+    let resolveSpawnSourceTabID: (_ metadata: MCPRequestMetadata) async -> UUID?
+    let resolveSpawnParentSessionID: (_ metadata: MCPRequestMetadata, _ targetWindow: WindowState) async -> UUID?
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
-    var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
+    var beginAgentRunWait: (_ metadata: MCPRequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval) async -> AgentRunWaitScopeRegistration? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
     let startRun: StartRun
     #if DEBUG
@@ -36,7 +39,8 @@ struct AgentExploreMCPToolService {
             operationName: "agent_explore.start",
             vcsService: vcsService,
             gitTargetResolver: gitTargetResolver,
-            preBindingCommitObserver: preBindingCommitObserver
+            preBindingCommitObserver: preBindingCommitObserver,
+            startupPhaseEventSink: AppWorktreeStartupPhaseEventSink()
         )
     }
 
@@ -173,7 +177,7 @@ struct AgentExploreMCPToolService {
     }
 
     private struct ExploreStartContext {
-        let metadata: RequestMetadata
+        let metadata: MCPRequestMetadata
         let targetWindow: WindowState
         let agentModeVM: AgentModeViewModel
         let expectedWorkspaceID: UUID
@@ -216,7 +220,7 @@ struct AgentExploreMCPToolService {
         return .batch(messages)
     }
 
-    private func resolveStartContext(metadata: RequestMetadata) async throws -> ExploreStartContext {
+    private func resolveStartContext(metadata: MCPRequestMetadata) async throws -> ExploreStartContext {
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_explore.start.")
@@ -354,7 +358,11 @@ struct AgentExploreMCPToolService {
         do {
             if let routed = try await context.agentModeVM.routeSubagentTargetIfEnabled(
                 task: message,
-                surface: .headless
+                surface: .headless,
+                baseline: context.selection.agentRaw.flatMap { agent in
+                    context.selection.modelRaw.map { .init(agentRaw: agent, modelRaw: $0, reasoningEffortRaw: nil, modelParameters: context.selection.modelParameterSelections) }
+                },
+                allowUsageBalance: context.selection.usageBalancingEligible
             ) {
                 selection = AgentMCPSelectionResolver.ResolvedSelection(
                     agentRaw: routed.agentRaw,
@@ -365,7 +373,7 @@ struct AgentExploreMCPToolService {
                 routedReasoningEffortRaw = routed.reasoningEffortRaw
                 routerSelectedTarget = true
                 #if DEBUG
-                    AgentModePerfDiagnostics.event("modelRouter.subagent.selected", fields: [
+                    perfRecorder.event("modelRouter.subagent.selected", fields: [
                         "entryPoint": "agent_explore.start",
                         "provider": routed.agentRaw,
                         "model": routed.modelRaw,
@@ -432,7 +440,7 @@ struct AgentExploreMCPToolService {
     }
 
     private func resolveExploreCaller(
-        metadata: RequestMetadata,
+        metadata: MCPRequestMetadata,
         agentModeVM: AgentModeViewModel
     ) async throws -> (sourceTabID: UUID, sourceSessionID: UUID) {
         guard let sourceTabID = await resolveSpawnSourceTabID(metadata),

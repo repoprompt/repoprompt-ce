@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptProcess
 import XCTest
 
 final class ClaudeCodeAgentProviderGracefulDisposalTests: XCTestCase {
@@ -32,6 +33,7 @@ final class ClaudeCodeAgentProviderGracefulDisposalTests: XCTestCase {
         let processStarted = AsyncTestSignal()
         let runner = CLIProcessRunner(config: CLIProcessConfiguration(
             command: executable.path,
+            allowsProviderProcessLaunchForTesting: true,
             workingDirectory: root.path,
             environment: ProcessInfo.processInfo.environment,
             additionalPaths: [],

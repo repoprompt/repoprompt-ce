@@ -1,5 +1,7 @@
 import CryptoKit
 import Foundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 enum ACPRuntimeEventParsing {
     static func extractContentText(from value: Any?) -> String? {
@@ -175,7 +177,7 @@ enum ACPDefaultSessionUpdateNormalizer {
         providerID: ACPProviderID
     ) -> [NormalizedAgentRuntimeEvent] {
         guard let sessionUpdate = (payload["sessionUpdate"] as? String)?.lowercased() else {
-            return []
+            return providerID == .devin ? [.stream(AIStreamResult(type: "event", text: nil))] : []
         }
 
         switch sessionUpdate {
@@ -201,10 +203,14 @@ enum ACPDefaultSessionUpdateNormalizer {
                 return [.stream(AIStreamResult(type: "status", text: title))]
             }
             return []
-        case "available_commands_update", "plan", "user_message_chunk":
+        case "available_commands_update", "config_option_update":
             return []
+        case "plan", "user_message_chunk":
+            // No retained exact sent-block proof exists for own echoes (including fragments).
+            // Fresh task/echo ambiguity is ordinary; other ACP providers remain byte/timing-identical.
+            return providerID == .devin ? [.stream(AIStreamResult(type: "event", text: nil))] : []
         default:
-            return []
+            return providerID == .devin ? [.stream(AIStreamResult(type: "event", text: nil))] : []
         }
     }
 
@@ -240,7 +246,13 @@ enum ACPDefaultSessionUpdateNormalizer {
         let progressText = ACPRuntimeEventParsing.extractContentText(from: payload["content"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if status == "completed" || status == "failed" {
+        if let status, status == "completed" || status == "failed" {
+            // Some agents (Devin) finish with empty JSON after streaming results in
+            // running updates. Agree with retention's empty-output classification so
+            // the terminal marker finishes the lifecycle without erasing its content.
+            let outputJSON = AgentToolResultPayloadRetention.isThin(outputJSON)
+                ? ACPRuntimeEventParsing.serializeJSON(["status": status])
+                : outputJSON
             return [
                 .stream(
                     AIStreamResult(
@@ -521,6 +533,10 @@ actor ACPTimeoutState {
 /// Cursor's normalizer; Grok Build feeds the same shapes through it. Provider-specific
 /// suppression rules (e.g. Cursor's placeholder tools) stay in the provider normalizers.
 enum ACPToolUpdateResultAdapter {
+    /// Generated-diff input limits shared by the persistence policy and provider enrichment.
+    static let generatedDiffInputBytesLimit = 16384
+    static let generatedDiffInputLineLimit = 800
+
     static func adaptedTerminalToolUpdatePayload(_ payload: [String: Any], sessionUpdate: String) -> [String: Any] {
         guard sessionUpdate == "tool_call_update",
               let status = ACPRuntimeEventParsing.firstString(in: payload, keys: ["status"])?.lowercased(),
@@ -629,8 +645,10 @@ enum ACPPermissionOptionPolicy {
     /// bare kind match would otherwise select it and broaden approval beyond the request.
     static func denylistedAutoSelectOptionIDs(for providerID: ACPProviderID) -> Set<String> {
         switch providerID {
-        case .openCode, .cursor, .antigravity, .devin:
+        case .openCode, .cursor, .antigravity:
             []
+        case .devin:
+            ["allow_always", "allow_always_global", "allow_server_session", "allow_server_always"]
         case .grokBuild:
             ["enable-always-approve"]
         }
@@ -652,7 +670,7 @@ enum ACPPermissionOptionPolicy {
                   normalizedOptionValue(option.kind) == "allow_once",
                   isAutoSelectable(optionID: id, for: providerID)
             else { return false }
-            return !id.contains("always") && !id.contains("session") && !id.contains("persist")
+            return !id.contains("always") && !id.contains("session") && !id.contains("persist") && !id.contains("global")
         }?.optionID
     }
 

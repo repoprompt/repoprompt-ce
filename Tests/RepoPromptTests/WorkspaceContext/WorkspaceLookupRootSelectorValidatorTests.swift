@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class WorkspaceLookupRootSelectorValidatorTests: XCTestCase {

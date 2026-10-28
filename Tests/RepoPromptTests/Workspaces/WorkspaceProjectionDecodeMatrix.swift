@@ -139,6 +139,10 @@ import Foundation
             var values = [WorkspaceModel?](repeating: nil, count: cell.consumers)
             if cell.scenario != .newRevision {
                 for index in values.indices {
+                    // The matrix measures per-decode work; the digest cache
+                    // would turn repeat decodes of identical bytes into hits
+                    // and fail the per-sample normalization-count check.
+                    WorkspaceFileDecodeCache.shared.removeAllForTesting()
                     values[index] = try fixture.decode(bytes[1])
                 }
             }
@@ -153,7 +157,8 @@ import Foundation
                 let start = DispatchTime.now().uptimeNanoseconds
                 for index in values.indices {
                     do {
-                        values[index] = try Diagnostics.$context.withValue(.init(
+                        WorkspaceFileDecodeCache.shared.removeAllForTesting()
+                        values[index] = try Diagnostics.contextTaskLocal.withValue(.init(
                             recorder: recorder, contentOrdinal: revision, consumerOrdinal: index + 1,
                             revision: UInt64(revision), schemaVersion: 1, onMainActor: true
                         )) { try fixture.decode(bytes[revision]) }
@@ -180,8 +185,11 @@ import Foundation
             values[0]?.composeTabs[0].promptText = "consumer-local edit"
             values[0]?.composeTabs[0].selection = StoredSelection(selectedPaths: ["consumer-local selection"])
             values[0]?.presets[0].selectedFilePaths.removeAll()
-            guard values.dropFirst().allSatisfy({ $0 == models[currentRevision - 1] }),
-                  try fixture.decode(bytes[currentRevision]) == models[currentRevision - 1]
+            guard values.dropFirst().allSatisfy({ $0 == models[currentRevision - 1] }) else {
+                throw InvalidTrial.mutationAliasing
+            }
+            WorkspaceFileDecodeCache.shared.removeAllForTesting()
+            guard try fixture.decode(bytes[currentRevision]) == models[currentRevision - 1]
             else { throw InvalidTrial.mutationAliasing }
             values.removeAll(keepingCapacity: false)
             guard values.isEmpty else { throw InvalidTrial.retainedConsumers }

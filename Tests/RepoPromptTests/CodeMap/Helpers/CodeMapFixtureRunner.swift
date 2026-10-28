@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptCodeMapCore
+import RepoPromptWorkspaceCore
 
 enum CodeMapFixtureRunner {
     static func expectedFileTree() -> String {
@@ -98,5 +100,15 @@ enum CodeMapFixtureRunner {
             normalized.append("\n")
         }
         return normalized
+    }
+}
+
+/// Shared CodeMap fixture rendering retains the app's presentation adapter.
+extension CodeMapSyntaxArtifact {
+    func renderedCodeMap(displayPath: String) -> String {
+        CodeMapAPIContentFormatter.pathAndImportsBlock(
+            displayPath: displayPath,
+            imports: imports
+        ) + apiDescription
     }
 }

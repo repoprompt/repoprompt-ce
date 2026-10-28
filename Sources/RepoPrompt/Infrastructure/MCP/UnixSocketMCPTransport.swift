@@ -237,217 +237,6 @@ private enum MCPExplicitNullRequestIDIngressValidation {
     }
 }
 
-/// Owns the terminal-response claim for an accepted socket. This is separate from
-/// `MCPDomainResponseDeliveryTracker`: that tracker records physical write delivery,
-/// while this one retains exact JSON-RPC number-versus-string identities needed to
-/// decide which logical response the watchdog owns. Requests are recorded before
-/// they are offered to the MCP SDK, so a watchdog can answer every accepted request,
-/// including one that has not reached a handler.
-///
-/// The ledger seals before writing terminal errors. Later SDK completions are then
-/// suppressed, preserving one response per JSON-RPC request ID after the connection
-/// has become terminal.
-private final class MCPExecutionWatchdogResponseLedger: @unchecked Sendable {
-    enum PreparedFrameSealPolicy {
-        case preemptIfSealed
-        case allowAfterSeal
-    }
-
-    struct PreparedFrame {
-        let data: Data
-        let sealPolicy: PreparedFrameSealPolicy
-    }
-
-    private let lock = NSLock()
-    private var isSealed = false
-    private var isTerminalDeliveryPending = false
-    private var pendingRequestIDs: [JSONRPCBridgeID] = []
-    private var pendingRequestIDSet = Set<JSONRPCBridgeID>()
-    private var sealedRequestIDs = Set<JSONRPCBridgeID>()
-
-    /// Returns false when the watchdog has already sealed the connection, preventing
-    /// a frame accepted after the terminal snapshot from reaching the SDK.
-    func recordAcceptedClientFrame(_ frame: Data) -> Bool {
-        let requestIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
-            frame,
-            direction: .clientToServer
-        ).compactMap { metadata -> JSONRPCBridgeID? in
-            guard case .request = metadata.kind,
-                  let id = metadata.id,
-                  id != .null
-            else {
-                return nil
-            }
-            return id
-        }
-
-        lock.lock()
-        defer { lock.unlock() }
-        guard !isSealed else { return false }
-        for requestID in requestIDs where pendingRequestIDSet.insert(requestID).inserted {
-            pendingRequestIDs.append(requestID)
-        }
-        return true
-    }
-
-    /// Atomically freezes ingress before waiting for the transport actor. Pending IDs
-    /// remain live until a complete ordinary response is delivered or the watchdog's
-    /// actor-isolated terminal writer claims them.
-    func seal() {
-        lock.lock()
-        guard !isSealed else {
-            lock.unlock()
-            return
-        }
-        isSealed = true
-        isTerminalDeliveryPending = true
-        sealedRequestIDs.formUnion(pendingRequestIDSet)
-        lock.unlock()
-    }
-
-    /// Marks the terminal writer's actor-isolated error/control attempt complete. Only
-    /// after this publication may an unrelated frame prepared after sealing use the
-    /// still-open socket.
-    func finishTerminalDelivery() {
-        lock.withLock { isTerminalDeliveryPending = false }
-    }
-
-    /// Claims the still-outstanding IDs after the watchdog has acquired the transport
-    /// actor. A complete ordinary write which won the race retires its ID first.
-    func takeOutstandingRequestIDsAfterSeal() -> [JSONRPCBridgeID] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard isSealed else { return [] }
-        let requestIDs = pendingRequestIDs
-        pendingRequestIDs.removeAll()
-        pendingRequestIDSet.removeAll()
-        return requestIDs
-    }
-
-    func shouldPreemptOrdinaryWrite(
-        with sealPolicy: PreparedFrameSealPolicy
-    ) -> Bool {
-        lock.withLock {
-            if isTerminalDeliveryPending {
-                return true
-            }
-            guard case .preemptIfSealed = sealPolicy else { return false }
-            return isSealed
-        }
-    }
-
-    func reset() {
-        lock.lock()
-        isSealed = false
-        isTerminalDeliveryPending = false
-        pendingRequestIDs.removeAll()
-        pendingRequestIDSet.removeAll()
-        sealedRequestIDs.removeAll()
-        lock.unlock()
-    }
-
-    /// Prepares an SDK frame without retiring any response ID. Ordinary ownership is
-    /// committed only after the complete frame passes its final delivery-deadline
-    /// check. After terminal sealing, strips every late response while preserving
-    /// unrelated notifications or responses from the same batch.
-    func prepareServerFrameForDelivery(_ frame: Data) -> PreparedFrame? {
-        let responseMetadata = JSONRPCBridgeFrameInspector.inspectPermissively(
-            frame,
-            direction: .serverToClient
-        )
-        let responseIDs = responseMetadata.compactMap { metadata -> JSONRPCBridgeID? in
-            guard case .response = metadata.kind,
-                  let id = metadata.id,
-                  id != .null
-            else {
-                return nil
-            }
-            return id
-        }
-        let hasExplicitNullResponse = responseMetadata.contains { metadata in
-            guard case .response = metadata.kind else { return false }
-            return metadata.id == .null
-        }
-
-        lock.lock()
-        let sealedIDs = sealedRequestIDs
-        let isSealed = isSealed
-        lock.unlock()
-
-        guard isSealed else {
-            return PreparedFrame(data: frame, sealPolicy: .preemptIfSealed)
-        }
-        guard hasExplicitNullResponse || responseIDs.contains(where: sealedIDs.contains) else {
-            return PreparedFrame(data: frame, sealPolicy: .allowAfterSeal)
-        }
-        return Self.removingResponses(
-            for: sealedIDs,
-            removingExplicitNullResponses: hasExplicitNullResponse,
-            from: frame
-        ).map { PreparedFrame(data: $0, sealPolicy: .allowAfterSeal) }
-    }
-
-    /// Retires exact response identities only after a complete ordinary frame is on
-    /// the wire and its absolute delivery deadline remains valid.
-    func recordDeliveredServerFrame(_ frame: Data) {
-        let responseIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
-            frame,
-            direction: .serverToClient
-        ).compactMap { metadata -> JSONRPCBridgeID? in
-            guard case .response = metadata.kind,
-                  let id = metadata.id,
-                  id != .null
-            else {
-                return nil
-            }
-            return id
-        }
-        guard !responseIDs.isEmpty else { return }
-
-        lock.lock()
-        pendingRequestIDSet.subtract(responseIDs)
-        pendingRequestIDs.removeAll { responseIDs.contains($0) }
-        lock.unlock()
-    }
-
-    private static func removingResponses(
-        for sealedIDs: Set<JSONRPCBridgeID>,
-        removingExplicitNullResponses: Bool = false,
-        from frame: Data
-    ) -> Data? {
-        let hadNewline = frame.last == UInt8(ascii: "\n")
-        let unframed = hadNewline ? Data(frame.dropLast()) : frame
-        guard let root = try? JSONSerialization.jsonObject(with: unframed, options: [.fragmentsAllowed]) else {
-            // The SDK only emits valid JSON-RPC frames. Fail closed here rather than
-            // letting an uninspectable late response violate the terminal claim.
-            return nil
-        }
-
-        func isSealedResponse(_ object: Any) -> Bool {
-            guard let message = object as? [String: Any],
-                  message["result"] != nil || message["error"] != nil,
-                  let id = JSONRPCBridgeID.parseJSONValue(message["id"])
-            else {
-                return false
-            }
-            return (removingExplicitNullResponses && id == .null) || sealedIDs.contains(id)
-        }
-
-        if let message = root as? [String: Any] {
-            return isSealedResponse(message) ? nil : frame
-        }
-        guard let batch = root as? [Any] else { return frame }
-        let retained = batch.filter { !isSealedResponse($0) }
-        guard !retained.isEmpty,
-              var encoded = try? JSONSerialization.data(withJSONObject: retained, options: [.sortedKeys])
-        else {
-            return nil
-        }
-        if hadNewline { encoded.append(UInt8(ascii: "\n")) }
-        return encoded
-    }
-}
-
 final class MCPExportResponseDeliveryDeadlineRegistry: @unchecked Sendable {
     struct Token: Hashable {
         fileprivate let connectionID: String
@@ -966,15 +755,19 @@ public actor UnixSocketMCPTransport: Transport {
         }
 
         let candidateFrame = Self.frameWithNewlineIfNeeded(message)
-        guard let preparedFrame = executionWatchdogResponseLedger.prepareServerFrameForDelivery(candidateFrame) else {
+        let preparedFrame: MCPExecutionWatchdogResponseLedger.PreparedFrame
+        switch executionWatchdogResponseLedger.prepareServerFrameForDelivery(candidateFrame) {
+        case let .frame(frame):
+            preparedFrame = frame
+        case let .suppressed(phase, terminalReason):
             MCPResponseDeliveryTracer.emitFrame(
                 layer: "app_uds_transport",
-                phase: "watchdog_late_response_suppressed",
+                phase: phase,
                 frame: candidateFrame,
                 direction: .serverToClient,
                 connectionID: timelineCorrelationConnectionID,
                 connectionGeneration: timelineConnectionGeneration,
-                terminalReason: "tool_execution_watchdog"
+                terminalReason: terminalReason
             )
             return
         }
@@ -1956,6 +1749,8 @@ public actor UnixSocketMCPTransport: Transport {
         )
 
         let inboundChannel = inboundChannel
+        let ingressGeneration = executionWatchdogResponseLedger.currentGeneration
+        let deliveryGeneration = responseDeliveryGate.currentGeneration
         let log = logger
         #if DEBUG
             let debugBeforeInboundFrameOfferForTesting = debugBeforeInboundFrameOfferForTesting
@@ -1975,12 +1770,20 @@ public actor UnixSocketMCPTransport: Transport {
                         )
                     }
                 }
-                guard let forwardedFrame = ingressValidation.forwardedFrame,
-                      executionWatchdogResponseLedger.recordAcceptedClientFrame(forwardedFrame)
-                else {
+                guard let forwardedFrame = ingressValidation.forwardedFrame else { return }
+                do {
+                    guard try executionWatchdogResponseLedger.recordAcceptedClientFrame(
+                        forwardedFrame,
+                        expectedGeneration: ingressGeneration
+                    ) else { return }
+                } catch {
+                    Task { await self.handleClientCancellationOwnershipFailure(error, from: identity) }
                     return
                 }
-                responseDeliveryGate.recordAcceptedClientFrame(forwardedFrame)
+                responseDeliveryGate.recordAcceptedClientFrame(
+                    forwardedFrame,
+                    expectedGeneration: deliveryGeneration
+                )
                 let dispatchFrame: Data = if let timelineConnectionID {
                     MCPExportResponseDeliveryDeadlineRegistry.shared.recordAcceptedClientFrame(
                         forwardedFrame,
@@ -2149,6 +1952,18 @@ public actor UnixSocketMCPTransport: Transport {
                 socketOwnershipGeneration &+= 1
             }
         }
+    }
+
+    private func handleClientCancellationOwnershipFailure(
+        _ error: Swift.Error,
+        from identity: ReaderIdentity
+    ) {
+        guard activeReaderOwnership?.identity == identity, !streamFinished else { return }
+        tearDownSocket(
+            error: error,
+            cause: .clientCancellationOwnershipFailure,
+            initiator: .transport
+        )
     }
 
     private func handleReceiveBufferOverflow(

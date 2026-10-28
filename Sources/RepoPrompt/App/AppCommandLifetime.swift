@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptWorkspaceCore
 
 /// The single retained record for a command, including across window transfers.
 /// Window queues schedule this reference; they do not copy or settle its bookkeeping.

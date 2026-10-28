@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 import XCTest
 
 /// Presentation-only projection refresh exercised through execution-location invalidation.
@@ -26,7 +27,19 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
         private(set) var passiveNoticePublicationCount = 0
         private(set) var observationSnapshotCount = 0
 
-        func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+        func agentSessionLinkCandidate(
+            for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation _: Bool
+        ) -> AgentSessionLinkEndpointCandidate? {
+            candidates.first { $0.domainEndpoint == endpoint }
+        }
+
+        func agentSessionLinkCandidates(
+            forSessionIDs sessionIDs: Set<UUID>, includeLocation _: Bool
+        ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+            Dictionary(uniqueKeysWithValues: sessionIDs.map { id in (id, candidates.filter { $0.sessionID == id }) })
+        }
+
+        func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
             candidates
         }
 
@@ -39,6 +52,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: .empty,
                 idleForSend: true,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: "seeded",
@@ -127,6 +141,15 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
         ) async -> AgentSessionLinkSendTransactionOutcome {
             .blocked(.targetNotIdle)
         }
+
+        func agentSessionLinkPerformCompact(
+            to _: AgentSessionLinkEndpointCandidate,
+            request _: AgentSessionLinkCompactRequest,
+            liveness _: @escaping AgentSessionLinkSendLivenessProbe,
+            commitAuthorization _: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+        ) async -> AgentSessionLinkSendTransactionOutcome {
+            .blocked(.endpointInvalidated)
+        }
     }
 
     /// Records the sessions the bridge asks to re-advertise `agent_session_link` for.
@@ -151,6 +174,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
+        GlobalSettingsStore.shared.installApplicationEventBridge()
         previousExactSink = AgentSessionLinkLocationInvalidationSink.refreshExactTargets
         previousObservedSink = AgentSessionLinkLocationInvalidationSink.refreshObservedTargets
     }
@@ -179,12 +203,14 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
         displayName: String,
         locationLabel: String
     ) -> AgentSessionLinkEndpointCandidate {
-        AgentSessionLinkEndpointCandidate(
+        let binding = AgentPersistentSessionBindingIdentity(tabID: UUID(), sessionID: UUID())
+        let token = AgentSessionRestorationBindingToken(bindingIdentity: binding, bindingTransitionGeneration: 1)
+        return AgentSessionLinkEndpointCandidate(
             windowID: windowID,
             workspaceID: UUID(),
-            tabID: UUID(),
-            sessionID: UUID(),
-            persistentBindingGeneration: UUID(),
+            tabID: binding.tabID,
+            sessionID: binding.sessionID,
+            persistentBindingGeneration: binding.generation,
             bindingTransitionGeneration: 1,
             isTopLevel: true,
             hasLoadedPersistedState: true,
@@ -195,7 +221,8 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             roleAllowsOutboundMonitoring: true,
             displayName: displayName,
             providerDisplayName: "Codex CLI",
-            locationLabel: locationLabel
+            locationLabel: locationLabel,
+            restorationReadiness: .authoritative(token, .persistedPayloadApplied)
         )
     }
 
@@ -221,11 +248,13 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             roleAllowsOutboundMonitoring: candidate.roleAllowsOutboundMonitoring,
             displayName: candidate.displayName,
             providerDisplayName: candidate.providerDisplayName,
-            locationLabel: locationLabel
+            locationLabel: locationLabel,
+            restorationReadiness: candidate.restorationReadiness,
+            isDeletionInProgress: candidate.isDeletionInProgress
         )
     }
 
-    private func makeBridgeFixture() async -> BridgeFixture {
+    private func makeBridgeFixture() async throws -> BridgeFixture {
         let authority = DomainAgentSessionLinkAuthority(
             identity: DomainRuntimeIdentity(
                 runtimeID: UUID(),
@@ -250,9 +279,8 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
             observerSessionID: observer.sessionID,
             rawTargetSessionID: target.sessionID.uuidString
         )
-        if case .added = outcome {} else {
-            XCTFail("expected added, got \(outcome)")
-        }
+        let grantedLinkID: UUID? = if case let .added(linkID, _) = outcome { linkID } else { nil }
+        _ = try XCTUnwrap(grantedLinkID, "expected added, got \(outcome)")
         await bridge.test_settleProjections()
         return BridgeFixture(
             authority: authority,
@@ -482,7 +510,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
     // MARK: - Repaint scope
 
     func testTargetLocationRefreshRepaintsObserverOutboundRowsOnly() async throws {
-        let fixture = await makeBridgeFixture()
+        let fixture = try await makeBridgeFixture()
         let observerEndpoint = fixture.observer.domainEndpoint
         let targetEndpoint = fixture.target.domainEndpoint
         XCTAssertEqual(
@@ -511,7 +539,7 @@ final class AgentSessionLinkLocationPresentationRefreshTests: XCTestCase {
     // MARK: - No side effects
 
     func testLocationRefreshTouchesNoAuthorityPromptOrAdvertisementState() async throws {
-        let fixture = await makeBridgeFixture()
+        let fixture = try await makeBridgeFixture()
         let targetEndpoint = fixture.target.domainEndpoint
         let revisionBefore = await fixture.authority.snapshot().authorityRevision
         let observerLinkSetRevisionBefore = await fixture.authority

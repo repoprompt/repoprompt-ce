@@ -1,8 +1,14 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 final class CursorProductionFactoryTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testProductionFactoriesUseAutomaticCommandSelection() async throws {
         let interactiveProvider = try await ACPAgentProviderFactory.makeProvider(
             for: .cursor,

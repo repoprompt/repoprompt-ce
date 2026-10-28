@@ -48,6 +48,7 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         var seen = Set<String>()
         var effortStateByModelRaw: [String: GrokBuildAdvertisedEffortState] = [:]
         var wireValuesByModelRaw: [String: [CodexReasoningEffort: String]] = [:]
+        var effortsByIDByModelRaw: [String: [String: CodexReasoningEffort]] = [:]
         for entry in available {
             guard let rawID = nonEmpty(entry["modelId"] as? String) else { continue }
             guard seen.insert(rawID).inserted else { continue }
@@ -55,6 +56,13 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
             let description = nonEmpty(entry["description"] as? String)
 
             let meta = entry["_meta"] as? [String: Any]
+            let contextWindowTokens: Int? = {
+                guard let number = meta?["totalContextTokens"] as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(),
+                      let tokens = number as? Int, tokens > 0
+                else { return nil }
+                return tokens
+            }()
             let supportsEffort = (meta?["supportsReasoningEffort"] as? Bool) == true
             let effortEntries = supportsEffort ? (meta?["reasoningEfforts"] as? [[String: Any]] ?? []) : []
             let advertisedEfforts = effortEntries.map { effortEntry in
@@ -93,6 +101,19 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                 wireValueByEffort: wireValueByEffort
             )
             wireValuesByModelRaw[rawID.lowercased()] = wireValueByEffort
+            var entriesByID: [String: [GrokBuildAdvertisedEffortEntry]] = [:]
+            for entry in advertisedEfforts {
+                guard let id = entry.idRaw else { continue }
+                entriesByID[id.lowercased(), default: []].append(entry)
+            }
+            effortsByIDByModelRaw[rawID.lowercased()] = entriesByID.compactMapValues { entries in
+                guard entries.allSatisfy({ entry in
+                    guard let effort = entry.reasoningEffort else { return false }
+                    return wireValueByEffort[effort] != nil
+                }) else { return nil }
+                let efforts = Set(entries.compactMap(\.reasoningEffort))
+                return efforts.count == 1 ? efforts.first : nil
+            }
 
             let declaredDefault = supportsEffort
                 ? CodexReasoningEffort.parse(meta?["reasoningEffort"] as? String)
@@ -124,7 +145,8 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                     isPlaceholderDefault: false,
                     isProviderDefault: false,
                     supportedReasoningEfforts: supportedEfforts,
-                    defaultReasoningEffort: defaultEffort
+                    defaultReasoningEffort: defaultEffort,
+                    contextWindowTokens: contextWindowTokens
                 )
             )
 
@@ -134,7 +156,9 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                     guard let otherID = nonEmpty($0["modelId"] as? String) else { return false }
                     return otherID.caseInsensitiveCompare(compound) == .orderedSame
                 }
-                if collidesWithBase { continue }
+                if collidesWithBase {
+                    continue
+                }
                 variants.append(
                     AgentModelOption(
                         rawValue: compound,
@@ -145,7 +169,8 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
                         effortVariant: AgentModelEffortVariant(
                             baseModelRaw: rawID,
                             reasoningEffort: selection.effort
-                        )
+                        ),
+                        contextWindowTokens: contextWindowTokens
                     )
                 )
             }
@@ -194,13 +219,40 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
 
         directEffortWireState.replace(
             sessionID: sessionID,
-            valuesByModelRaw: wireValuesByModelRaw
+            valuesByModelRaw: wireValuesByModelRaw,
+            effortsByIDByModelRaw: effortsByIDByModelRaw
         )
         return .valid(ACPDiscoveredSessionModels(
             options: options,
             currentModelRaw: currentRaw,
             currentEffortRaw: currentEffortRaw
         ))
+    }
+
+    func parseDirectSessionEffortReport(
+        from configOptions: [[String: Any]],
+        sessionID: String,
+        options: [AgentModelOption]
+    ) -> ACPDirectSessionEffortReport? {
+        let effortOptions = configOptions.filter {
+            $0["id"] as? String == "reasoning_effort" && $0["category"] as? String == "thought_level"
+        }
+        guard !effortOptions.isEmpty,
+              let reportedModel = configOptions.first(where: { $0["id"] as? String == "model" })?["currentValue"] as? String,
+              let base = options.first(where: {
+                  $0.effortVariant == nil && $0.rawValue.caseInsensitiveCompare(
+                      reportedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+                  ) == .orderedSame
+              })
+        else { return nil }
+        // Resolve against the base named in this report, not the controller's prior model.
+        // An applicable unknown/ambiguous ID clears effort; absence leaves it untouched.
+        let effort = effortOptions.count == 1 ? directEffortWireState.reportedEffort(
+            sessionID: sessionID,
+            baseModelRaw: base.rawValue,
+            idRaw: effortOptions[0]["currentValue"] as? String
+        ) : nil
+        return ACPDirectSessionEffortReport(baseModelRaw: base.rawValue, effortRaw: effort?.rawValue)
     }
 
     func makeDirectModelSelectionRequest(

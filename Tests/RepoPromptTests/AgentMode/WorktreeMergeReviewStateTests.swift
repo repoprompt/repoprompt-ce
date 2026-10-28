@@ -1,4 +1,6 @@
 @testable import RepoPromptApp
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class WorktreeMergeReviewStateTests: XCTestCase {

@@ -3,6 +3,11 @@ import JSONSchema
 import MCP
 import Ontology
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
+import RepoPromptInstrumentation
+import RepoPromptShared
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 @MainActor
 private final class MCPGitRequestContext {
@@ -37,7 +42,7 @@ private final class MCPGitRequestContext {
             let standardized = root.standardizedFullPath
             let rootKey = standardized.lowercased()
             guard seenRoots.insert(rootKey).inserted else { continue }
-            guard let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: standardized)) else { continue }
+            guard let resolved = await vcsService.resolveRepoForRead(at: URL(fileURLWithPath: standardized), authorizedRoots: rootRefs.map { URL(fileURLWithPath: $0.standardizedFullPath) }) else { continue }
             let repo = GitRepoDescriptor(rootURL: resolved.rootURL)
             guard seenRepos.insert(repo.rootPath.lowercased()).inserted else { continue }
             repos.append(repo)
@@ -136,7 +141,7 @@ private final class MCPGitRequestContext {
         let worktreeHead = await (headID(for: repoURL)).map { String($0.prefix(7)) }
         var mainBranch: String?
         var mainHead: String?
-        if let mainRoot {
+        if let mainRoot, GitRepoRootAuthorization.isPathWithinAuthorizedRoots(mainRoot.path, roots: rootRefs.map(\.standardizedFullPath)) {
             mainBranch = await currentBranch(for: mainRoot)
             mainHead = await (headID(for: mainRoot)).map { String($0.prefix(7)) }
         }
@@ -248,7 +253,7 @@ final class MCPGitToolProvider {
     nonisolated static func selectedGitDiffPathsForPublication(
         logicalSelection: StoredSelection,
         physicalSelection: StoredSelection,
-        worktreeBindings: [AgentSessionWorktreeBinding]
+        worktreeBindings: [WorkspaceSessionWorktreeBinding]
     ) -> [String] {
         let boundRoots = worktreeBindings.compactMap { binding -> (logical: String, physical: String)? in
             guard let logical = standardizedAbsoluteSelectionPath(binding.logicalRootPath),
@@ -405,6 +410,41 @@ final class MCPGitToolProvider {
         }
     }
 
+    /// Default for an omitted or relative selector under an available frozen Context Builder target; see
+    /// `MCPContextBuilderGitReviewAdmission.frozenDefaultRepository()`.
+    nonisolated static func frozenDefaultRepository(
+        for admission: MCPContextBuilderGitReviewAdmission
+    ) throws -> GitRepoDescriptor? {
+        try admission.frozenDefaultRepository()
+    }
+
+    /// The repository an omitted or relative selector resolves against: an available frozen Context Builder
+    /// target's checkout (or its refusal), otherwise the shared election, which a declared-order or binding
+    /// change made while it awaited supersedes rather than retargets.
+    private func defaultRepository(
+        admission: MCPContextBuilderGitReviewAdmission,
+        election snapshot: WorkspaceDefaultGitRepositoryElection.Snapshot,
+        vcsService: VCSService,
+        isCurrent: (WorkspaceDefaultGitRepositoryElection.Snapshot) -> Bool
+    ) async throws -> GitRepoDescriptor {
+        do {
+            if let frozen = try Self.frozenDefaultRepository(for: admission) {
+                return frozen
+            }
+        } catch let error as MCPContextBuilderGitReviewPolicyError {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
+        do {
+            let selection = try await WorkspaceDefaultGitRepositoryElection(vcsService: vcsService).elect(in: snapshot)
+            guard isCurrent(snapshot) else {
+                throw WorkspaceDefaultGitRepositoryElection.Failure.superseded
+            }
+            return selection.repository
+        } catch let failure as WorkspaceDefaultGitRepositoryElection.Failure {
+            throw MCPError.invalidParams(failure.localizedDescription)
+        }
+    }
+
     private func takeStagedAdvertisement(
         invocationID: UUID
     ) -> MCPGitStagedAdvertisement? {
@@ -474,19 +514,19 @@ final class MCPGitToolProvider {
         let store = GitDiffSnapshotStore()
         let vcsService = VCSService.shared
 
-        // Generic callers retain first-root compatibility. Exact Agent Context Builder Discover
-        // runs instead use the immutable selected-repository target carried by their tab snapshot.
-        let metadata: MCPServerViewModel.RequestMetadata = if let appContext {
+        // Generic callers use the shared default repository election. Exact Agent Context Builder
+        // Discover runs instead use the immutable selected-repository target carried by their tab snapshot.
+        let metadata: MCPRequestMetadata = if let appContext {
             appContext.metadata
         } else {
             await dependencies.context.captureRequestMetadata()
         }
         let hasExplicitPathspecs = !(args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             || (args["paths"]?.arrayValue?.contains { !($0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) } ?? false)
-        let preLookupSelectedPublicationContext: MCPServerViewModel.ResolvedTabContextSnapshot? = if op == .diff,
-                                                                                                     args["artifacts"]?.boolValue == true,
-                                                                                                     !hasExplicitPathspecs,
-                                                                                                     (args["scope"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "all") == "selected"
+        let preLookupSelectedPublicationContext: MCPResolvedTabContextSnapshot? = if op == .diff,
+                                                                                     args["artifacts"]?.boolValue == true,
+                                                                                     !hasExplicitPathspecs,
+                                                                                     (args["scope"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "all") == "selected"
         {
             try appContext?.resolvedTabContext ?? dependencies.context.resolveTabContextSnapshot(
                 metadata,
@@ -500,6 +540,15 @@ final class MCPGitToolProvider {
         } else {
             await dependencies.selection.resolveFileToolLookupContext(metadata)
         }
+        // Election authority is captured with the lookup it must agree with, before discovery awaits: a
+        // domain read reuses its resolved tab, and the legacy route captures after its lookup, whose
+        // resolution may hydrate the session's bindings.
+        let electionBindingSource = WorkspaceDefaultGitRepositoryElection.Snapshot.bindingSource(
+            routed: appContext?.resolvedTabContext
+                ?? (try? dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.git)),
+            runPurpose: metadata.runPurpose
+        )
+        let declaredRepoPaths = workspace.repoPaths
         let visibleRoots = await dependencies.context.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
         let allRepos = await requestContext.allRepos()
@@ -545,20 +594,58 @@ final class MCPGitToolProvider {
             }
             repos = [match]
         } else {
-            guard let ambientDefaultRepo = allRepos.first else {
-                throw MCPError.invalidParams("No VCS repository found in loaded roots.")
-            }
-            let defaultRepo = contextBuilderAdmission.preferredDefaultRepository ?? ambientDefaultRepo
             let resolver = GitRepoTargetResolver()
             do {
-                repos = try await resolver.resolveRepoRoots(
-                    explicitRootTokens: explicitTokens,
-                    allRepos: allRepos,
-                    visibleRoots: visibleRoots,
-                    defaultRepo: defaultRepo
-                )
+                do {
+                    // Identifying tokens resolve without a default; only omission or a relative token elects.
+                    repos = try await resolver.resolveRepoRoots(
+                        explicitRootTokens: explicitTokens,
+                        allRepos: allRepos,
+                        visibleRoots: visibleRoots,
+                        defaultRepo: nil
+                    )
+                } catch is GitRepoTargetResolver.DefaultRepositoryRequired {
+                    let defaultRepo = try await defaultRepository(
+                        admission: contextBuilderAdmission,
+                        election: WorkspaceDefaultGitRepositoryElection.Snapshot(
+                            workspaceID: workspace.id,
+                            declaredRepoPaths: declaredRepoPaths,
+                            bindingSource: electionBindingSource,
+                            lookupContext: lookupContext,
+                            lookupRoots: visibleRoots
+                        ),
+                        vcsService: vcsService,
+                        isCurrent: { snapshot in
+                            // A domain read keeps its captured tab as the request's authority; the legacy
+                            // route re-reads routing so a changed binding set supersedes the selection.
+                            snapshot.isCurrent(
+                                declaredRepoPaths: workspaceManager.workspaces.first { $0.id == workspace.id }?.repoPaths,
+                                bindingSource: appContext == nil
+                                    ? WorkspaceDefaultGitRepositoryElection.Snapshot.bindingSource(
+                                        routed: try? dependencies.context.resolveTabContextSnapshot(metadata, MCPWindowToolName.git),
+                                        runPurpose: metadata.runPurpose
+                                    )
+                                    : electionBindingSource
+                            )
+                        }
+                    )
+                    repos = try await resolver.resolveRepoRoots(
+                        explicitRootTokens: explicitTokens,
+                        allRepos: allRepos,
+                        visibleRoots: visibleRoots,
+                        defaultRepo: defaultRepo
+                    )
+                }
             } catch let error as GitRepoTargetResolverError {
                 throw MCPError.invalidParams(error.message)
+            }
+        }
+
+        // Explicit external worktree selectors retain the resolver's identity-based grant.
+        // Regardless of selector, reject unrelated metadata before executing any Git read.
+        for repo in repos {
+            guard await vcsService.resolveRepoForRead(at: repo.rootURL, authorizedRoots: visibleRoots.map { URL(fileURLWithPath: $0.standardizedFullPath) } + [repo.rootURL]) != nil else {
+                throw MCPError.invalidParams("Repository metadata is not authorized for this Git read.")
             }
         }
 
@@ -909,6 +996,7 @@ final class MCPGitToolProvider {
             }
 
             let spec = GitDiffCompareSpec.parse(rawInput)
+            try spec.validateRevisionArgument()
             let resolved = spec.displayString
             let input = (resolved == rawInput) ? nil : rawInput
             return (spec, resolved, input)
@@ -1004,6 +1092,7 @@ final class MCPGitToolProvider {
             guard let ref = args["ref"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !ref.isEmpty else {
                 throw MCPError.invalidParams("ref is required for op: show")
             }
+            try GitRevisionArgument.validate(ref)
             let rawShowDetail = args["detail"]?.stringValue?.lowercased() ?? "summary"
             // For show, "patches" behaves the same as "full" (single commit, no truncation needed)
             let detail = rawShowDetail == "patches" ? "full" : rawShowDetail
@@ -1011,7 +1100,7 @@ final class MCPGitToolProvider {
             let commitInfo = try await showBackend.commitInfo(ref: ref, at: repoURL)
 
             // Get diff for this commit
-            let revspec = "\(ref)^!"
+            let revspec = "\(commitInfo.id)^!"
             let contextLines = args["context_lines"]?.intValue ?? 3
             let detectRenames = args["detect_renames"]?.boolValue ?? false
             let changedFiles = try await showBackend.getChangedFilesStats(

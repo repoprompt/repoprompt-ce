@@ -1,6 +1,8 @@
 import CoreServices
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 struct WorkspaceRootCreationFSEvent: Equatable {
     let path: String
@@ -347,6 +349,7 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
         private let startEventID: UInt64
         private var semanticEndEventID: UInt64?
         private var latestMaterialEventID: UInt64
+        private var previousEventBatch: [WorkspaceRootCreationFSEvent] = []
         private var acceptedCallbackWatermark: UInt64 = 0
         private var acceptedCallbackCount = 0
         private var acceptedEventCount = 0
@@ -372,6 +375,13 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
             acceptedCallbackWatermark = Self.incremented(acceptedCallbackWatermark)
             acceptedCallbackCount = Self.incremented(acceptedCallbackCount)
             acceptedEventCount = Self.added(acceptedEventCount, events.count)
+
+            // An identical callback replay need not mean the journal regressed.
+            // Retain only one batch, requiring matching IDs, paths, flags and order.
+            let isIdenticalReplay = !events.isEmpty && events == previousEventBatch
+            if !events.isEmpty {
+                previousEventBatch = events
+            }
 
             for event in events {
                 let flags = event.flags
@@ -400,10 +410,12 @@ final class WorkspaceRootCreationReceiptCoordinator: @unchecked Sendable {
                 guard isWithinEndingCut else {
                     continue
                 }
-                if eventID == 0 || eventID == UInt64.max || eventID < latestMaterialEventID {
+                if eventID == 0 || eventID == UInt64.max
+                    || (!isIdenticalReplay && eventID < latestMaterialEventID)
+                {
                     eventIDRegressed = true
                 } else {
-                    latestMaterialEventID = eventID
+                    latestMaterialEventID = max(latestMaterialEventID, eventID)
                 }
                 guard eventID > startEventID, eventID != UInt64.max else {
                     continue

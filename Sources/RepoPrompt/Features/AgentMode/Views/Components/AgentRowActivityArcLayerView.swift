@@ -14,15 +14,18 @@ import SwiftUI
 /// once a second.
 struct AgentRowAnimatedActivityArc: NSViewRepresentable {
     var tint: Color
+    var isPresentationVisible: Bool = true
 
     func makeNSView(context _: Context) -> AgentRowActivityArcLayerView {
         let view = AgentRowActivityArcLayerView()
         view.tint = NSColor(tint)
+        view.isPresentationVisible = isPresentationVisible
         return view
     }
 
     func updateNSView(_ nsView: AgentRowActivityArcLayerView, context _: Context) {
         nsView.tint = NSColor(tint)
+        nsView.isPresentationVisible = isPresentationVisible
         nsView.startAnimatingIfNeeded()
     }
 
@@ -48,6 +51,10 @@ final class AgentRowActivityArcLayerView: NSView {
     static let animationKey = "agentRowActivityArc.rotation"
 
     let arcLayer = CAShapeLayer()
+
+    var isPresentationVisible: Bool = true {
+        didSet { startAnimatingIfNeeded() }
+    }
 
     var tint: NSColor = .controlAccentColor {
         didSet {
@@ -108,7 +115,15 @@ final class AgentRowActivityArcLayerView: NSView {
 
     /// Idempotent; a no-op outside a window, where nothing can see the arc.
     func startAnimatingIfNeeded() {
-        guard window != nil else { return }
+        updateAnimation(isAttachedToWindow: window != nil)
+    }
+
+    /// Window-independent playback boundary: the production caller supplies actual attachment.
+    func updateAnimation(isAttachedToWindow: Bool) {
+        guard isAttachedToWindow, isPresentationVisible else {
+            stopAnimating()
+            return
+        }
         ensureArcLayerInstalled()
         guard arcLayer.animation(forKey: Self.animationKey) == nil else { return }
         let rotation = CABasicAnimation(keyPath: "transform.rotation.z")

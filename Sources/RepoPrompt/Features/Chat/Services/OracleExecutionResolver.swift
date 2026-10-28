@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 struct OraclePromptConfiguration {
     let chatPreset: ChatPreset
@@ -93,19 +94,23 @@ struct ResolvedOracleExecution {
     let models: [AIModel]
     let promptConfiguration: OraclePromptConfiguration
     let selection: OracleExecutionSelection
+    /// Caller-facing delivery policy, never provider prompt configuration or canonical history.
+    let reconciliationGuidance: String?
 
     fileprivate init(
         mode: OracleMode,
         roster: OracleRoster,
         models: [AIModel],
         promptConfiguration: OraclePromptConfiguration,
-        selection: OracleExecutionSelection
+        selection: OracleExecutionSelection,
+        reconciliationGuidance: String?
     ) {
         self.mode = mode
         self.roster = roster
         self.models = models
         self.promptConfiguration = promptConfiguration
         self.selection = selection
+        self.reconciliationGuidance = reconciliationGuidance
     }
 
     var primaryModel: AIModel {
@@ -266,7 +271,8 @@ struct OracleExecutionResolver {
             presetName: nil,
             chatPreset: chatPreset,
             mode: mode,
-            selection: .conversation
+            selection: .conversation,
+            profile: snapshot.agentModelsProfile
         )
     }
 
@@ -290,7 +296,8 @@ struct OracleExecutionResolver {
                 presetName: nil,
                 chatPreset: defaultChatPreset(mode: mode, snapshot: snapshot),
                 mode: mode,
-                selection: .rawPrimaryOverride(normalized)
+                selection: .rawPrimaryOverride(normalized),
+                profile: snapshot.agentModelsProfile
             )
         }
         if presetsExposed, let preset = fuzzyMatchingPreset(normalized, in: snapshot.modelPresets) {
@@ -359,7 +366,8 @@ struct OracleExecutionResolver {
             mode: mode,
             selection: automatic
                 ? .automaticPreset(id: preset.id, name: preset.name)
-                : .explicitPreset(id: preset.id, name: preset.name)
+                : .explicitPreset(id: preset.id, name: preset.name),
+            profile: snapshot.agentModelsProfile
         )
     }
 
@@ -375,7 +383,8 @@ struct OracleExecutionResolver {
             presetName: nil,
             chatPreset: defaultChatPreset(mode: mode, snapshot: snapshot),
             mode: mode,
-            selection: .agentModels
+            selection: .agentModels,
+            profile: snapshot.agentModelsProfile
         )
     }
 
@@ -393,7 +402,8 @@ struct OracleExecutionResolver {
             presetName: nil,
             chatPreset: chatPreset,
             mode: mode,
-            selection: .contextBuilderUI
+            selection: .contextBuilderUI,
+            profile: snapshot.agentModelsProfile
         )
     }
 
@@ -402,7 +412,8 @@ struct OracleExecutionResolver {
         presetName: String?,
         chatPreset: ChatPreset,
         mode: OracleMode,
-        selection: OracleExecutionSelection
+        selection: OracleExecutionSelection,
+        profile: AgentModelsSettingsProfile
     ) throws -> ResolvedOracleExecution {
         let roster: OracleRoster
         do {
@@ -437,7 +448,8 @@ struct OracleExecutionResolver {
             roster: roster,
             models: models,
             promptConfiguration: capturePromptConfiguration(chatPreset, mode),
-            selection: selection
+            selection: selection,
+            reconciliationGuidance: profile.oracleReconciliationGuidance
         )
     }
 

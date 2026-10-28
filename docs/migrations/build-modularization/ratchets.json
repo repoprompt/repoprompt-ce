@@ -1,0 +1,34 @@
+{
+  "description": "Codex required discovery merge-forward after oversight revert: measured upstream/main bdfa1b3910fe4aef7722ed787d52efad3552ae96 app baseline 604207 plus exact net PR app-source delta 122 = 604329, with zero app-line headroom. Required discovery, cold compaction ownership and renewed replacement admission are unchanged. All other upstream numeric metrics and enforcement remain unchanged. Agent Re-prompt adds the seven explicitly planned app-boundary test suites; only the testable-import ceiling increases by seven (333 to 340), with no source-size ratchet relaxation.",
+  "ratcheted": [
+    "app_files_over_5000_lines",
+    "app_files_over_2000_lines",
+    "tests_testable_import_app_files",
+    "app_static_shared_declarations"
+  ],
+  "app_target_swift_lines_headroom": 0,
+  "tracked": [
+    "app_target_swift_lines",
+    "app_shared_accessor_uses",
+    "app_userdefaults_standard_uses",
+    "app_wrong_way_file_edges",
+    "app_largest_cycle_components",
+    "tests_sleep_calls"
+  ],
+  "metrics": {
+    "app_components": 69,
+    "app_files_over_2000_lines": 47,
+    "app_files_over_5000_lines": 16,
+    "app_largest_cycle_components": 64,
+    "app_share_permille": 868,
+    "app_shared_accessor_uses": 1218,
+    "app_static_shared_declarations": 89,
+    "app_target_swift_files": 1126,
+    "app_target_swift_lines": 604329,
+    "app_userdefaults_standard_uses": 234,
+    "app_wrong_way_file_edges": 1079,
+    "first_party_swift_lines": 747202,
+    "tests_sleep_calls": 59,
+    "tests_testable_import_app_files": 340
+  }
+}

@@ -14,7 +14,7 @@ Reverify these facts before a migration phase; line numbers and target compositi
 
 The root package contains materially different concurrency domains:
 
-- `RepoPromptApp`: app composition, UI, feature/runtime code, and an Objective-C bridging header.
+- `RepoPromptApp`: app composition, UI, and feature/runtime code. C interop goes through explicit `import RepoPromptC`; there is no bridging header.
 - `RepoPrompt`: one-file executable entry shell.
 - `RepoPromptMCP`: MCP executable and transport/process flows.
 - `RepoPromptShared`: app/CLI protocol code.

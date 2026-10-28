@@ -6,8 +6,11 @@
 //
 
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - Supporting Models
+
+typealias AIChatFileAttachment = RepoPromptDomainRuntime.AIChatFileAttachment
 
 struct AIChatMessage: Identifiable, Equatable {
     let id: UUID
@@ -21,6 +24,9 @@ struct AIChatMessage: Identifiable, Equatable {
 
     /// The user's selected file paths at the time this message was created.
     private(set) var allowedFilePaths: [String] = []
+
+    /// Image attachments sent with this message (thumbnails only).
+    private(set) var fileAttachments: [AIChatFileAttachment] = []
 
     /// Quick access to how many files were selected when this message was created.
     var selectedFileCount: Int {
@@ -46,7 +52,8 @@ struct AIChatMessage: Identifiable, Equatable {
         sequenceIndex: Int = 0,
         allowedFilePaths: [String] = [],
         reasoningContent: String = "",
-        modelName: String? = nil
+        modelName: String? = nil,
+        fileAttachments: [AIChatFileAttachment] = []
     ) {
         self.id = id
         self.content = content
@@ -56,6 +63,7 @@ struct AIChatMessage: Identifiable, Equatable {
         self.isFinalized = isFinalized
         self.reasoningContent = reasoningContent
         self.modelName = modelName
+        self.fileAttachments = fileAttachments
     }
 
     static func == (lhs: AIChatMessage, rhs: AIChatMessage) -> Bool {
@@ -101,5 +109,6 @@ struct AIChatMessage: Identifiable, Equatable {
         updateContent("")
         updateReasoningContent("")
         setAllowedPaths([])
+        fileAttachments = []
     }
 }

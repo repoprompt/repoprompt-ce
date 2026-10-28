@@ -25,7 +25,7 @@ extension AgentModeViewModel {
         guard sessions[endpoint.tabID] === session,
               agentSessionLinkObserverEndpoint(tabID: endpoint.tabID) == endpoint,
               session.oversight.periodicIdleWakeEnabled,
-              session.hasLoadedPersistedState, !session.bindingTransitionInProgress,
+              session.permitsBoundOperationAndSave,
               agentSessionLinkPeriodicObserverIsLive(endpoint),
               let published = agentSessionLinkPromptInventoryBySessionID[endpoint.sessionID],
               published.endpoint == endpoint, !published.inventory.isEmpty
@@ -39,8 +39,9 @@ extension AgentModeViewModel {
 
     /// Excludes this producer's own active run and composer claim.
     func agentSessionLinkPeriodicPreparationIsUnblocked(_ session: TabSession) -> Bool {
-        !session.terminalCommitInProgress && !session.bindingTransitionInProgress
+        session.permitsBoundOperationAndSave && !session.terminalCommitInProgress
             && !session.isChangingExecutionLocation && !session.isPreparingInitialWorktree
+            && !session.selfCompactState.blocksAutomaticWake
             && session.pendingInstructions.isEmpty && session.pendingACPSteeringInstructions.isEmpty
             && session.pendingClaudeSteeringInstructions.isEmpty
             && session.pendingAskUser == nil && session.pendingUserInputRequest == nil
@@ -56,6 +57,7 @@ extension AgentModeViewModel {
             if session.oversight.periodicEndpoint == endpoint { session.oversight.retirePeriodicScheduling() }
             return
         }
+        agentSelfCompactSettleStaleParkedNote(session)
         agentSessionLinkReleasePeriodicACPContinuationSlot(for: session)
         if session.oversight.periodicEndpoint != endpoint {
             session.oversight.retirePeriodicScheduling()
@@ -137,7 +139,8 @@ extension AgentModeViewModel {
             wakeID: UUID(), observerEndpoint: endpoint,
             queueEpoch: nil, queueRevision: 0, wakeFingerprint: nil,
             admissionBasis: .periodic, attemptedFingerprint: nil,
-            physicalOutcome: .notAttempted, phase: .scheduled, task: nil
+            physicalOutcome: .notAttempted, phase: .scheduled, task: nil,
+            stopFence: AgentRunStartStopFence(session: session)
         )
         session.oversight.pendingAutoWake = attempt
         agentSessionLinkScheduleAutoWakeReevaluation(wakeID: attempt.wakeID, endpoint: endpoint)
@@ -195,7 +198,7 @@ extension AgentModeViewModel {
         _ = await startAgentRun(
             tabID: endpoint.tabID,
             initialMessage: Self.periodicWakeMessage,
-            directStartOptions: .periodicWake(wakeID: attempt.wakeID)
+            directStartOptions: .periodicWake(wakeID: attempt.wakeID, stopFence: attempt.stopFence)
         )
         if var current = session.oversight.pendingAutoWake, current.wakeID == attempt.wakeID {
             current.periodicStartReturned = true

@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  AIQueryBasicSettingsView.swift
 //  RepoPrompt

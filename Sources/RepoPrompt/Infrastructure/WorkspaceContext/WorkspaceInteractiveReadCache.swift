@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptFileSystem
 
 struct WorkspaceInteractiveReadCacheKey: Hashable {
     let rootID: UUID

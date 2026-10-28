@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 /// Passive OpenCode effort-pin renderer shared by the Settings, popover and Context Builder

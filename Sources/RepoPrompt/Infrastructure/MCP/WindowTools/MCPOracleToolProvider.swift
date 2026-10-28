@@ -8,6 +8,17 @@ import RepoPromptDomainRuntime
 final class MCPOracleToolProvider: MCPAppToolProviding {
     let group: MCPAppToolGroup = .oracle
 
+    static let oracleAttachmentsUsageDescription = OracleAttachmentContract.usageDescription()
+
+    static var oracleAttachmentsSchema: JSONSchema {
+        let schema = OracleAttachmentContract.schemaProperty()
+        do {
+            return try JSONDecoder().decode(JSONSchema.self, from: JSONEncoder().encode(schema))
+        } catch {
+            preconditionFailure("OracleAttachmentContract schema must decode as JSONSchema: \(error)")
+        }
+    }
+
     private let runtime: MCPAppToolBinder
     private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
@@ -60,9 +71,11 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab. Omit `chat_id` or set `new_chat=true` to start; otherwise `chat_id` continues. The optional `model` override changes only the primary model of a new conversation.
 
+            \(Self.oracleAttachmentsUsageDescription)
+
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
-            Use `oracle_chat_log` after compaction to recover recent oracle messages.
+            Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and reading it with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit.
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
@@ -86,6 +99,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Optional primary-model override for a new conversation; rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
+                    OracleAttachmentContract.argumentName: Self.oracleAttachmentsSchema,
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
                     )
@@ -106,6 +120,8 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode. When `chat_id` and `new_chat` are omitted, the resolved tab resumes its selected eligible conversation, falling back to the most recent eligible conversation. Set `new_chat=true` to force a new conversation; `model` is valid only for that explicit start. With Model Presets exposed, an exact preset UUID or name is resolved before raw-model interpretation and supplies the complete roster and mapped Chat Preset. An available raw model replaces only the configured primary and retains configured additional Oracles.
             Use `oracle_utils` for passive helpers like models and sessions.
+
+            \(Self.oracleAttachmentsUsageDescription)
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
@@ -133,6 +149,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Optional exposed Model Preset name/UUID or available raw primary-model override for an explicit new_chat=true start. Exact preset identity wins a collision; a raw model retains configured additional Oracles. Rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
+                    OracleAttachmentContract.argumentName: Self.oracleAttachmentsSchema,
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
                     )

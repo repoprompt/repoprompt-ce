@@ -1,0 +1,5 @@
+Test Suite 'Selected tests' started at 2026-10-01.
+Test Case '-[CoreTests.ExampleTests testOne]' passed (0.001 seconds).
+Test Case '-[CoreTests.ExampleTests testTwo]' skipped (0.001 seconds).
+Test Suite 'Selected tests' passed at 2026-10-01.
+ Executed 2 tests, with 1 test skipped and 0 failures (0 unexpected) in 0.002 seconds

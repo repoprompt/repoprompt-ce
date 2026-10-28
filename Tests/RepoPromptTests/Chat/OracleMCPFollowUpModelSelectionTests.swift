@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 import XCTest
 
 final class OracleMCPFollowUpModelSelectionTests: XCTestCase {

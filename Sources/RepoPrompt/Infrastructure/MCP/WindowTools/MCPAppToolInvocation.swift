@@ -4,4 +4,5 @@ import Foundation
 struct MCPAppToolInvocation {
     let toolName: String
     let windowID: Int
+    let context: ToolInvocationContext
 }

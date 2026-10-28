@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  AgentInputBar.swift
 //  RepoPrompt
@@ -7,18 +9,22 @@
 //
 
 import AppKit
+import RepoPromptInstrumentation
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct AgentComposerActions {
-    let storeDraft: (_ tabID: UUID, _ text: String) -> Void
-    let retrieveDraft: (_ tabID: UUID) -> String
+    var prepareReprompt: (AgentComposerSubmitTarget, String) -> Bool = { _, _ in false }
+    var toggleComputerUse: (UUID, ObjectIdentifier) async -> Void = { _, _ in }
+    let storeDraft: (_ tabID: UUID, _ text: String, _ acknowledgedSequence: UInt64) -> Void
+    let loadDraft: (_ tabID: UUID) -> AgentComposerDraftSnapshot
     let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
     let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
     let cancelRouting: (_ tabID: UUID) async -> Void
-    let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
-    let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
+    let attachFiles: (_ tabID: UUID, _ urls: [URL]) async -> Void
+    let reportAttachmentFailures: (_ tabID: UUID, _ failures: [AgentAttachmentFailure]) -> Void
+    let removePendingAttachment: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let commitTaggedFile: (_ tabID: UUID, _ suggestion: MentionSuggestion, _ displayName: String) -> Void
     let removeTaggedFile: (_ tabID: UUID, _ attachmentID: UUID) -> Void
     let agentWorkspaceLookupContext: (_ tabID: UUID?) async -> WorkspaceLookupContext
@@ -29,6 +35,8 @@ struct AgentComposerActions {
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
     let selectACPModelParameter: (_ target: ACPModelParameterSelection, _ openCodeDiscoveryKey: OpenCodeACPModelParameterKey?) -> Void
+    var clearCursorModelParameter: (ACPModelParameterIdentity) -> Void = { _ in }
+    var canMutateCursorModel: (_ tabID: UUID?) -> Bool = { _ in false }
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
     let setProviderPermissionLevel: (_ id: AgentProviderPermissionLevelID) -> Void
     let applyCodexToolSettingMutation: (_ mutation: CodexToolSettingMutation) -> Void
@@ -38,6 +46,7 @@ struct AgentComposerActions {
 }
 
 struct AgentInputBar: View {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let agentModeVM: AgentModeViewModel
     @ObservedObject var composerUI: AgentComposerUIStore
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
@@ -83,7 +92,7 @@ struct AgentInputBar: View {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar")
+            let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
         AgentComposerView(
             props: composerUI.props,
@@ -94,6 +103,9 @@ struct AgentInputBar: View {
             selectionCoordinator: selectionCoordinator,
             windowID: windowID,
             currentTabID: currentTabID,
+            repromptViewModel: agentModeVM,
+            repromptStore: agentModeVM.repromptUIStore,
+            pendingSubmissionStore: composerUI,
             resetTextFieldTrigger: $resetTextFieldTrigger,
             composerBottomInset: $composerBottomInset,
             transcriptBottomClearance: $transcriptBottomClearance,
@@ -107,17 +119,37 @@ struct AgentInputBar: View {
     }
 
     private var composerActions: AgentComposerActions {
-        AgentComposerActions(
-            storeDraft: { tabID, text in agentModeVM.storeDraftText(for: tabID, text) },
-            retrieveDraft: { tabID in agentModeVM.retrieveDraftText(for: tabID) },
-            claimSubmit: { attempt in agentModeVM.claimComposerSubmitAttempt(attempt) },
+        // Composer props carry the source session identity in submitTarget, so replacing
+        // an idle session also invalidates the equatable view's retained actions.
+        let cursorSession = agentModeVM.activeSession
+        let attachmentAdmission: @MainActor (UUID) -> Bool = { [weak agentModeVM, weak composerUI] tabID in
+            guard let agentModeVM, let composerUI else { return false }
+            return !composerUI.hasPendingSubmission(tabID: tabID)
+                && agentModeVM.repromptUIStore.allowsAttachmentMutation(tabID: tabID, currentTabID: agentModeVM.currentTabID)
+        }
+        return AgentComposerActions(
+            prepareReprompt: { target, text in agentModeVM.prepareRepromptForComposerSend(target: target, text: text) },
+            toggleComputerUse: { tabID, identity in await agentModeVM.toggleComputerUse(tabID: tabID, expectedSessionIdentity: identity) },
+            storeDraft: { tabID, text, sequence in
+                agentModeVM.storeDraftText(for: tabID, text, acknowledgingThrough: sequence)
+            },
+            loadDraft: { tabID in agentModeVM.loadDraftSnapshotForComposer(for: tabID) },
+            claimSubmit: { attempt in agentModeVM.claimComposerSubmitForImmediatePresentation(attempt) },
             executeSubmit: { claim, text in
-                await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
+                await agentModeVM.executePresentedComposerSubmitAttempt(text: text, claim: claim)
             },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             cancelRouting: { tabID in await agentModeVM.cancelFreshTaskRouting(tabID: tabID) },
-            attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
-            removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
+            attachFiles: { tabID, urls in
+                await agentModeVM.attachFiles(tabID: tabID, urls: urls, admission: {
+                    attachmentAdmission(tabID)
+                }).value
+            },
+            reportAttachmentFailures: { tabID, failures in
+                guard attachmentAdmission(tabID) else { return }
+                agentModeVM.reportAttachmentFailures(tabID: tabID, failures)
+            },
+            removePendingAttachment: { tabID, attachmentID in agentModeVM.removePendingFileAttachment(tabID: tabID, attachmentID: attachmentID) },
             commitTaggedFile: { tabID, suggestion, displayName in
                 agentModeVM.commitPendingTaggedFile(
                     tabID: tabID,
@@ -144,6 +176,10 @@ struct AgentInputBar: View {
             selectACPModelParameter: { target, openCodeDiscoveryKey in
                 agentModeVM.selectACPModelParameter(target, openCodeDiscoveryKey: openCodeDiscoveryKey)
             },
+            clearCursorModelParameter: { agentModeVM.clearCursorModelParameter($0) },
+            canMutateCursorModel: { tabID in
+                agentModeVM.canMutateCursorComposerModel(expectedSession: cursorSession, expectedTabID: tabID)
+            },
             setAutoEditEnabled: { enabled in agentModeVM.setAutoEditEnabled(enabled) },
             setProviderPermissionLevel: { id in agentModeVM.setProviderPermissionLevel(id) },
             applyCodexToolSettingMutation: { mutation in
@@ -166,11 +202,14 @@ struct AgentInputBar: View {
     @ViewBuilder
     private var statusPills: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.inputBar.statusPills")
+            let _ = perfRecorder.increment("ui.body.inputBar.statusPills")
         #endif
         AgentStatusPillsRow(
             agentModeVM: agentModeVM,
             statusPillsUI: statusPillsUI,
+            computerUse: composerUI.props.computerUse,
+            computerUseTarget: composerUI.props.submitTarget,
+            toggleComputerUse: composerActions.toggleComputerUse,
             openContextDrawerFiles: openContextDrawerFiles,
             oracleViewModel: oracleViewModel,
             promptManager: promptManager,
@@ -179,6 +218,7 @@ struct AgentInputBar: View {
             windowID: windowID
         )
         .padding(.horizontal, 28)
+        .disabled(composerUI.hasPendingSubmission(tabID: currentTabID))
     }
 }
 
@@ -244,6 +284,7 @@ enum AgentFileMentionText {
 }
 
 struct AgentComposerView: View, Equatable {
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     let props: AgentComposerProps
     let placeholderText: String
     let actions: AgentComposerActions
@@ -252,6 +293,9 @@ struct AgentComposerView: View, Equatable {
     let selectionCoordinator: WorkspaceSelectionCoordinator
     let windowID: Int
     let currentTabID: UUID?
+    var repromptViewModel: AgentModeViewModel?
+    @ObservedObject var repromptStore = AgentRepromptUIStore()
+    @ObservedObject var pendingSubmissionStore = AgentComposerUIStore()
 
     @Binding var resetTextFieldTrigger: Bool
     @Binding var composerBottomInset: CGFloat
@@ -259,15 +303,27 @@ struct AgentComposerView: View, Equatable {
 
     @FocusState var isFocused: Bool
 
+    private func flushDraftOnDeparture(tabID: UUID) {
+        guard AgentRepromptUIStore.shouldFlushDraftOnDeparture(
+            tabID: tabID, presentation: repromptStore.presentation, publication: repromptStore.draftUpdate,
+            acknowledged: acknowledgedRepromptPublicationsByTab[tabID]
+        ) else { return }
+        actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+    }
+
     @State private var localInputText: String = ""
+    @State private var nativeComposerEditor = TextFieldNativeEditor()
     @State private var externalTextUpdateTick: Int = 0
     @State private var submissionLatch = AgentComposerSubmissionLatch()
-    @State private var lastAppliedDraftRestorationEventIDByTab: [UUID: UUID] = [:]
+    @State private var acknowledgedDraftRestorationSequenceByTab: [UUID: UInt64] = [:]
+    @State private var acknowledgedRepromptPublicationsByTab: [UUID: AgentRepromptUIStore.PublicationIdentity] = [:]
+    @State private var repromptStripHeight: CGFloat = 0
+    @State private var composerFocusRestoreRequest: UUID?
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
     @State private var isSyncingDraftFromSession: Bool = false
-    @State private var isImageDropTargeted: Bool = false
+    @State private var isAttachmentDropTargeted: Bool = false
     @State private var showCodexToolsPopover: Bool = false
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
@@ -282,7 +338,7 @@ struct AgentComposerView: View, Equatable {
         fontScale.preset
     }
 
-    private let imageInputAdapter = AgentImageInputAdapter()
+    private let attachmentIntake = AgentAttachmentIntake()
     private static let staleSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
 
     static func hasEquivalentRenderIdentity(
@@ -309,8 +365,8 @@ struct AgentComposerView: View, Equatable {
         )
     }
 
-    private var hasPendingImageAttachments: Bool {
-        props.attachments.hasImages
+    private var hasPendingFileAttachments: Bool {
+        props.attachments.hasAttachments
     }
 
     private var hasPendingTaggedFileAttachments: Bool {
@@ -318,7 +374,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var hasPendingAttachments: Bool {
-        hasPendingImageAttachments || hasPendingTaggedFileAttachments
+        hasPendingFileAttachments || hasPendingTaggedFileAttachments
     }
 
     private var isCodexRunActive: Bool {
@@ -329,9 +385,11 @@ struct AgentComposerView: View, Equatable {
         props.canUseLinkedAgentSession
     }
 
-    private var canAttachImages: Bool {
+    private static let attachmentDropTypes: [UTType] = [.fileURL, .image]
+
+    private var canAttachFiles: Bool {
         // Grok Build advertises no ACP image capability; its provider rejects attachments.
-        !props.isAgentBusy && currentTabID != nil && props.selectedAgent != .grokBuild
+        !props.isAgentBusy && currentTabID.map(canMutateAttachments) == true && props.selectedAgent != .grokBuild
     }
 
     private var renderedSubmitTarget: AgentComposerSubmitTarget? {
@@ -339,19 +397,61 @@ struct AgentComposerView: View, Equatable {
               target.tabID == props.currentTabID,
               target.tabID == currentTabID
         else { return nil }
+        if let viewModel = repromptViewModel {
+            guard viewModel.currentTabID == target.tabID, let session = viewModel.sessions[target.tabID],
+                  viewModel.makeComposerSubmitTarget(tabID: target.tabID, session: session) == target else { return nil }
+        }
         return target
+    }
+
+    private var repromptPresentation: AgentRepromptUIStore.Presentation? {
+        repromptStore.presentation.flatMap { $0.sourceTabID == currentTabID ? $0 : nil }
+    }
+
+    private var repromptUndoRecovery: AgentRepromptUIStore.Recovery? {
+        guard repromptPresentation == nil, let tabID = currentTabID,
+              let recovery = repromptStore.recoveries[tabID], recovery.reason == "Original restored",
+              localInputText == recovery.originalDraft else { return nil }
+        return recovery
+    }
+
+    private var repromptEditTransaction: TextFieldExternalEditTransaction? {
+        if let presentation = repromptPresentation { return .init(id: presentation.id, isComplete: presentation.phase == .completed) }
+        return repromptUndoRecovery.map { .init(id: $0.id, isComplete: true) }
+    }
+
+    private var isSubmissionPending: Bool {
+        if let viewModel = repromptViewModel, let tabID = currentTabID {
+            // Cancel releases admission immediately, even if the old backend call is settling.
+            return pendingSubmissionStore.hasPendingSubmission(tabID: tabID)
+                || viewModel.sessions[tabID]?.activeComposerSubmitAttempt != nil
+        }
+        return submissionLatch.isLatched(for: currentTabID)
+            || pendingSubmissionStore.hasPendingSubmission(tabID: currentTabID)
+    }
+
+    private func retireUnownedSubmissionLatch() {
+        guard let viewModel = repromptViewModel, let tabID = currentTabID,
+              !isSubmissionPending, let attempt = submissionLatch.activeAttemptsByTabID[tabID],
+              viewModel.sessions[tabID]?.activeComposerSubmitAttempt?.id != attempt.id else { return }
+        submissionLatch.cancel(attempt)
     }
 
     private var canSubmitToRenderedTarget: Bool {
         props.canSendWithCurrentProvider
             && renderedSubmitTarget != nil
-            && !submissionLatch.isLatched(for: currentTabID)
+            && !isSubmissionPending
     }
 
     private var localInputTextBinding: Binding<String> {
         Binding(
             get: { localInputText },
-            set: { setLocalInputText($0) }
+            set: { text in
+                guard let tabID = currentTabID,
+                      repromptViewModel == nil || repromptViewModel?.currentTabID == tabID else { return }
+                setLocalInputText(text)
+                actions.storeDraft(tabID, text, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+            }
         )
     }
 
@@ -397,9 +497,9 @@ struct AgentComposerView: View, Equatable {
 
     private var mainContentHeight: CGFloat {
         editorTextFieldHeight + AgentAttachmentStripLayout.reservedHeight(
-            hasImages: hasPendingImageAttachments,
+            hasAttachments: hasPendingFileAttachments,
             hasTaggedFiles: hasPendingTaggedFileAttachments
-        ) + steeringUnsupportedInfoBoxReservedHeight
+        ) + steeringUnsupportedInfoBoxReservedHeight + repromptStripHeight
     }
 
     private var composerChromeVerticalPadding: CGFloat {
@@ -451,7 +551,7 @@ struct AgentComposerView: View, Equatable {
 
     var body: some View {
         #if DEBUG
-            let _ = AgentModePerfDiagnostics.increment("ui.body.composer")
+            let _ = perfRecorder.increment("ui.body.composer")
         #endif
         VStack(spacing: 0) {
             ComposerChrome(
@@ -489,9 +589,7 @@ struct AgentComposerView: View, Equatable {
         }
         .onDisappear {
             // Store draft when leaving
-            if let tabID = currentTabID {
-                actions.storeDraft(tabID, localInputText)
-            }
+            if let tabID = currentTabID { flushDraftOnDeparture(tabID: tabID) }
             steeringUnsupportedDismissTask?.cancel()
             steeringUnsupportedDismissTask = nil
             modelMenuSnapshotReleaseTask?.cancel()
@@ -499,10 +597,9 @@ struct AgentComposerView: View, Equatable {
             modelMenuSnapshotByAgent = nil
         }
         .onChange(of: currentTabID) { oldTabID, newTabID in
+            composerFocusRestoreRequest = nil
             // Switch drafts when tab changes
-            if let oldTabID {
-                actions.storeDraft(oldTabID, localInputText)
-            }
+            if let oldTabID { flushDraftOnDeparture(tabID: oldTabID) }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
             }
@@ -510,7 +607,25 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: localInputText) { _, newValue in
             isInputEmpty = newValue.isEmpty
             guard let tabID = currentTabID, !isSyncingDraftFromSession else { return }
-            actions.storeDraft(tabID, newValue)
+            actions.storeDraft(tabID, newValue, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+        }
+        .onChange(of: repromptStore.composerFocusRestoreRequest) { _, request in
+            guard let request, request.tabID == currentTabID,
+                  repromptViewModel?.currentTabID == request.tabID else { return }
+            composerFocusRestoreRequest = request.id
+        }
+        .onReceive(repromptStore.$draftUpdate) { update in
+            guard let update, update.tabID == currentTabID else { return }
+            // Read the canonical draft, not a queued older payload, and acknowledge restoration fragments.
+            loadDraftFromSession(for: update.tabID)
+            // @Published delivers before the stored property changes; acknowledge the incoming revision.
+            acknowledgedRepromptPublicationsByTab[update.tabID] = update.identity
+        }
+        .onReceive(repromptStore.$autoSendRequest) { request in
+            guard let request, request.tabID == currentTabID,
+                  let operation = repromptViewModel?.repromptOperation, operation.id == request.operationID,
+                  operation.consumeAutoSend(request), localInputText == request.text else { return }
+            submitMessage(rawDraftSnapshot: request.text, restoreFocus: false)
         }
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
@@ -536,15 +651,20 @@ struct AgentComposerView: View, Equatable {
                     restoredText = AgentComposerDraftRestorationReducer.apply(
                         operation,
                         to: localInputText,
-                        lastAppliedRestorationEventID: lastAppliedDraftRestorationEventIDByTab[event.tabID]
+                        acknowledgedSequence: acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0
                     )
                 } else {
                     restoredText = event.text
                 }
             }
-            lastAppliedDraftRestorationEventIDByTab[event.tabID] = event.id
+            let sequence = max(
+                acknowledgedDraftRestorationSequenceByTab[event.tabID] ?? 0,
+                event.operation?.fragments.last?.sequence ?? 0
+            )
+            acknowledgedDraftRestorationSequenceByTab[event.tabID] = sequence
             setLocalInputText(restoredText, forceRevision: true, isExternalUpdate: true)
-            actions.storeDraft(event.tabID, restoredText)
+            composerFocusRestoreRequest = UUID()
+            actions.storeDraft(event.tabID, restoredText, sequence)
             DispatchQueue.main.async {
                 isSyncingDraftFromSession = false
             }
@@ -552,8 +672,8 @@ struct AgentComposerView: View, Equatable {
                 showSteeringUnsupportedNotice(event.message)
             }
         }
-        .onDrop(of: [UTType.fileURL, UTType.image], isTargeted: $isImageDropTargeted, perform: handleImageDrop(providers:))
-        .overlay(imageDropOutline)
+        .onDrop(of: Self.attachmentDropTypes, isTargeted: $isAttachmentDropTargeted, perform: handleAttachmentDrop(providers:))
+        .overlay(attachmentDropOutline)
     }
 
     // MARK: - Transient Submit Guidance
@@ -589,6 +709,26 @@ struct AgentComposerView: View, Equatable {
 
     private var mainContent: some View {
         VStack(alignment: .leading, spacing: AgentAttachmentStripLayout.composerVerticalSpacingWhenPresent) {
+            if let repromptViewModel {
+                VStack(alignment: .leading, spacing: 6) {
+                    AgentRepromptQuestionsView(viewModel: repromptViewModel, store: repromptStore, tabID: currentTabID, onReturnToComposer: { [tabID = currentTabID] in
+                        guard repromptViewModel.currentTabID == tabID else { return }
+                        repromptStore.requestComposerFocus(tabID: tabID)
+                    })
+                    AgentRepromptComposerStrip(
+                        viewModel: repromptViewModel,
+                        store: repromptStore,
+                        tabID: currentTabID,
+                        onUndo: { undoRepromptDraft(expectedID: $0) },
+                        onSendOriginal: { sendRepromptOriginal(expectedID: $0) }
+                    )
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .background(GeometryReader { geometry in
+                    Color.clear.onAppear { repromptStripHeight = geometry.size.height }
+                        .onChange(of: geometry.size.height) { _, height in repromptStripHeight = height }
+                })
+            }
             if hasSteeringUnsupportedNotice {
                 steeringUnsupportedInfoBox
             }
@@ -596,8 +736,8 @@ struct AgentComposerView: View, Equatable {
             if hasPendingAttachments {
                 AgentAttachmentsStrip(
                     snapshot: props.attachments,
-                    allowsRemoval: true,
-                    onRemoveImage: removeImageAttachment,
+                    allowsRemoval: currentTabID.map(canMutateAttachments) == true,
+                    onRemoveAttachment: removeAttachment,
                     onRemoveTaggedFile: removeTaggedFileAttachment
                 )
                 .equatable()
@@ -608,7 +748,7 @@ struct AgentComposerView: View, Equatable {
                 placeholder: placeholderText,
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
-                onImagePaste: handleImagePaste(pasteboard:),
+                onAttachmentPaste: handleAttachmentPaste(pasteboard:),
                 features: .agentInputBar(
                     fileTagStore: promptManager.fileManager.workspaceFileContextStore,
                     fileTagSearchService: workspaceSearchService,
@@ -624,6 +764,31 @@ struct AgentComposerView: View, Equatable {
                     }
                 ),
                 externalUpdateTick: externalTextUpdateTick,
+                externalEditTransaction: repromptEditTransaction,
+                onUndoExternalEdit: { [id = repromptPresentation?.id, recoveryID = repromptUndoRecovery?.id, tabID = currentTabID] in
+                    if let id { undoRepromptDraft(expectedID: id) }
+                    else if let tabID, let recoveryID, repromptStore.recoveries[tabID]?.id == recoveryID {
+                        _ = repromptViewModel?.restoreRepromptRecovery(tabID: tabID, confirmedReplacement: false)
+                    }
+                },
+                onBeginUserEditing: repromptViewModel == nil ? nil : { [tabID = currentTabID] text, yieldedID in
+                    guard let tabID, let viewModel = repromptViewModel,
+                          viewModel.currentTabID == tabID, let operation = viewModel.repromptOperation,
+                          operation.sourceTabID == tabID, operation.id != yieldedID, operation.beginUserEditing() else { return nil }
+                    setLocalInputText(text)
+                    actions.storeDraft(tabID, text, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+                    return .init(id: operation.id, revision: externalTextUpdateTick)
+                },
+                onEscape: repromptPresentation == nil ? nil : { [id = repromptPresentation?.id] in
+                    guard let id, let operation = repromptViewModel?.repromptOperation, operation.id == id else { return }
+                    if operation.phase == .completed { undoRepromptDraft(expectedID: id) }
+                    else { operation.cancel() }
+                },
+                onCommandReturn: repromptViewModel == nil ? nil : repromptAgain,
+                commandReturnMatcher: { LocalKeyboardShortcut.matches($0, .repromptDraft) },
+                focusRestoreRequest: composerFocusRestoreRequest,
+                nativeEditor: nativeComposerEditor,
+                nativeEditorIdentity: currentTabID.map { AnyHashable($0) },
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight
                 }
@@ -658,11 +823,19 @@ struct AgentComposerView: View, Equatable {
                     if props.hasAvailableAgentProviders {
                         if props.isGlobalModelRouterControllingFreshTask {
                             automaticRouterTargetChip
+                            if let autoEffortServiceName = props.autoEffortServiceName {
+                                automaticEffortChip(serviceName: autoEffortServiceName)
+                            }
                         } else {
                             agentProviderModelPicker
                             acpModelParameterPickers
                             reasoningEffortPicker
                             claudeEffortPicker
+                            if let autoEffortServiceName = props.autoEffortServiceName,
+                               props.manualEffortControl != nil
+                            {
+                                automaticEffortChip(serviceName: autoEffortServiceName)
+                            }
                             codexToolsButton
                             claudeToolsButton
                         }
@@ -680,15 +853,15 @@ struct AgentComposerView: View, Equatable {
 
             // Right side: Attach + Send/Cancel button
             HStack(spacing: 8) {
-                Button(action: pickImages) {
-                    Image(systemName: "photo.badge.plus")
-                        .foregroundColor(canAttachImages ? .secondary : .gray)
+                Button(action: pickFiles) {
+                    Image(systemName: "paperclip")
+                        .foregroundColor(canAttachFiles ? .secondary : .gray)
                         .font(.system(size: 16))
                         .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.plain)
-                .disabled(!canAttachImages)
-                .hoverTooltip("Attach Images")
+                .disabled(!canAttachFiles)
+                .hoverTooltip("Attach Files")
                 .transaction { transaction in
                     transaction.animation = nil
                 }
@@ -702,7 +875,7 @@ struct AgentComposerView: View, Equatable {
                         inputText: localInputText,
                         hasMessages: false, // Disable resend in agent mode - just show greyed send button
                         sendWhenEmpty: hasPendingAttachments,
-                        sendTooltip: "Send Message",
+                        sendTooltip: repromptPresentation == nil ? "Send Message (Return)" : "Send Current Text (Return)",
                         foregroundColor: .accentColor,
                         sendAction: sendMessage,
                         resendAction: {}
@@ -740,22 +913,60 @@ struct AgentComposerView: View, Equatable {
     // MARK: - Agent Pickers
 
     private var automaticRouterTargetChip: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "arrow.triangle.branch")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
-            Text("Automatic · Jev")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+        let serviceName = props.automaticRouterServiceName
+        return Button {
+            openAgentDecisionsSettings(section: .modelRouter)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                Text(serviceName.map { "Model Router · \($0)" } ?? "Model Router")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            }
+            .foregroundColor(.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.accentColor.opacity(0.10))
+            .cornerRadius(6)
         }
-        .foregroundColor(.accentColor)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(Color.accentColor.opacity(0.10))
-        .cornerRadius(6)
-        .accessibilityElement(children: .combine)
+        .buttonStyle(.plain)
         .accessibilityLabel("Model Router")
-        .accessibilityValue("Automatic with Jev")
-        .hoverTooltip("Jev will choose the provider, model, and reasoning effort after you send. Turn off Router to choose them manually.")
+        .accessibilityValue(serviceName.map { "Using \($0)" } ?? "On")
+        .hoverTooltip("Model Router asks \(serviceName ?? "the selected service") to choose a model and reasoning effort for this new task. Click to open Model Router settings.")
         .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func automaticEffortChip(serviceName: String) -> some View {
+        Button {
+            openAgentDecisionsSettings(section: .autoEffort)
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "gauge.open.with.lines.needle.33percent")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .regular))
+                Text("Auto Effort · \(serviceName)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+            }
+            .foregroundColor(.accentColor)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.accentColor.opacity(0.10))
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Auto Effort")
+        .accessibilityValue("Using \(serviceName)")
+        .hoverTooltip("Auto Effort uses \(serviceName) before eligible turns; otherwise, your current effort applies. Click to open Auto Effort settings.")
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func effortPickerLabel(_ manualDisplayName: String) -> some View {
+        Text(manualDisplayName)
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(pickerChipColor)
+            .cornerRadius(4)
     }
 
     private enum LayoutMetrics {
@@ -792,7 +1003,7 @@ struct AgentComposerView: View, Equatable {
         return "\(props.selectedAgent.displayName) · \(truncatedModelName)"
     }
 
-    private var isSelectedCodexFastModel: Bool {
+    private var isSelectedCodexSpeedTier: Bool {
         AgentModelSelectionWarningVisuals.showsWarning(
             agent: props.selectedAgent,
             rawModel: props.selectedModelRaw
@@ -807,8 +1018,8 @@ struct AgentComposerView: View, Equatable {
         } else {
             "Choose agent and model"
         }
-        guard isSelectedCodexFastModel else { return baseTooltip }
-        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.warningTooltip)"
+        guard isSelectedCodexSpeedTier else { return baseTooltip }
+        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.tooltip(agent: props.selectedAgent, rawModel: props.selectedModelRaw))"
     }
 
     private var inputBarSelectedModelDisplayName: String {
@@ -838,6 +1049,17 @@ struct AgentComposerView: View, Equatable {
         actions.openCLIProvidersSettings()
     }
 
+    private func openAgentDecisionsSettings(section: SettingsWindowCoordinator.AgentDecisionsSection) {
+        NotificationCenter.default.post(
+            name: .showModelRouterSettingsTab,
+            object: nil,
+            userInfo: [
+                "windowID": windowID,
+                "agentDecisionsSection": section
+            ]
+        )
+    }
+
     @ViewBuilder
     private var agentProviderModelPicker: some View {
         let isLocked = props.isProviderPickerLockedForCurrentTab
@@ -850,10 +1072,11 @@ struct AgentComposerView: View, Equatable {
             HStack(spacing: 4) {
                 Image(systemName: props.selectedAgent.iconName)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                if isSelectedCodexFastModel {
-                    Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                        .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                if isSelectedCodexSpeedTier {
+                    AgentModelSpeedIcon(
+                        agent: props.selectedAgent, rawModel: props.selectedModelRaw,
+                        font: fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold)
+                    )
                 }
                 Text(providerChipTitle)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -868,7 +1091,7 @@ struct AgentComposerView: View, Equatable {
                     .foregroundColor(.secondary)
             }
             .frame(maxWidth: providerChipMaxWidth, alignment: .leading)
-            .foregroundColor(isSelectedCodexFastModel ? .orange : .primary)
+            .foregroundColor(isSelectedCodexSpeedTier ? AgentModelSelectionWarningVisuals.color(agent: props.selectedAgent, rawModel: props.selectedModelRaw) : .primary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
@@ -914,6 +1137,50 @@ struct AgentComposerView: View, Equatable {
             return [.action("Use \(agent.displayName)", isEnabled: true, imageSystemName: agent.iconName) {
                 actions.selectAgentModel(agent, "")
             }]
+        }
+        if agent == .cursor {
+            return AgentModelStableMenuItems.cursorModelItems(
+                options: options,
+                selectedModelRaw: props.selectedAgent == .cursor ? ((try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) ?? props.selectedModelRaw) : "",
+                selections: props.acpModelParameterControls.filter { $0.providerID == .cursor }.compactMap {
+                    guard let savedValueRaw = $0.savedValueRaw else { return nil }
+                    return ACPModelParameterSelection(
+                        providerID: .cursor,
+                        baseModelRaw: $0.baseModelRaw,
+                        kind: $0.kind,
+                        configID: $0.configID,
+                        valueRaw: savedValueRaw
+                    )
+                },
+                onSelectModel: { model in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    actions.selectAgentModel(.cursor, model.rawValue)
+                },
+                onSelectParameter: { model, parameter in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
+                        actions.selectAgentModel(.cursor, model.rawValue)
+                    }
+                    actions.selectACPModelParameter(parameter, nil)
+                },
+                onClearParameter: { model, identity in
+                    guard !modelControlsDisabled, actions.canMutateCursorModel(props.currentTabID), actions.canSelectAgentInCurrentChat(.cursor) else { return }
+                    if props.selectedAgent != .cursor || (try? CursorAIModelCatalog.ModelSpecifier(raw: props.selectedModelRaw).baseModelRaw) != model.rawValue {
+                        actions.selectAgentModel(.cursor, model.rawValue)
+                    }
+                    actions.clearCursorModelParameter(identity)
+                }
+            )
+        }
+        if agent == .devin {
+            return DevinModelCatalog.current.menuGroups(for: options).flatMap { group -> [StableMenuItem] in
+                guard group.rendersAsSubmenu else {
+                    return group.entries.map { inputBarModelMenuItem(agent: agent, model: $0.option) }
+                }
+                return [.submenu(group.displayName, items: group.entries.map {
+                    inputBarModelMenuItem(agent: agent, model: $0.option, title: $0.effortDisplayName)
+                })]
+            }
         }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
@@ -990,7 +1257,7 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var reasoningEffortPicker: some View {
-        if props.selectedAgent == .codexExec {
+        if props.manualEffortControl == .codex {
             let efforts = actions.reasoningEffortOptionsForCurrentSelection()
             Menu {
                 ForEach(efforts, id: \.rawValue) { effort in
@@ -1007,15 +1274,7 @@ struct AgentComposerView: View, Equatable {
                     }
                 }
             } label: {
-                HStack(spacing: 4) {
-                    Text(props.selectedReasoningEffortDisplayName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                }
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(pickerChipColor)
-                .cornerRadius(4)
+                effortPickerLabel(props.selectedReasoningEffortDisplayName)
             }
             .menuStyle(.borderlessButton)
             .disabled(efforts.isEmpty || modelControlsDisabled)
@@ -1080,7 +1339,7 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var claudeEffortPicker: some View {
-        if props.selectedAgent.usesClaudeTooling,
+        if props.manualEffortControl == .claude,
            let claudeTools = props.providerControls?.claudeTools
         {
             let efforts = AgentModelCatalog.supportedClaudeEfforts(
@@ -1102,15 +1361,7 @@ struct AgentComposerView: View, Equatable {
                     }
                 }
             } label: {
-                HStack(spacing: 4) {
-                    Text(claudeTools.effortLevel.displayName)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                }
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(pickerChipColor)
-                .cornerRadius(4)
+                effortPickerLabel(claudeTools.effortLevel.displayName)
             }
             .menuStyle(.borderlessButton)
             .disabled(modelControlsDisabled || efforts.isEmpty)
@@ -1525,22 +1776,59 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private var imageDropOutline: some View {
-        Group {
-            if isImageDropTargeted {
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
-                    .foregroundColor(.accentColor)
-                    .padding(.horizontal, 2)
-                    .padding(.bottom, Self.footerHeight)
-            }
+    @ViewBuilder
+    private var attachmentDropOutline: some View {
+        if isAttachmentDropTargeted {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(style: StrokeStyle(lineWidth: 2, dash: [8]))
+                .foregroundColor(.accentColor)
+                .padding(.horizontal, 2)
+                .padding(.bottom, Self.footerHeight)
         }
     }
 
     // MARK: - Actions
 
+    private func sendRepromptOriginal(expectedID: UUID) {
+        guard let operation = repromptViewModel?.repromptOperation, operation.id == expectedID,
+              let tabID = currentTabID, operation.sourceTabID == tabID else { return }
+        operation.useOriginal()
+        guard operation.phase == .completed else { return }
+        loadDraftFromSession(for: tabID)
+        submitMessage(rawDraftSnapshot: localInputText, restoreFocus: true)
+    }
+
+    private func undoRepromptDraft(expectedID: UUID?) {
+        guard let expectedID, let viewModel = repromptViewModel, let operation = viewModel.repromptOperation,
+              operation.id == expectedID, viewModel.currentTabID == operation.sourceTabID,
+              operation.validate() else { return }
+        // Flush a last keystroke even if SwiftUI's onChange has not run yet.
+        if let tabID = currentTabID {
+            actions.storeDraft(tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[tabID] ?? 0)
+        }
+        repromptViewModel?.undoReprompt()
+    }
+
+    private func repromptAgain() -> Bool {
+        retireUnownedSubmissionLatch()
+        if repromptViewModel?.repromptOperation?.phase.isBusy == true || isSubmissionPending { return true }
+        guard props.canSendWithCurrentProvider,
+              let target = renderedSubmitTarget, let repromptViewModel else { return false }
+        guard let native = nativeComposerEditor.snapshot(matching: AnyHashable(target.tabID)), !native.hasMarkedText else { return true }
+        setLocalInputText(native.text)
+        actions.storeDraft(target.tabID, localInputText, acknowledgedDraftRestorationSequenceByTab[target.tabID] ?? 0)
+        return repromptViewModel.requestComposerRepromptAgain(target: target, text: localInputText)
+    }
+
     private func sendMessage() {
-        guard !submissionLatch.isLatched(for: currentTabID) else {
+        guard let tabID = currentTabID,
+              let native = nativeComposerEditor.snapshot(matching: AnyHashable(tabID)), !native.hasMarkedText else { return }
+        submitMessage(rawDraftSnapshot: native.text, restoreFocus: true)
+    }
+
+    private func submitMessage(rawDraftSnapshot: String, restoreFocus: Bool) {
+        retireUnownedSubmissionLatch()
+        guard !isSubmissionPending else {
             logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
             return
         }
@@ -1552,7 +1840,6 @@ struct AgentComposerView: View, Equatable {
             }
             return
         }
-        let rawDraftSnapshot = localInputText
         let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || hasPendingAttachments else { return }
         guard let submitTarget = renderedSubmitTarget else {
@@ -1560,6 +1847,9 @@ struct AgentComposerView: View, Equatable {
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
             return
         }
+        setLocalInputText(rawDraftSnapshot)
+        actions.storeDraft(submitTarget.tabID, rawDraftSnapshot, acknowledgedDraftRestorationSequenceByTab[submitTarget.tabID] ?? 0)
+        if actions.prepareReprompt(submitTarget, rawDraftSnapshot) { return }
         guard let attempt = submissionLatch.begin(
             target: submitTarget,
             rawDraftSnapshot: rawDraftSnapshot
@@ -1568,9 +1858,17 @@ struct AgentComposerView: View, Equatable {
             return
         }
 
-        actions.storeDraft(attempt.sourceTabID, rawDraftSnapshot)
+        actions.storeDraft(
+            attempt.sourceTabID,
+            rawDraftSnapshot,
+            acknowledgedDraftRestorationSequenceByTab[attempt.sourceTabID] ?? 0
+        )
         switch actions.claimSubmit(attempt) {
         case let .claimed(claim):
+            // Admission owns this snapshot now; routing must not leave a duplicate in the editor.
+            setLocalInputText("", isExternalUpdate: true)
+            resetTextFieldTrigger.toggle()
+            if restoreFocus { composerFocusRestoreRequest = UUID() }
             Task { @MainActor in
                 let submissionResult = await actions.executeSubmit(claim, trimmed)
                 let effects = submissionLatch.complete(
@@ -1625,19 +1923,19 @@ struct AgentComposerView: View, Equatable {
 
     private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
         #if DEBUG
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "agent.composer.submit.rejected",
                 tabID: currentTabID,
                 fields: [
                     "reason": reason,
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                    "propsTabID": AgentModePerfDiagnostics.shortID(props.currentTabID),
-                    "targetTabID": AgentModePerfDiagnostics.shortID(target?.tabID),
-                    "attemptID": AgentModePerfDiagnostics.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
+                    "propsTabID": perfRecorder.shortID(props.currentTabID),
+                    "targetTabID": perfRecorder.shortID(target?.tabID),
+                    "attemptID": perfRecorder.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
                     "inputRevision": String(submissionLatch.inputRevision),
-                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target?.expectedSubmissionToken),
-                    "expectedSourceAgentSessionID": AgentModePerfDiagnostics.shortID(target?.expectedSourceAgentSessionID),
-                    "expectedPersistentBindingGeneration": AgentModePerfDiagnostics.shortID(target?.expectedPersistentBindingIdentity?.generation),
+                    "expectedSubmissionToken": perfRecorder.shortID(target?.expectedSubmissionToken),
+                    "expectedSourceAgentSessionID": perfRecorder.shortID(target?.expectedSourceAgentSessionID),
+                    "expectedPersistentBindingGeneration": perfRecorder.shortID(target?.expectedPersistentBindingIdentity?.generation),
                     "expectedBindingTransitionGeneration": target.map { String($0.expectedBindingTransitionGeneration) } ?? "nil"
                 ]
             )
@@ -1650,32 +1948,40 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func pickImages() {
-        guard canAttachImages, let tabID = currentTabID else { return }
+    private func canMutateAttachments(tabID: UUID) -> Bool {
+        let liveTabID: UUID? = if let repromptViewModel { repromptViewModel.currentTabID }
+        else { currentTabID }
+        return !pendingSubmissionStore.hasPendingSubmission(tabID: tabID)
+            && repromptStore.allowsAttachmentMutation(tabID: tabID, currentTabID: liveTabID)
+    }
+
+    private func pickFiles() {
+        guard canAttachFiles, let tabID = currentTabID else { return }
         Task { @MainActor in
             let targetWindow = WindowStatesManager.shared.allWindows.first { $0.windowID == windowID }?.nsWindow
-            let urls = await OpenPanelService.shared.pickImageFiles(
-                title: "Choose Images",
-                message: "Attach one or more images for the next turn.",
+            let urls = await OpenPanelService.shared.pickFiles(
+                title: "Choose Files",
+                message: "Attach one or more files for the next turn.",
                 attachedTo: targetWindow
             )
-            actions.attachImages(tabID, urls)
+            guard canMutateAttachments(tabID: tabID) else { return }
+            await actions.attachFiles(tabID, urls)
         }
     }
 
     private func handleFileTagCommitted(_ suggestion: MentionSuggestion) {
-        guard let tabID = currentTabID else { return }
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else { return }
         let attachmentDisplayName = AgentFileMentionText.attachmentDisplayName(for: suggestion)
         actions.commitTaggedFile(tabID, suggestion, attachmentDisplayName)
     }
 
-    private func removeImageAttachment(_ attachmentID: UUID) {
-        guard let tabID = currentTabID else { return }
-        actions.removeImage(tabID, attachmentID)
+    private func removeAttachment(_ attachmentID: UUID) {
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else { return }
+        actions.removePendingAttachment(tabID, attachmentID)
     }
 
     private func removeTaggedFileAttachment(_ attachmentID: UUID) {
-        guard let tabID = currentTabID else { return }
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else { return }
         let attachment = props.attachments.taggedFileAttachments
             .first(where: { $0.id == attachmentID })
         actions.removeTaggedFile(tabID, attachmentID)
@@ -1691,37 +1997,44 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private func handleImageDrop(providers: [NSItemProvider]) -> Bool {
-        guard let tabID = currentTabID else {
+    private func handleAttachmentDrop(providers: [NSItemProvider]) -> Bool {
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
             return false
         }
-        return imageInputAdapter.loadPreparedImages(from: providers) { prepared in
-            guard !prepared.isEmpty else { return }
+        return attachmentIntake.loadPreparedAttachments(from: providers) { prepared, failures in
+            guard !prepared.isEmpty || !failures.isEmpty else { return }
             Task { @MainActor in
-                attachPreparedImages(prepared, tabID: tabID)
+                actions.reportAttachmentFailures(tabID, failures)
+                if !prepared.isEmpty {
+                    attachPreparedAttachments(prepared, tabID: tabID)
+                }
             }
         }
     }
 
-    private func handleImagePaste(pasteboard: NSPasteboard) -> Bool {
-        guard let tabID = currentTabID else {
+    private func handleAttachmentPaste(pasteboard: NSPasteboard) -> Bool {
+        guard let tabID = currentTabID, canMutateAttachments(tabID: tabID) else {
             return false
         }
-        guard imageInputAdapter.shouldConsumePasteAsImageAttachment(from: pasteboard) else {
+        guard attachmentIntake.shouldConsumePasteAsAttachment(from: pasteboard) else {
             return false
         }
-        let prepared = imageInputAdapter.preparedImages(from: pasteboard)
+        let prepared = attachmentIntake.preparedAttachments(from: pasteboard)
         guard !prepared.isEmpty else {
             return false
         }
-        attachPreparedImages(prepared, tabID: tabID)
+        attachPreparedAttachments(prepared, tabID: tabID)
         return true
     }
 
-    private func attachPreparedImages(_ prepared: [AgentImageInputAdapter.PreparedImage], tabID: UUID) {
+    private func attachPreparedAttachments(_ prepared: [AgentAttachmentIntake.Prepared], tabID: UUID) {
         let urls = prepared.map(\.url)
-        actions.attachImages(tabID, urls)
-        imageInputAdapter.cleanupTemporaryFiles(prepared)
+        let intake = attachmentIntake
+        Task { @MainActor in
+            defer { intake.cleanupTemporaryFiles(prepared) }
+            guard canMutateAttachments(tabID: tabID) else { return }
+            await actions.attachFiles(tabID, urls)
+        }
     }
 
     private func normalizedServerToggleKey(_ value: String) -> String {
@@ -1747,8 +2060,13 @@ struct AgentComposerView: View, Equatable {
 
     private func loadDraftFromSession(for tabID: UUID) {
         isSyncingDraftFromSession = true
+        let snapshot = actions.loadDraft(tabID)
+        if let update = repromptStore.draftUpdate, update.tabID == tabID {
+            acknowledgedRepromptPublicationsByTab[tabID] = update.identity
+        }
+        acknowledgedDraftRestorationSequenceByTab[tabID] = snapshot.restorationSequence
         setLocalInputText(
-            actions.retrieveDraft(tabID),
+            snapshot.text,
             forceRevision: true,
             isExternalUpdate: true
         )
@@ -1758,8 +2076,8 @@ struct AgentComposerView: View, Equatable {
     }
 }
 
-struct AgentImageInputAdapter {
-    struct PreparedImage: Equatable {
+struct AgentAttachmentIntake {
+    struct Prepared: Equatable {
         let url: URL
         let isTemporary: Bool
     }
@@ -1768,28 +2086,19 @@ struct AgentImageInputAdapter {
     private let temporaryRoot: URL
     private let preferredImageTypes: [UTType] = [.png, .jpeg, .heic, .heif, .gif, .bmp, .tiff]
 
-    private static let maxPlainTextCandidateCharacters = 50000
-    private static let maxPlainTextLineCount = 500
-    private static let markdownLinkTargetRegex = try! NSRegularExpression(pattern: #"\(([^)\r\n]+)\)"#)
-    private static let quotedPathRegex = try! NSRegularExpression(pattern: #"\"([^\"]+)\"|'([^']+)'|`([^`]+)`"#)
-    private static let fileURLTokenRegex = try! NSRegularExpression(pattern: #"file://[^\s<>()\[\]{}\"'`]+"#)
-    private static let absolutePathTokenRegex = try! NSRegularExpression(pattern: #"(?:^|[\s:=,])((?:~|/)[^\s<>()\[\]{}\"'`]+)"#)
-    private static let pathHintTokens = ["file://", "/", "~", ".png", ".jpg", ".jpeg", ".jfif", ".webp", ".avif", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".svg"]
-    private static let fallbackImageFileExtensions: Set<String> = [
-        "png", "jpg", "jpeg", "jfif", "jpe", "gif", "bmp", "webp", "avif", "heic", "heif", "tif", "tiff", "svg", "ico"
-    ]
-
     init(fileManager: FileManager = .default, temporaryRoot: URL? = nil) {
         self.fileManager = fileManager
         self.temporaryRoot = temporaryRoot
             ?? MCPFilesystemConstants.identity.temporaryRootURL(fileManager: fileManager)
-            .appendingPathComponent("AgentImageInput", isDirectory: true)
+            .appendingPathComponent("AgentAttachmentInput", isDirectory: true)
     }
 
-    func preparedImages(from pasteboard: NSPasteboard) -> [PreparedImage] {
-        let fileURLPrepared = preparedFileURLImages(from: pasteboard, includePlainTextReferences: true)
-        if !fileURLPrepared.isEmpty {
-            return fileURLPrepared
+    /// Files copied from Finder or any file URL on the pasteboard come first; raw image data, such as a
+    /// screenshot, is the fallback. Plain text is never read as a reference to a file.
+    func preparedAttachments(from pasteboard: NSPasteboard) -> [Prepared] {
+        let files = preparedFileURLs(from: pasteboard)
+        if !files.isEmpty {
+            return files
         }
 
         var prepared = preparedImageDataRepresentations(from: pasteboard)
@@ -1800,28 +2109,19 @@ struct AgentImageInputAdapter {
         return deduplicated(prepared)
     }
 
-    func shouldConsumePasteAsImageAttachment(from pasteboard: NSPasteboard) -> Bool {
+    func shouldConsumePasteAsAttachment(from pasteboard: NSPasteboard) -> Bool {
+        if !AttachmentPasteboard.regularFileURLs(in: pasteboard).isEmpty {
+            return true
+        }
         if hasExplicitImagePasteboardType(in: pasteboard) {
             return true
         }
-        if shouldConsumeNSImageReadablePasteboard(pasteboard) {
-            return true
-        }
-        if !preparedFileURLImages(from: pasteboard, includePlainTextReferences: false).isEmpty {
-            return true
-        }
-        guard let plainString = pasteboard.string(forType: .string) else {
-            return false
-        }
-        guard !fileURLs(fromPlainText: plainString).isEmpty else {
-            return false
-        }
-        return shouldConsumePlainTextPaste(plainString)
+        return shouldConsumeNSImageReadablePasteboard(pasteboard)
     }
 
-    func loadPreparedImages(
+    func loadPreparedAttachments(
         from providers: [NSItemProvider],
-        completion: @escaping ([PreparedImage]) -> Void
+        completion: @escaping (_ prepared: [Prepared], _ failures: [AgentAttachmentFailure]) -> Void
     ) -> Bool {
         let candidates = providers.filter {
             $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
@@ -1831,38 +2131,60 @@ struct AgentImageInputAdapter {
             return false
         }
 
-        let lockQueue = DispatchQueue(label: "AgentImageInputAdapter.lock")
+        let lockQueue = DispatchQueue(label: "AgentAttachmentIntake.lock")
         let group = DispatchGroup()
-        var prepared: [PreparedImage] = []
+        var prepared: [Prepared] = []
+        var failures: [AgentAttachmentFailure] = []
+
+        func fail(_ fileName: String, _ reason: String) {
+            lockQueue.sync {
+                failures.append(AgentAttachmentFailure(fileName: fileName, reason: reason))
+            }
+        }
+
+        func appendImageData(from provider: NSItemProvider, typeIdentifier: String) {
+            provider.loadDataRepresentation(forTypeIdentifier: typeIdentifier) { data, _ in
+                defer { group.leave() }
+                guard let data, !data.isEmpty,
+                      let fileURL = try? writeTemporaryImageData(data, typeIdentifier: typeIdentifier)
+                else {
+                    fail(provider.suggestedName ?? "image", "The dropped image could not be read.")
+                    return
+                }
+                lockQueue.sync {
+                    prepared.append(Prepared(url: fileURL, isTemporary: true))
+                }
+            }
+        }
 
         for provider in candidates {
             if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
                 group.enter()
                 provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                    if let fileURL = droppedFileURL(from: item), isImageFileURL(fileURL) {
+                    let fileURL = droppedFileURL(from: item)
+                    if let fileURL, AttachmentPasteboard.isRegularFile(fileURL) {
                         lockQueue.sync {
-                            prepared.append(PreparedImage(url: fileURL.standardizedFileURL, isTemporary: false))
+                            prepared.append(Prepared(url: fileURL.standardizedFileURL, isTemporary: false))
                         }
                         group.leave()
                         return
                     }
 
                     guard let imageTypeIdentifier = bestImageTypeIdentifier(from: provider.registeredTypeIdentifiers) else {
+                        if let fileURL {
+                            fail(
+                                fileURL.lastPathComponent,
+                                AttachmentPasteboard.isDirectory(fileURL)
+                                    ? AgentAttachmentStore.Error.sourceIsNotFile.localizedDescription
+                                    : "The item is not a regular file."
+                            )
+                        } else {
+                            fail(provider.suggestedName ?? "dropped item", "The dropped item could not be read.")
+                        }
                         group.leave()
                         return
                     }
-                    provider.loadDataRepresentation(forTypeIdentifier: imageTypeIdentifier) { data, _ in
-                        defer { group.leave() }
-                        guard let data, !data.isEmpty else { return }
-                        do {
-                            let fileURL = try writeTemporaryImageData(data, typeIdentifier: imageTypeIdentifier)
-                            lockQueue.sync {
-                                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-                            }
-                        } catch {
-                            return
-                        }
-                    }
+                    appendImageData(from: provider, typeIdentifier: imageTypeIdentifier)
                 }
                 continue
             }
@@ -1871,32 +2193,22 @@ struct AgentImageInputAdapter {
                 continue
             }
             group.enter()
-            provider.loadDataRepresentation(forTypeIdentifier: imageTypeIdentifier) { data, _ in
-                defer { group.leave() }
-                guard let data, !data.isEmpty else { return }
-                do {
-                    let fileURL = try writeTemporaryImageData(data, typeIdentifier: imageTypeIdentifier)
-                    lockQueue.sync {
-                        prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-                    }
-                } catch {
-                    return
-                }
-            }
+            appendImageData(from: provider, typeIdentifier: imageTypeIdentifier)
         }
 
         group.notify(queue: .main) {
             lockQueue.sync {
                 let deduplicatedPrepared = deduplicated(prepared)
+                let reportedFailures = failures
                 DispatchQueue.main.async {
-                    completion(deduplicatedPrepared)
+                    completion(deduplicatedPrepared, reportedFailures)
                 }
             }
         }
         return true
     }
 
-    func cleanupTemporaryFiles(_ prepared: [PreparedImage]) {
+    func cleanupTemporaryFiles(_ prepared: [Prepared]) {
         let temporaryPrefix = temporaryRoot.path + "/"
         for entry in prepared where entry.isTemporary {
             let standardized = entry.url.standardizedFileURL
@@ -1964,54 +2276,46 @@ struct AgentImageInputAdapter {
         canonicalImageType(forIdentifier: type.rawValue)
     }
 
-    private func preparedImageDataRepresentations(from pasteboard: NSPasteboard) -> [PreparedImage] {
-        var prepared: [PreparedImage] = []
+    private func preparedImageDataRepresentations(from pasteboard: NSPasteboard) -> [Prepared] {
+        var prepared: [Prepared] = []
 
         for item in pasteboard.pasteboardItems ?? [] {
-            guard let representation = firstImageDataRepresentation(in: item) else { continue }
-            do {
-                let fileURL = try writeTemporaryImageData(
-                    representation.data,
-                    typeIdentifier: representation.typeIdentifier
-                )
-                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-            } catch {
-                continue
-            }
+            guard let representation = firstImageDataRepresentation(in: item),
+                  let fileURL = try? writeTemporaryImageData(
+                      representation.data,
+                      typeIdentifier: representation.typeIdentifier
+                  )
+            else { continue }
+            prepared.append(Prepared(url: fileURL, isTemporary: true))
         }
 
-        if prepared.isEmpty, let representation = firstImageDataRepresentation(in: pasteboard) {
-            do {
-                let fileURL = try writeTemporaryImageData(
-                    representation.data,
-                    typeIdentifier: representation.typeIdentifier
-                )
-                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-            } catch {
-                // Ignore fallback conversion errors.
-            }
+        if prepared.isEmpty,
+           let representation = firstImageDataRepresentation(in: pasteboard),
+           let fileURL = try? writeTemporaryImageData(
+               representation.data,
+               typeIdentifier: representation.typeIdentifier
+           )
+        {
+            prepared.append(Prepared(url: fileURL, isTemporary: true))
         }
 
         return prepared
     }
 
-    private func preparedNSImageObjects(from pasteboard: NSPasteboard) -> [PreparedImage] {
+    private func preparedNSImageObjects(from pasteboard: NSPasteboard) -> [Prepared] {
         guard let images = pasteboard.readObjects(forClasses: [NSImage.self], options: nil) as? [NSImage] else {
             return []
         }
 
-        var prepared: [PreparedImage] = []
+        var prepared: [Prepared] = []
         for image in images {
-            guard let representation = imageDataRepresentation(from: image) else { continue }
-            do {
-                let fileURL = try writeTemporaryImageData(
-                    representation.data,
-                    typeIdentifier: representation.typeIdentifier
-                )
-                prepared.append(PreparedImage(url: fileURL, isTemporary: true))
-            } catch {
-                continue
-            }
+            guard let representation = imageDataRepresentation(from: image),
+                  let fileURL = try? writeTemporaryImageData(
+                      representation.data,
+                      typeIdentifier: representation.typeIdentifier
+                  )
+            else { continue }
+            prepared.append(Prepared(url: fileURL, isTemporary: true))
         }
         return prepared
     }
@@ -2052,83 +2356,18 @@ struct AgentImageInputAdapter {
         return (tiffData, UTType.tiff.identifier)
     }
 
-    private func preparedFileURLImages(
-        from pasteboard: NSPasteboard,
-        includePlainTextReferences: Bool
-    ) -> [PreparedImage] {
-        var urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
-
-        for item in pasteboard.pasteboardItems ?? [] {
-            if let fileURLString = item.string(forType: .fileURL),
-               let fileURL = URL(string: fileURLString),
-               fileURL.isFileURL
-            {
-                urls.append(fileURL)
-            } else if let fileURLData = item.data(forType: .fileURL),
-                      let fileURL = URL(dataRepresentation: fileURLData, relativeTo: nil),
-                      fileURL.isFileURL
-            {
-                urls.append(fileURL)
-            }
-
-            if includePlainTextReferences, let plainString = item.string(forType: .string) {
-                urls.append(contentsOf: fileURLs(fromPlainText: plainString))
-            }
-        }
-
-        if includePlainTextReferences, let plainString = pasteboard.string(forType: .string) {
-            urls.append(contentsOf: fileURLs(fromPlainText: plainString))
-        }
-
-        let prepared = urls
-            .map(\.standardizedFileURL)
-            .filter { $0.isFileURL && fileManager.fileExists(atPath: $0.path) && isImageFileURL($0) }
-            .map { PreparedImage(url: $0, isTemporary: false) }
-        return deduplicated(prepared)
-    }
-
-    private func fileURLs(fromPlainText text: String) -> [URL] {
-        let cappedText = text.count > Self.maxPlainTextCandidateCharacters
-            ? String(text.prefix(Self.maxPlainTextCandidateCharacters))
-            : text
-        var results: [URL] = []
-        var seenPaths: Set<String> = []
-        var processedLineCount = 0
-        cappedText.enumerateLines { line, stop in
-            if processedLineCount >= Self.maxPlainTextLineCount {
-                stop = true
-                return
-            }
-            processedLineCount += 1
-            guard lineLikelyContainsPathReference(line) else { return }
-            for candidate in fileReferenceCandidates(in: line) {
-                guard let fileURL = fileURLFromPlainText(candidate) else { continue }
-                let standardizedURL = fileURL.standardizedFileURL
-                let key = standardizedURL.path
-                guard !key.isEmpty else { continue }
-                guard !seenPaths.contains(key) else { continue }
-                seenPaths.insert(key)
-                results.append(standardizedURL)
-            }
-        }
-        return results
+    private func preparedFileURLs(from pasteboard: NSPasteboard) -> [Prepared] {
+        deduplicated(
+            AttachmentPasteboard.regularFileURLs(in: pasteboard).map { Prepared(url: $0, isTemporary: false) }
+        )
     }
 
     private func shouldConsumeNSImageReadablePasteboard(_ pasteboard: NSPasteboard) -> Bool {
         guard pasteboard.canReadObject(forClasses: [NSImage.self], options: nil) else {
             return false
         }
-        guard let plainString = pasteboard.string(forType: .string) else {
-            return true
-        }
-        let trimmed = plainString.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return true
-        }
-        guard !fileURLs(fromPlainText: plainString).isEmpty else {
-            return false
-        }
-        return shouldConsumePlainTextPaste(plainString)
+        let plainString = pasteboard.string(forType: .string) ?? ""
+        return plainString.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func hasExplicitImagePasteboardType(in pasteboard: NSPasteboard) -> Bool {
@@ -2143,302 +2382,6 @@ struct AgentImageInputAdapter {
             }
         }
         return false
-    }
-
-    private func shouldConsumePlainTextPaste(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-
-        let cappedText = trimmed.count > Self.maxPlainTextCandidateCharacters
-            ? String(trimmed.prefix(Self.maxPlainTextCandidateCharacters))
-            : trimmed
-        let lines = cappedText
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !lines.isEmpty else { return false }
-        guard lines.count <= Self.maxPlainTextLineCount else { return false }
-        return lines.allSatisfy { lineLooksLikeStandaloneImageReference($0) }
-    }
-
-    private func lineLooksLikeStandaloneImageReference(_ line: String) -> Bool {
-        if fileURLFromPlainText(line) != nil {
-            return true
-        }
-        if let markdownTarget = firstMarkdownImageTarget(in: line),
-           fileURLFromPlainText(markdownTarget) != nil
-        {
-            return true
-        }
-        return false
-    }
-
-    private func firstMarkdownImageTarget(in line: String) -> String? {
-        markdownImageTargets(in: line, requireStandaloneLine: true).first
-    }
-
-    private func markdownImageTargets(in line: String, requireStandaloneLine: Bool = false) -> [String] {
-        let characters = Array(line)
-        guard !characters.isEmpty else { return [] }
-
-        var targets: [String] = []
-        var index = 0
-        while index < characters.count {
-            guard characters[index] == "!", index + 1 < characters.count, characters[index + 1] == "[" else {
-                index += 1
-                continue
-            }
-
-            let imageStart = index
-            guard let altEnd = findClosingBracket(in: characters, startingAt: index + 1) else {
-                index += 2
-                continue
-            }
-            guard altEnd + 1 < characters.count, characters[altEnd + 1] == "(" else {
-                index = altEnd + 1
-                continue
-            }
-
-            guard let parsed = parseMarkdownLinkTarget(in: characters, openingParenIndex: altEnd + 1) else {
-                index = altEnd + 2
-                continue
-            }
-
-            if requireStandaloneLine {
-                let prefix = String(characters[..<imageStart]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let suffix = String(characters[(parsed.closingParenIndex + 1)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !prefix.isEmpty || !suffix.isEmpty {
-                    index = parsed.closingParenIndex + 1
-                    continue
-                }
-            }
-
-            targets.append(parsed.target)
-            index = parsed.closingParenIndex + 1
-        }
-
-        return targets
-    }
-
-    private func findClosingBracket(in characters: [Character], startingAt openingBracketIndex: Int) -> Int? {
-        guard openingBracketIndex < characters.count, characters[openingBracketIndex] == "[" else {
-            return nil
-        }
-        var index = openingBracketIndex + 1
-        var isEscaping = false
-        while index < characters.count {
-            let character = characters[index]
-            if isEscaping {
-                isEscaping = false
-                index += 1
-                continue
-            }
-            if character == "\\" {
-                isEscaping = true
-                index += 1
-                continue
-            }
-            if character == "]" {
-                return index
-            }
-            index += 1
-        }
-        return nil
-    }
-
-    private func parseMarkdownLinkTarget(
-        in characters: [Character],
-        openingParenIndex: Int
-    ) -> (target: String, closingParenIndex: Int)? {
-        guard openingParenIndex < characters.count, characters[openingParenIndex] == "(" else {
-            return nil
-        }
-        var depth = 1
-        var index = openingParenIndex + 1
-        var target = ""
-        var isEscaping = false
-        while index < characters.count {
-            let character = characters[index]
-            if isEscaping {
-                target.append(character)
-                isEscaping = false
-                index += 1
-                continue
-            }
-            if character == "\\" {
-                isEscaping = true
-                index += 1
-                continue
-            }
-            if character == "(" {
-                depth += 1
-                target.append(character)
-                index += 1
-                continue
-            }
-            if character == ")" {
-                depth -= 1
-                if depth == 0 {
-                    return (
-                        target.trimmingCharacters(in: .whitespacesAndNewlines),
-                        index
-                    )
-                }
-                target.append(character)
-                index += 1
-                continue
-            }
-            target.append(character)
-            index += 1
-        }
-        return nil
-    }
-
-    private func lineLikelyContainsPathReference(_ line: String) -> Bool {
-        let lower = line.lowercased()
-        for token in Self.pathHintTokens where lower.contains(token) {
-            return true
-        }
-        return false
-    }
-
-    private func fileReferenceCandidates(in line: String) -> [String] {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-
-        var candidates = [trimmed]
-        candidates.append(contentsOf: markdownImageTargets(in: line))
-        appendMatches(regex: Self.markdownLinkTargetRegex, in: line, captureGroup: 1, into: &candidates)
-        appendMatches(regex: Self.quotedPathRegex, in: line, captureGroup: 1, into: &candidates)
-        appendMatches(regex: Self.quotedPathRegex, in: line, captureGroup: 2, into: &candidates)
-        appendMatches(regex: Self.quotedPathRegex, in: line, captureGroup: 3, into: &candidates)
-        appendMatches(regex: Self.fileURLTokenRegex, in: line, into: &candidates)
-        appendMatches(regex: Self.absolutePathTokenRegex, in: line, captureGroup: 1, into: &candidates)
-        return candidates
-    }
-
-    private func appendMatches(
-        regex: NSRegularExpression,
-        in text: String,
-        captureGroup: Int? = nil,
-        into candidates: inout [String]
-    ) {
-        let nsText = text as NSString
-        let searchRange = NSRange(location: 0, length: nsText.length)
-        regex.enumerateMatches(in: text, options: [], range: searchRange) { match, _, _ in
-            guard let match else { return }
-            let range: NSRange
-            if let captureGroup {
-                guard match.numberOfRanges > captureGroup else { return }
-                range = match.range(at: captureGroup)
-            } else {
-                range = match.range
-            }
-            guard range.location != NSNotFound, range.length > 0 else { return }
-            candidates.append(nsText.substring(with: range))
-        }
-    }
-
-    private func fileURLFromPlainText(_ rawText: String) -> URL? {
-        let normalized = normalizedPlainTextCandidate(rawText)
-        guard !normalized.isEmpty else { return nil }
-        let unescaped = unescapePathEscapes(in: normalized)
-
-        if let fileURL = URL(string: unescaped), fileURL.isFileURL {
-            return fileURL
-        }
-
-        if unescaped.hasPrefix("file://") {
-            var pathPart = String(unescaped.dropFirst("file://".count))
-            if pathPart.hasPrefix("localhost/") {
-                pathPart = String(pathPart.dropFirst("localhost/".count))
-            }
-            if !pathPart.hasPrefix("/") {
-                pathPart = "/" + pathPart
-            }
-            let decodedPath = pathPart.removingPercentEncoding ?? pathPart
-            return URL(fileURLWithPath: decodedPath)
-        }
-
-        if unescaped.hasPrefix("file:/") {
-            let normalized = "file://" + String(unescaped.dropFirst("file:/".count))
-            if let fileURL = URL(string: normalized), fileURL.isFileURL {
-                return fileURL
-            }
-        }
-
-        guard unescaped.hasPrefix("/") || unescaped.hasPrefix("~") else { return nil }
-        let expandedPath = (unescaped as NSString).expandingTildeInPath
-        let decodedPath = expandedPath.removingPercentEncoding ?? expandedPath
-        return URL(fileURLWithPath: decodedPath)
-    }
-
-    private func normalizedPlainTextCandidate(_ rawText: String) -> String {
-        var value = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return "" }
-
-        while let first = value.first, "<[({".contains(first) {
-            value.removeFirst()
-        }
-        while let last = value.last, ">)]},.;:!?".contains(last) {
-            value.removeLast()
-        }
-
-        if value.count > 1,
-           (value.hasPrefix("\"") && value.hasSuffix("\""))
-           || (value.hasPrefix("'") && value.hasSuffix("'"))
-           || (value.hasPrefix("`") && value.hasSuffix("`"))
-        {
-            value.removeFirst()
-            value.removeLast()
-        }
-
-        return value.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func unescapePathEscapes(in value: String) -> String {
-        guard value.contains("\\") else { return value }
-        let escapable: Set<Character> = [" ", "(", ")", "[", "]", "{", "}", "!", "?", ",", ";", "\"", "'", "`"]
-        var output = ""
-        var index = value.startIndex
-        while index < value.endIndex {
-            let character = value[index]
-            if character == "\\" {
-                let nextIndex = value.index(after: index)
-                if nextIndex < value.endIndex {
-                    let next = value[nextIndex]
-                    if escapable.contains(next) {
-                        output.append(next)
-                    } else {
-                        output.append("\\")
-                        output.append(next)
-                    }
-                    index = value.index(after: nextIndex)
-                    continue
-                }
-            }
-            output.append(character)
-            index = value.index(after: index)
-        }
-        return output
-    }
-
-    private func isImageFileURL(_ url: URL) -> Bool {
-        if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType {
-            if type.conforms(to: .image) {
-                return true
-            }
-        }
-
-        let rawExtension = url.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawExtension.isEmpty else { return false }
-        let normalizedExtension = rawExtension.lowercased()
-        if let type = UTType(filenameExtension: normalizedExtension) {
-            if type.conforms(to: .image) {
-                return true
-            }
-        }
-        return Self.fallbackImageFileExtensions.contains(normalizedExtension)
     }
 
     private func droppedFileURL(from item: NSSecureCoding?) -> URL? {
@@ -2457,9 +2400,9 @@ struct AgentImageInputAdapter {
         return nil
     }
 
-    private func deduplicated(_ prepared: [PreparedImage]) -> [PreparedImage] {
+    private func deduplicated(_ prepared: [Prepared]) -> [Prepared] {
         var seenPaths: Set<String> = []
-        var result: [PreparedImage] = []
+        var result: [Prepared] = []
         for entry in prepared {
             let path = entry.url.standardizedFileURL.path
             guard !seenPaths.contains(path) else { continue }

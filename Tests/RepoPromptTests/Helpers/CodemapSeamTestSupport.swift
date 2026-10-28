@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptPersistence
 
 final class CodemapRuntimeTracker: @unchecked Sendable {
     private let lock = NSLock()
@@ -27,25 +28,69 @@ final class CodemapLockedValues<Value: Sendable>: @unchecked Sendable {
     func append(_ value: Value) {
         lock.withLock { storage.append(value) }
     }
+
+    func takeFirst() -> Value? {
+        lock.withLock { storage.isEmpty ? nil : storage.removeFirst() }
+    }
+}
+
+/// Raised by the fixture's injected spawner when a Code Map collaborator attempts to launch a
+/// Git child while the scenario forbids it. Attempts are recorded before throwing, so the failure
+/// reaches both the assertion and the production error path.
+struct CodemapForbiddenGitProcessError: Error {
+    let arguments: [String]
 }
 
 final class CodemapStoreFixture: @unchecked Sendable {
     let registry: WorkspaceCodemapBindingIntegrationRegistry
+    /// Sources handed to the real builder, recorded when the build is *attempted*. Use this for
+    /// "must not rebuild" assertions, which have to notice an unnecessary build even before it
+    /// finishes.
     let builtSourceTexts: CodemapLockedValues<String>
+    /// Sources whose real build actually *returned*. Use this when a scenario needs a completion,
+    /// for example to prove that a stale completion existed to be rejected.
+    let completedSourceTexts: CodemapLockedValues<String>
+    /// Every Git child the Code Map capability, identity, materialization and preflight
+    /// collaborators tried to launch. Unrelated app-wide VCS work uses its own services and is
+    /// deliberately not observed here.
+    let codeMapGitProcessAttempts: CodemapLockedValues<String>
 
     private let sandbox: URL
     private let runtimeTracker: CodemapRuntimeTracker
     private let runtimeProvider: CodeMapArtifactRuntimeProvider
+    private let codeMapGitService: GitService
 
     init(
         name: String,
-        capabilityHooks: WorkspaceCodemapGitCapabilityServiceHooks = .none,
+        capabilityHooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,
         enginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
-        graphPullPause: WorkspaceCodemapGraphPullPause = .production
+        engineHooks: WorkspaceCodemapBindingEngineHooks = .none,
+        manifestStoreHooks: CodeMapRootManifestStoreHooks = .none,
+        globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
+        graphPullPause: WorkspaceCodemapGraphPullPause = .production,
+        overlay: WorkspaceCodemapLiveOverlay = WorkspaceCodemapLiveOverlay(),
+        forbidCodeMapGitProcesses: Bool = false,
+        beforeArtifactBuild: @escaping @Sendable (String) async -> Void = { _ in }
     ) throws {
         let registry = WorkspaceCodemapBindingIntegrationRegistry()
         let builtSourceTexts = CodemapLockedValues<String>()
+        let completedSourceTexts = CodemapLockedValues<String>()
+        let codeMapGitProcessAttempts = CodemapLockedValues<String>()
         let runtimeTracker = CodemapRuntimeTracker()
+        let codeMapGitService = GitService(
+            processSpawner: { executablePath, arguments, environment, workingDirectoryPath in
+                codeMapGitProcessAttempts.append(arguments.joined(separator: " "))
+                if forbidCodeMapGitProcesses {
+                    throw CodemapForbiddenGitProcessError(arguments: arguments)
+                }
+                return try GitService.defaultProcessSpawner(
+                    executablePath,
+                    arguments,
+                    environment,
+                    workingDirectoryPath
+                )
+            }
+        )
         let sandbox = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodemapStoreFixture-\(name)-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: sandbox, withIntermediateDirectories: true)
@@ -70,49 +115,90 @@ final class CodemapStoreFixture: @unchecked Sendable {
         let runtimeProvider = CodeMapArtifactRuntimeProvider {
             try runtimeTracker.record(CodeMapArtifactRuntime(
                 rootURL: resolvedArtifactRoot,
+                manifestStoreHooks: manifestStoreHooks,
+                globalCodeMapsDisabled: globalCodeMapsDisabled,
                 builder: CodeMapArtifactBuilderClient(execute: { input, ownerID, priority in
+                    var decodedText: String?
                     if case let .decoded(source) = input.source.decodeResult {
+                        await beforeArtifactBuild(source.text)
                         builtSourceTexts.append(source.text)
+                        decodedText = source.text
                     }
-                    return try await defaultBuilder.execute(input, ownerID, priority)
+                    let artifact = try await defaultBuilder.execute(input, ownerID, priority)
+                    if let decodedText {
+                        completedSourceTexts.append(decodedText)
+                    }
+                    return artifact
                 }),
                 bindingIntegrationRegistry: registry,
                 bindingEngineFactory: { runtime in
                     WorkspaceCodemapBindingEngine(
                         runtime: runtime,
-                        capabilityService: WorkspaceCodemapGitCapabilityService(
+                        capabilityService: WorkspaceCodemapRootCapabilityService(
+                            gitService: codeMapGitService,
                             namespaceSalt: Data(
                                 repeating: 0x6C,
                                 count: GitBlobRepositoryNamespace.saltByteCount
                             ),
                             hooks: capabilityHooks
                         ),
+                        identityService: GitBlobIdentityService(gitService: codeMapGitService),
+                        materializationService: GitBlobSourceMaterializationService(
+                            gitService: codeMapGitService
+                        ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
                         catalogClient: registry.makeBindingCatalogClient(),
+                        overlay: overlay,
                         policy: enginePolicy,
-                        graphPullPause: graphPullPause
+                        hooks: engineHooks,
+                        graphPullPause: graphPullPause,
+                        globalCodeMapsDisabled: globalCodeMapsDisabled
                     )
                 }
             ))
         }
         self.registry = registry
         self.builtSourceTexts = builtSourceTexts
+        self.completedSourceTexts = completedSourceTexts
+        self.codeMapGitProcessAttempts = codeMapGitProcessAttempts
         self.sandbox = sandbox
         self.runtimeTracker = runtimeTracker
         self.runtimeProvider = runtimeProvider
+        self.codeMapGitService = codeMapGitService
     }
 
     deinit {
         try? FileManager.default.removeItem(at: sandbox)
     }
 
-    func makeStore() -> WorkspaceFileContextStore {
+    /// Store that forces Code Map eligibility. Retained for the existing Git scenarios, whose
+    /// contracts are about serving and not about admission.
+    func makeStore(codeMapsGloballyDisabled: Bool = false) -> WorkspaceFileContextStore {
         let runtimeProvider = runtimeProvider
         return WorkspaceFileContextStore(
             codemapRuntimeProvider: { try runtimeProvider.runtime() },
             codemapLocalGitClassificationProbe: .init { _ in .requiresGitPreflight },
-            codemapGitEligibilityProbe: .init { _ in .eligible }
+            codemapGitEligibilityProbe: .init { _ in .eligible },
+            codeMapsGloballyDisabled: codeMapsGloballyDisabled
         )
+    }
+
+    /// Store that admits roots through the production local proof and Git preflight, sharing the
+    /// fixture's instrumented Git service with the engine's Code Map collaborators.
+    func makeProductionStore(nonGitCodeMapsEnabled: Bool = true) -> WorkspaceFileContextStore {
+        let runtimeProvider = runtimeProvider
+        return WorkspaceFileContextStore(
+            codemapRuntimeProvider: { try runtimeProvider.runtime() },
+            codemapLocalGitClassificationProbe: .production,
+            codemapGitEligibilityProbe: .production(gitService: codeMapGitService),
+            nonGitCodeMapsEnabled: nonGitCodeMapsEnabled
+        )
+    }
+
+    /// Manifest writer bookkeeping for the fixture's isolated store. A fresh store starts with
+    /// capacity, so an unchanged sequence plus no active sessions proves no writer registration.
+    func manifestWriterSessionState() async throws -> (nextSequence: UInt64?, activeCount: Int) {
+        try await runtimeProvider.runtime().manifestStore.debugWriterSessionState()
     }
 
     func runtime() throws -> CodeMapArtifactRuntime {

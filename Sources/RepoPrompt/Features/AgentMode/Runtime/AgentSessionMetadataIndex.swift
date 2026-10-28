@@ -1,7 +1,34 @@
 import Foundation
+import RepoPromptSettingsCore
+
+// MARK: - Agent Session Metadata
+
+/// Lightweight metadata for agent session listing
+struct AgentSessionMeta {
+    let id: UUID
+    let composeTabID: UUID?
+    let name: String
+    let lastModified: Date
+    let itemCount: Int
+    let agentKind: String?
+    let agentModel: String?
+    let lastRunState: String?
+    let acpModelParameterSelections: [ACPModelParameterSelection]
+    let parentSessionID: UUID?
+    let createdByOverseerSessionID: UUID?
+    let isMCPOriginated: Bool
+    let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
+    let activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
+}
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
     /// 8 adds canonical transcript-turn counts for history analytics.
+    ///
+    /// Organizational placement (`organizationalParentID`, `delegationScopeID`) is additive and
+    /// `decodeIfPresent` *without* a bump: a version bump makes every not-yet-reopened workspace's
+    /// index unreadable to the cross-workspace `history` scan until rebuilt, which would change
+    /// external `history` output. A record missing the fields falls back to spawn provenance, and
+    /// placement only ever exists after this build writes it.
     static let currentSchemaVersion = 8
 
     var schemaVersion: Int
@@ -68,6 +95,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var periodicIdleWakeEnabled: Bool
     var periodicIdleWakeIntervalSeconds: Int
     var parentSessionID: UUID?
+    var createdByOverseerSessionID: UUID?
+    /// Mutable organizational placement; `nil` follows spawn provenance. Deliberately **not** listed
+    /// in `lacksTranscriptDerivedFields`: it is session configuration, not transcript-derived.
+    var organizationalParentID: UUID?
+    var delegationScopeID: UUID?
     var isMCPOriginated: Bool
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
@@ -144,6 +176,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         periodicIdleWakeEnabled: Bool = false,
         periodicIdleWakeIntervalSeconds: Int = AgentSessionLinkPeriodicWakeInterval.defaultSeconds,
         parentSessionID: UUID?,
+        createdByOverseerSessionID: UUID? = nil,
+        organizationalParentID: UUID? = nil,
+        delegationScopeID: UUID? = nil,
         isMCPOriginated: Bool,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = [],
@@ -182,6 +217,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.periodicIdleWakeEnabled = periodicIdleWakeEnabled
         self.periodicIdleWakeIntervalSeconds = AgentSessionLinkPeriodicWakeInterval.normalized(periodicIdleWakeIntervalSeconds)
         self.parentSessionID = parentSessionID
+        self.createdByOverseerSessionID = createdByOverseerSessionID
+        self.organizationalParentID = organizationalParentID
+        self.delegationScopeID = delegationScopeID
         self.isMCPOriginated = isMCPOriginated
         self.worktreeBindingSummaries = worktreeBindingSummaries
         self.activeWorktreeMergeSummaries = activeWorktreeMergeSummaries
@@ -222,6 +260,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case periodicIdleWakeEnabled
         case periodicIdleWakeIntervalSeconds
         case parentSessionID
+        case createdByOverseerSessionID
+        case organizationalParentID
+        case delegationScopeID
         case isMCPOriginated
         case worktreeBindingSummaries
         case activeWorktreeMergeSummaries
@@ -280,6 +321,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
                 ?? AgentSessionLinkPeriodicWakeInterval.defaultSeconds
         )
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+        createdByOverseerSessionID = try container.decodeIfPresent(UUID.self, forKey: .createdByOverseerSessionID)
+        organizationalParentID = try container.decodeIfPresent(UUID.self, forKey: .organizationalParentID)
+        delegationScopeID = try container.decodeIfPresent(UUID.self, forKey: .delegationScopeID)
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         worktreeBindingSummaries = try container.decodeIfPresent([AgentSessionWorktreeBindingSummary].self, forKey: .worktreeBindingSummaries) ?? []
         activeWorktreeMergeSummaries = try container.decodeIfPresent([AgentSessionWorktreeMergeSummary].self, forKey: .activeWorktreeMergeSummaries) ?? []
@@ -318,6 +362,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             periodicIdleWakeEnabled: periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: periodicIdleWakeIntervalSeconds,
             parentSessionID: parentSessionID,
+            createdByOverseerSessionID: createdByOverseerSessionID,
+            organizationalParentID: organizationalParentID,
+            delegationScopeID: delegationScopeID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -337,6 +384,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             lastRunState: lastRunStateRaw,
             acpModelParameterSelections: acpModelParameterSelections,
             parentSessionID: parentSessionID,
+            createdByOverseerSessionID: createdByOverseerSessionID,
             isMCPOriginated: isMCPOriginated,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
@@ -367,6 +415,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && periodicIdleWakeEnabled == other.periodicIdleWakeEnabled
             && periodicIdleWakeIntervalSeconds == other.periodicIdleWakeIntervalSeconds
             && parentSessionID == other.parentSessionID
+            && createdByOverseerSessionID == other.createdByOverseerSessionID
+            && organizationalParentID == other.organizationalParentID
+            && delegationScopeID == other.delegationScopeID
             && isMCPOriginated == other.isMCPOriginated
             && worktreeBindingSummaries == other.worktreeBindingSummaries
             && activeWorktreeMergeSummaries == other.activeWorktreeMergeSummaries
@@ -419,6 +470,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             periodicIdleWakeEnabled: session.periodicIdleWakeEnabled,
             periodicIdleWakeIntervalSeconds: session.periodicIdleWakeIntervalSeconds,
             parentSessionID: session.parentSessionID,
+            createdByOverseerSessionID: session.createdByOverseerSessionID,
+            organizationalParentID: session.organizationalParentID,
+            delegationScopeID: session.delegationScopeID,
             isMCPOriginated: session.isMCPOriginated,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries,

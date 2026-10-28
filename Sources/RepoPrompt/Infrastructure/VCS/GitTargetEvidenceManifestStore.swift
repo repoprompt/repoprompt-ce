@@ -1,6 +1,8 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptFileSystem
+import RepoPromptVCS
 
 struct GitTargetEvidenceResourcePolicy: Equatable {
     static let `default` = GitTargetEvidenceResourcePolicy()

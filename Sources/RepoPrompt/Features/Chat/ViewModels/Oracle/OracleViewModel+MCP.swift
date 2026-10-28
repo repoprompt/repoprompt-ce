@@ -1,6 +1,7 @@
 import Foundation
 import MCP // <- required for `Value`
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
@@ -120,6 +121,8 @@ extension OracleViewModel {
         let agentModeRunID: UUID?
         let activationPolicy: OracleSendActivationPolicy
         let packaging: OracleSendPackagingContext
+        let attachments: [OracleAttachment]
+        var toolSettlement: OracleToolSettlementCallbacks?
 
         init(
             tabID: UUID,
@@ -128,7 +131,8 @@ extension OracleViewModel {
             agentModeSessionID: UUID? = nil,
             agentModeRunID: UUID? = nil,
             activationPolicy: OracleSendActivationPolicy = .foregroundWhenActive,
-            packaging: OracleSendPackagingContext
+            packaging: OracleSendPackagingContext,
+            attachments: [OracleAttachment] = []
         ) {
             self.tabID = tabID
             self.workspaceID = workspaceID
@@ -137,6 +141,7 @@ extension OracleViewModel {
             self.agentModeRunID = agentModeRunID
             self.activationPolicy = activationPolicy
             self.packaging = packaging
+            self.attachments = attachments
         }
     }
 
@@ -282,8 +287,10 @@ extension OracleViewModel {
         id rawID: String,
         tabID: UUID?,
         agentModeSessionID: UUID?,
-        agentModeRunID: UUID?
+        agentModeRunID: UUID?,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async throws -> ChatSession {
+        try contextBuilderScope?.checkpoint()
         let session: ChatSession
         if let loaded = resolveSession(id: rawID) {
             session = loaded
@@ -296,6 +303,7 @@ extension OracleViewModel {
                 throw ChatToolError.invalidParams("Chat with ID '\(rawID)' not found")
             }
 
+            try contextBuilderScope?.checkpoint()
             // Inactive headless generation deliberately avoids publishing into the active
             // workspace's chat catalog. Load only an explicitly requested continuation;
             // activation remains disabled for an inactive tab, so currentSession is untouched.
@@ -313,7 +321,9 @@ extension OracleViewModel {
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID
         ) else {
-            throw ChatToolError.invalidParams("Chat with ID '\(rawID)' belongs to a different Agent Mode owner")
+            throw ChatToolError.invalidParams(
+                Self.oracleOwnerRefusalMessage(chatID: rawID, session: session, agentModeSessionID: agentModeSessionID)
+            )
         }
         return session
     }
@@ -321,8 +331,10 @@ extension OracleViewModel {
     @MainActor
     private func resolveBackgroundTabID(
         for session: ChatSession,
-        fallbackTabID: UUID?
+        fallbackTabID: UUID?,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async -> UUID? {
+        guard contextBuilderScope?.isLive != false else { return nil }
         if let tabID = session.composeTabID,
            workspaceManager.composeTab(with: tabID) != nil
         {
@@ -336,7 +348,7 @@ extension OracleViewModel {
             return fallbackTabID
         }
 
-        return await ensureTabForSession(session)
+        return await ensureTabForSession(session, contextBuilderScope: contextBuilderScope)
     }
 
     private enum ChatInspectionScope: String {
@@ -507,6 +519,14 @@ extension OracleViewModel {
         return true
     }
 
+    static func validateRawAttachmentDispatchInvariant(_ args: [String: Value]) throws {
+        guard OracleAttachmentContract.redactedArgumentKeys.allSatisfy({ args[$0] == nil }) else {
+            throw ChatToolError.internalError(
+                "Raw ask_oracle attachment arguments must be consumed before Oracle dispatch."
+            )
+        }
+    }
+
     static func sessionMatchesOracleOwnerForExplicitContinuation(
         _ session: ChatSession,
         agentModeSessionID: UUID?,
@@ -518,6 +538,34 @@ extension OracleViewModel {
             agentModeRunID: agentModeRunID,
             allowUnownedLegacy: false
         )
+    }
+
+    /// Text for a chat refused by ``sessionMatchesOracleOwnerForExplicitContinuation``. It changes
+    /// only the message: a chat stamped with the caller's own Agent session can differ only in its
+    /// run, so that case names the run limit and the next step. Every other mismatch keeps the
+    /// generic text and reveals nothing about another owner.
+    static func oracleOwnerRefusalMessage(
+        chatID: String,
+        session: ChatSession,
+        agentModeSessionID: UUID?
+    ) -> String {
+        guard let agentModeSessionID, session.agentModeSessionID == agentModeSessionID else {
+            return "Chat with ID '\(chatID)' belongs to a different Agent Mode owner"
+        }
+        return "Chat with ID '\(chatID)' belongs to this Agent session but not to its current run. "
+            + "Oracle chats can be continued or read only from the run that created them, and the run can change, "
+            + "for example after Stop, Clear chat, or an app relaunch. "
+            + "Start a new Oracle chat (new_chat: true) and restate the context you need."
+    }
+
+    /// `oracle_chat_log` text when the tab has no chat the caller may read without a `chat_id`.
+    static func oracleChatLogNoEligibleChatMessage(agentModeSessionID: UUID?, agentModeRunID: UUID?) -> String {
+        guard agentModeSessionID != nil || agentModeRunID != nil else {
+            return "No chats found in the current tab"
+        }
+        return "No Oracle chats from this Agent session's current run were found in the current tab. "
+            + "oracle_chat_log cannot read chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) "
+            + "or from another Agent session; start a new Oracle chat instead."
     }
 
     private static func oracleOwnerRank(
@@ -605,18 +653,23 @@ extension OracleViewModel {
     private func activateResolvedChatSession(
         _ session: ChatSession,
         resolvedTabID: UUID?,
-        activateInUI: Bool
+        activateInUI: Bool,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async {
+        guard contextBuilderScope?.isLive != false else { return }
         if activateInUI {
             await switchToSession(session.id)
             return
         }
 
-        _ = await ensureSessionLoadedForBackground(session)
+        _ = await ensureSessionLoadedForBackground(session, contextBuilderScope: contextBuilderScope)
+        guard contextBuilderScope?.isLive != false else { return }
         let targetTabID = await resolveBackgroundTabID(
             for: session,
-            fallbackTabID: resolvedTabID
+            fallbackTabID: resolvedTabID,
+            contextBuilderScope: contextBuilderScope
         )
+        guard contextBuilderScope?.isLive != false else { return }
         if let targetTabID {
             workspaceManager.setActiveChatSessionID(session.id, forTabID: targetTabID)
         }
@@ -704,8 +757,13 @@ extension OracleViewModel {
         activateInUI: Bool = true,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
-        implicitSessionID: UUID? = nil
+        implicitSessionID: UUID? = nil,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil
     ) async throws -> UUID {
+        try contextBuilderScope?.checkpoint()
+        if let activeWorkspace = workspaceManager.activeWorkspace {
+            prepareChatSessionCatalog(for: activeWorkspace)
+        }
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         if forceNew {
@@ -725,16 +783,20 @@ extension OracleViewModel {
                 id: idString,
                 tabID: resolvedTabID,
                 agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID
+                agentModeRunID: agentModeRunID,
+                contextBuilderScope: contextBuilderScope
             )
 
+            try contextBuilderScope?.checkpoint()
             await applyOracleOwnerIfNeeded(
                 sessionID: existing.id,
                 tabID: resolvedTabID,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             )
-            await activateResolvedChatSession(existing, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
+            try contextBuilderScope?.checkpoint()
+            await activateResolvedChatSession(existing, resolvedTabID: resolvedTabID, activateInUI: activateInUI, contextBuilderScope: contextBuilderScope)
+            try contextBuilderScope?.checkpoint()
 
             if let newName = desiredName,
                !newName.isEmpty,
@@ -797,11 +859,14 @@ extension OracleViewModel {
         resolvedExecution: ResolvedOracleExecution? = nil,
         resolvedLaneIndex: Int = 0,
         implicitSessionID: UUID? = nil,
+        contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws
         -> [String: Value]
     {
+        try contextBuilderScope?.checkpoint()
         // ────────── 1. Validate & extract parameters ──────────
+        try Self.validateRawAttachmentDispatchInvariant(args)
         let removedArgs = ["selected_paths", "git_scope", "git_base"].filter { args[$0] != nil }
         if !removedArgs.isEmpty {
             throw ChatToolError.invalidParams(
@@ -846,6 +911,10 @@ extension OracleViewModel {
             throw ChatToolError.internalError("Resolved Oracle lane index is invalid.")
         }
         let selectedModel = resolvedExecution.models[resolvedLaneIndex]
+        #if DEBUG
+            if let contextBuilderScope { await contextBuilderBeforeChatResolutionForTesting?(contextBuilderScope, selectedModel) }
+        #endif
+        try contextBuilderScope?.checkpoint()
         let selectionLabel = switch resolvedExecution.selection {
         case let .explicitPreset(_, name): "Model Preset \(name)"
         case let .automaticPreset(_, name): "Automatic Model Preset \(name)"
@@ -855,6 +924,14 @@ extension OracleViewModel {
         case .contextBuilderUI: "Context Builder"
         }
         let mcpControlledModel = "\(mode.capitalized) mode • \(selectionLabel) (\(selectedModel.displayName))"
+        let attachments = tabContext?.attachments ?? []
+        if case let .failure(error) = AttachmentPlanner.plan(
+            OracleAttachmentSet(attachments),
+            route: selectedModel.attachmentRoute,
+            limits: .production
+        ) {
+            throw ChatToolError.invalidParams(error.localizedDescription)
+        }
         let overrideModelName = selectedModel.displayName
         let overrideChatPresetName = resolvedExecution.promptConfiguration.chatPreset.name
 
@@ -869,8 +946,10 @@ extension OracleViewModel {
             activateInUI: shouldActivate,
             agentModeSessionID: tabContext?.agentModeSessionID,
             agentModeRunID: tabContext?.agentModeRunID,
-            implicitSessionID: implicitSessionID
+            implicitSessionID: implicitSessionID,
+            contextBuilderScope: contextBuilderScope
         )
+        try contextBuilderScope?.checkpoint()
         pinSession(chatID)
         defer { unpinSession(chatID) }
 
@@ -884,10 +963,12 @@ extension OracleViewModel {
         if requiresAuthorityPersistence {
             let sessionToPersist = sessions[sessionIndex]
             let savedURL = try await autosaveSession(sessionToPersist)
+            // Record the write that already happened, even if the lane expired during I/O.
             if let refreshedIndex = sessions.firstIndex(where: { $0.id == chatID }) {
                 sessions[refreshedIndex].fileURL = savedURL
                 sessions[refreshedIndex].savedAt = Date()
             }
+            try contextBuilderScope?.checkpoint()
         }
         setMCPSessionUIState(
             MCPSessionUIState(
@@ -917,6 +998,9 @@ extension OracleViewModel {
                 lookupContextOverride: lookupContextOverride,
                 reviewGitContextOverride: reviewGitContextOverride,
                 overrideAIMessage: tabContext?.packaging.prebuiltAIMessage,
+                oracleAttachments: attachments,
+                completionPolicy: contextBuilderScope == nil ? .interactive : .contextBuilderStrict,
+                contextBuilderScope: contextBuilderScope,
                 onProgress: onProgress
             )
         }
@@ -931,9 +1015,12 @@ extension OracleViewModel {
             queryId = await send()
         #endif
         guard let queryId else {
+            // No query exists to clear the label this call set above.
+            clearMCPSessionUIState(for: chatID)
             throw OracleContextBuilderCompletionError.missingExactQuery
         }
         let response = try await waitForContextBuilderCompletion(queryId)
+        try contextBuilderScope?.admitSuccess()
 
         // ────────── 6. Build typed reply ──────────
         let replyObj = ChatSendReply(
@@ -1092,7 +1179,13 @@ extension OracleViewModel {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             ) else {
-                throw ChatToolError.invalidParams("Chat with ID '\(normalizedChatID)' belongs to a different Agent Mode owner")
+                throw ChatToolError.invalidParams(
+                    Self.oracleOwnerRefusalMessage(
+                        chatID: normalizedChatID,
+                        session: found,
+                        agentModeSessionID: agentModeSessionID
+                    )
+                )
             }
             guard let loaded = await ensureSessionLoadedForBackground(found) else {
                 throw ChatToolError.internalError("Failed to load chat session '\(normalizedChatID)'")
@@ -1106,7 +1199,12 @@ extension OracleViewModel {
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             ) else {
-                throw ChatToolError.invalidParams("No chats found in the current tab")
+                throw ChatToolError.invalidParams(
+                    Self.oracleChatLogNoEligibleChatMessage(
+                        agentModeSessionID: agentModeSessionID,
+                        agentModeRunID: agentModeRunID
+                    )
+                )
             }
             guard let loaded = await ensureSessionLoadedForBackground(preferredSession) else {
                 throw ChatToolError.internalError("Failed to load the preferred chat for the current tab")

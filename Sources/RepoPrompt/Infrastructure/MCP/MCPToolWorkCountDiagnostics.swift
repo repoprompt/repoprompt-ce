@@ -346,3 +346,9 @@ enum MCPToolWorkCountDiagnostics {
         }
     #endif
 }
+
+struct AppWorkspaceExternalReadWorkRecorder: WorkspaceExternalReadWorkRecording {
+    func makeRecorder() -> @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void {
+        MCPToolWorkCountDiagnostics.readFileExternalRecorder()
+    }
+}

@@ -1,16 +1,68 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptFoundation
 
-struct AgentPersistentSessionBindingIdentity: Equatable, Hashable {
+/// Qualifies transcript presentation facts by owner, tab, session object, binding
+/// incarnation and transition. Presentation-only; never an authorization token.
+struct AgentSessionPresentationScope: Equatable {
+    let owner: AgentWorkspaceSessionIndexStore.SessionIndexOwner
     let tabID: UUID
-    let sessionID: UUID
-    let generation: UUID
+    let sessionIdentity: ObjectIdentifier?
+    let binding: AgentPersistentSessionBindingIdentity?
+    let bindingTransitionGeneration: UInt64
+}
 
-    init(tabID: UUID, sessionID: UUID, generation: UUID = UUID()) {
-        self.tabID = tabID
-        self.sessionID = sessionID
-        self.generation = generation
+struct AgentPersistedLoadAttempt: Equatable {
+    let scope: AgentSessionPresentationScope
+    let attemptID: UUID
+    let sourceItemsRevision: Int
+    /// The loader's existing commit fence for this bound attempt (never a new authority).
+    let commitToken: AgentModeViewModel.PersistedHydrationCommitToken?
+    /// The settled attempt an explicit Retry admitted this replacement for.
+    let retriedAttemptID: UUID?
+
+    init(
+        scope: AgentSessionPresentationScope,
+        attemptID: UUID,
+        sourceItemsRevision: Int,
+        commitToken: AgentModeViewModel.PersistedHydrationCommitToken? = nil,
+        retriedAttemptID: UUID? = nil
+    ) {
+        self.scope = scope
+        self.attemptID = attemptID
+        self.sourceItemsRevision = sourceItemsRevision
+        self.commitToken = commitToken
+        self.retriedAttemptID = retriedAttemptID
     }
+}
+
+enum AgentPersistedLoadExit: Equatable {
+    case payloadApplied
+    case missingPayload
+    case loadFailed
+    case cancelled
+    case sourceRevisionSuperseded
+    case persistenceSuppressed
+}
+
+struct AgentSessionPresentationRecord: Equatable {
+    enum Origin: Equatable {
+        case fresh
+        case saved
+    }
+
+    enum Phase: Equatable {
+        /// Saved load is scheduled/deferred for this scope but has not installed an attempt.
+        case notStarted
+        case loading(AgentPersistedLoadAttempt)
+        case settled(AgentPersistedLoadAttempt, AgentPersistedLoadExit)
+        /// Local state owns the scope (fresh creation, already-loaded or competing local transaction).
+        case settledLocal
+    }
+
+    let scope: AgentSessionPresentationScope
+    let origin: Origin
+    let phase: Phase
 }
 
 enum AgentSidebarThreadKey: Hashable, Equatable {
@@ -134,6 +186,7 @@ extension AgentModeViewModel {
         let tabID: UUID
         let sessionIdentity: ObjectIdentifier
         let workspaceID: UUID
+        let workspaceDirectoryPath: String
         let binding: AgentPersistentSessionBindingIdentity
         let bindingTransitionGeneration: UInt64
         let sourceItemsRevision: Int
@@ -148,9 +201,8 @@ extension AgentModeViewModel {
     }
 
     /// Immutable authority inputs shared by a batch of persistent-session lookups.
-    /// Building these maps is the expensive part: it walks every live, compose, and
-    /// stashed tab. Individual resolutions remain session-specific and preserve the
-    /// same ambiguity and indexed-fallback rules as the scalar lookup.
+    /// Point callers include only requested identities and their conflicting carriers; whole-scope
+    /// callers can still supply a full census. Both use identical ambiguity and indexed-fallback rules.
     struct PersistentBindingResolutionSnapshot {
         let liveClaimsByTabID: [UUID: UUID]
         let workspaceClaimsByTabID: [UUID: Set<UUID>]
@@ -181,12 +233,14 @@ extension AgentModeViewModel {
         case search
         case visibleCount
         case explicit
+        case restoreProjection
     }
 
     struct SidebarSessionRowsCacheKey: Equatable {
         let workspaceID: UUID?
         let rowContentRevision: Int
         let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
+        let restorePresentation: SidebarRestorePresentationKey
     }
 
     struct SidebarListProjectionCacheKey: Equatable {
@@ -197,10 +251,13 @@ extension AgentModeViewModel {
         let stashedTabSignatures: [AgentSessionSidebarStashedTabSignature]
         let archivedSessionsExpanded: Bool
         let showComposeTabsWithoutAgentSessions: Bool
+        let restorePresentation: SidebarRestorePresentationKey
     }
 
     struct SidebarListProjection {
         let workspaceID: UUID?
+        /// An actual switch/queued adoption is unresolved: no outgoing rows and no target headings (§5.3).
+        let isOwnerPending: Bool
         let filteredSessions: [SidebarSession]
         let pagedSessions: [SidebarSession]
         let effectiveVisibleSessionCount: Int
@@ -267,6 +324,8 @@ extension AgentModeViewModel {
         let activeAgentSessionID: UUID?
         let isPinned: Bool
         let pinnedOrder: Int?
+        let sidebarGroup: String?
+        let sidebarGroupOrder: Int?
         let lastModified: Date
     }
 
@@ -293,14 +352,21 @@ extension AgentModeViewModel {
         let runState: AgentSessionRunState
         let lastActivityAt: Date
         let lastUserMessageAt: Date?
+        /// The row builder prefers live bindings and merge operations over the index entry, so a
+        /// live change must refresh rows even when no index entry exists to carry it.
+        var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = []
+        var worktreeMergeAttention: AgentWorktreeMergeAttention?
     }
 
     /// Fingerprint of every VM-level input that affects the rendered session sidebar.
     /// `syncSidebarUIState(refresh:reason:)` gates forced revisions on changes to
     /// this fingerprint, ensuring duplicate refresh requests during steady provider
     /// output do not bump `AgentSessionSidebarUIStore.revision`.
+    ///
+    /// The selected tab is deliberately absent: no built row depends on it (the list receives it as a
+    /// view input and the projection cache keys on it). Including it forced a full O(sessions) row
+    /// rebuild on every session switch (#1373).
     struct AgentSessionSidebarContentFingerprint: Equatable {
-        let currentTabID: UUID?
         let sessionListCacheReady: Bool
         let tabsWithActiveAgentRun: Set<UUID>
         let mcpControlledTabIDs: Set<UUID>
@@ -308,7 +374,18 @@ extension AgentModeViewModel {
         let sessionSignatures: [AgentSessionSidebarTabSignature]
         let sessionIndex: [UUID: AgentSessionIndexEntry]
         let sessionListSortDates: [UUID: Date]
-        let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
+        /// Baseline revision (nil once released) and owner-pending state; a baseline-only change must
+        /// invalidate consumers even when index and transcript inputs are unchanged.
+        let sidebarRestorePresentation: SidebarRestorePresentationKey
+    }
+
+    /// Positional restoration state that row caches, the list projection and fingerprints key on.
+    struct SidebarRestorePresentationKey: Equatable {
+        let baselineOwner: AgentWorkspaceSessionIndexStore.SessionIndexOwner?
+        let baselineRevision: UInt64?
+        let isOwnerPending: Bool
+
+        static let settled = SidebarRestorePresentationKey(baselineOwner: nil, baselineRevision: nil, isOwnerPending: false)
     }
 
     struct ActiveUIInvalidation: OptionSet {
@@ -492,6 +569,11 @@ extension AgentModeViewModel {
         }
     }
 
+    enum MCPSessionCreationKind {
+        case mcpControlled
+        case oversightLane(creatorSessionID: UUID)
+    }
+
     struct MCPSessionTarget: Equatable {
         /// How this session target was obtained.
         enum Origin: Equatable {
@@ -508,6 +590,7 @@ extension AgentModeViewModel {
         let recoveryClaim: AgentProvisionalAdmissionClaim?
         let discardAuthorityID: UUID?
         let discardRestoreIndexEntry: AgentSessionIndexEntry?
+        let creationHandle: AgentSessionCreationHandle?
 
         init(
             tabID: UUID,
@@ -516,7 +599,8 @@ extension AgentModeViewModel {
             lifecycleIdentity: AgentSessionLifecycleAuthority.Identity? = nil,
             recoveryClaim: AgentProvisionalAdmissionClaim? = nil,
             discardAuthorityID: UUID? = nil,
-            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil
+            discardRestoreIndexEntry: AgentSessionIndexEntry? = nil,
+            creationHandle: AgentSessionCreationHandle? = nil
         ) {
             self.tabID = tabID
             self.sessionID = sessionID
@@ -525,6 +609,7 @@ extension AgentModeViewModel {
             self.recoveryClaim = recoveryClaim
             self.discardAuthorityID = discardAuthorityID
             self.discardRestoreIndexEntry = discardRestoreIndexEntry
+            self.creationHandle = creationHandle
         }
 
         func withDiscardAuthorityID(_ discardAuthorityID: UUID) -> MCPSessionTarget {
@@ -535,7 +620,8 @@ extension AgentModeViewModel {
                 lifecycleIdentity: lifecycleIdentity,
                 recoveryClaim: recoveryClaim,
                 discardAuthorityID: discardAuthorityID,
-                discardRestoreIndexEntry: discardRestoreIndexEntry
+                discardRestoreIndexEntry: discardRestoreIndexEntry,
+                creationHandle: creationHandle
             )
         }
     }
@@ -582,8 +668,8 @@ extension AgentModeViewModel {
 
     enum AttachmentTurnState: Equatable {
         case idle
-        case reserved(reservationID: UUID, attachments: [AgentImageAttachment])
-        case consumed(reservationID: UUID, attachments: [AgentImageAttachment])
+        case reserved(reservationID: UUID, attachments: [AgentFileAttachment])
+        case consumed(reservationID: UUID, attachments: [AgentFileAttachment])
     }
 
     struct CodexComputerUseActivation: Equatable {
@@ -607,6 +693,8 @@ extension AgentModeViewModel {
         /// until the destination tab successfully sends its first real user turn.
         var defersProviderLockUntilSend: Bool = false
         var isStagedForSend: Bool = false
+        /// Durable failure/preparation marker; ordinary send cleanup must never clear it.
+        var executionLocationFailure: String?
 
         var hasPayload: Bool {
             guard let payload else { return false }
@@ -637,6 +725,13 @@ extension AgentModeViewModel {
         case fresh
         case resumed
         case resumeFellBackToFresh
+        case resumeTimedOut
+    }
+
+    /// Exact provider reference known to exceed the resume frame budget in this session.
+    struct CodexOversizedResumeTarget: Equatable {
+        var conversationID: String?
+        var rolloutPath: String?
     }
 
     struct CodexResumeTimeoutState: Equatable {
@@ -854,6 +949,7 @@ extension AgentModeViewModel {
         let sessionID: UUID?
         let canStash: Bool
         let parentSessionID: UUID?
+        let createdByOverseerSessionID: UUID?
         let depth: Int
         let isMCPControlled: Bool
         /// Bound-worktree visual identity for this session (Item 10). Nil when
@@ -874,6 +970,9 @@ extension AgentModeViewModel {
         /// completing or needing approval still gets a visible signal.
         let hiddenThreadDescendantAttentionCount: Int
         let threadActivityDate: Date?
+        /// Captured restoration date bucket while the sidebar baseline positions this row (§5.4);
+        /// nil for settled rows, which keep the ordinary maximum-date heading.
+        let restorationDateBucket: AgentSidebarDateSectionBucket?
         /// Deferred search-field inputs. Rows intentionally store the raw source
         /// rather than normalized `AgentSessionSearchFields` so ordinary sidebar
         /// rebuilds never pay ICU folding cost for a search box that is empty.
@@ -891,6 +990,7 @@ extension AgentModeViewModel {
             sessionID: UUID?,
             canStash: Bool = false,
             parentSessionID: UUID?,
+            createdByOverseerSessionID: UUID? = nil,
             depth: Int,
             isMCPControlled: Bool,
             worktree: AgentWorktreeIndicator? = nil,
@@ -901,6 +1001,7 @@ extension AgentModeViewModel {
             hiddenThreadDescendantCount: Int = 0,
             hiddenThreadDescendantAttentionCount: Int = 0,
             threadActivityDate: Date? = nil,
+            restorationDateBucket: AgentSidebarDateSectionBucket? = nil,
             searchFieldSource: AgentSessionSearchFieldSource = .empty
         ) {
             self.id = id
@@ -912,6 +1013,7 @@ extension AgentModeViewModel {
             self.sessionID = sessionID
             self.canStash = canStash
             self.parentSessionID = parentSessionID
+            self.createdByOverseerSessionID = createdByOverseerSessionID
             self.depth = depth
             self.isMCPControlled = isMCPControlled
             self.worktree = worktree
@@ -922,6 +1024,7 @@ extension AgentModeViewModel {
             self.hiddenThreadDescendantCount = hiddenThreadDescendantCount
             self.hiddenThreadDescendantAttentionCount = hiddenThreadDescendantAttentionCount
             self.threadActivityDate = threadActivityDate
+            self.restorationDateBucket = restorationDateBucket
             self.searchFieldSource = searchFieldSource
         }
 
@@ -936,6 +1039,7 @@ extension AgentModeViewModel {
     }
 
     struct BuiltTranscriptPresentation {
+        var localInputSeed = AgentSessionLinkRetainedLocalInputIndex.Seed()
         let transcript: AgentTranscript
         let baseProjection: AgentTranscriptProjection
         let fullProjection: AgentTranscriptProjection
@@ -943,6 +1047,9 @@ extension AgentModeViewModel {
         let projection: AgentTranscriptProjection
         let turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
         let archivedSnapshot: AgentArchivedTranscriptSnapshot
+        /// Semantic reuse evidence from the existing validated sanitizer prefix, not a claim
+        /// that building the archive projection avoided traversal or reused its storage.
+        let reusesPreviousArchive: Bool
         let projectionProtection: AgentTranscriptProjectionProtection
         let canonicalVisibleRowCount: Int
         let projectionCounts: AgentTranscriptProjectionCounts
@@ -1042,13 +1149,13 @@ extension AgentModeViewModel {
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct PendingUserTurnState: Equatable {
         let workflow: AgentWorkflowDefinition?
-        let imageAttachments: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
 
         var isEmpty: Bool {
             workflow == nil
-                && imageAttachments.isEmpty
+                && attachments.isEmpty
                 && taggedFileAttachments.isEmpty
                 && initialStartLocation == .local
         }
@@ -1063,12 +1170,6 @@ extension AgentModeViewModel {
         let message: String
         let strategy: AgentModeRunService.DraftRestorationStrategy
         let operation: AgentComposerDraftRestorationOperation?
-    }
-
-    /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
-    struct ImageAttachmentFingerprint: Hashable {
-        let byteCount: Int64
-        let digestHex: String
     }
 
     struct SlashSkillToken: Equatable {

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptDomainRuntime
+import RepoPromptInstrumentation
 
 @MainActor
 final class AgentModeRunService {
@@ -34,6 +35,14 @@ final class AgentModeRunService {
     typealias CancellationIntent = DomainAgentRunCancellationIntent
     typealias CancellationCompletion = DomainAgentRunCancellationCompletion
 
+    /// Who asked for a cancellation. Only an explicit user or managed Stop withdraws queued
+    /// cross-session work, retracts auto-wake, or invalidates queued inbound sends; internal
+    /// lifecycle cancellations (instruction timeout, attachment restart, teardown) do not.
+    enum CancellationOrigin: Equatable {
+        case explicitStop
+        case internalLifecycle
+    }
+
     /// Strategy for restoring draft text back to the composer.
     enum DraftRestorationStrategy: Equatable {
         /// Only restore if the composer is currently empty.
@@ -53,6 +62,31 @@ final class AgentModeRunService {
     private let claudeRunner: ClaudeIntegratedAgentModeRunner
     private let acpRunner: ACPIntegratedAgentModeRunner
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
+    private let perfRecorder: any AgentModePerfRecording
+
+    #if DEBUG
+        var testBeforeCancellationCommit: (@MainActor (AgentTabSession) async -> Void)?
+
+        func test_publishNaturalCompletion(_ session: AgentTabSession, supportsFollowUp: Bool = false) async {
+            guard let ownership = session.activeRunOwnership else { return }
+            _ = await terminalCommitBarrier.commit(.init(
+                binding: hooks.bindTerminalSession(session),
+                ownership: ownership,
+                expectedRunID: session.runID,
+                terminalState: .completed,
+                source: "test.naturalCompletion",
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: false,
+                supportsFollowUp: supportsFollowUp,
+                notifyTurnComplete: false,
+                providerDrainGeneration: session.providerTerminalDrainGeneration,
+                prepareProviderState: {
+                    session.provider = nil
+                    return nil
+                }
+            ))
+        }
+    #endif
 
     private static let enableSteeringDebugLogging = false
 
@@ -66,11 +100,13 @@ final class AgentModeRunService {
     init(
         dependencies: Dependencies,
         hooks: Hooks,
-        toolTrackingHooks: AgentToolTrackingHooks
+        toolTrackingHooks: AgentToolTrackingHooks,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.dependencies = dependencies
+        self.perfRecorder = perfRecorder
         self.hooks = hooks
-        let terminalCommitBarrier = AgentRunTerminalCommitBarrier()
+        let terminalCommitBarrier = AgentRunTerminalCommitBarrier(perfRecorder: perfRecorder)
         self.terminalCommitBarrier = terminalCommitBarrier
         dependencies.codexCoordinator.installTerminalCommitBarrier(
             terminalCommitBarrier,
@@ -100,19 +136,100 @@ final class AgentModeRunService {
         )
     }
 
+    func oracleToolSettlementCallbacks(
+        session: AgentTabSession,
+        invocationID: UUID,
+        toolName: String,
+        isOwnerCurrent: @escaping @MainActor @Sendable () -> Bool
+    ) -> OracleToolSettlementCallbacks? {
+        guard session.selectedAgent.acpProviderID != nil else { return nil }
+        return acpRunner.oracleToolSettlementCallbacks(session: session, invocationID: invocationID, toolName: toolName, isOwnerCurrent: isOwnerCurrent)
+    }
+
+    /// Whether this session's run pipeline sends `command` as its exact native text.
+    ///
+    /// Claude Code always does. An ACP session does only while its live controller advertises the
+    /// command in the admitted provider session (see `AgentProviderControlCommand.acpSession`). The
+    /// Claude-compatible variants share the CLI but their backends are not verified to honor the
+    /// native command, and headless runtimes have no undecorated path.
+    static func dispatchesProviderControlCommand(
+        _ command: AgentProviderControlCommand,
+        for session: AgentTabSession
+    ) -> Bool {
+        if session.selectedAgent == .claudeCode {
+            return true
+        }
+        return AgentProviderControlCommand.acpSession(
+            session,
+            advertises: command.kind,
+            inProviderConversation: command.expectedProviderConversation
+        )
+    }
+
+    /// Claude and Codex use correlated completion. ACP self-compaction is admitted only for
+    /// runtimes whose advertised `compact` is a native command, and only after that support was
+    /// recorded on the attempt.
+    private static func allowsSelfCompactDispatch(_ session: AgentTabSession) -> Bool {
+        if session.selectedAgent == .codexExec || session.selectedAgent == .claudeCode {
+            return true
+        }
+        return AgentProviderControlCommand.acpRuntimeAdvertisesNativeCommands(session.selectedAgent)
+            && session.selfCompactState.active?.admittedSupport == .acpAdvertisedCommand
+    }
+
     @discardableResult
     func startRun(
         tabID: UUID,
         session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         codexFallbackContext: AgentTabSession.CodexFallbackSubmissionContext? = nil,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
-        startOutcome: AgentRunStartOutcomeRecorder? = nil
+        providerControlCommand: AgentProviderControlCommand? = nil,
+        selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,
+        startOutcome: AgentRunStartOutcomeRecorder? = nil,
+        stopFence: AgentRunStartStopFence? = nil,
+        localComposerCandidate: UUID? = nil,
+        initialUserItemID: UUID? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+        var candidateTransferred = false
+        defer {
+            if !candidateTransferred {
+                session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
+            }
+        }
+        guard stopFence?.permitsStart(of: session) ?? true else {
+            startOutcome?.recordStartFailure(message: "This scheduled run was cancelled by Stop.")
+            return nil
+        }
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the AgentTabSession tab ID")
+        if let message = session.operationAdmissionFailureMessage {
+            startOutcome?.recordStartFailure(message: message)
+            return session.selectedAgent == .codexExec ? .preDispatchRejected(message: message) : nil
+        }
         let selectedAgent = session.selectedAgent
+        if let selfCompactDispatchID {
+            guard session.selfCompactState.active?.id == selfCompactDispatchID.requestID,
+                  selfCompactDispatchID.stage == .note
+                  ? session.selfCompactNoteDispatchIsCurrent(selfCompactDispatchID)
+                  : session.selfCompactDispatchIsCurrent?() != false,
+                  Self.allowsSelfCompactDispatch(session),
+                  (selfCompactDispatchID.stage == .compact) == (providerControlCommand != nil)
+            else {
+                startOutcome?.recordStartFailure(message: nil)
+                return nil
+            }
+        }
+        // A control command is only ever routed to a runtime that dispatches it natively and
+        // undecorated. Any other runtime would send it as ordinary prose, so it never starts at all.
+        if let providerControlCommand,
+           !Self.dispatchesProviderControlCommand(providerControlCommand, for: session)
+        {
+            let message = "\(selectedAgent.displayName) does not support this provider command."
+            startOutcome?.recordStartFailure(message: message)
+            return nil
+        }
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         let workspacePath: String?
         do {
@@ -126,6 +243,12 @@ final class AgentModeRunService {
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
 
+        // Every path that reaches a provider from here is a new turn, and a new turn is exactly what
+        // cancels a background ACP compaction. Held deliveries never get here, so this is the
+        // session's own user (or its own queued work) choosing to proceed: the hold protects nothing
+        // any more.
+        session.endACPBackgroundCompactionSettle()
+
         if selectedAgent == .codexExec {
             let outcome = await codexRunner.startRun(
                 tabID: tabID,
@@ -133,7 +256,9 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 fallbackContext: codexFallbackContext,
-                autoEffortSelection: autoEffortSelection
+                autoEffortSelection: autoEffortSelection,
+                selfCompactDispatchID: selfCompactDispatchID,
+                stopFence: stopFence
             )
             startOutcome?.record(codexOutcome: outcome)
             return outcome
@@ -165,12 +290,14 @@ final class AgentModeRunService {
             )
             return MCPBootstrapLease(
                 spec: leaseSpec,
+                perfRecorder: self.perfRecorder,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
                 expectedPIDPolicyArmer: expectedPIDPolicyArmer
             )
         }
         if selectedAgent.usesClaudeNativeRuntime {
+            candidateTransferred = true
             await claudeRunner.startRun(
                 tabID: tabID,
                 session: session,
@@ -178,12 +305,18 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 makeLease: makeLease,
-                autoEffortSelection: autoEffortSelection
+                autoEffortSelection: autoEffortSelection,
+                providerControlCommand: providerControlCommand,
+                selfCompactDispatchID: selfCompactDispatchID,
+                stopFence: stopFence,
+                localComposerCandidate: localComposerCandidate,
+                initialUserItemID: initialUserItemID
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
         }
         if let acpRunRequest {
+            candidateTransferred = true
             await acpRunner.startRun(
                 tabID: tabID,
                 session: session,
@@ -191,18 +324,24 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 runRequest: acpRunRequest,
-                makeLease: makeLease
+                providerControlCommand: providerControlCommand,
+                makeLease: makeLease,
+                stopFence: stopFence,
+                localComposerCandidate: localComposerCandidate
             )
             recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
         }
+        candidateTransferred = true
         await headlessRunner.startRun(
             tabID: tabID,
             session: session,
             initialUserMessage: initialUserMessage,
             initialMessageForRun: initialMessageForRun,
             attachments: attachments,
-            makeLease: makeLease
+            makeLease: makeLease,
+            stopFence: stopFence,
+            localComposerCandidate: localComposerCandidate
         )
         recordNonCodexStartOutcome(startOutcome, session: session)
         return nil
@@ -232,11 +371,13 @@ final class AgentModeRunService {
     func submitActiveACPPromptIfSupported(
         session: AgentTabSession,
         messageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         targetRunID: UUID?,
         targetRunAttemptID: UUID?,
-        targetController: ACPAgentSessionController
+        targetController: ACPAgentSessionController,
+        writeReceipt: ACPAgentSessionController.PromptWriteReceipt? = nil
     ) async -> Bool {
+        guard session.operationAdmissionFailureMessage == nil else { return false }
         let selectedAgent = session.selectedAgent
         let runtimePermission = dependencies.providerRuntimePermissionResolver(selectedAgent, session.permissionProfile)
         guard selectedAgent.acpProviderID != nil,
@@ -272,7 +413,8 @@ final class AgentModeRunService {
             runRequest: runRequest,
             targetRunID: targetRunID,
             targetRunAttemptID: targetRunAttemptID,
-            targetController: targetController
+            targetController: targetController,
+            writeReceipt: writeReceipt
         )
         steeringDebugLog("[AgentRunSteeringWake] ACP active submit runner returned sent=\(sent) agent=\(selectedAgent.rawValue) model=\(runRequest.modelString ?? "default") runID=\(String(describing: targetRunID)) attempt=\(String(describing: targetRunAttemptID))")
         return sent
@@ -281,7 +423,7 @@ final class AgentModeRunService {
     static func makeACPRunRequest(
         session: AgentTabSession,
         workspacePath: String?,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         runtimePermission: AgentProviderRuntimePermissionBinding
     ) -> ACPRunRequest? {
         let selectedAgent = session.selectedAgent
@@ -332,12 +474,19 @@ final class AgentModeRunService {
               let controller = session.acpController else { return false }
 
         let tabID = session.tabID
+        let flushStopFence = AgentRunStartStopFence(session: session)
+        let flushID = UUID()
+        session.acpSteeringFlushID = flushID
         steeringDebugLog("[AgentRunSteeringWake] ACP flush start tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
         session.acpSteeringFlushTask = Task { [weak self, weak session, controller] in
             guard let self, let session else { return }
             defer {
-                session.acpSteeringFlushTask = nil
-                if session.runState == .running,
+                if session.acpSteeringFlushID == flushID {
+                    session.acpSteeringFlushTask = nil
+                    session.acpSteeringFlushID = nil
+                }
+                if session.acpSteeringFlushTask == nil,
+                   session.runState == .running,
                    session.selectedAgent.acpProviderID != nil,
                    !session.pendingACPSteeringInstructions.isEmpty
                 {
@@ -349,12 +498,14 @@ final class AgentModeRunService {
             }
 
             while true {
+                guard !Task.isCancelled, session.acpSteeringFlushID == flushID else { return }
                 guard isCurrentACPSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller) else {
                     requeueQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
                         session: session,
                         matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID },
-                        reason: "stale ACP steering attempt before MCP idle wait"
+                        reason: "stale ACP steering attempt before MCP idle wait",
+                        stopFence: flushStopFence
                     )
                     return
                 }
@@ -367,7 +518,8 @@ final class AgentModeRunService {
                         tabID: tabID,
                         session: session,
                         while: { $0.targetRunID != runID || $0.targetRunAttemptID != runAttemptID },
-                        reason: "queued ACP steering target no longer matches active run"
+                        reason: "queued ACP steering target no longer matches active run",
+                        stopFence: flushStopFence
                     )
                     continue
                 }
@@ -380,6 +532,9 @@ final class AgentModeRunService {
                 let supersedingBaseline = session.pendingSupersedingTurnCompletions
                 session.pendingSupersedingTurnCompletions += 1
                 let releaseSupersedingProtectionIfUnused = {
+                    guard session.runID == runID,
+                          session.activeRunAttemptID == runAttemptID
+                    else { return }
                     if session.pendingSupersedingTurnCompletions > supersedingBaseline {
                         session.pendingSupersedingTurnCompletions -= 1
                     }
@@ -388,19 +543,30 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] ACP flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 do {
+                    try await session.awaitObserverWaitRelease(runID: runID, runAttemptID: runAttemptID)
                     try await dependencies.awaitNoActiveMCPTools(runID)
                     steeringDebugLog("[AgentRunSteeringWake] ACP flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 } catch {
                     releaseSupersedingProtectionIfUnused()
                     steeringDebugLog("[AgentRunSteeringWake] ACP flush MCP idle cancelled tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) error=\(error)")
-                    requeueAllQueuedACPSteeringAsFollowUp(
+                    guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                          session.acpController === controller else { return }
+                    requeueQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
                         session: session,
-                        reason: "ACP steering MCP idle wait was cancelled"
+                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID },
+                        reason: "ACP steering MCP idle wait was cancelled",
+                        stopFence: flushStopFence
                     )
                     return
                 }
 
+                guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                      session.acpController === controller
+                else {
+                    releaseSupersedingProtectionIfUnused()
+                    return
+                }
                 guard isCurrentACPSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID, controller: controller),
                       !session.pendingACPSteeringInstructions.isEmpty
                 else {
@@ -409,16 +575,23 @@ final class AgentModeRunService {
                         tabID: tabID,
                         session: session,
                         matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID },
-                        reason: "stale ACP steering attempt after MCP idle wait"
+                        reason: "stale ACP steering attempt after MCP idle wait",
+                        stopFence: flushStopFence
                     )
                     return
                 }
 
-                let steeringBatch = Array(session.pendingACPSteeringInstructions.prefix(while: {
+                let queuedBatch = Array(session.pendingACPSteeringInstructions.prefix(while: {
                     $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID
+                        && $0.skipsSlashExpansion == session.pendingACPSteeringInstructions.first?.skipsSlashExpansion
                 }))
-                guard !steeringBatch.isEmpty else { continue }
-                session.pendingACPSteeringInstructions.removeFirst(steeringBatch.count)
+                guard !queuedBatch.isEmpty else { continue }
+                session.pendingACPSteeringInstructions.removeFirst(queuedBatch.count)
+                let steeringBatch = currentACPSteeringInstructions(queuedBatch, session: session)
+                guard !steeringBatch.isEmpty else {
+                    releaseSupersedingProtectionIfUnused()
+                    continue
+                }
 
                 let providerTextForSend = coalescedACPProviderText(for: steeringBatch)
                 var dequeuedUserInputTokens: [Int] = []
@@ -435,30 +608,94 @@ final class AgentModeRunService {
                     providerTextForSend,
                     steeringBatch.flatMap(\.attachments),
                     steeringBatch.flatMap(\.taggedFileAttachments),
-                    session
+                    session, steeringBatch.contains(where: \.skipsSlashExpansion)
                 )
+                // Augmentation suspended. A retired flush owns this dequeued batch, which teardown
+                // cannot see in the queue; withdraw it rather than requeueing into a dead controller.
+                guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                      session.acpController === controller
+                else {
+                    releaseSupersedingProtectionIfUnused()
+                    withdrawManagedACPSteering(steeringBatch, session: session, stopFence: flushStopFence)
+                    restoreLocalACPSteeringDrafts(steeringBatch, tabID: tabID, session: session, stopFence: flushStopFence)
+                    return
+                }
+                // Re-prove every attributed endpoint before the provider call; if one went stale,
+                // never send the already-coalesced batch containing it.
+                guard flushStopFence.permitsStart(of: session),
+                      hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
+                else {
+                    releaseSupersedingProtectionIfUnused()
+                    withdrawManagedACPSteering(steeringBatch, session: session, stopFence: flushStopFence)
+                    restoreLocalACPSteeringDrafts(steeringBatch, tabID: tabID, session: session, stopFence: flushStopFence)
+                    return
+                }
+                let stillCurrent = currentACPSteeringInstructions(steeringBatch, session: session)
+                if stillCurrent.count != steeringBatch.count {
+                    releaseSupersedingProtectionIfUnused()
+                    if !dequeuedUserInputTokens.isEmpty {
+                        session.pendingNonCodexUserInputTokenQueue.insert(contentsOf: dequeuedUserInputTokens, at: 0)
+                    }
+                    requeueACPSteeringAsFollowUp(
+                        stillCurrent, tabID: tabID, session: session,
+                        reason: "ACP steering endpoint changed during preparation",
+                        stopFence: flushStopFence
+                    )
+                    return
+                }
+                let writeReceipt = ACPAgentSessionController.PromptWriteReceipt()
                 let sent = await submitActiveACPPromptIfSupported(
                     session: session,
                     messageForRun: augmentedSteeringText,
                     attachments: steeringBatch.flatMap(\.attachments),
                     targetRunID: runID,
                     targetRunAttemptID: runAttemptID,
-                    targetController: controller
+                    targetController: controller,
+                    writeReceipt: writeReceipt
                 )
-                hooks.providerInput.recordPendingHandoffSendOutcome(session, sent)
+                if !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                   session.acpController === controller,
+                   hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
+                {
+                    hooks.providerInput.recordPendingHandoffSendOutcome(session, sent || writeReceipt.wasWritten)
+                }
+                if !sent, writeReceipt.wasWritten {
+                    // The response settles only at turn end. Stop/transport failure can lose it
+                    // after the provider has received the prompt: never restore or requeue that
+                    // text, remove its row, or release a managed idempotency key for retry.
+                    releaseSupersedingProtectionIfUnused()
+                    for item in steeringBatch {
+                        item.managed?.sink.resolve(.unconfirmed(
+                            message: "The ACP prompt was written, but RepoPrompt could not confirm its completion. Read the session before retrying."
+                        ))
+                    }
+                    return
+                }
                 if sent {
+                    steeringBatch.forEach { $0.managed?.sink.resolve(.delivered(.steered)) }
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 }
                 if !sent {
                     releaseSupersedingProtectionIfUnused()
+                    guard !Task.isCancelled, session.acpSteeringFlushID == flushID,
+                          session.acpController === controller,
+                          flushStopFence.permitsStart(of: session),
+                          hooks.queuedWorkRecovery.isCurrentSessionBinding(session, flushStopFence)
+                    else {
+                        withdrawManagedACPSteering(steeringBatch, session: session, stopFence: flushStopFence)
+                        restoreLocalACPSteeringDrafts(steeringBatch, tabID: tabID, session: session, stopFence: flushStopFence)
+                        return
+                    }
                     session.pendingACPSteeringInstructions.insert(contentsOf: steeringBatch, at: 0)
                     if !dequeuedUserInputTokens.isEmpty {
                         session.pendingNonCodexUserInputTokenQueue.insert(contentsOf: dequeuedUserInputTokens, at: 0)
                     }
-                    requeueAllQueuedACPSteeringAsFollowUp(
+                    requeueQueuedACPSteeringAsFollowUp(
                         tabID: tabID,
                         session: session,
-                        reason: "ACP interrupt+prompt send returned false"
+                        matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID },
+                        reason: "ACP interrupt+prompt send returned false",
+                        stopFence: flushStopFence
                     )
                     return
                 }
@@ -517,50 +754,43 @@ final class AgentModeRunService {
         tabID: UUID,
         session: AgentTabSession,
         matching shouldRequeue: (AgentTabSession.ACPSteeringInstruction) -> Bool,
-        reason: String
+        reason: String,
+        stopFence: AgentRunStartStopFence
     ) {
+        guard stopFence.permitsStart(of: session) else { return }
         let instructions = session.pendingACPSteeringInstructions.filter(shouldRequeue)
         guard !instructions.isEmpty else { return }
         session.pendingACPSteeringInstructions.removeAll(where: shouldRequeue)
-        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason)
+        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason, stopFence: stopFence)
     }
 
     private func requeueLeadingACPSteeringAsFollowUp(
         tabID: UUID,
         session: AgentTabSession,
         while shouldRequeue: (AgentTabSession.ACPSteeringInstruction) -> Bool,
-        reason: String
+        reason: String,
+        stopFence: AgentRunStartStopFence
     ) {
+        guard stopFence.permitsStart(of: session) else { return }
         let instructions = Array(session.pendingACPSteeringInstructions.prefix(while: shouldRequeue))
         guard !instructions.isEmpty else { return }
         session.pendingACPSteeringInstructions.removeFirst(instructions.count)
-        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason)
-    }
-
-    private func requeueAllQueuedACPSteeringAsFollowUp(
-        tabID: UUID,
-        session: AgentTabSession,
-        reason: String
-    ) {
-        let instructions = session.pendingACPSteeringInstructions
-        guard !instructions.isEmpty else { return }
-        session.pendingACPSteeringInstructions.removeAll()
-        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason)
+        requeueACPSteeringAsFollowUp(instructions, tabID: tabID, session: session, reason: reason, stopFence: stopFence)
     }
 
     private func coalescedACPProviderText(
         for instructions: [AgentTabSession.ACPSteeringInstruction]
     ) -> String {
         let steeringTexts = instructions
-            .map { $0.providerText.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .map(\.providerText)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !steeringTexts.isEmpty else { return "" }
 
         var seenInterruptedTexts = Set<String>()
         let steeringTextSet = Set(steeringTexts)
         let interruptedTexts = instructions.compactMap { instruction -> String? in
-            guard let text = instruction.interruptedPromptProviderText?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !text.isEmpty,
+            guard let text = instruction.interruptedPromptProviderText,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !steeringTextSet.contains(text),
                   seenInterruptedTexts.insert(text).inserted
             else {
@@ -596,26 +826,139 @@ final class AgentModeRunService {
         """
     }
 
+    private func managedACPSteeringIsCurrent(
+        _ managed: AgentTabSession.ACPSteeringManagedContext,
+        session: AgentTabSession
+    ) -> Bool {
+        let candidate = managed.endpoint
+        return session.tabID == candidate.tabID
+            && session.activeAgentSessionID == candidate.sessionID
+            && session.persistentSessionBindingIdentity?.generation == candidate.persistentBindingGeneration
+            && session.bindingTransitionGeneration == candidate.bindingTransitionGeneration
+            && !session.bindingTransitionInProgress
+            && session.items.contains {
+                $0.id == managed.attributedItemID && $0.crossSessionAttribution == managed.attribution
+            }
+    }
+
+    private func withdrawManagedACPSteering(
+        _ instructions: [AgentTabSession.ACPSteeringInstruction],
+        session: AgentTabSession,
+        stopFence: AgentRunStartStopFence? = nil
+    ) {
+        let mayMutateOriginalBinding = stopFence.map {
+            hooks.queuedWorkRecovery.isCurrentSessionBinding(session, $0)
+        } ?? true
+        var removedRow = false
+        for instruction in instructions {
+            guard let managed = instruction.managed else { continue }
+            if mayMutateOriginalBinding,
+               let index = session.items.firstIndex(where: { $0.id == managed.attributedItemID })
+            {
+                _ = session.removeItem(at: index)
+                removedRow = true
+            }
+            managed.sink.resolve(.notAccepted(
+                message: "The ACP steer was withdrawn before the provider accepted it."
+            ))
+        }
+        if removedRow {
+            session.isDirty = true
+            hooks.bindingObservation.updateBindings(session)
+            hooks.persistence.scheduleSave(session)
+        }
+    }
+
+    private func currentACPSteeringInstructions(
+        _ instructions: [AgentTabSession.ACPSteeringInstruction],
+        session: AgentTabSession
+    ) -> [AgentTabSession.ACPSteeringInstruction] {
+        instructions.filter { instruction in
+            guard let managed = instruction.managed else { return true }
+            guard managedACPSteeringIsCurrent(managed, session: session) else {
+                withdrawManagedACPSteering([instruction], session: session)
+                return false
+            }
+            return true
+        }
+    }
+
+    #if DEBUG
+        func test_resumeStaleACPFlush(
+            session: AgentTabSession,
+            runID: UUID,
+            runAttemptID: UUID,
+            stopFence: AgentRunStartStopFence
+        ) {
+            requeueQueuedACPSteeringAsFollowUp(
+                tabID: session.tabID, session: session,
+                matching: { $0.targetRunID == runID && $0.targetRunAttemptID == runAttemptID },
+                reason: "test stale ACP flush", stopFence: stopFence
+            )
+        }
+
+        func test_requeueDequeuedACPSteeringAfterStop(
+            _ instructions: [AgentTabSession.ACPSteeringInstruction],
+            session: AgentTabSession,
+            stopFence: AgentRunStartStopFence
+        ) {
+            requeueACPSteeringAsFollowUp(
+                instructions, tabID: session.tabID, session: session,
+                reason: "test stopped ACP flush", stopFence: stopFence
+            )
+        }
+    #endif
+
     private func requeueACPSteeringAsFollowUp(
         _ instructions: [AgentTabSession.ACPSteeringInstruction],
         tabID: UUID,
         session: AgentTabSession,
-        reason: String
+        reason: String,
+        stopFence: AgentRunStartStopFence
     ) {
-        var providerTexts = [coalescedACPProviderText(for: instructions)]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !providerTexts.isEmpty else { return }
-        if session.runState == .completed, session.acpController != nil {
-            let first = providerTexts.removeFirst()
-            if !providerTexts.isEmpty {
-                session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
-            }
-            session.mcpFollowUpRunPending = true
-            hooks.continuation.startFollowUpRun(session, first)
+        guard stopFence.permitsStart(of: session) else {
+            withdrawManagedACPSteering(instructions, session: session, stopFence: stopFence)
+            restoreLocalACPSteeringDrafts(instructions, tabID: tabID, session: session, stopFence: stopFence)
             return
         }
-        session.pendingInstructions.insert(contentsOf: providerTexts, at: 0)
+        let current = currentACPSteeringInstructions(instructions, session: session)
+        guard !current.isEmpty else { return }
+        if let first = current.first, current.contains(where: { $0.skipsSlashExpansion != first.skipsSlashExpansion }) {
+            var groups: [[AgentTabSession.ACPSteeringInstruction]] = []
+            for instruction in current {
+                if groups.last?.first?.skipsSlashExpansion == instruction.skipsSlashExpansion {
+                    groups[groups.count - 1].append(instruction)
+                } else {
+                    groups.append([instruction])
+                }
+            }
+            let startsTypedFollowUp = session.runState == .completed && session.acpController != nil
+            for group in startsTypedFollowUp ? groups : Array(groups.reversed()) {
+                requeueACPSteeringAsFollowUp(group, tabID: tabID, session: session, reason: reason, stopFence: stopFence)
+            }
+            return
+        }
+        let providerText = coalescedACPProviderText(for: current)
+        guard !providerText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            current.forEach { $0.managed?.sink.resolve(.notAccepted(message: "The ACP steer contained no provider text.")) }
+            return
+        }
+        let localDrafts = current.filter { $0.managed == nil }
+            .map(\.draftText)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let followUp = AgentTabSession.PendingInstruction(
+            providerText: providerText,
+            localDraftText: localDrafts.isEmpty ? nil : localDrafts.joined(separator: "\n"),
+            stopFence: stopFence,
+            skipsSlashExpansion: current.contains(where: \.skipsSlashExpansion)
+        )
+        current.forEach { $0.managed?.sink.resolve(.delivered(.queuedFollowUp)) }
+        if session.runState == .completed, session.acpController != nil {
+            session.mcpFollowUpRunPending = true
+            hooks.continuation.startTypedACPFollowUpRun(session, followUp)
+            return
+        }
+        session.pendingInstructions.insert(followUp, at: 0)
         session.isDirty = true
         hooks.bindingObservation.updateBindings(session)
         hooks.persistence.scheduleSave(session)
@@ -776,6 +1119,7 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 do {
+                    try await session.awaitObserverWaitRelease(runID: runID, runAttemptID: runAttemptID)
                     try await dependencies.awaitNoActiveMCPTools(runID)
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 } catch {
@@ -831,7 +1175,7 @@ final class AgentModeRunService {
                     steering.providerText,
                     steering.attachments,
                     steering.taggedFileAttachments,
-                    session
+                    session, steering.skipsSlashExpansion
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush sending native interrupt id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
                 let sendOutcome = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
@@ -931,8 +1275,8 @@ final class AgentModeRunService {
     ) {
         let drafts = (
             session.pendingClaudeSteeringInstructions.map(\.draftText)
-                + session.pendingACPSteeringInstructions.map(\.draftText)
-                + session.pendingInstructions
+                + session.pendingACPSteeringInstructions.filter { $0.managed == nil }.map(\.draftText)
+                + session.pendingInstructions.compactMap(\.localDraftText)
         )
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
@@ -954,15 +1298,106 @@ final class AgentModeRunService {
         )
     }
 
+    private func restoreLocalACPSteeringDrafts(
+        _ instructions: [AgentTabSession.ACPSteeringInstruction],
+        tabID: UUID,
+        session: AgentTabSession? = nil,
+        stopFence: AgentRunStartStopFence? = nil
+    ) {
+        if let stopFence, let session,
+           !hooks.queuedWorkRecovery.isCurrentSessionBinding(session, stopFence)
+        {
+            return
+        }
+        let drafts = instructions.filter { $0.managed == nil }
+            .map(\.draftText)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !drafts.isEmpty else { return }
+        hooks.queuedWorkRecovery.restoreDraftText(
+            tabID, drafts.joined(separator: "\n"), "Restored local ACP steering after Stop", .prependAlways
+        )
+    }
+
+    /// Synchronously retracts queued producers at managed-stop claim time. A naturally completed
+    /// run must not leave pre-stop follow-ups armed when its cleanup admission later fails.
+    func withdrawQueuedWorkForManagedStop(tabID: UUID, session: AgentTabSession) {
+        session.claudeSteeringFlushTask?.cancel()
+        session.claudeSteeringFlushTask = nil
+        session.acpSteeringFlushTask?.cancel()
+        session.acpSteeringFlushTask = nil
+        session.acpSteeringFlushID = nil
+        restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+        session.pendingClaudeSteeringInstructions.removeAll()
+        restoreLocalACPSteeringDrafts(session.pendingACPSteeringInstructions, tabID: tabID)
+        if let scheduled = session.scheduledACPFollowUp {
+            session.scheduledACPFollowUp = nil
+            let drafts = ([AgentTabSession.ScheduledACPFollowUp.QueuedInstruction(
+                instruction: scheduled.instruction, stopFence: scheduled.stopFence
+            )] + scheduled.queuedInstructions)
+                .filter { $0.stopFence.binding == session.persistentSessionBindingIdentity }
+                .compactMap(\.instruction.localDraftText)
+            if !drafts.isEmpty {
+                hooks.queuedWorkRecovery.restoreDraftText(
+                    tabID, drafts.joined(separator: "\n"), "Restored local ACP follow-up after Stop", .prependAlways
+                )
+            }
+        }
+        let localPending = session.pendingInstructions
+            .filter { $0.stopFence?.binding == session.persistentSessionBindingIdentity || $0.stopFence == nil }
+            .compactMap(\.localDraftText)
+        if !localPending.isEmpty {
+            hooks.queuedWorkRecovery.restoreDraftText(
+                tabID, localPending.joined(separator: "\n"),
+                "Restored local queued instructions after Stop", .prependAlways
+            )
+        }
+        session.pendingInstructions.removeAll()
+        withdrawManagedACPSteering(session.pendingACPSteeringInstructions, session: session)
+        session.pendingACPSteeringInstructions.removeAll()
+        session.pendingNonCodexUserInputTokenQueue.removeAll()
+        session.pendingSupersedingTurnCompletions = 0
+        session.claudeSupersedingProtectedTurnIDs.removeAll()
+        session.claudeExpectedTurnIDs.removeAll()
+        session.isDirty = true
+    }
+
+    /// Withdraws a startup producer without manufacturing a cancelled run attempt.
+    /// The exact-object admission is checked before the shared user-Stop preparation invalidates
+    /// its generation. Only locally authored Claude draft text is restored.
+    func withdrawPendingStartForSessionLink(
+        tabID: UUID,
+        session: AgentTabSession,
+        admission: AgentRunCancellationAdmission
+    ) -> Bool {
+        guard admission.scope == .pendingStart, admission.claim(for: session) else { return false }
+        hooks.prepareForCancellation(session, .userStop, .explicitStop)
+        withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+        return true
+    }
+
     func cancelRun(
         tabID: UUID,
         session: AgentTabSession,
         intent: CancellationIntent = .userStop,
-        completion: CancellationCompletion = .terminalPublished
+        completion: CancellationCompletion = .terminalPublished,
+        origin: CancellationOrigin = .internalLifecycle,
+        admission: AgentRunCancellationAdmission? = nil,
+        outcomeRecorder: AgentRunCancellationOutcomeRecorder? = nil
     ) async {
+        if let admission {
+            // Pending starts are withdrawn synchronously by their producer owner, not terminalized.
+            guard admission.scope == .activeRun, admission.claim(for: session) else { return }
+            outcomeRecorder?.recordCancellationInitiated()
+        }
+        hooks.prepareForCancellation(session, intent, origin)
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
+            // A settled run can still carry deferred instructions. Local Stop must withdraw
+            // them without manufacturing another terminal attempt.
+            if intent == .userStop, origin == .explicitStop {
+                withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            }
             await terminalCommitBarrier.awaitTerminalPublication(
                 for: revision.ownership,
                 lifecycle: session.runLifecycle
@@ -985,13 +1420,14 @@ final class AgentModeRunService {
         session.claudeSteeringFlushTask = nil
         session.acpSteeringFlushTask?.cancel()
         session.acpSteeringFlushTask = nil
+        session.acpSteeringFlushID = nil
 
-        // Ordinary stop keeps existing behavior. A cwd-changing cancellation
-        // restores every queued, undelivered draft once without replaying the
-        // already-delivered active prompt.
+        // Stop withdraws all undelivered local queued work, including ACP steering
+        // already moved to a binding-fenced follow-up. Never replay the active prompt
+        // or put managed instructions in the user's composer.
         switch intent {
         case .userStop:
-            restoreAllQueuedClaudeSteeringDrafts(tabID: tabID, session: session, strategy: .prependAlways)
+            withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
         case .executionLocationChange:
             restoreAllQueuedDraftsForExecutionLocationChange(tabID: tabID, session: session, strategy: .prependAlways)
         case .runtimeShutdown:
@@ -1007,6 +1443,7 @@ final class AgentModeRunService {
         session.activeNonCodexTurnTokenAccumulator = nil
         session.pendingInstructions.removeAll()
         session.pendingClaudeSteeringInstructions.removeAll()
+        withdrawManagedACPSteering(session.pendingACPSteeringInstructions, session: session)
         session.pendingACPSteeringInstructions.removeAll()
         session.pendingSupersedingTurnCompletions = 0
         session.claudeSupersedingProtectedTurnIDs.removeAll()
@@ -1022,6 +1459,7 @@ final class AgentModeRunService {
         )
 
         let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.cancel")
+        let cancellationLifecycle = session.runLifecycle
         let expectedRunID = session.runID
         let provider = session.provider
         let acpController = session.acpController
@@ -1038,7 +1476,10 @@ final class AgentModeRunService {
             dependencies.codexCoordinator.drainCodexTerminalBuffersForCancellation(session)
         }
 
-        await terminalCommitBarrier.commit(.init(
+        #if DEBUG
+            await testBeforeCancellationCommit?(session)
+        #endif
+        let committedRevision = await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: expectedRunID,
@@ -1090,13 +1531,23 @@ final class AgentModeRunService {
                 AgentModeProcessRunIdentity.clearProcessRunID(for: session)
                 guard let provider, !hasAttemptTerminalResources else { return nil }
                 return { await provider.dispose() }
+            },
+            postCommit: { revision, publicationResult in
+                outcomeRecorder?.recordPrimaryPublication(
+                    revision: revision,
+                    result: publicationResult,
+                    session: session
+                )
             }
         ))
         if completion == .terminalTeardownCompleted {
             await terminalCommitBarrier.awaitTerminalTeardown(
                 for: ownership,
-                lifecycle: session.runLifecycle
+                lifecycle: cancellationLifecycle
             )
+            if committedRevision?.ownership == ownership {
+                outcomeRecorder?.recordTeardownCompleted()
+            }
         }
     }
 

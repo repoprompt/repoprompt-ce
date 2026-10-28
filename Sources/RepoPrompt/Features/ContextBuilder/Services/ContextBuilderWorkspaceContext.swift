@@ -1,8 +1,9 @@
 import Foundation
+import RepoPromptWorkspaceCore
 
 struct ContextBuilderWorkspaceContext {
     let parentAgentSessionID: UUID
-    let frozenTabContext: MCPServerViewModel.TabContextSnapshot
+    let frozenTabContext: MCPTabContextSnapshot
     let worktreeBindings: [AgentSessionWorktreeBinding]
     let lookupContext: WorkspaceLookupContext
     let primaryRootSnapshot: WorkspacePrimaryRootSnapshot?
@@ -19,7 +20,7 @@ struct ContextBuilderWorkspaceContext {
 
     @MainActor
     static func resolve(
-        from snapshot: MCPServerViewModel.TabContextSnapshot,
+        from snapshot: MCPTabContextSnapshot,
         workspaceRepoPaths: [String],
         workspaceDirectoryPath: String,
         workspaceManager: WorkspaceManagerViewModel,
@@ -206,7 +207,7 @@ struct ContextBuilderWorkspaceContext {
 
     private static func emitReadiness(
         phase: ContextBuilderWorkspaceReadinessDiagnosticEvent.Phase,
-        snapshot: MCPServerViewModel.TabContextSnapshot,
+        snapshot: MCPTabContextSnapshot,
         roots: WorkspacePrimaryRootSnapshot?,
         expectedCount: Int,
         error: Error? = nil,
@@ -278,9 +279,9 @@ struct ContextBuilderWorkspaceContext {
         )
     }
 
-    func nestedDiscoveryTabContext(runID: UUID) -> MCPServerViewModel.TabContextSnapshot {
+    func nestedDiscoveryTabContext(runID: UUID) -> MCPTabContextSnapshot {
         let source = frozenTabContext
-        return MCPServerViewModel.TabContextSnapshot(
+        return MCPTabContextSnapshot(
             tabID: source.tabID,
             windowID: source.windowID,
             workspaceID: source.workspaceID,

@@ -1,4 +1,8 @@
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptProcess
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
@@ -6,7 +10,22 @@ import XCTest
 /// identity, the persisted store binding, the launch argument the provider emits, and the
 /// controller reuse key that forces a fresh process when the launch flag changes.
 final class DevinPermissionLevelTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     private typealias Level = DevinAgentToolPreferences.PermissionLevel
+
+    func testDefaultDiscoveryRefusesBeforeInstalledProviderSupportProbe() async {
+        // Exercise the real discovery runner, not a replacement controller factory.
+        let service = DevinModelDiscoveryService(isInstalled: { true })
+        let outcome = await service.discoverIfNeeded()
+        guard case let .failed(message) = outcome else {
+            return XCTFail("Default discovery must refuse before querying the installed provider")
+        }
+        XCTAssertTrue(message.hasPrefix("Provider process launch refused under XCTest."), message)
+    }
 
     // MARK: - PermissionLevel
 
@@ -30,6 +49,14 @@ final class DevinPermissionLevelTests: XCTestCase {
         }
     }
 
+    func testDevinPermissionOptionScope() {
+        XCTAssertTrue(ACPPermissionOptionPolicy.isAutoSelectable(optionID: "allow_once", for: .devin))
+        XCTAssertTrue(ACPPermissionOptionPolicy.isAutoSelectable(optionID: "allow_session", for: .devin))
+        for optionID in ["allow_always", "allow_always_global", "allow_server_session", "allow_server_always"] {
+            XCTAssertFalse(ACPPermissionOptionPolicy.isAutoSelectable(optionID: optionID, for: .devin))
+        }
+    }
+
     func testCLIPermissionModeRoundTripsAndIdentifiesUnsupportedModes() {
         XCTAssertEqual(Level.from(cliPermissionMode: "auto"), .normal)
         XCTAssertEqual(Level.from(cliPermissionMode: "accept-edits"), .acceptEdits)
@@ -49,6 +76,22 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(Level.acceptEdits.launchArguments, ["--permission-mode", "accept-edits"])
         XCTAssertEqual(Level.smart.launchArguments, ["--permission-mode", "smart"])
         XCTAssertEqual(Level.fullApproval.launchArguments, ["--permission-mode", "dangerous"])
+    }
+
+    func testDevinClassifiesOnlyThoughtLevel() {
+        let provider = DevinACPAgentProvider(config: DevinAgentConfig())
+        XCTAssertTrue(provider.supportsParameterizedModelPicker)
+        let cases: [(configID: String, category: String?, kind: ACPModelParameterKind?)] = [
+            ("arbitrary_effort_id", " ThOuGhT_LeVeL ", .thinking),
+            ("thought_level", "model_config", nil),
+            ("speed", "model_config", nil),
+            ("speed", "speed", nil)
+        ]
+        for (configID, category, expectedKind) in cases {
+            XCTAssertEqual(provider.modelParameterKind(for: .init(
+                configID: configID, category: category, displayName: configID, choices: []
+            )), expectedKind)
+        }
     }
 
     func testOnlyFullApprovalIsAWarningLevel() {
@@ -293,7 +336,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         )
         let request = makeRequest(workspacePath: directory.path, launchPermissionMode: "auto")
 
-        let support = try await provider.support(for: request)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+            try await provider.support(for: request)
+        }
         XCTAssertEqual(support, .supported)
         let launch = try provider.makeLaunchConfiguration(for: request)
 
@@ -331,9 +376,9 @@ final class DevinPermissionLevelTests: XCTestCase {
         })
         let config = DevinAgentConfig(commandName: "devin", includeRepoPromptMCPServer: false)
 
-        let initialSupport = try await resolver.probeSupport(for: config)
+        let initialSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
         XCTAssertEqual(initialSupport, .supported)
-        let secondProbe = Task { try await resolver.probeSupport(for: config) }
+        let secondProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
         await gate.waitForSecondCall()
         let resolved = Result { try resolver.resolvedLaunch(for: config) }
         await gate.releaseSecondCall()
@@ -394,6 +439,31 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Return Markdown."))
         XCTAssertTrue(prompt.contains("Summarize this."))
         XCTAssertTrue(prompt.contains("Do not use any tools"))
+    }
+
+    func testOracleAttachmentsCarryThroughToolLessACPMessage() {
+        let image = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
+        let message = DevinCLIProvider.test_makeImageAgentMessage(from: AIMessage(
+            systemPrompt: "Return Markdown.",
+            conversationMessages: [.init(role: .user, content: "Describe the image.")],
+            attachments: [image],
+            temperature: nil,
+            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+            disabledPromptSections: []
+        ))
+
+        XCTAssertEqual(message.attachments, [image])
+        XCTAssertTrue(message.systemPrompt.contains("Return Markdown."))
+        XCTAssertTrue(message.systemPrompt.contains("Do not use any tools"))
+        XCTAssertTrue(message.userMessage.contains("Describe the image."))
+        XCTAssertFalse(message.userMessage.contains("Do not use any tools"))
+        XCTAssertNil(message.resumeSessionID)
+
+        let config = DevinCLIProvider(config: DevinAgentConfig(commandName: "custom-devin", additionalPathHints: ["/custom/bin"])).test_makeImageHeadlessConfig(modelName: "claude-opus-4-6")
+        XCTAssertEqual(config.commandName, "custom-devin")
+        XCTAssertEqual(config.additionalPathHints, ["/custom/bin"])
+        XCTAssertEqual(config.modelString, "claude-opus-4-6")
+        XCTAssertFalse(config.includeRepoPromptMCPServer)
     }
 
     func testOracleModelIdentityPreservesRawDevinModelID() {
@@ -504,7 +574,8 @@ final class DevinPermissionLevelTests: XCTestCase {
         let first = Task { await service.discoverIfNeeded() }
         try await Task.sleep(for: .milliseconds(80))
         first.cancel()
-        _ = await first.value
+        let firstOutcome = await first.value
+        XCTAssertEqual(firstOutcome, .cancelled)
 
         let second = Task { await service.discoverIfNeeded() }
         try await Task.sleep(for: .milliseconds(80))
@@ -583,6 +654,260 @@ final class DevinPermissionLevelTests: XCTestCase {
         return (store, defaults)
     }
 
+    func testHeadlessSparseRepoPromptPermissionsAreScopedAndFailClosed() async throws {
+        for scenario in [
+            "git", "git-input-update", "manage_selection", "corroborated", "foreign", "superseded", "completed",
+            "broad-only", "alias-only", "contradicted", "input-update-contradicted", "meta-contradicted"
+        ] {
+            let directory = try makeTestDirectory(name: "DevinHeadlessPermission")
+            let executable = directory.appendingPathComponent("devin")
+            let record = directory.appendingPathComponent("permission.json")
+            let script = #"""
+            #!/usr/bin/env python3
+            import json
+            import sys
+            if "--help" in sys.argv:
+                print("Run as an ACP server over stdio")
+                sys.exit(0)
+            scenario = "\#(scenario)"
+            def send(message):
+                print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+            def update(value):
+                send({"method": "session/update", "params": {"sessionId": "test-session", "update": value}})
+            prompt_id = None
+            for line in sys.stdin:
+                request = json.loads(line)
+                method = request.get("method")
+                if method == "initialize":
+                    send({"id": request["id"], "result": {"agentCapabilities": {}, "authMethods": []}})
+                elif method == "session/new":
+                    send({"id": request["id"], "result": {"sessionId": "test-session"}})
+                elif method == "session/prompt":
+                    prompt_id = request["id"]
+                    tool = "manage_selection" if scenario == "manage_selection" else "git"
+                    server = "Other" if scenario == "foreign" else "RepoPromptCE"
+                    update({"sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Calling " + tool,
+                            "kind": "read", "rawInput": {"op": "diff", "artifacts": False},
+                            "_meta": {"cognition.ai/toolName": "mcp__" + server + "__" + tool}})
+                    if scenario in ["git-input-update", "input-update-contradicted"]:
+                        update({"sessionUpdate": "tool_call_update", "toolCallId": "tool-1",
+                                "rawInput": {"op": "diff", "artifacts": False, "detail": "patches"}})
+                    if scenario == "superseded":
+                        update({"sessionUpdate": "tool_call_update", "toolCallId": "tool-1", "title": "Shell",
+                                "kind": "execute", "rawInput": {"command": "printf changed"},
+                                "_meta": {"cognition.ai/toolName": "shell"}})
+                    if scenario == "completed":
+                        update({"sessionUpdate": "tool_call_update", "toolCallId": "tool-1", "status": "completed"})
+                    options = [{"optionId": "allow_always", "kind": "allow_once", "name": "Always"},
+                               {"optionId": "ALLOW_ONCE", "kind": "allow_once", "name": "Alias"}]
+                    if scenario not in ["broad-only", "alias-only"]:
+                        options.append({"optionId": "allow_once", "kind": "allow_once", "name": "Allow"})
+                    options.append({"optionId": "reject_once", "kind": "reject_once", "name": "Decline"})
+                    permission_tool = {"toolCallId": "tool-1"}
+                    if scenario == "corroborated":
+                        permission_tool.update({"title": "Calling git", "kind": "read",
+                                                "_meta": {"cognition.ai/toolName": "mcp__RepoPromptCE__git"}})
+                    if scenario in ["contradicted", "input-update-contradicted"]:
+                        permission_tool.update({"title": "Shell command", "kind": "execute"})
+                    if scenario == "meta-contradicted":
+                        permission_tool["_meta"] = {"cognition.ai/toolName": "shell"}
+                    send({"id": "permission-1", "method": "session/request_permission", "params": {
+                        "sessionId": "test-session", "toolCall": permission_tool, "options": options}})
+                elif request.get("id") == "permission-1":
+                    with open(r"\#(record.path)", "w", encoding="utf-8") as output:
+                        json.dump(request["result"]["outcome"], output)
+                    send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
+                elif method == "session/cancel" and prompt_id is not None:
+                    send({"id": prompt_id, "result": {"stopReason": "cancelled"}})
+            """#
+            try script.write(to: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            let provider = DevinACPHeadlessAgentProvider(
+                config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: true),
+                workspacePath: directory.path,
+                providerFactory: { _ in
+                    DevinACPAgentProvider(config: DevinAgentConfig(
+                        commandName: executable.path,
+                        includeRepoPromptMCPServer: true
+                    ), repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true"))
+                }
+            )
+            do {
+                try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                    let stream = try await provider.streamAgentMessage(AgentMessage(userMessage: "Discover"))
+                    for try await _ in stream {}
+                }
+                XCTFail("Unattested provider metadata must require approval: \(scenario)")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("approval"), "\(scenario): \(error)")
+            }
+            // Stream failure precedes child-process receipt; wait for the recorded wire
+            // response before disposal can terminate the fixture.
+            let responseRecorded = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                guard let data = try? Data(contentsOf: record) else { return false }
+                return (try? JSONSerialization.jsonObject(with: data)) != nil
+            }, object: nil)
+            await fulfillment(of: [responseRecorded], timeout: 2)
+            await provider.dispose()
+            let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+            XCTAssertEqual(response, ["outcome": "selected", "optionId": "reject_once"], scenario)
+        }
+    }
+
+    func testSparseDevinRepoPromptPermissionRequiresExplicitAllowOnce() async throws {
+        let directory = try makeTestDirectory(name: "DevinSparsePermission")
+        let executable = directory.appendingPathComponent("devin")
+        let record = directory.appendingPathComponent("permission.json")
+        let script = #"""
+        #!/usr/bin/env python3
+        import json
+        import sys
+        if "--help" in sys.argv:
+            print("Run as an ACP server over stdio")
+            sys.exit(0)
+
+        record_path = r"\#(record.path)"
+
+        def send(message):
+            print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+
+        prompt_id = None
+        for line in sys.stdin:
+            request = json.loads(line)
+            method = request.get("method")
+            if method == "initialize":
+                send({"id": request["id"], "result": {"agentCapabilities": {}, "authMethods": []}})
+            elif method == "session/new":
+                send({"id": request["id"], "result": {"sessionId": "test-session"}})
+            elif method == "session/prompt":
+                prompt_id = request["id"]
+                send({"method": "session/update", "params": {"sessionId": "test-session", "update": {
+                    "sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Calling get_file_tree from RepoPromptCE",
+                    "kind": "read", "rawInput": {"type": "roots"},
+                    "_meta": {"cognition.ai/toolName": "mcp__RepoPromptCE__get_file_tree"}
+                }}})
+                send({"id": "permission-1", "method": "session/request_permission", "params": {
+                    "sessionId": "test-session", "toolCall": {"toolCallId": "tool-1"},
+                    "options": [
+                        {"optionId": "ALLOW_ONCE", "kind": "allow_once", "name": "Alias"},
+                        {"optionId": "allow_always", "kind": "allow_always", "name": "Always"},
+                        {"optionId": "allow_once", "kind": "allow_once", "name": "Allow"}
+                    ]
+                }})
+            elif request.get("id") == "permission-1":
+                with open(record_path, "w", encoding="utf-8") as output:
+                    json.dump(request.get("result"), output)
+                send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
+        """#
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let provider = DevinACPAgentProvider(
+            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: true),
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true")
+        )
+        let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
+        let controller = try ACPAgentSessionController(
+            provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
+        )
+        do {
+            _ = try await controller.bootstrap()
+            let events = await controller.events
+            let consumer = Task { () -> Bool in
+                for await event in events {
+                    if case let .approvalRequested(approval) = event {
+                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: .accept)
+                        return true
+                    }
+                }
+                return false
+            }
+            try await controller.prompt(AgentMessage(userMessage: "Read roots"), request: request)
+            await controller.shutdown()
+            let approvalRequested = await consumer.value
+            XCTAssertTrue(approvalRequested, "Injected server configuration and cached metadata do not authenticate invocation identity")
+        } catch {
+            await controller.shutdown()
+            throw error
+        }
+        let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: Any])
+        let outcome = try XCTUnwrap(response["outcome"] as? [String: Any])
+        XCTAssertEqual(outcome["outcome"] as? String, "selected")
+        XCTAssertEqual(outcome["optionId"] as? String, "allow_once")
+    }
+
+    func testExplicitDevinPermissionUsesExactIDsOrCancels() async throws {
+        for (options, decision, expectedID) in [
+            (#"[{"optionId":"ALLOW_ONCE","kind":"allow_once"},{"optionId":"allow_session","kind":"allow_always"}]"#, AgentApprovalDecision.accept, nil),
+            (#"[{"optionId":"ALLOW_SESSION","kind":"allow_always"},{"optionId":"allow_once","kind":"allow_once"}]"#, .acceptForSession, "allow_once"),
+            (#"[{"optionId":"allow_session","kind":"allow_always"},{"optionId":"allow_once","kind":"allow_once"}]"#, .acceptForSession, "allow_session")
+        ] {
+            let directory = try makeTestDirectory(name: "DevinExactPermission")
+            let executable = directory.appendingPathComponent("devin")
+            let record = directory.appendingPathComponent("response.json")
+            let script = #"""
+            #!/usr/bin/env python3
+            import json
+            import sys
+            if "--help" in sys.argv:
+                print("Run as an ACP server over stdio")
+                sys.exit(0)
+            def send(message):
+                print(json.dumps({"jsonrpc": "2.0", **message}), flush=True)
+            prompt_id = None
+            for line in sys.stdin:
+                request = json.loads(line)
+                method = request.get("method")
+                if method == "initialize":
+                    send({"id": request["id"], "result": {"agentCapabilities": {}, "authMethods": []}})
+                elif method == "session/new":
+                    send({"id": request["id"], "result": {"sessionId": "test-session"}})
+                elif method == "session/prompt":
+                    prompt_id = request["id"]
+                    send({"method": "session/update", "params": {"sessionId": "test-session", "update": {
+                        "sessionUpdate": "tool_call", "toolCallId": "tool-1", "title": "Shell command", "kind": "execute"
+                    }}})
+                    send({"id": "permission-1", "method": "session/request_permission", "params": {
+                        "sessionId": "test-session", "toolCall": {"toolCallId": "tool-1"},
+                        "options": json.loads(r'\#(options)')
+                    }})
+                elif request.get("id") == "permission-1":
+                    with open(r"\#(record.path)", "w", encoding="utf-8") as output:
+                        json.dump(request["result"]["outcome"], output)
+                    send({"id": prompt_id, "result": {"stopReason": "end_turn"}})
+            """#
+            try script.write(to: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+            let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
+            let controller = try ACPAgentSessionController(
+                provider: DevinACPAgentProvider(config: DevinAgentConfig(
+                    commandName: executable.path,
+                    includeRepoPromptMCPServer: false
+                )),
+                runRequest: request,
+                allowsProviderProcessLaunchForTesting: true
+            )
+            do {
+                _ = try await controller.bootstrap()
+                let events = await controller.events
+                let prompt = Task { try await controller.prompt(AgentMessage(userMessage: "Run"), request: request) }
+                for await event in events {
+                    if case let .approvalRequested(approval) = event {
+                        await controller.respondToPermissionRequest(id: approval.requestID.displayValue, decision: decision)
+                        break
+                    }
+                }
+                try await prompt.value
+                await controller.shutdown()
+            } catch {
+                await controller.shutdown()
+                throw error
+            }
+            let response = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: record)) as? [String: String])
+            XCTAssertEqual(response["outcome"], expectedID == nil ? "cancelled" : "selected")
+            XCTAssertEqual(response["optionId"], expectedID)
+        }
+    }
+
     private func makeProvider() throws -> (DevinACPAgentProvider, URL) {
         let directory = try makeTestDirectory(name: "DevinPermissionLevelTests")
         let executable = directory.appendingPathComponent("devin")
@@ -651,6 +976,11 @@ private actor DevinProbeEnvironmentGate {
 }
 
 final class DevinIntegrationConfigurationTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+    }
+
     func testOverlayPreservesXDGEntriesAndDevinWritesThroughCleanup() throws {
         let sourceRoot = try makeTestDirectory(name: "DevinIntegrationSource")
         let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
@@ -662,7 +992,7 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
             atomically: true,
             encoding: .utf8
         )
-        try "native config".write(
+        try #"{"native": "config"}"#.write(
             to: devinSource.appendingPathComponent("config.json"),
             atomically: true,
             encoding: .utf8
@@ -674,7 +1004,10 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         )
         let sourceMCP: [String: Any] = [
             "mcpServers": [
-                "Existing": ["transport": "stdio", "command": "existing"]
+                "Existing": ["transport": "stdio", "command": "existing"],
+                RepoPromptMCPServerConfiguration.defaultServerName: [
+                    "transport": "stdio", "command": "/Applications/RepoPrompt.app/Contents/MacOS/repoprompt-mcp"
+                ]
             ]
         ]
         try JSONSerialization.data(withJSONObject: sourceMCP).write(
@@ -705,7 +1038,9 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         let mergedRoot = try XCTUnwrap(JSONSerialization.jsonObject(with: mergedData) as? [String: Any])
         let mergedServers = try XCTUnwrap(mergedRoot["mcpServers"] as? [String: Any])
         XCTAssertNotNil(mergedServers["Existing"])
-        XCTAssertNotNil(mergedServers[RepoPromptMCPServerConfiguration.defaultServerName])
+        let injected = try XCTUnwrap(mergedServers[RepoPromptMCPServerConfiguration.defaultServerName] as? [String: Any])
+        XCTAssertEqual(injected["command"] as? String, executable.path)
+        XCTAssertEqual(injected["args"] as? [String], ["--backend", "app"])
         let existing = try XCTUnwrap(mergedServers["Existing"] as? [String: Any])
         XCTAssertEqual((existing["env"] as? [String: String])?["XDG_CONFIG_HOME"], sourceRoot.path)
 
@@ -738,12 +1073,151 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: overlayRoot.path))
     }
 
+    func testOverlayDisablesForeignMCPImportsWithoutChangingNativeConfig() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationForeignImports")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        let nativeData = try JSONSerialization.data(withJSONObject: [
+            "agent": ["model": "native-model"],
+            "read_config_from": ["zed": false]
+        ])
+        try nativeData.write(to: nativeConfig)
+        let executable = sourceRoot.appendingPathComponent("repoprompt-mcp")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: executable.path),
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayConfig = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+            .appendingPathComponent("devin", isDirectory: true)
+            .appendingPathComponent("config.json")
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: overlayConfig.path))
+        let overlay = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: overlayConfig)) as? [String: Any]
+        )
+        XCTAssertEqual((overlay["agent"] as? [String: String])?["model"], "native-model")
+        XCTAssertEqual(
+            overlay["read_config_from"] as? [String: Bool],
+            ["zed": false, "claude": false, "cursor": false]
+        )
+
+        try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
+
+        XCTAssertEqual(try Data(contentsOf: nativeConfig), nativeData)
+    }
+
+    func testCleanupPublishesDevinSettingsWritesWithoutImportOverride() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationSettingsWrite")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        try JSONSerialization.data(withJSONObject: ["agent": ["model": "before"]]).write(to: nativeConfig)
+        let executable = sourceRoot.appendingPathComponent("repoprompt-mcp")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: executable.path),
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayConfig = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+            .appendingPathComponent("devin", isDirectory: true)
+            .appendingPathComponent("config.json")
+        var overlay = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: overlayConfig)) as? [String: Any]
+        )
+        overlay["agent"] = ["model": "after"]
+        try JSONSerialization.data(withJSONObject: overlay).write(to: overlayConfig, options: .atomic)
+
+        try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
+
+        let native = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: nativeConfig)) as? [String: Any]
+        )
+        XCTAssertEqual((native["agent"] as? [String: String])?["model"], "after")
+        XCTAssertNil(native["read_config_from"])
+    }
+
+    /// Cleanup undoes only the import toggles RepoPrompt set: other `read_config_from` keys the
+    /// run changed survive, a toggle the user had set is restored, and one RepoPrompt added is
+    /// removed.
+    func testCleanupRestoresOnlyTheImportTogglesRepoPromptChanged() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationReadConfigFromWrite")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        try JSONSerialization.data(withJSONObject: [
+            "read_config_from": ["zed": false, "claude": true]
+        ]).write(to: nativeConfig)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            mcpServers: .disableAll,
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayConfig = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+            .appendingPathComponent("devin/config.json")
+        var overlay = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: overlayConfig)) as? [String: Any]
+        )
+        var readConfigFrom = try XCTUnwrap(overlay["read_config_from"] as? [String: Bool])
+        XCTAssertEqual(readConfigFrom, ["zed": false, "claude": false, "cursor": false])
+        readConfigFrom["zed"] = true
+        readConfigFrom["windsurf"] = false
+        overlay["read_config_from"] = readConfigFrom
+        try JSONSerialization.data(withJSONObject: overlay).write(to: overlayConfig, options: .atomic)
+
+        try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
+
+        let native = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: nativeConfig)) as? [String: Any]
+        )
+        XCTAssertEqual(
+            native["read_config_from"] as? [String: Bool],
+            ["zed": true, "windsurf": false, "claude": true]
+        )
+    }
+
+    func testCleanupLeavesJSON5NativeSettingsUntouchedWhenDevinWroteOtherKeys() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationJSON5SettingsWrite")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        let nativeText = "{\n  // keep this comment\n  \"agent\": {\"model\": \"before\"},\n}\n"
+        try nativeText.write(to: nativeConfig, atomically: true, encoding: .utf8)
+
+        let prepared = try DevinIntegrationConfiguration.prepare(
+            workingDirectory: sourceRoot.path,
+            mcpServers: .disableAll,
+            sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+        )
+        let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+        let overlayConfig = overlayRoot.appendingPathComponent("devin/config.json")
+        var overlay = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: overlayConfig)) as? [String: Any]
+        )
+        overlay["agent"] = ["model": "after"]
+        try JSONSerialization.data(withJSONObject: overlay).write(to: overlayConfig, options: .atomic)
+
+        XCTAssertThrowsError(try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Recovery data remains at \(overlayRoot.path)"))
+        }
+        XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), nativeText)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlayConfig.path))
+        try? FileManager.default.removeItem(at: overlayRoot)
+    }
+
     func testCleanupPreservesNewerNativeConfigAndRetainsRecoveryOverlay() throws {
         let sourceRoot = try makeTestDirectory(name: "DevinIntegrationConcurrentNativeWrite")
         let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
         try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
         let nativeConfig = devinSource.appendingPathComponent("config.json")
-        try "original".write(to: nativeConfig, atomically: true, encoding: .utf8)
+        try #"{"original": true}"#.write(to: nativeConfig, atomically: true, encoding: .utf8)
 
         let prepared = try DevinIntegrationConfiguration.prepare(
             workingDirectory: sourceRoot.path,
@@ -766,12 +1240,48 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         try? FileManager.default.removeItem(at: overlayRoot)
     }
 
+    /// A foreign writer (for example the user's own `devin` CLI) changing native settings during
+    /// the run must not be mistaken for a Devin write while the overlay still holds what
+    /// `prepare` wrote, including when Devin rewrote it byte-identically.
+    func testCleanupSkipsUnchangedOverlaySettingsWhenNativeConfigChanges() throws {
+        for devinRewritesIdenticalBytes in [false, true] {
+            let sourceRoot = try makeTestDirectory(name: "DevinIntegrationForeignNativeWrite")
+            let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+            try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+            let nativeConfig = devinSource.appendingPathComponent("config.json")
+            try #"{"agent": {"model": "before"}}"#.write(to: nativeConfig, atomically: true, encoding: .utf8)
+
+            let prepared = try DevinIntegrationConfiguration.prepare(
+                workingDirectory: sourceRoot.path,
+                mcpServers: .disableAll,
+                sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+            )
+            let overlayRoot = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+            addTeardownBlock { try? FileManager.default.removeItem(at: overlayRoot) }
+            let overlayConfig = overlayRoot
+                .appendingPathComponent("devin", isDirectory: true)
+                .appendingPathComponent("config.json")
+            if devinRewritesIdenticalBytes {
+                try Data(contentsOf: overlayConfig).write(to: overlayConfig, options: .atomic)
+            }
+            let nativeAfter = #"{"agent": {"model": "native-after"}, "preferred_family_models": {"f": "native-after"}}"#
+            try nativeAfter.write(to: nativeConfig, atomically: true, encoding: .utf8)
+
+            var replacements = 0
+            try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact) { _ in replacements += 1 }
+
+            XCTAssertEqual(replacements, 0, "rewrite=\(devinRewritesIdenticalBytes)")
+            XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), nativeAfter, "rewrite=\(devinRewritesIdenticalBytes)")
+            XCTAssertFalse(FileManager.default.fileExists(atPath: overlayRoot.path), "rewrite=\(devinRewritesIdenticalBytes)")
+        }
+    }
+
     func testCleanupRestoresNativeConfigWhenItChangesDuringPublication() throws {
         let sourceRoot = try makeTestDirectory(name: "DevinIntegrationPublicationRace")
         let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
         try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
         let nativeConfig = devinSource.appendingPathComponent("config.json")
-        try "original".write(to: nativeConfig, atomically: true, encoding: .utf8)
+        try #"{"original": true}"#.write(to: nativeConfig, atomically: true, encoding: .utf8)
 
         let prepared = try DevinIntegrationConfiguration.prepare(
             workingDirectory: sourceRoot.path,
@@ -841,7 +1351,7 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
         try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
         let nativeConfig = devinSource.appendingPathComponent("config.json")
-        try "original".write(to: nativeConfig, atomically: true, encoding: .utf8)
+        try #"{"original": true}"#.write(to: nativeConfig, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nativeConfig.path)
 
         let prepared = try DevinIntegrationConfiguration.prepare(
@@ -867,7 +1377,7 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         )) { error in
             XCTAssertTrue(error.localizedDescription.contains("Recovery data remains at \(overlayRoot.path)"))
         }
-        XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), "original")
+        XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), #"{"original": true}"#)
         let mode = try XCTUnwrap(
             FileManager.default.attributesOfItem(atPath: nativeConfig.path)[.posixPermissions] as? NSNumber
         )
@@ -880,11 +1390,9 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         let sourceRoot = try makeTestDirectory(name: "DevinIntegrationNoMCP")
         let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
         try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
-        try "native config".write(
-            to: devinSource.appendingPathComponent("config.json"),
-            atomically: true,
-            encoding: .utf8
-        )
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        let nativeData = try JSONSerialization.data(withJSONObject: ["agent": ["model": "native-model"]])
+        try nativeData.write(to: nativeConfig)
         let sourceMCP: [String: Any] = [
             "mcpServers": ["Existing": ["transport": "stdio", "command": "existing"]]
         ]
@@ -905,15 +1413,87 @@ final class DevinIntegrationConfigurationTests: XCTestCase {
         )
 
         XCTAssertEqual((overlayMCP["mcpServers"] as? [String: Any])?.count, 0)
-        XCTAssertNotNil(try? FileManager.default.destinationOfSymbolicLink(
-            atPath: overlayDevin.appendingPathComponent("config.json").path
-        ))
+        // Emptying mcp_config.json is not enough: Devin would still import Claude and Cursor
+        // MCP servers through the native settings, so the settings are isolated too.
+        let overlayConfig = overlayDevin.appendingPathComponent("config.json")
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: overlayConfig.path))
+        let overlay = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: overlayConfig)) as? [String: Any]
+        )
+        XCTAssertEqual((overlay["agent"] as? [String: String])?["model"], "native-model")
+        XCTAssertEqual(overlay["read_config_from"] as? [String: Bool], ["claude": false, "cursor": false])
 
         try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
         XCTAssertEqual(
             try Data(contentsOf: sourceMCPURL),
             try JSONSerialization.data(withJSONObject: sourceMCP)
         )
+        XCTAssertEqual(try Data(contentsOf: nativeConfig), nativeData)
+    }
+
+    func testMissingNativeSettingsStillIsolatesImportsForBothPolicies() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationMissingSettings")
+        let executable = sourceRoot.appendingPathComponent("repoprompt-mcp")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let nativeConfig = sourceRoot.appendingPathComponent("devin/config.json")
+
+        for policy: DevinIntegrationConfiguration.MCPServersPolicy in [
+            .disableAll,
+            .mergeRepoPrompt(RepoPromptMCPServerConfiguration(command: executable.path))
+        ] {
+            let prepared = try DevinIntegrationConfiguration.prepare(
+                workingDirectory: sourceRoot.path,
+                mcpServers: policy,
+                sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path, "HOME": sourceRoot.path]
+            )
+            let overlayConfig = try XCTUnwrap(prepared.environment["XDG_CONFIG_HOME"]).asFileURL
+                .appendingPathComponent("devin/config.json")
+            let overlay = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(contentsOf: overlayConfig)) as? [String: Any]
+            )
+            XCTAssertEqual(overlay["read_config_from"] as? [String: Bool], ["claude": false, "cursor": false])
+
+            try DevinIntegrationConfiguration.cleanup(artifact: prepared.cleanupArtifact)
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: nativeConfig.path),
+                "the launch-only import switches must not be published as native settings"
+            )
+        }
+    }
+
+    /// A settings file RepoPrompt cannot parse must abort preparation: linking it instead
+    /// would let Devin import Claude or Cursor MCP servers into the launch.
+    func testUnreadableNativeSettingsAbortPreparationForBothPolicies() throws {
+        let sourceRoot = try makeTestDirectory(name: "DevinIntegrationMalformedSettings")
+        let devinSource = sourceRoot.appendingPathComponent("devin", isDirectory: true)
+        try FileManager.default.createDirectory(at: devinSource, withIntermediateDirectories: true)
+        let nativeConfig = devinSource.appendingPathComponent("config.json")
+        let executable = sourceRoot.appendingPathComponent("repoprompt-mcp")
+        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let before = try overlayNames()
+
+        for contents in ["native config", "[]"] {
+            try contents.write(to: nativeConfig, atomically: true, encoding: .utf8)
+            for policy: DevinIntegrationConfiguration.MCPServersPolicy in [
+                .disableAll,
+                .mergeRepoPrompt(RepoPromptMCPServerConfiguration(command: executable.path))
+            ] {
+                XCTAssertThrowsError(
+                    try DevinIntegrationConfiguration.prepare(
+                        workingDirectory: sourceRoot.path,
+                        mcpServers: policy,
+                        sourceEnvironment: ["XDG_CONFIG_HOME": sourceRoot.path]
+                    )
+                ) { error in
+                    XCTAssertTrue(error.localizedDescription.contains(nativeConfig.path), "\(error)")
+                    XCTAssertTrue(error.localizedDescription.contains("fix or remove"), "\(error)")
+                }
+                XCTAssertEqual(try overlayNames(), before)
+                XCTAssertEqual(try String(contentsOf: nativeConfig, encoding: .utf8), contents)
+            }
+        }
     }
 
     func testMalformedSourceMCPDoesNotLeaveAnOverlay() throws {

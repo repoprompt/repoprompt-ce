@@ -52,6 +52,13 @@ public enum ClaudeCompatibleBackendModelBehavior: Codable, Hashable, Sendable {
     case claudeSlotMapping(ClaudeCompatibleSlotMapping)
 }
 
+/// Shared host/provider validation bounds for optional backend overrides.
+public enum ClaudeCompatibleBackendLimits {
+    /// RepoPrompt requires at least one second to avoid accidental seconds-as-milliseconds input.
+    public static let requestTimeoutMilliseconds = 1000 ... Int(Int32.max)
+    public static let contextWindowTokens = 1 ... Int(Int32.max)
+}
+
 /// Sanitized persisted backend configuration supplied by the host at launch/catalog time.
 /// Secrets are deliberately absent; the host owns secure storage and may pass a
 /// resolved launch environment separately after keychain access succeeds.
@@ -62,6 +69,9 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
     public let baseURL: String
     public let auth: ClaudeCompatibleBackendAuth
     public let modelBehavior: ClaudeCompatibleBackendModelBehavior
+    public let requestTimeoutMilliseconds: Int?
+    public let contextWindowTokens: Int?
+    public let httpCredentialConsentEndpoint: String?
 
     public init(
         id: ClaudeCompatibleBackendID,
@@ -69,7 +79,10 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         displayName: String,
         baseURL: String,
         auth: ClaudeCompatibleBackendAuth,
-        modelBehavior: ClaudeCompatibleBackendModelBehavior
+        modelBehavior: ClaudeCompatibleBackendModelBehavior,
+        requestTimeoutMilliseconds: Int?,
+        contextWindowTokens: Int?,
+        httpCredentialConsentEndpoint: String? = nil
     ) {
         self.id = id
         self.isEnabled = isEnabled
@@ -77,6 +90,9 @@ public struct ClaudeCompatibleBackendConfig: Codable, Hashable, Sendable {
         self.baseURL = baseURL
         self.auth = auth
         self.modelBehavior = modelBehavior
+        self.requestTimeoutMilliseconds = requestTimeoutMilliseconds
+        self.contextWindowTokens = contextWindowTokens
+        self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
     }
 }
 
@@ -237,6 +253,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let fableRaw = "fable"
     private static let fable51Raw = "claude-fable-5-1"
     private static let fable5Raw = "claude-fable-5"
+    private static let mythos51Raw = "claude-mythos-5-1"
     private static let opus1mRaw = "opus[1m]"
     private static let opus55Raw = "claude-opus-5-5"
     private static let opus5Raw = "claude-opus-5"
@@ -244,6 +261,7 @@ public enum ClaudeCompatibleModelCatalog {
     private static let opus47Raw = "claude-opus-4-7"
     private static let opus46Raw = "claude-opus-4-6"
     private static let opus45Raw = "claude-opus-4-5"
+    private static let sonnet55Raw = "claude-sonnet-5-5"
     private static let sonnet5Raw = "claude-sonnet-5"
     private static let sonnet46Raw = "claude-sonnet-4-6"
     private static let sonnet45Raw = "claude-sonnet-4-5"
@@ -266,6 +284,12 @@ public enum ClaudeCompatibleModelCatalog {
             rawValue: fable5Raw,
             displayName: "Fable 5",
             description: "Pinned Claude Fable 5 with 1M context for demanding reasoning and long-horizon agentic work.",
+            supportsXHigh: true
+        ),
+        StaticModel(
+            rawValue: mythos51Raw,
+            displayName: "Mythos 5.1 (Restricted)",
+            description: "Pinned Claude Mythos 5.1 with 1M context. Restricted-access tier; only works for entitled accounts and is never used as a default.",
             supportsXHigh: true
         ),
         StaticModel(
@@ -321,6 +345,12 @@ public enum ClaudeCompatibleModelCatalog {
             displayName: "Sonnet Latest",
             description: "Balanced speed and capability. Good for general coding, analysis, and everyday work.",
             supportsXHigh: false
+        ),
+        StaticModel(
+            rawValue: sonnet55Raw,
+            displayName: "Sonnet 5.5",
+            description: "Pinned Claude Sonnet 5.5 with 1M context and adaptive thinking. Balanced speed and capability for everyday engineering.",
+            supportsXHigh: true
         ),
         StaticModel(
             rawValue: sonnet5Raw,

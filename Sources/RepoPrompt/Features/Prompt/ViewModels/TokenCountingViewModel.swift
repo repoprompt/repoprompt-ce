@@ -1,6 +1,9 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptSettingsCore
 import SwiftUI
 
 @MainActor
@@ -457,7 +460,7 @@ class TokenCountingViewModel: ObservableObject {
     #endif
 
     @MainActor
-    func forceImmediateRecount() async {
+    func forceImmediateRecount(windowOrdinal: Int? = nil) async {
         #if DEBUG
             let forceStartMS = PromptTokenRecountDiagnostics.start()
             let replacedDebounceTask = tokenUpdateDebounceTask != nil
@@ -486,7 +489,9 @@ class TokenCountingViewModel: ObservableObject {
         updateTokenCountTask = nil
         pendingDirty = []
         isImmediateRecountInProgress = true
+        let immediateRecountSpan = StartupPhaseLog.begin(.immediateRecount, window: windowOrdinal)
         await performTokenCountOffMainThread()
+        immediateRecountSpan.end()
         isImmediateRecountInProgress = false
         scheduleTokenCountUpdateIfNeeded()
         #if DEBUG
@@ -518,15 +523,6 @@ class TokenCountingViewModel: ObservableObject {
         // without a compose-tab owner. Normal compose-tab flows inject a provider
         // that publishes the active tab snapshot and reads ComposeTabState.selection.
         return fileManager?.snapshotSelection() ?? StoredSelection()
-    }
-
-    private func allStoreFileRecords(from store: WorkspaceFileContextStore) async -> [WorkspaceFileRecord] {
-        let roots = await store.roots()
-        var records: [WorkspaceFileRecord] = []
-        for root in roots {
-            await records.append(contentsOf: store.files(inRoot: root.id))
-        }
-        return records
     }
 
     private func predominantLanguage(
@@ -608,27 +604,26 @@ class TokenCountingViewModel: ObservableObject {
 
         let store = fileManager.workspaceFileContextStore
         #if DEBUG
-            let allFilesStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.allFiles.begin")
+            let fileExtensionsStartMS = PromptTokenRecountDiagnostics.start()
+            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.fileExtensions.begin")
         #endif
-        let allFileRecords = await allStoreFileRecords(from: store)
+        let detectedExts = await store.allLoadedFileExtensions()
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.allFiles.end",
+                "tokenRecount.calculate.fileExtensions.end",
                 fields: [
-                    "files": "\(allFileRecords.count)",
-                    "duration": allFilesStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "extensions": "\(detectedExts.count)",
+                    "duration": fileExtensionsStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
                 ]
             )
         #endif
         guard !Task.isCancelled else {
             #if DEBUG
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "allFiles", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
+                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "fileExtensions", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
             #endif
             return
         }
-        // Derive and publish the set of detected languages from store-owned file records.
-        let detectedExts = allFileRecords.map { (($0.name as NSString).pathExtension).lowercased() }
+        // Preserve all-loaded language scope without enumerating file records.
         let detectedLangs = detectedExts.compactMap { SyntaxManager.shared.extensionToLanguage[$0] }
         scannedLanguages = Set(detectedLangs)
 

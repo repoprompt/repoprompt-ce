@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 
 /// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
 ///
@@ -6,7 +7,7 @@ import Foundation
 /// users may explicitly select an absolute executable in Settings; ordinary environment and PATH
 /// lookup are intentionally not runtime authorities.
 enum CodexRuntimeAuthority {
-    static let bundledVersion = Version(major: 0, minor: 156, patch: 1)
+    static let bundledVersion = Version(major: 0, minor: 164, patch: 0)
     static let minimumExternalVersion = Version(major: 0, minor: 149, patch: 0)
     static let externalExecutableOverrideEnvironmentKey = "REPOPROMPT_CODEX_EXECUTABLE"
 
@@ -536,6 +537,11 @@ enum CodexRuntimeAuthority {
         executableURL: URL,
         environment: [String: String]
     ) -> String? {
+        do {
+            try ProviderProcessLaunchPolicy.check()
+        } catch {
+            return nil
+        }
         let process = Process()
         let output = Pipe()
         process.executableURL = executableURL

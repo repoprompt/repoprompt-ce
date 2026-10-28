@@ -1,7 +1,10 @@
+import RepoPromptVCS
+
 // MARK: - DEBUG Worktree Startup Benchmark Diagnostics
 
 import Foundation
 import MCP
+import RepoPromptInstrumentation
 
 #if DEBUG
     extension ServerNetworkManager {
@@ -287,12 +290,17 @@ import MCP
                     let snapshot = await resolved.store.debugCodemapGraphIndexAdmissionSnapshot(
                         rootID: targetRootID
                     )
+                    let sourceMode = await resolved.store.debugCodemapRootSourceMode(
+                        rootID: targetRootID
+                    )
                     return debugDiagnosticsResult([
                         "ok": true,
                         "op": op,
                         "action": action,
                         "target_root_id": targetRootID.uuidString,
                         "engine_present": enginePresent,
+                        "source_kind": sourceMode?.sourceKind.rawValue ?? NSNull(),
+                        "manifest_mode": sourceMode?.manifestMode.rawValue ?? NSNull(),
                         "codemap_graph_index": snapshot.map { debugCodemapGraphIndexPayload($0) } ?? [
                             "hold_count": 0,
                             "queued_graph_index_batch_count": 0,

@@ -3,6 +3,28 @@ import Darwin
 import Foundation
 import OSLog
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
+import RepoPromptInstrumentation
+import RepoPromptPersistence
+import RepoPromptProcess
+import RepoPromptShared
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
+
+extension GitDiffCompareSpec {
+    /// Validate even programmatically constructed or decoded specs before Git runs.
+    func validateRevisionArgument() throws {
+        switch self {
+        case let .uncommitted(base), let .uncommittedMergeBase(base),
+             let .staged(base), let .stagedMergeBase(base):
+            try GitRevisionArgument.validate(base)
+        case let .revspec(spec):
+            try GitRevisionArgument.validate(spec)
+        case .unstaged:
+            break
+        }
+    }
+}
 
 enum GitPrefixControlEvidenceCacheMode {
     case automatic
@@ -87,6 +109,43 @@ private final class GitFileManagerPrefixControlCandidateSource: GitPrefixControl
 /// Async Git helper for fetching repository information
 /// Based on the macOS 14+ Swift Git integration guide
 actor GitService {
+    private struct UntrackedStatsKey: Hashable {
+        let root: String
+        let path: String
+    }
+
+    private struct CachedUntrackedStats {
+        let fingerprint: FileContentFingerprint
+        let additions: Int?
+        let deletions: Int?
+        var lastUsed: Date
+    }
+
+    private var untrackedStatsCache: [UntrackedStatsKey: CachedUntrackedStats] = [:]
+    private let untrackedStatsCacheLimit: Int
+    #if DEBUG
+        private var untrackedStatsReadCount = 0
+        func untrackedStatsCacheSnapshotForTesting(at root: URL) -> (reads: Int, count: Int, paths: Set<String>) {
+            (untrackedStatsReadCount, untrackedStatsCache.count, Set(untrackedStatsCache.keys.filter {
+                $0.root == root.standardizedFileURL.path
+            }.map(\.path)))
+        }
+    #endif
+
+    func invalidateUntrackedStats(at root: URL) {
+        let path = root.standardizedFileURL.path
+        untrackedStatsCache = untrackedStatsCache.filter { $0.key.root != path }
+    }
+
+    private func pruneUntrackedStats(at root: URL, paths: Set<String>?) {
+        let rootPath = root.standardizedFileURL.path
+        let now = Date()
+        untrackedStatsCache = untrackedStatsCache.filter { key, value in
+            now.timeIntervalSince(value.lastUsed) < 300
+                && (key.root != rootPath || paths?.contains(key.path) != false)
+        }
+    }
+
     private static let gitProcessTimeout: Duration = .seconds(120)
     private static let gitProcessTerminationGrace: Duration = .seconds(5)
     private static let gitCheckAttrOutputByteLimit = 4 * 1024 * 1024
@@ -104,9 +163,27 @@ actor GitService {
 
     struct GitError: LocalizedError {
         let message: String
+        /// Set only by worktree creation, where the evidence is: its preflight or Git's own `worktree add` stderr.
+        /// Callers classify from this, never by searching a message that also carries refs and paths.
+        var worktreeCreateFailure: WorktreeCreateFailure?
         var errorDescription: String? {
             GitService.friendlyErrorDescription(for: message)
         }
+
+        /// The same failure, also naming the workspace root that `checkout` serves.
+        func naming(workspaceRoot: String, servedBy checkout: String) -> GitError {
+            GitError(
+                message: "\(message) Workspace root \(workspaceRoot) is served by checkout \(checkout).",
+                worktreeCreateFailure: worktreeCreateFailure
+            )
+        }
+    }
+
+    struct WorktreeCreateFailure: Equatable {
+        /// Refused under the mutation lock before any creation side effect or commit fence: nothing was created.
+        let refusedBeforeCreation: Bool
+        /// The requested branch already exists, by the preflight check or by Git's own report.
+        let branchExists: Bool
     }
 
     struct ResolvedWorktreeRecord: Equatable {
@@ -132,6 +209,8 @@ actor GitService {
     }
 
     private enum GitProcessRepositoryBinding {
+        /// Deliberate app discovery only; MCP root grants use scoped layout resolution.
+        case discovery
         case inferred
         case exactObjectRead(GitRepositoryLayout)
         case exactWorktree(GitRepositoryLayout)
@@ -375,7 +454,8 @@ actor GitService {
             command: executablePath,
             arguments: arguments,
             environment: environment,
-            workingDirectory: workingDirectoryPath
+            workingDirectory: workingDirectoryPath,
+            purpose: .tool
         )
     }
 
@@ -386,15 +466,18 @@ actor GitService {
         processTerminationGrace: Duration = GitService.gitProcessTerminationGrace,
         processSpawner: @escaping ProcessSpawner = GitService.defaultProcessSpawner,
         worktreeLayoutCacheLimit: Int = 128,
+        untrackedStatsCacheLimit: Int = 4096,
         inheritedProcessEnvironment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         precondition(worktreeLayoutCacheLimit > 0)
+        precondition(untrackedStatsCacheLimit >= 0)
         self.gitExecutableURL = gitExecutableURL
         self.processAdmissionController = processAdmissionController
         self.workspaceStateAuthority = workspaceStateAuthority
         self.processTerminationGrace = processTerminationGrace
         self.processSpawner = processSpawner
         self.worktreeLayoutCacheLimit = worktreeLayoutCacheLimit
+        self.untrackedStatsCacheLimit = untrackedStatsCacheLimit
         self.inheritedProcessEnvironment = inheritedProcessEnvironment
     }
 
@@ -597,7 +680,8 @@ actor GitService {
     func findGitRoot(from path: URL) async throws -> URL? {
         let (stdout, _, exitCode) = try await runGit(
             ["rev-parse", "--show-toplevel"],
-            at: path
+            at: path,
+            repositoryBinding: .discovery
         )
 
         guard exitCode == 0 else {
@@ -626,7 +710,8 @@ actor GitService {
         }
         let (stdout, _, exitCode) = try await runGit(
             ["rev-parse", "--is-bare-repository"],
-            at: path
+            at: path,
+            repositoryBinding: .discovery
         )
         guard exitCode == 0 else {
             // `rev-parse` has no repository context to inspect when this structured probe
@@ -700,10 +785,13 @@ actor GitService {
     /// Create a Git worktree and return best-effort `.worktreeinclude` copy details.
     /// Receipt observation is additive and fail-open: creation remains successful when
     /// authority or witness evidence cannot be proven.
+    @TaskLocal private static var worktreeCreationCommitFence: (@Sendable () async throws -> Void)?
+
     func createWorktreeWithResult(
         request: GitWorktreeCreateRequest,
         at repoURL: URL,
-        initializationContext: GitWorktreeInitializationContext? = nil
+        initializationContext: GitWorktreeInitializationContext? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeCreateResult {
         let sourceLayout = getLayout(for: repoURL)
         let mutationKey = sourceLayout?.commonDir.standardizedFileURL.path
@@ -793,6 +881,9 @@ actor GitService {
                         throw error
                     }
                 }
+                // Deterministic Git refusals settle here, before any creation side effect and
+                // before the caller's commit fence, so a protected caller can report not-applied.
+                try await validateWorktreeCreatePreconditions(mutationRequest, at: repoURL)
                 var parentEvidence: (
                     lease: GitWorkspaceAuthorityLease,
                     snapshot: WorkspaceRootReusableSnapshot,
@@ -937,9 +1028,13 @@ actor GitService {
                     args.append(mutationRequest.path.standardizedFileURL.path)
                     if let baseRef = mutationRequest.baseRef, !baseRef.isEmpty { args.append(baseRef) }
 
-                    let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+                    let (_, stderr, exitCode) = try await Self.$worktreeCreationCommitFence.withValue(beforeCommit) {
+                        try await runGit(args, at: repoURL)
+                    }
                     guard exitCode == 0 else {
-                        throw GitError(message: "git worktree add failed: \(stderr)")
+                        throw Self.worktreeAddFailure(
+                            stderr: stderr, exitCode: exitCode, request: mutationRequest, repoURL: repoURL
+                        )
                     }
                     let checkoutReport: GitWorktreeCheckoutReport
                     switch trackedCloneDecision {
@@ -2079,6 +2174,110 @@ actor GitService {
         }
     }
 
+    /// Refuses requests that `git worktree add` would deterministically reject. Runs under the
+    /// repository's worktree mutation lock and before any creation side effect, so a refusal here
+    /// proves this request created nothing. Races with Git processes outside RepoPrompt still
+    /// surface from `git worktree add` itself, after the commit fence.
+    private func validateWorktreeCreatePreconditions(
+        _ request: GitWorktreeCreateRequest,
+        at repoURL: URL
+    ) async throws {
+        let branch = request.branch.flatMap { $0.isEmpty ? nil : $0 }
+        if let branch {
+            // `-b` never overwrites an existing branch, with or without `--force`.
+            let (_, _, exitCode) = try await runGit(
+                ["show-ref", "--verify", "--quiet", "refs/heads/\(branch)"],
+                at: repoURL
+            )
+            if exitCode == 0 {
+                throw Self.worktreeCreateRefusal(
+                    "a branch named '\(branch)' already exists; choose a new branch name, or bind the worktree that has it checked out",
+                    branchExists: true,
+                    request: request,
+                    repoURL: repoURL
+                )
+            }
+        }
+        // Without `-b`/`--detach`, Git may DWIM a remote-tracking branch name; leave that to Git.
+        if let baseRef = request.baseRef, !baseRef.isEmpty, branch != nil || request.detach {
+            // Like `git worktree add`, a lone "-" names the previously checked-out ref.
+            let resolvableRef = baseRef == "-" ? "@{-1}" : baseRef
+            let resolves: Bool
+            if resolvableRef.hasPrefix("-") {
+                resolves = false
+            } else {
+                let (_, _, exitCode) = try await runGit(
+                    ["rev-parse", "--verify", "--quiet", "\(resolvableRef)^{commit}"],
+                    at: repoURL
+                )
+                resolves = exitCode == 0
+            }
+            guard resolves else {
+                throw Self.worktreeCreateRefusal(
+                    "base ref '\(baseRef)' does not resolve to a commit",
+                    request: request,
+                    repoURL: repoURL
+                )
+            }
+        }
+        // Git accepts an existing empty directory; anything else at the destination is refused.
+        let destinationPath = request.path.standardizedFileURL.path
+        if let attributes = try? FileManager.default.attributesOfItem(atPath: destinationPath) {
+            let isDirectory = (attributes[.type] as? FileAttributeType) == .typeDirectory
+            let isEmptyDirectory = isDirectory
+                && ((try? FileManager.default.contentsOfDirectory(atPath: destinationPath).isEmpty) ?? false)
+            guard isEmptyDirectory else {
+                throw Self.worktreeCreateRefusal(
+                    "destination path is occupied",
+                    request: request,
+                    repoURL: repoURL
+                )
+            }
+        }
+    }
+
+    /// A refusal proven before any creation side effect, naming the repository Git would run in and the request.
+    private static func worktreeCreateRefusal(
+        _ detail: String,
+        branchExists: Bool = false,
+        request: GitWorktreeCreateRequest,
+        repoURL: URL
+    ) -> GitError {
+        GitError(
+            message: "git worktree add refused before creation in repository \(repoURL.standardizedFileURL.path): \(detail). \(worktreeCreateRequestDescription(request)). Nothing was created.",
+            worktreeCreateFailure: WorktreeCreateFailure(refusedBeforeCreation: true, branchExists: branchExists)
+        )
+    }
+
+    /// Git's own `worktree add` failure, past the commit fence: it makes no claim about what was created.
+    private static func worktreeAddFailure(
+        stderr: String,
+        exitCode: Int32,
+        request: GitWorktreeCreateRequest,
+        repoURL: URL
+    ) -> GitError {
+        let reason = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Git's own report, matched on its stderr rather than on the message below.
+        let branchExists = request.branch.map { !$0.isEmpty && stderr.contains("a branch named '\($0)' already exists") } ?? false
+        return GitError(
+            message: "git worktree add failed in repository \(repoURL.standardizedFileURL.path): \(reason.isEmpty ? "git exited with status \(exitCode)" : reason). \(worktreeCreateRequestDescription(request)).",
+            worktreeCreateFailure: WorktreeCreateFailure(refusedBeforeCreation: false, branchExists: branchExists)
+        )
+    }
+
+    /// The requested branch, base ref, and destination. An omitted base ref is Git's default rather than a claim
+    /// about HEAD; a lone "-" keeps the caller's spelling.
+    private static func worktreeCreateRequestDescription(_ request: GitWorktreeCreateRequest) -> String {
+        let branch = request.branch.flatMap { $0.isEmpty ? nil : "branch '\($0)'" }
+            ?? (request.detach ? "branch omitted (detached)" : "branch omitted")
+        let baseRef = switch request.baseRef {
+        case nil, ""?: "base ref (omitted; Git default)"
+        case "-"?: "base ref '-' (@{-1}, the previously checked-out branch)"
+        case let baseRef?: "base ref '\(baseRef)'"
+        }
+        return "Request: \(branch), \(baseRef), destination \(request.path.standardizedFileURL.path)"
+    }
+
     private static func canonicalizedAppManagedRequestAtMutationBoundary(
         _ request: GitWorktreeCreateRequest
     ) throws -> GitWorktreeCreateRequest {
@@ -2127,6 +2326,8 @@ actor GitService {
     // MARK: - Worktree Merge Primitives
 
     func getMergeBase(sourceHead: String, targetHead: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(sourceHead)
+        try GitRevisionArgument.validate(targetHead)
         let (stdout, stderr, exitCode) = try await runGit(
             ["merge-base", targetHead, sourceHead],
             at: repoURL
@@ -2138,6 +2339,8 @@ actor GitService {
     }
 
     func isAncestor(_ ancestor: String, of descendant: String, at repoURL: URL) async throws -> Bool {
+        try GitRevisionArgument.validate(ancestor)
+        try GitRevisionArgument.validate(descendant)
         let (_, stderr, exitCode) = try await runGit(
             ["merge-base", "--is-ancestor", ancestor, descendant],
             at: repoURL
@@ -2597,6 +2800,7 @@ actor GitService {
 
     /// Get uncommitted modified files in the repository
     func getUncommittedFiles(at repoURL: URL) async throws -> [UncommittedFile] {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "--untracked-files=all"],
             at: repoURL
@@ -2616,25 +2820,31 @@ actor GitService {
             at: repoURL
         )
         guard exitCode == 0 else {
-            throw GitError(message: "git rev-parse HEAD failed: \(stderr)")
+            throw GitError(
+                message: "git rev-parse failed in repository \(repoURL.standardizedFileURL.path) for requested HEAD: \(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
         }
         return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Resolve any ref (branch, tag, commit-ish) to a SHA.
     func getRefSHA(at repoURL: URL, ref: String) async throws -> String {
+        try GitRevisionArgument.validate(ref)
         let (stdout, stderr, exitCode) = try await runGit(
-            ["rev-parse", ref],
+            ["rev-parse", "--verify", "--end-of-options", ref],
             at: repoURL
         )
         guard exitCode == 0 else {
-            throw GitError(message: "git rev-parse \(ref) failed: \(stderr)")
+            throw GitError(
+                message: "git rev-parse failed in repository \(repoURL.standardizedFileURL.path) for requested ref '\(ref)': \(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
         }
         return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Get git status output in porcelain format with NUL delimiters.
     func getStatusPorcelainZ(at repoURL: URL) async throws -> Data {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "-z", "--untracked-files=all"],
             at: repoURL
@@ -2732,6 +2942,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree
     func getDiff(from branch: String, at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Compare branch to working tree to include all uncommitted changes
         let (stdout, stderr, exitCode) = try await runGit(
             ["diff", branch],
@@ -2747,6 +2958,7 @@ actor GitService {
 
     /// Get diff between specified branch and working tree for specific files
     func getDiff(from branch: String, for files: [String], at repoURL: URL) async throws -> String {
+        try GitRevisionArgument.validate(branch)
         // Prefer normal argv for smaller file sets (compatibility),
         // use pathspec-from-file when args are large, and chunk as a fallback.
         let maxChunk = 3000
@@ -3139,6 +3351,28 @@ actor GitService {
         paths: [String]?,
         at repoURL: URL
     ) async throws -> String {
+        let data = try await runDiffData(
+            argsPrefix: argsPrefix,
+            contextLines: contextLines,
+            detectRenames: detectRenames,
+            refArg: refArg,
+            paths: paths,
+            legacyTextOutput: true,
+            at: repoURL
+        )
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    private func runDiffData(
+        argsPrefix: [String],
+        contextLines: Int?,
+        detectRenames: Bool,
+        refArg: String?,
+        paths: [String]?,
+        legacyTextOutput: Bool = false,
+        at repoURL: URL
+    ) async throws -> Data {
+        if let refArg { try GitRevisionArgument.validate(refArg) }
         let maxChunk = 3000
         let pathspecByteLimit = 128 * 1024
         let cleanedPaths = (paths ?? []).filter { !$0.isEmpty }
@@ -3162,15 +3396,15 @@ actor GitService {
             do {
                 var args = baseArgs()
                 args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
-                if let refArg, !refArg.isEmpty {
+                if let refArg {
                     args.append(refArg)
                 }
                 let stdin = makePathspecStdinData(cleanedPaths)
-                let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL, stdin: stdin)
+                let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL, stdin: stdin)
                 guard exitCode == 0 || exitCode == 1 else {
-                    throw GitError(message: "git diff failed: \(stderr)")
+                    throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
                 }
-                return stdout
+                return legacyTextOutput ? Self.diffTextChunkBytes(stdout) : stdout
             } catch {
                 if !shouldFallbackFromPathspecError(error) {
                     throw error
@@ -3180,48 +3414,62 @@ actor GitService {
 
         guard !cleanedPaths.isEmpty else {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            args.append("--")
+            let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
-                throw GitError(message: "git diff failed: \(stderr)")
+                throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
             }
-            return stdout
+            return legacyTextOutput ? Self.diffTextChunkBytes(stdout) : stdout
         }
 
         if cleanedPaths.count <= maxChunk {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
             args.append(contentsOf: cleanedPaths)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
-                throw GitError(message: "git diff failed: \(stderr)")
+                throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
             }
-            return stdout
+            return legacyTextOutput ? Self.diffTextChunkBytes(stdout) : stdout
         }
 
-        var combined = ""
+        var combined = Data()
         for chunk in cleanedPaths.chunked(into: maxChunk) {
             var args = baseArgs()
-            if let refArg, !refArg.isEmpty {
+            if let refArg {
                 args.append(refArg)
             }
             args.append("--")
             args.append(contentsOf: chunk)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGitData(args, at: repoURL)
             guard exitCode == 0 || exitCode == 1 else {
-                throw GitError(message: "git diff failed: \(stderr)")
+                throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
             }
-            if !stdout.isEmpty {
-                combined += stdout
-                if !combined.hasSuffix("\n") { combined += "\n" }
-            }
+            Self.appendDiffChunk(stdout, to: &combined, legacyTextOutput: legacyTextOutput)
         }
         return combined
+    }
+
+    nonisolated static func diffTextChunkBytes(_ output: Data) -> Data {
+        // Preserve the existing text API's per-invocation UTF-8 export behavior.
+        Data((String(data: output, encoding: .utf8) ?? "").utf8)
+    }
+
+    nonisolated static func appendDiffChunk(
+        _ output: Data,
+        to combined: inout Data,
+        legacyTextOutput: Bool
+    ) {
+        let chunk = legacyTextOutput ? diffTextChunkBytes(output) : output
+        guard !chunk.isEmpty else { return }
+        combined.append(chunk)
+        if legacyTextOutput, combined.last != 10 { combined.append(10) }
     }
 
     func getDiffUncommitted(
@@ -3702,22 +3950,26 @@ actor GitService {
         case let .branch(ref): [ref]
         }
 
-        let numstatArgs = ["diff"] + reference + ["--numstat"]
-        let nameStatusArgs = ["diff"] + reference + ["--name-status"]
+        for ref in reference {
+            try GitRevisionArgument.validate(ref)
+        }
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
+        let numstatArgs = ["diff"] + reference + ["--numstat", "-z"]
+        let nameStatusArgs = ["diff"] + reference + ["--name-status", "-z"]
 
         // Run all commands in parallel -----------------------------------------
-        async let numstatResult = runGit(numstatArgs, at: repoURL)
-        async let nameStatResult = runGit(nameStatusArgs, at: repoURL)
-        async let untrackedResult = runGit(["ls-files", "--others", "--exclude-standard"], at: repoURL)
+        async let numstatResult = runGitData(numstatArgs, at: repoURL)
+        async let nameStatResult = runGitData(nameStatusArgs, at: repoURL)
+        async let untrackedResult = runGitData(["ls-files", "--others", "--exclude-standard", "-z"], at: repoURL)
 
         let (numOut, numErr, numExit) = try await numstatResult
         guard numExit == 0 || numExit == 1 else {
-            throw GitError(message: "git diff --numstat failed: \(numErr)")
+            throw GitError(message: "git diff --numstat failed: \(String(decoding: numErr, as: UTF8.self))")
         }
 
         let (nameOut, nameErr, nameExit) = try await nameStatResult
         guard nameExit == 0 || nameExit == 1 else {
-            throw GitError(message: "git diff --name-status failed: \(nameErr)")
+            throw GitError(message: "git diff --name-status failed: \(String(decoding: nameErr, as: UTF8.self))")
         }
 
         let (untrackedOut, _, untrackedExit) = try await untrackedResult
@@ -3726,8 +3978,8 @@ actor GitService {
         }
 
         // Parse outputs ----------------------------------------------------------
-        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
-            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        let (statsMap, statusMap) = try MCPToolWorkCountDiagnostics.measureGitParse {
+            try (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
         }
 
         // Merge into unified results --------------------------------------------
@@ -3739,9 +3991,9 @@ actor GitService {
             let tuple = statsMap[path]
             let additions = tuple?.0
             let deletions = tuple?.1
-            results.append(
+            try results.append(
                 UncommittedFile(
-                    path: path,
+                    path: path.utf8String(),
                     status: status,
                     additions: additions,
                     deletions: deletions
@@ -3750,14 +4002,12 @@ actor GitService {
         }
 
         // Add untracked files ----------------------------------------------------
-        let untrackedFiles = untrackedOut
-            .split(separator: "\n")
-            .map { String($0) }
-            .filter { !$0.isEmpty }
+        let untrackedFiles = try GitDiffMachineRecords.paths(untrackedOut).map { try $0.utf8String() }
 
+        pruneUntrackedStats(at: repoURL, paths: Set(untrackedFiles))
         for path in untrackedFiles {
             // Only add if not already in the results (avoid duplicates)
-            if !allPaths.contains(path) {
+            if try !allPaths.contains(GitDiffPath(bytes: Data(path.utf8))) {
                 let stats = untrackedLineStats(for: path, repoURL: repoURL)
                 results.append(
                     UncommittedFile(
@@ -3805,9 +4055,9 @@ actor GitService {
         }
         switch kind {
         case .numstat:
-            argsPrefix.append("--numstat")
+            argsPrefix.append(contentsOf: ["--numstat", "-z"])
         case .nameStatus:
-            argsPrefix.append("--name-status")
+            argsPrefix.append(contentsOf: ["--name-status", "-z"])
         }
 
         let refArg: String? = switch compare {
@@ -3832,9 +4082,9 @@ actor GitService {
         detectRenames: Bool = false,
         paths: [String]? = nil,
         at repoURL: URL
-    ) async throws -> String {
+    ) async throws -> Data {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .numstat)
-        return try await runDiff(
+        return try await runDiffData(
             argsPrefix: argsPrefix,
             contextLines: nil,
             detectRenames: detectRenames,
@@ -3849,9 +4099,9 @@ actor GitService {
         detectRenames: Bool = false,
         paths: [String]? = nil,
         at repoURL: URL
-    ) async throws -> String {
+    ) async throws -> Data {
         let (argsPrefix, refArg) = diffArgs(for: compare, kind: .nameStatus)
-        return try await runDiff(
+        return try await runDiffData(
             argsPrefix: argsPrefix,
             contextLines: nil,
             detectRenames: detectRenames,
@@ -3868,7 +4118,14 @@ actor GitService {
         paths: [String]? = nil,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
+        try compare.validateRevisionArgument()
         if let paths, paths.isEmpty { return [] }
+        switch compare {
+        case .uncommitted, .uncommittedMergeBase, .unstaged:
+            try await requireCompleteWorkingTreeInspection(at: repoURL)
+        case .staged, .stagedMergeBase, .revspec:
+            break
+        }
         let includeUntracked = includeUntrackedWhenApplicable && {
             switch compare {
             case .uncommitted, .uncommittedMergeBase, .unstaged:
@@ -3882,8 +4139,8 @@ actor GitService {
         async let nameOutTask = getDiffNameStatus(compare: compare, detectRenames: detectRenames, paths: paths, at: repoURL)
         async let untrackedFilesTask = includeUntracked ? getUntrackedPaths(paths: paths, at: repoURL) : []
         let (numOut, nameOut, untrackedFiles) = try await (numOutTask, nameOutTask, untrackedFilesTask)
-        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
-            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        let (statsMap, statusMap) = try MCPToolWorkCountDiagnostics.measureGitParse {
+            try (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
         }
 
         var results: [UncommittedFile] = []
@@ -3894,9 +4151,9 @@ actor GitService {
             let tuple = statsMap[path]
             let additions = tuple?.0
             let deletions = tuple?.1
-            results.append(
+            try results.append(
                 UncommittedFile(
-                    path: path,
+                    path: path.utf8String(),
                     status: status,
                     additions: additions,
                     deletions: deletions
@@ -3905,8 +4162,10 @@ actor GitService {
         }
 
         if includeUntracked {
+            // A path-scoped listing cannot evict entries outside its pathspec.
+            pruneUntrackedStats(at: repoURL, paths: paths == nil ? Set(untrackedFiles) : nil)
             for path in untrackedFiles {
-                if !allPaths.contains(path) {
+                if try !allPaths.contains(GitDiffPath(bytes: Data(path.utf8))) {
                     let stats = untrackedLineStats(for: path, repoURL: repoURL)
                     results.append(
                         UncommittedFile(
@@ -3933,19 +4192,19 @@ actor GitService {
 
     private func getUntrackedPaths(paths: [String]?, at repoURL: URL) async throws -> [String] {
         if let paths, paths.isEmpty { return [] }
-        var args = ["ls-files", "--others", "--exclude-standard"]
+        var args = ["ls-files", "--others", "--exclude-standard", "-z"]
         if let paths {
             args.append("--")
             args.append(contentsOf: paths)
         }
-        let (stdout, stderr, exitCode) = try await runGit(
+        let (stdout, stderr, exitCode) = try await runGitData(
             args,
             at: repoURL
         )
         guard exitCode == 0 else {
-            throw GitError(message: "git ls-files failed: \(stderr)")
+            throw GitError(message: "git ls-files failed: \(String(decoding: stderr, as: UTF8.self))")
         }
-        return stdout.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        return try GitDiffMachineRecords.paths(stdout).map { try $0.utf8String() }
     }
 
     func getCommitGraph(maxLines: Int, at repoURL: URL) async throws -> String {
@@ -4012,8 +4271,21 @@ actor GitService {
         let workingStatus: WorkingStatus
     }
 
+    private func requireCompleteWorkingTreeInspection(at repoURL: URL) async throws {
+        // The passive status fence suppresses Git's recursive submodule status:
+        // children have independent executable configuration that has not been
+        // validated. Never interpret that deliberately partial view as clean.
+        // Index metadata is safe to read without entering those repositories.
+        let (index, indexError, indexExit) = try await runGitData(["ls-files", "--stage", "-z", "--", ":/"], at: repoURL)
+        guard indexExit == 0 else { throw GitError(message: "Could not determine status completeness: \(String(decoding: indexError, as: UTF8.self))") }
+        if index.split(separator: 0).contains(where: { $0.starts(with: "160000 ".utf8) }) {
+            throw GitError(message: "Working-tree status is incomplete: tracked submodules cannot be safely inspected by passive Git reads. Cleanliness is unknown; inspect submodules with Git outside RepoPrompt before merging. RepoPrompt cannot approve a worktree merge from this partial status.")
+        }
+    }
+
     /// Read branch metadata and working-tree state from one porcelain-v2 snapshot.
     func getRepositoryStatus(at repoURL: URL) async throws -> RepositoryStatus {
+        try await requireCompleteWorkingTreeInspection(at: repoURL)
         let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -4816,15 +5088,9 @@ actor GitService {
     private nonisolated static func targetEvidenceGitArguments(
         _ arguments: [String]
     ) -> [String] {
-        let safetyArguments = [
-            "-c", "core.fsmonitor=false",
-            "-c", "core.hooksPath=/dev/null",
-            "-c", "core.untrackedCache=false"
-        ]
-        if Array(arguments.prefix(safetyArguments.count)) == safetyArguments {
-            return arguments
-        }
-        return safetyArguments + arguments
+        let fenced = GitReadSafety.arguments(arguments)
+        return fenced.starts(with: GitReadSafety.configurationArguments)
+            ? fenced : GitReadSafety.configurationArguments + fenced
     }
 
     private nonisolated static func targetEvidenceEnvironmentIdentity(
@@ -7206,6 +7472,7 @@ actor GitService {
 
     /// Get commit info (metadata only, no diff).
     func commitInfo(ref: String, at repoURL: URL) async throws -> CommitInfo {
+        try GitRevisionArgument.validate(ref)
         let args = [
             "show",
             "-s",
@@ -7214,7 +7481,9 @@ actor GitService {
             "--no-ext-diff",
             "--no-textconv",
             "--color=never",
-            ref
+            // Peel annotated tags so their headers cannot enter the commit metadata.
+            "\(ref)^{commit}",
+            "--"
         ]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
@@ -7360,11 +7629,21 @@ actor GitService {
         return "\(action) couldn’t launch git-lfs from RepoPrompt’s subprocess environment. If git-lfs is installed, restart RepoPrompt and make sure it’s available from your login shell PATH.\n\nRaw error: \(rawMessage)"
     }
 
+    /// The exact environment this instance's Git subprocesses inherit (memoized on first use).
+    func preparedProcessEnvironment() async -> [String: String] {
+        await processEnvironment()
+    }
+
     private func processEnvironment() async -> [String: String] {
         if let preparedBaseProcessEnvironment {
             return preparedBaseProcessEnvironment
         }
         let shellEnvironment = await CLIEnvironmentCache.shared.environment(enableLogging: false)
+        // Another first-use caller may have prepared the environment while this one was suspended;
+        // the first prepared environment wins so every caller observes the same snapshot.
+        if let preparedBaseProcessEnvironment {
+            return preparedBaseProcessEnvironment
+        }
         let environment = Self.mergedProcessEnvironment(
             baseEnvironment: inheritedProcessEnvironment,
             shellEnvironment: shellEnvironment
@@ -7374,25 +7653,7 @@ actor GitService {
     }
 
     nonisolated static func isVerifiedReadOnlyGitOperation(_ args: [String]) -> Bool {
-        guard let command = args.first else { return false }
-        switch command {
-        case "rev-parse", "status", "ls-files", "ls-tree", "diff", "diff-tree", "check-attr", "merge-base", "merge-tree",
-             "show-ref", "for-each-ref", "log", "rev-list", "show", "blame", "cat-file":
-            return true
-        case "worktree":
-            return args.dropFirst().first == "list"
-        case "symbolic-ref":
-            return args.contains("--short") && args.last == "HEAD"
-        case "branch":
-            return args == ["branch", "--show-current"]
-        case "config":
-            return args.contains("--get") || args.contains("--get-regexp")
-        default:
-            if command == "--git-dir", let configIndex = args.firstIndex(of: "config") {
-                return args[configIndex...].contains("--get")
-            }
-            return false
-        }
+        GitReadSafety.isRead(args)
     }
 
     private func withWorkspaceAuthorityMutation<T>(
@@ -7482,16 +7743,31 @@ actor GitService {
             environment["GIT_OPTIONAL_LOCKS"] = "0"
         }
 
+        var readBinding: GitReadRepositoryBinding?
         switch repositoryBinding {
+        case .discovery:
+            // Native discovery retains Git's ownership checks and may search parents.
+            // Never use it to authorize an MCP data read or reuse ambient selectors.
+            environment.merge(env) { _, new in new }
+            environment = GitReadRepositoryBinding.discoveryEnvironment(environment)
         case .inferred:
-            // For gitfile worktrees, inject GIT_DIR and GIT_WORK_TREE to ensure
-            // git commands operate in the correct context.
-            // Skip for commands that don't need repo context (e.g., --no-index diffs).
-            if requiresRepoContext, let layout = getLayout(for: repoURL), layout.isWorktree {
+            if requiresRepoContext, Self.isVerifiedReadOnlyGitOperation(args) {
+                guard let layout = getLayout(for: repoURL) else {
+                    return (Data(), Data("Repository metadata is missing at the requested Git read root.".utf8), 128)
+                }
+                readBinding = try GitReadRepositoryBinding(layout: layout)
+                environment.merge(env) { _, new in new }
+                environment = GitReadRepositoryBinding.discoveryEnvironment(environment)
                 environment["GIT_DIR"] = layout.gitDir.path
                 environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
+            } else {
+                // Preserve the existing explicit binding for gitfile mutations.
+                if requiresRepoContext, let layout = getLayout(for: repoURL), layout.isWorktree {
+                    environment["GIT_DIR"] = layout.gitDir.path
+                    environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
+                }
+                environment.merge(env) { _, new in new }
             }
-            environment.merge(env) { _, new in new }
         case let .exactObjectRead(layout):
             environment.merge(env) { _, new in new }
             environment = Self.capabilityBoundObjectReadEnvironment(
@@ -7508,7 +7784,7 @@ actor GitService {
 
         let budgetURL = budgetRepoURL ?? repoURL
         let repositoryKey = switch repositoryBinding {
-        case .inferred:
+        case .discovery, .inferred:
             getLayout(for: budgetURL)?.commonDir.standardizedFileURL.path
                 ?? budgetURL.standardizedFileURL.path
         case let .exactObjectRead(layout):
@@ -7523,18 +7799,43 @@ actor GitService {
         )
         do {
             try Task.checkCancellation()
+            if let readBinding {
+                // Explicit GIT_DIR skips Git's native ownership check. Probe the
+                // exact checkout first, without ambient repository selectors, then
+                // keep the captured metadata binding for the actual data command.
+                let probe = try await runAdmittedGitData(
+                    readBinding.ownershipProbeArguments,
+                    at: readBinding.layout.workTreeRoot,
+                    environment: readBinding.ownershipProbeEnvironment(environment),
+                    stdin: nil,
+                    diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
+                    processQueueWaitMicroseconds: lease.queueWaitMicroseconds,
+                    stdoutByteLimit: 4096,
+                    stderrByteLimit: stderrByteLimit,
+                    admissionPriority: admissionPriority,
+                    commandFamily: .repositoryRead,
+                    commandTimeout: commandTimeout,
+                    readBinding: readBinding
+                )
+                if probe.2 != 0 {
+                    throw GitError(message: GitReadSafety.ownershipProbeFailure(exitCode: probe.2, stderr: probe.1))
+                }
+                try readBinding.validateOwnershipProbe(String(decoding: probe.0, as: UTF8.self))
+                try Task.checkCancellation()
+            }
             let result = try await runAdmittedGitData(
                 args,
                 at: repoURL,
                 environment: environment,
                 stdin: stdin,
                 diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
-                processQueueWaitMicroseconds: lease.queueWaitMicroseconds,
+                processQueueWaitMicroseconds: readBinding.map { _ in 0 } ?? lease.queueWaitMicroseconds,
                 stdoutByteLimit: stdoutByteLimit,
                 stderrByteLimit: stderrByteLimit,
                 admissionPriority: admissionPriority,
                 commandFamily: commandFamily ?? Self.commandFamily(for: args),
-                commandTimeout: commandTimeout
+                commandTimeout: commandTimeout,
+                readBinding: readBinding
             )
             await processAdmissionController.release(lease)
             return result
@@ -7608,6 +7909,11 @@ actor GitService {
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily
     ) async throws -> (GitRawOutputSpoolLease, Data, Int32, Process.TerminationReason) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: resourcePolicy.activityTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
@@ -7955,7 +8261,7 @@ actor GitService {
         environment["GIT_ALLOW_PROTOCOL"] = ""
         environment["LC_ALL"] = "C"
         environment["LANG"] = "C"
-        return environment
+        return GitReadSafety.environment(environment)
     }
 
     private nonisolated static func exactWorktreeEnvironment(
@@ -7992,6 +8298,39 @@ actor GitService {
         }
     }
 
+    /// Called inside the existing admission lease; the config query uses that
+    /// lease too, rather than recursively acquiring a per-repository slot.
+    /// Do not cache this result: includes and worktree configuration can change
+    /// without changing the main config's modification time.
+    private func preparePassiveGitRead(
+        _ args: [String],
+        at repoURL: URL,
+        environment: [String: String],
+        diagnosticRepositoryPath: String,
+        admissionPriority: GitProcessAdmissionPriority,
+        commandTimeout: Duration
+    ) async throws -> ([String], [String: String]) {
+        guard GitReadSafety.isRead(args) else { return (args, environment) }
+        try GitReadSafety.validateSupportedRead(args)
+        let safeEnvironment = GitReadSafety.environment(environment)
+        if GitReadSafety.needsDriverCheck(args), let commandIndex = GitReadSafety.commandIndex(in: args) {
+            let query = Array(args.prefix(commandIndex)) + GitReadSafety.driverQuery
+            let (configuration, diagnostic, exitCode) = try await runAdmittedGitData(
+                query, at: repoURL, environment: safeEnvironment, stdin: nil,
+                diagnosticRepositoryPath: diagnosticRepositoryPath,
+                processQueueWaitMicroseconds: 0,
+                stdoutByteLimit: 1024 * 1024, stderrByteLimit: 64 * 1024,
+                admissionPriority: admissionPriority, commandFamily: .repositoryRead,
+                commandTimeout: commandTimeout
+            )
+            guard exitCode == 0 || (exitCode == 1 && configuration.isEmpty && diagnostic.isEmpty) else {
+                throw GitError(message: GitReadSafety.driverQueryFailure(exitCode: exitCode, stderr: diagnostic))
+            }
+            try GitReadSafety.validateDriverConfiguration(configuration, for: args)
+        }
+        return (GitReadSafety.arguments(args), safeEnvironment)
+    }
+
     private func runAdmittedGitData(
         _ args: [String],
         at repoURL: URL,
@@ -8003,8 +8342,14 @@ actor GitService {
         stderrByteLimit: Int?,
         admissionPriority: GitProcessAdmissionPriority,
         commandFamily: GitProcessCommandFamily,
-        commandTimeout: Duration
+        commandTimeout: Duration,
+        readBinding: GitReadRepositoryBinding? = nil
     ) async throws -> (Data, Data, Int32) {
+        let (args, environment) = try await preparePassiveGitRead(
+            args, at: repoURL, environment: environment,
+            diagnosticRepositoryPath: diagnosticRepositoryPath,
+            admissionPriority: admissionPriority, commandTimeout: commandTimeout
+        )
         #if DEBUG
             let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
         #endif
@@ -8021,6 +8366,12 @@ actor GitService {
             let injectedDrainFailure = drainCreationFailureForTesting
         #endif
         let physicalMutationGuard = try await MCPDomainMutationCommitContext.physicalMutationGuard()
+        // Only delegated creation carries this callback. All repository resolution, mutation-lock,
+        // eligibility and process-lane waits have completed; rejection here leaves no Git worktree
+        // or branch. Once admitted, checkout and receipt completion retain ordinary semantics.
+        if args.prefix(2).elementsEqual(["worktree", "add"]) {
+            try await Self.worktreeCreationCommitFence?()
+        }
 
         return try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation {
@@ -8076,6 +8427,7 @@ actor GitService {
                 do {
                     try lifecycleController.checkCancellationBeforeSpawn()
                     try physicalMutationGuard?.revalidate()
+                    try readBinding?.revalidate()
                     let spawnInterval = GitProcessSpawnDiagnostics.beginSpawnInterval(
                         family: commandFamily,
                         priority: admissionPriority
@@ -8660,10 +9012,37 @@ actor GitService {
 
     private func untrackedLineStats(for path: String, repoURL: URL) -> (additions: Int?, deletions: Int?) {
         let fileURL = repoURL.appendingPathComponent(path)
+        let key = UntrackedStatsKey(root: repoURL.standardizedFileURL.path, path: path)
+        // lstat deliberately makes symlinks uncacheable; their existing read behavior is unchanged.
+        // ctime also catches many same-size writes with restored mtime. Metadata collisions on
+        // coarse filesystems remain possible; this is a statistics cache, not content authority.
+        let fingerprint = try? FileContentFingerprintReader.fingerprint(atPath: fileURL.path)
+        if let fingerprint, var cached = untrackedStatsCache[key], cached.fingerprint == fingerprint {
+            cached.lastUsed = Date()
+            untrackedStatsCache[key] = cached
+            return (cached.additions, cached.deletions)
+        }
+        untrackedStatsCache.removeValue(forKey: key)
         guard let handle = try? FileHandle(forReadingFrom: fileURL) else {
             return (nil, nil)
         }
+        #if DEBUG
+            untrackedStatsReadCount += 1
+        #endif
+        let openedFingerprint = try? FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)
+        var stats: (additions: Int?, deletions: Int?) = (nil, nil)
+        var cacheable = false
         defer {
+            // Never retain partial reads, non-regular files, or content changed/replaced during reading.
+            if cacheable, untrackedStatsCache.count < untrackedStatsCacheLimit,
+               let fingerprint, openedFingerprint == fingerprint,
+               (try? FileContentFingerprintReader.fingerprint(fileDescriptor: handle.fileDescriptor)) == fingerprint,
+               (try? FileContentFingerprintReader.fingerprint(atPath: fileURL.path)) == fingerprint
+            {
+                untrackedStatsCache[key] = CachedUntrackedStats(
+                    fingerprint: fingerprint, additions: stats.additions, deletions: stats.deletions, lastUsed: Date()
+                )
+            }
             try? handle.close()
         }
 
@@ -8673,20 +9052,28 @@ actor GitService {
         var lastByte: UInt8?
 
         while true {
-            guard let data = try? handle.read(upToCount: chunkSize),
-                  !data.isEmpty
-            else {
+            let data: Data
+            do {
+                guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
+                    cacheable = true
+                    break
+                }
+                data = chunk
+            } catch {
                 break
             }
             sawData = true
-            for byte in data {
-                if byte == 0 {
-                    return (nil, nil)
+            let isText = data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                for byte in bytes {
+                    if byte == 0 { return false }
+                    if byte == 0x0A { lineCount += 1 }
                 }
-                if byte == 0x0A {
-                    lineCount += 1
-                }
-                lastByte = byte
+                lastByte = bytes.last
+                return true
+            }
+            guard isText else {
+                cacheable = true
+                return stats
             }
         }
 
@@ -8695,96 +9082,23 @@ actor GitService {
                 lineCount += 1
             }
         }
-
-        return (lineCount, 0)
+        stats = (lineCount, 0)
+        return stats
     }
 
-    /// Parses `git diff --numstat` output into a map of path → (additions, deletions)
-    nonisolated func parseNumstatOutput(_ output: String) -> [String: (Int?, Int?)] {
-        var map: [String: (Int?, Int?)] = [:]
-
-        for rawLine in output.split(separator: "\n") {
-            let parts = rawLine.split(separator: "\t", maxSplits: 2).map(String.init)
-            guard parts.count == 3 else { continue }
-
-            let addStr = parts[0]
-            let delStr = parts[1]
-            let pathRaw = parts[2]
-            let path = normalizeRenamedPath(pathRaw)
-
-            let additions = Int(addStr) // nil when "-"
-            let deletions = Int(delStr)
-
-            map[path] = (additions, deletions)
+    /// Decode NUL-framed machine output and join on exact bytes, never pretty-text spelling.
+    nonisolated func parseNumstatOutput(_ output: Data) throws -> [GitDiffPath: (Int?, Int?)] {
+        var map: [GitDiffPath: (Int?, Int?)] = [:]
+        for record in try GitDiffMachineRecords.numstat(output) {
+            map[record.path] = (record.additions, record.deletions)
         }
         return map
     }
 
-    /// Convert numstat rename formats to the final/new path so they line up with name-status.
-    /// Handles:
-    ///  - "old/path => new/path"
-    ///  - "dir/{old => new}/file.swift"
-    nonisolated func normalizeRenamedPath(_ s: String) -> String {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Brace segment renames: "a/{old => new}/b"
-        if trimmed.contains("{"), trimmed.contains("}"), trimmed.contains(" => ") {
-            var out = ""
-            var i = trimmed.startIndex
-            var handledBraceRename = false
-            while i < trimmed.endIndex {
-                if trimmed[i] == "{", let end = trimmed[i...].firstIndex(of: "}") {
-                    let inner = trimmed[trimmed.index(after: i) ..< end]
-                    if let sep = inner.range(of: " => ") {
-                        handledBraceRename = true
-                        out += inner[sep.upperBound...].trimmingCharacters(in: .whitespacesAndNewlines)
-                    } else {
-                        out.append("{")
-                        out += inner
-                        out.append("}")
-                    }
-                    i = trimmed.index(after: end)
-                } else {
-                    out.append(trimmed[i])
-                    i = trimmed.index(after: i)
-                }
-            }
-            if handledBraceRename {
-                return out
-            }
-        }
-
-        // Simple "old/path => new/path" whole-path rename
-        if let arrow = trimmed.range(of: " => ") {
-            return String(trimmed[arrow.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        return trimmed
-    }
-
-    /// Parses `git diff --name-status` lines into a map of path → single-letter status
-    nonisolated func parseNameStatusOutput(_ output: String) -> [String: String] {
-        var map: [String: String] = [:]
-
-        for rawLine in output.split(separator: "\n") {
-            let parts = rawLine
-                .split(separator: "\t", omittingEmptySubsequences: false)
-                .map(String.init)
-            guard !parts.isEmpty else { continue }
-
-            let statusCode = parts[0].trimmingCharacters(in: .whitespaces)
-
-            // Handle rename/copy which provide two paths
-            let path: String = if statusCode.hasPrefix("R") || statusCode.hasPrefix("C") {
-                // new path is last field
-                parts.last ?? ""
-            } else {
-                parts.count > 1 ? parts[1] : ""
-            }
-
-            if !path.isEmpty {
-                map[path] = String(statusCode.prefix(1)) // e.g. "M"
-            }
+    nonisolated func parseNameStatusOutput(_ output: Data) throws -> [GitDiffPath: String] {
+        var map: [GitDiffPath: String] = [:]
+        for record in try GitDiffMachineRecords.nameStatus(output) {
+            map[record.path] = String(record.status.prefix(1))
         }
         return map
     }

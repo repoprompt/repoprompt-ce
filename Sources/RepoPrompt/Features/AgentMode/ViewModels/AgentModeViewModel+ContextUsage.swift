@@ -45,7 +45,8 @@ extension AgentModeViewModel {
         ) != nil
         session.noteLiveContextUsageReport(
             contextUsedTokens: contextUsedTokens,
-            promptTokens: promptTokens,
+            // A prompt count is billed input, not occupancy: it cannot vouch during a compaction turn.
+            promptTokens: session.contextCountVouchAwaitsOccupancyReport ? nil : promptTokens,
             modelContextWindow: modelContextWindow
         )
         return changed
@@ -95,9 +96,16 @@ extension AgentModeViewModel {
         // live occupancy report the billed report stands alone, vouch or withdraw. Note the vouch
         // call treats nil and non-positive inputs as no-ops — only a positive reported count or
         // window can vouch a figure or withdraw an existing vouch.
-        let vouchedCount: Int? = heldOccupancy
-            ? session.contextUsageSnapshot?.used
-            : contextUsedTokens
+        // During an overseer compaction turn the billed count is the pre-compaction context, so it
+        // neither vouches nor withdraws; only this turn's occupancy report may vouch. (ACP turns
+        // without one already returned above; this keeps the rule for any runtime.)
+        let vouchedCount: Int? = if heldOccupancy {
+            session.contextUsageSnapshot?.used
+        } else if session.contextCountVouchAwaitsOccupancyReport {
+            nil
+        } else {
+            contextUsedTokens
+        }
         session.noteLiveContextUsageReport(
             contextUsedTokens: vouchedCount,
             promptTokens: nil,
@@ -166,21 +174,25 @@ extension AgentModeViewModel {
         // Only trust exact stream-derived context snapshots (contextUsedTokens).
         // Do NOT fall back to promptTokens — those are billed-turn aggregates that
         // include internal tool sub-steps and cause inflated context estimates.
-        let latestContextUsed = usage.reversed().compactMap { turn -> Int? in
+        for turn in usage.reversed() {
+            if turn.contextCompacted {
+                return AgentContextUsage(
+                    modelContextWindow: modelContextWindow,
+                    lastTotalTokens: nil,
+                    totalTotalTokens: nil,
+                    awaitingPostCompactionUsage: true
+                )
+            }
             if let contextUsed = turn.contextUsedTokens,
                contextUsed > 0,
                contextUsed <= maxContextTokens
             {
-                return contextUsed
+                return AgentContextUsage(
+                    modelContextWindow: modelContextWindow,
+                    lastTotalTokens: contextUsed,
+                    totalTotalTokens: contextUsed
+                )
             }
-            return nil
-        }.first
-        if let latestContextUsed {
-            return AgentContextUsage(
-                modelContextWindow: modelContextWindow,
-                lastTotalTokens: latestContextUsed,
-                totalTotalTokens: latestContextUsed
-            )
         }
         guard modelContextWindow != nil else { return nil }
         return AgentContextUsage(

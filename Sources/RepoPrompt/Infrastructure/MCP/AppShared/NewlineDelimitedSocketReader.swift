@@ -1,3 +1,5 @@
+import RepoPromptFileSystem
+
 //
 //  NewlineDelimitedSocketReader.swift
 //  RepoPrompt

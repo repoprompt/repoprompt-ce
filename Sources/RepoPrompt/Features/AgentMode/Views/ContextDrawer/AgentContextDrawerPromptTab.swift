@@ -1,3 +1,6 @@
+import RepoPromptFileSystem
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import SwiftUI
 
 struct AgentContextDrawerPromptTab: View {

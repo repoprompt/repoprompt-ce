@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 enum ContextBuilderRunOrigin: Equatable {
     case ui
@@ -212,7 +213,7 @@ enum ContextBuilderRunError: LocalizedError {
 
 struct ContextBuilderMCPRunConfiguration {
     let identity: WorkspaceSelectionIdentity
-    let nestedTabContext: MCPServerViewModel.TabContextSnapshot
+    let nestedTabContext: MCPTabContextSnapshot
     let providerWorkspacePath: String
     let runBehavior: ContextBuilderRunBehavior
     let responseType: String?

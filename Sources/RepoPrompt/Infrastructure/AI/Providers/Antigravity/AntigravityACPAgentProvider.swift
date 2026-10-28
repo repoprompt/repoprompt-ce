@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 /// Google Antigravity's official ACP runtime provider.
 /// The runtime is distributed as `agy_acp_server.par` together with
@@ -38,7 +39,8 @@ struct AntigravityACPAgentProvider: ACPAgentProvider {
             environment: environment,
             workingDirectory: request.workspacePath,
             additionalPathHints: ["~/.local/bin", "/usr/local/bin"],
-            enableDebugLogging: false
+            enableDebugLogging: false,
+            explicitEnvironmentKeys: Set(environment.keys)
         )
     }
 

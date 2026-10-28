@@ -14,8 +14,8 @@ import RepoPromptDomainRuntime
 /// Provider route one managed steer takes, classified before the attributed row exists.
 ///
 /// Deliberately short. An idle target is not a route: it goes through the durable send transaction.
-/// ACP live steering and the shared follow-up queue are not routes: both can hand the steer's text
-/// back to the target user's composer on their recovery paths.
+/// The ACP route is a managed-aware serialized queue; only local draft text is recoverable into
+/// the target user's composer.
 enum AgentSessionLinkManagedSteerRoute: Equatable {
     /// Codex native steer, or its durable fallback queue. The outcome comes from the steer
     /// acknowledgement tracker.
@@ -24,6 +24,8 @@ enum AgentSessionLinkManagedSteerRoute: Equatable {
     case waitingInstruction
     /// The Claude-native interrupt-steering queue.
     case claudeInterrupt
+    /// The serialized ACP interrupt, settle, and prompt queue.
+    case acpQueued
 }
 
 /// Provider-level outcome of one managed steer after its attributed row was appended.
@@ -125,6 +127,10 @@ extension AgentSessionLinkSteerAdmission {
             return .blocked(.endpointInvalidated)
         case .blocked(.targetLoading):
             return .blocked(.targetLoading)
+        case .blocked(.targetRestoreUnavailable):
+            return .blocked(.targetRestoreUnavailable)
+        case .blocked(.targetCreationIncomplete):
+            return .blocked(.targetCreationIncomplete)
         case .blocked(.targetNotIdle):
             break
         }
@@ -137,7 +143,8 @@ extension AgentSessionLinkSteerAdmission {
             // only idle path, so wait for it rather than racing it.
             return .blocked(.targetBusy)
         }
-        if readiness.terminalCommitInProgress
+        if readiness.stopInProgress
+            || readiness.terminalCommitInProgress
             || readiness.isComposerSubmissionInFlight
             || readiness.isPreparingInitialWorktree
             || readiness.isChangingExecutionLocation
@@ -146,5 +153,33 @@ extension AgentSessionLinkSteerAdmission {
         }
         guard let route else { return .blocked(.steerUnavailable) }
         return .steer(route)
+    }
+}
+
+/// Immutable submission data shared by noncomposer callers. The exact endpoint is a dispatch
+/// fence, not a grant: each caller proves its own authority before entering submission.
+struct AgentNoncomposerTurn {
+    let endpoint: DomainAgentSessionLinkEndpointIdentity
+    let providerText: String
+    let attribution: AgentCrossSessionAttribution?
+    let sink: AgentSessionLinkManagedSteerSink
+
+    init(
+        endpoint: DomainAgentSessionLinkEndpointIdentity,
+        providerText: String,
+        attribution: AgentCrossSessionAttribution? = nil,
+        sink: AgentSessionLinkManagedSteerSink
+    ) {
+        self.endpoint = endpoint
+        self.providerText = providerText
+        self.attribution = attribution
+        self.sink = sink
+    }
+
+    init(managed turn: AgentSessionLinkManagedTurn) {
+        endpoint = turn.candidate.domainEndpoint
+        providerText = turn.providerText
+        attribution = turn.attribution
+        sink = turn.sink
     }
 }

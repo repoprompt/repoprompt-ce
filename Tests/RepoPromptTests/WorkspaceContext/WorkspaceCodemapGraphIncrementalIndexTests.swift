@@ -1,6 +1,9 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptPersistence
 import XCTest
 
 /// Regression coverage for #1082: graph-index publication and graph commits must scale with the
@@ -509,17 +512,19 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
         }
         let rootURL = try repository.makeRepository(named: "root", files: repositoryFiles)
         addTeardownBlock { repository.cleanup() }
-        let service = WorkspaceCodemapGitCapabilityService(
+        let service = WorkspaceCodemapRootCapabilityService(
             namespaceSalt: Data(repeating: 0x6C, count: GitBlobRepositoryNamespace.saltByteCount),
             hooks: .none
         )
-        let request = WorkspaceCodemapGitCapabilityRequest(
+        let request = WorkspaceCodemapRootCapabilityRequest(
             rootID: UUID(),
             rootLifetimeID: UUID(),
             loadedRootURL: rootURL
         )
-        guard case let .eligible(capability) = await service.resolve(root: request) else {
-            return XCTFail("The fixture repository must be codemap eligible")
+        guard case let .eligible(rootCapability) = await service.resolve(root: request),
+              case let .git(capability) = rootCapability
+        else {
+            return XCTFail("The fixture repository must be Git codemap eligible")
         }
 
         var maximumVisits: [WorkspaceCodemapGraphReconcileMode: [Int: UInt64]] = [:]
@@ -534,12 +539,12 @@ final class WorkspaceCodemapGraphIncrementalIndexTests: XCTestCase {
                 )
                 let livePaths = (0 ..< seededLiveCount).map { "Live/File\($0).swift" }
                 let authorities = await service.makeSourceAuthorities(
-                    capability: capability,
+                    capability: rootCapability,
                     observedRootEpoch: capability.rootEpoch,
-                    observedRepositoryAuthority: capability.repositoryAuthority,
+                    observedRootAuthority: rootCapability.rootAuthority,
                     candidates: livePaths.map {
                         WorkspaceCodemapSourceAuthorityRequest(
-                            candidateRepositoryRelativePath: $0,
+                            candidateRootRelativePath: $0,
                             observedPathGeneration: 1,
                             currentPathGeneration: 1,
                             observedIngressGeneration: 1,

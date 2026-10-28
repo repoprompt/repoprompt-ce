@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptWorkspaceCore
 
 struct MCPContextBindingMatch {
     let windowID: Int

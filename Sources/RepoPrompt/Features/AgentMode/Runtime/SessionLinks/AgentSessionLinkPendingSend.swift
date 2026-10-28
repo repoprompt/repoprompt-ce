@@ -75,6 +75,10 @@ struct AgentSessionLinkPendingSend: Equatable {
     /// against this, and a duplicate live incarnation of the same UUID must not inherit the entry.
     let observerEndpoint: DomainAgentSessionLinkEndpointIdentity
     let targetSessionID: UUID
+    /// Exact target incarnation captured from the authorizing grant, never a UUID-only lookup.
+    let targetEndpoint: DomainAgentSessionLinkEndpointIdentity
+    /// Captured before the queued drain can suspend; a later user Stop invalidates it.
+    let startStopFence: AgentRunStartStopFence?
     let message: String
     let idempotencyKey: String
     /// Message bytes plus the caller's canonical workflow selector — never the resolved workflow's
@@ -103,6 +107,8 @@ struct AgentSessionLinkPendingSend: Equatable {
         reference: DomainAgentSessionLinkReference,
         observerEndpoint: DomainAgentSessionLinkEndpointIdentity,
         targetSessionID: UUID,
+        targetEndpoint: DomainAgentSessionLinkEndpointIdentity,
+        startStopFence: AgentRunStartStopFence? = nil,
         message: String,
         idempotencyKey: String,
         requestDigest: String,
@@ -116,6 +122,8 @@ struct AgentSessionLinkPendingSend: Equatable {
         self.reference = reference
         self.observerEndpoint = observerEndpoint
         self.targetSessionID = targetSessionID
+        self.targetEndpoint = targetEndpoint
+        self.startStopFence = startStopFence
         self.message = message
         self.idempotencyKey = idempotencyKey
         self.requestDigest = requestDigest
@@ -124,6 +132,11 @@ struct AgentSessionLinkPendingSend: Equatable {
         self.phase = phase
         self.parkReason = parkReason
         self.missedDrainTriggers = missedDrainTriggers
+    }
+
+    /// Stop's inbound scan must match the exact captured endpoint, not a reused session UUID.
+    func addresses(_ endpoint: DomainAgentSessionLinkEndpointIdentity) -> Bool {
+        targetEndpoint == endpoint
     }
 
     // MARK: Lossless drain triggers

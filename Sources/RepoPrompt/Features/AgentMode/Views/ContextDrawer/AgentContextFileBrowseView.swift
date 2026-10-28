@@ -1,3 +1,4 @@
+import RepoPromptFileSystem
 import SwiftUI
 
 func agentContextFileBrowseTreeRootTitle(_ root: AgentContextFileBrowseRoot) -> String {

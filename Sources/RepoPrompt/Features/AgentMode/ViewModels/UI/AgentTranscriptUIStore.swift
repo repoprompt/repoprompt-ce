@@ -1,16 +1,20 @@
 import Foundation
+import RepoPromptInstrumentation
 
 struct AgentTranscriptUISnapshot: Equatable {
     var currentTabID: UUID?
     var presentation: AgentTranscriptPresentationSnapshot
     var isHydrated: Bool
     var presentationRevision: Int
+    var displayMaskRevision: UInt64 = 0
     var followBindingState: AgentModeViewModel.ActiveTranscriptFollowBindingState
     var activeSessionLoadInProgressTabID: UUID?
     var activeBashLiveExecutionByItemID: [UUID: AgentModeViewModel.BashLiveExecutionState]
     var runtimeFooterByItemID: [UUID: AgentMessageRuntimeFooter]
     var fallbackFollowArmingState: AgentModeViewModel.AgentTranscriptAutoFollowArmingState
     var archivedBlocks: [AgentTranscriptRenderBlock]
+    var panePresentation: AgentTranscriptPanePresentation
+    var paneTarget: AgentTranscriptPaneTarget
 
     static let empty = AgentTranscriptUISnapshot(
         currentTabID: nil,
@@ -22,7 +26,9 @@ struct AgentTranscriptUISnapshot: Equatable {
         activeBashLiveExecutionByItemID: [:],
         runtimeFooterByItemID: [:],
         fallbackFollowArmingState: .armed,
-        archivedBlocks: []
+        archivedBlocks: [],
+        panePresentation: .restoring,
+        paneTarget: .unresolved
     )
 
     /// Custom equality uses `presentationRevision` as a cheap fingerprint for
@@ -36,6 +42,7 @@ struct AgentTranscriptUISnapshot: Equatable {
     static func == (lhs: AgentTranscriptUISnapshot, rhs: AgentTranscriptUISnapshot) -> Bool {
         lhs.currentTabID == rhs.currentTabID
             && lhs.presentationRevision == rhs.presentationRevision
+            && lhs.displayMaskRevision == rhs.displayMaskRevision
             && lhs.presentation.tabID == rhs.presentation.tabID
             && lhs.isHydrated == rhs.isHydrated
             && lhs.followBindingState == rhs.followBindingState
@@ -44,26 +51,29 @@ struct AgentTranscriptUISnapshot: Equatable {
             && lhs.activeBashLiveExecutionByItemID == rhs.activeBashLiveExecutionByItemID
             && lhs.runtimeFooterByItemID == rhs.runtimeFooterByItemID
             && lhs.archivedBlocks == rhs.archivedBlocks
+            && lhs.panePresentation == rhs.panePresentation
+            && lhs.paneTarget == rhs.paneTarget
     }
 }
 
 @MainActor
 final class AgentTranscriptUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentTranscriptUISnapshot = .empty
 
     func update(_ snapshot: AgentTranscriptUISnapshot) {
         guard self.snapshot != snapshot else {
             #if DEBUG
-                AgentModePerfDiagnostics.recordStoreUpdate("transcript", published: false)
+                perfRecorder.recordStoreUpdate("transcript", published: false)
             #endif
             return
         }
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 "transcript",
                 published: true,
                 details: [
-                    "tabID": AgentModePerfDiagnostics.shortID(snapshot.currentTabID),
+                    "tabID": perfRecorder.shortID(snapshot.currentTabID),
                     "presentationRevision": String(snapshot.presentationRevision),
                     "visibleRows": String(snapshot.presentation.visibleRows.count),
                     "workingRows": String(snapshot.presentation.workingRows.count),

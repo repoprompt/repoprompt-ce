@@ -47,11 +47,30 @@ enum ClaudeCompatibleModelCatalogAdapter {
         availability: AgentModelCatalog.AvailabilityContext = .current,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption]? {
-        catalogSnapshot(
+        guard let snapshot = catalogSnapshot(
             for: agentKind,
             availability: availability,
             includeClaudeEffortVariants: includeClaudeEffortVariants
-        ).map { modelOptions(from: $0.options, for: agentKind) }
+        ) else { return nil }
+        let baseOptions = includeClaudeEffortVariants
+            ? catalogSnapshot(for: agentKind, availability: availability, includeClaudeEffortVariants: false)?.options ?? []
+            : []
+        return snapshot.options.map { option in
+            let parsed = ClaudeModelSpecifier(raw: option.rawValue)
+            let base = baseOptions.first { candidate in
+                candidate.rawValue == parsed.baseModel
+                    && candidate.supportedEffortLevels.contains(parsed.effortLevel?.rawValue ?? "")
+            }
+            let effort = parsed.effortLevel.flatMap { CodexReasoningEffort.parse($0.rawValue) }
+            return modelOption(
+                from: option,
+                for: agentKind,
+                effortVariant: base.flatMap { base in
+                    effort.map { AgentModelEffortVariant(baseModelRaw: base.rawValue, reasoningEffort: $0) }
+                },
+                supportedEffortRawValues: base?.supportedEffortLevels ?? option.supportedEffortLevels
+            )
+        }
     }
 
     static func modelOptions(
@@ -96,8 +115,11 @@ enum ClaudeCompatibleModelCatalogAdapter {
         forRequestedModelRaw rawModel: String?,
         agentKind: AgentProviderKind
     ) -> Int? {
-        guard let config = compatibleBackendConfig(for: agentKind),
-              let baseRaw = canonicalCompatibleBackendBaseRaw(rawModel, for: agentKind) else { return nil }
+        guard let config = compatibleBackendConfig(for: agentKind) else { return nil }
+        if let window = config.contextWindowTokens, ClaudeCompatibleBackendLimits.contextWindowTokens.contains(window) {
+            return window
+        }
+        guard let baseRaw = canonicalCompatibleBackendBaseRaw(rawModel, for: agentKind) else { return nil }
         let backendModelID = directBackendModelID(forCanonicalBaseRaw: baseRaw, agentKind: agentKind)
             ?? backendModelID(forCanonicalSlotRaw: baseRaw, config: config)
         return ClaudeCompatibleProviderRuntimeBridge.contextWindowTokens(forGLMBackendModelID: backendModelID)
@@ -243,13 +265,20 @@ enum ClaudeCompatibleModelCatalogAdapter {
         )
     }
 
-    private static func modelOption(from option: ClaudeCompatiblePluginModelOption, for agentKind: AgentProviderKind) -> AgentModelOption {
+    private static func modelOption(
+        from option: ClaudeCompatiblePluginModelOption,
+        for agentKind: AgentProviderKind,
+        effortVariant: AgentModelEffortVariant? = nil,
+        supportedEffortRawValues: [String]? = nil
+    ) -> AgentModelOption {
         AgentModelOption(
             rawValue: canonicalModelRaw(option.rawValue, for: agentKind),
             displayName: option.displayName,
             description: option.description,
             isPlaceholderDefault: option.isPlaceholderDefault,
-            isProviderDefault: option.isProviderDefault
+            isProviderDefault: option.isProviderDefault,
+            supportedReasoningEffortRawValues: supportedEffortRawValues ?? option.supportedEffortLevels,
+            effortVariant: effortVariant
         )
     }
 
@@ -387,6 +416,8 @@ enum ClaudeCompatibleModelCatalogAdapter {
         AgentModel.claudeFable.rawValue.lowercased(),
         AgentModel.claudeFable51.rawValue.lowercased(),
         AgentModel.claudeFable5.rawValue.lowercased(),
+        AgentModel.claudeMythos51.rawValue.lowercased(),
+        AgentModel.claudeSonnet55.rawValue.lowercased(),
         AgentModel.claudeSonnet5.rawValue.lowercased(),
         AgentModel.claudeOpus.rawValue.lowercased(),
         AgentModel.claudeOpus1m.rawValue.lowercased(),

@@ -1,8 +1,11 @@
+import Darwin
 import Foundation
+import RepoPromptDomainRuntime
+import RepoPromptProcess
 
-/// Prompt-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
+/// Text-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
-/// one-shot JSON CLI and preserves the existing trusted Grok executable preflight.
+/// one-shot prompt-file CLI and rejects images before launch.
 final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     typealias APIKeyProvider = @Sendable () async throws -> String?
 
@@ -10,6 +13,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     private let launchResolver: GrokBuildACPLaunchResolver
     private let requestTimeout: TimeInterval
     private let apiKeyProvider: APIKeyProvider
+    private let removedNamesProvider: ProviderEnvironmentFiltering.RemovedNamesProvider?
     private let activeRuns = ActiveGrokBuildOneShotRunStore()
 
     init(
@@ -18,12 +22,14 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         requestTimeout: TimeInterval = 6000,
         apiKeyProvider: @escaping APIKeyProvider = {
             try await KeyManager().getAPIKey(for: .grok)
-        }
+        },
+        removedNamesProvider: ProviderEnvironmentFiltering.RemovedNamesProvider? = nil
     ) {
         self.config = config
         self.launchResolver = launchResolver
         self.requestTimeout = requestTimeout
         self.apiKeyProvider = apiKeyProvider
+        self.removedNamesProvider = removedNamesProvider
     }
 
     func streamAgentMessage(
@@ -35,6 +41,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 detail: "Grok Build one-shot requests cannot resume a previous session."
             )
         }
+        let message = try Self.inliningAttachments(of: message)
 
         let trackedRunID = runID ?? UUID()
         return AsyncThrowingStream { continuation in
@@ -71,9 +78,9 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     }
 
     private func runOneShot(_ message: AgentMessage) async throws -> GrokBuildOneShotCompletion {
-        let selection = try Self.resolveModelSelection(
+        let selection = try await Self.resolveModelSelection(
             modelString: config.modelString,
-            snapshot: AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)
+            snapshot: AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .grokBuild)
         )
         try Task.checkCancellation()
 
@@ -94,6 +101,25 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         }
         try Task.checkCancellation()
 
+        var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if apiKey?.isEmpty != false {
+            apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        try Task.checkCancellation()
+
+        // Resolve once after key retrieval. Cleanup and the child must use this exact
+        // snapshot, even if ambient values or the filtering policy change later.
+        let ambientEnvironment = await ProcessEnvironmentBuilder.build(
+            ProcessEnvironmentRequest(purpose: .cliRunner, overrides: launch.environment)
+        ).environment
+        let environment = await ProviderEnvironmentFiltering.filter(
+            ambientEnvironment,
+            for: .grokBuild,
+            explicitOverrides: Self.launchEnvironment(apiKey: apiKey),
+            removedNamesProvider: removedNamesProvider
+        )
+        try Task.checkCancellation()
+
         let promptDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("rp-grok-oneshot-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -101,91 +127,240 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
             withIntermediateDirectories: false,
             attributes: [.posixPermissions: 0o700]
         )
-        defer { try? FileManager.default.removeItem(at: promptDirectory) }
+        return try await Self.withRequestCleanup(
+            promptDirectory: promptDirectory,
+            environment: environment
+        ) {
+            let promptURL = promptDirectory.appendingPathComponent("prompt.txt")
+            let prompt = Self.promptText(from: message)
+            guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw AIProviderError.invalidResponse(detail: "Grok Build prompt is empty")
+            }
+            try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: promptURL.path)
 
-        let promptURL = promptDirectory.appendingPathComponent("prompt.txt")
-        let prompt = Self.promptText(from: message)
-        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw AIProviderError.invalidResponse(detail: "Grok Build prompt is empty")
+            let processConfig = CLIProcessConfiguration(
+                command: launch.command,
+                workingDirectory: promptDirectory.path,
+                environment: environment,
+                // Do not reconstruct withheld ambient names or re-read policy here.
+                environmentFilter: { _, _ in environment },
+                additionalPaths: [],
+                enableDebugLogging: config.enableDebugLogging,
+                resolveCandidates: [(launch.command as NSString).lastPathComponent],
+                shellLookupMode: .disabled
+            )
+            let runner = CLIProcessRunner(config: processConfig)
+
+            let arguments = GrokBuildOneShotCLIOptions(
+                promptFilePath: promptURL.path,
+                model: selection.model,
+                effort: selection.effort
+            ).toTokens()
+
+            let result: (stdout: Data, stderr: Data, status: Int32, timedOut: Bool)
+            do {
+                // Revalidate at the final launch boundary after all async/keychain work.
+                try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
+                result = try await Self.runRequestProcess(
+                    runner: runner,
+                    arguments: arguments,
+                    timeout: requestTimeout
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw mapProcessError(error)
+            }
+
+            if result.timedOut {
+                throw runtimeError(
+                    code: Int(result.status),
+                    message: "Grok Build timed out after \(Int(requestTimeout))s."
+                )
+            }
+
+            if result.status != 0 {
+                throw mapProcessFailure(
+                    exitCode: result.status,
+                    stdout: result.stdout,
+                    stderr: result.stderr
+                )
+            }
+
+            if let errorMessage = Self.structuredErrorMessage(from: result.stdout) {
+                throw normalizeCLIError(message: errorMessage, exitCode: result.status)
+            }
+            guard !result.stdout.isEmpty else {
+                throw AIProviderError.invalidResponse(detail: "Grok Build CLI returned no output")
+            }
+            do {
+                return try Self.parseCompletion(result.stdout)
+            } catch let error as AIProviderError {
+                throw error
+            } catch {
+                throw AIProviderError.invalidResponse(
+                    detail: "Failed to decode Grok Build CLI JSON: \(error.localizedDescription)"
+                )
+            }
         }
-        try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: promptURL.path)
+    }
 
-        let processConfig = CLIProcessConfiguration(
-            command: launch.command,
-            workingDirectory: promptDirectory.path,
-            environment: launch.environment,
-            additionalPaths: [],
-            enableDebugLogging: config.enableDebugLogging,
-            resolveCandidates: [(launch.command as NSString).lastPathComponent],
-            shellLookupMode: .disabled
+    /// The streaming runner's physical finalizer, not its bounded result or cancellation,
+    /// is the authority for when the request's child has stopped writing.
+    private static func runRequestProcess(
+        runner: CLIProcessRunner,
+        arguments: [String],
+        timeout: TimeInterval
+    ) async throws -> (stdout: Data, stderr: Data, status: Int32, timedOut: Bool) {
+        let termination = GrokBuildOneShotProcessTermination()
+        let stream = try await runner.runStreaming(
+            args: arguments,
+            stdin: nil,
+            outputMode: .none,
+            timeout: timeout,
+            onProcessTerminated: { _ in await termination.finish() }
         )
-        let runner = CLIProcessRunner(config: processConfig)
-
-        var additionalEnvironment: [String: String] = [:]
-        var apiKey = config.apiKey?.trimmingCharacters(in: .whitespacesAndNewlines)
-        if apiKey?.isEmpty != false {
-            apiKey = try await apiKeyProvider()?.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if let apiKey, !apiKey.isEmpty {
-            additionalEnvironment["XAI_API_KEY"] = apiKey
-        }
-        try Task.checkCancellation()
-
-        let arguments = GrokBuildOneShotCLIOptions(
-            promptFilePath: promptURL.path,
-            model: selection.model,
-            effort: selection.effort
-        ).toTokens()
-
-        let result: CLIProcessRunner.Result
+        var stdout = Data()
+        var stderr = Data()
+        var exitStatus: (status: Int32, timedOut: Bool)?
         do {
-            // Revalidate at the final launch boundary after all async/keychain work.
-            try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
-            result = try await runner.run(
-                args: arguments,
-                stdin: nil,
-                outputMode: .none,
-                timeout: requestTimeout,
-                additionalEnvironment: additionalEnvironment,
-                cancelChildOnTaskCancellation: true
-            )
-        } catch is CancellationError {
-            throw CancellationError()
+            for try await event in stream {
+                switch event {
+                case let .stdout(data): stdout.append(data)
+                case let .stderr(data): stderr.append(data)
+                case let .terminated(status, timedOut): exitStatus = (status, timedOut)
+                }
+            }
         } catch {
-            throw mapProcessError(error)
-        }
-
-        if result.timedOut {
-            throw runtimeError(
-                code: Int(result.status),
-                message: "Grok Build timed out after \(Int(requestTimeout))s."
-            )
-        }
-
-        if result.status != 0 {
-            throw mapProcessFailure(
-                exitCode: result.status,
-                stdout: result.stdout,
-                stderr: result.stderr
-            )
-        }
-
-        if let errorMessage = Self.structuredErrorMessage(from: result.stdout) {
-            throw normalizeCLIError(message: errorMessage, exitCode: result.status)
-        }
-        guard !result.stdout.isEmpty else {
-            throw AIProviderError.invalidResponse(detail: "Grok Build CLI returned no output")
-        }
-        do {
-            return try Self.parseCompletion(result.stdout)
-        } catch let error as AIProviderError {
+            await termination.wait()
+            try Task.checkCancellation()
             throw error
-        } catch {
-            throw AIProviderError.invalidResponse(
-                detail: "Failed to decode Grok Build CLI JSON: \(error.localizedDescription)"
+        }
+        // AsyncThrowingStream can end normally on consumer cancellation. Always join
+        // physical finalization before the outer request scope removes any artifacts.
+        await termination.wait()
+        try Task.checkCancellation()
+        guard let exitStatus else {
+            throw AIProviderError.invalidResponse(detail: "Grok Build process ended without an exit status")
+        }
+        return (stdout: stdout, stderr: stderr, status: exitStatus.status, timedOut: exitStatus.timedOut)
+    }
+
+    /// Failed deletion is diagnostic and must not replace a successful completion,
+    /// original request failure, or cancellation.
+    static func withRequestCleanup<Value>(
+        promptDirectory: URL,
+        environment: [String: String],
+        removeItem: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) },
+        reportFailure: (String) -> Void = { NSLog("%@", $0) },
+        operation: () async throws -> Value
+    ) async throws -> Value {
+        var sessionDirectory: URL?
+        defer {
+            do {
+                try cleanupRequestArtifacts(
+                    promptDirectory: promptDirectory,
+                    sessionDirectory: sessionDirectory,
+                    removeItem: removeItem
+                )
+            } catch {
+                reportFailure(cleanupFailureDiagnostic(error))
+            }
+        }
+        let physicalDirectory = try resolvedRequestDirectory(promptDirectory)
+        let encoded = encodedCWD(physicalDirectory.path)
+        // Grok hashes longer paths. Refuse before launch rather than infer ownership
+        // from directory names or potentially unfinished .cwd metadata.
+        guard encoded.utf8.count <= 255 else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Grok Build one-shot request directory is too long for safe session cleanup (URL-encoded physical path exceeds 255 bytes). Use a shorter temporary directory and retry."
             )
         }
+        sessionDirectory = sessionsRoot(promptDirectory: physicalDirectory, environment: environment)
+            .appendingPathComponent(encoded, isDirectory: true)
+        return try await operation()
+    }
+
+    private static func cleanupRequestArtifacts(
+        promptDirectory: URL,
+        sessionDirectory: URL?,
+        removeItem: (URL) throws -> Void
+    ) throws {
+        var failure: Error?
+        if let sessionDirectory {
+            do {
+                try removeItemIfPresent(sessionDirectory, removeItem: removeItem)
+            } catch {
+                failure = error
+            }
+        }
+        // Even a failed session delete must not retain the temporary prompt file too.
+        do {
+            try removeItemIfPresent(promptDirectory, removeItem: removeItem)
+        } catch {
+            if failure == nil { failure = error }
+        }
+        if let failure { throw failure }
+    }
+
+    private static func resolvedRequestDirectory(_ directory: URL) throws -> URL {
+        // Foundation can shorten /private/var back to /var while resolving symlinks.
+        // Grok uses the physical getcwd path, so preserve POSIX realpath's spelling.
+        guard let path = realpath(directory.path, nil) else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { free(path) }
+        return URL(fileURLWithPath: String(cString: path), isDirectory: true)
+    }
+
+    private static func sessionsRoot(promptDirectory: URL, environment: [String: String]) -> URL {
+        let override = environment["GROK_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+        let home = override ?? environment["HOME"] ?? NSHomeDirectory()
+        // Preserve symlink/.. spelling: Grok lets the filesystem resolve the path,
+        // and the home may not exist until the child creates it during the request.
+        let absoluteHome = home.hasPrefix("/") ? home : promptDirectory.path + "/" + home
+        return URL(
+            fileURLWithPath: absoluteHome + (override == nil ? "/.grok/sessions" : "/sessions"),
+            isDirectory: true
+        )
+    }
+
+    private static func encodedCWD(_ cwd: String) -> String {
+        cwd.addingPercentEncoding(withAllowedCharacters: CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"))!
+    }
+
+    private static func removeItemIfPresent(_ url: URL, removeItem: (URL) throws -> Void) throws {
+        do {
+            try removeItem(url)
+        } catch {
+            if !isMissingFile(error) { throw error }
+        }
+    }
+
+    private static func isMissingFile(_ error: Error) -> Bool {
+        let error = error as NSError
+        return (error.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code))
+            || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+    }
+
+    private static func cleanupFailureDiagnostic(_ error: Error) -> String {
+        // Do not include error descriptions, domains, paths, or userInfo: any of
+        // those can contain prompt content. The numeric filesystem code is bounded.
+        "[GrokBuildOneShot] Request artifact cleanup failed (filesystem code \((error as NSError).code)); artifacts may remain."
+    }
+
+    /// Process-local overrides, kept separate from Grok's inherited credential/config environment.
+    static func launchEnvironment(apiKey: String?) -> [String: String] {
+        var environment = GrokBuildAgentConfig.importIsolationEnvironment
+        environment["GROK_CLAUDE_HOOKS_ENABLED"] = "0"
+        environment["GROK_CURSOR_HOOKS_ENABLED"] = "0"
+        environment["GROK_SESSION_SEARCH"] = "0"
+        environment["GROK_STORAGE_MODE"] = "local"
+        if let apiKey, !apiKey.isEmpty {
+            environment["XAI_API_KEY"] = apiKey
+        }
+        return environment
     }
 
     private func mapProcessError(_ error: Error) -> Error {
@@ -251,6 +426,17 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
                 userInfo: [NSLocalizedDescriptionKey: message]
             )
         )
+    }
+
+    private static func inliningAttachments(of message: AgentMessage) throws -> AgentMessage {
+        var inlined = message
+        inlined.userMessage = try AttachmentEncoding.textOnlyBody(
+            for: message.attachments,
+            route: .grokBuild,
+            body: message.userMessage
+        )
+        inlined.attachments = []
+        return inlined
     }
 
     private static func promptText(from message: AgentMessage) -> String {
@@ -355,6 +541,23 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
             )
         )
         return results
+    }
+}
+
+/// One request has one finalization waiter. Cancellation must not cancel this join.
+private actor GrokBuildOneShotProcessTermination {
+    private var terminated = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func finish() {
+        terminated = true
+        continuation?.resume()
+        continuation = nil
+    }
+
+    func wait() async {
+        guard !terminated else { return }
+        await withCheckedContinuation { continuation = $0 }
     }
 }
 

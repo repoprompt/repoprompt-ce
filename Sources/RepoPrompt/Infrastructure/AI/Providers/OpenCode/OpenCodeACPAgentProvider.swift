@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private enum LaunchContract {
@@ -76,7 +78,8 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
-            expectedExecutableIdentity: resolvedLaunch.executableIdentity
+            expectedExecutableIdentity: resolvedLaunch.executableIdentity,
+            explicitEnvironmentKeys: Set(environment.keys)
         )
     }
 
@@ -118,7 +121,8 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
 
         return try ACPPromptContentBuilder.blocks(
             text: text,
-            attachments: request.attachments
+            attachments: request.attachments,
+            oracleAttachments: message.attachments
         )
     }
 

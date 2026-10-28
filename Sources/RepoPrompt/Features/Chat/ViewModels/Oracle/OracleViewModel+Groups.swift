@@ -1,6 +1,12 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
+
+struct OracleToolSettlementCallbacks {
+    let prepared: @MainActor @Sendable (_ groupID: OracleGroupID, _ turnID: OracleTurnID) async -> Void
+    let settled: @MainActor @Sendable (_ result: OracleGroupResult, _ turnID: OracleTurnID, _ reconciliationGuidance: String?) -> Void
+}
 
 struct AppOracleGroupExecutionCallbacks {
     let prepared: @MainActor @Sendable (
@@ -25,7 +31,7 @@ private struct AppOracleConfiguredRosterSelection {
 
 private enum AppOracleConfiguredRosterDispatch {
     case singleMCPValue([String: Value])
-    case groupedCompletion(OracleGroupRuntime.Completion)
+    case groupedCompletion(OracleGroupRuntime.Completion, reconciliationGuidance: String?)
 }
 
 private enum AppOracleConfiguredRosterSingleFallback {
@@ -39,10 +45,20 @@ enum AppOracleGroupRouting {
     }
 
     static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
-        try? OracleExecutionProfile(
+        let effort: String?
+        if model.providerType == .grokBuild {
+            let snapshot = AgentACPModelRegistry.shared.resolvedSnapshotIncludingStandardStore(for: .grokBuild)
+            effort = GrokBuildModelSpecifier.decompose(
+                raw: model.modelName,
+                options: snapshot?.options ?? []
+            )?.explicitEffort?.rawValue
+        } else {
+            effort = model.defaultReasoningEffort
+        }
+        return try? OracleExecutionProfile(
             providerID: providerID(for: model),
             modelID: model.modelName,
-            effectiveReasoningEffort: model.defaultReasoningEffort
+            effectiveReasoningEffort: effort
         )
     }
 
@@ -99,15 +115,17 @@ extension OracleViewModel {
             capturedProfile: capturedProfile,
             selectionSnapshotOverride: selectionSnapshotOverride,
             resolvedStartExecution: resolvedStartExecution,
+            contextBuilderSupervision: nil,
             singleFallback: .executeSingleMCPValue
         ) {
         case let .singleMCPValue(value):
             value
-        case let .groupedCompletion(completion):
+        case let .groupedCompletion(completion, reconciliationGuidance):
             Self.oracleGroupValue(
                 completion.result,
                 mode: completion.terminalDocument.turns.last?.input.mode.rawValue ?? "chat",
-                tabContext: tabContext
+                tabContext: tabContext,
+                reconciliationGuidance: reconciliationGuidance
             )
         }
     }
@@ -121,7 +139,8 @@ extension OracleViewModel {
         callbacks: AppOracleGroupExecutionCallbacks? = nil,
         capturedProfile: AgentModelsSettingsProfile? = nil,
         selectionSnapshotOverride: OracleSelectionSnapshot? = nil,
-        resolvedStartExecution: ResolvedOracleExecution? = nil
+        resolvedStartExecution: ResolvedOracleExecution? = nil,
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision? = nil
     ) async throws -> OracleGroupRuntime.Completion {
         switch try await executeConfiguredRosterDispatch(
             args: args,
@@ -132,11 +151,12 @@ extension OracleViewModel {
             capturedProfile: capturedProfile,
             selectionSnapshotOverride: selectionSnapshotOverride,
             resolvedStartExecution: resolvedStartExecution,
+            contextBuilderSupervision: contextBuilderSupervision,
             singleFallback: .rejectTypedCompletion
         ) {
         case .singleMCPValue:
             throw ChatToolError.internalError("Configured Oracle group dispatcher returned a single response.")
-        case let .groupedCompletion(completion):
+        case let .groupedCompletion(completion, _):
             return completion
         }
     }
@@ -151,6 +171,7 @@ extension OracleViewModel {
         capturedProfile: AgentModelsSettingsProfile?,
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         resolvedStartExecution: ResolvedOracleExecution?,
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision?,
         singleFallback: AppOracleConfiguredRosterSingleFallback
     ) async throws -> AppOracleConfiguredRosterDispatch {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
@@ -185,6 +206,13 @@ extension OracleViewModel {
                 snapshotOverride: selectionSnapshotOverride
             )
             : nil
+        // An execution with no override owns the built-in policy; it must not fall
+        // through to a different profile's custom guidance. Continuations use this request's profile.
+        let reconciliationGuidance = if let startExecution {
+            startExecution.reconciliationGuidance
+        } else {
+            profile.oracleReconciliationGuidance
+        }
         let singleExecution: ResolvedOracleExecution? = if let startExecution {
             startExecution
         } else if let sessionID = selection.singleSessionID,
@@ -233,12 +261,14 @@ extension OracleViewModel {
             tabContext: tabContext,
             workspaceID: workspaceID,
             startExecution: startExecution,
+            reconciliationGuidance: reconciliationGuidance,
             selectionSnapshotOverride: selectionSnapshotOverride,
             existingGroup: selection.group,
             frozenInput: frozenInput,
-            callbacks: callbacks
+            callbacks: callbacks,
+            contextBuilderSupervision: contextBuilderSupervision
         )
-        return .groupedCompletion(completion)
+        return .groupedCompletion(completion, reconciliationGuidance: reconciliationGuidance)
     }
 
     @MainActor
@@ -321,10 +351,12 @@ extension OracleViewModel {
         tabContext: OracleSendTabContext?,
         workspaceID: UUID?,
         startExecution: ResolvedOracleExecution?,
+        reconciliationGuidance: String?,
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         existingGroup: OracleGroupDocument?,
         frozenInput: OracleInput?,
-        callbacks: AppOracleGroupExecutionCallbacks?
+        callbacks: AppOracleGroupExecutionCallbacks?,
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision?
     ) async throws -> OracleGroupRuntime.Completion {
         let useTabPrompt = args["use_tab_prompt"]?.boolValue ?? false
         let rawMessage = args["message"]?.stringValue ?? ""
@@ -360,6 +392,26 @@ extension OracleViewModel {
         } else {
             throw ChatToolError.internalError("Resolved Oracle execution is required for a new group.")
         }
+        if let attachments = tabContext?.attachments, !attachments.isEmpty {
+            for (laneIndex, laneModel) in roster.orderedModels.enumerated() {
+                let resolution = PromptViewModel.mcpOraclePlanningModelResolution(
+                    rawValue: laneModel.modelID,
+                    isModelAvailable: { promptVM.mcpOracleIsProviderConfigured(for: $0) }
+                )
+                guard case let .configured(resolvedModel) = resolution else {
+                    throw ChatToolError.invalidParams(
+                        "Attachments require every Oracle lane model to be configured; Oracle \(laneIndex + 1) is unavailable."
+                    )
+                }
+                if case let .failure(error) = AttachmentPlanner.plan(
+                    OracleAttachmentSet(attachments),
+                    route: resolvedModel.attachmentRoute,
+                    limits: .production
+                ) {
+                    throw ChatToolError.invalidParams("Oracle \(laneIndex + 1): \(error.localizedDescription)")
+                }
+            }
+        }
         let input = try frozenInput ?? OracleInput(mode: mode, userMessage: message)
         guard input.mode == mode, input.userMessage == message else {
             throw ChatToolError.invalidParams("Frozen Oracle input does not match the requested mode and message.")
@@ -369,6 +421,7 @@ extension OracleViewModel {
         let runtimeCallbacks = OracleGroupRuntime.Callbacks(
             prepared: { [weak self] document in
                 guard let self else { throw CancellationError() }
+                await recordOracleGroupPresentation(document, invocationID: invocationID)
                 try await restoreOracleGroupProjectionsIfNeeded(
                     document,
                     workspaceID: workspaceID,
@@ -378,6 +431,7 @@ extension OracleViewModel {
                 )
                 if let turn = document.turns.last {
                     try await callbacks?.prepared(document.group.id, turn.id, document.members)
+                    await tabContext?.toolSettlement?.prepared(document.group.id, turn.id)
                 }
             },
             executeLane: { [weak self] invocation in
@@ -390,10 +444,12 @@ extension OracleViewModel {
                     startExecution: startExecution,
                     selectionSnapshotOverride: selectionSnapshotOverride,
                     executionContext: invocation.context,
-                    callbacks: callbacks
+                    callbacks: callbacks,
+                    supervision: contextBuilderSupervision
                 )
             },
-            progress: { event in
+            progress: { [weak self] event in
+                await self?.receiveOracleGroupProgress(event, owner: owner)
                 await callbacks?.progress(event)
             }
         )
@@ -450,9 +506,17 @@ extension OracleViewModel {
                     callbacks: runtimeCallbacks
                 )
             }
+            recordOracleGroupPresentation(completion.terminalDocument)
+            if let turn = completion.terminalDocument.turns.last {
+                tabContext?.toolSettlement?.settled(completion.result, turn.id, reconciliationGuidance)
+            }
             return completion
-        } catch let error as OracleGroupRuntime.RuntimeError {
-            throw mapOracleGroupRuntimeError(error)
+        } catch {
+            await finishOracleGroupPresentation(invocationID: invocationID)
+            if let runtimeError = error as? OracleGroupRuntime.RuntimeError {
+                throw mapOracleGroupRuntimeError(runtimeError)
+            }
+            throw error
         }
     }
 
@@ -589,7 +653,32 @@ extension OracleViewModel {
         startExecution: ResolvedOracleExecution?,
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         executionContext: OracleLaneExecutionContext,
-        callbacks: AppOracleGroupExecutionCallbacks?
+        callbacks: AppOracleGroupExecutionCallbacks?,
+        supervision: ContextBuilderOracleGroupSupervision?
+    ) async throws -> OracleLaneExecutionResponse {
+        let scope = supervision?.makeLane(sessionID: member.memberID.rawValue)
+        let operation = {
+            try await self.executeOracleLaneBody(
+                member: member, args: args, promptVM: promptVM, tabContext: tabContext,
+                startExecution: startExecution, selectionSnapshotOverride: selectionSnapshotOverride,
+                executionContext: executionContext, callbacks: callbacks, scope: scope
+            )
+        }
+        if let scope { return try await scope.run(oracle: self, operation: operation) }
+        return try await operation()
+    }
+
+    @MainActor
+    private func executeOracleLaneBody(
+        member: OracleGroupMember,
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext?,
+        startExecution: ResolvedOracleExecution?,
+        selectionSnapshotOverride: OracleSelectionSnapshot?,
+        executionContext: OracleLaneExecutionContext,
+        callbacks: AppOracleGroupExecutionCallbacks?,
+        scope: ContextBuilderOracleLaneScope?
     ) async throws -> OracleLaneExecutionResponse {
         var laneArgs = args
         laneArgs["chat_id"] = .string(member.publicChatID)
@@ -621,6 +710,7 @@ extension OracleViewModel {
         }
         let resolvedModel = laneExecution.models[resolvedLaneIndex]
         let executionProfile = AppOracleGroupRouting.executionProfile(for: resolvedModel)
+        scope?.executionProfile = executionProfile
         let laneContext: OracleSendTabContext? = if member.laneID.index == 0 {
             tabContext
         } else if let tabContext {
@@ -638,17 +728,22 @@ extension OracleViewModel {
                     tabContext: laneContext,
                     resolvedExecution: laneExecution,
                     resolvedLaneIndex: resolvedLaneIndex,
+                    contextBuilderScope: scope,
                     onProgress: { text, reasoning in
                         partialResponse = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+                        scope?.partialResponse = partialResponse
                         callbacks?.laneProgress(member.laneID, text, reasoning)
                     }
                 )
             } onCancel: { [weak self] in
-                Task { @MainActor in
-                    await self?.cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+                // Scoped cancellation is owned by the lane's arbiter, not an ambient session lookup.
+                if scope == nil {
+                    Task { @MainActor in
+                        await self?.cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+                    }
                 }
             }
-            if Task.isCancelled {
+            if scope == nil, Task.isCancelled {
                 await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
                 throw OracleLaneCancellation(
                     partialResponse: partialResponse,
@@ -659,7 +754,7 @@ extension OracleViewModel {
                 throw OracleLaneFailure(code: "empty_response", message: "Oracle lane returned no response.")
             }
             await executionContext.emitDelta(response)
-            if Task.isCancelled {
+            if scope == nil, Task.isCancelled {
                 await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
                 throw OracleLaneCancellation(
                     partialResponse: partialResponse,
@@ -671,8 +766,8 @@ extension OracleViewModel {
                 executionProfile: executionProfile
             )
         } catch {
-            if Task.isCancelled || error is CancellationError {
-                await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true)
+            if (scope == nil && Task.isCancelled) || error is CancellationError {
+                if scope == nil { await cancelAIResponse(in: sessionID, skipPartialParseAndSave: true) }
                 throw OracleLaneCancellation(
                     partialResponse: partialResponse,
                     executionProfile: executionProfile
@@ -767,16 +862,20 @@ extension OracleViewModel {
             agentModeSessionID: context.agentModeSessionID,
             agentModeRunID: context.agentModeRunID,
             activationPolicy: .background,
-            packaging: context.packaging
+            packaging: context.packaging,
+            attachments: context.attachments
         )
     }
 
     static func oracleGroupValue(
         _ result: OracleGroupResult,
         mode: String,
-        tabContext: OracleSendTabContext?
+        tabContext: OracleSendTabContext?,
+        reconciliationGuidance: String? = nil
     ) -> [String: Value] {
-        var object = OracleGroupMCPCodec.groupFields(result)
+        var object = ContextBuilderOracleGroupReply(
+            result: result, reconciliationGuidance: reconciliationGuidance
+        ).toMCPFields()
         object.merge([
             "chat_id": .string(result.primary.chatID),
             "mode": .string(mode),
@@ -796,6 +895,7 @@ extension OracleViewModel {
     @MainActor
     func deleteOracleGroupIfNeeded(containing session: ChatSession) async throws -> Bool {
         guard let rawGroupID = session.oracleGroupID else { return false }
+        let invalidateDeletedSnapshot = captureChatSessionCatalogDeletionFence(for: session.workspaceID, sessionID: session.id)
         guard let tabID = session.composeTabID,
               let owner = try? Self.oracleGroupOwner(workspaceID: session.workspaceID, tabID: tabID)
         else {
@@ -808,18 +908,40 @@ extension OracleViewModel {
         ) else { return false }
         let memberIDs = Set(group.members.map(\.memberID.rawValue))
         guard memberIDs.contains(session.id) else { return false }
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("Workspace storage changed before the Oracle group could be deleted.")
+        }
         for memberSession in sessions where memberIDs.contains(memberSession.id) && isSessionStreaming(memberSession.id) {
-            await cancelAIResponse(in: memberSession.id, skipPartialParseAndSave: true)
+            guard invalidateDeletedSnapshot.isCurrent() else {
+                throw ChatToolError.internalError("Workspace storage changed before the Oracle group could be deleted.")
+            }
+            await cancelAIResponse(
+                in: memberSession.id,
+                skipPartialParseAndSave: true,
+                cleanupOwnerIsCurrent: invalidateDeletedSnapshot.isCurrent
+            )
+        }
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("Workspace storage changed before the Oracle group could be deleted.")
         }
         try await store.delete(
             groupID: group.group.id,
             owner: owner,
             expectedRevision: group.revision
         )
+        invalidateDeletedSnapshot.invalidate()
+        // A released lane's save is an un-awaited tracked task; let it land (and record its file) before deleting files.
+        if let workspaceID = session.workspaceID { await drainTrackedAutosaves(for: workspaceID) }
+        #if DEBUG
+            await workspaceChatSessionDeletionBeforeCommitForTesting?(session.id)
+        #endif
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("The Oracle group was deleted, but projection cleanup stopped because workspace storage changed.")
+        }
         let removed = sessions.filter { memberIDs.contains($0.id) }
         var projectionCleanupFailed = false
         for projection in removed {
-            clearMCPSessionUIState(for: projection.id)
+            if invalidateDeletedSnapshot.isCurrent() { clearMCPSessionUIState(for: projection.id) }
             if let fileURL = projection.fileURL {
                 do {
                     try await chatData.deleteChatSessionFile(fileURL)
@@ -827,8 +949,13 @@ extension OracleViewModel {
                     projectionCleanupFailed = true
                 }
             }
-            purgeSessionStorage(projection.id)
+            if invalidateDeletedSnapshot.isCurrent() { purgeSessionStorage(projection.id) }
         }
+        guard invalidateDeletedSnapshot.isCurrent() else {
+            throw ChatToolError.internalError("The Oracle group was deleted, but projection cleanup stopped because workspace storage changed.")
+        }
+        // Also fence snapshots started while projection cleanup was awaiting disk writes.
+        invalidateDeletedSnapshot.invalidate()
         sessions.removeAll { memberIDs.contains($0.id) }
         for projection in removed {
             if let tabID = projection.composeTabID,
@@ -902,6 +1029,92 @@ extension OracleViewModel {
             throw ChatToolError.internalError(
                 "The Oracle group was renamed, but one or more projection files could not be updated."
             )
+        }
+    }
+}
+
+// MARK: - Canonical group presentation
+
+extension OracleViewModel {
+    func oracleMemberPresentation(for session: ChatSession) -> OracleMemberPresentation {
+        guard let key = OracleGroupPresentation.Key(session: session),
+              isCurrentOracleProjection(session)
+        else { return .unknown }
+        return oracleGroupPresentations[key]?.member(session) ?? .unknown
+    }
+
+    func recordOracleGroupPresentation(_ document: OracleGroupDocument, invocationID: UUID? = nil) {
+        let next = OracleGroupPresentation(document: document, invocationID: invocationID)
+        if let current = oracleGroupPresentations[next.key] {
+            // A store read can win the race with the prepared callback for the same revision.
+            let beginsKnownExecution = next.revision == current.revision && next.turnID == current.turnID
+                && !current.isTerminal && current.invocationID == nil && invocationID != nil
+            guard next.revision > current.revision || beginsKnownExecution else { return }
+        }
+        oracleGroupPresentations[next.key] = next
+        pruneOracleGroupPresentations()
+    }
+
+    func receiveOracleGroupProgress(_ event: OracleProgressEvent, owner: OracleConversationOwner) {
+        let key = OracleGroupPresentation.Key(groupID: event.groupID, owner: owner)
+        guard var current = oracleGroupPresentations[key] else { return }
+        let previous = current
+        current.receive(event)
+        if current != previous { oracleGroupPresentations[key] = current }
+    }
+
+    /// One group read on opening/switching groups; never per member or text delta.
+    func loadOracleGroupPresentation(containing session: ChatSession) async {
+        guard let key = OracleGroupPresentation.Key(session: session),
+              isCurrentOracleProjection(session)
+        else { return }
+        let previous = oracleGroupPresentations[key]
+        let document = try? await AppDomainRuntimeComposition.shared.oracleConversationStore.load(
+            groupID: key.groupID,
+            owner: key.owner
+        )
+        guard !Task.isCancelled, isCurrentOracleProjection(session) else { return }
+        if let document {
+            recordOracleGroupPresentation(document)
+        } else if oracleGroupPresentations[key] == previous, previous?.invocationID == nil {
+            // A failed fresh read cannot prove the cached turn is still current. Do not, however,
+            // erase a newer runtime publication that arrived while this read was suspended.
+            oracleGroupPresentations.removeValue(forKey: key)
+        }
+    }
+
+    func finishOracleGroupPresentation(invocationID: UUID) async {
+        guard let entry = oracleGroupPresentations.first(where: { $0.value.invocationID == invocationID }) else { return }
+        var ended = entry.value
+        ended.endExecution()
+        oracleGroupPresentations[entry.key] = ended
+        // Runtime catch settlement may already have published failure/cancellation before throwing.
+        // Read independently of caller cancellation, matching the runtime's terminal publication.
+        // If publication also failed, the prepared projection stays unknown, never successful/live.
+        let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+        let groupID = entry.key.groupID
+        let owner = entry.key.owner
+        let document = try? await Task.detached(priority: Task.currentPriority) {
+            try await store.load(groupID: groupID, owner: owner)
+        }.value
+        if let document {
+            recordOracleGroupPresentation(document)
+        }
+        pruneOracleGroupPresentations()
+    }
+
+    func pruneOracleGroupPresentations() {
+        let retained = Set(sessions.compactMap(OracleGroupPresentation.Key.init(session:)))
+        let next = oracleGroupPresentations.filter { retained.contains($0.key) || $0.value.invocationID != nil }
+        if next.count != oracleGroupPresentations.count { oracleGroupPresentations = next }
+    }
+
+    private func isCurrentOracleProjection(_ session: ChatSession) -> Bool {
+        sessions.contains {
+            $0.id == session.id && $0.shortID == session.shortID
+                && $0.workspaceID == session.workspaceID && $0.composeTabID == session.composeTabID
+                && $0.oracleGroupID == session.oracleGroupID && $0.oracleLaneIndex == session.oracleLaneIndex
+                && $0.oracleGroupSize == session.oracleGroupSize && $0.oracleModelRaw == session.oracleModelRaw
         }
     }
 }

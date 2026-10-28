@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import SwiftAnthropic
 
 class AnthropicProvider: AIProvider {
@@ -17,32 +18,85 @@ class AnthropicProvider: AIProvider {
         }
     }
 
-    private func createMessages(for aiMessage: AIMessage) -> [MessageParameter.Message] {
+    static func makeMessages(for aiMessage: AIMessage) throws -> [MessageParameter.Message] {
+        let planned = try AttachmentEncoding.plan(aiMessage.attachments, route: .anthropicMessages)
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
         var messages: [MessageParameter.Message] = []
 
         for (idx, entry) in aiMessage.conversationMessages.enumerated() {
-            let contentText: String = if let lastIdx = lastUserIndex,
-                                         entry.role == .user,
-                                         idx == lastIdx,
-                                         !tail.isEmpty
-            {
-                "\(tail)\n\n\(entry.content)"
-            } else {
-                entry.content
-            }
+            let isLastUser = entry.role == .user && idx == lastUserIndex
+            let body = isLastUser
+                ? AttachmentEncoding.prependingInlineText(of: planned, to: entry.content)
+                : entry.content
+            let contentText = isLastUser && !tail.isEmpty ? "\(tail)\n\n\(body)" : body
 
             let role: MessageParameter.Message.Role = (entry.role == .user) ? .user : .assistant
+            let content: MessageParameter.Message.Content = if isLastUser {
+                try Self.userContent(text: contentText, planned: planned)
+            } else {
+                .text(contentText)
+            }
             messages.append(
                 MessageParameter.Message(
                     role: role,
-                    content: .text(contentText)
+                    content: content
                 )
             )
         }
 
+        if lastUserIndex == nil, !planned.isEmpty {
+            try messages.append(MessageParameter.Message(
+                role: .user,
+                content: Self.userContent(
+                    text: AttachmentEncoding.prependingInlineText(of: planned, to: tail),
+                    planned: planned
+                )
+            ))
+        }
+
         return messages
+    }
+
+    private static func userContent(
+        text: String,
+        planned: [PlannedAttachment]
+    ) throws -> MessageParameter.Message.Content {
+        var blocks: [MessageParameter.Message.Content.ContentObject] = []
+        // Anthropic rejects empty text blocks.
+        if !text.isEmpty {
+            blocks.append(.text(text))
+        }
+        var nativeCount = 0
+        for item in planned {
+            switch item.delivery {
+            case let .nativeImage(imageType, data):
+                if let annotation = item.titleAnnotation {
+                    blocks.append(.text(annotation))
+                }
+                let mediaType: MessageParameter.Message.Content.ImageSource.MediaType = switch imageType {
+                case .png: .png
+                case .jpeg: .jpeg
+                case .gif: .gif
+                case .webp: .webp
+                }
+                blocks.append(.image(.init(
+                    type: .base64,
+                    mediaType: mediaType,
+                    data: data.base64EncodedString()
+                )))
+                nativeCount += 1
+            case let .nativeDocument(data):
+                try blocks.append(.document(.pdf(
+                    base64Data: data.base64EncodedString(),
+                    title: item.attachment.normalizedTitle ?? item.attachment.fileName
+                )))
+                nativeCount += 1
+            case .inlineText:
+                break
+            }
+        }
+        return nativeCount == 0 ? .text(text) : .list(blocks)
     }
 
     private func createSystemParameter(systemPrompt: String) -> MessageParameter.System {
@@ -104,15 +158,21 @@ class AnthropicProvider: AIProvider {
             thinkingBudget = 0
         }
 
+        let adaptiveThinkingOnly = Self.usesAdaptiveThinkingOnly(baseModelName)
+        if adaptiveThinkingOnly {
+            // Adaptive thinking consumes output tokens; leave room for reasoning plus the answer.
+            overrideMaxTokens = Self.adaptiveStreamingMaxTokens
+        }
+
         let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
 
         // Use your existing helper functions
         let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
-        let messages = createMessages(for: aiMessage)
+        let messages = try Self.makeMessages(for: aiMessage)
 
         var temperature: Double? = 0
-        // Skip temperature setting for thinking models
-        if isThinkingMode {
+        // Skip temperature setting for thinking models; Claude 5.x rejects sampling parameters.
+        if isThinkingMode || adaptiveThinkingOnly {
             temperature = nil
         }
         // Apply user-defined temperature if override is enabled (for non-thinking models)
@@ -128,7 +188,7 @@ class AnthropicProvider: AIProvider {
             system: systemParameter,
             stream: true,
             temperature: temperature,
-            thinking: isThinkingMode ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
+            thinking: isThinkingMode && !adaptiveThinkingOnly ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
         )
 
         let stream = try await service.streamMessage(parameters)
@@ -269,8 +329,31 @@ class AnthropicProvider: AIProvider {
             thinkingBudget = 0
         }
 
+        let adaptiveThinkingOnly = Self.usesAdaptiveThinkingOnly(baseModelName)
+        if adaptiveThinkingOnly, maxTokens == nil {
+            overrideMaxTokens = Self.adaptiveNonStreamingMaxTokens
+        }
+
         let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
-        return try await completeMessage(aiMessage, model: anthropicModel, maxTokens: overrideMaxTokens, isThinkingMode: isThinkingMode, thinkingBudget: thinkingBudget)
+        return try await completeMessage(
+            aiMessage,
+            model: anthropicModel,
+            maxTokens: overrideMaxTokens,
+            isThinkingMode: isThinkingMode && !adaptiveThinkingOnly,
+            thinkingBudget: thinkingBudget
+        )
+    }
+
+    static let adaptiveStreamingMaxTokens = 64000
+    static let adaptiveNonStreamingMaxTokens = 16000
+
+    /// Claude 5.x-generation models (Sonnet 5/5.5, Opus 5/5.5, Fable, Mythos) accept only adaptive
+    /// thinking: `thinking.budget_tokens` and sampling parameters such as `temperature` return 400.
+    /// Omitting `thinking` runs adaptive thinking at the model's default effort.
+    static func usesAdaptiveThinkingOnly(_ modelName: String) -> Bool {
+        let normalized = modelName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let prefixes = ["claude-fable-", "claude-mythos-", "claude-opus-5", "claude-sonnet-5"]
+        return prefixes.contains { normalized.hasPrefix($0) }
     }
 
     private func completeMessage(_ aiMessage: AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0) async throws -> AICompletionResult {
@@ -279,7 +362,7 @@ class AnthropicProvider: AIProvider {
         }
 
         let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
-        let messages = createMessages(for: aiMessage)
+        let messages = try Self.makeMessages(for: aiMessage)
 
         let parameters = MessageParameter(
             model: model,

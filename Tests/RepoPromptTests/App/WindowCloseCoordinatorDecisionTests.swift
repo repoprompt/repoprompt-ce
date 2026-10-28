@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptSettingsCore
 import XCTest
 
 @MainActor
@@ -192,5 +193,49 @@ final class WindowCloseCoordinatorPolicyTests: XCTestCase {
             secondaryButtonTitle: "Hide and Keep Running",
             secondaryAction: .backgroundWindow
         )
+    }
+}
+
+final class WindowPresentationVisibilityPolicyTests: XCTestCase {
+    func testPresentationRequiresEveryOnScreenCondition() {
+        let cases: [(visible: Bool, minimized: Bool, unoccluded: Bool, hidden: Bool, expected: Bool)] = [
+            (true, false, true, false, true),
+            (false, false, true, false, false),
+            (true, true, true, false, false),
+            (true, false, false, false, false),
+            (true, false, true, true, false)
+        ]
+        for item in cases {
+            XCTAssertEqual(WindowPresentationVisibility.isVisible(
+                windowIsVisible: item.visible,
+                isMiniaturized: item.minimized,
+                occlusionIsVisible: item.unoccluded,
+                appIsHidden: item.hidden
+            ), item.expected)
+        }
+    }
+}
+
+@MainActor
+final class WindowStateAttachmentAdmissionTests: XCTestCase {
+    func testClosingRefusesLateAttachmentButStillAllowsDetachCleanup() async {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        defer { GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false) }
+
+        let state = WindowState()
+        let window = NSObject()
+        var updates: [String] = []
+        state.performWindowAttachment(window) { _ in updates.append("attach") }
+        XCTAssertEqual(updates, ["attach"])
+
+        state.beginClose()
+        state.performWindowAttachment(window) { _ in updates.append("late attach") }
+        state.performWindowAttachment(nil as NSObject?) { _ in updates.append("detach cleanup") }
+        state.beginClose()
+        state.performWindowAttachment(window) { _ in updates.append("attach after repeated close") }
+
+        XCTAssertEqual(updates, ["attach", "detach cleanup"])
+        await state.tearDown()
     }
 }

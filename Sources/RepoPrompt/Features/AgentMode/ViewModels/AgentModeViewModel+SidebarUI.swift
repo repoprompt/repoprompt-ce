@@ -1,3 +1,4 @@
+import RepoPromptInstrumentation
 import SwiftUI
 
 @MainActor
@@ -8,7 +9,7 @@ extension AgentModeViewModel {
         sidebarTabs: [ComposeTabState]? = nil
     ) {
         #if DEBUG
-            let syncStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let syncStartMS = perfRecorder.timestampMSIfEnabled()
             let storeUpdateStartMS = syncStartMS
         #endif
         ui.sessionSidebar.update(
@@ -17,7 +18,7 @@ extension AgentModeViewModel {
             archivedVisibleSessionCount: sessionSidebarArchivedVisibleSessionCount
         )
         #if DEBUG
-            let storeUpdateDurationMS = storeUpdateStartMS.map { AgentModePerfDiagnostics.elapsedMS(since: $0) }
+            let storeUpdateDurationMS = storeUpdateStartMS.map { perfRecorder.elapsedMS(since: $0) }
             func emitSidebarSync(
                 result: String,
                 fingerprintDurationMS: Double? = nil,
@@ -26,16 +27,16 @@ extension AgentModeViewModel {
             ) {
                 guard let syncStartMS else { return }
                 var fields: [String: String] = [
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
-                    "fingerprintDuration": fingerprintDurationMS.map { AgentModePerfDiagnostics.formatMS($0) } ?? "n/a",
+                    "currentTabID": perfRecorder.shortID(currentTabID),
+                    "fingerprintDuration": fingerprintDurationMS.map { perfRecorder.formatMS($0) } ?? "n/a",
                     "reason": reason.rawValue,
                     "refresh": String(refresh),
                     "result": result,
                     "sessionCount": String(sessions.count),
                     "sessionIndexCount": String(sessionIndex.count),
                     "sortDateCount": String(sessionListSortDates.count),
-                    "storeUpdateDuration": storeUpdateDurationMS.map { AgentModePerfDiagnostics.formatMS($0) } ?? "n/a",
-                    "total": AgentModePerfDiagnostics.formatElapsedMS(since: syncStartMS)
+                    "storeUpdateDuration": storeUpdateDurationMS.map { perfRecorder.formatMS($0) } ?? "n/a",
+                    "total": perfRecorder.formatElapsedMS(since: syncStartMS)
                 ]
                 if let fingerprint {
                     fields["sessionSignatureCount"] = String(fingerprint.sessionSignatures.count)
@@ -47,7 +48,7 @@ extension AgentModeViewModel {
                 if let fingerprintDelta {
                     fields.merge(fingerprintDelta.eventFields) { _, new in new }
                 }
-                AgentModePerfDiagnostics.event("sidebar.sync", fields: fields)
+                perfRecorder.event("sidebar.sync", fields: fields)
             }
         #endif
         guard refresh else {
@@ -57,20 +58,21 @@ extension AgentModeViewModel {
             return
         }
 
+        admitSidebarRestoreCoverageForOwnerWorkspace()
         #if DEBUG
-            let fingerprintStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let fingerprintStartMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let nextFingerprint = makeSessionSidebarContentFingerprint(for: sidebarTabs)
         #if DEBUG
-            let fingerprintDurationMS = fingerprintStartMS.map { AgentModePerfDiagnostics.elapsedMS(since: $0) }
+            let fingerprintDurationMS = fingerprintStartMS.map { perfRecorder.elapsedMS(since: $0) }
             let fingerprintDelta = nextFingerprint.debugDeltaDiagnostics(from: lastSidebarContentFingerprint)
         #endif
         if let previous = lastSidebarContentFingerprint, previous == nextFingerprint {
             #if DEBUG
-                AgentModePerfDiagnostics.increment("store.sessionSidebar.refreshSkipped")
+                perfRecorder.increment("store.sessionSidebar.refreshSkipped")
                 var skipFields = ["reason": reason.rawValue]
                 skipFields.merge(fingerprintDelta.eventFields) { _, new in new }
-                AgentModePerfDiagnostics.event(
+                perfRecorder.event(
                     "store.sessionSidebar.refreshSkipped",
                     fields: skipFields
                 )
@@ -87,7 +89,7 @@ extension AgentModeViewModel {
         #if DEBUG
             var publishFields = ["reason": reason.rawValue]
             publishFields.merge(fingerprintDelta.eventFields) { _, new in new }
-            AgentModePerfDiagnostics.event(
+            perfRecorder.event(
                 "store.sessionSidebar.refreshPublished",
                 fields: publishFields
             )
@@ -101,6 +103,19 @@ extension AgentModeViewModel {
                 fingerprintDelta: fingerprintDelta
             )
         #endif
+    }
+
+    /// Coverage admission precedes row publication (§5.4): new rows of the baseline owner's own
+    /// workspace join before the fingerprint, so the revision change invalidates every consuming cache.
+    /// Tabs from a lagging outgoing projection are never admitted into the successor's baseline.
+    private func admitSidebarRestoreCoverageForOwnerWorkspace() {
+        guard let workspaceID = ownerValidatedSidebarRestoreBaseline?.owner.workspaceID else { return }
+        if let snapshot = promptManager?.sidebarWorkspaceSnapshot {
+            guard snapshot.workspaceID == workspaceID else { return }
+            sessionIndexStore.admitSidebarRestoreCoverage(snapshot.composeTabs + snapshot.stashedTabs.map(\.tab))
+        } else if let workspace = workspaceManager?.activeWorkspace, workspace.id == workspaceID {
+            sessionIndexStore.admitSidebarRestoreCoverage(workspace.composeTabs)
+        }
     }
 
     func setSessionSidebarSearchText(_ text: String) {
@@ -188,24 +203,30 @@ extension AgentModeViewModel {
                     )
                 }
             #endif
-            let report = await promptManager.deleteComposeAndStashedTabs(
-                composeTabIDs: targets.activeDeleteTabIDs,
-                archivedTargets: targets.archivedDeleteTargets,
-                isMutationContextCurrent: contextIsCurrent,
-                onProjectionRemovalCommitted: onProjectionRemovalCommitted
-            )
+            let report = await AgentSessionDeletionOrigin.currentTaskLocal.withValue(.userUI) {
+                await promptManager.deleteComposeAndStashedTabs(
+                    composeTabIDs: targets.activeDeleteTabIDs,
+                    archivedTargets: targets.archivedDeleteTargets,
+                    isMutationContextCurrent: contextIsCurrent,
+                    onProjectionRemovalCommitted: onProjectionRemovalCommitted
+                )
+            }
             notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
+        // Pin/unpin/stash share one mutation path with `session_admin` (design §3.4); delete stays
+        // human-only and keeps its own path above.
         case .stash:
-            let report = await promptManager.stashComposeTabs(
-                withIDs: targets.stashTabIDs,
+            let report = await OpenWindowsAgentSessionOrganizer.stashTabs(
+                targets.stashTabIDs,
+                promptManager: promptManager,
                 isMutationContextCurrent: contextIsCurrent,
                 onProjectionRemovalCommitted: onProjectionRemovalCommitted
             )
             notice = sidebarBulkActionNotice(for: report, action: action, origin: origin)
         case .pin:
-            let report = promptManager.setComposeTabsPinned(
+            let report = OpenWindowsAgentSessionOrganizer.setTabsPinned(
                 true,
-                for: targets.pinTabIDs,
+                tabIDs: targets.pinTabIDs,
+                promptManager: promptManager,
                 isMutationContextCurrent: contextIsCurrent
             )
             if report.contextRejected {
@@ -218,9 +239,10 @@ extension AgentModeViewModel {
                 )
             }
         case .unpin:
-            let report = promptManager.setComposeTabsPinned(
+            let report = OpenWindowsAgentSessionOrganizer.setTabsPinned(
                 false,
-                for: targets.unpinTabIDs,
+                tabIDs: targets.unpinTabIDs,
+                promptManager: promptManager,
                 isMutationContextCurrent: contextIsCurrent
             )
             if report.contextRejected {
@@ -307,13 +329,19 @@ extension AgentModeViewModel {
         diagnosticSource: String? = nil
     ) -> SidebarCollapseAllState {
         #if DEBUG
-            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+            let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
         let source = diagnosticSource ?? "unknown"
         let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let keys: [AgentSidebarThreadKey]
         let state: SidebarCollapseAllState
-        if trimmedSearch.isEmpty {
+        let restorePresentation = sidebarRestorePresentationKey
+        if restorePresentation.isOwnerPending || restorePresentation.baselineRevision != nil {
+            // Flat restore/owner pending: no thread tree is shown, so collapse-all is unavailable
+            // rather than reporting a misleading all-collapsed state (§5.6).
+            keys = []
+            state = .hidden
+        } else if trimmedSearch.isEmpty {
             keys = collapsibleSidebarThreadKeys(
                 for: tabs,
                 currentTabID: currentTabID,
@@ -323,7 +351,10 @@ extension AgentModeViewModel {
             if keys.isEmpty {
                 state = .hidden
             } else {
-                let collapsedThreadKeys = ui.sessionSidebar.snapshot.collapsedThreadKeys
+                let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(
+                    in: sidebarSessions(for: tabs),
+                    searchText: searchText
+                )
                 let allCollapsed = keys.allSatisfy { collapsedThreadKeys.contains($0) }
                 state = allCollapsed ? .canExpand : .canCollapse
             }
@@ -332,11 +363,11 @@ extension AgentModeViewModel {
             state = .hidden
         }
         #if DEBUG
-            AgentModePerfDiagnostics.durationEvent(
+            perfRecorder.durationEvent(
                 "sidebar.collapseAllState",
                 startMS: startMS,
                 fields: [
-                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                    "currentTabID": perfRecorder.shortID(currentTabID),
                     "keyCount": String(keys.count),
                     "searchActive": String(!trimmedSearch.isEmpty),
                     "source": source,
@@ -491,6 +522,8 @@ extension AgentModeViewModel {
             activeAgentSessionID: tab.activeAgentSessionID,
             isPinned: tab.isPinned,
             pinnedOrder: tab.pinnedOrder,
+            sidebarGroup: tab.sidebarGroup,
+            sidebarGroupOrder: tab.sidebarGroupOrder,
             lastModified: tab.lastModified
         )
     }
@@ -525,11 +558,14 @@ extension AgentModeViewModel {
                     transcriptTurnsIsEmpty: session.transcript.turns.isEmpty,
                     runState: session.runState,
                     lastActivityAt: session.lastActivityAt,
-                    lastUserMessageAt: session.lastUserMessageAt
+                    lastUserMessageAt: session.lastUserMessageAt,
+                    worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
+                    worktreeMergeAttention: AgentWorktreeMergeBlockerSelector.sidebarAttention(
+                        in: session.worktreeMergeOperations
+                    )
                 )
             }
         return AgentSessionSidebarContentFingerprint(
-            currentTabID: currentTabID,
             sessionListCacheReady: ownerValidatedSessionListCacheReady,
             tabsWithActiveAgentRun: tabsWithActiveAgentRun,
             mcpControlledTabIDs: mcpControlledTabIDs,
@@ -537,7 +573,7 @@ extension AgentModeViewModel {
             sessionSignatures: signatures,
             sessionIndex: ownerValidatedSessionIndex,
             sessionListSortDates: ownerValidatedSessionListSortDates,
-            sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID
+            sidebarRestorePresentation: sidebarRestorePresentationKey
         )
     }
 }
@@ -579,11 +615,10 @@ extension AgentModeViewModel {
             guard previous != self else { return Self.makeDebugDelta(categories: ["none"]) }
 
             var categories = Set<String>()
-            if previous.currentTabID != currentTabID { categories.insert("currentTabID") }
             if previous.sessionListCacheReady != sessionListCacheReady { categories.insert("sessionListCacheReady") }
             if previous.tabsWithActiveAgentRun != tabsWithActiveAgentRun { categories.insert("tabsWithActiveAgentRun") }
             if previous.mcpControlledTabIDs != mcpControlledTabIDs { categories.insert("mcpControlledTabIDs") }
-            if previous.sidebarRestoreFrozenOrderByTabID != sidebarRestoreFrozenOrderByTabID { categories.insert("sidebarRestoreFrozenOrder") }
+            if previous.sidebarRestorePresentation != sidebarRestorePresentation { categories.insert("sidebarRestorePresentation") }
 
             let tabChanges = debugTabMetadataChanges(from: previous, categories: &categories)
             let sessionChanges = debugSessionSignatureChanges(from: previous, categories: &categories)
@@ -667,6 +702,12 @@ extension AgentModeViewModel {
                 if previousTab.pinnedOrder != currentTab.pinnedOrder { categories.insert("tabMetadata.pinnedOrder")
                     changed = true
                 }
+                if previousTab.sidebarGroup != currentTab.sidebarGroup
+                    || previousTab.sidebarGroupOrder != currentTab.sidebarGroupOrder
+                {
+                    categories.insert("tabMetadata.sidebarGroup")
+                    changed = true
+                }
                 if previousTab.lastModified != currentTab.lastModified {
                     categories.insert("tabMetadata.lastModified")
                     changes.changedLastModifiedCount += 1
@@ -730,13 +771,13 @@ extension AgentModeViewModel {
 
         private static func orderedCategories(from categories: Set<String>) -> [String] {
             let preferredOrder = [
-                "currentTabID", "sessionListCacheReady", "tabsWithActiveAgentRun", "mcpControlledTabIDs",
+                "sessionListCacheReady", "tabsWithActiveAgentRun", "mcpControlledTabIDs",
                 "tabMetadata.count", "tabMetadata.order", "tabMetadata.name", "tabMetadata.activeAgentSessionID",
                 "tabMetadata.isPinned", "tabMetadata.lastModified", "session.count", "session.activeAgentSessionID",
                 "session.parentSessionID", "session.hasLoadedPersistedState", "session.itemsIsEmpty",
                 "session.transcriptTurnsIsEmpty", "session.runState",
                 "session.lastActivityAt", "session.lastUserMessageAt", "sessionIndex", "sessionListSortDates",
-                "sidebarRestoreFrozenOrder"
+                "sidebarRestorePresentation"
             ]
             return preferredOrder.filter(categories.contains) + categories.subtracting(preferredOrder).sorted()
         }

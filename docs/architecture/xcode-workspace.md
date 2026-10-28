@@ -24,7 +24,7 @@ The native `RepoPrompt` product scheme retains the shipped product, target, and 
 
 - `RepoPrompt CE App` delegates to conductor to assemble the real debug app through the existing packaging flow, verifies the `.build/debug/RepoPrompt.app` compatibility path, then runs the local debug bundle under `~/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app`.
 - `RepoPrompt CE MCP` delegates to conductor to build and run `.build/debug/repoprompt-mcp`.
-- `RepoPrompt CE Tests` delegates to the conductor test runner. Root tests import `RepoPromptApp`, but retain their separate `RepoPromptMCP` dependency/imports; the scheme remains a legacy build target rather than a native Xcode test bundle because `RepoPromptMCP` is executable-only.
+- `RepoPrompt CE Tests` delegates to the conductor test runner, which owns the sandboxed test environment the root suites require. Test targets depend on library targets only (`RepoPromptMCPCore` replaced the former `RepoPromptMCP` executable dependency); the scheme remains a build target rather than a native Xcode test bundle.
 
 The native product schemes are useful for source navigation and indexing. Use `RepoPrompt CE Tests` for the supported full test workflow; optional `REPOPROMPT_XCODE_TEST_FILTER` narrows the delegated run. External dependency test targets are not added to RepoPrompt schemes. Sparkle's vendored XCFramework declares a `dSYMs` directory that is not present in the repository, so native Xcode package builds involving the app can fail before compilation. The generator deliberately does not mutate `Vendor/`; the packaged app convenience scheme remains the supported app build.
 

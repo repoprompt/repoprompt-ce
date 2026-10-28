@@ -1,3 +1,5 @@
+import RepoPromptSettingsCore
+
 //
 //  AgentModelsSettingsViewModel.swift
 //  RepoPrompt
@@ -38,6 +40,17 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     @Published private(set) var workspaceName: String?
     @Published private(set) var inheritanceMode: AgentModelsInheritanceMode
     @Published private(set) var profileSnapshot: AgentModelsSettingsProfile
+    @Published var repromptGuidanceDraft: String
+    @Published var repromptModelDraft: String
+    @Published var repromptModeDraft: AgentRepromptMode
+    @Published var repromptRecentChatDraft: Bool
+    private var repromptModeBaseline: AgentRepromptMode?
+    private var repromptRecentChatBaseline: Bool?
+    let repromptCurrentProvider: () -> AgentProviderKind?
+    private var repromptDraftScope: AgentModelsEditingScope
+    private var repromptGuidanceBaseline: String?
+    private var repromptModelBaseline: String?
+    @Published var oracleReconciliationGuidanceDraft: String
     @Published private(set) var recommendations: RecommendationSet = .init()
     @Published private(set) var isApplyingAll: Bool = false
     @Published var syncChatWithOracle: Bool {
@@ -80,6 +93,9 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
     private var isReloadingScopedState = false
+    // The draft depends only on guidance and scope; unrelated refreshed profile edits are safe.
+    private var oracleGuidanceDraftScope: AgentModelsEditingScope
+    private var oracleGuidanceDraftBaseline: String?
 
     // MARK: - Init
 
@@ -90,7 +106,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         settingsManager: (any SettingsManaging)? = nil,
         settingsStore: GlobalSettingsStore? = nil,
         defaults: UserDefaults = .standard,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        repromptCurrentProvider: @escaping () -> AgentProviderKind? = { nil }
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let settingsManager = settingsManager ?? settingsStore
@@ -100,11 +117,24 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         )
         let initialProfile = initial.profile
 
+        self.repromptCurrentProvider = repromptCurrentProvider
         self.apiSettingsVM = apiSettingsVM
         self.workspaceID = workspaceID
         self.workspaceName = workspaceName
         inheritanceMode = initial.inheritanceMode
         profileSnapshot = initialProfile
+        repromptGuidanceDraft = AgentRepromptGuidance.effectiveText(initialProfile.agentRepromptGuidance)
+        repromptModelDraft = initialProfile.agentRepromptModelRaw ?? ""
+        repromptModeDraft = initialProfile.agentRepromptMode ?? .review
+        repromptRecentChatDraft = initialProfile.agentRepromptIncludesRecentChat ?? true
+        repromptModeBaseline = initialProfile.agentRepromptMode
+        repromptRecentChatBaseline = initialProfile.agentRepromptIncludesRecentChat
+        repromptDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
+        repromptGuidanceBaseline = initialProfile.agentRepromptGuidance
+        repromptModelBaseline = initialProfile.agentRepromptModelRaw
+        oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(initialProfile.oracleReconciliationGuidance)
+        oracleGuidanceDraftScope = AgentModelsEditingScope.resolve(workspaceID: workspaceID, inheritanceMode: initial.inheritanceMode)
+        oracleGuidanceDraftBaseline = initialProfile.oracleReconciliationGuidance
         self.settingsManager = settingsManager
         _ = defaults // Retained for initializer compatibility while storage lives in GlobalSettingsStore.
         self.notificationCenter = notificationCenter
@@ -223,7 +253,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         return AgentModelCatalog.normalizeSelection(
             agentRaw: selectedAgentRaw,
             modelRaw: selectedModelRaw,
-            availability: availability
+            availability: availability,
+            surface: .headless
         )
     }
 
@@ -290,6 +321,139 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         recommendations.hasUnsatisfied
     }
 
+    // MARK: - Re-prompt draft
+
+    var resolvedRepromptDraftModel: AIModel? {
+        AgentRepromptModelPolicy.resolve(
+            selection: repromptModelDraft.isEmpty ? nil : repromptModelDraft,
+            currentProvider: repromptCurrentProvider(),
+            configured: apiSettingsVM.availableModels.filter { AgentRepromptModelPolicy.supportsSideCall($0) && $0.canStream }
+        )
+    }
+
+    var isRepromptDraftDirty: Bool {
+        repromptGuidanceDraft != AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
+            || repromptModelDraft != (repromptModelBaseline ?? "")
+            || repromptModeDraft != (repromptModeBaseline ?? .review)
+            || repromptRecentChatDraft != (repromptRecentChatBaseline ?? true)
+    }
+
+    var repromptDraftHasConflict: Bool {
+        repromptDraftScope != editingScope
+            || repromptGuidanceBaseline != profileSnapshot.agentRepromptGuidance
+            || repromptModelBaseline != profileSnapshot.agentRepromptModelRaw
+            || repromptModeBaseline != profileSnapshot.agentRepromptMode
+            || repromptRecentChatBaseline != profileSnapshot.agentRepromptIncludesRecentChat
+    }
+
+    var repromptGuidanceIsWithinLimit: Bool {
+        AgentRepromptGuidance.isWithinLimit(repromptGuidanceDraft)
+    }
+
+    @discardableResult
+    func saveRepromptDraft() -> Bool {
+        guard isRepromptDraftDirty, repromptGuidanceIsWithinLimit else { return false }
+        return persistRepromptDraft(
+            guidance: repromptGuidanceDraft == AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
+                ? repromptGuidanceBaseline : AgentRepromptGuidance.normalizedOverride(repromptGuidanceDraft),
+            model: repromptModelDraft.isEmpty ? nil : repromptModelDraft
+        )
+    }
+
+    @discardableResult
+    func restoreDefaultRepromptGuidance() -> Bool {
+        guard !repromptDraftHasConflict else { return false }
+        let accepted = updateSelectedProfile(reason: "agent_models.reprompt_default_guidance") { $0.agentRepromptGuidance = nil }
+        if accepted {
+            repromptGuidanceBaseline = nil
+            repromptGuidanceDraft = AgentRepromptGuidance.defaultText
+        }
+        return accepted
+    }
+
+    func reloadRepromptDraft() {
+        reloadScopedState()
+        refresh()
+        loadRepromptDraft()
+    }
+
+    private func loadRepromptDraft() {
+        repromptDraftScope = editingScope
+        repromptGuidanceBaseline = profileSnapshot.agentRepromptGuidance
+        repromptModelBaseline = profileSnapshot.agentRepromptModelRaw
+        repromptGuidanceDraft = AgentRepromptGuidance.effectiveText(repromptGuidanceBaseline)
+        repromptModelDraft = repromptModelBaseline ?? ""
+        repromptModeBaseline = profileSnapshot.agentRepromptMode
+        repromptRecentChatBaseline = profileSnapshot.agentRepromptIncludesRecentChat
+        repromptModeDraft = repromptModeBaseline ?? .review
+        repromptRecentChatDraft = repromptRecentChatBaseline ?? true
+    }
+
+    private func persistRepromptDraft(guidance: String?, model: String?) -> Bool {
+        guard !repromptDraftHasConflict else { return false }
+        let accepted = updateSelectedProfile(reason: "agent_models.reprompt_guidance") { profile in
+            profile.agentRepromptGuidance = guidance
+            profile.agentRepromptModelRaw = model
+            profile.agentRepromptMode = repromptModeDraft == .review ? nil : repromptModeDraft
+            profile.agentRepromptIncludesRecentChat = repromptRecentChatDraft ? nil : false
+        }
+        if accepted {
+            loadRepromptDraft()
+        }
+        return accepted
+    }
+
+    // MARK: - Oracle reconciliation draft
+
+    var isOracleGuidanceDraftDirty: Bool {
+        oracleReconciliationGuidanceDraft != OracleGroupDeliveryContract.effectiveReconciliationGuidance(
+            oracleGuidanceDraftBaseline
+        )
+    }
+
+    /// Acceptance is not a disk-save receipt; the existing Settings persistence banner owns failures.
+    @discardableResult
+    func saveOracleReconciliationGuidanceDraft() -> Bool {
+        guard isOracleGuidanceDraftDirty else { return false }
+        let text = OracleGroupDeliveryContract.normalizedReconciliationGuidanceOverride(oracleReconciliationGuidanceDraft)
+        return persistOracleGuidanceDraft(text)
+    }
+
+    @discardableResult
+    func restoreDefaultOracleReconciliationGuidance() -> Bool {
+        persistOracleGuidanceDraft(nil)
+    }
+
+    /// Explicitly discard the old draft and adopt the current live profile.
+    func reloadOracleReconciliationGuidanceDraft() {
+        reloadScopedState()
+        refresh()
+        loadOracleGuidanceDraft()
+    }
+
+    var oracleGuidanceHasConflict: Bool {
+        oracleGuidanceDraftScope != editingScope
+            || oracleGuidanceDraftBaseline != profileSnapshot.oracleReconciliationGuidance
+    }
+
+    private func loadOracleGuidanceDraft() {
+        oracleGuidanceDraftScope = editingScope
+        oracleGuidanceDraftBaseline = profileSnapshot.oracleReconciliationGuidance
+        oracleReconciliationGuidanceDraft = OracleGroupDeliveryContract.effectiveReconciliationGuidance(profileSnapshot.oracleReconciliationGuidance)
+    }
+
+    private func persistOracleGuidanceDraft(_ text: String?) -> Bool {
+        guard !oracleGuidanceHasConflict else { return false }
+        let accepted = updateSelectedProfile(reason: "agent_models.oracle_guidance") { profile in
+            profile.oracleReconciliationGuidance = text
+        }
+        if accepted {
+            loadOracleGuidanceDraft()
+        }
+        // A rejected click is never retried against the refreshed cache.
+        return accepted
+    }
+
     // MARK: - Scope
 
     func updateWorkspaceContext(workspaceID: UUID?, workspaceName: String?) {
@@ -328,26 +492,37 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// sync toggle is on, mirrors to `preferredComposeModel` in the selected
     /// global/workspace Agent Models profile.
     var oracleModelDestination: ModelDestination {
-        ModelDestination(
+        let expectedScope = editingScope
+        return ModelDestination(
             id: "agentModels.oracle",
             getter: { [weak self] in
                 self?.profileSnapshot.planningModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
-                self?.setOracleModel(raw: rawValue)
+                guard let self else { return }
+                reloadScopedState()
+                guard !rawValue.hasPrefix("cursor_custom_") || editingScope == expectedScope else { return }
+                setOracleModel(raw: rawValue)
             }
         )
     }
 
     func additionalOracleModelDestination(at index: Int) -> ModelDestination {
-        ModelDestination(
+        let expectedScope = editingScope
+        let expectedRaw = additionalOracleModelRaws.indices.contains(index) ? additionalOracleModelRaws[index] : nil
+        return ModelDestination(
             id: "agentModels.oracle.additional.\(index)",
             getter: { [weak self] in
                 guard let self, additionalOracleModelRaws.indices.contains(index) else { return "" }
                 return additionalOracleModelRaws[index]
             },
             applier: { [weak self] rawValue in
-                self?.setAdditionalOracleModel(raw: rawValue, at: index)
+                guard let self else { return }
+                reloadScopedState()
+                if rawValue.hasPrefix("cursor_custom_") {
+                    guard editingScope == expectedScope, additionalOracleModelRaws.indices.contains(index), additionalOracleModelRaws[index] == expectedRaw else { return }
+                }
+                setAdditionalOracleModel(raw: rawValue, at: index)
             }
         )
     }
@@ -356,13 +531,17 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     /// and, when the sync toggle is on, mirrors to `planningModel` in the
     /// selected global/workspace Agent Models profile.
     var builtinChatModelDestination: ModelDestination {
-        ModelDestination(
+        let expectedScope = editingScope
+        return ModelDestination(
             id: "agentModels.builtinChat",
             getter: { [weak self] in
                 self?.profileSnapshot.preferredComposeModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
-                self?.setBuiltinChatModel(raw: rawValue)
+                guard let self else { return }
+                reloadScopedState()
+                guard !rawValue.hasPrefix("cursor_custom_") || editingScope == expectedScope else { return }
+                setBuiltinChatModel(raw: rawValue)
             }
         )
     }
@@ -661,12 +840,44 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     func contextBuilderAgentModelMenuItems(windowID: Int) -> [StableMenuItem] {
         let selection = selectedContextBuilderSelection
+        let expectedScope = editingScope
         var items = AgentModelCatalog.selectableAgents(availability: availability, surface: .headless).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
                 selectedAgent: selection.agent,
-                selectedModelRaw: selection.modelRaw
+                selectedModelRaw: selection.modelRaw,
+                cursorSelections: contextBuilderModelParameters,
+                onSelectCursorParameter: { [weak self] option, parameter in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope, selectedContextBuilderSelection == selection else { return }
+                    let existing = profileSnapshot.contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                    settingsManager.setAgentModelsContextBuilderModelParameter(
+                        ACPModelParameterSelection.normalized(existing + [parameter]),
+                        agentRaw: AgentProviderKind.cursor.rawValue,
+                        modelRaw: option.rawValue,
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    refresh()
+                    postShouldRefresh(reason: "agent_models.context_builder_model_parameter")
+                },
+                onClearCursorParameter: { [weak self] option, identity in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope, selectedContextBuilderSelection == selection else { return }
+                    let existing = profileSnapshot.contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                    settingsManager.setAgentModelsContextBuilderModelParameter(
+                        existing.filter { $0.identity != identity },
+                        agentRaw: AgentProviderKind.cursor.rawValue,
+                        modelRaw: option.rawValue,
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    refresh()
+                    postShouldRefresh(reason: "agent_models.context_builder_model_parameter")
+                }
             ) { [weak self] selectedAgent, selectedOption in
                 self?.setContextBuilderSelection(agent: selectedAgent, modelRaw: selectedOption.rawValue)
             }
@@ -682,14 +893,46 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+        let expectedScope = editingScope
+        return AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
                 selectedAgent: resolution.effective.agent,
                 selectedModelRaw: resolution.effective.modelRaw,
                 includePlaceholderDefault: false,
-                flattenSingleCodexGroups: true
+                flattenSingleCodexGroups: true,
+                cursorSelections: profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? [],
+                onSelectCursorParameter: { [weak self] option, parameter in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope,
+                          roleDefaultsResolutions.first(where: { $0.role == resolution.role })?.effective == resolution.effective else { return }
+                    let existing = profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? []
+                    settingsManager.setAgentModelsRoleModelParameter(
+                        ACPModelParameterSelection.normalized(existing + [parameter]),
+                        roleRawValue: resolution.role.rawValue,
+                        displayedSelectionID: AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue),
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    postAgentRoleDefaultsChanged()
+                },
+                onClearCursorParameter: { [weak self] option, identity in
+                    guard let self else { return }
+                    reloadScopedState()
+                    guard editingScope == expectedScope,
+                          roleDefaultsResolutions.first(where: { $0.role == resolution.role })?.effective == resolution.effective else { return }
+                    let existing = profileSnapshot.mcpAgentRoleModelParameters?[resolution.role.rawValue] ?? []
+                    settingsManager.setAgentModelsRoleModelParameter(
+                        existing.filter { $0.identity != identity },
+                        roleRawValue: resolution.role.rawValue,
+                        displayedSelectionID: AgentModelSelectionID(agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue),
+                        scope: expectedScope
+                    )
+                    reloadScopedState()
+                    postAgentRoleDefaultsChanged()
+                }
             ) { [weak self] selectedAgent, selectedOption in
                 guard let self else { return }
                 let selection = AgentModelCatalog.NormalizedAgentSelection(
@@ -791,6 +1034,12 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         syncChatWithOracle = nextProfile.syncChatModelWithOracle
         restrictMCPAgentDiscoveryToRoleLabels = nextProfile.restrictMCPAgentDiscoveryToRoleLabels
         isReloadingScopedState = false
+        if !isOracleGuidanceDraftDirty {
+            loadOracleGuidanceDraft()
+        }
+        if !isRepromptDraftDirty {
+            loadRepromptDraft()
+        }
     }
 
     /// Read-modify-write the selected Agent Models profile — or refuse.

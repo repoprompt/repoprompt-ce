@@ -1,11 +1,21 @@
 import Darwin
 import Foundation
+import RepoPromptProcess
 
 enum DevinIntegrationConfiguration {
     static let cleanupArtifactKind = "devinIsolatedMCPConfiguration"
     private static let directoryPrefix = "RepoPromptDevinACP-"
     private static let sourceDevinPathMarkerName = ".repoprompt-source-devin-path"
     private static let sourceDevinSnapshotMarkerName = ".repoprompt-source-devin-snapshot.json"
+    /// Bytes of the overlay settings as `prepare` wrote them, so cleanup can tell an untouched
+    /// overlay apart from a Devin write even after native settings changed during the run.
+    private static let preparedSettingsMarkerName = ".repoprompt-prepared-devin-settings.json"
+    private static let settingsFileName = "config.json"
+    private static let readConfigFromKey = "read_config_from"
+    /// Devin imports MCP servers from these tools' configs, and a same-named project entry
+    /// (for example `RepoPromptCE` in `~/.claude.json`) replaces the injected server. The
+    /// replacement then connects under another client identity and the run never routes.
+    private static let foreignMCPImportSources = ["claude", "cursor"]
 
     private struct SourceEntryFingerprint: Codable, Equatable {
         let deviceID: UInt64
@@ -54,7 +64,8 @@ enum DevinIntegrationConfiguration {
     static func prepare(
         workingDirectory: String,
         mcpServers policy: MCPServersPolicy,
-        sourceEnvironment: [String: String]
+        sourceEnvironment: [String: String],
+        isolateForeignMCPImports: Bool = true
     ) throws -> PreparedConfiguration {
         let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration? = switch policy {
         case let .mergeRepoPrompt(configuration):
@@ -63,6 +74,18 @@ enum DevinIntegrationConfiguration {
             nil
         }
         try repoPromptMCPConfiguration?.validateACPLaunchCommand(workingDirectory: workingDirectory)
+        // Ordinary Agent Mode keeps Devin's imports (they also carry rules and skills) unless an
+        // imported server would replace the injected RepoPrompt one and leave the run unrouted.
+        let isolateForeignMCPImports = isolateForeignMCPImports || repoPromptMCPConfiguration.map {
+            foreignImportsShadowServer(
+                named: $0.name,
+                workingDirectory: workingDirectory,
+                environment: sourceEnvironment
+            )
+        } == true
+        if isolateForeignMCPImports {
+            try validateProjectImportIsolation(workingDirectory: workingDirectory)
+        }
 
         let id = UUID()
         let root = configurationRoot(id: id)
@@ -81,10 +104,22 @@ enum DevinIntegrationConfiguration {
                 to: root,
                 excluding: ["devin"]
             )
+            // Import switches also suppress rules/skills. Headless runs isolate them; ordinary
+            // Agent Mode keeps native settings unless an import would replace RepoPrompt's server.
+            if isolateForeignMCPImports {
+                try writeImportIsolatedSettings(
+                    from: sourceDevinDirectory.appendingPathComponent(settingsFileName),
+                    to: devinDirectory.appendingPathComponent(settingsFileName)
+                )
+                let preparedSettingsMarker = root.appendingPathComponent(preparedSettingsMarkerName)
+                try Data(contentsOf: devinDirectory.appendingPathComponent(settingsFileName))
+                    .write(to: preparedSettingsMarker, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: preparedSettingsMarker.path)
+            }
             try linkExistingConfiguration(
                 from: sourceDevinDirectory,
                 to: devinDirectory,
-                excluding: ["mcp_config.json"]
+                excluding: isolateForeignMCPImports ? ["mcp_config.json", settingsFileName] : ["mcp_config.json"]
             )
             try sourceDevinDirectory.path.write(
                 to: root.appendingPathComponent(sourceDevinPathMarkerName),
@@ -233,6 +268,7 @@ enum DevinIntegrationConfiguration {
             [String: SourceEntryFingerprint].self,
             from: Data(contentsOf: root.appendingPathComponent(sourceDevinSnapshotMarkerName))
         )
+        let preparedSettings = try? Data(contentsOf: root.appendingPathComponent(preparedSettingsMarkerName))
         try FileManager.default.createDirectory(
             at: sourceDirectory,
             withIntermediateDirectories: true,
@@ -245,6 +281,19 @@ enum DevinIntegrationConfiguration {
             let sourceEntry = sourceDirectory.appendingPathComponent(entry.lastPathComponent)
             if let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: entry.path),
                URL(fileURLWithPath: destination).standardizedFileURL == sourceEntry.standardizedFileURL
+            {
+                continue
+            }
+            if entry.lastPathComponent == settingsFileName,
+               let preparedSettings,
+               (try? Data(contentsOf: entry)) == preparedSettings
+            {
+                // Devin wrote nothing; a foreign native change is not ours to publish over.
+                continue
+            }
+            if entry.lastPathComponent == settingsFileName,
+               preparedSettings != nil,
+               try !restoreNativeImportSettings(overlay: entry, native: sourceEntry)
             {
                 continue
             }
@@ -383,6 +432,181 @@ enum DevinIntegrationConfiguration {
             )
         }
         try? FileManager.default.removeItem(at: replacement)
+    }
+
+    /// Project/local settings override the user overlay. Resolve nearest-directory and local
+    /// overrides first, stopping at the checkout root (including Git worktrees), without writes.
+    private static func validateProjectImportIsolation(workingDirectory: String) throws {
+        var directory = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        var resolvedSources = Set<String>()
+        while true {
+            for fileName in ["config.local.json", "config.json"] {
+                let file = directory.appendingPathComponent(".devin").appendingPathComponent(fileName)
+                guard let settings = settingsObject(at: file) else {
+                    throw AIProviderError.invalidConfiguration(
+                        detail: "Cannot verify Devin import isolation: \(file.path) is not a readable JSON object. Please fix or remove that file."
+                    )
+                }
+                guard let value = settings[readConfigFromKey] else { continue }
+                guard let imports = value as? [String: Any] else {
+                    throw AIProviderError.invalidConfiguration(
+                        detail: "Cannot verify Devin import isolation: read_config_from in \(file.path) must be an object."
+                    )
+                }
+                for source in foreignMCPImportSources where !resolvedSources.contains(source) {
+                    guard let value = imports[source] else { continue }
+                    guard let enabled = value as? Bool, !enabled else {
+                        throw AIProviderError.invalidConfiguration(
+                            detail: "Devin import isolation is overridden by \(file.path): set read_config_from.\(source) to false "
+                                + "or remove that override before running Devin through RepoPrompt. RepoPrompt has not changed the file."
+                        )
+                    }
+                    resolvedSources.insert(source)
+                }
+            }
+            if directory.path == "/"
+                || FileManager.default.fileExists(atPath: directory.appendingPathComponent(".git").path)
+                || FileManager.default.fileExists(atPath: directory.appendingPathComponent(".jj").path)
+            {
+                return
+            }
+            directory.deleteLastPathComponent()
+        }
+    }
+
+    /// Whether a Claude or Cursor config Devin imports MCP servers from defines a server named like
+    /// the injected RepoPrompt one, which the import would replace. Checks `~/.claude.json` (global
+    /// and per-project entries for the working directory or an ancestor), `~/.cursor/mcp.json`,
+    /// and project `.mcp.json` / `.cursor/mcp.json` up to the checkout root. A config that exists
+    /// but cannot be parsed counts as shadowing, so the launch isolates instead of risking it.
+    private static func foreignImportsShadowServer(
+        named serverName: String,
+        workingDirectory: String,
+        environment: [String: String]
+    ) -> Bool {
+        let name = serverName.lowercased()
+        func shadows(configAt url: URL, serverTables: ([String: Any]) -> [Any?]) -> Bool {
+            guard FileManager.default.fileExists(atPath: url.path) else { return false }
+            guard let data = try? Data(contentsOf: url),
+                  let object = (try? JSONSerialization.jsonObject(with: data, options: .json5Allowed)) as? [String: Any]
+            else { return true }
+            return serverTables(object).contains { table in
+                (table as? [String: Any])?.keys.contains { $0.lowercased() == name } ?? false
+            }
+        }
+        let homePath = environment["HOME"].flatMap { $0.isEmpty ? nil : $0 }
+            ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let home = URL(fileURLWithPath: homePath, isDirectory: true)
+        var directory = URL(fileURLWithPath: workingDirectory, isDirectory: true)
+            .resolvingSymlinksInPath().standardizedFileURL
+        let workingPath = directory.path
+        let claudeShadows = shadows(configAt: home.appendingPathComponent(".claude.json")) { object in
+            var tables: [Any?] = [object["mcpServers"]]
+            for (path, project) in object["projects"] as? [String: Any] ?? [:] {
+                let root = URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath().standardizedFileURL.path
+                guard workingPath == root || workingPath.hasPrefix(root == "/" ? root : root + "/") else { continue }
+                tables.append((project as? [String: Any])?["mcpServers"])
+            }
+            return tables
+        }
+        if claudeShadows || shadows(configAt: home.appendingPathComponent(".cursor/mcp.json"), serverTables: { [$0["mcpServers"]] }) {
+            return true
+        }
+        while true {
+            for file in [".mcp.json", ".cursor/mcp.json"]
+                where shadows(configAt: directory.appendingPathComponent(file), serverTables: { [$0["mcpServers"]] })
+            {
+                return true
+            }
+            if directory.path == "/"
+                || FileManager.default.fileExists(atPath: directory.appendingPathComponent(".git").path)
+                || FileManager.default.fileExists(atPath: directory.appendingPathComponent(".jj").path)
+            {
+                return false
+            }
+            directory.deleteLastPathComponent()
+        }
+    }
+
+    /// A missing native file isolates from an empty object; one that cannot be read or is not a
+    /// JSON object throws rather than fall back to the native file.
+    private static func writeImportIsolatedSettings(from source: URL, to destination: URL) throws {
+        guard var settings = settingsObject(at: source) else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Devin settings at \(source.path) could not be read as a JSON object, so RepoPrompt cannot "
+                    + "turn off Devin's Claude and Cursor MCP imports for this launch. Please fix or remove that file."
+            )
+        }
+        var readConfigFrom = settings[readConfigFromKey] as? [String: Any] ?? [:]
+        for importSource in foreignMCPImportSources {
+            readConfigFrom[importSource] = false
+        }
+        settings[readConfigFromKey] = readConfigFrom
+        try writeSettings(settings, to: destination, permissions: posixPermissions(at: source) ?? 0o600)
+    }
+
+    /// Keeps the launch-only import switches out of native config. Returns false when the
+    /// overlay holds no Devin write to publish.
+    private static func restoreNativeImportSettings(overlay: URL, native: URL) throws -> Bool {
+        guard var settings = settingsObject(at: overlay),
+              let nativeSettings = settingsObject(at: native)
+        else {
+            return true
+        }
+        settings[readConfigFromKey] = restoredReadConfigFrom(
+            overlay: settings[readConfigFromKey],
+            native: nativeSettings[readConfigFromKey]
+        )
+        guard !NSDictionary(dictionary: settings).isEqual(to: nativeSettings) else { return false }
+        // Publishing re-serializes as strict JSON; never do that over JSON5-only syntax
+        // (comments, trailing commas) the user wrote. The overlay stays as recovery data.
+        if let nativeData = try? Data(contentsOf: native),
+           (try? JSONSerialization.jsonObject(with: nativeData)) == nil
+        {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Devin changed its settings during the run, but \(native.path) uses JSON5 syntax "
+                    + "RepoPrompt cannot rewrite without losing it, so the native file was left unchanged."
+            )
+        }
+        try writeSettings(settings, to: overlay, permissions: posixPermissions(at: overlay) ?? 0o600)
+        return true
+    }
+
+    /// Undoes only the import toggles RepoPrompt set, keeping every other key's current value.
+    /// A toggle present natively gets its native value back; one RepoPrompt added is removed.
+    private static func restoredReadConfigFrom(overlay: Any?, native: Any?) -> Any? {
+        guard var restored = overlay as? [String: Any] else { return overlay }
+        let nativeReadConfigFrom = native as? [String: Any]
+        for importSource in foreignMCPImportSources {
+            restored[importSource] = nativeReadConfigFrom?[importSource]
+        }
+        // Prepare replaces an absent or non-object value with an object; with nothing else
+        // written into it, the native value is restored as it was.
+        if restored.isEmpty, nativeReadConfigFrom == nil {
+            return native
+        }
+        return restored
+    }
+
+    /// Returns an empty object for a missing file and nil for anything that is not a JSON object.
+    private static func settingsObject(at url: URL) -> [String: Any]? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data, options: .json5Allowed)) as? [String: Any]
+    }
+
+    private static func writeSettings(_ settings: [String: Any], to url: URL, permissions: Int) throws {
+        let data = try JSONSerialization.data(
+            withJSONObject: settings,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        try data.write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: url.path)
+    }
+
+    private static func posixPermissions(at url: URL) -> Int? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.posixPermissions] as? Int
     }
 
     private static func usesStdioTransport(_ child: [String: Any]) -> Bool {

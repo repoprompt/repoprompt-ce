@@ -1,5 +1,8 @@
 @testable import RepoPromptApp
 @testable import RepoPromptDomainRuntime
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 #if DEBUG
@@ -19,6 +22,7 @@ import XCTest
             originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("WorkspaceDuplicateCleanupTests-\(UUID().uuidString)", isDirectory: true)
+            storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             agentWorkspaceRoot = storageRoot.appendingPathComponent("AgentWorkspaces", isDirectory: true)
             chatWorkspaceRoot = storageRoot.appendingPathComponent("ChatWorkspaces", isDirectory: true)
@@ -27,13 +31,13 @@ import XCTest
             await AgentSessionDataService.shared.test_setWorkspaceRootOverride(agentWorkspaceRoot)
             await ChatDataService.test_setWorkspaceRootOverride(chatWorkspaceRoot)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
             managers.forEach { $0.prepareForWindowClose() }
             managers.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             await AgentSessionDataService.shared.test_setWorkspaceRootOverride(nil)
             await ChatDataService.test_setWorkspaceRootOverride(nil)
             try? FileManager.default.removeItem(at: storageRoot)
@@ -180,7 +184,7 @@ import XCTest
                 contextID: nil,
                 operationID: UUID(),
                 origin: .appPresentation(windowID: -781),
-                revisions: nil,
+                revisions: canonicalBeforeLocalSave.revisions,
                 timestamp: Date(),
                 diagnostic: nil
             ))

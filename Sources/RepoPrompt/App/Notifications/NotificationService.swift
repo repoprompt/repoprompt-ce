@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import os
+import RepoPromptSettingsCore
 import UserNotifications
 
 private let notificationServiceLog = Logger(subsystem: "com.repoprompt.ce", category: "NotificationService")

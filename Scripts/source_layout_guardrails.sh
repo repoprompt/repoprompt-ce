@@ -14,7 +14,13 @@ print_matches() {
   local label="$1"
   shift
   local output
-  output="$($@ 2>/dev/null || true)"
+  local status=0
+  output="$("$@" 2>&1)" || status=$?
+  if (( status > 1 )); then
+    fail "$label: check failed (exit $status)"
+    printf '%s\n' "$output" >&2
+    return
+  fi
   if [[ -n "$output" ]]; then
     fail "$label"
     printf '%s\n' "$output" >&2
@@ -26,7 +32,7 @@ required_dirs=(
   "Sources/RepoPromptExecutable"
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
-  "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
+  "Sources/RepoPromptFoundation/SyntaxParsing"
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptWorkspaceCore"
   "Sources/RepoPromptDomainRuntime"
@@ -172,7 +178,10 @@ if workspace_core is None:
 else:
     if workspace_core.get("type") != "regular": errors.append("RepoPromptWorkspaceCore must remain an internal regular target")
     if workspace_core.get("path") != "Sources/RepoPromptWorkspaceCore": errors.append("RepoPromptWorkspaceCore target path drifted")
-    if workspace_core.get("dependencies", []): errors.append("RepoPromptWorkspaceCore must not declare target or package dependencies")
+    core_dependencies = workspace_core.get("dependencies", [])
+    core_products = {(dependency["product"][0], dependency["product"][1]) for dependency in core_dependencies if "product" in dependency}
+    if len(core_dependencies) != 1 or core_products != {("SystemPackage", "swift-system")}:
+        errors.append("RepoPromptWorkspaceCore must depend only on the existing Swift System native path package")
     if workspace_core.get("settings", []): errors.append("RepoPromptWorkspaceCore must not declare compiler settings")
 
 workspace_core_tests = targets.get("RepoPromptWorkspaceCoreTests")
@@ -188,9 +197,15 @@ else:
 app_by_name_dependencies = [dependency["byName"][0] for dependency in repo_prompt_app_dependencies if dependency.get("byName")]
 if app_by_name_dependencies.count("RepoPromptWorkspaceCore") != 1:
     errors.append("RepoPromptApp must depend exactly once on RepoPromptWorkspaceCore")
-for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptShared", "RepoPromptTests"):
+for forbidden_consumer in ("RepoPrompt", "RepoPromptMCP", "RepoPromptMCPCore", "RepoPromptShared"):
     dependencies = [dependency["byName"][0] for dependency in targets.get(forbidden_consumer, {}).get("dependencies", []) if dependency.get("byName")]
     if "RepoPromptWorkspaceCore" in dependencies: errors.append(f"{forbidden_consumer} must not directly depend on RepoPromptWorkspaceCore")
+for target_name, target in targets.items():
+    if target.get("type") == "test" or target_name == "RepoPromptTestSupport":
+        continue
+    target_dependencies = [dependency["byName"][0] for dependency in target.get("dependencies", []) if dependency.get("byName")]
+    if "RepoPromptTestSupport" in target_dependencies:
+        errors.append(f"production target {target_name} must not depend on RepoPromptTestSupport")
 for product in package.get("products", []):
     if "RepoPromptWorkspaceCore" in product.get("targets", []): errors.append("RepoPromptWorkspaceCore must not be exposed as a package product")
 
@@ -337,9 +352,15 @@ required_core_imports = {
 for module in sorted(required_core_imports):
     if f"import {module}\n" not in core_syntax_source:
         errors.append(f"CodeMapSyntaxEngine missing direct grammar/wrapper module import: {module}")
-bridging_header = Path("Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h").read_text()
-if "tree_sitter_" in bridging_header or "TSLanguage" in bridging_header:
-    errors.append("bridging header must not redeclare Tree-sitter grammar APIs")
+if "-import-objc-header" in Path("Package.swift").read_text():
+    errors.append("first-party targets must not use an Objective-C bridging header; import a C target module instead")
+repo_prompt_c_include = Path("Sources/RepoPromptC/include")
+repo_prompt_c_umbrella = (repo_prompt_c_include / "RepoPromptC.h").read_text()
+for header in sorted(repo_prompt_c_include.glob("*.h")):
+    if header.name != "RepoPromptC.h" and f'#include "{header.name}"' not in repo_prompt_c_umbrella:
+        errors.append(f"RepoPromptC umbrella header must include {header.name} (umbrella directories leave warm module caches stale)")
+if Path("Sources/RepoPrompt/Support").exists():
+    errors.append("Sources/RepoPrompt/Support was retired with the bridging header; C declarations belong in Sources/RepoPromptC")
 
 if errors:
     raise SystemExit("\n".join(errors))
@@ -369,7 +390,7 @@ for dir in "${retired_tree_sitter_grammar_dirs[@]}"; do
   fi
 done
 
-# RepoPromptWorkspaceCore is a Foundation-only path-policy boundary.
+# RepoPromptWorkspaceCore imports Foundation and the existing Swift System native path API only.
 workspace_core_source_dir="Sources/RepoPromptWorkspaceCore"
 if [[ -d "$workspace_core_source_dir" ]]; then
   unexpected_workspace_core_files="$(find "$workspace_core_source_dir" -type f ! -name '*.swift' -print)"
@@ -378,11 +399,16 @@ if [[ -d "$workspace_core_source_dir" ]]; then
     printf '%s\n' "$unexpected_workspace_core_files" >&2
   fi
 
-  if ! workspace_core_imports="$(xcrun swiftc -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
+  # Keep Xcode's selected toolchain on macOS; the same compiler check also runs headlessly on Linux.
+  workspace_core_compiler=(swiftc)
+  if command -v xcrun >/dev/null 2>&1; then
+    workspace_core_compiler=(xcrun swiftc)
+  fi
+  if ! workspace_core_imports="$("${workspace_core_compiler[@]}" -frontend -emit-imported-modules "$workspace_core_source_dir"/*.swift 2>&1 | sort -u)"; then
     fail "Swift compiler could not inspect RepoPromptWorkspaceCore imports"
     printf '%s\n' "$workspace_core_imports" >&2
-  elif [[ "$workspace_core_imports" != "Foundation" ]]; then
-    fail "RepoPromptWorkspaceCore compiler import allowlist is Foundation only"
+  elif [[ "$workspace_core_imports" != $'Foundation\nSystemPackage' ]]; then
+    fail "RepoPromptWorkspaceCore compiler import allowlist is Foundation and SystemPackage only"
     printf '%s\n' "$workspace_core_imports" >&2
   fi
 fi
@@ -573,15 +599,24 @@ else
   if ! grep -q 'final class DomainWorkspacePresentationBridge' "$m2_presentation_bridge"; then
     fail "M2 workspace presentation bridge declaration missing"
   fi
-  if ! grep -q 'guard subscription.snapshot.isBootstrapped' "$m2_presentation_bridge"; then
-    fail "M2 workspace presentation bridge lost first-projection readiness gate"
+  # Scope each readiness check to its owner: another guard elsewhere cannot cover its removal.
+  # Drain each scoped body: grep -q can SIGPIPE awk under pipefail.
+  if ! awk '/^    private func projectInitial\(/ { scoped=1 } /^    private func consume\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
+    | grep 'if initial.isBootstrapped, initial.workspaces.isEmpty,' > /dev/null; then
+    fail "M2 initial Default creation must be gated by authority bootstrap readiness"
+  fi
+  if ! awk '/^    private func project\(/ { scoped=1 } /^    private func commitAccepted\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
+    | grep 'guard snapshot.isBootstrapped else' > /dev/null; then
+    fail "M2 catalog projection must reject unbootstrapped authority snapshots"
   fi
 fi
 
 service_registry_source="Sources/RepoPrompt/Infrastructure/MCP/ServiceRegistry.swift"
-print_matches \
-  "ServiceRegistry reintroduced stored service/schema/catalog authority" \
-  grep -n -E 'static[[:space:]]+(var|let)[[:space:]]+(services|schemas|catalog)|\[any[[:space:]]+Service\]|\[Tool\]' "$service_registry_source"
+if [[ -f "$service_registry_source" ]]; then
+  print_matches \
+    "ServiceRegistry reintroduced stored service/schema/catalog authority" \
+    grep -n -E 'static[[:space:]]+(var|let)[[:space:]]+(services|schemas|catalog)|\[any[[:space:]]+Service\]|\[Tool\]' "$service_registry_source"
+fi
 for forwarding_source in \
   Sources/RepoPrompt/Infrastructure/MCP/MCPGlobalToolNames.swift \
   Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPWindowToolNames.swift \
@@ -647,10 +682,10 @@ fi
 # 4. Parser fixtures and sample parser inputs must not live in app source.
 print_matches \
   "parser fixture/test directory found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
+  find Sources/RepoPromptFoundation/SyntaxParsing -type d \( -iname '*fixture*' -o -iname '*test*' \) -print
 print_matches \
   "parser fixture-like sample input found under app syntax parsing source" \
-  find Sources/RepoPrompt/Infrastructure/SyntaxParsing -type f \( \
+  find Sources/RepoPromptFoundation/SyntaxParsing -type f \( \
     -iname '*fixture*' -o -iname '*test*' -o \
     -name '*.dart' -o -name '*.go' -o -name '*.java' -o -name '*.js' -o -name '*.jsx' -o \
     -name '*.py' -o -name '*.rb' -o -name '*.rs' -o -name '*.ts' -o -name '*.tsx' -o \
@@ -770,26 +805,43 @@ print_matches \
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
   "docs/architecture/actionable-macos-notifications.md"
+  "docs/architecture/agent-orchestration-guidance.md"
   "docs/architecture/agent-session-oversight-auto-wake.md"
   "docs/architecture/apple-identity-migration.md"
+  "docs/architecture/ci-reliability-2026-10-23.md"
+  "docs/architecture/ci-test-gates.md"
   "docs/architecture/codex-app-server-schema-gate.md"
+  "docs/architecture/codex-user-mcp-import.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
+  "docs/architecture/keyboard-shortcuts.md"
   "docs/architecture/mcp-lifecycle-diagnostics.md"
   "docs/architecture/model-routing.md"
+  "docs/architecture/modules.md"
+  "docs/architecture/oracle-attachments.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/prompt-experiments-gepa.md"
+  "docs/architecture/routing-profile-publication.md"
   "docs/architecture/settings-persistence.md"
+  "docs/architecture/self-compact-native-note-delivery.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
   "docs/mcp-progress.md"
   "docs/migrations/swift-6-2-concurrency-migration-2026-07-18.md"
   "docs/migrations/swift-6-2-concurrency/migration-ledger.md"
+  "docs/migrations/build-modularization-2026-09-28.md"
+  "docs/migrations/build-modularization/completion-plan.md"
+  "docs/migrations/build-modularization/ledger.md"
+  "docs/migrations/build-modularization/ratchets.json"
+  "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"
+  "docs/plans/agent-mode-reprompter-2026-10-20.md"
+  "docs/plans/openai-decisions-contract-2026-10-07.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"
+  "docs/reviews/model-router-auto-effort-openai-decisions-verification.md"
   "docs/testing.md"
   "docs/spec/headless-mcp-domain-runtime-m0-contracts.md"
   "docs/spec/headless-mcp-domain-runtime-m0-editflowperf-baseline.json"
@@ -817,6 +869,57 @@ unexpected_tracked_docs="$(comm -23 \
 if [[ -n "$unexpected_tracked_docs" ]]; then
   fail "unexpected tracked docs found; keep agent-authored working documents local or add durable docs to the explicit allowlist"
   printf '%s\n' "$unexpected_tracked_docs" >&2
+fi
+
+# 9. Runtime identity (build-modularization P0.6; inventory in
+# docs/migrations/build-modularization/ledger.md, "P0.6 compatibility inventory").
+# First-party production targets do not yet use SwiftPM resource bundles.
+# package_app.sh copies build-directory bundles, but arbitrary target bundles
+# have not been validated for runtime lookup after packaging.
+print_matches \
+  "production target declares SwiftPM resources (only test targets may; runtime bundle lookup is not validated)" \
+  awk '/\.(target|executableTarget|testTarget|binaryTarget)\(/ { kind = $0 } /resources:/ && kind !~ /testTarget/ { print FILENAME ":" FNR ": " $0 }' Package.swift
+print_matches \
+  "per-target bundle lookup in first-party Sources (use the app bundle via an allowlisted target)" \
+  grep -R -n -E '(^|[^A-Za-z0-9_])Bundle(\.module|\(for:)' Sources --include='*.swift'
+# `Bundle.main` and implicit main-bundle lookups resolve per process. They stay in
+# app-only targets; add a new app-only target here in the slice that creates it.
+# Targets linked into repoprompt-mcp are never allowlisted.
+bundle_main_allowed_roots=(
+  "Sources/RepoPrompt/"
+  "Sources/RepoPromptSecureStorage/"
+  "Sources/RepoPromptSettingsCore/"
+)
+bundle_main_hits="$(grep -R -n -E '(^|[^A-Za-z0-9_])(Bundle\.main|NSImage\(named:)' Sources --include='*.swift' || true)"
+for allowed_root in "${bundle_main_allowed_roots[@]}"; do
+  bundle_main_hits="$(printf '%s\n' "$bundle_main_hits" | grep -v -E "^${allowed_root}" || true)"
+done
+if [[ -n "$bundle_main_hits" ]]; then
+  fail "Bundle.main lookup outside an allowlisted app-only target"
+  printf '%s\n' "$bundle_main_hits" >&2
+fi
+# Extracted logic targets are app-free. Process additionally cannot read ambient
+# process-wide defaults; an app adapter must supply such configuration.
+if ! python3 Scripts/swift_imports.py --forbid-ui \
+  Sources/RepoPromptFoundation Sources/RepoPromptInstrumentation \
+  Sources/RepoPromptProcess Sources/RepoPromptRegexCore \
+  Sources/RepoPromptFileSystem Sources/RepoPromptVCS \
+  Sources/RepoPromptPersistence Sources/RepoPromptSettingsCore; then
+  fail "UI framework import in app-free target"
+fi
+if [[ -d Sources/RepoPromptProcess ]]; then
+  print_matches "ambient Bundle.main or UserDefaults.standard in RepoPromptProcess" \
+    grep -R -n -E 'Bundle[.]main|UserDefaults[.]standard' Sources/RepoPromptProcess --include='*.swift'
+fi
+
+# Swift class runtime names embed the module (`_TtC13RepoPromptApp...`), so these
+# APIs silently change identity when a type moves. Use explicit string identities.
+# The one allowed lookup names an Objective-C class, whose name has no module.
+runtime_type_name_hits="$(grep -R -n -E 'NSKeyedArchiver|NSKeyedUnarchiver|NSStringFromClass|NSClassFromString|_typeName\(' Sources --include='*.swift' \
+  | grep -v -F 'NSClassFromString("XCTestCase")' || true)"
+if [[ -n "$runtime_type_name_hits" ]]; then
+  fail "module-dependent runtime type-name API in first-party Sources"
+  printf '%s\n' "$runtime_type_name_hits" >&2
 fi
 
 if [[ "$failures" -ne 0 ]]; then

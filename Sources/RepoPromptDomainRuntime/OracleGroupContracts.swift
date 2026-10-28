@@ -474,6 +474,13 @@ package enum OracleLaneResultStatus: String, Codable {
 }
 
 package struct OracleLaneError: Codable, Equatable {
+    /// Shared by live coverage and bounded persistence so truncation cannot
+    /// turn a known timeout into a generic provider failure.
+    package static func indicatesTimeout(code: String?, message: String?) -> Bool {
+        let text = "\(code ?? "") \(message ?? "")".lowercased()
+        return text.contains("timeout") || text.contains("timed out") || text.contains("timed_out")
+    }
+
     package let code: String
     package let message: String
     package let partialResponse: String?
@@ -923,15 +930,15 @@ package struct OracleTurnRecord: Codable, Equatable {
 
     package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            id: try container.decode(OracleTurnID.self, forKey: .id),
-            input: try container.decode(OracleInput.self, forKey: .input),
-            state: try container.decode(OracleTurnState.self, forKey: .state),
-            startedAt: try container.decode(Date.self, forKey: .startedAt),
-            finishedAt: try container.decodeIfPresent(Date.self, forKey: .finishedAt),
-            status: try container.decodeIfPresent(OracleGroupStatus.self, forKey: .status),
-            warnings: try container.decodeIfPresent([OracleGroupWarning].self, forKey: .warnings) ?? [],
-            results: try container.decode([OracleLaneResult].self, forKey: .results)
+        try self.init(
+            id: container.decode(OracleTurnID.self, forKey: .id),
+            input: container.decode(OracleInput.self, forKey: .input),
+            state: container.decode(OracleTurnState.self, forKey: .state),
+            startedAt: container.decode(Date.self, forKey: .startedAt),
+            finishedAt: container.decodeIfPresent(Date.self, forKey: .finishedAt),
+            status: container.decodeIfPresent(OracleGroupStatus.self, forKey: .status),
+            warnings: container.decodeIfPresent([OracleGroupWarning].self, forKey: .warnings) ?? [],
+            results: container.decode([OracleLaneResult].self, forKey: .results)
         )
     }
 }

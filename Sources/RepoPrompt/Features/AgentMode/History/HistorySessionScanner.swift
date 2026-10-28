@@ -1,220 +1,7 @@
 import Darwin
 import Foundation
+import RepoPromptFileSystem
 import RepoPromptShared
-
-// MARK: - Cooperative Work Budgets
-
-struct HistoryScanDiagnostic: Codable, Equatable {
-    enum Kind: String, Codable, Hashable {
-        case workspaceCount = "workspace_count"
-        case workspaceDiscovery = "workspace_discovery"
-        case workspaceMetadataFileBytes = "workspace_metadata_file_bytes"
-        case workspaceMetadataReadFailure = "workspace_metadata_read_failure"
-        case indexCount = "index_count"
-        case indexBytes = "index_bytes"
-        case indexFileBytes = "index_file_bytes"
-        case indexReadFailure = "index_read_failure"
-        case transcriptBytes = "transcript_bytes"
-        case transcriptFileBytes = "transcript_file_bytes"
-        case transcriptReadFailure = "transcript_read_failure"
-        case turnCount = "turn_count"
-        case elapsedTime = "elapsed_time"
-        case diagnosticCount = "diagnostic_count"
-    }
-
-    enum Unit: String, Codable {
-        case workspaces
-        case indexes
-        case sessions
-        case bytes
-        case turns
-        case milliseconds
-    }
-
-    let kind: Kind
-    let retryable: Bool
-    let limit: Int64
-    let consumed: Int64
-    let unit: Unit
-    let phase: String?
-    let count: Int
-
-    init(
-        kind: Kind,
-        limit: Int64,
-        consumed: Int64,
-        unit: Unit,
-        retryable: Bool = true,
-        phase: String? = nil,
-        count: Int = 1
-    ) {
-        self.kind = kind
-        self.retryable = retryable
-        self.limit = limit
-        self.consumed = consumed
-        self.unit = unit
-        self.phase = phase
-        self.count = max(1, count)
-    }
-
-    var makesInventoryIncomplete: Bool {
-        switch kind {
-        case .workspaceMetadataFileBytes, .workspaceMetadataReadFailure:
-            false
-        case .workspaceCount, .workspaceDiscovery, .indexCount, .indexBytes,
-             .indexFileBytes, .indexReadFailure, .transcriptBytes,
-             .transcriptFileBytes, .transcriptReadFailure, .turnCount,
-             .elapsedTime, .diagnosticCount:
-            true
-        }
-    }
-}
-
-enum HistoryRemainingTimeDecision {
-    case sufficient(remaining: Duration)
-    case insufficient(HistoryScanDiagnostic)
-}
-
-final class HistoryRequestBudget: @unchecked Sendable {
-    enum ReadKind {
-        case index
-        case transcript
-    }
-
-    let startedAt: ContinuousClock.Instant
-    let deadline: ContinuousClock.Instant
-    let maxTurns: Int
-    let yieldEveryTurns: Int
-    let maxIndexBytes: Int64
-    let maxIndexFileBytes: Int64
-    let maxTranscriptBytes: Int64
-    let maxTranscriptFileBytes: Int64
-
-    private let nowProvider: @Sendable () -> ContinuousClock.Instant
-    private let lock = NSLock()
-    private var consumedIndexBytes: Int64 = 0
-    private var consumedTranscriptBytes: Int64 = 0
-
-    init(
-        startedAt: ContinuousClock.Instant,
-        deadline: ContinuousClock.Instant,
-        maxTurns: Int,
-        yieldEveryTurns: Int,
-        maxIndexBytes: Int64,
-        maxIndexFileBytes: Int64,
-        maxTranscriptBytes: Int64,
-        maxTranscriptFileBytes: Int64,
-        nowProvider: @escaping @Sendable () -> ContinuousClock.Instant
-    ) {
-        self.startedAt = startedAt
-        self.deadline = deadline
-        self.maxTurns = maxTurns
-        self.yieldEveryTurns = yieldEveryTurns
-        self.maxIndexBytes = maxIndexBytes
-        self.maxIndexFileBytes = maxIndexFileBytes
-        self.maxTranscriptBytes = maxTranscriptBytes
-        self.maxTranscriptFileBytes = maxTranscriptFileBytes
-        self.nowProvider = nowProvider
-    }
-
-    static func standalone(
-        maxElapsed: Duration = .seconds(20),
-        maxIndexBytes: Int64 = 128 * 1024 * 1024,
-        maxIndexFileBytes: Int64 = 16 * 1024 * 1024,
-        maxTranscriptBytes: Int64 = 256 * 1024 * 1024,
-        maxTranscriptFileBytes: Int64 = 64 * 1024 * 1024
-    ) -> HistoryRequestBudget {
-        let clock = ContinuousClock()
-        let startedAt = clock.now
-        return HistoryRequestBudget(
-            startedAt: startedAt,
-            deadline: startedAt + maxElapsed,
-            maxTurns: 250_000,
-            yieldEveryTurns: 64,
-            maxIndexBytes: maxIndexBytes,
-            maxIndexFileBytes: maxIndexFileBytes,
-            maxTranscriptBytes: maxTranscriptBytes,
-            maxTranscriptFileBytes: maxTranscriptFileBytes,
-            nowProvider: { ContinuousClock().now }
-        )
-    }
-
-    var now: ContinuousClock.Instant {
-        nowProvider()
-    }
-
-    func elapsedDiagnostic(phase: String) -> HistoryScanDiagnostic? {
-        let current = now
-        guard current >= deadline else { return nil }
-        return HistoryScanDiagnostic(
-            kind: .elapsedTime,
-            limit: Self.durationMilliseconds(deadline - startedAt),
-            consumed: Self.durationMilliseconds(current - startedAt),
-            unit: .milliseconds,
-            phase: phase
-        )
-    }
-
-    func remainingTimeDecision(
-        minimumRemaining: Duration,
-        phase: String
-    ) -> HistoryRemainingTimeDecision {
-        let current = now
-        let remaining = deadline - current
-        guard current < deadline, remaining >= minimumRemaining else {
-            return .insufficient(HistoryScanDiagnostic(
-                kind: .elapsedTime,
-                limit: Self.durationMilliseconds(deadline - startedAt),
-                consumed: Self.durationMilliseconds(current - startedAt),
-                unit: .milliseconds,
-                phase: phase
-            ))
-        }
-        return .sufficient(remaining: remaining)
-    }
-
-    func reserveRead(_ bytes: Int64, kind: ReadKind, phase: String) -> HistoryScanDiagnostic? {
-        let normalizedBytes = max(0, bytes)
-        let perFileLimit = kind == .index ? maxIndexFileBytes : maxTranscriptFileBytes
-        let fileKind: HistoryScanDiagnostic.Kind = kind == .index ? .indexFileBytes : .transcriptFileBytes
-        if normalizedBytes > perFileLimit {
-            return HistoryScanDiagnostic(
-                kind: fileKind,
-                limit: perFileLimit,
-                consumed: normalizedBytes,
-                unit: .bytes,
-                retryable: false,
-                phase: phase
-            )
-        }
-
-        return lock.withLock {
-            let cumulativeLimit = kind == .index ? maxIndexBytes : maxTranscriptBytes
-            let consumed = kind == .index ? consumedIndexBytes : consumedTranscriptBytes
-            guard normalizedBytes <= cumulativeLimit - consumed else {
-                return HistoryScanDiagnostic(
-                    kind: kind == .index ? .indexBytes : .transcriptBytes,
-                    limit: cumulativeLimit,
-                    consumed: consumed + normalizedBytes,
-                    unit: .bytes,
-                    phase: phase
-                )
-            }
-            if kind == .index {
-                consumedIndexBytes += normalizedBytes
-            } else {
-                consumedTranscriptBytes += normalizedBytes
-            }
-            return nil
-        }
-    }
-
-    private static func durationMilliseconds(_ duration: Duration) -> Int64 {
-        let components = duration.components
-        return components.seconds * 1000
-            + components.attoseconds / 1_000_000_000_000_000
-    }
-}
 
 struct HistoryInventoryScan: Equatable {
     let workspaces: [HistoryWorkspaceScanResult]
@@ -227,53 +14,6 @@ struct HistoryInventoryScan: Equatable {
 
     var isTruncated: Bool {
         diagnostics.contains(where: \.makesInventoryIncomplete)
-    }
-}
-
-struct HistoryInventoryBudget: Equatable {
-    let maxWorkspaces: Int
-    let maxIndexDecodes: Int
-    let maxIndexBytes: Int64
-    let maxIndexFileBytes: Int64
-    let maxWorkspaceMetadataFileBytes: Int64
-    let maxIndexCacheEntries: Int
-    let maxIndexCacheBytes: Int64
-    let maxTranscriptFileBytes: Int64
-    let maxTranscriptCacheBytes: Int64
-
-    static let `default` = HistoryInventoryBudget(
-        maxWorkspaces: 5000,
-        maxIndexDecodes: 2000,
-        maxIndexBytes: 128 * 1024 * 1024,
-        maxIndexFileBytes: 16 * 1024 * 1024,
-        maxWorkspaceMetadataFileBytes: 1024 * 1024,
-        maxIndexCacheEntries: 4096,
-        maxIndexCacheBytes: 128 * 1024 * 1024,
-        maxTranscriptFileBytes: 64 * 1024 * 1024,
-        maxTranscriptCacheBytes: 128 * 1024 * 1024
-    )
-
-    init(
-        maxWorkspaces: Int,
-        maxIndexDecodes: Int,
-        maxIndexBytes: Int64,
-        maxIndexFileBytes: Int64 = 16 * 1024 * 1024,
-        maxWorkspaceMetadataFileBytes: Int64 = 1024 * 1024,
-        maxIndexCacheEntries: Int = 4096,
-        maxIndexCacheBytes: Int64 = 128 * 1024 * 1024,
-        maxTranscriptFileBytes: Int64 = 64 * 1024 * 1024,
-        maxTranscriptCacheBytes: Int64 = 128 * 1024 * 1024,
-        maxElapsed _: Duration? = nil
-    ) {
-        self.maxWorkspaces = maxWorkspaces
-        self.maxIndexDecodes = maxIndexDecodes
-        self.maxIndexBytes = maxIndexBytes
-        self.maxIndexFileBytes = maxIndexFileBytes
-        self.maxWorkspaceMetadataFileBytes = maxWorkspaceMetadataFileBytes
-        self.maxIndexCacheEntries = max(1, maxIndexCacheEntries)
-        self.maxIndexCacheBytes = max(1, maxIndexCacheBytes)
-        self.maxTranscriptFileBytes = maxTranscriptFileBytes
-        self.maxTranscriptCacheBytes = maxTranscriptCacheBytes
     }
 }
 
@@ -321,163 +61,6 @@ struct HistoryDirectSessionLookup: Equatable {
     }
 }
 
-// MARK: - Scanner Protocol
-
-/// Protocol for cross-workspace session metadata scanning.
-/// Used for dependency injection in the MCP tool service (WI-3).
-protocol HistorySessionScanning: Sendable {
-    /// Discover all workspace directories and read their session metadata indexes.
-    /// Returns one result per workspace that has an AgentSessions directory.
-    func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult]
-
-    /// Same as ``scanAllWorkspaces()`` but force a fresh scan, bypassing the
-    /// cross-workspace inventory TTL cache. Used to resolve a session id that was
-    /// saved after the cache was populated (e.g. a `get_session` lookup that missed).
-    /// The per-workspace index signature cache still applies, so unchanged indexes
-    /// are not re-decoded, and the result repopulates the TTL cache.
-    func scanAllWorkspacesRefreshing() async throws -> [HistoryWorkspaceScanResult]
-
-    /// Budget-aware inventory entry point used by the MCP history service. Implementations
-    /// may pre-narrow exact workspace UUID/storage-directory scopes before opening indexes.
-    func scanWorkspaces(matching workspace: String?) async throws -> HistoryInventoryScan
-    func scanWorkspaces(
-        matching workspace: String?,
-        requestBudget: HistoryRequestBudget
-    ) async throws -> HistoryInventoryScan
-
-    /// Cache-bypassed budget-aware inventory used by the just-saved session fallback.
-    func scanWorkspacesRefreshing(matching workspace: String?) async throws -> HistoryInventoryScan
-    func scanWorkspacesRefreshing(
-        matching workspace: String?,
-        requestBudget: HistoryRequestBudget
-    ) async throws -> HistoryInventoryScan
-
-    /// Resolve an exact session file without hydrating the cross-workspace inventory.
-    func locateSession(sessionID: UUID) async throws -> HistoryDirectSessionLookup
-    func locateSession(
-        sessionID: UUID,
-        requestBudget: HistoryRequestBudget
-    ) async throws -> HistoryDirectSessionLookup
-
-    /// Load the session name and transcript through the same signature-checked cache.
-    func loadSessionForHistory(sessionID: UUID, workspaceDir: URL) async throws -> HistoryLoadedSession
-    func loadSessionForHistory(
-        sessionID: UUID,
-        workspaceDir: URL,
-        requestBudget: HistoryRequestBudget
-    ) async throws -> HistoryLoadedSession
-
-    /// Filter metadata records across all workspaces.
-    /// Calls ``scanAllWorkspaces()`` internally, then applies the given filters.
-    func sessionsMatchingFilters(
-        _ records: [HistoryWorkspaceScanResult],
-        workspace: String?,
-        agentKind: String?,
-        model: String?,
-        filePath: String?,
-        from: Date?,
-        to: Date?
-    ) -> [HistoryFilteredSessionRecord]
-
-    /// Lazily load a full transcript for a specific session.
-    /// Used by the ``search`` operation to walk turns for text matching.
-    func loadTranscriptForSearch(
-        sessionID: UUID,
-        workspaceDir: URL
-    ) async throws -> AgentTranscript
-    func loadTranscriptForSearch(
-        sessionID: UUID,
-        workspaceDir: URL,
-        requestBudget: HistoryRequestBudget
-    ) async throws -> AgentTranscript
-
-    /// Whether the session file for `record` has changed since its stored observed
-    /// signature was recorded — i.e., persisted transcript-derived fields may be
-    /// stale and should be recomputed from the live transcript.
-    func transcriptDerivedFieldsAreStale(
-        for record: AgentSessionMetadataRecord,
-        sessionID: UUID,
-        workspaceDir: URL
-    ) async -> Bool
-    func transcriptDerivedFieldsAreStale(
-        for record: AgentSessionMetadataRecord,
-        sessionID: UUID,
-        workspaceDir: URL,
-        requestBudget: HistoryRequestBudget
-    ) async throws -> Bool
-}
-
-extension HistorySessionScanning {
-    func scanWorkspaces(matching _: String?) async throws -> HistoryInventoryScan {
-        try await HistoryInventoryScan(workspaces: scanAllWorkspaces())
-    }
-
-    func scanWorkspaces(
-        matching workspace: String?,
-        requestBudget _: HistoryRequestBudget
-    ) async throws -> HistoryInventoryScan {
-        try await scanWorkspaces(matching: workspace)
-    }
-
-    func scanWorkspacesRefreshing(matching _: String?) async throws -> HistoryInventoryScan {
-        try await HistoryInventoryScan(workspaces: scanAllWorkspacesRefreshing())
-    }
-
-    func scanWorkspacesRefreshing(
-        matching workspace: String?,
-        requestBudget _: HistoryRequestBudget
-    ) async throws -> HistoryInventoryScan {
-        try await scanWorkspacesRefreshing(matching: workspace)
-    }
-
-    func locateSession(sessionID _: UUID) async throws -> HistoryDirectSessionLookup {
-        HistoryDirectSessionLookup(location: nil)
-    }
-
-    func locateSession(
-        sessionID: UUID,
-        requestBudget _: HistoryRequestBudget
-    ) async throws -> HistoryDirectSessionLookup {
-        try await locateSession(sessionID: sessionID)
-    }
-
-    func loadSessionForHistory(sessionID: UUID, workspaceDir: URL) async throws -> HistoryLoadedSession {
-        try await HistoryLoadedSession(
-            name: nil,
-            transcript: loadTranscriptForSearch(sessionID: sessionID, workspaceDir: workspaceDir)
-        )
-    }
-
-    func loadSessionForHistory(
-        sessionID: UUID,
-        workspaceDir: URL,
-        requestBudget _: HistoryRequestBudget
-    ) async throws -> HistoryLoadedSession {
-        try await loadSessionForHistory(sessionID: sessionID, workspaceDir: workspaceDir)
-    }
-
-    func loadTranscriptForSearch(
-        sessionID: UUID,
-        workspaceDir: URL,
-        requestBudget _: HistoryRequestBudget
-    ) async throws -> AgentTranscript {
-        try await loadTranscriptForSearch(sessionID: sessionID, workspaceDir: workspaceDir)
-    }
-
-    func transcriptDerivedFieldsAreStale(
-        for record: AgentSessionMetadataRecord,
-        sessionID: UUID,
-        workspaceDir: URL,
-        requestBudget _: HistoryRequestBudget
-    ) async throws -> Bool {
-        await transcriptDerivedFieldsAreStale(
-            for: record,
-            sessionID: sessionID,
-            workspaceDir: workspaceDir
-        )
-    }
-}
-
 // MARK: - Scan Results
 
 /// Result of scanning a single workspace's session metadata.
@@ -495,6 +78,9 @@ struct HistoryWorkspaceScanResult: Equatable {
     /// Non-nil when the index decoded successfully but its schema version doesn't match
     /// ``AgentSessionMetadataIndex/currentSchemaVersion``. Records are empty in this case.
     let indexSchemaVersion: Int?
+    /// Owner evidence travels with selected rows, independent of scanner cache eviction.
+    var registeredLocation: HistoryWorkspaceLocation?
+    var quarantinedFileCount: Int = 0
 }
 
 /// A metadata record paired with its workspace context, ready for filtering.
@@ -502,6 +88,7 @@ struct HistoryFilteredSessionRecord: Equatable {
     let record: AgentSessionMetadataRecord
     let workspaceName: String
     let workspaceDir: URL
+    var registeredLocation: HistoryWorkspaceLocation?
 
     var sessionID: UUID {
         record.id
@@ -513,6 +100,9 @@ struct HistoryFilteredSessionRecord: Equatable {
 enum HistorySessionScannerError: Error, Equatable, LocalizedError {
     case sessionFileNotFound(sessionID: UUID, workspaceDir: URL)
     case transcriptDecodingFailed(sessionID: UUID, underlying: String)
+    /// The session path or decoded identity is outside history authority (symlinked/non-regular
+    /// component, or embedded session ID differs from the requested ID). Never retryable.
+    case sessionAuthorityViolation(sessionID: UUID, reason: String)
     case workBudgetExceeded(HistoryScanDiagnostic)
 
     var errorDescription: String? {
@@ -521,6 +111,8 @@ enum HistorySessionScannerError: Error, Equatable, LocalizedError {
             "Session file not found for \(sessionID) in \(workspaceDir.lastPathComponent)"
         case let .transcriptDecodingFailed(sessionID, underlying):
             "Failed to decode transcript for session \(sessionID): \(underlying)"
+        case let .sessionAuthorityViolation(sessionID, reason):
+            "Session file for \(sessionID) failed history authority checks: \(reason)"
         case let .workBudgetExceeded(diagnostic):
             "History work budget exceeded during \(diagnostic.phase ?? diagnostic.kind.rawValue)"
         }
@@ -597,15 +189,21 @@ actor HistoryInventoryScanGate {
 /// and returns unified metadata across workspaces. Provides lazy transcript loading for the
 /// ``search`` operation.
 ///
-/// Uses ``MCPFilesystemIdentity.applicationSupportRootURL()`` for the base path and discovers
+/// Uses the compiled build-flavor application-state root as the base path and discovers
 /// workspaces under `Workspaces/*/`. Each workspace directory is expected to contain an
 /// `AgentSessions/AgentSessionIndex.json` file.
 actor HistorySessionScanner: HistorySessionScanning {
     private static let defaultScanCacheTTL: TimeInterval = 90
 
-    private struct FileSignature: Equatable {
+    struct FileSignature: Equatable {
         let fileSize: Int64
         let modificationTime: TimeInterval
+    }
+
+    private enum HistoryPathAuthorization {
+        case authorized(FileSignature)
+        case missing
+        case rejected(String)
     }
 
     private struct InventoryCounters {
@@ -652,6 +250,7 @@ actor HistorySessionScanner: HistorySessionScanning {
             let workspaceID: UUID?
             let indexSchemaVersion: Int?
             let records: [AgentSessionMetadataRecord]
+            let quarantinedFileCount: Int
             let estimatedByteCount: Int64
             var accessOrdinal: UInt64
         }
@@ -667,6 +266,7 @@ actor HistorySessionScanner: HistorySessionScanning {
     private struct TranscriptCacheEntry {
         let signature: FileSignature
         let sessionName: String?
+        let workspaceID: UUID?
         let transcript: AgentTranscript
         let providerTokenUsageByTurn: [AgentTokenUsagePersist]
         let codexLastTotalTokens: Int?
@@ -679,8 +279,9 @@ actor HistorySessionScanner: HistorySessionScanning {
     private let decoder: JSONDecoder
     private let inventoryBudget: HistoryInventoryBudget
     private let workspaceDirectoryProvider: (@Sendable (URL) throws -> [URL])?
+    private let workspaceLocations: HistoryWorkspaceLocationResolver?
 
-    /// Base URL for application support. Defaults to ``MCPFilesystemIdentity.applicationSupportRootURL()``.
+    /// Base URL for application support. Defaults to the compiled build-flavor application-state root.
     /// Injectable for testing.
     private let applicationSupportRoot: URL
     private let scanCacheTTL: TimeInterval
@@ -695,6 +296,8 @@ actor HistorySessionScanner: HistorySessionScanning {
     /// Observability counters for focused cache, cold-shape, cancellation, and direct-ID tests.
     private(set) var transcriptDecodeCountForTesting: Int = 0
     private(set) var indexDecodeCountForTesting: Int = 0
+    private(set) var indexCacheEvictionVisitsForTesting: Int = 0
+    private(set) var workspaceDirectoryStatCountForTesting: Int = 0
     private(set) var workspaceInspectionCountForTesting: Int = 0
     private(set) var directSessionFileStatCountForTesting: Int = 0
     var indexScanCacheEntryCountForTesting: Int {
@@ -711,15 +314,18 @@ actor HistorySessionScanner: HistorySessionScanning {
         applicationSupportRoot: URL? = nil,
         scanCacheTTL: TimeInterval = HistorySessionScanner.defaultScanCacheTTL,
         inventoryBudget: HistoryInventoryBudget = .default,
-        workspaceDirectoryProvider: (@Sendable (URL) throws -> [URL])? = nil
+        workspaceDirectoryProvider: (@Sendable (URL) throws -> [URL])? = nil,
+        workspaceLocations: HistoryWorkspaceLocationResolver? = nil
     ) {
         self.fileManager = fileManager
         self.decoder = decoder
         self.applicationSupportRoot = applicationSupportRoot
-            ?? MCPFilesystemConstants.identity.applicationSupportRootURL(fileManager: fileManager)
+            ?? fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(MCPFilesystemConstants.identity.applicationStateDirectoryName, isDirectory: true)
         self.scanCacheTTL = scanCacheTTL
         self.inventoryBudget = inventoryBudget
         self.workspaceDirectoryProvider = workspaceDirectoryProvider
+        self.workspaceLocations = workspaceLocations
     }
 
     // MARK: - Workspace Discovery
@@ -744,7 +350,10 @@ actor HistorySessionScanner: HistorySessionScanning {
         matching workspace: String?,
         requestBudget: HistoryRequestBudget
     ) async throws -> HistoryInventoryScan {
-        try await withInventoryScanGate {
+        if let selected = try await scanRegisteredWorkspace(matching: workspace, requestBudget: requestBudget) {
+            return selected
+        }
+        return try await withInventoryScanGate {
             try await performInventoryScan(
                 cacheDate: Date(),
                 workspace: workspace,
@@ -758,6 +367,9 @@ actor HistorySessionScanner: HistorySessionScanning {
         matching workspace: String?,
         requestBudget: HistoryRequestBudget
     ) async throws -> HistoryInventoryScan {
+        if let selected = try await scanRegisteredWorkspace(matching: workspace, requestBudget: requestBudget) {
+            return selected
+        }
         let now = Date()
         // A completed full inventory is authoritative for every workspace filter.
         if let cachedScanResults,
@@ -787,6 +399,95 @@ actor HistorySessionScanner: HistorySessionScanning {
                 cacheCompletedFullScan: true,
                 requestBudget: requestBudget
             )
+        }
+    }
+
+    /// A registered selection bypasses both the full-inventory cache and its root-scan gate.
+    private func scanRegisteredWorkspace(
+        matching workspace: String?, requestBudget: HistoryRequestBudget
+    ) async throws -> HistoryInventoryScan? {
+        guard let workspaceLocations, let raw = workspace?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        try Task.checkCancellation()
+        if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_selection") {
+            return HistoryInventoryScan(workspaces: [], diagnostics: [diagnostic])
+        }
+        let selector: HistoryWorkspaceSelector = UUID(uuidString: raw).map(HistoryWorkspaceSelector.id) ?? .exactName(raw)
+        let selection = await workspaceLocations.resolve(selector)
+        try Task.checkCancellation()
+        if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_selection") {
+            return HistoryInventoryScan(workspaces: [], diagnostics: [diagnostic])
+        }
+        let location: HistoryWorkspaceLocation
+        switch selection {
+        case let .matched(value): location = value
+        case .notRegistered:
+            if case .exactName = selector { return nil } // Preserve legacy partial-name discovery.
+            return selectionFailure("not_registered", retryable: false)
+        case .ambiguous: return selectionFailure("ambiguous", retryable: false)
+        case .unavailable: return selectionFailure("unavailable")
+        case .notReady: return selectionFailure("not_ready")
+        }
+        guard case .authorized = authorizeHistoryPath([], in: location.directory, location: location) else {
+            return selectionFailure("location_unavailable")
+        }
+        workspaceInspectionCountForTesting += 1
+        var seen: Set<String> = []
+        var counters = InventoryCounters()
+        counters.workspaces = 1
+        let outcome = try await scanWorkspace(
+            location.directory, seenIndexCacheKeys: &seen, counters: counters,
+            requestBudget: requestBudget, location: location
+        )
+        try Task.checkCancellation()
+        if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_selection") {
+            return HistoryInventoryScan(workspaces: [], diagnostics: [diagnostic])
+        }
+        let current = await workspaceLocations.resolve(selector)
+        try Task.checkCancellation()
+        if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_selection") {
+            return HistoryInventoryScan(workspaces: [], diagnostics: [diagnostic])
+        }
+        guard current == .matched(location) else { return selectionFailure("changed") }
+        guard case .authorized = authorizeHistoryPath([], in: location.directory, location: location) else {
+            return selectionFailure("location_unavailable")
+        }
+        switch outcome {
+        case let .result(result, _, diagnostics):
+            return HistoryInventoryScan(workspaces: [result], diagnostics: diagnostics)
+        case let .stopped(diagnostic, _):
+            return HistoryInventoryScan(workspaces: [], diagnostics: [diagnostic])
+        }
+    }
+
+    private func selectionFailure(_ phase: String, retryable: Bool = true) -> HistoryInventoryScan {
+        HistoryInventoryScan(workspaces: [], diagnostics: [selectionDiagnostic(phase, retryable: retryable)])
+    }
+
+    private func selectionDiagnostic(_ phase: String, retryable: Bool = true) -> HistoryScanDiagnostic {
+        HistoryScanDiagnostic(
+            kind: .workspaceDiscovery, limit: 1, consumed: 0, unit: .workspaces,
+            retryable: retryable, phase: "workspace_selection_\(phase)"
+        )
+    }
+
+    private func requireCurrentLocation(
+        _ location: HistoryWorkspaceLocation?, requestBudget: HistoryRequestBudget
+    ) async throws {
+        guard let location else { return }
+        try Task.checkCancellation()
+        if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_selection") {
+            throw HistorySessionScannerError.workBudgetExceeded(diagnostic)
+        }
+        guard let workspaceLocations else {
+            throw HistorySessionScannerError.workBudgetExceeded(selectionDiagnostic("changed"))
+        }
+        let current = await workspaceLocations.resolve(.id(location.workspaceID))
+        try Task.checkCancellation()
+        if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_selection") {
+            throw HistorySessionScannerError.workBudgetExceeded(diagnostic)
+        }
+        guard current == .matched(location) else {
+            throw HistorySessionScannerError.workBudgetExceeded(selectionDiagnostic("changed"))
         }
     }
 
@@ -879,13 +580,14 @@ actor HistorySessionScanner: HistorySessionScanning {
                 completedDiscovery = false
                 return false
             }
-            let isDirectory = directoryExists(at: workspaceDir)
+            // Match the directory-derived selector before any filesystem authorization work.
+            // The matching directory still passes the same no-symlink authority gate below.
+            if let scope, !scope.matches(workspaceDir) { return true }
+            workspaceDirectoryStatCountForTesting += 1
+            let isDirectory = historyPathSignature([], in: workspaceDir) != nil
             let isInjectedVirtualDirectory = workspaceDirectoryProvider != nil
                 && !fileManager.fileExists(atPath: workspaceDir.path)
             guard isDirectory || isInjectedVirtualDirectory else { return true }
-            if let scope, !scope.matches(workspaceDir) {
-                return true
-            }
             if counters.workspaces >= inventoryBudget.maxWorkspaces {
                 diagnostics.append(HistoryScanDiagnostic(
                     kind: .workspaceCount,
@@ -1006,7 +708,8 @@ actor HistorySessionScanner: HistorySessionScanning {
             if scan.indexSchemaVersion != nil { continue }
 
             // Workspace name filter: match against workspace name or workspace ID string
-            if let workspace {
+            if let rawWorkspace = workspace {
+                let workspace = rawWorkspace.trimmingCharacters(in: .whitespacesAndNewlines)
                 let nameMatch = scan.workspaceName.localizedCaseInsensitiveContains(workspace)
                 let idMatch = scan.workspaceID?.uuidString.caseInsensitiveCompare(workspace) == .orderedSame
                 let dirNameMatch = scan.workspaceDir.lastPathComponent.localizedCaseInsensitiveContains(workspace)
@@ -1047,7 +750,8 @@ actor HistorySessionScanner: HistorySessionScanning {
                 results.append(HistoryFilteredSessionRecord(
                     record: record,
                     workspaceName: scan.workspaceName,
-                    workspaceDir: scan.workspaceDir
+                    workspaceDir: scan.workspaceDir,
+                    registeredLocation: scan.registeredLocation
                 ))
             }
         }
@@ -1119,10 +823,8 @@ actor HistorySessionScanner: HistorySessionScanning {
             inspected += 1
             directSessionFileStatCountForTesting += 1
 
-            let sessionFile = workspaceDir
-                .appendingPathComponent("AgentSessions", isDirectory: true)
-                .appendingPathComponent(filename)
-            guard fileSignature(for: sessionFile) != nil else {
+            // Symlinked/non-regular components are outside history authority: skip them.
+            guard historyPathSignature(["AgentSessions", filename], in: workspaceDir) != nil else {
                 if inspected.isMultiple(of: 32) { await Task.yield() }
                 return nil
             }
@@ -1135,7 +837,8 @@ actor HistorySessionScanner: HistorySessionScanning {
             let cachedEntry = indexScanCache?.entries[cacheKey]
             let cachedRecord = cachedEntry?.records.first { $0.id == sessionID }
             let identity: (name: String, id: UUID?)
-            if let cachedEntry {
+            // Stale-schema cache entries carry only the storage-directory identity.
+            if let cachedEntry, cachedEntry.indexSchemaVersion == nil {
                 identity = (name: cachedEntry.workspaceName, id: cachedEntry.workspaceID)
                 touchCachedIndexScan(cacheKey)
             } else {
@@ -1235,7 +938,8 @@ actor HistorySessionScanner: HistorySessionScanning {
                 return HistoryFilteredSessionRecord(
                     record: record,
                     workspaceName: scan.workspaceName,
-                    workspaceDir: scan.workspaceDir
+                    workspaceDir: scan.workspaceDir,
+                    registeredLocation: scan.registeredLocation
                 )
             }
         }
@@ -1267,6 +971,18 @@ actor HistorySessionScanner: HistorySessionScanning {
         ).transcript
     }
 
+    func loadTranscriptForSearch(
+        sessionID: UUID,
+        workspaceDir: URL,
+        requestBudget: HistoryRequestBudget,
+        workspaceLocation: HistoryWorkspaceLocation?
+    ) async throws -> AgentTranscript {
+        try await loadSessionForHistory(
+            sessionID: sessionID, workspaceDir: workspaceDir,
+            requestBudget: requestBudget, workspaceLocation: workspaceLocation
+        ).transcript
+    }
+
     func loadSessionForHistory(
         sessionID: UUID,
         workspaceDir: URL
@@ -1283,6 +999,28 @@ actor HistorySessionScanner: HistorySessionScanning {
         workspaceDir: URL,
         requestBudget: HistoryRequestBudget
     ) async throws -> HistoryLoadedSession {
+        try await loadSessionForHistory(
+            sessionID: sessionID, workspaceDir: workspaceDir,
+            requestBudget: requestBudget, workspaceLocation: nil
+        )
+    }
+
+    func loadSessionForHistory(
+        sessionID: UUID, workspaceDir: URL, requestBudget: HistoryRequestBudget,
+        workspaceLocation location: HistoryWorkspaceLocation?
+    ) async throws -> HistoryLoadedSession {
+        try await requireCurrentLocation(location, requestBudget: requestBudget)
+        let result = try await loadSessionAtAuthorizedLocation(
+            sessionID: sessionID, workspaceDir: workspaceDir, requestBudget: requestBudget, location: location
+        )
+        try await requireCurrentLocation(location, requestBudget: requestBudget)
+        return result
+    }
+
+    private func loadSessionAtAuthorizedLocation(
+        sessionID: UUID, workspaceDir: URL, requestBudget: HistoryRequestBudget,
+        location: HistoryWorkspaceLocation?
+    ) async throws -> HistoryLoadedSession {
         try Task.checkCancellation()
         if let diagnostic = requestBudget.elapsedDiagnostic(phase: "transcript_stat") {
             throw HistorySessionScannerError.workBudgetExceeded(diagnostic)
@@ -1292,19 +1030,28 @@ actor HistorySessionScanner: HistorySessionScanning {
         let sessionFile = agentSessionsDir.appendingPathComponent(filename)
         let cacheKey = sessionFile.standardizedFileURL.path
 
-        guard let signature = fileSignature(for: sessionFile) else {
+        let signature: FileSignature
+        switch authorizeHistoryPath(["AgentSessions", filename], in: workspaceDir, location: location) {
+        case let .authorized(authorizedSignature):
+            signature = authorizedSignature
+        case .missing:
             removeTranscriptCacheEntry(cacheKey)
             throw HistorySessionScannerError.sessionFileNotFound(
                 sessionID: sessionID,
                 workspaceDir: workspaceDir
             )
+        case let .rejected(reason):
+            removeTranscriptCacheEntry(cacheKey)
+            throw HistorySessionScannerError.sessionAuthorityViolation(sessionID: sessionID, reason: reason)
         }
 
         if let cached = transcriptCache[cacheKey], cached.signature == signature {
+            try validateTranscriptWorkspace(cached.workspaceID, sessionID: sessionID, location: location)
             transcriptCacheAccessOrdinal &+= 1
             transcriptCache[cacheKey] = TranscriptCacheEntry(
                 signature: cached.signature,
                 sessionName: cached.sessionName,
+                workspaceID: cached.workspaceID,
                 transcript: cached.transcript,
                 providerTokenUsageByTurn: cached.providerTokenUsageByTurn,
                 codexLastTotalTokens: cached.codexLastTotalTokens,
@@ -1359,15 +1106,25 @@ actor HistorySessionScanner: HistorySessionScanning {
             // JSONDecoder is synchronous, so cancellation is checked immediately before
             // and after the single bounded-by-file decode rather than being silently lost.
             let session = try decoder.decode(AgentSession.self, from: data)
+            // A file copied under another session's filename must never be returned or
+            // cached as the requested session.
+            guard session.id == sessionID else {
+                throw HistorySessionScannerError.sessionAuthorityViolation(
+                    sessionID: sessionID,
+                    reason: "embedded session id \(session.id) does not match the requested id"
+                )
+            }
             try Task.checkCancellation()
             if let diagnostic = requestBudget.elapsedDiagnostic(phase: "transcript_decode") {
                 throw HistorySessionScannerError.workBudgetExceeded(diagnostic)
             }
+            try validateTranscriptWorkspace(session.workspaceID, sessionID: sessionID, location: location)
             let transcript = session.transcript ?? .empty
             insertTranscriptCacheEntry(
                 cacheKey,
                 signature: signature,
                 sessionName: session.name,
+                workspaceID: session.workspaceID,
                 transcript: transcript,
                 providerTokenUsageByTurn: session.providerTokenUsageByTurn,
                 codexLastTotalTokens: session.codexLastTotalTokens,
@@ -1414,6 +1171,18 @@ actor HistorySessionScanner: HistorySessionScanning {
         workspaceDir: URL,
         requestBudget: HistoryRequestBudget
     ) async throws -> Bool {
+        try await transcriptDerivedFieldsAreStale(
+            for: record, sessionID: sessionID, workspaceDir: workspaceDir,
+            requestBudget: requestBudget, workspaceLocation: nil
+        )
+    }
+
+    func transcriptDerivedFieldsAreStale(
+        for record: AgentSessionMetadataRecord,
+        sessionID: UUID, workspaceDir: URL, requestBudget: HistoryRequestBudget,
+        workspaceLocation location: HistoryWorkspaceLocation?
+    ) async throws -> Bool {
+        try await requireCurrentLocation(location, requestBudget: requestBudget)
         try Task.checkCancellation()
         if let diagnostic = requestBudget.elapsedDiagnostic(phase: "transcript_stat") {
             throw HistorySessionScannerError.workBudgetExceeded(diagnostic)
@@ -1424,15 +1193,26 @@ actor HistorySessionScanner: HistorySessionScanning {
         guard let observedSize = record.observedFileSize,
               let observedMod = record.observedFileModificationDate
         else { return true }
-        let sessionFile = workspaceDir
-            .appendingPathComponent("AgentSessions", isDirectory: true)
-            .appendingPathComponent("AgentSession-\(sessionID.uuidString).json")
-        guard let current = fileSignature(for: sessionFile) else { return true }
+        let current = historyPathSignature(
+            ["AgentSessions", "AgentSession-\(sessionID.uuidString).json"],
+            in: workspaceDir, location: location
+        )
+        try await requireCurrentLocation(location, requestBudget: requestBudget)
+        guard let current else { return true }
         return current.fileSize != observedSize
             || current.modificationTime != observedMod.timeIntervalSinceReferenceDate
     }
 
     // MARK: - Private Helpers
+
+    private func validateTranscriptWorkspace(
+        _ embeddedWorkspaceID: UUID?, sessionID: UUID, location: HistoryWorkspaceLocation?
+    ) throws {
+        guard let location, let embeddedWorkspaceID, embeddedWorkspaceID != location.workspaceID else { return }
+        throw HistorySessionScannerError.sessionAuthorityViolation(
+            sessionID: sessionID, reason: "embedded workspace id does not match the selected workspace"
+        )
+    }
 
     private func removeTranscriptCacheEntry(_ key: String) {
         guard let removed = transcriptCache.removeValue(forKey: key) else { return }
@@ -1443,6 +1223,7 @@ actor HistorySessionScanner: HistorySessionScanning {
         _ key: String,
         signature: FileSignature,
         sessionName: String?,
+        workspaceID: UUID?,
         transcript: AgentTranscript,
         providerTokenUsageByTurn: [AgentTokenUsagePersist],
         codexLastTotalTokens: Int?,
@@ -1455,6 +1236,7 @@ actor HistorySessionScanner: HistorySessionScanning {
         transcriptCache[key] = TranscriptCacheEntry(
             signature: signature,
             sessionName: sessionName,
+            workspaceID: workspaceID,
             transcript: transcript,
             providerTokenUsageByTurn: providerTokenUsageByTurn,
             codexLastTotalTokens: codexLastTotalTokens,
@@ -1480,20 +1262,23 @@ actor HistorySessionScanner: HistorySessionScanning {
         _ workspaceDir: URL,
         seenIndexCacheKeys: inout Set<String>,
         counters: InventoryCounters,
-        requestBudget: HistoryRequestBudget
+        requestBudget: HistoryRequestBudget,
+        location: HistoryWorkspaceLocation? = nil
     ) async throws -> WorkspaceScanOutcome {
         try Task.checkCancellation()
         if let diagnostic = requestBudget.elapsedDiagnostic(phase: "index_stat") {
             return .stopped(diagnostic, counters)
         }
         let dirName = workspaceDir.lastPathComponent
-        let fallbackIdentity = WorkspaceDirectoryName.parse(dirName)
+        let fallbackIdentity = location.map { (name: $0.name, id: Optional($0.workspaceID)) }
+            ?? WorkspaceDirectoryName.parse(dirName)
 
         func result(
             records: [AgentSessionMetadataRecord] = [],
             indexReadFailed: Bool = false,
             indexSchemaVersion: Int? = nil,
-            identity: (name: String, id: UUID?) = fallbackIdentity
+            identity: (name: String, id: UUID?) = fallbackIdentity,
+            quarantinedFileCount: Int = 0
         ) -> HistoryWorkspaceScanResult {
             HistoryWorkspaceScanResult(
                 workspaceDir: workspaceDir,
@@ -1501,42 +1286,93 @@ actor HistorySessionScanner: HistorySessionScanning {
                 workspaceID: identity.id,
                 records: records,
                 indexReadFailed: indexReadFailed,
-                indexSchemaVersion: indexSchemaVersion
+                indexSchemaVersion: indexSchemaVersion,
+                registeredLocation: location,
+                quarantinedFileCount: quarantinedFileCount
             )
         }
 
-        // A single exact index stat replaces the former AgentSessions-directory stat
-        // followed by an index stat. Missing directories and missing indexes retain the
-        // same empty-workspace result.
+        // A missing session-storage directory proves an empty workspace at this read. A missing
+        // derivative index inside existing (or unreadable) storage proves nothing about sessions.
+        // Inspect only that exact directory; discovery never enumerates transcript files to repair it.
         let indexFile = workspaceDir
             .appendingPathComponent("AgentSessions", isDirectory: true)
             .appendingPathComponent("AgentSessionIndex.json")
-        guard let indexSignature = fileSignature(for: indexFile) else {
-            return .result(result(), counters)
+        let indexSignature: FileSignature
+        switch authorizeHistoryPath(["AgentSessions", "AgentSessionIndex.json"], in: workspaceDir, location: location) {
+        case let .authorized(signature):
+            indexSignature = signature
+        case .missing:
+            if case .missing = authorizeHistoryPath(["AgentSessions"], in: workspaceDir, finalComponentIsDirectory: true, location: location) {
+                return .result(result(), counters)
+            }
+            return .result(result(indexReadFailed: true), counters, [HistoryScanDiagnostic(
+                kind: .indexReadFailure,
+                limit: 1,
+                consumed: 1,
+                unit: .indexes,
+                phase: "index_missing"
+            )])
+        case .rejected:
+            return .result(result(indexReadFailed: true), counters, [HistoryScanDiagnostic(
+                kind: .indexReadFailure,
+                limit: 1,
+                consumed: 1,
+                unit: .indexes,
+                retryable: false,
+                phase: "index_authority"
+            )])
         }
         try Task.checkCancellation()
 
         let cacheKey = indexScanCacheKey(for: indexFile)
         seenIndexCacheKeys.insert(cacheKey)
-        let workspaceJSON = workspaceDir.appendingPathComponent("workspace.json")
-        let workspaceSignature = fileSignature(for: workspaceJSON)
+        let workspaceSignature = location == nil ? historyPathSignature(["workspace.json"], in: workspaceDir) : nil
         if let cachedResult = cachedScanResult(
             for: cacheKey,
             indexSignature: indexSignature,
             workspaceSignature: workspaceSignature,
             workspaceDir: workspaceDir
         ) {
-            return .result(cachedResult, counters)
+            guard validIndexIdentity(cachedResult.records, location: location) else {
+                return .result(result(indexReadFailed: true), counters, [indexIdentityDiagnostic()])
+            }
+            return .result(result(
+                records: cachedResult.records, indexSchemaVersion: cachedResult.indexSchemaVersion,
+                identity: location == nil ? (cachedResult.workspaceName, cachedResult.workspaceID) : fallbackIdentity,
+                quarantinedFileCount: cachedResult.quarantinedFileCount
+            ), counters, selectedQuarantineDiagnostics(cachedResult.quarantinedFileCount, location: location))
         }
 
-        if counters.indexDecodes >= inventoryBudget.maxIndexDecodes {
-            return .stopped(HistoryScanDiagnostic(
+        func indexCountDiagnostic(_ current: InventoryCounters) -> HistoryScanDiagnostic? {
+            guard current.indexDecodes >= inventoryBudget.maxIndexDecodes else { return nil }
+            return HistoryScanDiagnostic(
                 kind: .indexCount,
                 limit: Int64(inventoryBudget.maxIndexDecodes),
-                consumed: Int64(counters.indexDecodes),
+                consumed: Int64(current.indexDecodes),
                 unit: .indexes,
                 phase: "index_decode"
-            ), counters)
+            )
+        }
+
+        // Stale-schema indexes are never decoded, so they must not consume the index
+        // count/byte budgets or the workspace.json identity read ahead of usable ones.
+        // A bounded head read answers the version question for the common writer layout
+        // (`schemaVersion` first); an inconclusive head falls back to the full read below.
+        let headSchemaVersion = headSchemaVersionSniff(of: indexFile)
+        if let headSchemaVersion, headSchemaVersion != AgentSessionMetadataIndex.currentSchemaVersion {
+            rememberStaleIndexScan(
+                cacheKey,
+                indexSignature: indexSignature,
+                workspaceSignature: workspaceSignature,
+                identity: fallbackIdentity,
+                indexSchemaVersion: headSchemaVersion
+            )
+            return .result(result(indexSchemaVersion: headSchemaVersion), counters)
+        }
+
+        if headSchemaVersion != nil, let diagnostic = indexCountDiagnostic(counters) {
+            return .stopped(diagnostic, counters)
         }
         let indexBytes = max(0, indexSignature.fileSize)
         let effectiveFileLimit = min(requestBudget.maxIndexFileBytes, inventoryBudget.maxIndexFileBytes)
@@ -1564,9 +1400,7 @@ actor HistorySessionScanner: HistorySessionScanning {
         }
 
         var updatedCounters = counters
-        updatedCounters.indexDecodes += 1
         updatedCounters.indexBytes += indexBytes
-        indexDecodeCountForTesting += 1
 
         do {
             let data = try Data(contentsOf: indexFile, options: .mappedIfSafe)
@@ -1585,33 +1419,35 @@ actor HistorySessionScanner: HistorySessionScanning {
                     phase: "index_decode"
                 )])
             }
+            guard schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
+                rememberStaleIndexScan(
+                    cacheKey,
+                    indexSignature: indexSignature,
+                    workspaceSignature: workspaceSignature,
+                    identity: fallbackIdentity,
+                    indexSchemaVersion: schemaVersion
+                )
+                return .result(result(indexSchemaVersion: schemaVersion), updatedCounters)
+            }
+            // The decode slot is charged only for current-schema indexes that will be decoded.
+            if let diagnostic = indexCountDiagnostic(updatedCounters) {
+                return .stopped(diagnostic, updatedCounters)
+            }
+            updatedCounters.indexDecodes += 1
+            indexDecodeCountForTesting += 1
 
-            let identityResolution = try await resolveWorkspaceNameAndID(
-                from: workspaceDir,
-                dirName: dirName,
-                requestBudget: requestBudget
-            )
+            let identityResolution: WorkspaceIdentityResolution = if location != nil {
+                WorkspaceIdentityResolution(identity: fallbackIdentity, diagnostic: nil)
+            } else {
+                try await resolveWorkspaceNameAndID(
+                    from: workspaceDir, dirName: dirName, requestBudget: requestBudget
+                )
+            }
             let identity = identityResolution.identity
             let identityDiagnostics = identityResolution.diagnostic.map { [$0] } ?? []
             try Task.checkCancellation()
             if let diagnostic = requestBudget.elapsedDiagnostic(phase: "workspace_identity") {
                 return .stopped(diagnostic, updatedCounters)
-            }
-            guard schemaVersion == AgentSessionMetadataIndex.currentSchemaVersion else {
-                rememberIndexScan(
-                    cacheKey,
-                    indexSignature: indexSignature,
-                    workspaceSignature: workspaceSignature,
-                    identity: identity,
-                    indexSchemaVersion: schemaVersion,
-                    records: [],
-                    estimatedByteCount: indexBytes
-                )
-                return .result(
-                    result(indexSchemaVersion: schemaVersion, identity: identity),
-                    updatedCounters,
-                    identityDiagnostics
-                )
             }
 
             if case let .insufficient(diagnostic) = requestBudget.remainingTimeDecision(
@@ -1621,6 +1457,9 @@ actor HistorySessionScanner: HistorySessionScanning {
                 return .stopped(diagnostic, updatedCounters)
             }
             let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
+            guard validIndexIdentity(index.entries, location: location) else {
+                return .result(result(indexReadFailed: true), updatedCounters, [indexIdentityDiagnostic()])
+            }
             try Task.checkCancellation()
             if let diagnostic = requestBudget.elapsedDiagnostic(phase: "index_decode") {
                 return .stopped(diagnostic, updatedCounters)
@@ -1632,9 +1471,12 @@ actor HistorySessionScanner: HistorySessionScanning {
                 identity: identity,
                 indexSchemaVersion: nil,
                 records: index.entries,
-                estimatedByteCount: indexBytes
+                estimatedByteCount: indexBytes,
+                quarantinedFileCount: index.quarantinedFiles.count
             )
-            return .result(result(records: index.entries, identity: identity), updatedCounters, identityDiagnostics)
+            return .result(result(
+                records: index.entries, identity: identity, quarantinedFileCount: index.quarantinedFiles.count
+            ), updatedCounters, identityDiagnostics + selectedQuarantineDiagnostics(index.quarantinedFiles.count, location: location))
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as HistorySessionScannerError {
@@ -1675,12 +1517,33 @@ actor HistorySessionScanner: HistorySessionScanning {
 
     private func pruneIndexScanCache(keeping liveKeys: Set<String>) {
         guard var cache = indexScanCache else { return }
+        indexScanCache = nil
         let originalCount = cache.entries.count
         cache.entries = cache.entries.filter { liveKeys.contains($0.key) }
         if cache.entries.count != originalCount {
             cache.estimatedByteCount = cache.entries.values.reduce(0) { $0 + $1.estimatedByteCount }
-            indexScanCache = cache
         }
+        indexScanCache = cache
+    }
+
+    private func selectedQuarantineDiagnostics(_ count: Int, location: HistoryWorkspaceLocation?) -> [HistoryScanDiagnostic] {
+        guard location != nil, count > 0 else { return [] }
+        return [HistoryScanDiagnostic(
+            kind: .indexReadFailure, limit: 1, consumed: 1, unit: .indexes,
+            retryable: false, phase: "index_quarantined"
+        )]
+    }
+
+    private func validIndexIdentity(_ records: [AgentSessionMetadataRecord], location: HistoryWorkspaceLocation?) -> Bool {
+        guard let location else { return true }
+        var seen: Set<UUID> = []
+        return records.allSatisfy {
+            ($0.workspaceID == nil || $0.workspaceID == location.workspaceID) && seen.insert($0.id).inserted
+        }
+    }
+
+    private func indexIdentityDiagnostic() -> HistoryScanDiagnostic {
+        HistoryScanDiagnostic(kind: .indexReadFailure, limit: 1, consumed: 1, unit: .indexes, retryable: false, phase: "index_identity")
     }
 
     private func cachedScanResult(
@@ -1703,24 +1566,29 @@ actor HistorySessionScanner: HistorySessionScanning {
             workspaceID: entry.workspaceID,
             records: entry.records,
             indexReadFailed: false,
-            indexSchemaVersion: entry.indexSchemaVersion
+            indexSchemaVersion: entry.indexSchemaVersion,
+            quarantinedFileCount: entry.quarantinedFileCount
         )
     }
 
-    private func rememberIndexScan(
+    func rememberIndexScan(
         _ cacheKey: String,
         indexSignature: FileSignature,
         workspaceSignature: FileSignature?,
         identity: (name: String, id: UUID?),
         indexSchemaVersion: Int?,
         records: [AgentSessionMetadataRecord],
-        estimatedByteCount: Int64
+        estimatedByteCount: Int64,
+        quarantinedFileCount: Int = 0
     ) {
         var cache = indexScanCache ?? IndexScanCache(
             entries: [:],
             estimatedByteCount: 0,
             accessOrdinal: 0
         )
+        // Transfer the actor-owned dictionary, rather than copying it on every insert.
+        // There is no suspension while ownership is temporarily held by this local.
+        indexScanCache = nil
         cache.accessOrdinal &+= 1
         let normalizedBytes = max(0, estimatedByteCount)
         let entry = IndexScanCache.Entry(
@@ -1731,6 +1599,7 @@ actor HistorySessionScanner: HistorySessionScanning {
             workspaceID: identity.id,
             indexSchemaVersion: indexSchemaVersion,
             records: records,
+            quarantinedFileCount: quarantinedFileCount,
             estimatedByteCount: normalizedBytes,
             accessOrdinal: cache.accessOrdinal
         )
@@ -1738,24 +1607,34 @@ actor HistorySessionScanner: HistorySessionScanning {
             cache.estimatedByteCount -= replaced.estimatedByteCount
         }
         cache.estimatedByteCount += normalizedBytes
-        while cache.entries.count > inventoryBudget.maxIndexCacheEntries
+        if cache.entries.count > inventoryBudget.maxIndexCacheEntries
             || cache.estimatedByteCount > inventoryBudget.maxIndexCacheBytes
         {
-            guard let evictionKey = cache.entries.min(by: { lhs, rhs in
-                if lhs.value.accessOrdinal != rhs.value.accessOrdinal {
-                    return lhs.value.accessOrdinal < rhs.value.accessOrdinal
+            // A cyclic history census must not run a full dictionary minimum for each
+            // insertion. Sort scalar keys/ordinals once and evict to a low-water mark.
+            // Bounds remain unchanged; the next overflow is amortized across new entries.
+            let entryTarget = max(1, inventoryBudget.maxIndexCacheEntries * 3 / 4)
+            let byteTarget = inventoryBudget.maxIndexCacheBytes - inventoryBudget.maxIndexCacheBytes / 4
+            indexCacheEvictionVisitsForTesting += cache.entries.count
+            let oldest = cache.entries.map { (key: $0.key, ordinal: $0.value.accessOrdinal) }
+                .sorted {
+                    $0.ordinal != $1.ordinal ? $0.ordinal < $1.ordinal : $0.key < $1.key
                 }
-                return lhs.key < rhs.key
-            })?.key,
-                let removed = cache.entries.removeValue(forKey: evictionKey)
-            else { break }
-            cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+            for candidate in oldest {
+                guard cache.entries.count > entryTarget || cache.estimatedByteCount > byteTarget else { break }
+                // Low water is an amortization target, not an admission cap. Retain the newest
+                // index when it fits the hard cap, even if it alone exceeds the byte target.
+                if candidate.key == cacheKey, normalizedBytes <= inventoryBudget.maxIndexCacheBytes { continue }
+                guard let removed = cache.entries.removeValue(forKey: candidate.key) else { continue }
+                cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+            }
         }
         indexScanCache = cache
     }
 
     private func touchCachedIndexScan(_ cacheKey: String) {
         guard var cache = indexScanCache, var entry = cache.entries[cacheKey] else { return }
+        indexScanCache = nil
         cache.accessOrdinal &+= 1
         entry.accessOrdinal = cache.accessOrdinal
         cache.entries[cacheKey] = entry
@@ -1763,22 +1642,90 @@ actor HistorySessionScanner: HistorySessionScanning {
     }
 
     private func removeCachedIndexScan(_ cacheKey: String) {
-        guard var cache = indexScanCache, let removed = cache.entries.removeValue(forKey: cacheKey) else { return }
-        cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+        guard var cache = indexScanCache else { return }
+        indexScanCache = nil
+        if let removed = cache.entries.removeValue(forKey: cacheKey) {
+            cache.estimatedByteCount = max(0, cache.estimatedByteCount - removed.estimatedByteCount)
+        }
         indexScanCache = cache
     }
 
-    private func fileSignature(for fileURL: URL) -> FileSignature? {
+    /// Signature of an authorized history path, or nil when it is missing or rejected.
+    private func historyPathSignature(
+        _ components: [String], in workspaceDir: URL, location: HistoryWorkspaceLocation? = nil
+    ) -> FileSignature? {
+        guard case let .authorized(signature) = authorizeHistoryPath(components, in: workspaceDir, location: location) else {
+            return nil
+        }
+        return signature
+    }
+
+    /// The single authority gate for every history read (workspace dirs, `AgentSessions`,
+    /// indexes, `workspace.json`, session files). An owner-issued location may select a custom
+    /// directory; the same component checks apply there. Only the saved Workspaces root is
+    /// canonicalized, so a root that legitimately lives behind a symlink (`/var` →
+    /// `/private/var`, a relocated storage root) keeps working. Every component below it is
+    /// checked with `lstat`: the workspace dir and intermediate components must be real
+    /// directories and the final component a regular file, never a symlink. An empty
+    /// `components` authorizes the workspace directory itself.
+    private func authorizeHistoryPath(
+        _ components: [String], in workspaceDir: URL, finalComponentIsDirectory: Bool = false,
+        location: HistoryWorkspaceLocation? = nil
+    ) -> HistoryPathAuthorization {
+        let name = workspaceDir.lastPathComponent
+        guard !name.isEmpty, name != ".", name != "..", !components.contains(where: { $0.contains("/") }) else {
+            return .rejected("invalid history path component")
+        }
+        let workspacesRoot = applicationSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        let parent = workspaceDir.deletingLastPathComponent()
+        if let location {
+            // Directory hints can differ before and after creation without changing the path.
+            // Compare file identity here; retain the supplied URL for the lstat checks below.
+            guard workspaceDir.isFileURL, location.directory.isFileURL,
+                  workspaceDir.host == location.directory.host,
+                  workspaceDir.standardizedFileURL.path == location.directory.standardizedFileURL.path
+            else {
+                return .rejected("workspace directory does not match registered location")
+            }
+        } else if parent.standardizedFileURL.path != workspacesRoot.standardizedFileURL.path {
+            guard let canonicalParent = Self.canonicalPath(parent) else { return .missing }
+            guard canonicalParent == Self.canonicalPath(workspacesRoot) else {
+                return .rejected("workspace directory is outside the saved Workspaces root")
+            }
+        }
+
+        var current = workspaceDir
         var statResult = Darwin.stat()
-        return fileURL.withUnsafeFileSystemRepresentation { path in
-            guard let path, stat(path, &statResult) == 0 else { return nil }
-            return FileSignature(
-                fileSize: Int64(statResult.st_size),
-                modificationTime: Date(
-                    timeIntervalSince1970: TimeInterval(statResult.st_mtimespec.tv_sec)
-                        + (TimeInterval(statResult.st_mtimespec.tv_nsec) / 1_000_000_000)
-                ).timeIntervalSinceReferenceDate
-            )
+        for (offset, component) in ([""] + components).enumerated() {
+            if offset > 0 { current = current.appendingPathComponent(component) }
+            let isFinal = offset == components.count
+            let expectedType = isFinal && !components.isEmpty && !finalComponentIsDirectory ? S_IFREG : S_IFDIR
+            let status = current.withUnsafeFileSystemRepresentation { path -> Int32 in
+                guard let path else { return ENOENT }
+                return lstat(path, &statResult) == 0 ? 0 : errno
+            }
+            if status == ENOENT || status == ENOTDIR { return .missing }
+            guard status == 0 else { return .rejected("history path component could not be inspected") }
+            let type = statResult.st_mode & S_IFMT
+            if type == S_IFLNK { return .rejected("history path component is a symbolic link") }
+            guard type == expectedType else {
+                return .rejected("history path component has an unexpected file type")
+            }
+        }
+        return .authorized(FileSignature(
+            fileSize: Int64(statResult.st_size),
+            modificationTime: Date(
+                timeIntervalSince1970: TimeInterval(statResult.st_mtimespec.tv_sec)
+                    + (TimeInterval(statResult.st_mtimespec.tv_nsec) / 1_000_000_000)
+            ).timeIntervalSinceReferenceDate
+        ))
+    }
+
+    private static func canonicalPath(_ url: URL) -> String? {
+        url.withUnsafeFileSystemRepresentation { path in
+            guard let path, let resolved = realpath(path, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
         }
     }
 
@@ -1792,23 +1739,6 @@ actor HistorySessionScanner: HistorySessionScanning {
 
     private func indexScanCacheKey(for fileURL: URL) -> String {
         fileURL.standardizedFileURL.path
-    }
-
-    private nonisolated func schemaVersionSniff(from data: Data) -> Int? {
-        guard let text = String(data: data, encoding: .utf8),
-              let keyRange = text.range(of: "\"schemaVersion\"")
-        else { return nil }
-        guard let colon = text[keyRange.upperBound...].firstIndex(of: ":") else { return nil }
-        var index = text.index(after: colon)
-        while index < text.endIndex, text[index].isWhitespace {
-            index = text.index(after: index)
-        }
-        let start = index
-        while index < text.endIndex, text[index].isNumber || text[index] == "-" {
-            index = text.index(after: index)
-        }
-        guard start < index else { return nil }
-        return Int(text[start ..< index])
     }
 
     private nonisolated func minimumTranscriptDecodeRemaining(for bytes: Int64) -> Duration {
@@ -1830,7 +1760,7 @@ actor HistorySessionScanner: HistorySessionScanning {
             throw HistorySessionScannerError.workBudgetExceeded(diagnostic)
         }
         let workspaceJSON = workspaceDir.appendingPathComponent("workspace.json")
-        guard let signature = fileSignature(for: workspaceJSON) else {
+        guard let signature = historyPathSignature(["workspace.json"], in: workspaceDir) else {
             return WorkspaceIdentityResolution(identity: fallback, diagnostic: nil)
         }
         if signature.fileSize > inventoryBudget.maxWorkspaceMetadataFileBytes {

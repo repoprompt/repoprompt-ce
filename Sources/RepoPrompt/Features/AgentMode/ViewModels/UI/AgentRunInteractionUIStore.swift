@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 struct AgentRunInteractionUISnapshot: Equatable {
     var currentTabID: UUID?
@@ -78,21 +79,22 @@ struct AgentRunInteractionUISnapshot: Equatable {
 
 @MainActor
 final class AgentRunInteractionUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot: AgentRunInteractionUISnapshot = .empty
 
     func update(_ snapshot: AgentRunInteractionUISnapshot) {
         guard self.snapshot != snapshot else {
             #if DEBUG
-                AgentModePerfDiagnostics.recordStoreUpdate("runInteraction", published: false)
+                perfRecorder.recordStoreUpdate("runInteraction", published: false)
             #endif
             return
         }
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 "runInteraction",
                 published: true,
                 details: [
-                    "tabID": AgentModePerfDiagnostics.shortID(snapshot.currentTabID),
+                    "tabID": perfRecorder.shortID(snapshot.currentTabID),
                     "runState": String(describing: snapshot.runState),
                     "hasPendingAskUser": String(snapshot.pendingAskUser != nil),
                     "askUserTimeoutStartedAt": snapshot.pendingAskUser?.timeoutStartedAt?.description ?? "nil",
@@ -100,13 +102,13 @@ final class AgentRunInteractionUIStore: ObservableObject {
                     "hasPendingApproval": String(snapshot.pendingApproval != nil),
                     "hasPendingCodexHookReview": String(snapshot.pendingCodexHookReview != nil),
                     "codexHookReviewPhase": snapshot.pendingCodexHookReview?.phase.rawValue ?? "nil",
-                    "codexHookReviewID": AgentModePerfDiagnostics.shortID(snapshot.pendingCodexHookReview?.id),
+                    "codexHookReviewID": perfRecorder.shortID(snapshot.pendingCodexHookReview?.id),
                     "hasPendingPermissions": String(snapshot.pendingPermissionsRequest != nil),
                     "hasPendingMCPElicitation": String(snapshot.pendingMCPElicitationRequest != nil),
                     "hasApplyReview": String(snapshot.pendingApplyEditsReview != nil),
                     "hasWorktreeMergeReview": String(snapshot.pendingWorktreeMergeReview != nil),
                     "hasWorktreeMergeConflict": String(snapshot.activeWorktreeMergeConflict != nil),
-                    "activeRunID": AgentModePerfDiagnostics.shortID(snapshot.activeRunID)
+                    "activeRunID": perfRecorder.shortID(snapshot.activeRunID)
                 ]
             )
         #endif

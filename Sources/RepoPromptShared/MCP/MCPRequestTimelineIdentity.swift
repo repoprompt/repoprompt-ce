@@ -59,5 +59,9 @@ public struct MCPRequestTimelineIdentity: Equatable, Sendable {
 }
 
 public enum MCPRequestTimelineContext {
-    @TaskLocal public static var current: MCPRequestTimelineIdentity?
+    // Boxed: runtime-sized payloads must not use `@TaskLocal` directly (#1039).
+    public static let currentTaskLocal = BoxedTaskLocal<MCPRequestTimelineIdentity?>(nil)
+    public static var current: MCPRequestTimelineIdentity? {
+        currentTaskLocal.get()
+    }
 }

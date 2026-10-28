@@ -21,29 +21,79 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     case manageCleanup = "agent_manage.cleanup_sessions"
 
     case monitorList = "agent_session_link.list"
+    case monitorCreateLane = "agent_session_link.create_lane"
+    case monitorRetireLane = "agent_session_link.retire_lane"
     case monitorPoll = "agent_session_link.poll"
     case monitorWait = "agent_session_link.wait"
     case monitorRead = "agent_session_link.read"
     case monitorSend = "agent_session_link.send"
+    /// Native compaction of one exact idle target, under its existing send grant.
+    case monitorCompact = "agent_session_link.compact"
     /// Observer-local Auto-wake admission policy for one exact outbound lane.
     ///
     /// It names a target because the policy is per-lane, but it never reaches that target: nothing
     /// about the overseen session is read, written, resumed, or notified. The authority it needs is
     /// therefore the plain read grant the observer already holds over that lane.
     case monitorSnoozeAutoWake = "agent_session_link.snooze_auto_wake"
-    /// Inspects the target's current pending prompt payload. Management-only: prompt text, commands,
-    /// and paths are more than a watch grant discloses.
-    case monitorGetInteraction = "agent_session_link.get_interaction"
     /// Answers the target's exact current pending prompt on the user's behalf.
     case monitorRespond = "agent_session_link.respond"
     /// Steers the target: injects an instruction into its active run or starts its next turn.
     case monitorSteer = "agent_session_link.steer"
+    /// Cancels one exact target's current run or pending start under a Manage grant.
+    case monitorStop = "agent_session_link.stop"
+    case monitorSetModel = "agent_session_link.set_model"
+    /// Rebinds or unbinds one exact target's execution worktree through `manage_worktree`
+    /// (`bind` / `select` / `unbind`, or `create` with `bind=true`) under a Manage grant.
+    ///
+    /// It is not an `agent_session_link` operation, but an Agent caller that is neither the target
+    /// itself nor its spawn parent may redirect the target's checkout only with the user's
+    /// management delegation over that exact target.
+    case monitorWorktreeBinding = "manage_worktree.binding"
+
+    // Delegation-scope (`session_admin`) identities. Each maps to exactly one required
+    // `DomainDelegationScopeCapability` in `requiredScopeCapability`. `adminSpawn` is the scope
+    // identity shared by every session-creating surface (`agent_run.start`, `create_lane`,
+    // `agent_manage.create_session`) when it acts under a scope.
+    case adminRequestScope = "session_admin.request_scope"
+    case adminScopeStatus = "session_admin.scope_status"
+    case adminReleaseScope = "session_admin.release_scope"
+    case adminAttenuate = "session_admin.attenuate"
+    case adminInventory = "session_admin.inventory"
+    case adminGet = "session_admin.get"
+    case adminTree = "session_admin.tree"
+    case adminLinks = "session_admin.links"
+    case adminRename = "session_admin.rename"
+    case adminSetPin = "session_admin.set_pin"
+    case adminReorderPins = "session_admin.reorder_pins"
+    case adminSetGroup = "session_admin.set_group"
+    case adminReorderGroups = "session_admin.reorder_groups"
+    case adminArchive = "session_admin.archive"
+    case adminUnarchive = "session_admin.unarchive"
+    case adminLink = "session_admin.link"
+    case adminUnlink = "session_admin.unlink"
+    case adminReparent = "session_admin.reparent"
+    case adminAdopt = "session_admin.adopt"
+    case adminRelease = "session_admin.release"
+    case adminRetire = "session_admin.retire"
+    case adminSpawn = "session_admin.spawn"
+    case adminFork = "session_admin.fork"
+    case adminSetModel = "session_admin.set_model"
+    case adminSetEffort = "session_admin.set_effort"
+    case adminWorktreeCreate = "session_admin.worktree_create"
+    case adminWorktreeBind = "session_admin.worktree_bind"
+    case adminWorktreeUnbind = "session_admin.worktree_unbind"
+    case adminWorktreeRelease = "session_admin.worktree_release"
+    case adminWorktreeInventory = "session_admin.worktree_inventory"
+    case adminMergePreview = "session_admin.merge_preview"
+    case adminMergeApply = "session_admin.merge_apply"
 
     package enum Family: String, Hashable, Sendable {
         /// Existing spawn-provenance control and read operations.
         case sessionControl = "session_control"
         /// New user-granted oversight operations.
         case monitor
+        /// Delegation-scope administration (`session_admin`). Authorized only by a scope lease.
+        case delegation
     }
 
     package var family: Family {
@@ -52,9 +102,19 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
             .sessionControl
-        case .monitorList, .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake, .monitorGetInteraction, .monitorRespond, .monitorSteer:
+        case .monitorList, .monitorCreateLane, .monitorRetireLane, .monitorPoll, .monitorWait, .monitorRead, .monitorSend, .monitorCompact,
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel,
+             .monitorWorktreeBinding:
             .monitor
+        case .adminRequestScope, .adminScopeStatus, .adminReleaseScope, .adminAttenuate,
+             .adminInventory, .adminGet, .adminTree, .adminLinks,
+             .adminRename, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
+             .adminArchive, .adminUnarchive,
+             .adminLink, .adminUnlink, .adminReparent, .adminAdopt, .adminRelease, .adminRetire,
+             .adminSpawn, .adminFork, .adminSetModel, .adminSetEffort,
+             .adminWorktreeCreate, .adminWorktreeBind, .adminWorktreeUnbind, .adminWorktreeRelease,
+             .adminWorktreeInventory, .adminMergePreview, .adminMergeApply:
+            .delegation
         }
     }
 
@@ -62,13 +122,16 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     /// grant set instead of a per-target proof.
     package var isObserverScoped: Bool {
         switch self {
-        case .monitorList:
+        case .monitorList, .monitorCreateLane:
             true
-        case .monitorPoll, .monitorWait, .monitorRead, .monitorSend,
-             .monitorSnoozeAutoWake, .monitorGetInteraction, .monitorRespond, .monitorSteer,
+        case .monitorRetireLane, .monitorPoll, .monitorWait, .monitorRead, .monitorSend, .monitorCompact,
+             .monitorSnoozeAutoWake, .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel,
+             .monitorWorktreeBinding,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
+            false
+        default:
             false
         }
     }
@@ -85,14 +148,18 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
             .wait
         case .monitorRead:
             .read
-        case .monitorSend:
+        case .monitorSend, .monitorCompact:
             .sendWhenIdle
-        case .monitorGetInteraction, .monitorRespond, .monitorSteer:
+        case .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel, .monitorRetireLane,
+             .monitorWorktreeBinding:
             .manage
-        case .monitorList,
+        case .monitorList, .monitorCreateLane,
              .runPoll, .runWait, .runCancel, .runSteer, .runRespond,
              .manageList, .manageGetLog, .manageExtractHandoff,
              .manageResume, .manageStop, .manageCleanup:
+            nil
+        default:
+            // Delegation operations are never authorized by an oversight link capability.
             nil
         }
     }
@@ -100,13 +167,16 @@ package enum DomainAgentSessionTargetOperation: String, CaseIterable, Hashable, 
     /// True when the operation mutates or resumes target state rather than only reading it.
     package var mutatesTarget: Bool {
         switch self {
-        case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend,
-             .monitorRespond, .monitorSteer:
+        case .runCancel, .runSteer, .runRespond, .manageResume, .manageStop, .manageCleanup, .monitorSend, .monitorCompact,
+             .monitorRespond, .monitorSteer, .monitorStop, .monitorSetModel, .monitorRetireLane,
+             .monitorWorktreeBinding:
             true
         case .runPoll, .runWait, .manageList, .manageGetLog, .manageExtractHandoff,
-             .monitorList, .monitorPoll, .monitorWait, .monitorRead,
-             .monitorSnoozeAutoWake, .monitorGetInteraction:
+             .monitorList, .monitorCreateLane, .monitorPoll, .monitorWait, .monitorRead,
+             .monitorSnoozeAutoWake:
             false
+        default:
+            delegationMutatesTarget
         }
     }
 }
@@ -198,6 +268,9 @@ package enum DomainAgentSessionAuthorityBasis: Hashable, Sendable {
     case monitorGrant(linkID: UUID, generation: UInt64, capability: DomainAgentSessionLinkCapability)
     /// The caller's own non-empty outbound grant set, used only by targetless oversight operations.
     case observerGrantSet
+    /// A live, user-granted (or attenuated) delegation scope whose lease names this exact caller,
+    /// target, scope generation, and capability. Issued only by `DomainDelegationScopeAuthority`.
+    case delegationScope(scopeID: UUID, generation: UInt64, capability: DomainDelegationScopeCapability)
 }
 
 /// Denial reasons are diagnostic only. Callers must surface one indistinguishable user-facing message
@@ -216,6 +289,17 @@ package enum DomainAgentSessionAuthorizationDenial: String, Error, Equatable, Se
     case observerScopedOperation = "observer_scoped_operation"
     case targetScopedOperation = "target_scoped_operation"
     case noActiveOutboundLink = "no_active_outbound_link"
+    case noActiveLink = "no_active_link"
+    /// A delegation operation (or a scope-authorizable control operation) presented no scope lease.
+    case missingScopeLease = "missing_scope_lease"
+    case scopeLeaseGranteeMismatch = "scope_lease_grantee_mismatch"
+    case scopeLeaseTargetMismatch = "scope_lease_target_mismatch"
+    case scopeCapabilityMismatch = "scope_capability_mismatch"
+    case delegationRequiresAgentCaller = "delegation_requires_agent_caller"
+    /// A scope-level (targetless) delegation operation was routed through the target-bearing path.
+    case delegationScopeLevelOperation = "delegation_scope_level_operation"
+    /// The operation performs a human-only action; no scope can authorize it.
+    case humanOnlyOperation = "human_only_operation"
 }
 
 package enum DomainAgentSessionAuthorizationDecision: Equatable, Sendable {
@@ -261,7 +345,8 @@ package enum DomainAgentSessionOperationAuthorizer {
         operation: DomainAgentSessionTargetOperation,
         caller: DomainAgentSessionCallerIdentity,
         target: DomainAgentSessionTargetProvenance,
-        monitorGrant: DomainAgentSessionMonitorGrantProof? = nil
+        monitorGrant: DomainAgentSessionMonitorGrantProof? = nil,
+        scopeLease: DomainDelegationScopeLease? = nil
     ) -> DomainAgentSessionAuthorizationDecision {
         guard !operation.isObserverScoped else {
             // `authorizeObserverScoped` is the only correct path for a targetless operation.
@@ -276,19 +361,38 @@ package enum DomainAgentSessionOperationAuthorizer {
                 monitorGrant: monitorGrant
             )
         case .sessionControl:
-            return authorizeSessionControlOperation(caller: caller, target: target)
+            return authorizeSessionControlOperation(
+                operation: operation,
+                caller: caller,
+                target: target,
+                scopeLease: scopeLease
+            )
+        case .delegation:
+            guard !operation.isScopeLevel else {
+                // Scope-level operations name no target; the scope authority decides them alone.
+                return .denied(.delegationScopeLevelOperation)
+            }
+            guard let callerSessionID = caller.agentSessionID else {
+                return .denied(.delegationRequiresAgentCaller)
+            }
+            return authorizeScopeLease(
+                operation: operation,
+                callerSessionID: callerSessionID,
+                targetSessionID: target.targetSessionID,
+                scopeLease: scopeLease
+            )
         }
     }
 
     /// Authorizes a targetless oversight operation against the caller's own grant set.
     ///
-    /// `agent_session_link.list` remains outbound-only even when an inbound link keeps the shared
-    /// tool catalog entry visible. After the final outbound revocation, callers must receive the
-    /// operation-specific denial rather than probe an inventory they no longer hold.
+    /// `list` requires an outbound link; `create_lane` accepts either direction. Neither
+    /// operation may use another caller's identity or infer a grant from catalog visibility.
     package static func authorizeObserverScoped(
         operation: DomainAgentSessionTargetOperation,
         caller: DomainAgentSessionCallerIdentity,
-        hasActiveOutboundLink: Bool
+        hasActiveOutboundLink: Bool,
+        hasActiveInboundLink: Bool = false
     ) -> DomainAgentSessionAuthorizationDecision {
         guard operation.isObserverScoped else {
             return .denied(.targetScopedOperation)
@@ -296,10 +400,16 @@ package enum DomainAgentSessionOperationAuthorizer {
         guard caller.agentSessionID != nil else {
             return .denied(.monitorRequiresAgentCaller)
         }
-        guard hasActiveOutboundLink else {
+        switch operation {
+        case .monitorList where hasActiveOutboundLink:
+            return .authorized(.observerGrantSet)
+        case .monitorCreateLane where hasActiveOutboundLink || hasActiveInboundLink:
+            return .authorized(.observerGrantSet)
+        case .monitorCreateLane:
+            return .denied(.noActiveLink)
+        default:
             return .denied(.noActiveOutboundLink)
         }
-        return .authorized(.observerGrantSet)
     }
 
     /// Enumeration scope for Agent-origin discovery. Agent callers may only see sessions they
@@ -320,27 +430,81 @@ package enum DomainAgentSessionOperationAuthorizer {
     // MARK: - Private
 
     private static func authorizeSessionControlOperation(
+        operation: DomainAgentSessionTargetOperation,
         caller: DomainAgentSessionCallerIdentity,
-        target: DomainAgentSessionTargetProvenance
+        target: DomainAgentSessionTargetProvenance,
+        scopeLease: DomainDelegationScopeLease?
     ) -> DomainAgentSessionAuthorizationDecision {
         // An oversight grant is never a valid authority basis for an existing control operation.
+        // A delegation-scope lease is, but only as a fallback after direct spawn provenance and only
+        // for operations that are not human-only.
         switch caller {
         case .administrativePrincipal:
             return .authorized(.administrativePrincipal)
         case .unresolvedAgentRun:
             return .denied(.callerRoutingUnresolved)
         case let .agentSession(callerSessionID):
+            // Deleting saved conversations is human-only, including directly spawned children.
+            // Reject before provenance lookup so no grant or parent relationship can widen it.
+            guard operation != .manageCleanup else { return .denied(.humanOnlyOperation) }
             guard case let .known(targetSessionID, parentSessionID) = target else {
                 return .denied(.targetProvenanceUnknown)
             }
             guard targetSessionID != callerSessionID else {
                 return .denied(.selfTarget)
             }
-            guard let parentSessionID, parentSessionID == callerSessionID else {
+            if let parentSessionID, parentSessionID == callerSessionID {
+                return .authorized(.directSpawnProvenance(parentSessionID: callerSessionID))
+            }
+            guard let scopeLease else {
                 return .denied(.notDirectChild)
             }
-            return .authorized(.directSpawnProvenance(parentSessionID: callerSessionID))
+            guard operation.requiredScopeCapability != nil else {
+                return .denied(.humanOnlyOperation)
+            }
+            return authorizeScopeLease(
+                operation: operation,
+                callerSessionID: callerSessionID,
+                targetSessionID: targetSessionID,
+                scopeLease: scopeLease
+            )
         }
+    }
+
+    /// Validates a scope lease against one exact caller, target, and the operation's capability.
+    ///
+    /// The lease itself already proves the scope was live and the target a member at issue time;
+    /// this check binds it to the operation being performed so a lease for one capability or target
+    /// can never authorize another.
+    private static func authorizeScopeLease(
+        operation: DomainAgentSessionTargetOperation,
+        callerSessionID: UUID,
+        targetSessionID: UUID,
+        scopeLease: DomainDelegationScopeLease?
+    ) -> DomainAgentSessionAuthorizationDecision {
+        guard let requiredCapability = operation.requiredScopeCapability else {
+            return .denied(.humanOnlyOperation)
+        }
+        guard let scopeLease else {
+            return .denied(.missingScopeLease)
+        }
+        guard scopeLease.granteeSessionID == callerSessionID else {
+            return .denied(.scopeLeaseGranteeMismatch)
+        }
+        guard scopeLease.targetSessionID == targetSessionID else {
+            return .denied(.scopeLeaseTargetMismatch)
+        }
+        guard scopeLease.capability == requiredCapability else {
+            return .denied(.scopeCapabilityMismatch)
+        }
+        if operation.deniesScopeSelfTarget, targetSessionID == callerSessionID {
+            return .denied(.selfTarget)
+        }
+        return .authorized(.delegationScope(
+            scopeID: scopeLease.scopeID,
+            generation: scopeLease.generation,
+            capability: requiredCapability
+        ))
     }
 
     private static func authorizeMonitorOperation(

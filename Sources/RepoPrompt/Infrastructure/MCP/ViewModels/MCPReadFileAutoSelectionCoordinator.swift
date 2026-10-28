@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 
 /// Window-scoped response-lane coordinator for Agent Mode `read_file` and eligible `file_search`
 /// automatic selection.
@@ -272,7 +274,7 @@ final class MCPReadFileAutoSelectionCoordinator {
     }
 
     struct CanonicalBatch {
-        let authority: MCPServerViewModel.FrozenFileToolAuthority
+        let authority: MCPFrozenFileToolAuthority
         private(set) var fullPaths: [String] = []
         private(set) var sliceEntries: [WorkspaceSelectionSliceInput] = []
         private(set) var coverageIdentity: CoverageIdentity?
@@ -286,7 +288,7 @@ final class MCPReadFileAutoSelectionCoordinator {
 
         init(
             intent: Intent,
-            authority: MCPServerViewModel.FrozenFileToolAuthority,
+            authority: MCPFrozenFileToolAuthority,
             coverageIdentity: CoverageIdentity? = nil
         ) {
             self.authority = authority
@@ -576,7 +578,7 @@ final class MCPReadFileAutoSelectionCoordinator {
     @discardableResult
     func enqueue(
         intent: Intent,
-        authority: MCPServerViewModel.FrozenFileToolAuthority,
+        authority: MCPFrozenFileToolAuthority,
         coverageIdentity: CoverageIdentity? = nil,
         for key: ContextKey,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = EditFlowPerf.currentLifecycleCorrelation
@@ -891,7 +893,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                         let debugMutationClock = ContinuousClock()
                         let debugMutationStartedAt = debugMutationClock.now
                     #endif
-                    let result = await EditFlowPerf.$currentLifecycleCorrelation.withValue(queued.lifecycleCorrelation) {
+                    let result = await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(queued.lifecycleCorrelation) {
                         await EditFlowPerf.measure(
                             EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalMutation,
                             EditFlowPerf.Dimensions(status: key.route.diagnosticScope)
@@ -1162,7 +1164,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                 EditFlowPerf.Lifecycle.ReadFileAutoSelect.mirrorApplyBegan,
                 correlation: queued.lifecycleCorrelation
             )
-            let mirrorOutcome = await EditFlowPerf.$currentLifecycleCorrelation.withValue(queued.lifecycleCorrelation) {
+            let mirrorOutcome = await EditFlowPerf.currentLifecycleCorrelationTaskLocal.withValue(queued.lifecycleCorrelation) {
                 await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.mirrorApply) {
                     await applyMirror(key)
                 }

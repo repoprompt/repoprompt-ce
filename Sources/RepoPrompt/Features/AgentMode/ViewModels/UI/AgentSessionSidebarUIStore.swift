@@ -1,10 +1,14 @@
 import Foundation
+import RepoPromptInstrumentation
 
 struct AgentSessionSidebarSnapshot: Equatable {
     var searchText: String
     var visibleSessionCount: Int
     var archivedVisibleSessionCount: Int
     var collapsedThreadKeys: Set<AgentSidebarThreadKey> = []
+    /// Collapsed sidebar group sections, by group name. Presentation-only, like thread collapse; the
+    /// list projection reads it so selection order matches what is shown.
+    var collapsedSidebarGroups: Set<String> = []
     /// Thread keys that have already received one-shot default collapse handling
     /// during this view-model lifetime. Explicit user expand/collapse actions
     /// and Expand All mark keys handled so later renders do not immediately
@@ -26,6 +30,7 @@ struct AgentSessionSidebarSnapshot: Equatable {
 
 @MainActor
 final class AgentSessionSidebarUIStore: ObservableObject {
+    var perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     @Published private(set) var snapshot = AgentSessionSidebarSnapshot(
         searchText: "",
         visibleSessionCount: AgentModeViewModel.sessionSidebarPageSize,
@@ -209,6 +214,19 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         setThreadCollapsed(!isThreadCollapsed(key), for: key)
     }
 
+    func toggleGroupCollapsed(_ group: String) {
+        var next = snapshot
+        if next.collapsedSidebarGroups.remove(group) == nil {
+            next.collapsedSidebarGroups.insert(group)
+        }
+        _ = publish(
+            next,
+            eventName: "sessionSidebar.groupCollapse",
+            force: false,
+            affectsRowContent: false
+        )
+    }
+
     func clearCollapsedThreads() {
         var next = snapshot
         next.collapsedThreadKeys.removeAll()
@@ -349,7 +367,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         guard next != selectionState else { return }
         selectionState = next
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 eventName,
                 published: true,
                 details: [
@@ -397,7 +415,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var next = proposedSnapshot
         guard force || next != snapshot else {
             #if DEBUG
-                AgentModePerfDiagnostics.recordStoreUpdate("sessionSidebar", published: false)
+                perfRecorder.recordStoreUpdate("sessionSidebar", published: false)
             #endif
             return false
         }
@@ -405,7 +423,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         if affectsRowContent { next.rowContentRevision &+= 1 }
         snapshot = next
         #if DEBUG
-            AgentModePerfDiagnostics.recordStoreUpdate(
+            perfRecorder.recordStoreUpdate(
                 eventName,
                 published: true,
                 details: [

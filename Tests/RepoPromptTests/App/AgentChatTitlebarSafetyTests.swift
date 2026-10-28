@@ -1,7 +1,14 @@
 import AppKit
+import Carbon.HIToolbox
+import Combine
 import Foundation
+import KeyboardShortcuts
 import MCP
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import RepoPromptPersistence
+import RepoPromptSettingsCore
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -431,30 +438,66 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
                 )
             ))
 
+            // Once Beta's title is actually published, a menu captured for Alpha no longer
+            // describes the displayed conversation and must not act.
             await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabBID)
-            XCTAssertTrue(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
-
+            let betaTitle = await awaitWindowTitleResolution(fixture.window)
+            XCTAssertEqual(betaTitle, "Titlebar Safety — Beta")
+            XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
             fixture.window.agentChatTitleClusterMenuActions().togglePin(target)
-            XCTAssertEqual(fixture.tab(fixture.tabAID)?.isPinned, true)
+            XCTAssertEqual(fixture.tab(fixture.tabAID)?.isPinned, false)
             XCTAssertEqual(fixture.tab(fixture.tabBID)?.isPinned, false)
 
+            // Back on a coherent Alpha, the identity controls run against the displayed target.
+            await fixture.window.promptManager.switchComposeTab(fixture.tabAID)
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabAID)
-            XCTAssertNil(fixture.window.agentChatTitleClusterMenuSnapshot())
+            let alphaTitle = await awaitWindowTitleResolution(fixture.window)
+            XCTAssertEqual(alphaTitle, "Titlebar Safety — Alpha")
+            XCTAssertTrue(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
+
             fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabBID)
+            XCTAssertNil(fixture.window.agentChatTitleClusterMenuSnapshot())
+            fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabAID)
 
             fixture.window.promptManager.renameComposeTab(fixture.tabAID, to: "Alpha Renamed")
             XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
             fixture.window.agentChatTitleClusterMenuActions().togglePin(target)
-            XCTAssertEqual(fixture.tab(fixture.tabAID)?.isPinned, true)
+            XCTAssertEqual(fixture.tab(fixture.tabAID)?.isPinned, false)
             fixture.window.promptManager.renameComposeTab(fixture.tabAID, to: "Alpha")
+            await awaitWindowTitleResolution(fixture.window)
             XCTAssertTrue(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
+            fixture.window.agentChatTitleClusterMenuActions().togglePin(target)
+            XCTAssertEqual(fixture.tab(fixture.tabAID)?.isPinned, true)
 
             fixture.sessionA.testInstallPersistentSessionBinding(sessionID: UUID())
             XCTAssertFalse(fixture.window.agentChatTitleClusterMenuTargetIsValid(target))
             fixture.window.agentChatTitleClusterMenuActions().togglePin(target)
             XCTAssertEqual(fixture.tab(fixture.tabAID)?.isPinned, true)
             XCTAssertEqual(fixture.tab(fixture.tabBID)?.isPinned, false)
+        }
+    }
+
+    func testCopySessionIDRejectsCaptureOnceAnotherConversationIsDisplayed() async throws {
+        try await withFixture { fixture in
+            fixture.sessionA.selectedAgent = .claudeCode
+            XCTAssertTrue(fixture.sessionA.permitsBoundOperationAndSave)
+            await awaitWindowTitleResolution(fixture.window)
+            let capture = try XCTUnwrap(
+                fixture.window.agentChatTitleClusterMenuSnapshot()?.copySessionIDTarget,
+                "precondition: Alpha offers Copy Session ID"
+            )
+
+            await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+            fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabBID)
+            let betaTitle = await awaitWindowTitleResolution(fixture.window)
+            XCTAssertEqual(betaTitle, "Titlebar Safety — Beta")
+            var writes: [String] = []
+            let copied = fixture.window.copyAgentSessionIDFromTitlebar(target: capture) { writes.append($0) }
+
+            XCTAssertFalse(copied)
+            XCTAssertTrue(writes.isEmpty, "\(writes)")
+            XCTAssertNil(fixture.window.agentChatTitleCluster.state.copiedNotice)
         }
     }
 
@@ -568,6 +611,34 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
+    func testPostPreflightStashRefusalPreservesSessionTranscriptAndTab() async throws {
+        try await withFixture { fixture in
+            fixture.sessionA.setItemsSilently([
+                .user("Keep this instruction", sequenceIndex: 0),
+                .assistant("Keep this answer", sequenceIndex: 1)
+            ], reason: .testOverride)
+            fixture.viewModel.refreshDerivedTranscriptState(for: fixture.sessionA)
+            let originalRows = fixture.sessionA.items.map(\.id)
+            let preflight = fixture.window.promptManager.setComposeTabsRemovalPreflight { _, _, _ in .proceed }
+            defer { fixture.window.promptManager.removeComposeTabsRemovalPreflight(preflight) }
+
+            let report = await fixture.window.promptManager.stashComposeTabs(
+                withIDs: [fixture.tabAID],
+                postPreflightValidation: { false },
+                expandCascade: false
+            )
+
+            XCTAssertFalse(report.rejections.isEmpty)
+            XCTAssertNotNil(fixture.tab(fixture.tabAID))
+            XCTAssertEqual(fixture.sessionA.items.map(\.id), originalRows)
+            XCTAssertEqual(fixture.sessionA.items.count, 2)
+            XCTAssertFalse(
+                fixture.window.workspaceManager.activeWorkspace?.stashedTabs
+                    .contains(where: { $0.tab.id == fixture.tabAID }) == true
+            )
+        }
+    }
+
     func testGuardedCloseCommitsTabRemovalAfterListenerCleanupInvalidatesTarget() async throws {
         try await withFixture { fixture in
             let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
@@ -587,6 +658,102 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
+    func testDeletionEntryPointsPersistTheirActualOrigin() async throws {
+        for entry in ["titlebar", "sidebar", "unspecified", "mcp_close", "agent_close", "mcp_cleanup"] {
+            try await withFixture { fixture in
+                let directory = fixture.rootURL.appendingPathComponent("scope-history")
+                let store = DelegationScopeStore(fileURL: directory.appendingPathComponent("scopes.json"), backupsDirectoryURL: directory, mode: .enabled)
+                let scopeID = UUID()
+                let grant = DomainDelegationScopeGrant(id: scopeID, granteeSessionID: fixture.sessionAID, kind: .tree(rootSessionID: fixture.sessionAID), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date())
+                let runtime = DelegationScopeRuntime(persistenceMode: .requiresStore, notifyCatalogChanged: { _ in })
+                await runtime.bootstrap(store: store)
+                XCTAssertEqual(store.record(operationID: UUID(), grants: [grant], revoked: []), .applied)
+                let registry = AgentSessionDeletionRegistry.shared
+                let previousObserver = registry.commitObserver
+                registry.commitObserver = { id, origin, removed in
+                    runtime.revokeAll(involving: id, origin: origin, fileRemoved: removed)
+                    await previousObserver?(id, origin, removed)
+                }
+                defer {
+                    registry.commitObserver = previousObserver
+                    runtime.freezeForTermination()
+                }
+                var expectedOrigin: OverseerScopeEnding.DeletionOrigin = .unknown
+                var expectedInitiator = "unknown"
+                var actor: UUID?
+                switch entry {
+                case "titlebar":
+                    expectedOrigin = .userUI
+                    expectedInitiator = "user"
+                    let target = try XCTUnwrap(fixture.window.agentChatTitleClusterMenuSnapshot()?.target)
+                    await fixture.window.deleteAgentChatFromTitlebar(target: target)
+                case "sidebar":
+                    expectedOrigin = .userUI
+                    expectedInitiator = "user"
+                    await fixture.viewModel.performSidebarBulkAction(.delete, origin: .command, commandProgressPlacement: .row, targets: .init(workspaceID: fixture.workspaceID, activeDeleteTabIDs: [fixture.tabAID], archivedDeleteTargets: [], stashTabIDs: [], pinTabIDs: [], unpinTabIDs: []), promptManager: fixture.window.promptManager)
+                case "mcp_close", "agent_close":
+                    expectedOrigin = .mcpClient
+                    expectedInitiator = entry == "agent_close" ? "agent" : "mcp_client"
+                    let connection = UUID()
+                    if entry == "agent_close" {
+                        await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: connection)
+                        actor = fixture.viewModel.sessions[fixture.tabBID]?.activeAgentSessionID
+                        fixture.window.mcpServer.tabContextByConnectionID[connection] = .init(tabID: fixture.tabBID, windowID: fixture.window.windowID, workspaceID: fixture.workspaceID, promptText: "", selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Beta", runID: UUID(), explicitlyBound: false)
+                    }
+                    defer { fixture.window.mcpServer.tabContextByConnectionID.removeValue(forKey: connection) }
+                    let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+                    await service.prepareDomainTools()
+                    let tools = await service.tools
+                    let tool = try XCTUnwrap(tools.first { $0.name == "manage_workspaces" })
+                    let invocation = ToolInvocationContext.trustedLocal(toolName: "manage_workspaces", metadata: .init(connectionID: connection, clientName: "deletion-origin-test", windowID: fixture.window.windowID, runPurpose: entry == "agent_close" ? .agentModeRun : nil))
+                    do {
+                        _ = try await MCPInvocationContextBridge.withInvocation(invocation) {
+                            try await tool(["action": .string("close_tab"), "window_id": .int(fixture.window.windowID), "tab": .string(fixture.tabAID.uuidString), "allow_active": .bool(true)])
+                        }
+                    } catch {
+                        await ServerNetworkManager.shared.setRunPurpose(.unknown, for: connection)
+                        throw error
+                    }
+                    await ServerNetworkManager.shared.setRunPurpose(.unknown, for: connection)
+                case "mcp_cleanup":
+                    fixture.sessionA.isMCPOriginated = true
+                    expectedOrigin = .mcpClient
+                    expectedInitiator = "mcp_client"
+                    let connection = UUID()
+                    let service = AgentManageMCPToolService(toolName: MCPWindowToolName.agentManage, captureRequestMetadata: { .init(connectionID: connection, clientName: "external-cleanup", windowID: fixture.window.windowID) }, requireTargetWindow: { fixture.window }, resolveSpawnSourceTabID: { _ in nil }, resolveSpawnParentSessionID: { _, _ in nil }, bindCurrentRequestToTab: { _, _ in })
+                    let result = try await service.execute(args: ["op": .string("cleanup_sessions"), "session_ids": .array([.string(fixture.sessionAID.uuidString)])])
+                    XCTAssertEqual(result.objectValue?["deleted_count"], .int(1), "\(result)")
+                default:
+                    await fixture.window.promptManager.closeComposeTab(fixture.tabAID)
+                }
+                await runtime.flushPersistence()
+                _ = store.loadForLaunch()
+                let ending = try XCTUnwrap(store.endedScopes[scopeID]?.ending, entry)
+                XCTAssertEqual(ending.deletionOrigin, expectedOrigin, entry)
+                XCTAssertEqual(ending.initiator, expectedInitiator, entry)
+                XCTAssertEqual(ending.actorSessionID, actor, entry)
+                XCTAssertNotNil(ending.fileRemoved, entry)
+            }
+        }
+    }
+
+    func testKeyboardCloseStashesWithoutEndingScopeOrDeletingSession() async throws {
+        try await withFixture { fixture in
+            let registry = AgentSessionDeletionRegistry.shared
+            let previous = registry.commitObserver
+            var deleted: [UUID] = []
+            registry.commitObserver = { id, origin, removed in
+                deleted.append(id)
+                await previous?(id, origin, removed)
+            }
+            defer { registry.commitObserver = previous }
+            await fixture.window.closeActiveComposeTabFromShortcut()?.value
+            XCTAssertNil(fixture.tab(fixture.tabAID))
+            XCTAssertTrue(fixture.window.workspaceManager.activeWorkspace?.stashedTabs.contains { $0.tab.id == fixture.tabAID } == true)
+            XCTAssertFalse(deleted.contains(fixture.sessionAID), "Keyboard close archives; it must not invent a scope ending")
+        }
+    }
+
     private func withFixture(_ body: (Fixture) async throws -> Void) async throws {
         let fixture = try await makeFixture()
         do {
@@ -599,6 +766,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
     }
 
     private func makeFixture() async throws -> Fixture {
+        _ = try WorkspaceTestProcessSandbox.validate()
         let rootURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentChatTitlebarSafetyTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
@@ -628,6 +796,15 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             let sessionBID = UUID()
             let tabA = ComposeTabState(id: tabAID, name: "Alpha", activeAgentSessionID: sessionAID)
             let tabB = ComposeTabState(id: tabBID, name: "Beta", activeAgentSessionID: sessionBID)
+            // These titlebar actions target restored conversations. A carrier UUID alone cannot
+            // authorize Copy Session ID or the required flush before closing its tab.
+            for (tab, sessionID) in [(tabA, sessionAID), (tabB, sessionBID)] {
+                var payload = AgentSession(
+                    id: sessionID, workspaceID: workspace.id, name: tab.name, autoEditEnabled: false
+                )
+                payload.composeTabID = tab.id
+                _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: workspace)
+            }
             let workspaceIndex = try XCTUnwrap(
                 window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id })
             )
@@ -639,11 +816,18 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
             )
 
             let viewModel = window.agentModeViewModel
-            let sessionA = viewModel.session(for: tabAID)
-            _ = viewModel.session(for: tabBID)
+            let sessionA = await viewModel.ensureSessionReady(tabID: tabAID)
+            let sessionB = await viewModel.ensureSessionReady(tabID: tabBID)
+            for (session, sessionID) in [(sessionA, sessionAID), (sessionB, sessionBID)] {
+                XCTAssertEqual(session.activeAgentSessionID, sessionID)
+                XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+                XCTAssertNil(session.operationAdmissionFailureMessage)
+            }
             viewModel.setAgentModeActive(true)
             viewModel.test_setCurrentTabIDOverride(tabAID)
             window.setAgentTitlebarAccessoryVisible(true, onNewSession: {})
+            // Snapshots describe the published title, so start from Alpha's real resolution.
+            await awaitWindowTitleResolution(window)
 
             return Fixture(
                 window: window,
@@ -695,5 +879,1017 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         func tab(_ id: UUID) -> ComposeTabState? {
             window.workspaceManager.activeWorkspace?.composeTabs.first(where: { $0.id == id })
         }
+    }
+}
+
+/// #1112: the window title, workspace label and native title must never combine the incoming
+/// workspace with the outgoing workspace's instance number while a real switch is in flight.
+@MainActor
+final class WorkspaceRestorationTitleTests: XCTestCase {
+    func testSystemToWorkspaceGapRetainsCoherentTitleUntilTargetNumberIsAssigned() async throws {
+        try await assertHeldSwitchKeepsCoherentTitle(systemNumber: 6, targetNumber: 1)
+    }
+
+    func testSystemToSecondInstanceNeverShowsSuffixlessTargetBeforeItsNumber() async throws {
+        try await assertHeldSwitchKeepsCoherentTitle(systemNumber: 8, targetNumber: 2)
+    }
+
+    /// After the number is assigned but before the deferred title resolution, the workspace label
+    /// still describes the published title rather than racing ahead of it.
+    func testWorkspaceLabelFollowsPublishedTitleUntilDeferredResolution() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Labelled \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        let outgoingTitle = await resolveTitle(window)
+        var atAssignment: (number: Int?, displayed: String, label: String)?
+        let token = window.workspaceManager.addWorkspaceDidSwitchListener(label: "issue1112LabelProbe") { workspace in
+            guard workspace?.id == target.id else { return }
+            atAssignment = (window.workspaceInstanceNumber, window.displayedWindowTitle, window.workspaceDisplayName)
+        }
+        defer { window.workspaceManager.removeWorkspaceDidSwitchListener(token) }
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleLabel")
+
+        let probe = try XCTUnwrap(atAssignment)
+        XCTAssertEqual(probe.number, 1)
+        XCTAssertEqual(probe.displayed, outgoingTitle)
+        XCTAssertEqual(probe.label, WindowTitleFormatter.defaultTitle)
+        await resolveTitle(window)
+        XCTAssertEqual(window.workspaceDisplayName, target.name)
+    }
+
+    /// A settled workspace that never received a number is not retained by a later, unrelated
+    /// switch that has not yet published its target: that switch's operation does not own it.
+    func testLaterSwitchBeforePublicationDoesNotFreezeSettledUnassignedTitle() async throws {
+        let fixture = try await makeFixture(systemNumber: 6, register: false)
+        let window = fixture.window
+        let manager = window.workspaceManager
+        for name in ["settled", "later"] {
+            try FileManager.default.createDirectory(
+                at: fixture.rootURL.appendingPathComponent(name), withIntermediateDirectories: true
+            )
+        }
+        let settled = manager.createWorkspace(
+            name: "Settled \(UUID().uuidString.prefix(6))",
+            repoPaths: [fixture.rootURL.appendingPathComponent("settled").path],
+            ephemeral: true
+        )
+        let later = manager.createWorkspace(
+            name: "Later \(UUID().uuidString.prefix(6))",
+            repoPaths: [fixture.rootURL.appendingPathComponent("later").path],
+            ephemeral: true
+        )
+        _ = await manager.switchWorkspace(to: settled, saveState: false, reason: "titleOperation")
+        let tabID = try XCTUnwrap(window.promptManager.activeComposeTabID)
+        XCTAssertNil(window.workspaceInstanceNumber)
+        let settledTitle = await resolveTitle(window)
+        XCTAssertTrue(settledTitle.hasPrefix(settled.name), settledTitle)
+
+        let gate = TitleGapGate()
+        manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { id in
+            guard id == later.id else { return }
+            await gate.hold()
+        }
+        let switchTask = Task { @MainActor in
+            _ = await manager.switchWorkspace(to: later, saveState: false, reason: "titleOperation")
+        }
+        await gate.waitUntilHeld()
+        XCTAssertTrue(manager.isSwitchingWorkspace)
+        XCTAssertEqual(manager.activeWorkspaceID, settled.id)
+        window.promptManager.renameComposeTab(tabID, to: "Renamed while later switch waits")
+        let renamedTitle = await resolveTitle(window)
+        XCTAssertEqual(renamedTitle, "\(settled.name) — Renamed while later switch waits")
+
+        await gate.release()
+        await switchTask.value
+        manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil)
+    }
+
+    /// Cancelled before publication, recovery settles without notifying switch listeners; the
+    /// switch finish alone reevaluates the title, which resolves System's existing number.
+    func testRecoveryWithoutSwitchNotificationSettlesAtSwitchFinish() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let manager = window.workspaceManager
+        let target = manager.createWorkspace(
+            name: "Abandoned \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        let outgoingTitle = await resolveTitle(window)
+        var notifications = 0
+        let token = manager.addWorkspaceDidSwitchListener(label: "issue1112RecoveryProbe") { _ in notifications += 1 }
+        defer { manager.removeWorkspaceDidSwitchListener(token) }
+        let gate = TitleGapGate()
+        manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting { id in
+            guard id == target.id else { return }
+            await gate.hold()
+        }
+        defer { manager.setWorkspaceSwitchBeforeActiveWorkspacePublicationHandlerForTesting(nil) }
+        let switchTask = Task { @MainActor in
+            _ = await manager.switchWorkspace(to: target, saveState: false, reason: "titleRecovery")
+        }
+        await gate.waitUntilHeld()
+        await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+
+        let naturalTitle = await titleResolvedAfterSwitchFinish(window) {
+            await gate.release()
+            await switchTask.value
+        }
+        XCTAssertEqual(notifications, 0)
+        XCTAssertEqual(manager.activeWorkspace?.isSystemWorkspace, true)
+        XCTAssertEqual(window.workspaceInstanceNumber, 6)
+        XCTAssertEqual(naturalTitle, outgoingTitle)
+        XCTAssertEqual(fixture.nsWindow.title, outgoingTitle)
+    }
+
+    /// With no switch listener to assign a number, the finished switch settles the workspace as
+    /// unassigned instead of retaining the previous title indefinitely.
+    func testUnassignedSwitchSettlesAtSwitchFinish() async throws {
+        let fixture = try await makeFixture(systemNumber: 6, register: false)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Unassigned \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        await resolveTitle(window)
+        let naturalTitle = await titleResolvedAfterSwitchFinish(window) {
+            _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleSettle")
+        }
+        let tabName = try XCTUnwrap(window.workspaceManager.activeWorkspace?.composeTabs.first {
+            $0.id == window.promptManager.activeComposeTabID
+        }?.name)
+        XCTAssertNil(window.workspaceInstanceNumber)
+        XCTAssertEqual(naturalTitle, "\(target.name) — \(tabName)")
+        XCTAssertEqual(window.workspaceDisplayName, target.name)
+    }
+
+    /// Runs `perform`, then returns the first title resolution that completes after a switch
+    /// finishes, without requesting one; switch completion itself must schedule it.
+    private func titleResolvedAfterSwitchFinish(
+        _ window: WindowState,
+        perform: () async -> Void
+    ) async -> String? {
+        let (titles, continuation) = AsyncStream<String>.makeStream()
+        window.workspaceManager.setWorkspaceSwitchDidFinishHandlerForTesting { _ in
+            window.setWindowTitleResolutionDidCompleteHandlerForTesting {
+                window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil)
+                continuation.yield(window.displayedWindowTitle)
+                continuation.finish()
+            }
+        }
+        defer { window.workspaceManager.setWorkspaceSwitchDidFinishHandlerForTesting(nil) }
+        await perform()
+        var iterator = titles.makeAsyncIterator()
+        return await iterator.next()
+    }
+
+    /// A switch cancelled while held recovers System, which resolves its existing assignment again.
+    func testCancelledSwitchRecoversOutgoingAssignmentWithoutMixedTitle() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Cancelled \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        await resolveTitle(window)
+        let coherentTitle = window.displayedWindowTitle
+        var published: [String] = []
+        let observation = window.$displayedWindowTitle.sink { published.append($0) }
+        defer { observation.cancel() }
+        let gate = TitleGapGate()
+        window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { id in
+            guard id == target.id else { return }
+            await gate.hold()
+        }
+        let switchTask = Task { @MainActor in
+            _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleCancel")
+        }
+        await gate.waitUntilHeld()
+        await window.workspaceManager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+        await gate.release()
+        await switchTask.value
+        window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
+        await resolveTitle(window)
+
+        XCTAssertEqual(window.workspaceManager.activeWorkspace?.isSystemWorkspace, true)
+        XCTAssertEqual(window.workspaceInstanceNumber, 6)
+        XCTAssertEqual(window.displayedWindowTitle, coherentTitle)
+        XCTAssertFalse(published.contains { $0.hasPrefix(target.name) }, "\(published)")
+    }
+
+    /// A true unload resets to the app default; a non-nil ID whose model is unresolved retains.
+    func testUnloadResetsTitleButUnresolvedWorkspaceRetainsIt() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Loaded \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleUnload")
+        await resolveTitle(window)
+        let settledTitle = window.displayedWindowTitle
+        XCTAssertTrue(settledTitle.hasPrefix(target.name), settledTitle)
+
+        let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == target.id })
+        let model = window.workspaceManager.workspaces.remove(at: index)
+        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, settledTitle)
+        XCTAssertEqual(window.workspaceDisplayName, target.name)
+        window.workspaceManager.workspaces.insert(model, at: index)
+
+        window.workspaceManager.activeWorkspace = nil
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, WindowTitleFormatter.defaultTitle)
+        XCTAssertEqual(window.workspaceDisplayName, WindowTitleFormatter.defaultTitle)
+        XCTAssertEqual(fixture.nsWindow.title, WindowTitleFormatter.defaultTitle)
+    }
+
+    /// Settled workspace/conversation renames update; a selection this workspace does not own
+    /// (another workspace's tab reaching the resolver) never decorates the title.
+    func testSettledRenamesUpdateAndForeignSelectionDoesNotDecorate() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Named \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleRename")
+        let tabID = try XCTUnwrap(window.promptManager.activeComposeTabID)
+        window.promptManager.renameComposeTab(tabID, to: "Renamed chat")
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, "\(target.name) — Renamed chat")
+
+        let renamed = "Renamed \(UUID().uuidString.prefix(6))"
+        let activeModel = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.workspaceManager.renameWorkspace(activeModel, newName: renamed)
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, "\(renamed) — Renamed chat")
+
+        // Production tab loading projects the outgoing (System) selection while this workspace stays active.
+        let system = try XCTUnwrap(window.workspaceManager.workspaces.first(where: \.isSystemWorkspace))
+        window.promptManager.loadComposeTabsFromWorkspace(system, syncPromptText: false)
+        let foreignID = try XCTUnwrap(window.promptManager.activeComposeTabID)
+        XCTAssertFalse(activeModel.composeTabs.contains { $0.id == foreignID })
+        var selectionAtResolution: UUID?
+        var ownedAtResolution: Bool?
+        let foreignTitle = await resolveTitle(window) {
+            selectionAtResolution = window.promptManager.activeComposeTabID
+            ownedAtResolution = window.workspaceManager.activeWorkspace?.composeTabs.contains { $0.id == foreignID }
+        }
+        XCTAssertEqual(selectionAtResolution, foreignID)
+        XCTAssertEqual(ownedAtResolution, false, "the projected selection must be foreign when resolved")
+        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+        XCTAssertEqual(foreignTitle, renamed)
+    }
+
+    /// Registration during a held switch assigns the target through the manager's established
+    /// allocation point; the outgoing selection still keeps the title from mixing identities.
+    func testRegistrationDuringHeldSwitchNeverMixesTitle() async throws {
+        let fixture = try await makeFixture(systemNumber: 6, register: false)
+        let window = fixture.window
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, WindowTitleFormatter.defaultTitle)
+        let target = window.workspaceManager.createWorkspace(
+            name: "Registered \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        var published: [String] = []
+        let observation = window.$displayedWindowTitle.sink { published.append($0) }
+        defer { observation.cancel() }
+        let gate = TitleGapGate()
+        window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { id in
+            guard id == target.id else { return }
+            await gate.hold()
+        }
+        let switchTask = Task { @MainActor in
+            _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleRegister")
+        }
+        await gate.waitUntilHeld()
+        WindowStatesManager.shared.registerWindowState(window)
+        XCTAssertEqual(window.workspaceInstanceNumber, 1)
+        await resolveTitle(window)
+        XCTAssertFalse(window.workspaceDisplayName.hasPrefix("\(target.name) ("), window.workspaceDisplayName)
+
+        await gate.release()
+        await switchTask.value
+        window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
+        await resolveTitle(window)
+        XCTAssertEqual(window.workspaceInstanceNumber, 1)
+        XCTAssertEqual(window.workspaceDisplayName, target.name)
+        XCTAssertFalse(published.contains { $0.hasPrefix("\(target.name) (") }, "\(published)")
+    }
+
+    /// While the real switch listener's owner adoption is queued (number already assigned), no
+    /// published title or label names the target; it is published once the owner is current.
+    func testTargetTitleIsNotPublishedWhileOwnerAdoptionIsQueued() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let viewModel = window.agentModeViewModel
+        let target = window.workspaceManager.createWorkspace(
+            name: "Queued \(UUID().uuidString.prefix(6))", repoPaths: [fixture.rootURL.path], ephemeral: true
+        )
+        let outgoingTitle = await resolveTitle(window)
+        var publications: [(title: String, pending: Bool)] = []
+        let observation = window.$displayedWindowTitle.sink { title in
+            publications.append((title, viewModel.hasPendingOwnerAdoption(forWorkspaceID: target.id)))
+        }
+        defer { observation.cancel() }
+        var paneOwners: [AgentTranscriptPaneTarget.Owner] = []
+        let paneObservation = viewModel.ui.transcript.$snapshot.sink { paneOwners.append($0.paneTarget.owner) }
+        defer { paneObservation.cancel() }
+        var atQueued: (pending: Bool, number: Int?, displayed: String, label: String)?
+        let token = window.workspaceManager.addWorkspaceDidSwitchListener(label: "issue1112QueuedProbe") { workspace in
+            guard workspace?.id == target.id else { return }
+            atQueued = (
+                viewModel.hasPendingOwnerAdoption(forWorkspaceID: target.id),
+                window.workspaceInstanceNumber,
+                window.displayedWindowTitle,
+                window.workspaceDisplayName
+            )
+        }
+        defer { window.workspaceManager.removeWorkspaceDidSwitchListener(token) }
+
+        let naturalTitle = await titleResolvedAfterSwitchFinish(window) {
+            _ = await window.workspaceManager.switchWorkspace(to: target, saveState: false, reason: "titleQueued")
+        }
+        let queued = try XCTUnwrap(atQueued)
+        XCTAssertTrue(queued.pending, "precondition: real adoption queued after the number was assigned")
+        XCTAssertEqual(queued.number, 1)
+        XCTAssertEqual(queued.displayed, outgoingTitle)
+        XCTAssertEqual(queued.label, WindowTitleFormatter.defaultTitle)
+        XCTAssertFalse(publications.contains { $0.pending && $0.title.hasPrefix(target.name) }, "\(publications)")
+        let installed = try XCTUnwrap(viewModel.currentPaneOwner)
+        XCTAssertEqual(installed.workspaceID, target.id)
+        XCTAssertTrue(naturalTitle?.hasPrefix(target.name) == true, "\(String(describing: naturalTitle))")
+        // The emitted pane target carries the adoption's end: awaiting the target owner, then installed.
+        let awaiting = try XCTUnwrap(
+            paneOwners.firstIndex(of: .awaitingOwner(workspaceID: target.id)),
+            "\(paneOwners)"
+        )
+        XCTAssertTrue(paneOwners[awaiting...].contains(.owner(installed)), "\(paneOwners)")
+    }
+
+    /// The exact overseer role comes from the real link authority for this workspace's selected tab
+    /// and current runtime owner; it is retained through a held switch and retired once the next
+    /// workspace is coherent, and a revoked link removes it.
+    func testOverseerRoleFollowsRealLinkAuthorityAndCurrentOwner() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let link = try await makeSettledOverseerLink(fixture)
+        var facts: (overseer: Bool, owner: UUID?, endpoint: UUID?)?
+        let overseerTitle = link.overseerTitle
+
+        await link.revokeAll()
+        let revokedTitle = await resolveTitle(window) { facts = link.roleFacts() }
+        XCTAssertEqual(facts?.overseer, false)
+        XCTAssertEqual(revokedTitle, "\(link.workspace.name) — Observer")
+
+        try await link.add()
+        let relinkedTitle = await resolveTitle(window)
+        XCTAssertEqual(relinkedTitle, overseerTitle)
+        try FileManager.default.createDirectory(
+            at: fixture.rootURL.appendingPathComponent("next"), withIntermediateDirectories: true
+        )
+        let next = window.workspaceManager.createWorkspace(
+            name: "Next \(UUID().uuidString.prefix(6))",
+            repoPaths: [fixture.rootURL.appendingPathComponent("next").path],
+            ephemeral: true
+        )
+        let gate = TitleGapGate()
+        window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { id in
+            guard id == next.id else { return }
+            await gate.hold()
+        }
+        defer { window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil) }
+        let switchTask = Task { @MainActor in
+            _ = await window.workspaceManager.switchWorkspace(to: next, saveState: false, reason: "titleRole")
+        }
+        await gate.waitUntilHeld()
+        let heldTitle = await resolveTitle(window)
+        XCTAssertEqual(heldTitle, overseerTitle)
+
+        await gate.release()
+        await switchTask.value
+        let settledTitle = await resolveTitle(window) { facts = link.roleFacts() }
+        XCTAssertEqual(facts?.owner, next.id)
+        XCTAssertTrue(settledTitle.hasPrefix(next.name), settledTitle)
+        XCTAssertFalse(settledTitle.contains(WindowTitleFormatter.overseerPrefix), settledTitle)
+    }
+
+    /// A stale activation (the real public `handleWorkspaceSwitch(nil)` while this window still
+    /// shows the workspace) leaves no current runtime owner; the still-resolvable endpoint's
+    /// overseer projection is then not this workspace's runtime fact and must not decorate.
+    func testOverseerRoleRequiresCurrentRuntimeOwner() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let viewModel = window.agentModeViewModel
+        let link = try await makeSettledOverseerLink(fixture)
+
+        await viewModel.handleWorkspaceSwitch(nil)
+        var facts: (overseer: Bool, owner: UUID?, endpoint: UUID?)?
+        var selection: UUID?
+        let title = await resolveTitle(window) {
+            facts = link.roleFacts()
+            selection = window.promptManager.activeComposeTabID
+        }
+        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, link.workspace.id, "precondition: still shown")
+        XCTAssertEqual(selection, link.observerTabID, "precondition: owned selection")
+        XCTAssertEqual(facts?.overseer, true, "precondition: projection still resolves")
+        XCTAssertEqual(facts?.endpoint, link.workspace.id, "precondition: endpoint still resolves")
+        XCTAssertNil(facts?.owner, "precondition: no current runtime owner")
+        XCTAssertEqual(title, "\(link.workspace.name) — Observer")
+    }
+
+    private struct SettledOverseerLink {
+        let workspace: WorkspaceModel
+        let observerTabID: UUID
+        let overseerTitle: String
+        let add: @MainActor () async throws -> Void
+        let revokeAll: @MainActor () async -> Void
+        let roleFacts: @MainActor () -> (overseer: Bool, owner: UUID?, endpoint: UUID?)
+    }
+
+    /// Settles a workspace whose selected Observer tab oversees its Target tab through the real
+    /// shared link authority (added, projected and later revoked by exact link ID and generation).
+    private func makeSettledOverseerLink(_ fixture: Fixture) async throws -> SettledOverseerLink {
+        let window = fixture.window
+        let viewModel = window.agentModeViewModel
+        let bridge = AgentSessionLinkRuntimeBridge.shared
+        let authority = AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority
+        let root = fixture.rootURL.appendingPathComponent("role")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let overseen = window.workspaceManager.createWorkspace(
+            name: "Overseer \(UUID().uuidString.prefix(6))", repoPaths: [root.path], ephemeral: true
+        )
+        let observerSessionID = UUID()
+        let targetSessionID = UUID()
+        let observerTab = ComposeTabState(id: UUID(), name: "Observer", activeAgentSessionID: observerSessionID)
+        let targetTab = ComposeTabState(id: UUID(), name: "Target", activeAgentSessionID: targetSessionID)
+        // Real link authority requires restored endpoints. Save both payloads before publishing
+        // their carriers so workspace activation cannot observe either as a missing session.
+        for (tab, sessionID) in [(observerTab, observerSessionID), (targetTab, targetSessionID)] {
+            var payload = AgentSession(
+                id: sessionID, workspaceID: overseen.id, name: tab.name,
+                agentKind: AgentProviderKind.claudeCode.rawValue, autoEditEnabled: false
+            )
+            payload.composeTabID = tab.id
+            _ = try await AgentSessionDataService.shared.saveAgentSession(payload, for: overseen)
+        }
+        let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == overseen.id })
+        window.workspaceManager.workspaces[index].composeTabs = [observerTab, targetTab]
+        window.workspaceManager.workspaces[index].activeComposeTabID = observerTab.id
+        _ = await window.workspaceManager.switchWorkspace(to: overseen, saveState: false, reason: "titleRole")
+        XCTAssertEqual(window.promptManager.activeComposeTabID, observerTab.id)
+        for (tab, sessionID) in [(observerTab, observerSessionID), (targetTab, targetSessionID)] {
+            let session = await viewModel.ensureSessionReady(tabID: tab.id)
+            XCTAssertEqual(session.activeAgentSessionID, sessionID)
+            XCTAssertTrue(session.qualifiedRestorationReadiness.isAuthoritative)
+            XCTAssertNil(session.operationAdmissionFailureMessage)
+        }
+        let revokeAll: @MainActor () async -> Void = {
+            for item in await authority.links(forObserver: observerSessionID).items {
+                await bridge.revokeLink(linkID: item.linkID, generation: item.generation)
+            }
+            await bridge.test_settleProjections()
+        }
+        addTeardownBlock { @MainActor in await revokeAll() }
+        let add: @MainActor () async throws -> Void = {
+            let outcome = await bridge.addMonitorLink(
+                observerSessionID: observerSessionID,
+                rawTargetSessionID: targetSessionID.uuidString
+            )
+            guard case .added = outcome else { return XCTFail("link not added: \(outcome)") }
+            await bridge.test_settleProjections()
+        }
+        let roleFacts: @MainActor () -> (overseer: Bool, owner: UUID?, endpoint: UUID?) = {
+            (
+                viewModel.agentSessionLinkIsOverseer(tabID: observerTab.id),
+                viewModel.currentPaneOwner?.workspaceID,
+                viewModel.agentSessionLinkObserverEndpoint(tabID: observerTab.id)?.workspaceID
+            )
+        }
+
+        try await add()
+        var facts: (overseer: Bool, owner: UUID?, endpoint: UUID?)?
+        let overseerTitle = await awaitWindowTitleResolution(window) { facts = roleFacts() }
+        XCTAssertEqual(facts?.overseer, true)
+        XCTAssertEqual(facts?.owner, overseen.id)
+        XCTAssertEqual(facts?.endpoint, overseen.id)
+        XCTAssertEqual(overseerTitle, WindowTitleFormatter.overseerPrefix + "\(overseen.name) — Observer")
+        return SettledOverseerLink(
+            workspace: overseen,
+            observerTabID: observerTab.id,
+            overseerTitle: overseerTitle,
+            add: add,
+            revokeAll: revokeAll,
+            roleFacts: roleFacts
+        )
+    }
+
+    /// Assignments are qualified installs: one for another workspace is stale, and nil is only an
+    /// unload/termination result, never a way to publish the active workspace unnumbered.
+    func testStaleAndNilAssignmentsCannotReplaceActiveWorkspaceNumber() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        XCTAssertEqual(window.workspaceInstanceNumber, 6)
+
+        window.setWorkspaceInstanceAssignment(WorkspaceInstanceAssignment(workspaceID: UUID(), number: 9))
+        XCTAssertEqual(window.workspaceInstanceNumber, 6)
+        window.setWorkspaceInstanceAssignment(nil)
+        XCTAssertEqual(window.workspaceInstanceNumber, 6)
+    }
+
+    /// An ID published outside any switch (authority-only adoption) has no pending assignment:
+    /// the current workspace shows unassigned rather than retaining the outgoing title forever.
+    func testIDPublishedOutsideSwitchShowsCurrentWorkspaceUnassigned() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Adopted \(UUID().uuidString.prefix(6))",
+            repoPaths: [fixture.rootURL.path],
+            ephemeral: true
+        )
+        await resolveTitle(window)
+
+        window.workspaceManager.activeWorkspace = target
+        XCTAssertFalse(window.workspaceManager.isSwitchingWorkspace)
+        var ownedTabName: String??
+        let title = await resolveTitle(window) {
+            ownedTabName = window.promptManager.activeComposeTabID.map { tabID in
+                window.workspaceManager.activeWorkspace?.composeTabs.first { $0.id == tabID }?.name
+            }
+        }
+
+        XCTAssertNil(window.workspaceInstanceNumber)
+        XCTAssertEqual(window.workspaceDisplayName, target.name)
+        // The outgoing selection reached the resolver unowned and is ignored, never decorating.
+        XCTAssertEqual(ownedTabName, .some(nil), "expected a selection this workspace does not own")
+        XCTAssertEqual(title, target.name)
+        XCTAssertEqual(fixture.nsWindow.title, title)
+    }
+
+    /// Natural post-compose gap: the target's saved tab is restored (and its tab notification
+    /// delivered) while root loading holds the switch before its number is assigned.
+    func testPostComposeGapKeepsTitleAndRejectsChatOptionsUntilTargetIsCoherent() async throws {
+        let fixture = try await makeFixture(systemNumber: 6)
+        let window = fixture.window
+        let target = window.workspaceManager.createWorkspace(
+            name: "Restored \(UUID().uuidString.prefix(6))",
+            repoPaths: [fixture.rootURL.path],
+            ephemeral: true
+        )
+        let sessionID = UUID()
+        let tab = ComposeTabState(id: UUID(), name: "Saved chat", activeAgentSessionID: sessionID)
+        let index = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == target.id })
+        window.workspaceManager.workspaces[index].composeTabs = [tab]
+        window.workspaceManager.workspaces[index].activeComposeTabID = tab.id
+        let heldTarget = AgentChatOptionsMenuTarget(
+            windowID: window.windowID, workspaceID: target.id, tabID: tab.id, agentSessionID: sessionID, tabName: tab.name
+        )
+        await resolveTitle(window)
+        let coherentTitle = window.displayedWindowTitle
+        var published: [String] = []
+        let observation = window.$displayedWindowTitle.sink { published.append($0) }
+        defer { observation.cancel() }
+
+        let rootName = fixture.rootURL.lastPathComponent
+        let gate = TitleGapGate()
+        let store = window.workspaceFileContextStore
+        await store.setRootLoadWillStartHandler { path in
+            guard path.hasSuffix(rootName) else { return }
+            await gate.hold()
+        }
+        addTeardownBlock { @MainActor in
+            await gate.release()
+            await store.setRootLoadWillStartHandler(nil)
+            window.agentModeViewModel.test_setCurrentTabIDOverride(nil)
+            window.setAgentTitlebarAccessoryVisible(false)
+        }
+        let switchTask = Task { @MainActor in
+            _ = await window.workspaceManager.switchWorkspace(
+                to: target, saveState: false, reason: "workspaceRestorationTitleTests"
+            )
+        }
+        await gate.waitUntilHeld()
+        for await activity in window.workspaceManager.$activeWorkspaceSwitch.values
+            where activity?.phase == .hydratingRoots
+        {
+            break
+        }
+        XCTAssertEqual(window.promptManager.activeComposeTabID, tab.id)
+        _ = window.agentModeViewModel.session(for: tab.id)
+        window.agentModeViewModel.setAgentModeActive(true)
+        window.agentModeViewModel.test_setCurrentTabIDOverride(tab.id)
+        window.setAgentTitlebarAccessoryVisible(true, onNewSession: {})
+        var clipboardWrites = 0
+        let actions = window.agentChatTitleClusterMenuActions(
+            handoffInstructionsProvider: { "" },
+            copyToClipboard: { _ in clipboardWrites += 1 }
+        )
+
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, coherentTitle)
+        XCTAssertEqual(fixture.nsWindow.title, coherentTitle)
+        XCTAssertFalse(window.agentChatTitleCluster.state.showsChatOptions)
+        XCTAssertNil(window.agentChatTitleClusterMenuSnapshot())
+        XCTAssertFalse(window.agentChatTitleClusterMenuTargetIsValid(heldTarget))
+        actions.togglePin(heldTarget)
+        actions.copyHandoffPrompt(heldTarget)
+        XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.first?.isPinned, false)
+        XCTAssertEqual(clipboardWrites, 0)
+
+        await gate.release()
+        await switchTask.value
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, "\(target.name) — Saved chat")
+        XCTAssertEqual(fixture.nsWindow.title, window.displayedWindowTitle)
+        XCTAssertTrue(window.agentChatTitleCluster.state.showsChatOptions)
+        XCTAssertEqual(window.agentChatTitleClusterMenuSnapshot()?.target, heldTarget)
+        actions.togglePin(heldTarget)
+        XCTAssertEqual(window.workspaceManager.activeWorkspace?.composeTabs.first?.isPinned, true)
+        XCTAssertFalse(published.contains { $0.hasPrefix("\(target.name) (") }, "\(published)")
+    }
+
+    /// Holds a real switch after the target ID is published and before its number is assigned,
+    /// resolves the production title there, then releases and checks the settled title.
+    private func assertHeldSwitchKeepsCoherentTitle(systemNumber: Int, targetNumber: Int) async throws {
+        let fixture = try await makeFixture(systemNumber: systemNumber)
+        let window = fixture.window
+        XCTAssertEqual(window.workspaceInstanceNumber, systemNumber)
+        let target = window.workspaceManager.createWorkspace(
+            name: "Restored \(UUID().uuidString.prefix(6))",
+            repoPaths: [fixture.rootURL.path],
+            ephemeral: true
+        )
+        for _ in 1 ..< targetNumber {
+            WindowStatesManager.shared.recordWorkspaceSwitch(forWindowID: WindowState.reserveWindowIDForTesting(), to: target)
+        }
+        await resolveTitle(window)
+        let coherentTitle = window.displayedWindowTitle
+        let coherentLabel = window.workspaceDisplayName
+        var published: [String] = []
+        let observation = window.$displayedWindowTitle.sink { published.append($0) }
+        defer { observation.cancel() }
+
+        let gate = TitleGapGate()
+        window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting { id in
+            guard id == target.id else { return }
+            await gate.hold()
+        }
+        let switchTask = Task { @MainActor in
+            _ = await window.workspaceManager.switchWorkspace(
+                to: target, saveState: false, reason: "workspaceRestorationTitleTests"
+            )
+        }
+        await gate.waitUntilHeld()
+        XCTAssertEqual(window.workspaceManager.activeWorkspaceID, target.id)
+
+        await resolveTitle(window)
+        XCTAssertEqual(window.displayedWindowTitle, coherentTitle)
+        XCTAssertEqual(window.workspaceDisplayName, coherentLabel)
+        XCTAssertEqual(fixture.nsWindow.title, coherentTitle)
+
+        await gate.release()
+        await switchTask.value
+        window.workspaceManager.setWorkspaceRootHydrationWillSpawnHandlerForTesting(nil)
+        await resolveTitle(window)
+
+        let settledLabel = targetNumber >= 2 ? "\(target.name) (\(targetNumber))" : target.name
+        XCTAssertEqual(window.workspaceInstanceNumber, targetNumber)
+        XCTAssertEqual(window.workspaceDisplayName, settledLabel)
+        XCTAssertTrue(window.displayedWindowTitle.hasPrefix(settledLabel), window.displayedWindowTitle)
+        XCTAssertEqual(fixture.nsWindow.title, window.displayedWindowTitle)
+        // Every publication naming the target already carries its own settled label.
+        let mixed = published.filter { $0.hasPrefix(target.name) && !$0.hasPrefix(settledLabel) }
+        XCTAssertTrue(mixed.isEmpty, "\(published)")
+        XCTAssertFalse(published.contains { $0.hasPrefix("\(target.name) (\(systemNumber))") }, "\(published)")
+    }
+
+    private struct Fixture {
+        let window: WindowState
+        let nsWindow: NSWindow
+        let rootURL: URL
+    }
+
+    /// Registers a fresh window on System with exactly `systemNumber`, seeded from an empty
+    /// allocator by reserved window IDs; the process-wide allocator state is restored afterwards.
+    private func makeFixture(systemNumber: Int, register: Bool = true) async throws -> Fixture {
+        _ = try WorkspaceTestProcessSandbox.validate()
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WorkspaceRestorationTitleTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        let nsWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: true
+        )
+        nsWindow.isReleasedWhenClosed = false
+        let previousAllocator = WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting()
+        addTeardownBlock { @MainActor in
+            window.attachWindow(nil)
+            window.beginClose()
+            await window.tearDown()
+            WindowStatesManager.shared.unregisterWindowState(window)
+            WindowStatesManager.shared.replaceInstanceAllocatorStateForTesting(previousAllocator)
+            try? FileManager.default.removeItem(at: rootURL)
+        }
+
+        await window.workspaceManager.awaitInitialized()
+        let system = try XCTUnwrap(window.workspaceManager.workspaces.first(where: \.isSystemWorkspace))
+        for _ in 1 ..< systemNumber {
+            WindowStatesManager.shared.recordWorkspaceSwitch(forWindowID: WindowState.reserveWindowIDForTesting(), to: system)
+        }
+        if register {
+            WindowStatesManager.shared.registerWindowState(window)
+        }
+        if window.workspaceManager.activeWorkspaceID != system.id {
+            _ = await window.workspaceManager.switchWorkspace(
+                to: system, saveState: false, reason: "workspaceRestorationTitleTests"
+            )
+        }
+        window.attachWindow(nsWindow)
+        return Fixture(window: window, nsWindow: nsWindow, rootURL: rootURL)
+    }
+
+    @discardableResult
+    private func resolveTitle(_ window: WindowState, probe: @escaping @MainActor () -> Void = {}) async -> String {
+        await awaitWindowTitleResolution(window, probe: probe)
+    }
+
+    private actor TitleGapGate {
+        private var held = false
+        private var released = false
+        private var heldWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func hold() async {
+            held = true
+            heldWaiters.forEach { $0.resume() }
+            heldWaiters.removeAll()
+            guard !released else { return }
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+
+        func waitUntilHeld() async {
+            guard !held else { return }
+            await withCheckedContinuation { heldWaiters.append($0) }
+        }
+
+        func release() {
+            released = true
+            releaseWaiters.forEach { $0.resume() }
+            releaseWaiters.removeAll()
+        }
+    }
+}
+
+/// Requests the production deferred title update, waits for that resolution to publish, and
+/// returns the title it installed; `probe` reads other facts at that same checkpoint.
+@MainActor
+@discardableResult
+private func awaitWindowTitleResolution(
+    _ window: WindowState,
+    probe: @escaping @MainActor () -> Void = {}
+) async -> String {
+    await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
+        window.setWindowTitleResolutionDidCompleteHandlerForTesting {
+            window.setWindowTitleResolutionDidCompleteHandlerForTesting(nil)
+            probe()
+            continuation.resume(returning: window.displayedWindowTitle)
+        }
+        window.requestWindowTitleUpdate(reason: .explicit)
+    }
+}
+
+@MainActor
+final class KeyboardShortcutCoverageTests: XCTestCase {
+    func testCatalogHasUniqueIdentitiesAndCoversApplicationAndSessionCommands() {
+        let rows = KeyboardShortcutCatalog.sections.flatMap(\.bindings)
+        XCTAssertEqual(Set(rows.map(\.id)).count, rows.count)
+        XCTAssertEqual(Set(rows.map(\.name)).count, rows.count)
+        let names = Set(rows.map(\.name))
+        for name: KeyboardShortcuts.Name in [.newWorkspaceWindow, .showAppSettings, .closeAppWindow, .checkForUpdates, .cmdS, .cmdShiftS] {
+            XCTAssertTrue(names.contains(name))
+        }
+        for action in AgentChatShortcutAction.allCases {
+            XCTAssertTrue(names.contains(action.shortcutName))
+        }
+        let workflow: [KeyboardShortcuts.Name] = [
+            .stopAgentRun, .focusAgentComposer, .reopenStashedAgentSession, .nextAttentionAgentSession, .resetFontScale
+        ]
+        for name in workflow + LocalKeyboardShortcut.names {
+            XCTAssertTrue(names.contains(name), "\(name.rawValue) must be customizable in Settings")
+        }
+        XCTAssertTrue(Set(KeyboardShortcutCatalog.applicationNames).isDisjoint(with: LocalKeyboardShortcut.names))
+    }
+
+    func testFormerlyFixedComposerKeysKeepTheirDefaultsAndNewWorkflowDefaultsFollowConventions() {
+        XCTAssertEqual(KeyboardShortcuts.Name.repromptDraft.defaultShortcut, .init(.return, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.repromptSendOriginal.defaultShortcut, .init(.o, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.stopAgentRun.defaultShortcut, .init(.period, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.focusAgentComposer.defaultShortcut, .init(.l, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.reopenStashedAgentSession.defaultShortcut, .init(.t, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.nextAttentionAgentSession.defaultShortcut, .init(.a, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.resetFontScale.defaultShortcut, .init(.zero, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.increaseFontScale.defaultShortcut, .init(.equal, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.decreaseFontScale.defaultShortcut, .init(.minus, modifiers: .command))
+    }
+
+    func testLocalShortcutMatchesCurrentAssignmentAndConvertsForSwiftUI() throws {
+        func key(_ code: Int, _ flags: NSEvent.ModifierFlags, _ characters: String = "\r") throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0, context: nil,
+                characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: UInt16(code)
+            ))
+        }
+        let original = KeyboardShortcuts.getShortcut(for: .repromptDraft)
+        defer { KeyboardShortcuts.setShortcut(original, for: .repromptDraft) }
+
+        KeyboardShortcuts.reset(.repromptDraft)
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), .repromptDraft))
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_ANSI_KeypadEnter, .command), .repromptDraft), "Keypad Enter keeps working")
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, [.command, .shift]), .repromptDraft))
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, []), .repromptDraft))
+
+        KeyboardShortcuts.setShortcut(.init(.r, modifiers: [.command, .option]), for: .repromptDraft)
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), .repromptDraft))
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_ANSI_R, [.command, .option], "r"), .repromptDraft))
+
+        let recordedKeypadEnter = KeyboardShortcuts.Shortcut(carbonKeyCode: kVK_ANSI_KeypadEnter, carbonModifiers: cmdKey)
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_ANSI_KeypadEnter, .command), recordedKeypadEnter))
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), recordedKeypadEnter))
+
+        KeyboardShortcuts.setShortcut(nil, for: .repromptDraft)
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), .repromptDraft))
+        XCTAssertNil(LocalKeyboardShortcut.swiftUIShortcut(for: .repromptDraft))
+
+        let originalSend = KeyboardShortcuts.getShortcut(for: .repromptSendOriginal)
+        defer { KeyboardShortcuts.setShortcut(originalSend, for: .repromptSendOriginal) }
+        KeyboardShortcuts.reset(.repromptSendOriginal)
+        let send = try XCTUnwrap(LocalKeyboardShortcut.swiftUIShortcut(for: .repromptSendOriginal))
+        XCTAssertEqual(send.key, KeyEquivalent("o"))
+        XCTAssertEqual(send.modifiers, [.command, .shift])
+    }
+
+    func testNextAttentionSessionWrapsInSidebarOrderAndSkipsTheActiveSession() {
+        let ids = (0 ..< 4).map { _ in UUID() }
+        let next = AgentModeViewModel.nextAttentionSidebarSessionTabID
+        XCTAssertEqual(next(ids[1], ids, [ids[0], ids[3]]), ids[3])
+        XCTAssertEqual(next(ids[3], ids, [ids[0], ids[3]]), ids[0], "Wraps past the end")
+        XCTAssertEqual(next(nil, ids, [ids[2]]), ids[2])
+        XCTAssertNil(next(ids[2], ids, [ids[2]]), "The active session alone is not a jump target")
+        XCTAssertNil(next(ids[0], ids, []))
+    }
+
+    func testStopFallsBackToNativeCancelOnlyForConventionalCommandPeriod() {
+        XCTAssertTrue(GlobalKeyboardShortcutsCoordinator.shouldForwardNativeCancel(stopShortcut: .init(.period, modifiers: .command)))
+        XCTAssertFalse(GlobalKeyboardShortcutsCoordinator.shouldForwardNativeCancel(stopShortcut: .init(.period, modifiers: [.command, .shift])))
+        XCTAssertFalse(GlobalKeyboardShortcutsCoordinator.shouldForwardNativeCancel(stopShortcut: nil))
+    }
+
+    func testExistingMenuDefaultsArePreservedAndNewDefaultsDoNotCollide() {
+        XCTAssertEqual(KeyboardShortcuts.Name.newWorkspaceWindow.defaultShortcut, .init(.n, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.showAppSettings.defaultShortcut, .init(.comma, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.closeAppWindow.defaultShortcut, .init(.w, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.checkForUpdates.defaultShortcut, .init(.u, modifiers: [.command, .option]))
+        XCTAssertEqual(KeyboardShortcuts.Name.cmdS.defaultShortcut, .init(.s, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.cmdShiftS.rawValue, "cmdShiftS3")
+        XCTAssertEqual(KeyboardShortcuts.Name.agentNewChat.defaultShortcut, .init(.n, modifiers: [.command, .option]))
+        XCTAssertEqual(KeyboardShortcuts.Name.newComposeTab.defaultShortcut, .init(.t, modifiers: .command))
+        XCTAssertNil(KeyboardShortcuts.Name.deleteAgentSession.defaultShortcut)
+        let defaults = KeyboardShortcutCatalog.sections.flatMap(\.bindings).compactMap(\.name.defaultShortcut)
+        XCTAssertEqual(Set(defaults).count, defaults.count)
+    }
+
+    func testRemapClearAndRestoreAreReflectedInDisplayWithoutReservingMenuKeys() {
+        let name = KeyboardShortcuts.Name.newWorkspaceWindow
+        let original = KeyboardShortcuts.getShortcut(for: name)
+        defer {
+            KeyboardShortcuts.setShortcut(original, for: name)
+            GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        }
+        let remapped = KeyboardShortcuts.Shortcut(.n, modifiers: [.command, .control])
+        KeyboardShortcuts.setShortcut(remapped, for: name)
+        GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        XCTAssertEqual(GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.title("New Window", for: name), "New Window    \(remapped.description)")
+        KeyboardShortcuts.setShortcut(nil, for: name)
+        GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        XCTAssertEqual(GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.title("New Window", for: name), "New Window")
+        KeyboardShortcuts.reset(name)
+        GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay.refresh()
+        XCTAssertEqual(KeyboardShortcuts.getShortcut(for: name), name.defaultShortcut)
+    }
+
+    func testNewDefaultsYieldToSavedCustomAssignmentsAndPreserveExplicitClears() {
+        let existing = KeyboardShortcuts.Name("shortcut-test-existing-\(UUID())")
+        let raw = "shortcut-test-new-\(UUID())"
+        let shortcut = KeyboardShortcuts.Shortcut(.p, modifiers: [.command, .shift, .control])
+        defer {
+            KeyboardShortcuts.setShortcut(nil, for: existing)
+            KeyboardShortcuts.setShortcut(nil, for: .init(raw))
+            UserDefaults.standard.removeObject(forKey: "KeyboardShortcuts_" + existing.rawValue)
+            UserDefaults.standard.removeObject(forKey: "KeyboardShortcuts_" + raw)
+        }
+        KeyboardShortcuts.setShortcut(shortcut, for: existing)
+        let added = KeyboardShortcuts.Name.sessionAction(raw, default: shortcut)
+        XCTAssertNil(KeyboardShortcuts.getShortcut(for: added))
+        XCTAssertEqual(added.defaultShortcut, shortcut)
+        KeyboardShortcuts.setShortcut(nil, for: existing)
+        let recreated = KeyboardShortcuts.Name.sessionAction(raw, default: shortcut)
+        XCTAssertNil(KeyboardShortcuts.getShortcut(for: recreated), "An explicitly cleared assignment must remain cleared")
+        KeyboardShortcuts.reset(recreated)
+        XCTAssertEqual(KeyboardShortcuts.getShortcut(for: recreated), shortcut)
+    }
+
+    func testDisplayRefreshesAutomaticallyAfterBindingChange() async {
+        let name = KeyboardShortcuts.Name.newWorkspaceWindow
+        let original = KeyboardShortcuts.getShortcut(for: name)
+        let display = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
+        let shortcut = KeyboardShortcuts.Shortcut(.n, modifiers: [.command, .control, .shift])
+        let changed = expectation(description: "Binding display refreshed from defaults notification")
+        let observation = display.$labels.dropFirst().first { $0[name] == shortcut.description }.sink { _ in changed.fulfill() }
+        defer {
+            observation.cancel()
+            KeyboardShortcuts.setShortcut(original, for: name)
+            display.refresh()
+        }
+        KeyboardShortcuts.setShortcut(shortcut, for: name)
+        await fulfillment(of: [changed], timeout: 3)
+    }
+
+    func testAutomaticCloseAdapterOnlyRemovesStandardCloseEquivalent() {
+        let menu = NSMenu()
+        let close = NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        close.keyEquivalentModifierMask = .command
+        let unrelated = NSMenuItem(title: "Other", action: #selector(NSApplication.hide(_:)), keyEquivalent: "w")
+        unrelated.keyEquivalentModifierMask = .command
+        menu.addItem(close)
+        menu.addItem(unrelated)
+        ManagedCloseMenuShortcut.removeAutomaticCloseEquivalent(in: menu)
+        XCTAssertEqual(close.keyEquivalent, "")
+        XCTAssertEqual(close.title, "Close")
+        XCTAssertEqual(close.action, #selector(NSWindow.performClose(_:)))
+        XCTAssertEqual(unrelated.keyEquivalent, "w")
+        // Also reconcile a replacement created by SwiftUI after the first pass.
+        let rebuilt = NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        rebuilt.keyEquivalentModifierMask = .command
+        menu.addItem(rebuilt)
+        ManagedCloseMenuShortcut.removeAutomaticCloseEquivalent(in: menu)
+        XCTAssertEqual(rebuilt.keyEquivalent, "")
+    }
+
+    func testSessionShortcutsForwardExactCapturedTargetsAndRequireCopyIDCapture() {
+        let target = AgentChatOptionsMenuTarget(windowID: 7, workspaceID: UUID(), tabID: UUID(), agentSessionID: UUID(), tabName: "Captured")
+        let capture = AgentSessionCopyIDTarget(windowID: target.windowID, workspaceID: target.workspaceID, tabID: target.tabID, sessionID: target.agentSessionID, persistentBindingGeneration: UUID(), bindingTransitionGeneration: 4)
+        var calls: [String] = []
+        let record: (String, AgentChatOptionsMenuTarget) -> Void = { action, received in
+            XCTAssertEqual(received, target)
+            calls.append(action)
+        }
+        let actions = AgentChatOptionsMenuActions(
+            togglePin: { record("pin", $0) },
+            rename: { record("rename", $0) },
+            stash: { record("stash", $0) },
+            copyHandoffPrompt: { record("handoff", $0) },
+            copySessionID: { XCTAssertEqual($0, capture)
+                calls.append("id")
+            },
+            delete: { record("delete", $0) }
+        )
+        let snapshot = AgentChatOptionsMenuSnapshot(target: target, isPinned: false, copySessionIDTarget: capture)
+        for action in AgentChatShortcutAction.allCases {
+            action.perform(snapshot: snapshot, actions: actions)
+        }
+        XCTAssertEqual(calls, ["pin", "rename", "stash", "handoff", "id", "delete"])
+        AgentChatShortcutAction.copySessionID.perform(snapshot: .init(target: target, isPinned: false), actions: actions)
+        XCTAssertEqual(calls.count, 6)
+    }
+
+    func testSessionMenuKeepsPlainTitlesAndShowsCurrentBindingAsNativeKeyEquivalent() {
+        let originalPin = KeyboardShortcuts.getShortcut(for: .pinAgentSession)
+        let originalDelete = KeyboardShortcuts.getShortcut(for: .deleteAgentSession)
+        defer {
+            KeyboardShortcuts.setShortcut(originalPin, for: .pinAgentSession)
+            KeyboardShortcuts.setShortcut(originalDelete, for: .deleteAgentSession)
+        }
+        let remapped = KeyboardShortcuts.Shortcut(.p, modifiers: [.command, .control])
+        KeyboardShortcuts.setShortcut(remapped, for: .pinAgentSession)
+        KeyboardShortcuts.setShortcut(nil, for: .deleteAgentSession)
+        let target = AgentChatOptionsMenuTarget(windowID: 7, workspaceID: UUID(), tabID: UUID(), agentSessionID: UUID(), tabName: "Captured")
+        let noop: (AgentChatOptionsMenuTarget) -> Void = { _ in }
+        let menu = AgentChatOptionsMenuPresenter.makeMenu(
+            snapshot: .init(target: target, isPinned: false),
+            actions: .init(togglePin: noop, rename: noop, stash: noop, copyHandoffPrompt: noop, copySessionID: { _ in }, delete: noop)
+        )
+
+        // Titles stay the plain action names; the binding lives only in the key equivalent.
+        XCTAssertEqual(menu.items.map(\.title), ["Pin", "Rename", "Stash", "Handoff", "", "Delete"])
+        XCTAssertTrue(menu.items.allSatisfy { $0.attributedTitle == nil })
+        XCTAssertEqual(menu.items[0].keyEquivalent, remapped.nsMenuItemKeyEquivalent)
+        XCTAssertEqual(menu.items[0].keyEquivalentModifierMask, [.command, .control])
+        // An unassigned action shows no key equivalent.
+        XCTAssertEqual(menu.items[5].keyEquivalent, "")
+        XCTAssertEqual(menu.items[5].keyEquivalentModifierMask, [])
     }
 }

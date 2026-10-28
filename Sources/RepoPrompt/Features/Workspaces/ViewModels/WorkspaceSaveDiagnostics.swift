@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptInstrumentation
 
 struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, CustomStringConvertible {
     let rawValue: String
@@ -47,6 +48,8 @@ struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, Cus
     static let normalizationWriteback = WorkspaceSaveSource("normalizationWriteback")
     static let refreshWorkspace = WorkspaceSaveSource("refreshWorkspace")
     static let mcpTabContextEndOfRun = WorkspaceSaveSource("mcpTabContextEndOfRun")
+    /// Finishes this presentation's own interrupted save during Agent admission (#1089).
+    static let agentAdmissionOwnedWorkingConvergence = WorkspaceSaveSource("agentAdmissionOwnedWorkingConvergence")
     #if DEBUG
         /// DEBUG diagnostics/fixture save attribution for workspace selection fixture apply flows.
         static let debugWorkspaceSelectionFixtureApply = WorkspaceSaveSource("debugWorkspaceSelectionFixtureApply")
@@ -146,15 +149,17 @@ struct WorkspaceSavePayloadMetadata: Equatable {
     }
 }
 
-enum WorkspaceSaveTracer {
-    static func event(
+struct WorkspaceSaveTracer {
+    let restorePerfRecorder: any WorkspaceRestorePerfRecording
+
+    func event(
         _ name: String,
         metadata: WorkspaceSavePayloadMetadata?,
         url: URL? = nil,
         extra fields: [String: String] = [:]
     ) {
         #if DEBUG
-            guard WorkspaceRestorePerfLog.isEnabled else { return }
+            guard restorePerfRecorder.isEnabled else { return }
             var payload = fields
             if let metadata {
                 payload.merge(baseFields(for: metadata)) { current, _ in current }
@@ -162,11 +167,11 @@ enum WorkspaceSaveTracer {
             if let url {
                 payload["url"] = url.lastPathComponent
             }
-            WorkspaceRestorePerfLog.event(name, fields: payload)
+            restorePerfRecorder.event(name, fields: payload)
         #endif
     }
 
-    static func capture(
+    func capture(
         metadata: WorkspaceSavePayloadMetadata,
         url: URL? = nil,
         liveUI: StoredSelection?,
@@ -184,16 +189,16 @@ enum WorkspaceSaveTracer {
     }
 
     #if DEBUG
-        private static func baseFields(for metadata: WorkspaceSavePayloadMetadata) -> [String: String] {
+        private func baseFields(for metadata: WorkspaceSavePayloadMetadata) -> [String: String] {
             var fields: [String: String] = [
-                "payloadID": WorkspaceRestorePerfLog.shortID(metadata.payloadID),
+                "payloadID": restorePerfRecorder.shortID(metadata.payloadID),
                 "source": metadata.source.rawValue,
                 "windowID": metadata.owner.windowID.map(String.init) ?? "<none>",
-                "managerID": metadata.owner.managerID.map { WorkspaceRestorePerfLog.shortID($0) } ?? "<none>",
-                "workspaceID": WorkspaceRestorePerfLog.shortID(metadata.workspaceID),
+                "managerID": metadata.owner.managerID.map { restorePerfRecorder.shortID($0) } ?? "<none>",
+                "workspaceID": restorePerfRecorder.shortID(metadata.workspaceID),
                 "workspaceName": metadata.workspaceName,
                 "workspaceDateModified": String(format: "%.6f", metadata.workspaceDateModified.timeIntervalSince1970),
-                "activeTabID": metadata.activeTabID.map { WorkspaceRestorePerfLog.shortID($0) } ?? "<none>",
+                "activeTabID": metadata.activeTabID.map { restorePerfRecorder.shortID($0) } ?? "<none>",
                 "activeSelectionRevision": "\(metadata.activeSelectionRevision)",
                 "createdAt": String(format: "%.6f", metadata.createdAt.timeIntervalSince1970)
             ]

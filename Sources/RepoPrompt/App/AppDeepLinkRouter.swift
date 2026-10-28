@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptWorkspaceCore
 
 @MainActor
 final class AppDeepLinkRouter {

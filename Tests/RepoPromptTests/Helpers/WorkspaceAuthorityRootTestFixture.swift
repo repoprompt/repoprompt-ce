@@ -1,6 +1,11 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptSecureStorage
+import RepoPromptSettingsCore
+import RepoPromptShared
+import RepoPromptVCS
 import XCTest
 
 #if DEBUG
@@ -66,6 +71,7 @@ import XCTest
 
             override func checkIfActivePresetIsDirty(with newSelection: [FileViewModel]) {
                 super.checkIfActivePresetIsDirty(with: newSelection)
+                // The synchronous selection sink publishes its tab snapshot after this returns.
                 selectionObservationDidFinish?(newSelection)
             }
 
@@ -100,7 +106,9 @@ import XCTest
         private init(sandbox: URL, rootNames: [String]) {
             let base = sandbox.appendingPathComponent("root-fixture-\(UUID().uuidString)", isDirectory: true)
             self.base = base
-            storage = base.appendingPathComponent("Workspaces", isDirectory: true)
+            storage = AppProfileLocations.current.customWorkspaceDirectory(
+                selectedDirectory: base.appendingPathComponent("Workspaces", isDirectory: true)
+            )
             rootPaths = rootNames.map { base.appendingPathComponent($0).path }
         }
 
@@ -108,14 +116,18 @@ import XCTest
             paddedConfiguration: Bool = false,
             rootNames: [String] = ["A", "B"],
             configuration: (([String]) -> [String])? = nil,
+            readmeContent: String = "fixture",
             _ body: (WorkspaceAuthorityRootTestFixture) async throws -> Void
         ) async throws {
             // Must precede every shared settings, sidecar, key, and store access.
-            let sandbox = try validatedSandbox()
+            let sandbox = try WorkspaceTestProcessSandbox.validate()
             let fixture = WorkspaceAuthorityRootTestFixture(sandbox: sandbox, rootNames: rootNames)
             do {
                 try await fixture.perform("real-authority fixture setup") {
-                    try await fixture.setUp(paddedConfiguration: paddedConfiguration, configuration: configuration, sandbox: sandbox)
+                    try await fixture.setUp(
+                        paddedConfiguration: paddedConfiguration, configuration: configuration,
+                        readmeContent: readmeContent, sandbox: sandbox
+                    )
                 }
                 try await body(fixture)
                 await fixture.shutdown()
@@ -125,61 +137,12 @@ import XCTest
             }
         }
 
-        private static func validatedSandbox() throws -> URL {
-            let env = ProcessInfo.processInfo.environment
-            let raw = try XCTUnwrap(
-                env["REPOPROMPT_TEST_SANDBOX_ROOT"],
-                "Run this suite with Scripts/ci_app_test_runner.py"
-            )
-            let sandbox = normalizedDirectoryURL(raw)
-            guard (raw as NSString).isAbsolutePath, sandbox.path != "/" else {
-                throw IsolationFailure.invalidEnvironment
-            }
-
-            let expectedHome = normalizedDirectoryURL(sandbox.appendingPathComponent("home", isDirectory: true).path)
-            guard expectedHome.deletingLastPathComponent().path == sandbox.path,
-                  try normalizedEnvironmentDirectory("HOME", in: env) == expectedHome,
-                  try normalizedEnvironmentDirectory("CFFIXED_USER_HOME", in: env) == expectedHome
-            else { throw IsolationFailure.invalidEnvironment }
-
-            let home = FileManager.default.homeDirectoryForCurrentUser.resolvingSymlinksInPath()
-            let support = try FileManager.default.url(
-                for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false
-            ).resolvingSymlinksInPath()
-            guard home == expectedHome,
-                  support.path.hasPrefix(home.path + "/"),
-                  FileManager.default.fileExists(atPath: sandbox.appendingPathComponent(".issue944-test-sandbox").path)
-            else { throw IsolationFailure.foundationOutsideSandbox }
-
-            for (key, suffix) in [
-                ("TMPDIR", "tmp"), ("TMP", "tmp"), ("TEMP", "tmp"),
-                ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_DATA_HOME", "data")
-            ] {
-                let expected = normalizedDirectoryURL(sandbox.appendingPathComponent(suffix, isDirectory: true).path)
-                guard expected.deletingLastPathComponent().path == sandbox.path,
-                      try normalizedEnvironmentDirectory(key, in: env) == expected
-                else {
-                    throw IsolationFailure.invalidEnvironment
-                }
-            }
-            print("ISSUE944 isolation=verified foundationHome=true applicationSupport=true")
-            return sandbox
-        }
-
-        private static func normalizedEnvironmentDirectory(
-            _ key: String,
-            in environment: [String: String]
-        ) throws -> URL {
-            let path = try XCTUnwrap(environment[key], "Missing \(key) in CI test sandbox")
-            guard (path as NSString).isAbsolutePath else { throw IsolationFailure.invalidEnvironment }
-            return normalizedDirectoryURL(path)
-        }
-
-        private static func normalizedDirectoryURL(_ path: String) -> URL {
-            URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
-        }
-
-        private func setUp(paddedConfiguration: Bool, configuration: (([String]) -> [String])?, sandbox: URL) async throws {
+        private func setUp(
+            paddedConfiguration: Bool,
+            configuration: (([String]) -> [String])?,
+            readmeContent: String,
+            sandbox: URL
+        ) async throws {
             try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
             previousStoragePreference = UserDefaults.standard.object(forKey: "GlobalCustomStorageURL")
             changedStoragePreference = true
@@ -194,7 +157,8 @@ import XCTest
             for path in rootPaths {
                 let root = URL(fileURLWithPath: path, isDirectory: true)
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-                try "fixture".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+                // Written before any window scans the root, so every store indexes this exact content.
+                try readmeContent.write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
             }
             let tabID = UUID()
             let configured = configuration?(rootPaths) ?? rootPaths.enumerated().map { index, path in
@@ -260,8 +224,8 @@ import XCTest
         }
 
         /// Seed an additional real canonical workspace without starting manager-owned create tasks.
-        func createAdditionalWorkspace(name: String, repoPaths: [String]) async throws -> WorkspaceModel {
-            let model = WorkspaceModel(name: name, repoPaths: repoPaths)
+        func createAdditionalWorkspace(name: String, repoPaths: [String], isSystemWorkspace: Bool = false) async throws -> WorkspaceModel {
+            let model = WorkspaceModel(name: name, repoPaths: repoPaths, isSystemWorkspace: isSystemWorkspace)
             let url = manager.workspaceFileURL(for: model)
             let client = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -945)
             _ = try await client.create(model, fileURL: url, operationID: UUID())
@@ -346,6 +310,12 @@ import XCTest
         }
 
         func selectFixtureFiles(_ paths: [String]) async throws {
+            // Root-only activation sets the manager ID, not the foreground compose-tab UI.
+            // Selection observation must have the same active tab before it can commit a
+            // meaningful snapshot; a later save deliberately keeps stored selection authority.
+            let active = try XCTUnwrap(manager.workspace(withID: workspace.id))
+            manager.promptViewModel.loadComposeTabsFromWorkspace(active, syncPromptText: true)
+            XCTAssertEqual(manager.promptViewModel.activeComposeTabID, active.activeComposeTabID)
             let dirty = XCTestExpectation(description: "selected files reached the real dirty observer")
             let observed = XCTestExpectation(description: "selected files reached the debounced selection observer")
             let expected = Set(paths)
@@ -372,6 +342,12 @@ import XCTest
             try await awaitGateEvent(observed)
             try await perform("selected fixture files saved") { await self.manager.pollAndSaveStateAsync() }
             try await settle()
+            let baseline = try await capturePassive()
+            let canonical = try JSONDecoder().decode(WorkspaceModel.self, from: baseline.canonical.document.documentBytes)
+            for model in [baseline.model, canonical, baseline.disk] {
+                let tab = try XCTUnwrap(model.composeTabs.first { $0.id == active.activeComposeTabID })
+                XCTAssertEqual(Set(tab.selection.selectedPaths), expected, "Fixture selection must be durable before the action under test")
+            }
         }
 
         /// Root-action return + save joins + bridge publication, not future W3 readiness.
@@ -381,8 +357,8 @@ import XCTest
             let catalog = await runtime.workspaceStore.snapshot()
             let projected = await bridge.waitUntilProjected(through: catalog.publicationSequence)
             guard projected else { throw CheckpointFailure.projectionTimedOut }
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceURL)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: indexURL)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceURL)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: indexURL)
         }
 
         /// Active admission is deliberately separate from the passive convergence checkpoint.
@@ -432,20 +408,42 @@ import XCTest
             let after = await runtime.workspaceStore.snapshot()
             let diskAfter = try Data(contentsOf: workspaceURL)
             var changed: [String] = []
-            if model != manager.workspace(withID: workspace.id) { changed.append("manager model") }
+            if model != manager.workspace(withID: workspace.id) {
+                changed.append("manager model")
+            }
             // Debounced in-memory observers can advance the dirty-tracking version while
             // this cross-actor read is suspended, without changing the model or authority.
             // No-op actions bracket their own version on the main actor instead.
-            if shells != files.visibleRootShellProjections { changed.append("visible shells") }
-            if ticket != manager.currentRootReconciliationTicketForTesting { changed.append("reconciliation ticket") }
-            if selection != files.snapshotSelection() { changed.append("selection") }
-            if notifications != rootNotificationCount { changed.append("root notifications") }
-            if roots != rootsAfter { changed.append("primary roots") }
-            if readinessObservation != observationAfter { changed.append("root readiness") }
-            if savedState != savedAfter { changed.append("saved state") }
-            if before.publicationSequence != after.publicationSequence { changed.append("publication sequence") }
-            if canonical != canonicalAfter { changed.append("canonical workspace") }
-            if diskBytes != diskAfter { changed.append("disk bytes") }
+            if shells != files.visibleRootShellProjections {
+                changed.append("visible shells")
+            }
+            if ticket != manager.currentRootReconciliationTicketForTesting {
+                changed.append("reconciliation ticket")
+            }
+            if selection != files.snapshotSelection() {
+                changed.append("selection")
+            }
+            if notifications != rootNotificationCount {
+                changed.append("root notifications")
+            }
+            if roots != rootsAfter {
+                changed.append("primary roots")
+            }
+            if readinessObservation != observationAfter {
+                changed.append("root readiness")
+            }
+            if savedState != savedAfter {
+                changed.append("saved state")
+            }
+            if before.publicationSequence != after.publicationSequence {
+                changed.append("publication sequence")
+            }
+            if canonical != canonicalAfter {
+                changed.append("canonical workspace")
+            }
+            if diskBytes != diskAfter {
+                changed.append("disk bytes")
+            }
             guard changed.isEmpty else {
                 throw CheckpointFailure.authorityChangedDuringCapture(changed.joined(separator: ", "))
             }
@@ -475,11 +473,14 @@ import XCTest
             manager?.rootReconciliationWaiterCountDidChangeForTesting = nil
             manager?.rootProbeFailureForTesting = nil
             manager?.dirtyMarkDidFinish = nil
+            manager?.selectionObservationDidFinish = nil
             manager?.omitRootReconciliationRequests = false
             // Detach admission/operation continuations before joining tasks blocked on them.
             // Full manager close still follows the existing save/writer drains below.
             manager?.beginRootReconciliationShutdown()
             if let files {
+                files.setRootTeardownWillUnloadStoreRootHandler(nil)
+                files.setRootLoadDidAttachRootShellHandler(nil)
                 await files.workspaceFileContextStore.setRootUnloadDidDetachHandler(nil)
                 for root in await files.workspaceFileContextStore.roots() {
                     await files.workspaceFileContextStore.setPrimaryRootQueryabilityFailureForTesting(rootID: root.id, failure: nil)
@@ -499,7 +500,9 @@ import XCTest
                 manager.prepareForWindowClose()
                 await manager.awaitRootReconciliationShutdown()
             }
-            if let notificationObserver { NotificationCenter.default.removeObserver(notificationObserver) }
+            if let notificationObserver {
+                NotificationCenter.default.removeObserver(notificationObserver)
+            }
             notificationObserver = nil
             if let files {
                 for root in await files.workspaceFileContextStore.roots() {
@@ -513,8 +516,8 @@ import XCTest
                 XCTAssertEqual(result.finalLifecycle, .stopped)
             }
             if workspace != nil {
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceURL)
-                await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: indexURL)
+                await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceURL)
+                await WorkspaceDiskWriterComposition.processWriter.flush(url: indexURL)
             }
             bridge = nil
             manager = nil
@@ -538,13 +541,155 @@ import XCTest
         }
 
         private enum IsolationFailure: Error {
-            case invalidEnvironment, foundationOutsideSandbox, sidecarOutsideSandbox, mcpAutoStartEnabled
+            case sidecarOutsideSandbox, mcpAutoStartEnabled
         }
 
         enum CheckpointFailure: Error, Equatable {
             case projectionTimedOut, savedBytesUnverified
             case authorityChangedDuringCapture(String)
             case operationTimedOut(String)
+        }
+    }
+
+    // MARK: - Projection observation
+
+    /// Test-only bounded waits on the bridge's passive projection checkpoints. Shared by the
+    /// authority-root fixture and app-composition suites; kept here so app-aware test support
+    /// stays in one `@testable` file.
+    @MainActor
+    final class DomainWorkspaceProjectionObserver {
+        private let bridge: DomainWorkspacePresentationBridge
+        private(set) var pendingWaiterCount = 0
+
+        init(bridge: DomainWorkspacePresentationBridge) {
+            self.bridge = bridge
+        }
+
+        /// `requireCatalogApplication` skips self-echo baseline checkpoints, which never certify a catalog.
+        func waitForProjection(
+            afterGeneration: UInt64,
+            through publicationSequence: UInt64 = 0,
+            requireCatalogApplication: Bool = false,
+            timeout: Duration = .seconds(5)
+        ) async -> DomainWorkspacePresentationBridge.ProjectionCheckpoint? {
+            let ticket = WaitTicket(
+                afterGeneration: afterGeneration,
+                publicationSequence: publicationSequence,
+                requireCatalogApplication: requireCatalogApplication
+            )
+            return await withTaskCancellationHandler {
+                if Task.isCancelled {
+                    ticket.finish(with: nil)
+                    return nil
+                }
+
+                register(ticket)
+                guard !ticket.isTerminal else { return ticket.result }
+
+                let waitResult = await XCTWaiter.fulfillment(
+                    of: [ticket.expectation],
+                    timeout: Self.timeInterval(for: timeout)
+                )
+                if waitResult != .completed {
+                    ticket.finish(with: nil)
+                    return nil
+                }
+                return ticket.result
+            } onCancel: {
+                Task { @MainActor [weak ticket] in
+                    ticket?.finish(with: nil)
+                }
+            }
+        }
+
+        private func register(_ ticket: WaitTicket) {
+            let state = bridge.projectionObservationStateForTesting
+            guard let runID = state.runID, !Task.isCancelled else {
+                ticket.finish(with: nil)
+                return
+            }
+            ticket.runID = runID
+            if let checkpoint = [state.checkpoint, state.catalogCheckpoint].compactMap(\.self)
+                .first(where: ticket.isSatisfied(by:))
+            {
+                ticket.finish(with: checkpoint)
+                return
+            }
+
+            pendingWaiterCount += 1
+            ticket.didFinish = { [weak self] in
+                guard let self else { return }
+                pendingWaiterCount -= 1
+            }
+            ticket.token = bridge.projectionObservationPublisherForTesting.sink { [weak ticket] event in
+                guard let ticket else { return }
+                switch event {
+                case let .applied(checkpoint) where ticket.isSatisfied(by: checkpoint):
+                    ticket.finish(with: checkpoint)
+                case let .stopped(stoppedRunID) where stoppedRunID == ticket.runID:
+                    ticket.finish(with: nil)
+                case .applied, .rejected, .stopped:
+                    break
+                }
+            }
+        }
+
+        private static func timeInterval(for duration: Duration) -> TimeInterval {
+            let components = duration.components
+            return TimeInterval(components.seconds)
+                + TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000
+        }
+
+        @MainActor
+        private final class WaitTicket {
+            let expectation = XCTestExpectation(description: "domain workspace projection observed")
+            let afterGeneration: UInt64
+            let publicationSequence: UInt64
+            let requireCatalogApplication: Bool
+            var runID: UUID?
+            var token: AnyCancellable?
+            var result: DomainWorkspacePresentationBridge.ProjectionCheckpoint?
+            var isTerminal = false
+            var didFinish: (() -> Void)?
+
+            init(afterGeneration: UInt64, publicationSequence: UInt64, requireCatalogApplication: Bool) {
+                self.afterGeneration = afterGeneration
+                self.publicationSequence = publicationSequence
+                self.requireCatalogApplication = requireCatalogApplication
+            }
+
+            func isSatisfied(by checkpoint: DomainWorkspacePresentationBridge.ProjectionCheckpoint) -> Bool {
+                checkpoint.runID == runID
+                    && checkpoint.generation > afterGeneration
+                    && checkpoint.publicationSequence >= publicationSequence
+                    && (!requireCatalogApplication || checkpoint.catalogReceipt != nil)
+            }
+
+            func finish(with checkpoint: DomainWorkspacePresentationBridge.ProjectionCheckpoint?) {
+                guard !isTerminal else { return }
+                isTerminal = true
+                result = checkpoint
+                token?.cancel()
+                token = nil
+                let completion = didFinish
+                didFinish = nil
+                completion?()
+                expectation.fulfill()
+            }
+        }
+    }
+
+    extension DomainWorkspacePresentationBridge {
+        func waitUntilProjected(
+            through publicationSequence: UInt64,
+            timeout: Duration = .seconds(5)
+        ) async -> Bool {
+            let observer = DomainWorkspaceProjectionObserver(bridge: self)
+            return await observer.waitForProjection(
+                afterGeneration: 0,
+                through: publicationSequence,
+                timeout: timeout
+            ) != nil
         }
     }
 #endif

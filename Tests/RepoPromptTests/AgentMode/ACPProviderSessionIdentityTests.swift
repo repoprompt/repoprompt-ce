@@ -1,8 +1,98 @@
 import Foundation
+import os
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import RepoPromptProcess
+import RepoPromptSettingsCore
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
+    func testACPBootstrapRefusesDevinNewAndColdResumeWithoutFixtureOptIn() async throws {
+        // Hydration can request a fresh controller for a persisted provider session;
+        // neither that identity nor discovery is permission to start a provider in XCTest.
+        for resumeID in [nil, "persisted-devin-session"] as [String?] {
+            let workspace = try makeTemporaryDirectory()
+            let recordURL = workspace.appendingPathComponent("requests.jsonl")
+            let provider = try FakeACPProvider(
+                providerID: .devin,
+                commandPath: makeFakeACPServerScript().path,
+                environment: ["ACP_RECORD_PATH": recordURL.path]
+            )
+            let request = makeRunRequest(agentKind: .devin, workspacePath: workspace.path, resumeSessionID: resumeID)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+            do {
+                _ = try await controller.bootstrap()
+                XCTFail("Discovery and cold resume must fail closed without an explicit fixture permit")
+            } catch {
+                XCTAssertTrue(error is ProviderProcessLaunchPolicy.Refusal, "Unexpected refusal: \(error)")
+            }
+            let identity = await controller.currentProviderSessionIdentity()
+            XCTAssertNil(identity.runtimeSessionID)
+            XCTAssertEqual(identity.loadSessionID, resumeID)
+            await controller.shutdown()
+            XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path), "Refusal must precede ACP initialization")
+        }
+    }
+
+    func testDevinKnownUpdatesDuringRealNewBootstrapKeepForeignFence() async throws {
+        try await assertDevinBootstrapUpdates(resumeID: nil)
+    }
+
+    func testDevinKnownUpdatesDuringRealLoadBootstrapKeepReplayAndForeignFences() async throws {
+        try await assertDevinBootstrapUpdates(resumeID: "bootstrap-session-id")
+    }
+
+    private func assertDevinBootstrapUpdates(resumeID: String?) async throws {
+        let workspace = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("requests.jsonl")
+        let provider = try FakeACPProvider(
+            providerID: .devin,
+            commandPath: makeFakeACPServerScript().path,
+            environment: [
+                "ACP_RECORD_PATH": recordURL.path,
+                "ACP_RUNTIME_SESSION_ID": "bootstrap-session-id",
+                "ACP_BOOTSTRAP_UPDATE_PROBE": "1"
+            ]
+        )
+        let request = makeRunRequest(agentKind: .devin, workspacePath: workspace.path, resumeSessionID: resumeID)
+        let controller = try ACPAgentSessionController(
+            provider: provider, runRequest: request,
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        let stream = await controller.currentEventsStream()
+        do {
+            let bootstrap = try await controller.bootstrap()
+            XCTAssertEqual(bootstrap.sessionID, "bootstrap-session-id")
+            XCTAssertEqual(bootstrap.providerSessionIdentity.runtimeSessionID, "bootstrap-session-id")
+            // This real prompt request can only run after bootstrap has installed sessionID.
+            // Its fake response is preceded by foreign then current tagged known-kind updates.
+            try await controller.prompt(AgentMessage(userMessage: "probe after bootstrap"), request: request)
+        } catch {
+            await controller.shutdown()
+            throw error
+        }
+        await controller.shutdown()
+        var content: [String] = []
+        for await event in stream {
+            if case let .stream(result) = event, result.type == "content", let text = result.text {
+                content.append(text)
+            }
+        }
+        let expected = resumeID == nil
+            ? ["before-initialize-reply", "before-new-reply", "current-after-open"]
+            : ["before-initialize-reply", "current-after-open"]
+        XCTAssertEqual(content, expected, "\(resumeID == nil ? "new" : "load"): nil identity permits known bootstrap updates; load replay and installed foreign identity remain fenced")
+        let records = try String(contentsOf: recordURL, encoding: .utf8).split(whereSeparator: \.isNewline).map { line in
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+        }
+        let methods = records.compactMap { $0["method"] as? String }.filter { $0 != "session/cancel" }
+        XCTAssertEqual(methods, ["initialize", resumeID == nil ? "session/new" : "session/load", "session/prompt"], "Fake emissions are gated by the real RPC exchange, not a timer")
+        if resumeID != nil { XCTAssertEqual(recordedSessionLoadIDs(at: recordURL), ["bootstrap-session-id"]) }
+        print("QUIET_F3_BOOTSTRAP mode=\(resumeID == nil ? "new" : "load") applied=\(content)")
+        XCTAssertFalse(AgentSessionLinkPrompts.supportsQuietCheckIn(.devin), "F3 does not qualify Devin quiet/copy")
+    }
+
     func testCursorNewSessionPublishesRuntimeIDAsVerifiedLoadID() async throws {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()
@@ -12,7 +102,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RUNTIME_SESSION_ID": "cursor-runtime-id"]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
         let stream = await controller.currentEventsStream()
 
         let bootstrap = try await controller.bootstrap()
@@ -42,7 +132,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             commandPath: scriptURL.path,
             environment: ["ACP_RECORD_PATH": recordURL.path]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -72,7 +162,7 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
                 "ACP_RUNTIME_SESSION_ID": "fresh-runtime-id"
             ]
         )
-        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
 
         let bootstrap = try await controller.bootstrap()
         await controller.shutdown()
@@ -97,6 +187,211 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         XCTAssertEqual(identity.runtimeSessionID, "cursor-runtime-id")
         XCTAssertNil(identity.loadSessionID)
         XCTAssertEqual(identity.loadSessionIDConfidence, .unavailable)
+    }
+
+    func testNegotiatedImagesRequireLiteralTrueAndRefusalKeepsTextUsable() async throws {
+        for capability in ["{\"image\":true}", "{}", "{\"image\":false}", "{\"image\":null}", "{\"image\":1}", "{\"image\":\"true\"}", "[]", "{\"image\":0}"] {
+            let workspace = try makeTemporaryDirectory()
+            let record = workspace.appendingPathComponent("requests.jsonl")
+            let builds = BuildObserver()
+            let provider = try FakeACPProvider(
+                providerID: .cursor,
+                commandPath: makeFakeACPServerScript().path,
+                environment: ["ACP_RECORD_PATH": record.path, "ACP_PROMPT_CAPABILITIES": capability, "ACP_COMMAND": "compact"],
+                builds: builds
+            )
+            let request = makeRunRequest(agentKind: .cursor, workspacePath: workspace.path)
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5), allowsProviderProcessLaunchForTesting: true)
+            let bootstrap = try await controller.bootstrap()
+            let image = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: nil)
+            let supported = capability == "{\"image\":true}"
+            do {
+                try await controller.prompt(AgentMessage(userMessage: "image", attachments: [image]))
+                XCTAssertTrue(supported)
+            } catch {
+                XCTAssertFalse(supported)
+                guard case AIProviderError.invalidConfiguration = error else { XCTFail("Unexpected error: \(error)")
+                    await controller.shutdown()
+                    continue
+                }
+            }
+            if !supported {
+                let attachmentRequest = ACPRunRequest(
+                    agentKind: .cursor,
+                    modelString: nil,
+                    workspacePath: workspace.path,
+                    resumeSessionID: nil,
+                    attachments: [AgentFileAttachment(source: .localFile(path: "/nonexistent-must-not-read.png"))],
+                    taskLabelKind: nil
+                )
+                do {
+                    try await controller.prompt(AgentMessage(userMessage: "attachment override"), request: attachmentRequest)
+                    XCTFail("Effective override attachments must be gated")
+                } catch {
+                    guard case AIProviderError.invalidConfiguration = error else { XCTFail("Unexpected error: \(error)")
+                        await controller.shutdown()
+                        continue
+                    }
+                }
+            }
+            XCTAssertEqual(builds.count, supported ? 1 : 0)
+            let beforeText = recordedPrompts(at: record)
+            XCTAssertEqual(beforeText.count, supported ? 1 : 0)
+            if supported {
+                let blocks = try XCTUnwrap(beforeText.first?["prompt"] as? [[String: Any]])
+                XCTAssertEqual(blocks.map { $0["type"] as? String }, ["text", "image"])
+                XCTAssertEqual(blocks.last?["data"] as? String, "AQID")
+                XCTAssertEqual(blocks.last?["mimeType"] as? String, "image/png")
+            }
+            try await controller.prompt(AgentMessage(userMessage: "next text"))
+            XCTAssertEqual(recordedPrompts(at: record).count, supported ? 2 : 1)
+            let deadline = Date().addingTimeInterval(5)
+            while !controller.advertisesCommand("compact", inProviderSession: bootstrap.sessionID), Date() < deadline {
+                await Task.yield()
+            }
+            XCTAssertTrue(controller.advertisesCommand("compact", inProviderSession: bootstrap.sessionID))
+            let inheritedAttachments = ACPRunRequest(
+                agentKind: .cursor,
+                modelString: nil,
+                workspacePath: workspace.path,
+                resumeSessionID: nil,
+                attachments: [AgentFileAttachment(source: .localFile(path: "/must-not-read.png"))],
+                taskLabelKind: nil
+            )
+            try await controller.promptAdvertisedCommand("compact", expectedSessionID: bootstrap.sessionID, request: inheritedAttachments)
+            let commandBlocks = try XCTUnwrap(recordedPrompts(at: record).last?["prompt"] as? [[String: Any]])
+            XCTAssertEqual(commandBlocks.count, 1)
+            XCTAssertEqual(commandBlocks.first?["text"] as? String, "/compact")
+            XCTAssertEqual(builds.count, supported ? 2 : 1)
+            await controller.shutdown()
+        }
+    }
+
+    func testNonImageAttachmentsDoNotNeedImageInputAndReachThePromptAsText() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let record = workspace.appendingPathComponent("requests.jsonl")
+        let builds = BuildObserver()
+        let provider = try FakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            environment: ["ACP_RECORD_PATH": record.path, "ACP_PROMPT_CAPABILITIES": "{}"],
+            builds: builds
+        )
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: makeRunRequest(agentKind: .cursor, workspacePath: workspace.path),
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        _ = try await controller.bootstrap()
+        let csvBytes = Data("a,b\n1,2\n".utf8)
+        let csv = AgentFileAttachment(
+            source: .localFile(path: "/nonexistent-must-not-read.csv"),
+            kind: .text,
+            fileName: "table.csv",
+            byteCount: csvBytes.count
+        )
+        let request = ACPRunRequest(
+            agentKind: .cursor,
+            modelString: nil,
+            workspacePath: workspace.path,
+            resumeSessionID: nil,
+            attachments: [csv],
+            taskLabelKind: nil
+        )
+        try await controller.prompt(AgentMessage(userMessage: "see @table.csv"), request: request)
+        let oracleText = OracleAttachment(payload: .text("a,b\n1,2\n", csvBytes), fileName: "table.csv", title: nil)
+        try await controller.prompt(AgentMessage(userMessage: "inline", attachments: [oracleText]), request: request)
+
+        XCTAssertEqual(builds.count, 2)
+        let prompts = recordedPrompts(at: record)
+        XCTAssertEqual(prompts.count, 2)
+        for prompt in prompts {
+            let blocks = try XCTUnwrap(prompt["prompt"] as? [[String: Any]])
+            XCTAssertEqual(blocks.map { $0["type"] as? String }, ["text"])
+        }
+        await controller.shutdown()
+    }
+
+    func testInheritedAttachmentsRejectBeforeReadingAndTextOverrideRecovers() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let record = workspace.appendingPathComponent("requests.jsonl")
+        let builds = BuildObserver()
+        let provider = try FakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            environment: ["ACP_RECORD_PATH": record.path],
+            builds: builds
+        )
+        let request = ACPRunRequest(
+            agentKind: .cursor,
+            modelString: nil,
+            workspacePath: workspace.path,
+            resumeSessionID: nil,
+            attachments: [AgentFileAttachment(source: .localFile(path: "/nonexistent-must-not-read.png"))],
+            taskLabelKind: nil
+        )
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: request,
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        _ = try await controller.bootstrap()
+        do {
+            try await controller.prompt(AgentMessage(userMessage: "inherited attachment"))
+            XCTFail("Expected local rejection")
+        } catch {
+            guard case AIProviderError.invalidConfiguration = error else { XCTFail("Unexpected error: \(error)")
+                await controller.shutdown()
+                return
+            }
+        }
+        XCTAssertEqual(builds.count, 0)
+        XCTAssertTrue(recordedPrompts(at: record).isEmpty)
+        try await controller.prompt(
+            AgentMessage(userMessage: "text override"),
+            request: makeRunRequest(agentKind: .cursor, workspacePath: workspace.path)
+        )
+        XCTAssertEqual(builds.count, 1)
+        XCTAssertEqual(recordedPrompts(at: record).count, 1)
+        await controller.shutdown()
+    }
+
+    func testRealPromptRPCFailureStillRetiresController() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let provider = try FakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            environment: ["ACP_FAIL_PROMPT": "1"]
+        )
+        let controller = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: makeRunRequest(agentKind: .cursor, workspacePath: workspace.path),
+            requestTimeouts: .init(bootstrapSeconds: 5, operationalSeconds: 5),
+            allowsProviderProcessLaunchForTesting: true
+        )
+        _ = try await controller.bootstrap()
+        do { try await controller.prompt(AgentMessage(userMessage: "transport failure"))
+            XCTFail("Expected RPC failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("real RPC failure"))
+        }
+        do { try await controller.prompt(AgentMessage(userMessage: "must not reuse"))
+            XCTFail("Failed controller must refuse")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "ACP controller expected sessionOpen or promptRunning, but was failed.")
+        }
+        await controller.shutdown()
+    }
+
+    private func recordedPrompts(at url: URL) -> [[String: Any]] {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap {
+            guard let object = try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any],
+                  object["method"] as? String == "session/prompt" else { return nil }
+            return object["params"] as? [String: Any]
+        }
     }
 
     private func makeRunRequest(
@@ -139,6 +434,9 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             with open(record_path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps({"method": method, "params": params}) + "\n")
 
+        def probe_update(session_id, text):
+            print(json.dumps({"jsonrpc":"2.0", "method":"session/update", "params":{"sessionId":session_id, "update":{"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":text}}}}), flush=True)
+
         def respond(request_id, result=None, error=None):
             payload = {"jsonrpc": "2.0", "id": request_id}
             if error is not None:
@@ -156,17 +454,31 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
             params = request.get("params") or {}
             record(method, params)
             if method == "initialize":
-                respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+                if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
+                    probe_update(runtime_session_id, "before-initialize-reply")
+                respond(request.get("id"), {"agentCapabilities": {"loadSession": True, "promptCapabilities": json.loads(os.environ.get("ACP_PROMPT_CAPABILITIES", "{}"))}, "authMethods": []})
             elif method == "session/new":
+                if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
+                    probe_update(runtime_session_id, "before-new-reply")
+                if os.environ.get("ACP_COMMAND"):
+                    print(json.dumps({"jsonrpc":"2.0", "method":"session/update", "params":{"sessionId":runtime_session_id, "update":{"sessionUpdate":"available_commands_update", "availableCommands":[{"name":os.environ["ACP_COMMAND"], "description":"command"}]}}}), flush=True)
                 respond(request.get("id"), {"sessionId": runtime_session_id})
             elif method == "session/load":
                 session_id = params.get("sessionId")
+                if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
+                    probe_update(session_id, "during-load-replay")
                 if fail_load:
                     message = load_error_message or ("session not found: " + str(session_id))
                     respond(request.get("id"), error={"code": load_error_code, "message": message})
                 else:
                     respond(request.get("id"), {"sessionId": session_id})
             elif method == "session/prompt":
+                if os.environ.get("ACP_BOOTSTRAP_UPDATE_PROBE") == "1":
+                    probe_update("foreign-session-id", "foreign-after-open")
+                    probe_update(params.get("sessionId"), "current-after-open")
+                if os.environ.get("ACP_FAIL_PROMPT"):
+                    respond(request.get("id"), error={"code":-32603, "message":"real RPC failure"})
+                    continue
                 respond(request.get("id"), {"stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 2}})
             else:
                 respond(request.get("id"), {})
@@ -210,6 +522,7 @@ private struct FakeACPProvider: ACPAgentProvider {
     let providerID: ACPProviderID
     let commandPath: String
     let environment: [String: String]
+    var builds: BuildObserver?
 
     func support(for request: ACPRunRequest) async -> ACPSupportResult {
         .supported
@@ -244,17 +557,29 @@ private struct FakeACPProvider: ACPAgentProvider {
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
-        [["type": "text", "text": message.userMessage]]
+        builds?.increment()
+        return try ACPPromptContentBuilder.blocks(text: message.userMessage, attachments: request.attachments, oracleAttachments: message.attachments)
     }
 
     func normalizeSessionUpdate(
         _ payload: [String: Any],
         sessionID: String
     ) -> [NormalizedAgentRuntimeEvent] {
-        []
+        providerID == .devin ? ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: providerID) : []
     }
 
     func normalizeError(_ error: Error) -> Error {
         error
+    }
+}
+
+private final class BuildObserver: Sendable {
+    private let value = OSAllocatedUnfairLock(initialState: 0)
+    var count: Int {
+        value.withLock { $0 }
+    }
+
+    func increment() {
+        value.withLock { $0 += 1 }
     }
 }

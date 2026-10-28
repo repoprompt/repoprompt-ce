@@ -1,5 +1,5 @@
 import Foundation
-@testable import RepoPromptApp
+import RepoPromptFoundation
 import XCTest
 
 final class CancellableProbeTests: XCTestCase {

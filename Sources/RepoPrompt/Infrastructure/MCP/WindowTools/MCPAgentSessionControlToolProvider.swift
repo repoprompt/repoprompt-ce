@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
 @MainActor
@@ -18,6 +19,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
     func buildTools() -> [Tool] {
         var tools = [
+            agentSelfTool(),
             shareThoughtsTool(),
             setStatusTool(),
             waitForNextInstructionTool()
@@ -26,6 +28,31 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             tools.append(promptExperimentTool())
         #endif
         return tools
+    }
+
+    private func agentSelfTool() -> Tool {
+        guard let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.agentSelf) else {
+            preconditionFailure("Missing canonical self_compact definition")
+        }
+        return runtime.tool(
+            name: MCPWindowToolName.agentSelf,
+            freshnessPolicy: .none,
+            description: definition.description,
+            annotations: .init(
+                readOnlyHint: false, destructiveHint: true,
+                idempotentHint: false, openWorldHint: true
+            ),
+            inputSchema: .object(
+                properties: [
+                    "op": .string(description: "Required operation: context or compact.", enum: ["context", "compact"]),
+                    "note": .string(description: "[compact] Required verbatim note: 10% of window tokens × 4 UTF-8 bytes; 65,536 if unknown."),
+                    "idempotency_key": .string(description: "[compact] Required identical-retry key, at most 200 UTF-8 bytes.")
+                ],
+                required: ["op"]
+            )
+        ) { [dependencies] _, args in
+            try await dependencies.executeAgentSelf(args)
+        }
     }
 
     private func shareThoughtsTool() -> Tool {
@@ -62,8 +89,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 ],
                 required: ["thoughts"]
             )
-        ) { [dependencies] _, args in
-            try await Self.executeShareThoughts(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeShareThoughts(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
@@ -83,8 +110,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 ],
                 required: []
             )
-        ) { [dependencies] _, args in
-            try await Self.executeSetStatus(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeSetStatus(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
@@ -125,8 +152,8 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
                 ],
                 required: []
             )
-        ) { [dependencies] _, args in
-            try await Self.executeWaitForNextInstruction(args: args, dependencies: dependencies)
+        ) { [dependencies] invocation, args in
+            try await Self.executeWaitForNextInstruction(args: args, invocationContext: invocation.context, dependencies: dependencies)
         }
     }
 
@@ -178,6 +205,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
     private static func executeShareThoughts(
         args: [String: Value],
+        invocationContext: ToolInvocationContext,
         dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         guard let thoughts = args["thoughts"]?.stringValue else {
@@ -185,7 +213,7 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         }
         let title = args["title"]?.stringValue
 
-        let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.shareThoughts)
+        let connectionID = try await dependencies.requireAgentModeConnection(invocationContext, MCPWindowToolName.shareThoughts)
         let targetWindow = try dependencies.requireTargetWindow()
         let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .shareThoughts)
 
@@ -206,9 +234,10 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
     private static func executeSetStatus(
         args: [String: Value],
+        invocationContext: ToolInvocationContext,
         dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
-        let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.setStatus)
+        let connectionID = try await dependencies.requireAgentModeConnection(invocationContext, MCPWindowToolName.setStatus)
         let trimmedSessionName = args["session_name"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionNameToApply = (trimmedSessionName?.isEmpty == false) ? trimmedSessionName : nil
@@ -247,13 +276,14 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
     private static func executeWaitForNextInstruction(
         args: [String: Value],
+        invocationContext: ToolInvocationContext,
         dependencies: MCPAppPhysicalCapabilityAdapters.Execution
     ) async throws -> Value {
         let prompt = args["prompt"]?.stringValue
         let timeout = try resolvedInstructionWaitTimeoutSeconds(args["timeout_seconds"])
 
         let targetWindow = try dependencies.requireTargetWindow()
-        let connectionID = ServerNetworkManager.currentConnectionID
+        let connectionID = invocationContext.connectionID
         let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .waitForInstruction)
 
         // Invariant: waiting state is stored on the target session; do not switch tabs here.

@@ -6,10 +6,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -140,6 +143,19 @@ from pathlib import Path
 args = sys.argv[1:]
 state = json.loads(Path(os.environ["PUBLISHER_STUB_STATE"]).read_text(encoding="utf-8"))
 asset_dir = Path(os.environ["PUBLISHER_ASSET_DIR"])
+# Inspect the actual argv before decoding the private config for fixture auth.
+for token_name in ("TIP_GH_TOKEN", "TIP_SOURCE_GH_TOKEN"):
+    token = os.environ.get(token_name)
+    if token and any(token in argument for argument in args):
+        raise SystemExit("bearer token must not appear in curl argv")
+if "--config" in args:
+    config = Path(args[args.index("--config") + 1])
+    if config.stat().st_mode & 0o777 != 0o600 or config.parent.stat().st_mode & 0o777 != 0o700:
+        raise SystemExit("curl config must be private")
+    state.setdefault("curl_configs", []).append(str(config))
+    Path(os.environ["PUBLISHER_STUB_STATE"]).write_text(json.dumps(state))
+    import shlex
+    args += shlex.split(config.read_text())[2:]
 output = Path(args[args.index("--output") + 1])
 urls = [argument for argument in args if argument.startswith("https://")]
 if not urls:
@@ -395,7 +411,8 @@ class PublishTipReleaseTests(unittest.TestCase):
         scenario: str,
         release: dict[str, object] | None,
         *,
-        source_token: str | None = "fixture-source-token",
+        source_token: str | None = 'fixture-source"-token\\',
+        update_token: str = 'fixture-update"-token\\',
         live_main: str = COMMIT,
     ) -> subprocess.CompletedProcess[str]:
         self.state_path.write_text(
@@ -422,8 +439,8 @@ class PublishTipReleaseTests(unittest.TestCase):
                 "PUBLISHER_ASSET_DIR": str(self.asset_dir),
                 "PUBLISHER_STABLE_APPCAST": str(self.stable_appcast),
                 "PUBLISHER_STABLE_FEED_URL": policy["sparkle"]["stableFeedURL"],
-                "TIP_GH_TOKEN": "fixture-update-token",
-                "PUBLISHER_EXPECTED_SOURCE_TOKEN": "fixture-source-token",
+                "TIP_GH_TOKEN": update_token,
+                "PUBLISHER_EXPECTED_SOURCE_TOKEN": 'fixture-source"-token\\',
                 "PUBLISHER_LIVE_MAIN": live_main,
                 "TIP_UPDATE_REPOSITORY": UPDATE_REPOSITORY,
                 "TIP_SOURCE_REPOSITORY": SOURCE_REPOSITORY,
@@ -443,7 +460,7 @@ class PublishTipReleaseTests(unittest.TestCase):
             environment.pop("TIP_SOURCE_GH_TOKEN", None)
         else:
             environment["TIP_SOURCE_GH_TOKEN"] = source_token
-        return subprocess.run(
+        result = subprocess.run(
             [
                 "bash",
                 str(PUBLISHER),
@@ -457,6 +474,13 @@ class PublishTipReleaseTests(unittest.TestCase):
             capture_output=True,
             timeout=30,
         )
+        for config in self._state().get("curl_configs", []):
+            self.assertFalse(Path(config).exists(), "curl config survived script exit")
+        for token_name in ("TIP_GH_TOKEN", "TIP_SOURCE_GH_TOKEN"):
+            token = environment.get(token_name)
+            if token:
+                self.assertNotIn(token, result.stdout + result.stderr)
+        return result
 
     def _state(self) -> dict[str, object]:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -468,6 +492,16 @@ class PublishTipReleaseTests(unittest.TestCase):
             self.assertIn("--paginate", arguments)
             self.assertNotIn("--slurp", arguments)
             self.assertNotIn("--jq", arguments)
+
+    def test_config_line_breaks_are_rejected_before_curl(self) -> None:
+        for arguments, message in (({"update_token": "fixture\ninvalid"}, "Invalid Tip token"),
+                                   ({"source_token": "fixture\rinvalid"}, "Invalid source token")):
+            with self.subTest(message=message):
+                result = self._run("existing", self._release(), **arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self._state().get("curl_configs", []), [])
+                self.assertEqual(self._state()["mutations"], [])
 
     def test_existing_release_on_later_page_is_reused_without_mutation(self) -> None:
         result = self._run("existing", self._release())
@@ -605,6 +639,246 @@ class PublishTipReleaseTests(unittest.TestCase):
         state = self._state()
         self.assertEqual(state["mutations"], [])
         self.assert_compatible_lookup(state)
+
+
+class TipAdmissionTests(unittest.TestCase):
+    """Execute the workflow's admission Bash, not a duplicate decision helper."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        step = workflow.split("      - name: Resolve protected main commit\n", 1)[1]
+        script = step.split("        run: |\n", 1)[1].split("\n  credential-preflight:", 1)[0]
+        cls.admission_script = textwrap.dedent(script)
+
+    def setUp(self) -> None:
+        temporary_directory = tempfile.TemporaryDirectory(prefix="tip-admission-")
+        self.addCleanup(temporary_directory.cleanup)
+        self.root = Path(temporary_directory.name)
+        self.source = self.root / "source"
+        self.checkout = self.root / "checkout"
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self.runner_temp = self.root / "runner"
+        self.runner_temp.mkdir()
+        self.output = self.root / "output"
+        self.summary = self.root / "summary"
+        self.http_calls = self.root / "http-calls"
+        self.appcast = self.root / "appcast.xml"
+        self.appcast.write_text(
+            '<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'
+            '<channel><item><sparkle:version>36</sparkle:version>'
+            '<sparkle:shortVersionString>1.4.0</sparkle:shortVersionString></item></channel></rss>\n',
+            encoding="utf-8",
+        )
+        # Do not inherit credentials, Git hooks/configuration, or signing setup.
+        self.environment = {
+            "PATH": f"{self.bin_dir}:{Path(sys.executable).parent}:/usr/bin:/bin",
+            "HOME": str(self.root),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_AUTHOR_NAME": "Tip fixture",
+            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "Tip fixture",
+            "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            "GIT_AUTHOR_DATE": "2026-01-01T00:00:00Z",
+            "GIT_COMMITTER_DATE": "2026-01-01T00:00:00Z",
+            "RUNNER_TEMP": str(self.runner_temp),
+            "GITHUB_OUTPUT": str(self.output),
+            "GITHUB_STEP_SUMMARY": str(self.summary),
+            "TIP_UPDATE_REPOSITORY": UPDATE_REPOSITORY,
+            "ADMISSION_HTTP_CALLS": str(self.http_calls),
+            "ADMISSION_APPCAST": str(self.appcast),
+            "ADMISSION_STABLE_FEED_URL": json.loads(POLICY.read_text())["sparkle"]["stableFeedURL"],
+            "ADMISSION_CURL_STATUS": "0",
+        }
+        curl_stub = r'''#!/usr/bin/env python3
+import os
+import shutil
+import sys
+from pathlib import Path
+args = sys.argv[1:]
+with Path(os.environ["ADMISSION_HTTP_CALLS"]).open("a") as calls:
+    calls.write("curl\n")
+if os.environ["ADMISSION_STABLE_FEED_URL"] not in args or "--fail" not in args:
+    raise SystemExit("unexpected admission HTTP request")
+status = int(os.environ["ADMISSION_CURL_STATUS"])
+if status:
+    print("fixture HTTP/auth failure", file=sys.stderr)
+    raise SystemExit(status)
+shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1])
+'''
+        PublishTipReleaseTests._write_executable(self.bin_dir / "curl", curl_stub)
+        self._git(self.root, "init", "-q", "-b", "main", str(self.source))
+        (self.source / "Scripts").mkdir()
+        for path in (ROLLOUT_TOOL, POLICY):
+            shutil.copyfile(path, self.source / "Scripts" / path.name)
+        for name in ("tip-rollout.json", "version.env"):
+            shutil.copyfile(ROOT_DIR / name, self.source / name)
+        self._git(self.source, "add", ".")
+        self._git(self.source, "commit", "-qm", "tested candidate")
+        self.candidate = self._git(self.source, "rev-parse", "HEAD")
+        (self.source / "advance").write_text("new protected main\n", encoding="utf-8")
+        self._git(self.source, "add", ".")
+        self._git(self.source, "commit", "-qm", "advance main")
+        self.advanced = self._git(self.source, "rev-parse", "HEAD")
+        self._git(self.root, "clone", "-q", str(self.source), str(self.checkout))
+        self._git(self.checkout, "checkout", "-q", "--detach", self.candidate)
+        # The checkout starts with an old origin/main: admission must fetch it.
+        self._git(self.checkout, "update-ref", "refs/remotes/origin/main", self.candidate)
+        self._git(self.source, "update-ref", "refs/heads/main", self.candidate)
+
+    def _git(self, cwd: Path, *arguments: str) -> str:
+        result = subprocess.run(
+            ["git", *arguments], cwd=cwd, env=self.environment,
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def _run(self, **overrides: str) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+        self.output.write_text("", encoding="utf-8")
+        self.summary.write_text("", encoding="utf-8")
+        self.http_calls.write_text("", encoding="utf-8")
+        environment = {
+            **self.environment,
+            "EVENT_NAME": "workflow_run",
+            # Unlike the tested SHA, github.sha can point at newer main.
+            "DISPATCH_COMMIT": self.advanced,
+            "DISPATCH_REF": "refs/heads/main",
+            "WORKFLOW_RUN_COMMIT": self.candidate,
+            "WORKFLOW_DEFINITION_COMMIT": self.candidate,
+            **overrides,
+        }
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.admission_script],
+            cwd=self.checkout, env=environment, text=True, capture_output=True, timeout=10,
+        )
+        outputs = dict(line.split("=", 1) for line in self.output.read_text().splitlines())
+        return result, outputs
+
+    def assert_rejected(self, message: str, **overrides: str) -> None:
+        result, outputs = self._run(**overrides)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertEqual(outputs, {})
+        self.assertNotIn("::notice::", result.stdout)
+
+    def test_current_tested_commit_is_eligible_without_substituting_dispatch_sha(self) -> None:
+        result, outputs = self._run()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["eligible"], "true")
+        self.assertEqual(outputs["commit"], self.candidate)
+        self.assertEqual(outputs["tooling-commit"], self.candidate)
+        self.assertEqual(outputs["short-sha"], self.candidate[:12])
+        self.assertEqual(outputs["tag"], f"tip-{self.candidate[:12]}")
+        self.assertEqual(outputs["build-number"], "36.0.1")
+        self.assertEqual(self.http_calls.read_text(), "curl\n")
+
+    def test_superseded_tested_commit_skips_before_http_without_release_outputs(self) -> None:
+        self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
+        for tooling in (self.candidate, self.advanced):
+            with self.subTest(tooling=tooling):
+                self._git(self.checkout, "checkout", "-q", "--detach", tooling)
+                result, outputs = self._run(WORKFLOW_DEFINITION_COMMIT=tooling)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(outputs, {"eligible": "false"})
+                self.assertEqual(self.http_calls.read_text(), "")
+                self.assertIn("::notice::", result.stdout)
+                self.assertIn("superseded", result.stdout)
+                for commit in (self.candidate, self.advanced):
+                    self.assertIn(commit, self.summary.read_text())
+                self.assertEqual(self._git(self.checkout, "rev-parse", "origin/main"), self.advanced)
+
+    def test_current_main_dispatch_is_eligible_and_ignores_workflow_run_sha(self) -> None:
+        result, outputs = self._run(
+            EVENT_NAME="workflow_dispatch", DISPATCH_COMMIT=self.candidate,
+            WORKFLOW_RUN_COMMIT="not-a-sha",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(outputs["eligible"], "true")
+        self.assertEqual(outputs["commit"], self.candidate)
+
+    def test_malformed_event_and_source_inputs_remain_failures(self) -> None:
+        cases = (
+            ("Unsupported Tip release event", {"EVENT_NAME": "push"}),
+            ("Manual Tip dispatch must run from protected main", {
+                "EVENT_NAME": "workflow_dispatch", "DISPATCH_REF": "refs/heads/feature",
+            }),
+            ("full lowercase source commit SHA", {"WORKFLOW_RUN_COMMIT": "A" * 40}),
+            ("full lowercase source commit SHA", {"WORKFLOW_RUN_COMMIT": "abc123"}),
+            ("full workflow definition SHA", {"WORKFLOW_DEFINITION_COMMIT": "invalid"}),
+        )
+        for message, overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.assert_rejected(message, **overrides)
+                self.assertEqual(self.http_calls.read_text(), "")
+
+    def test_missing_source_object_remains_a_failure(self) -> None:
+        self.assert_rejected("f" * 40, WORKFLOW_RUN_COMMIT="f" * 40)
+
+    def test_tooling_definition_mismatch_is_not_hidden_by_supersession(self) -> None:
+        self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
+        self.assert_rejected(
+            "Checked-out release tooling differs", WORKFLOW_DEFINITION_COMMIT=self.advanced,
+        )
+        self.assertEqual(self.http_calls.read_text(), "")
+
+    def test_eligible_source_still_requires_same_commit_tooling(self) -> None:
+        self._git(self.source, "update-ref", "refs/heads/main", self.advanced)
+        self.assert_rejected(
+            "Release tooling and selected protected-main source are not the same commit",
+            WORKFLOW_RUN_COMMIT=self.advanced,
+        )
+
+    def test_candidate_outside_main_ancestry_is_not_benign_supersession(self) -> None:
+        self._git(self.checkout, "checkout", "-qb", "unrelated", self.candidate)
+        (self.checkout / "outside-main").write_text("unapproved\n", encoding="utf-8")
+        self._git(self.checkout, "add", ".")
+        self._git(self.checkout, "commit", "-qm", "outside main")
+        unrelated = self._git(self.checkout, "rev-parse", "HEAD")
+        self.assert_rejected(
+            "outside protected-main ancestry", WORKFLOW_RUN_COMMIT=unrelated,
+            WORKFLOW_DEFINITION_COMMIT=unrelated,
+        )
+        self.assertEqual(self.http_calls.read_text(), "")
+
+    def test_fetch_failure_is_not_benign_supersession(self) -> None:
+        self._git(self.checkout, "remote", "set-url", "origin", str(self.root / "missing-origin"))
+        self.assert_rejected("does not appear to be a git repository")
+
+    def test_http_failure_remains_a_failure(self) -> None:
+        self.assert_rejected("fixture HTTP/auth failure", ADMISSION_CURL_STATUS="22")
+        self.assertEqual(self.http_calls.read_text(), "curl\n")
+
+    def test_invalid_appcast_remains_a_failure(self) -> None:
+        self.appcast.write_text("not XML", encoding="utf-8")
+        self.assert_rejected("ERROR:")
+
+    def test_update_repository_policy_mismatch_remains_a_failure(self) -> None:
+        self.assert_rejected(
+            "does not match the reviewed identity policy", TIP_UPDATE_REPOSITORY="fixture/wrong",
+        )
+        self.assertEqual(self.http_calls.read_text(), "")
+
+    def test_every_downstream_job_requires_explicit_eligibility_and_setup_dependency(self) -> None:
+        # The external Actions scheduler cannot execute locally. This narrow
+        # structural guard complements the executable admission outcome tests.
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        jobs = re.split(r"^  ([A-Za-z_][\w-]*):\n", workflow.split("\njobs:\n", 1)[1], flags=re.M)
+        sections = dict(zip(jobs[1::2], jobs[2::2]))
+        setup_header = sections.pop("setup").split("    steps:\n", 1)[0]
+        self.assertIn("      eligible: ${{ steps.tip.outputs.eligible }}", setup_header)
+        self.assertEqual(set(sections), {"credential-preflight", "stage", "sign", "smoke-no-secrets", "publish"})
+        for name, section in sections.items():
+            with self.subTest(job=name):
+                header = section.split("    steps:\n", 1)[0]
+                self.assertIn("    if: needs.setup.outputs.eligible == 'true'\n", header)
+                needs = re.search(r"^    needs:([^\n]*)(\n(?:      - [^\n]+\n)*)", header, re.M)
+                self.assertIsNotNone(needs)
+                self.assertIn("setup", needs.group(0).split())
+                self.assertNotIn("continue-on-error:", section)
 
 
 if __name__ == "__main__":

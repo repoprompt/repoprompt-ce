@@ -67,7 +67,7 @@ final class PromptSuiteLoaderTests: XCTestCase {
 
     func testEveryCheckedInSuiteValidates() throws {
         for id in BuiltInPromptID.allCases {
-            let directory = try BuiltInPromptRegistry.shared.directory(for: id)
+            let directory = try AppDomainRuntimeComposition.shared.builtInPromptRegistry.directory(for: id)
             guard FileManager.default.fileExists(atPath: directory.appendingPathComponent(PromptSuite.fileName).path) else {
                 continue
             }

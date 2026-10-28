@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // MARK: - Agent Chat Item Types
 
@@ -144,6 +145,32 @@ public struct AgentCrossSessionAttribution: Codable, Sendable, Equatable, Hashab
 
 // MARK: - Agent Chat Item
 
+enum AgentToolArgumentPersistencePolicy {
+    static func sanitizedArgsJSON(toolName: String?, argsJSON: String?) -> String? {
+        guard let argsJSON else { return nil }
+        guard isOracleSendTool(toolName) else { return argsJSON }
+        return OracleAttachmentContract.redactingArgsJSON(argsJSON)
+    }
+
+    /// Whether the tool name resolves to an Oracle send, using the canonical MCP
+    /// name resolver plus a fail-closed suffix check for server prefixes the resolver does
+    /// not own.
+    private static func isOracleSendTool(_ toolName: String?) -> Bool {
+        guard let toolName else { return false }
+        let oracleTools = OracleAttachmentContract.oracleToolNames
+        if let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName), oracleTools.contains(canonical) {
+            return true
+        }
+        let lowered = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return oracleTools.contains { name in
+            lowered == name
+                || lowered.hasSuffix("__\(name)")
+                || lowered.hasSuffix(":\(name)")
+                || lowered.hasSuffix(".\(name)")
+        }
+    }
+}
+
 /// A single item in an agent chat transcript (user message, assistant message, tool call, etc.)
 public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public let id: UUID
@@ -153,8 +180,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// Human-readable text shown in bubbles (for user/assistant/system/error kinds)
     public var text: String
 
-    /// User-provided image attachments for this turn
-    public var attachments: [AgentImageAttachment]
+    public var attachments: [AgentFileAttachment]
 
     /// Tagged file attachments (@ mentioned files) for this user turn
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
@@ -163,11 +189,23 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     public var toolName: String? {
         didSet {
             toolName = AgentToolNamePolicy.accepted(toolName)
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
         }
     }
 
     public var toolInvocationID: UUID?
-    public var toolArgsJSON: String? // JSON string of tool arguments
+    public var toolArgsJSON: String? {
+        didSet {
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
+        }
+    }
+
     public var toolResultJSON: String? // Tool execution result JSON (for toolResult kind)
     public var toolIsError: Bool?
 
@@ -189,8 +227,15 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// True for local control-plane echoes that should display in chat but are not provider-backed user turns.
     public var isLocalControlPlaneEcho: Bool
 
-    /// Set only on user rows delivered across a user-granted oversight link.
+    /// Positive retained composer authorship; absent means other or unknown.
+    public var userInputOrigin: AgentUserInputOrigin?
+
+    /// Set on attributed user deliveries and fixed-text system control rows.
     public var crossSessionAttribution: AgentCrossSessionAttribution?
+
+    /// Exact provider payload of an attributed user turn. It is never shown as the bubble text;
+    /// ACP interrupted-turn replay uses it instead of impersonating the lane user's own words.
+    public var dispatchedProviderText: String?
 
     /// Set only on the `.system` lane-update row of an accepted automatic wake.
     ///
@@ -199,12 +244,19 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// their own transcript gets, and nothing else.
     public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
 
+    /// Typed recovery record for a `.system` provider-thread recovery notice.
+    ///
+    /// `text` remains the user-facing notice; this record carries the structured transition
+    /// (reason, outcome, thread IDs) so the summary contract can keep it inspectable after
+    /// retention drops the row.
+    public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
+
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
         kind: AgentChatItemKind,
         text: String,
-        attachments: [AgentImageAttachment] = [],
+        attachments: [AgentFileAttachment] = [],
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         toolName: String? = nil,
         toolInvocationID: UUID? = nil,
@@ -217,8 +269,11 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         isLocalControlPlaneEcho: Bool = false,
+        userInputOrigin: AgentUserInputOrigin? = nil,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
-        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil
+        dispatchedProviderText: String? = nil,
+        laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil,
+        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -228,7 +283,10 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.taggedFileAttachments = taggedFileAttachments
         self.toolName = AgentToolNamePolicy.accepted(toolName)
         self.toolInvocationID = toolInvocationID
-        self.toolArgsJSON = toolArgsJSON
+        self.toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: self.toolName,
+            argsJSON: toolArgsJSON
+        )
         self.toolResultJSON = toolResultJSON
         self.toolIsError = toolIsError
         self.reasoning = reasoning
@@ -237,8 +295,11 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
+        self.userInputOrigin = userInputOrigin
         self.crossSessionAttribution = crossSessionAttribution
+        self.dispatchedProviderText = dispatchedProviderText
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
+        self.recoveryDiagnostic = recoveryDiagnostic
     }
 
     public var hasDisplayableAssistantBody: Bool {
@@ -252,8 +313,11 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case id, timestamp, kind, text, attachments, taggedFileAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, isLocalControlPlaneEcho
+        case userInputOrigin
         case crossSessionAttribution
+        case dispatchedProviderText
         case laneUpdateDisplayAttribution
+        case recoveryDiagnostic
     }
 
     public init(from decoder: Decoder) throws {
@@ -262,11 +326,14 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         timestamp = try c.decode(Date.self, forKey: .timestamp)
         kind = try c.decode(AgentChatItemKind.self, forKey: .kind)
         text = try c.decode(String.self, forKey: .text)
-        attachments = try c.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
+        attachments = try c.decodeIfPresent([AgentFileAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try c.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
         toolName = try AgentToolNamePolicy.accepted(c.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try c.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
-        toolArgsJSON = try c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        toolArgsJSON = try AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: toolName,
+            argsJSON: c.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        )
         toolResultJSON = try c.decodeIfPresent(String.self, forKey: .toolResultJSON)
         toolIsError = try c.decodeIfPresent(Bool.self, forKey: .toolIsError)
         reasoning = try c.decodeIfPresent(String.self, forKey: .reasoning)
@@ -275,22 +342,28 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        userInputOrigin = AgentUserInputOrigin(rawValue: (try? c.decode(String.self, forKey: .userInputOrigin)) ?? "")
         crossSessionAttribution = try c.decodeIfPresent(
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution
         )
+        dispatchedProviderText = try c.decodeIfPresent(String.self, forKey: .dispatchedProviderText)
         // Lossy on purpose: a malformed local-display blob is dropped, never propagated as a decode
         // failure that would take the whole transcript row with it.
         laneUpdateDisplayAttribution = try c.decodeIfPresent(
             AgentLaneUpdateDisplayAttribution.self,
             forKey: .laneUpdateDisplayAttribution
         )?.validated
+        recoveryDiagnostic = try c.decodeIfPresent(
+            AgentTranscriptRecoveryDiagnostic.self,
+            forKey: .recoveryDiagnostic
+        )
     }
 
     // MARK: - Factory Methods
 
-    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, crossSessionAttribution: AgentCrossSessionAttribution? = nil) -> AgentChatItem {
-        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, crossSessionAttribution: crossSessionAttribution)
+    public static func user(_ text: String, attachments: [AgentFileAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false, userInputOrigin: AgentUserInputOrigin? = nil, crossSessionAttribution: AgentCrossSessionAttribution? = nil, dispatchedProviderText: String? = nil) -> AgentChatItem {
+        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho, userInputOrigin: userInputOrigin, crossSessionAttribution: crossSessionAttribution, dispatchedProviderText: dispatchedProviderText)
     }
 
     public static func assistant(_ text: String, reasoning: String? = nil, sequenceIndex: Int = 0, isStreaming: Bool = false) -> AgentChatItem {
@@ -317,8 +390,20 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         AgentChatItem(kind: .toolResult, text: resultJSON, toolName: name, toolInvocationID: invocationID, toolArgsJSON: argsJSON, toolResultJSON: resultJSON, toolIsError: isError, sequenceIndex: sequenceIndex)
     }
 
-    public static func system(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {
-        AgentChatItem(kind: .system, text: text, sequenceIndex: sequenceIndex)
+    public static func system(
+        _ text: String,
+        sequenceIndex: Int = 0,
+        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil
+    ) -> AgentChatItem {
+        var item = AgentChatItem(kind: .system, text: text, sequenceIndex: sequenceIndex)
+        // The row is the identity authority: the diagnostic is re-keyed to it so any later
+        // summary extraction can rebuild the same row ID in compacted projections.
+        item.recoveryDiagnostic = recoveryDiagnostic.map { diagnostic in
+            var aligned = diagnostic
+            aligned.align(to: item.id, timestamp: item.timestamp, sequenceIndex: item.sequenceIndex)
+            return aligned
+        }
+        return item
     }
 
     /// The visible provenance row for one accepted automatic lane-update turn.
@@ -353,6 +438,106 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         )
     }
 
+    /// Fixed provider-replay text of an overseer compaction request row. It names no session and
+    /// carries no observer-derived bytes, because system rows are replayed verbatim to providers.
+    public static let overseerCompactionRequestText =
+        "Context compaction was requested by an overseeing session."
+
+    /// Fixed text of the note appended when an ACP provider accepts `/compact` and ends the command
+    /// turn instantly with no output — the signature of a fire-and-forget slash command whose
+    /// compaction keeps running in the provider's background, where the session's next prompt
+    /// cancels it.
+    public static let acpBackgroundCompactionNoteText =
+        "The provider accepted the compaction; it may still be running in the background — sending "
+            + "a message to this session in the next ~60–90 s can cancel it. Overseer messages and "
+            + "automatic wakes are held until then."
+
+    /// The visible provenance row for one overseer-requested context compaction.
+    ///
+    /// `.system`, never `.user`: RepoPrompt issued the provider command, not the target's user, and no
+    /// `/compact` user message is fabricated. The observer's identity travels only in the typed
+    /// `crossSessionAttribution`, which is local display metadata and never enters provider replay or
+    /// the cross-session `read` projection (that classifies `.user` rows only). The row records the
+    /// *request*; whether the compaction started or finished is told by the run's own rows.
+    public static func overseerCompactionRequest(
+        attribution: AgentCrossSessionAttribution,
+        sequenceIndex: Int
+    ) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: overseerCompactionRequestText,
+            sequenceIndex: sequenceIndex,
+            crossSessionAttribution: attribution
+        )
+    }
+
+    /// Fixed replay-safe provenance. The continuation note remains only in the attempt record.
+    public static func selfCompactionRequest(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Context compaction was requested by this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe cancellation text. The retained recovery note is not interpolated here.
+    public static func selfCompactionCancelled(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Scheduled self-compaction was cancelled before it reached the provider.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe failure text; no note bytes or provider error are interpolated.
+    public static func selfCompactionCouldNotStart(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Self-compaction could not start. The continuation note was retained for recovery.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe text for unverified completion: an ACP settle that never saw a vouched
+    /// context drop, or a native command that outlived its deadline.
+    /// The session resumes when completion is confirmed or on the next ordinary send;
+    /// the continuation note is not interpolated here.
+    public static func selfCompactionCompletionUnverified(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "Compaction is not confirmed yet. The session resumes when it is, or with your next message.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Fixed replay-safe provenance; the provider input, not this row, contains the note.
+    public static func selfCompactionNoteRestored(sequenceIndex: Int) -> AgentChatItem {
+        AgentChatItem(
+            kind: .system,
+            text: "A continuation note from before compaction was restored to this session.",
+            sequenceIndex: sequenceIndex
+        )
+    }
+
+    /// Provider-replay-safe fact row: the overseer's name remains typed display metadata only.
+    public static let overseerRunStoppedText = "Run stopped by an overseeing session."
+
+    public static func overseerRunStopped(
+        stopID: UUID,
+        stoppedAt: Date,
+        attribution: AgentCrossSessionAttribution,
+        sequenceIndex: Int
+    ) -> AgentChatItem {
+        AgentChatItem(
+            id: stopID,
+            timestamp: stoppedAt,
+            kind: .system,
+            text: overseerRunStoppedText,
+            sequenceIndex: sequenceIndex,
+            crossSessionAttribution: attribution
+        )
+    }
+
     public static func error(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {
         AgentChatItem(kind: .error, text: text, sequenceIndex: sequenceIndex)
     }
@@ -382,10 +567,17 @@ extension AgentChatItem {
             workflow: workflow,
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution,
+            dispatchedProviderText: dispatchedProviderText,
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
         )
     }
+}
+
+/// A positive authorship mark on retained local rows, never an external MCP field.
+public enum AgentUserInputOrigin: String, Codable, Sendable, Equatable {
+    case localComposer
 }
 
 // MARK: - Persistence Model
@@ -396,16 +588,28 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public let timestamp: Date
     public var kind: AgentChatItemKind
     public var text: String
-    public var attachments: [AgentImageAttachment]
+    public var attachments: [AgentFileAttachment]
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
     public var toolName: String? {
         didSet {
             toolName = AgentToolNamePolicy.accepted(toolName)
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
         }
     }
 
     public var toolInvocationID: UUID?
-    public var toolArgsJSON: String?
+    public var toolArgsJSON: String? {
+        didSet {
+            toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+                toolName: toolName,
+                argsJSON: toolArgsJSON
+            )
+        }
+    }
+
     public var toolResultJSON: String?
     public var toolIsError: Bool?
     public var toolResultStatus: String?
@@ -414,10 +618,14 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool
+    public var userInputOrigin: AgentUserInputOrigin?
     public var crossSessionAttribution: AgentCrossSessionAttribution?
+    public var dispatchedProviderText: String?
     /// Local-display lane labels for an accepted lane-update row. Persisted with the session file
     /// and nowhere else; see `AgentLaneUpdateDisplayAttribution`.
     public var laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution?
+    /// Typed recovery record for a `.system` recovery notice row; bounded, payload-free.
+    public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
 
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {
         id = item.id
@@ -427,14 +635,21 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         taggedFileAttachments = item.taggedFileAttachments
         toolName = AgentToolNamePolicy.accepted(item.toolName)
         toolInvocationID = item.toolInvocationID
-        toolArgsJSON = sanitizeToolResults && (item.kind == .toolCall || item.kind == .toolResult) ? nil : item.toolArgsJSON
+        let copiedToolArgs = sanitizeToolResults && (item.kind == .toolCall || item.kind == .toolResult) ? nil : item.toolArgsJSON
+        toolArgsJSON = AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: toolName,
+            argsJSON: copiedToolArgs
+        )
         reasoning = item.reasoning
         sequenceIndex = item.sequenceIndex
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
+        userInputOrigin = item.userInputOrigin
         crossSessionAttribution = item.crossSessionAttribution
+        dispatchedProviderText = item.dispatchedProviderText
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
+        recoveryDiagnostic = item.recoveryDiagnostic
         toolResultStatus = nil
 
         if sanitizeToolResults, item.kind == .toolResult {
@@ -508,8 +723,11 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             workflow: workflow,
             codexGoalMode: codexGoalMode,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            userInputOrigin: userInputOrigin,
             crossSessionAttribution: crossSessionAttribution,
-            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution
+            dispatchedProviderText: dispatchedProviderText,
+            laneUpdateDisplayAttribution: laneUpdateDisplayAttribution,
+            recoveryDiagnostic: recoveryDiagnostic
         )
     }
 
@@ -556,8 +774,11 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case workflow
         case codexGoalMode
         case isLocalControlPlaneEcho
+        case userInputOrigin
         case crossSessionAttribution
+        case dispatchedProviderText
         case laneUpdateDisplayAttribution
+        case recoveryDiagnostic
     }
 
     public init(from decoder: Decoder) throws {
@@ -566,11 +787,14 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         timestamp = try container.decode(Date.self, forKey: .timestamp)
         kind = try container.decode(AgentChatItemKind.self, forKey: .kind)
         text = try container.decode(String.self, forKey: .text)
-        attachments = try container.decodeIfPresent([AgentImageAttachment].self, forKey: .attachments) ?? []
+        attachments = try container.decodeIfPresent([AgentFileAttachment].self, forKey: .attachments) ?? []
         taggedFileAttachments = try container.decodeIfPresent([AgentTaggedFileAttachment].self, forKey: .taggedFileAttachments) ?? []
         toolName = try AgentToolNamePolicy.accepted(container.decodeIfPresent(String.self, forKey: .toolName))
         toolInvocationID = try container.decodeIfPresent(UUID.self, forKey: .toolInvocationID)
-        toolArgsJSON = try container.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        toolArgsJSON = try AgentToolArgumentPersistencePolicy.sanitizedArgsJSON(
+            toolName: toolName,
+            argsJSON: container.decodeIfPresent(String.self, forKey: .toolArgsJSON)
+        )
         toolResultJSON = try container.decodeIfPresent(String.self, forKey: .toolResultJSON)
         toolIsError = try container.decodeIfPresent(Bool.self, forKey: .toolIsError)
         toolResultStatus = try container.decodeIfPresent(String.self, forKey: .toolResultStatus)
@@ -579,14 +803,20 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         workflow = try container.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try container.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        userInputOrigin = AgentUserInputOrigin(rawValue: (try? container.decode(String.self, forKey: .userInputOrigin)) ?? "")
         crossSessionAttribution = try container.decodeIfPresent(
             AgentCrossSessionAttribution.self,
             forKey: .crossSessionAttribution
         )
+        dispatchedProviderText = try container.decodeIfPresent(String.self, forKey: .dispatchedProviderText)
         laneUpdateDisplayAttribution = try container.decodeIfPresent(
             AgentLaneUpdateDisplayAttribution.self,
             forKey: .laneUpdateDisplayAttribution
         )?.validated
+        recoveryDiagnostic = try container.decodeIfPresent(
+            AgentTranscriptRecoveryDiagnostic.self,
+            forKey: .recoveryDiagnostic
+        )
     }
 }
 

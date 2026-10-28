@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 // MARK: - VCS Resolved Repo
 
@@ -59,10 +61,25 @@ public actor VCSService {
     /// Whether jj is available on this system (cached after first check).
     private var _jjAvailable: Bool?
 
+    /// Configuration for the process-wide shared worktree listing used by periodic
+    /// Git context refreshes. See `VCSService+SharedWorktreeListing.swift`.
+    let sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration
+
+    /// Entries, in-flight enumerations, and invalidation generation for the shared listing.
+    var sharedWorktreeListing = SharedWorktreeListingState()
+
     // MARK: - Initialization
 
     public init(jjRunner: JJCommandRunner = JJCommandRunner()) {
+        self.init(jjRunner: jjRunner, sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration())
+    }
+
+    init(
+        jjRunner: JJCommandRunner,
+        sharedWorktreeListingConfiguration: SharedWorktreeListingConfiguration
+    ) {
         self.jjRunner = jjRunner
+        self.sharedWorktreeListingConfiguration = sharedWorktreeListingConfiguration
     }
 
     // MARK: - Backend Access
@@ -142,6 +159,100 @@ public actor VCSService {
         return nil
     }
 
+    /// Resolve a repository for an MCP read at an explicitly authorized workspace root.
+    /// Do not reuse unrestricted discovery caches or run parent-searching command fallbacks.
+    func resolveRepoForRead(at root: URL, authorizedRoots: [URL]) async -> VCSResolvedRepo? {
+        let rootPaths = authorizedRoots.map(\.path)
+        guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(root.path, roots: rootPaths) else { return nil }
+        let jjDirectory = root.appendingPathComponent(".jj")
+        var jjIsDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: jjDirectory.path, isDirectory: &jjIsDirectory) {
+            guard jjIsDirectory.boolValue else { return nil }
+            guard GitRepoRootAuthorization.isPathWithinAuthorizedRoots(jjDirectory.path, roots: rootPaths),
+                  Self.isJJRepositoryAuthorized(jjDirectory, roots: rootPaths)
+            else { return nil }
+            if await isJJAvailable() {
+                backendKindCache[root.standardizedFileURL.path] = .jujutsu
+                return VCSResolvedRepo(rootURL: root, backendKind: .jujutsu)
+            }
+        }
+        guard let layout = GitRepositoryLayoutResolver.resolveForRead(atWorkTreeRoot: root, authorizedRoots: authorizedRoots) else { return nil }
+        gitLayoutCache[root.standardizedFileURL.path] = layout
+        backendKindCache[root.standardizedFileURL.path] = .git
+        return VCSResolvedRepo(rootURL: root, backendKind: .git)
+    }
+
+    private static func isJJRepositoryAuthorized(_ jjDirectory: URL, roots: [String]) -> Bool {
+        let repoEntry = jjDirectory.appendingPathComponent("repo")
+        guard isScopedJJMetadataPath(repoEntry, roots: roots) else { return false }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: repoEntry.path, isDirectory: &isDirectory) else { return false }
+        let repo: URL
+        if isDirectory.boolValue {
+            repo = repoEntry
+        } else {
+            // JJ resolves secondary-workspace pointers relative to .jj, without trimming bytes.
+            guard let path = readScopedMetadata(repoEntry, roots: roots) else { return false }
+            repo = path.hasPrefix("/") ? URL(fileURLWithPath: path) : jjDirectory.appendingPathComponent(path)
+        }
+        guard isScopedJJMetadataPath(repo, roots: roots),
+              FileManager.default.fileExists(atPath: repo.path, isDirectory: &isDirectory), isDirectory.boolValue
+        else { return false }
+        let store = repo.resolvingSymlinksInPath().appendingPathComponent("store")
+        guard isScopedJJMetadataPath(store, roots: roots),
+              FileManager.default.fileExists(atPath: store.path, isDirectory: &isDirectory), isDirectory.boolValue,
+              let backend = readScopedMetadata(store.appendingPathComponent("type"), roots: roots)
+        else { return false }
+        // These are JJ's built-in disk backends. Unknown backend layouts have no read grant.
+        if backend == "Simple" { return true }
+        guard backend == "git",
+              let path = readScopedMetadata(store.appendingPathComponent("git_target"), roots: roots)
+        else { return false }
+        let target = path.hasPrefix("/") ? URL(fileURLWithPath: path) : store.appendingPathComponent(path)
+        guard isScopedJJMetadataPath(target, roots: roots),
+              FileManager.default.fileExists(atPath: target.path, isDirectory: &isDirectory)
+        else { return false }
+        if !isDirectory.boolValue {
+            // A colocated linked checkout may use its reciprocally registered .git file.
+            return target.lastPathComponent == ".git"
+                && GitRepositoryLayoutResolver.resolveForRead(
+                    atWorkTreeRoot: target.deletingLastPathComponent(),
+                    authorizedRoots: roots.map { URL(fileURLWithPath: $0) }
+                ) != nil
+        }
+        let commonFile = target.appendingPathComponent("commondir")
+        if FileManager.default.fileExists(atPath: commonFile.path) {
+            guard let commonPath = readScopedMetadata(commonFile, roots: roots, trimLineEndings: true) else { return false }
+            let common = commonPath.hasPrefix("/") ? URL(fileURLWithPath: commonPath) : target.appendingPathComponent(commonPath)
+            return isScopedJJMetadataPath(common, roots: roots)
+        }
+        return true
+    }
+
+    private static func isScopedJJMetadataPath(_ url: URL, roots: [String]) -> Bool {
+        // JJ metadata contains literal paths. Do not trim path whitespace or expand
+        // '~' as a selector: either would authorize a different filesystem entry.
+        let candidate = url.resolvingSymlinksInPath().standardizedFileURL.path
+        return roots.contains { path in
+            let root = URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+            return candidate == root || candidate.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+        }
+    }
+
+    private static func readScopedMetadata(_ url: URL, roots: [String], trimLineEndings: Bool = false) -> String? {
+        guard isScopedJJMetadataPath(url, roots: roots),
+              let data = try? VCSMetadataFileReader.contents(of: url),
+              var text = String(data: data, encoding: .utf8)
+        else { return nil }
+        if trimLineEndings {
+            while text.last == "\r" || text.last == "\n" {
+                text.removeLast()
+            }
+        }
+        guard !text.isEmpty, !text.contains("\0"), !text.contains("\n"), !text.contains("\r") else { return nil }
+        return text
+    }
+
     /// Get the backend for a known repository root.
     /// Use this when you already know the repo root from a previous resolve call.
     ///
@@ -170,11 +281,26 @@ public actor VCSService {
         resolvedRepoCache.removeAll()
         backendKindCache.removeAll()
         gitLayoutCache.removeAll()
+        invalidateSharedWorktreeListings()
+    }
+
+    /// Drop the cached resolution of one repository root only (no shared-listing invalidation),
+    /// e.g. when its worktree listing shows the root now belongs to a different repository.
+    func dropCachedResolution(forRepoRoot url: URL) {
+        let path = url.standardizedFileURL.path
+        resolvedRepoCache.removeValue(forKey: path)
+        backendKindCache.removeValue(forKey: path)
+        gitLayoutCache.removeValue(forKey: path)
+        sharedWorktreeListing.keyByRootPath.removeValue(forKey: path)
     }
 
     /// Remove a specific path from the cache.
     /// Also invalidates the resolved root if different from the input path.
+    ///
+    /// Every RepoPrompt operation that changes worktree-list data (worktree create, branch
+    /// switch, worktree merge) calls this, so it also drops every shared worktree listing.
     public func invalidateCache(for url: URL) {
+        invalidateSharedWorktreeListings()
         let path = url.standardizedFileURL.path
 
         // Get the resolved root path before removing (if cached)
@@ -409,7 +535,14 @@ extension VCSService {
 
     func switchGitBranch(_ request: GitBranchSwitchRequest, at repoURL: URL) async throws -> GitBranchSwitchResult {
         let resolved = try await requireGitBranchSwitchRepo(repoURL, operation: "branch_switch")
-        let result = try await gitBackend().switchGitBranch(request, at: resolved.rootURL)
+        let result: GitBranchSwitchResult
+        do {
+            result = try await gitBackend().switchGitBranch(request, at: resolved.rootURL)
+        } catch {
+            // The checkout may have happened before a later read threw.
+            invalidateCache(for: resolved.rootURL)
+            throw error
+        }
         invalidateCache(for: resolved.rootURL)
         return result
     }
@@ -499,7 +632,7 @@ public extension VCSService {
     func gitWorktreeContext(for url: URL, resolved: VCSResolvedRepo) async -> GitWorktreeContextSummary? {
         guard resolved.backendKind == .git else { return nil }
         do {
-            let worktrees = try await listGitWorktrees(for: resolved)
+            let worktrees = try await sharedGitWorktreeListing(for: resolved)
             return await gitWorktreeContext(for: url, resolved: resolved, worktrees: worktrees)
         } catch {
             return await gitWorktreeContext(for: url, resolved: resolved, worktrees: nil)
@@ -600,7 +733,8 @@ public extension VCSService {
     internal func createGitWorktreeWithResult(
         request: GitWorktreeCreateRequest,
         at repoURL: URL,
-        initializationContext: GitWorktreeInitializationContext? = nil
+        initializationContext: GitWorktreeInitializationContext? = nil,
+        beforeCommit: (@Sendable () async throws -> Void)? = nil
     ) async throws -> GitWorktreeCreateResult {
         let resolved = await resolveRepo(from: repoURL)
         guard let resolved else {
@@ -610,11 +744,20 @@ public extension VCSService {
             throw VCSError.unsupportedOperation(operation: "create_worktree", backend: resolved.backendKind)
         }
 
-        let result = try await gitBackend().createWorktreeWithResult(
-            request: request,
-            at: resolved.rootURL,
-            initializationContext: initializationContext
-        )
+        let result: GitWorktreeCreateResult
+        do {
+            result = try await gitBackend().createWorktreeWithResult(
+                request: request,
+                at: resolved.rootURL,
+                initializationContext: initializationContext,
+                beforeCommit: beforeCommit
+            )
+        } catch {
+            // `git worktree add` may have succeeded before a later step threw.
+            invalidateCache(for: resolved.rootURL)
+            invalidateCache(for: request.path)
+            throw error
+        }
         invalidateCache(for: resolved.rootURL)
         invalidateCache(for: request.path)
         return result

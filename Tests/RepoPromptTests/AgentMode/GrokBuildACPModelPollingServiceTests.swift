@@ -13,6 +13,81 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         super.tearDown()
     }
 
+    func testControllerDiscoveryReusesVerifiedSessionAcrossWorkspacesInNeutralDirectory() async throws {
+        let agentModeProvider = try await ACPAgentProviderFactory.makeProvider(
+            for: .grokBuild, modelString: nil, grokAPIKeyProvider: { nil }
+        )
+        let agentModeEnvironment = try XCTUnwrap(agentModeProvider as? GrokBuildACPAgentProvider)
+            .test_config.backgroundFeatureEnvironment
+        let contextBuilderEnvironment = try XCTUnwrap(
+            AgentRuntimeProviderService.shared.makeProvider(for: .grokBuild) as? GrokBuildACPHeadlessAgentProvider
+        ).test_config.backgroundFeatureEnvironment
+        let managedEnvironment = [
+            "GROK_MEMORY": "0", "GROK_SUBAGENTS": "0", "GROK_WORKFLOWS": "0", "GROK_AUTO_WAKE": "0"
+        ]
+        let neutralPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptGrokBuildACPDiscovery", isDirectory: true)
+            .standardizedFileURL.path
+        let fixtureDirectory = try makeTestDirectory()
+        let scriptURL = try AgentSessionLinkACPServerScript.write(to: fixtureDirectory)
+        let fixtureProvider = AgentSessionLinkCapturingACPProvider(
+            providerID: .grokBuild, commandPath: scriptURL.path, environment: ["ACP_LOAD": "1"]
+        )
+        let initialRequest = ACPRunRequest(
+            agentKind: .grokBuild,
+            modelString: nil,
+            workspacePath: neutralPath,
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        // Keep the first real controller observable after discovery shuts down its process.
+        let firstController = try ACPAgentSessionController(
+            provider: fixtureProvider, runRequest: initialRequest, allowsProviderProcessLaunchForTesting: true
+        )
+        let resumeIDs = LifecycleRecorder()
+        let client = GrokBuildACPControllerModelDiscoveryClient(
+            providerFactory: { config in
+                XCTAssertFalse(config.includeRepoPromptMCPServer)
+                XCTAssertNil(config.apiKey)
+                for (usage, environment, expected) in [
+                    ("Agent Mode", agentModeEnvironment, managedEnvironment),
+                    ("model polling", config.backgroundFeatureEnvironment, managedEnvironment),
+                    ("Context Builder", contextBuilderEnvironment, managedEnvironment)
+                ] {
+                    XCTAssertEqual(environment, expected, "Background-feature policy for \(usage)")
+                }
+                return fixtureProvider
+            },
+            controllerFactory: { provider, request in
+                XCTAssertEqual(request.workspacePath, neutralPath)
+                resumeIDs.record(request.resumeSessionID ?? "<new>")
+                if resumeIDs.events.count == 1 {
+                    return firstController
+                }
+                return try ACPAgentSessionController(
+                    provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true
+                )
+            }
+        )
+        let service = GrokBuildACPModelPollingService(client: client)
+        do {
+            _ = try await service.discoverOnce(workspacePath: "/unused/grok-project-a")
+            let identity = await firstController.currentProviderSessionIdentity()
+            XCTAssertEqual(identity.loadSessionIDConfidence, .verified)
+            let verifiedID = try XCTUnwrap(identity.loadSessionID)
+            XCTAssertFalse(verifiedID.isEmpty)
+            XCTAssertEqual(resumeIDs.events, ["<new>"])
+
+            _ = try await service.discoverOnce(workspacePath: "/unused/grok-project-b")
+            XCTAssertEqual(resumeIDs.events, ["<new>", verifiedID])
+        } catch {
+            await service.shutdown()
+            throw error
+        }
+        await service.shutdown()
+    }
+
     private struct StubDiscoveryClient: GrokBuildACPModelDiscoveryClient {
         let models: ACPDiscoveredSessionModels?
         let failure: (any Error)?
@@ -64,11 +139,32 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
             client: StubDiscoveryClient(models: nil, failure: AIProviderError.invalidConfiguration(detail: "boom"))
         )
         let refreshed = await failing.refreshNow(workspacePath: nil)
-        XCTAssertFalse(refreshed)
+        XCTAssertEqual(refreshed, .failed)
         let latest = await failing.latestSnapshot()
         XCTAssertEqual(latest?.models.options.map(\.rawValue), ["grok-4.6"])
         XCTAssertEqual(latest?.isLiveDiscovery, false)
         await failing.shutdown()
+    }
+
+    func testRefreshOutcomesDistinguishUpdatedUnchangedAndNoModels() async {
+        let service = GrokBuildACPModelPollingService(
+            client: StubDiscoveryClient(models: makeModels(["grok-4.6"]), failure: nil)
+        )
+        let first = await service.refreshNow(workspacePath: nil)
+        let second = await service.refreshNow(workspacePath: nil)
+        XCTAssertEqual(first, .updated)
+        XCTAssertEqual(second, .unchanged)
+        await service.shutdown()
+
+        let empty = GrokBuildACPModelPollingService(
+            client: StubDiscoveryClient(
+                models: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil),
+                failure: nil
+            )
+        )
+        let emptyOutcome = await empty.refreshNow(workspacePath: nil)
+        XCTAssertEqual(emptyOutcome, .noModelsAdvertised)
+        await empty.shutdown()
     }
 
     func testEmptyDiscoveryDoesNotPersistFakeDefaultSnapshot() async throws {
@@ -107,5 +203,56 @@ final class GrokBuildAgentToolPreferencesTests: XCTestCase {
         XCTAssertEqual(document.permissionLevel(), .fullAccess)
         let failClosed = SecureGrokBuildPermissionDocument.failClosedDocument()
         XCTAssertEqual(failClosed.permissionLevel(), .managedDefault)
+    }
+}
+
+final class GrokBuildPermissionDisclosureTests: XCTestCase {
+    func testDisclosureFollowsEffectivePermissionLevel() throws {
+        let suiteName = "GrokBuildPermissionDisclosureTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let defaultDetail = GrokBuildAgentToolPreferences.PermissionLevel.managedDefault.detailText
+        for fragment in [
+            "defaultMode",
+            "can allow",
+            "without asking RepoPrompt",
+            "many requests (`bypassPermissions`)",
+            "edit tools such as `write` (`acceptEdits`)"
+        ] {
+            XCTAssertTrue(defaultDetail.contains(fragment), "Default detail must disclose \(fragment)")
+        }
+
+        let cases: [(
+            name: String,
+            profile: AgentProviderPermissionProfile,
+            storedLevel: GrokBuildAgentToolPreferences.PermissionLevel,
+            expectsDefault: Bool
+        )] = [
+            ("Direct Default", .userConfigured, .managedDefault, true),
+            ("Safe Managed with stored Full Access", .mcpSafeDefaults, .fullAccess, true),
+            ("Direct Full Access", .userConfigured, .fullAccess, false)
+        ]
+        let builder = AgentPermissionCapabilitySummaryBuilder(defaults: defaults)
+        let availability = AgentModelCatalog.AvailabilityContext(grokBuildAvailable: true)
+        for testCase in cases {
+            GrokBuildAgentToolPreferences.setPermissionLevel(testCase.storedLevel, defaults: defaults)
+            let summary = builder.summary(for: .grokBuild, profile: testCase.profile, availability: availability)
+            if testCase.expectsDefault {
+                XCTAssertEqual(
+                    summary.fileMutation,
+                    "Always-approve launch: off; Grok's rules can still allow requests",
+                    testCase.name
+                )
+                XCTAssertTrue(summary.warnings.isEmpty, testCase.name)
+            } else {
+                XCTAssertEqual(summary.fileMutation, "Always-approve launch: on", testCase.name)
+                XCTAssertEqual(
+                    summary.warnings,
+                    ["Grok Build launches with `--always-approve` — its tools run without per-request confirmation."],
+                    testCase.name
+                )
+            }
+        }
     }
 }

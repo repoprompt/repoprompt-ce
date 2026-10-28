@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptVCS
 import XCTest
 
 final class GitBlobIdentityServiceTests: XCTestCase {

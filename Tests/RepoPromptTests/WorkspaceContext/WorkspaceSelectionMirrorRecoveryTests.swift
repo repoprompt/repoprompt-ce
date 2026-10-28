@@ -263,7 +263,7 @@ final class WorkspaceSelectionMirrorRecoveryTests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) async {
-        XCTFail("Bounded yield guard expired while waiting for \(description)", file: file, line: line)
+        XCTFail("Hang guard expired after \(selectionMirrorRecoveryHangGuardTimeout) while waiting for \(description)", file: file, line: line)
         for gate in gates {
             await gate.release()
         }
@@ -271,7 +271,8 @@ final class WorkspaceSelectionMirrorRecoveryTests: XCTestCase {
     }
 
     private func waitUntilMirrorWorkIsReclaimed(_ coordinator: WorkspaceSelectionCoordinator) async -> Bool {
-        for _ in 0 ..< selectionMirrorRecoveryHangGuardYieldLimit {
+        let deadline = ContinuousClock.now.advanced(by: selectionMirrorRecoveryHangGuardTimeout)
+        while ContinuousClock.now < deadline {
             let snapshot = coordinator.selectionMirrorDebugSnapshot()
             if snapshot.activePhysicalWorkerCount == 0, snapshot.pendingDemandCount == 0 {
                 return true
@@ -283,7 +284,8 @@ final class WorkspaceSelectionMirrorRecoveryTests: XCTestCase {
 }
 
 /// Ordering remains continuation-driven; this bound only fails open when a regression would otherwise hang the suite.
-private let selectionMirrorRecoveryHangGuardYieldLimit = 10000
+/// It is wall-clock time, not a `Task.yield()` count, because runner load can delay the awaited main-actor workers (#1100).
+private let selectionMirrorRecoveryHangGuardTimeout: Duration = .seconds(30)
 
 private actor SelectionMirrorRecoveryGate {
     private struct EnteredWaiter {
@@ -317,9 +319,10 @@ private actor SelectionMirrorRecoveryGate {
                 }
                 enteredWaiters.append(EnteredWaiter(id: id, continuation: continuation))
                 enteredWaitGuards[id] = Task { [weak self] in
-                    for _ in 0 ..< selectionMirrorRecoveryHangGuardYieldLimit {
-                        guard !Task.isCancelled else { return }
-                        await Task.yield()
+                    do {
+                        try await Task.sleep(for: selectionMirrorRecoveryHangGuardTimeout)
+                    } catch {
+                        return
                     }
                     await self?.expireEnteredWaiter(id: id)
                 }
@@ -438,9 +441,10 @@ private actor ManualSelectionMirrorDeadline {
                     return
                 }
                 let waitGuard = Task { [weak self] in
-                    for _ in 0 ..< selectionMirrorRecoveryHangGuardYieldLimit {
-                        guard !Task.isCancelled else { return }
-                        await Task.yield()
+                    do {
+                        try await Task.sleep(for: selectionMirrorRecoveryHangGuardTimeout)
+                    } catch {
+                        return
                     }
                     await self?.expireWaiter(id: id, counter: kind)
                 }
@@ -525,9 +529,10 @@ private final class SelectionMirrorRecoverySignal {
                 }
                 waiters.append(Waiter(id: id, count: target, continuation: continuation))
                 waitGuards[id] = Task { @MainActor [weak self] in
-                    for _ in 0 ..< selectionMirrorRecoveryHangGuardYieldLimit {
-                        guard !Task.isCancelled else { return }
-                        await Task.yield()
+                    do {
+                        try await Task.sleep(for: selectionMirrorRecoveryHangGuardTimeout)
+                    } catch {
+                        return
                     }
                     self?.expireWaiter(id: id)
                 }
@@ -548,6 +553,16 @@ private final class SelectionMirrorRecoverySignal {
 @MainActor
 private final class SelectionMirrorRecoveryHost: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
+    var activeSelectionWorkspace: WorkspaceSelectionWorkspace? {
+        activeWorkspace.map { workspace in
+            WorkspaceSelectionWorkspace(
+                id: workspace.id,
+                activeComposeTabID: workspace.activeComposeTabID,
+                firstComposeTabID: workspace.composeTabs.first?.id
+            )
+        }
+    }
+
     private(set) var selectionMirrorContextRevision: UInt64 = 0
     var gatesByAttempt: [Int: SelectionMirrorRecoveryGate] = [:]
     let completed = SelectionMirrorRecoverySignal()
@@ -585,6 +600,21 @@ private final class SelectionMirrorRecoveryHost: WorkspaceSelectionHost {
     func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState? {
         guard activeWorkspace?.id == identity.workspaceID else { return nil }
         return composeTab(with: identity.tabID)
+    }
+
+    func selectionTab(for identity: WorkspaceSelectionIdentity) -> WorkspaceSelectionTab? {
+        composeTab(for: identity).map { WorkspaceSelectionTab(id: $0.id, selection: $0.selection) }
+    }
+
+    func storeSelection(
+        _ selection: StoredSelection,
+        modifiedAt: Date,
+        for identity: WorkspaceSelectionIdentity
+    ) -> Bool {
+        guard var tab = composeTab(for: identity) else { return false }
+        tab.selection = selection
+        tab.lastModified = modifiedAt
+        return updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID)
     }
 
     func publishActiveComposeTabSnapshot(commitToMemory _: Bool, touchModified _: Bool) {}

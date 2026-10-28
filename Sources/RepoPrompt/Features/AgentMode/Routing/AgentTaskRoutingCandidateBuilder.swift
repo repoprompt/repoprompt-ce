@@ -1,9 +1,7 @@
 import Foundation
 
-/// Builds router-owned model and effort choices from live provider catalogs.
-///
-/// Agent Models assignments are included as reference signals. They never restrict the candidates
-/// or preselect a target because Router mode owns the final model-and-effort decision.
+/// Builds router-owned choices from one provider-authoritative metadata snapshot.
+/// Profile prose is advisory and never admits a model or effort.
 @MainActor
 struct AgentTaskRoutingCandidateBuilder {
     struct Candidate: Equatable {
@@ -11,15 +9,35 @@ struct AgentTaskRoutingCandidateBuilder {
         let utilityTier: String
         let target: AgentRoutingExecutableTarget
         let descriptor: AgentTaskRoutingCandidateDescriptor
+        let snapshotScope: RoutingExecutionMetadataSnapshot.Scope?
+        let profileIdentity: String?
+        var usagePeerClass: String?
+        var usageModelAliases: Set<String> = []
+
+        init(
+            opaqueKey: String,
+            utilityTier: String,
+            target: AgentRoutingExecutableTarget,
+            descriptor: AgentTaskRoutingCandidateDescriptor,
+            snapshotScope: RoutingExecutionMetadataSnapshot.Scope? = nil,
+            profileIdentity: String? = nil,
+            usagePeerClass: String? = nil,
+            usageModelAliases: Set<String> = []
+        ) {
+            self.opaqueKey = opaqueKey
+            self.utilityTier = utilityTier
+            self.target = target
+            self.descriptor = descriptor
+            self.snapshotScope = snapshotScope
+            self.profileIdentity = profileIdentity
+            self.usagePeerClass = usagePeerClass
+            self.usageModelAliases = usageModelAliases
+        }
     }
 
-    enum BuildError: Error, Equatable { case noAvailableTargets }
-
-    struct RoleDefaultReference: Equatable {
-        let roleLabel: String
-        let provider: AgentProviderKind
-        let modelRaw: String
-        let isUserOverride: Bool
+    enum BuildError: Error, Equatable {
+        case noAvailableTargets
+        case insufficientCapacity
     }
 
     private struct ModelDefinition {
@@ -28,6 +46,17 @@ struct AgentTaskRoutingCandidateBuilder {
         let modelClass: String
         let preferredCodexFamily: String?
         let rubric: String
+
+        /// Explicit substitution constraints, not a claim of identical model capabilities.
+        var usagePeerClass: String? {
+            switch modelClass {
+            case "gpt-luna", "claude-haiku": "light"
+            case "gpt-5.6-terra", "claude-sonnet": "balanced"
+            case "gpt-sol", "claude-opus": "strong"
+            case "gpt-6-astra", "claude-fable": "frontier"
+            default: nil
+            }
+        }
 
         init(
             provider: AgentProviderKind,
@@ -44,212 +73,439 @@ struct AgentTaskRoutingCandidateBuilder {
         }
     }
 
+    struct ModelFamilyAvailability: Equatable {
+        let id: String
+        let displayName: String
+        let provider: AgentProviderKind
+        let model: RoutingExecutionModelMetadata?
+        let unavailableReason: String?
+
+        var isAvailable: Bool {
+            model != nil
+        }
+    }
+
+    struct RoleDefaultReference: Equatable {
+        let roleLabel: String
+        let provider: AgentProviderKind
+        let modelRaw: String
+        let isUserOverride: Bool
+    }
+
     let opaqueKey: () -> String
-    private let modelOptions: @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption]
+    private let metadata: RoutingExecutionMetadataAdapter
+    private let profiles: RoutingModelProfileResolver
+    private let profileSnapshot: RoutingModelProfileSnapshot
 
     init(
         opaqueKey: @escaping () -> String = { UUID().uuidString.lowercased() },
+        profileResolver: RoutingModelProfileResolver? = nil,
+        profileSnapshot: RoutingModelProfileSnapshot? = nil,
         modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
             AgentModelCatalog.options(for: $0, availability: $1)
         }
     ) {
         self.opaqueKey = opaqueKey
-        self.modelOptions = modelOptions
+        metadata = RoutingExecutionMetadataAdapter(modelOptions: modelOptions)
+        let snapshot = profileSnapshot ?? RoutingModelProfileSnapshot.bundled
+        self.profileSnapshot = snapshot
+        profiles = profileResolver ?? snapshot.resolver
+    }
+
+    func capture(
+        allowedProviders: Set<AgentProviderKind>,
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general
+    ) -> RoutingExecutionMetadataSnapshot {
+        metadata.capture(allowedProviders: allowedProviders, availability: availability, surface: surface)
     }
 
     func build(
         allowedProviders: Set<AgentProviderKind>,
         availability: AgentModelCatalog.AvailabilityContext,
         surface: AgentModelCatalog.AgentSelectionSurface = .general,
-        roleDefaults: [RoleDefaultReference] = []
+        roleDefaults: [RoleDefaultReference] = [],
+        maximumChoices: Int = FiniteChoiceDecisionValidator.maximumChoices
     ) throws -> [Candidate] {
-        let definitions = Self.modelDefinitions.filter {
-            allowedProviders.contains($0.provider)
-                && surface.allows($0.provider)
-                && AgentModelCatalog.isAgentAvailable($0.provider, availability: availability)
+        try build(
+            snapshot: capture(allowedProviders: allowedProviders, availability: availability, surface: surface),
+            roleDefaults: roleDefaults,
+            maximumChoices: maximumChoices
+        )
+    }
+
+    func build(
+        snapshot: RoutingExecutionMetadataSnapshot,
+        roleDefaults: [RoleDefaultReference] = [],
+        maximumChoices: Int = FiniteChoiceDecisionValidator.maximumChoices,
+        usagePeerClasses: Set<String>? = nil
+    ) throws -> [Candidate] {
+        // Class filtering happens before capacity truncation so excluded tiers never consume slots.
+        let allSelected = Self.executableModels(in: snapshot).filter { definition, _ in
+            usagePeerClasses.map { classes in definition.usagePeerClass.map(classes.contains) == true } ?? true
         }
-        var seenTargets: Set<AgentRoutingExecutableTarget> = []
-        let candidates = definitions.compactMap { definition -> Candidate? in
-            guard let option = resolveModelOption(definition, availability: availability),
-                  let baseModelRaw = Self.baseModelRaw(option.rawValue, provider: definition.provider)
-            else { return nil }
-            let target = AgentRoutingExecutableTarget(
-                agentRaw: definition.provider.rawValue,
-                modelRaw: baseModelRaw,
-                reasoningEffortRaw: nil,
-                modelParameters: []
-            )
-            guard seenTargets.insert(target).inserted else { return nil }
+        guard !allSelected.isEmpty else { throw BuildError.noAvailableTargets }
+        let capacity = min(maximumChoices, FiniteChoiceDecisionValidator.maximumChoices)
+        guard capacity > 0, allSelected.count == 1 || capacity >= 2 else {
+            throw BuildError.insufficientCapacity
+        }
+        let selected = Array(allSelected.prefix(capacity))
+        return selected.map { definition, model in
+            let target = model.baseTarget
+            let profile = profiles.resolve(model, catalogRevision: snapshot.scope.catalogRevision)
             let key = opaqueKey()
-            let utilityTier = definition.preferredCodexFamily == nil ? definition.modelClass : baseModelRaw
-            let matchingRoleDefaults = roleDefaults.filter {
-                $0.provider == definition.provider
-                    && Self.baseModelRaw($0.modelRaw, provider: $0.provider)?
-                    .caseInsensitiveCompare(baseModelRaw) == .orderedSame
+            let tier = definition.preferredCodexFamily == nil ? definition.modelClass : model.baseModelRaw
+            let references = roleDefaults.filter { reference in
+                reference.provider == model.provider
+                    && model.advertisedOptionRawValues.contains {
+                        $0 == reference.modelRaw
+                    }
             }
             return Candidate(
                 opaqueKey: key,
-                utilityTier: utilityTier,
+                utilityTier: tier,
                 target: target,
-                descriptor: AgentTaskRoutingCandidateDescriptor(
+                descriptor: .init(
                     opaqueKey: key,
-                    roleLabels: [utilityTier],
-                    targetDescription: Self.modelDescription(
-                        target,
-                        displayName: AgentModelCatalog.displayName(
-                            for: baseModelRaw,
-                            agentKind: definition.provider,
-                            availability: availability
-                        ),
-                        roleDefaults: matchingRoleDefaults
-                    ),
-                    rubricVersion: AgentTaskRoutingModelProfileCatalog.rubricVersion,
+                    roleLabels: [tier],
+                    targetDescription: Self.modelDescription(model, profile: profile, snapshotDate: profiles.snapshotDate, roleDefaults: references),
+                    rubricVersion: profiles.rubricVersion,
                     rubric: definition.rubric
-                )
+                ),
+                snapshotScope: snapshot.scope,
+                profileIdentity: profileSnapshot.identity,
+                usagePeerClass: definition.usagePeerClass,
+                usageModelAliases: Set([model.baseModelRaw] + (model.provider == .claudeCode ? definition.baseModelAliases.filter { ["opus", "sonnet", "haiku", "fable"].contains($0) } : []))
             )
         }
-        guard !candidates.isEmpty else { throw BuildError.noAvailableTargets }
-        return candidates
     }
 
     func buildEfforts(
         for model: Candidate,
-        availability: AgentModelCatalog.AvailabilityContext
+        availability: AgentModelCatalog.AvailabilityContext,
+        allowPaidFast: Bool = false,
+        maximumChoices: Int = FiniteChoiceDecisionValidator.maximumChoices
     ) throws -> [Candidate] {
-        guard let provider = AgentProviderKind(rawValue: model.target.agentRaw) else {
-            throw BuildError.noAvailableTargets
-        }
-        let selectedBase = Self.baseModelRaw(model.target.modelRaw, provider: provider)?.lowercased()
-        guard let selectedBase else { throw BuildError.noAvailableTargets }
+        guard let scope = model.snapshotScope else { throw BuildError.noAvailableTargets }
+        return try buildEfforts(
+            for: model,
+            snapshot: capture(
+                allowedProviders: scope.allowedProviders,
+                availability: availability,
+                surface: scope.surface
+            ),
+            allowPaidFast: allowPaidFast,
+            maximumChoices: maximumChoices
+        )
+    }
 
-        let options = modelOptions(provider, availability)
-        var targets: [(AgentRoutingExecutableTarget, String)] = []
-        for option in options where !option.isPlaceholderDefault {
-            guard Self.baseModelRaw(option.rawValue, provider: provider)?.lowercased() == selectedBase else { continue }
-            let target = Self.executableTarget(option.rawValue, provider: provider)
-            targets.append((target, option.displayName))
-            if provider == .codexExec,
-               target.reasoningEffortRaw == nil,
-               !option.supportedReasoningEfforts.isEmpty
-            {
-                for effort in option.supportedReasoningEfforts {
-                    let raw = "\(model.target.modelRaw)-\(effort.rawValue)"
-                    targets.append((Self.executableTarget(raw, provider: provider), "\(option.displayName) \(effort.displayName)"))
-                }
-            }
-        }
-
+    func buildEfforts(
+        for model: Candidate,
+        snapshot: RoutingExecutionMetadataSnapshot,
+        allowPaidFast: Bool = false,
+        maximumChoices: Int = FiniteChoiceDecisionValidator.maximumChoices
+    ) throws -> [Candidate] {
+        guard model.snapshotScope == snapshot.scope,
+              model.profileIdentity == profileSnapshot.identity,
+              let selected = snapshot.model(for: model.target)
+        else { throw BuildError.noAvailableTargets }
+        // A Fast tier remains an exact provider-advertised target. Never synthesize it from
+        // a model name, and expose it only after the explicit paid-tier opt-in.
+        let fastVariants = allowPaidFast && selected.provider == .codexExec
+            ? snapshot.models.filter {
+                $0.provider == .codexExec && Self.isPaidFast($0.baseTarget)
+                    && CodexModelSpecifier(raw: $0.baseModelRaw).baseModel == selected.baseModelRaw
+            } : []
+        let baseTargets = [selected.baseTarget] + selected.efforts.compactMap(\.executableTarget)
         var seen: Set<AgentRoutingExecutableTarget> = []
-        let candidates = targets.compactMap { target, displayName -> Candidate? in
-            guard seen.insert(target).inserted else { return nil }
+        let ordinaryTargets = baseTargets.filter { !Self.isPaidFast($0) && seen.insert($0).inserted }
+        let capacity = min(maximumChoices, FiniteChoiceDecisionValidator.maximumChoices)
+        guard capacity > 0, ordinaryTargets.count <= capacity else { throw BuildError.insufficientCapacity }
+        let optionalFastTargets = allowPaidFast
+            ? baseTargets.filter(Self.isPaidFast)
+            + fastVariants.flatMap { [$0.baseTarget] + $0.efforts.compactMap(\.executableTarget) }
+            : []
+        let fastTargets = optionalFastTargets.filter { seen.insert($0).inserted }
+        let targets = ordinaryTargets + (ordinaryTargets.count + fastTargets.count <= capacity ? fastTargets : [])
+        let candidates = targets.map { target -> Candidate in
             let key = opaqueKey()
-            let effort = Self.effortRaw(target, provider: provider) ?? "provider-default"
+            let effort = target.reasoningEffortRaw
+                ?? selected.efforts.first(where: { $0.executableTarget == target })?.id.rawValue
+                ?? "provider-default"
             return Candidate(
                 opaqueKey: key,
                 utilityTier: effort,
                 target: target,
-                descriptor: AgentTaskRoutingCandidateDescriptor(
+                descriptor: .init(
                     opaqueKey: key,
                     roleLabels: ["effort:\(effort)"],
-                    targetDescription: "Already selected model: \(displayName). \(AgentTaskRoutingModelProfileCatalog.effortDescription(for: target))",
-                    rubricVersion: AgentTaskRoutingModelProfileCatalog.rubricVersion,
+                    targetDescription: "Already selected model: \(selected.displayName). \(profiles.effortDescription(raw: effort == "provider-default" ? nil : effort).value)",
+                    rubricVersion: profiles.rubricVersion,
                     rubric: "Choose this effort only if it supplies the reasoning depth the task needs. Prefer the lowest effort with a clear reliability margin; raise effort when ambiguity, review depth, risk, or long-horizon reasoning warrants it."
-                )
+                ),
+                snapshotScope: snapshot.scope,
+                profileIdentity: profileSnapshot.identity
             )
         }
         guard !candidates.isEmpty else { throw BuildError.noAvailableTargets }
         return candidates
     }
 
-    static func availableProviders(
+    func usageCandidates(
+        basedOn target: AgentRoutingExecutableTarget,
+        allowedProviders: Set<AgentProviderKind>,
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface
+    ) -> (selected: Candidate, candidates: [Candidate])? {
+        guard target.modelParameters.isEmpty, !Self.isPaidFast(target),
+              let provider = AgentProviderKind(rawValue: target.agentRaw),
+              let base = Self.baseModelRaw(target.modelRaw, provider: provider),
+              let models = try? build(allowedProviders: allowedProviders, availability: availability, surface: surface),
+              let definition = Self.modelDefinitions.first(where: { definition in
+                  definition.provider == provider && (definition.baseModelAliases.contains(base) || models.contains {
+                      $0.target.agentRaw == provider.rawValue && $0.target.modelRaw == base && $0.usagePeerClass == definition.usagePeerClass
+                  })
+              }), let peerClass = definition.usagePeerClass else { return nil }
+        let selectedKey = opaqueKey()
+        let selected = Candidate(
+            opaqueKey: selectedKey,
+            utilityTier: definition.modelClass,
+            target: target,
+            descriptor: .init(opaqueKey: selectedKey, roleLabels: [], targetDescription: "Local starting choice", rubricVersion: "local", rubric: ""),
+            snapshotScope: models.first?.snapshotScope,
+            profileIdentity: profileSnapshot.identity,
+            usagePeerClass: peerClass,
+            usageModelAliases: Set([base] + definition.baseModelAliases.filter { ["opus", "sonnet", "haiku", "fable"].contains($0) })
+        )
+        let effort = Self.effortRaw(target, provider: provider)
+        let peers = models.filter { $0.usagePeerClass == peerClass && $0.target.agentRaw != provider.rawValue }.compactMap { model -> Candidate? in
+            guard let effort else { return model }
+            guard let efforts = try? buildEfforts(for: model, availability: availability),
+                  let peerProvider = AgentProviderKind(rawValue: model.target.agentRaw),
+                  let match = efforts.first(where: { Self.effortRaw($0.target, provider: peerProvider) == effort }) else { return nil }
+            return Candidate(
+                opaqueKey: model.opaqueKey,
+                utilityTier: model.utilityTier,
+                target: match.target,
+                descriptor: model.descriptor,
+                snapshotScope: match.snapshotScope,
+                profileIdentity: match.profileIdentity,
+                usagePeerClass: model.usagePeerClass,
+                usageModelAliases: model.usageModelAliases
+            )
+        }
+        return (selected, [selected] + peers)
+    }
+
+    static func isPaidFast(_ target: AgentRoutingExecutableTarget) -> Bool {
+        (target.agentRaw == AgentProviderKind.codexExec.rawValue && CodexModelSpecifier(raw: target.modelRaw).serviceTier != nil)
+            || target.modelParameters.contains { $0.configID == "fast" && $0.valueRaw == "true" }
+    }
+
+    /// Capability floor for user-created primary sessions. Light and balanced classes (Luna, Haiku,
+    /// Terra, Sonnet) are never offered to the primary-session Model Router.
+    static let primarySessionUsagePeerClasses: Set<String> = ["strong", "frontier"]
+
+    private static func effortRaw(_ target: AgentRoutingExecutableTarget, provider: AgentProviderKind) -> String? {
+        switch provider {
+        case .codexExec: target.reasoningEffortRaw ?? CodexModelSpecifier(raw: target.modelRaw).reasoningEffort?.rawValue
+        case .claudeCode: target.reasoningEffortRaw ?? ClaudeModelSpecifier(raw: target.modelRaw).effortLevel?.rawValue
+        default: nil
+        }
+    }
+
+    func hasAvailableTarget(
+        allowedProviders: Set<AgentProviderKind>,
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general
+    ) -> Bool {
+        for provider in Self.curatedProviders where allowedProviders.contains(provider)
+            && surface.allows(provider)
+            && AgentModelCatalog.isAgentAvailable(provider, availability: availability)
+        {
+            let snapshot = capture(allowedProviders: [provider], availability: availability, surface: surface)
+            if !Self.executableModels(in: snapshot).isEmpty { return true }
+        }
+        return false
+    }
+
+    /// Saved scope intent narrows the executable frontier only while that provider is available.
+    static func providers(
+        for scope: AgentTaskRoutingScope,
+        configuration: AgentTaskRouterConfiguration,
         availability: AgentModelCatalog.AvailabilityContext,
         surface: AgentModelCatalog.AgentSelectionSurface = .general
     ) -> Set<AgentProviderKind> {
-        Set([AgentProviderKind.codexExec, .claudeCode].filter {
-            surface.allows($0) && AgentModelCatalog.isAgentAvailable($0, availability: availability)
+        let available = availableProviders(availability: availability, surface: surface)
+        let preferred = scope == .primarySession ? configuration.primaryProvider : configuration.subagentProvider
+        if let preferred, available.contains(preferred) { return [preferred] }
+        return available
+    }
+
+    static func availableProviders(
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general,
+        modelOptions: @escaping @MainActor (AgentProviderKind, AgentModelCatalog.AvailabilityContext) -> [AgentModelOption] = {
+            AgentModelCatalog.options(for: $0, availability: $1)
+        }
+    ) -> Set<AgentProviderKind> {
+        Set(curatedProviders.filter { provider in
+            guard surface.allows(provider), AgentModelCatalog.isAgentAvailable(provider, availability: availability) else {
+                return false
+            }
+            return !modelOptions(provider, availability).filter { !$0.isPlaceholderDefault }.isEmpty
         })
     }
 
-    /// A saved provider choice is a live preference rather than an availability gate. Use it
-    /// exclusively while authenticated; otherwise keep routing with the remaining verified
-    /// providers and automatically resume the preference when it becomes available again.
-    static func providers(
-        preferring preferredProvider: AgentProviderKind?,
-        from availableProviders: Set<AgentProviderKind>
-    ) -> Set<AgentProviderKind> {
-        guard let preferredProvider,
-              availableProviders.contains(preferredProvider)
-        else { return availableProviders }
-        return [preferredProvider]
+    func modelFamilyAvailability(
+        availability: AgentModelCatalog.AvailabilityContext,
+        surface: AgentModelCatalog.AgentSelectionSurface = .general
+    ) -> [ModelFamilyAvailability] {
+        let snapshot = capture(
+            allowedProviders: Set(Self.curatedProviders),
+            availability: availability,
+            surface: surface
+        )
+        return Self.familyDisplayOrderedDefinitions.map { definition in
+            let displayName = Self.familyDisplayName(for: definition)
+            let providerAvailable = surface.allows(definition.provider)
+                && AgentModelCatalog.isAgentAvailable(definition.provider, availability: availability)
+            let model = providerAvailable
+                ? Self.resolveModel(definition, from: snapshot.models.filter { $0.provider == definition.provider })
+                : nil
+            let reason: String? = if model != nil {
+                nil
+            } else if !providerAvailable {
+                "\(definition.provider.displayName) not connected."
+            } else {
+                "\(definition.provider.displayName) does not advertise a supported \(displayName) model."
+            }
+            return .init(
+                id: "\(definition.provider.rawValue):\(definition.modelClass)",
+                displayName: displayName,
+                provider: definition.provider,
+                model: model,
+                unavailableReason: reason
+            )
+        }
     }
 
+    /// Strongest-first within each provider so that position bias in a finite-choice judge and
+    /// any capacity truncation favor capable models. Main-session flagships (Sol, Opus) lead.
     private static let modelDefinitions: [ModelDefinition] = [
         .init(
             provider: .codexExec,
-            baseModelAliases: ["gpt-6-luna", "gpt-5.6-luna"],
-            modelClass: "gpt-luna",
-            preferredCodexFamily: "luna",
-            rubric: "Judge Luna as a base model using its capability, expected completion reliability, and price. Do not choose it merely because the prompt is short."
-        ),
-        .init(
-            provider: .codexExec,
-            baseModelAliases: ["gpt-5.6-terra"],
-            modelClass: "gpt-5.6-terra",
-            rubric: "Judge Terra as a base model using its capability, expected completion reliability, and price. It is not a default and receives no preference from its market tier."
-        ),
-        .init(
-            provider: .codexExec,
-            baseModelAliases: ["gpt-6-sol", "gpt-5.6-sol", "gpt-5.6"],
+            baseModelAliases: ["gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6"],
             modelClass: "gpt-sol",
             preferredCodexFamily: "sol",
-            rubric: "Judge Sol as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries."
+            rubric: "Sol is OpenAI's current flagship for complex coding and agentic work. Strong default for substantive primary work; its base capability avoids missed findings and retries."
         ),
         .init(
             provider: .codexExec,
             baseModelAliases: ["gpt-6-astra"],
             modelClass: "gpt-6-astra",
-            rubric: "Judge Astra as a base model using its capability, expected completion reliability, and premium price."
+            rubric: "Astra is OpenAI's most capable premium tier. Choose it for the hardest, highest-risk, or longest-horizon work where its extra capability justifies premium price."
         ),
         .init(
-            provider: .claudeCode,
-            baseModelAliases: ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "haiku"],
-            modelClass: "claude-haiku",
-            rubric: "Judge Haiku as a base model using its capability, expected completion reliability, and price. Do not choose it merely because the prompt is short."
+            provider: .codexExec,
+            baseModelAliases: ["gpt-5.6-terra"],
+            modelClass: "gpt-5.6-terra",
+            rubric: "Terra is a previous-generation balanced tier, weaker than current flagships. Choose it only for clearly bounded, routine work; it is not cheaper than Sol."
         ),
         .init(
-            provider: .claudeCode,
-            baseModelAliases: ["claude-sonnet-5", "sonnet"],
-            modelClass: "claude-sonnet",
-            rubric: "Judge Sonnet as a base model using its capability, expected completion reliability, and price. It is not a default and receives no preference from its market tier."
+            provider: .codexExec,
+            baseModelAliases: ["gpt-6-luna", "gpt-5.6-luna"],
+            modelClass: "gpt-luna",
+            preferredCodexFamily: "luna",
+            rubric: "Luna is a light, high-volume tier meant for exploration and simple lookups. Not suitable for implementation, review, debugging, or multi-step agentic work. A short prompt does not make a task simple."
         ),
         .init(
             provider: .claudeCode,
             baseModelAliases: ["claude-opus-5-5", "opus", "claude-opus-5"],
             modelClass: "claude-opus",
-            rubric: "Judge Opus as a base model using its capability, expected completion reliability, and price, including whether its stronger base capability avoids missed findings or retries."
+            rubric: "Opus is Anthropic's recommended flagship for long-running agentic coding and knowledge work. Strong default for substantive primary work; its base capability avoids missed findings and retries."
         ),
         .init(
             provider: .claudeCode,
             baseModelAliases: ["claude-fable-5-1", "fable"],
             modelClass: "claude-fable",
-            rubric: "Judge Fable as a base model using its capability, expected completion reliability, and premium price."
+            rubric: "Fable is Anthropic's most capable premium tier. Choose it for the hardest, highest-risk, or longest-horizon work where its extra capability justifies premium price."
+        ),
+        .init(
+            provider: .claudeCode,
+            baseModelAliases: ["claude-sonnet-5-5", "claude-sonnet-5", "sonnet"],
+            modelClass: "claude-sonnet",
+            rubric: "Sonnet is a balanced tier below the flagships. Choose it only for clearly bounded, routine work with a clear reliability margin."
+        ),
+        .init(
+            provider: .claudeCode,
+            baseModelAliases: ["claude-haiku-4-5-20251001", "claude-haiku-4-5", "haiku"],
+            modelClass: "claude-haiku",
+            rubric: "Haiku is a light, fast tier meant for exploration and simple lookups. Not suitable for implementation, review, debugging, or multi-step agentic work. A short prompt does not make a task simple."
         )
     ]
 
-    private func resolveModelOption(
+    /// Settings list families lightest-first; router candidate order is independent of this.
+    private static let familyDisplayOrder = [
+        "gpt-luna", "gpt-5.6-terra", "gpt-sol", "gpt-6-astra",
+        "claude-haiku", "claude-sonnet", "claude-opus", "claude-fable"
+    ]
+
+    private static var familyDisplayOrderedDefinitions: [ModelDefinition] {
+        modelDefinitions.sorted {
+            (familyDisplayOrder.firstIndex(of: $0.modelClass) ?? .max) < (familyDisplayOrder.firstIndex(of: $1.modelClass) ?? .max)
+        }
+    }
+
+    private static let curatedProviders: [AgentProviderKind] = [.codexExec, .claudeCode]
+
+    private static func familyDisplayName(for definition: ModelDefinition) -> String {
+        definition.modelClass.split(separator: "-").last.map(String.init)?.capitalized
+            ?? definition.modelClass.capitalized
+    }
+
+    private static func executableModels(
+        in snapshot: RoutingExecutionMetadataSnapshot
+    ) -> [(ModelDefinition, RoutingExecutionModelMetadata)] {
+        modelDefinitions.compactMap { definition in
+            let provider = definition.provider
+            guard snapshot.scope.allowedProviders.contains(provider),
+                  snapshot.scope.surface.allows(provider),
+                  AgentModelCatalog.isAgentAvailable(provider, availability: snapshot.scope.availability),
+                  let model = resolveModel(
+                      definition,
+                      from: snapshot.models.filter { $0.provider == provider }
+                  )
+            else { return nil }
+            return (definition, model)
+        }
+    }
+
+    private static func resolveModel(
         _ definition: ModelDefinition,
-        availability: AgentModelCatalog.AvailabilityContext
-    ) -> AgentModelOption? {
-        let options = modelOptions(definition.provider, availability)
-        if let family = definition.preferredCodexFamily,
-           let option = AgentModelCatalog.preferredCodexFamilyOption(family, from: options)
-        {
-            return option
+        from models: [RoutingExecutionModelMetadata]
+    ) -> RoutingExecutionModelMetadata? {
+        let providerModels = models.filter { model in
+            guard model.provider == definition.provider else { return false }
+            return baseModelRaw(model.baseModelRaw, provider: definition.provider) == model.baseModelRaw
+        }
+        if let family = definition.preferredCodexFamily {
+            let options = providerModels.map { model in
+                AgentModelOption(
+                    rawValue: model.baseModelRaw,
+                    displayName: model.displayName,
+                    description: nil,
+                    isPlaceholderDefault: false,
+                    isProviderDefault: model.isProviderDefault
+                )
+            }
+            if let preferred = AgentModelCatalog.preferredCodexFamilyOption(family, from: options),
+               let model = providerModels.first(where: { $0.baseModelRaw == preferred.rawValue })
+            { return model }
         }
         return definition.baseModelAliases.lazy.compactMap { alias in
-            options.first { option in
-                Self.baseModelRaw(option.rawValue, provider: definition.provider)?
-                    .caseInsensitiveCompare(alias) == .orderedSame
+            providerModels.first { model in
+                model.baseModelRaw.caseInsensitiveCompare(alias) == .orderedSame
             }
         }.first
     }
@@ -262,40 +518,18 @@ struct AgentTaskRoutingCandidateBuilder {
         }
     }
 
-    private static func effortRaw(_ target: AgentRoutingExecutableTarget, provider: AgentProviderKind) -> String? {
-        switch provider {
-        case .codexExec: target.reasoningEffortRaw
-        case .claudeCode: ClaudeModelSpecifier(raw: target.modelRaw).effortLevel?.rawValue
-        default: nil
-        }
-    }
-
-    private static func executableTarget(
-        _ modelRaw: String,
-        provider: AgentProviderKind
-    ) -> AgentRoutingExecutableTarget {
-        AgentRoutingExecutableTarget(
-            agentRaw: provider.rawValue,
-            modelRaw: modelRaw,
-            reasoningEffortRaw: provider == .codexExec
-                ? CodexModelSpecifier(raw: modelRaw).reasoningEffort?.rawValue
-                : nil,
-            modelParameters: []
-        )
-    }
-
     private static func modelDescription(
-        _ target: AgentRoutingExecutableTarget,
-        displayName: String,
+        _ model: RoutingExecutionModelMetadata,
+        profile: ResolvedRoutingProfile,
+        snapshotDate: String,
         roleDefaults: [RoleDefaultReference]
     ) -> String {
-        let provider = AgentProviderKind(rawValue: target.agentRaw)?.displayName ?? target.agentRaw
         let references = if roleDefaults.isEmpty {
             ""
         } else {
             " Agent Models references: \(roleDefaultLabels(roleDefaults)). These are context about the user's established setup, not constraints or automatic choices."
         }
-        return "Provider: \(provider); base model: \(displayName). \(AgentTaskRoutingModelProfileCatalog.modelDescription(for: target))\(references)"
+        return "Provider: \(model.provider.displayName); base model: \(model.displayName). \(profile.description(snapshotDate: snapshotDate))\(references)"
     }
 
     private static func roleDefaultLabels(_ references: [RoleDefaultReference]) -> String {

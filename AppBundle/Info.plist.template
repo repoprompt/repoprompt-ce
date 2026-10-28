@@ -29,6 +29,7 @@
   <key>SUFeedURL</key><string>https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml</string>
   <key>SUPublicEDKey</key><string>845kp9v5+kp4U6no85H53cUdnbfN3NmE1PJHKwH8Pd4=</string>
   <key>SUBundleName</key><string>RepoPrompt CE.app</string>
+  <key>NSAppleEventsUsageDescription</key><string>RepoPrompt CE uses Apple Events to connect to the Computer Use companion for actions you request.</string>
   <key>NSLocalNetworkUsageDescription</key><string>RepoPrompt CE needs local network access to enable MCP server functionality, allowing external tools to connect and interact with your workspace.</string>
   <key>NSBonjourServices</key><array><string>_preflight_check._tcp</string><string>_mcp._tcp</string></array>
 </dict>

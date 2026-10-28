@@ -80,8 +80,6 @@ enum BuiltInPromptRegistryError: Error, Equatable, LocalizedError {
 /// read the checked-in `AppResources/Prompts` directory directly, so tests and the app
 /// load the same bytes.
 final class BuiltInPromptRegistry: Sendable {
-    static let shared = BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory())
-
     let promptsDirectory: URL?
     private let cache = OSAllocatedUnfairLock<[BuiltInPromptID: BuiltInPromptResource]>(initialState: [:])
 

@@ -1,6 +1,9 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 import XCTest
 
 #if DEBUG
@@ -211,7 +214,9 @@ import XCTest
                 let sourceA = try XCTUnwrap(sourceA)
                 let sourceB = try XCTUnwrap(sourceB)
                 let git = GitService()
-                let store = WorkspaceFileContextStore()
+                WorkspaceContextStartupInstrumentation.install(AppWorkspaceStartupEventRecorder())
+                WorkspaceExternalReadWorkHooks.install(AppWorkspaceExternalReadWorkRecorder())
+                let store = WorkspaceFileContextStore(startupFeatureFlags: .standaloneOperationalDefault())
 
                 phase = "source snapshot admission"
                 let loadedA = try await store.loadRoot(path: sourceA.path, kind: .primaryWorkspace)

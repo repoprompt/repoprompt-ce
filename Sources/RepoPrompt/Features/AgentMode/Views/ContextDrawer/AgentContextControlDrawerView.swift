@@ -29,6 +29,7 @@ struct AgentContextControlDrawerView: View {
     let activeAgentSessionID: UUID?
     let worktreeBindingsProvider: @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]
 
+    @Environment(\.agentModePerfRecorder) private var perfRecorder
     @StateObject private var modelCoordinator = AgentSelectedFilesModelCoordinator()
     @State private var hoveredTab: AgentContextDrawerUIStore.Tab?
     @State private var observedSwitchKey: AgentContextDrawerSwitchKey?
@@ -119,6 +120,7 @@ struct AgentContextControlDrawerView: View {
         .background(Color(NSColor.windowBackgroundColor))
         .clipped()
         .onAppear {
+            modelCoordinator.perfRecorder = perfRecorder
             if observedSwitchKey == nil {
                 observedSwitchKey = currentSwitchKey
             }
@@ -289,6 +291,7 @@ struct AgentContextControlDrawerView: View {
         modelCoordinator.cancelLoading(keepLoadedModel: false)
         selectedFilesBlankingIdentity = request.identity
         captureTokenBlankingSelection()
+        modelCoordinator.perfRecorder = perfRecorder
         modelCoordinator.refreshIfNeeded(request, force: true, preserveDisplayedModel: false)
         observedSwitchKey = newKey
         clearCompletedSelectedFilesBlankingIfNeeded(currentIdentity: request.identity)
@@ -312,6 +315,7 @@ struct AgentContextControlDrawerView: View {
         selectedFilesBlankingIdentity = request.identity
         captureTokenBlankingSelection()
         if shouldRefreshTarget {
+            modelCoordinator.perfRecorder = perfRecorder
             modelCoordinator.refreshIfNeeded(request, force: true, preserveDisplayedModel: false)
         }
         clearCompletedSelectedFilesBlankingIfNeeded(currentIdentity: request.identity)

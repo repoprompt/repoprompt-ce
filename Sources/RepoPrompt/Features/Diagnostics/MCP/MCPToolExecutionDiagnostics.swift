@@ -1,59 +1,19 @@
 import Foundation
+import RepoPromptInstrumentation
 import RepoPromptShared
 
-enum MCPToolExecutionHandlerPhase: String, Equatable {
-    case manageSelectionAutoSelectionDrain = "manage_selection.auto_selection_drain"
-    case manageSelectionIngressWait = "manage_selection.ingress_wait"
-    case manageSelectionConstruction = "manage_selection.selection_construction"
-    case manageSelectionPersistence = "manage_selection.persistence"
-    case manageSelectionReplyConstruction = "manage_selection.reply_construction"
-    case fileActionsPreMutationChecks = "file_actions.pre_mutation_checks"
-    case fileActionsCatalogEligibility = "file_actions.catalog_eligibility"
-    case fileActionsMutationIO = "file_actions.mutation_io"
-    case fileActionsPostMutationCatalog = "file_actions.post_mutation_catalog"
-    case fileActionsPostMutationSelection = "file_actions.post_mutation_selection"
-    case fileActionsReplyConstruction = "file_actions.reply_construction"
-    case readFileRequestResolution = "read_file.request_resolution"
-    case readFileContentRead = "read_file.content_read"
-    case readFileAutoSelection = "read_file.auto_selection"
-    case getFileTreeRequestResolution = "get_file_tree.request_resolution"
-    case getFileTreeIngressWait = "get_file_tree.ingress_wait"
-    case getFileTreeConstruction = "get_file_tree.construction"
-    case promptExportSelectionDrain = "prompt_export.selection_drain"
-    case promptExportPresetResolution = "prompt_export.preset_resolution"
-    case promptExportContentAssembly = "prompt_export.content_assembly"
-    case promptExportMetadataAssembly = "prompt_export.metadata_assembly"
-    case promptExportDestinationAuthorization = "prompt_export.destination_authorization"
-    case promptExportDurableWrite = "prompt_export.durable_write"
-    case promptExportIngressWait = "prompt_export.ingress_wait"
-    case promptExportReplyAssembly = "prompt_export.reply_assembly"
-    case promptExportFormatting = "prompt_export.formatting"
-    case promptExportPublication = "prompt_export.publication"
-    // Graph-first get_code_structure execution stages.
-    case getCodeStructureSeedResolution = "get_code_structure.seed_resolution"
-    case getCodeStructureGraphSnapshot = "get_code_structure.graph_snapshot"
-    case getCodeStructureGraphTraversal = "get_code_structure.graph_traversal"
-    case getCodeStructureGraphRevalidation = "get_code_structure.graph_revalidation"
-    case getCodeStructureRenderDemand = "get_code_structure.render_demand"
-    case getCodeStructureFreeze = "get_code_structure.freeze"
-    case getCodeStructureRender = "get_code_structure.render"
-    case getCodeStructureAssembly = "get_code_structure.assembly"
-}
-
-enum MCPToolExecutionHandlerPhaseTransition: String, Equatable {
-    case started
-    case completed
-}
-
-struct MCPToolExecutionHandlerPhaseSnapshot: Equatable {
-    let phase: MCPToolExecutionHandlerPhase
-    let transition: MCPToolExecutionHandlerPhaseTransition
-    let elapsedMilliseconds: Double
+struct AppMCPToolExecutionHandlerPhaseRecorderFactory: MCPToolExecutionHandlerPhaseRecorderFactory {
+    func make(
+        origin: Duration,
+        now: @escaping @Sendable () async -> Duration
+    ) -> any MCPToolExecutionHandlerPhaseRecording {
+        MCPToolExecutionHandlerPhaseRecorder(origin: origin, now: now)
+    }
 }
 
 /// Per-invocation progress state. Providers use the task-local accessor while the
 /// connection manager retains this recorder explicitly for watchdog escalation.
-final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
+final class MCPToolExecutionHandlerPhaseRecorder: MCPToolExecutionHandlerPhaseRecording, @unchecked Sendable {
     private let lock = NSLock()
     private let origin: Duration
     private let now: @Sendable () async -> Duration
@@ -68,7 +28,7 @@ final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
     }
 
     @discardableResult
-    func report(
+    package func report(
         _ phase: MCPToolExecutionHandlerPhase,
         transition: MCPToolExecutionHandlerPhaseTransition
     ) async -> MCPToolExecutionHandlerPhaseSnapshot {
@@ -82,7 +42,7 @@ final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
         return snapshot
     }
 
-    func snapshot() -> MCPToolExecutionHandlerPhaseSnapshot? {
+    package func snapshot() -> MCPToolExecutionHandlerPhaseSnapshot? {
         lock.lock()
         defer { lock.unlock() }
         return latest
@@ -95,75 +55,8 @@ final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
     }
 }
 
-enum MCPToolExecutionHandlerPhaseContext {
-    @TaskLocal
-    static var recorder: MCPToolExecutionHandlerPhaseRecorder?
-
-    #if DEBUG
-        private final class DebugState: @unchecked Sendable {
-            let lock = NSLock()
-            var sink: (@Sendable (MCPToolExecutionHandlerPhaseSnapshot) -> Void)?
-        }
-
-        private static let debugState = DebugState()
-    #endif
-
-    static func report(
-        _ phase: MCPToolExecutionHandlerPhase,
-        transition: MCPToolExecutionHandlerPhaseTransition = .started
-    ) async {
-        guard let recorder else { return }
-        await report(phase, transition: transition, using: recorder)
-    }
-
-    @discardableResult
-    static func report(
-        _ phase: MCPToolExecutionHandlerPhase,
-        transition: MCPToolExecutionHandlerPhaseTransition = .started,
-        using recorder: MCPToolExecutionHandlerPhaseRecorder
-    ) async -> MCPToolExecutionHandlerPhaseSnapshot {
-        let snapshot = await recorder.report(phase, transition: transition)
-        #if DEBUG
-            let sink = debugState.lock.withLock { debugState.sink }
-            sink?(snapshot)
-        #endif
-        return snapshot
-    }
-
-    #if DEBUG
-        static func setTestSink(_ sink: (@Sendable (MCPToolExecutionHandlerPhaseSnapshot) -> Void)?) {
-            debugState.lock.lock()
-            debugState.sink = sink
-            debugState.lock.unlock()
-        }
-    #endif
-}
-
 struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
-    enum Phase: String {
-        case contractSelected = "execution_contract_selected"
-        case started = "execution_started"
-        case handlerCompleted = "execution_handler_completed"
-        case handlerPhaseTransition = "execution_handler_phase_transition"
-        case deadlineExpired = "execution_deadline_expired"
-        case cancellationRequested = "execution_cancellation_requested"
-        case settledDuringGrace = "execution_settled_during_grace"
-        case cleanupGraceExpired = "execution_cleanup_grace_expired"
-        case detachedForSettlement = "execution_detached_for_settlement"
-        case detachedSettled = "execution_detached_settled"
-        case connectionForceDisconnectRequested = "connection_force_disconnect_requested"
-
-        var isAlwaysEmitted: Bool {
-            switch self {
-            case .deadlineExpired, .cancellationRequested, .settledDuringGrace,
-                 .cleanupGraceExpired, .detachedForSettlement, .detachedSettled,
-                 .connectionForceDisconnectRequested:
-                true
-            case .contractSelected, .started, .handlerCompleted, .handlerPhaseTransition:
-                false
-            }
-        }
-    }
+    typealias Phase = MCPToolExecutionDiagnosticEvent.Phase
 
     let toolName: String
     let operationIdentity: MCPToolOperationIdentity
@@ -325,13 +218,52 @@ enum MCPToolExecutionTracer {
     #endif
 }
 
-extension Duration {
-    var mcpSeconds: Double {
-        let components = components
-        return Double(components.seconds) + Double(components.attoseconds) / 1_000_000_000_000_000_000
-    }
-
-    var mcpMilliseconds: Double {
-        mcpSeconds * 1000
+/// App-owned implementation of the extracted lifecycle event contract.
+struct AppMCPToolExecutionEventSink: MCPToolExecutionEventSink {
+    func record(_ event: MCPToolExecutionDiagnosticEvent) {
+        let contractKind: MCPToolExecutionContract.Kind = switch event.contractKind {
+        case .bounded: .bounded
+        case .longSynchronousCancellable: .longSynchronousCancellable
+        case .lifecycleManagedCancellable: .lifecycleManagedCancellable
+        case .interactiveCancellable: .interactiveCancellable
+        case .workspaceLifecycleCancellable: .workspaceLifecycleCancellable
+        }
+        let cleanupDisposition: MCPToolExecutionCleanupDisposition? = switch event.cleanupDisposition {
+        case .forceDisconnect: .forceDisconnect
+        case .detachAndSettle: .detachAndSettle
+        case nil: nil
+        }
+        let cancellationOrigin: MCPToolExecutionCancellationOrigin? = switch event.cancellationOrigin {
+        case .watchdogDeadline: .watchdogDeadline
+        case .requestCancellation: .requestCancellation
+        case .clientDeadline: .clientDeadline
+        case .serverExportEnvelope: .serverExportEnvelope
+        case nil: nil
+        }
+        MCPToolExecutionTracer.emit(MCPToolExecutionTraceEvent(
+            toolName: event.toolName,
+            operationIdentity: MCPDomainToolOperationIdentity(
+                canonicalTool: event.canonicalTool,
+                normalizedOperation: event.normalizedOperation
+            ),
+            connectionID: event.connectionID,
+            invocationID: event.invocationID,
+            runID: event.runID,
+            requestIdentity: event.requestIdentity,
+            contractKind: contractKind,
+            executionDeadlineSeconds: event.executionDeadlineSeconds,
+            cleanupGraceSeconds: event.cleanupGraceSeconds,
+            cleanupDisposition: cleanupDisposition,
+            phase: event.phase,
+            elapsedMilliseconds: event.elapsedMilliseconds,
+            cancellationRequested: event.cancellationRequested,
+            cancellationOutcome: event.cancellationOutcome?.rawValue,
+            cancellationOrigin: cancellationOrigin,
+            settlement: event.settlement?.rawValue,
+            graceOutcome: event.graceOutcome?.rawValue,
+            escalationReason: event.escalationReason?.rawValue,
+            handlerPhase: event.handlerPhase,
+            handlerPhaseAgeMilliseconds: event.handlerPhaseAgeMilliseconds
+        ))
     }
 }

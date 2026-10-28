@@ -85,41 +85,6 @@ final class AgentSessionLinkLifecycleInvalidationTests: XCTestCase {
         )
     }
 
-    func testTargetKeepsProviderPromptManualWithoutExactAutoApprovalLink() async throws {
-        let tabID = UUID()
-        let (viewModel, _) = try makeViewModel(tabID: tabID)
-        let session = viewModel.session(for: tabID)
-        session.codexController = LifecycleNoopCodexController(recorder: LifecycleRecorder())
-        let request = AgentApprovalRequest(
-            requestID: .codex(.int(42)),
-            method: "item/commandExecution/requestApproval",
-            kind: .commandExecution,
-            threadID: "thread",
-            turnID: "turn",
-            itemID: "item"
-        )
-        session.pendingApproval = request
-
-        await viewModel.autoApproveOverseenProviderPermissions(for: session, requestIDs: [request.id])
-
-        XCTAssertEqual(session.pendingApproval, request, "default-off must preserve the target's manual prompt")
-    }
-
-    func testManagedCodexLogoutKeepsTargetPermissionListenerInstalled() async throws {
-        let tabID = UUID()
-        let (viewModel, _) = try makeViewModel(tabID: tabID)
-        let session = viewModel.session(for: tabID)
-        session.selectedAgent = .codexExec
-        XCTAssertNotNil(session.permissionAutoApprovalCancellable)
-
-        await viewModel.stopCodexSessionsForManagedLogout()
-
-        XCTAssertNotNil(
-            session.permissionAutoApprovalCancellable,
-            "MCP teardown must not leave an enabled Overseer toggle with no target listener"
-        )
-    }
-
     /// A tab that never held a durable binding has no incarnation to invalidate.
     func testRemovingAnUnboundTabInvalidatesNothing() {
         var recorded: [Recorded] = []

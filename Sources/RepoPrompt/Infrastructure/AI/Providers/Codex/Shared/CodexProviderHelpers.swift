@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptProcess
 
 /// Singleton actor that manages the cache of broken Codex MCP servers.
 /// Shared across all Codex provider instances (CLI and Exec Agent).
@@ -140,13 +141,17 @@ enum CodexProviderHelpers {
             inheritedEnvironment: inheritedEnvironment,
             shellEnvironmentProvider: shellEnvironmentProvider
         )
+        // Detached work does not inherit task locals. Carry only this explicit fixture permit.
+        let allowsFixtureProcess = ProviderProcessLaunchPolicy.allowsLaunchForTesting
         let resolution = await Task.detached(priority: .utility) {
-            resolveCodexExecutable(
-                commandName: commandName,
-                environment: environment,
-                additionalPathHints: additionalPathHints,
-                launchSnapshot: launchSnapshot
-            )
+            ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(allowsFixtureProcess) {
+                resolveCodexExecutable(
+                    commandName: commandName,
+                    environment: environment,
+                    additionalPathHints: additionalPathHints,
+                    launchSnapshot: launchSnapshot
+                )
+            }
         }.value
         logPreflightResolution(
             resolution,
@@ -171,16 +176,19 @@ enum CodexProviderHelpers {
         )
         let activeSelection = injectedActiveSelection ?? CodexRuntimePreferences.activeSelection
         let pendingSelection = injectedPendingSelection ?? CodexRuntimePreferences.selection()
+        let allowsFixtureProcess = ProviderProcessLaunchPolicy.allowsLaunchForTesting
         let preflight = await Task.detached(priority: .utility) {
-            CodexRuntimeSettingsPreflight(
-                bundledResolution: resolveCodexExecutable(environment: environment, selection: .bundled),
-                activeResolution: resolveCodexExecutable(environment: environment, selection: activeSelection),
-                pendingResolution: resolveCodexExecutable(environment: environment, selection: pendingSelection),
-                ignoredLegacyEnvironmentOverride: CodexRuntimeAuthority.ignoredLegacyEnvironmentOverride(
-                    environment: environment,
-                    selection: activeSelection
+            ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(allowsFixtureProcess) {
+                CodexRuntimeSettingsPreflight(
+                    bundledResolution: resolveCodexExecutable(environment: environment, selection: .bundled),
+                    activeResolution: resolveCodexExecutable(environment: environment, selection: activeSelection),
+                    pendingResolution: resolveCodexExecutable(environment: environment, selection: pendingSelection),
+                    ignoredLegacyEnvironmentOverride: CodexRuntimeAuthority.ignoredLegacyEnvironmentOverride(
+                        environment: environment,
+                        selection: activeSelection
+                    )
                 )
-            )
+            }
         }.value
         logPreflightResolution(
             preflight.pendingResolution,
@@ -208,7 +216,7 @@ enum CodexProviderHelpers {
         } else {
             await ProcessEnvironmentBuilder.build(request)
         }
-        return environmentResult.environment
+        return await ProviderEnvironmentFiltering.filter(environmentResult.environment, for: .codexExec)
     }
 
     private static func logPreflightResolution(

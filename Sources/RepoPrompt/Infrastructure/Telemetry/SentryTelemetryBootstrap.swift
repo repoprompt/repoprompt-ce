@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptSettingsCore
 
 #if REPOPROMPT_SENTRY_ENABLED
     import Sentry
@@ -37,7 +38,7 @@ enum SentryTelemetryBootstrap {
                     options.environment = "production"
                     options.debug = false
                 #endif
-                options.tracesSampleRate = performanceTracingEnabled ? 0.05 : 0
+                options.tracesSampleRate = NSNumber(value: performanceTracingEnabled ? 0.05 : 0)
                 // Do not let SDK defaults or future configuration attach distribution metadata.
                 options.dist = nil
                 options.add(inAppInclude: "RepoPrompt")

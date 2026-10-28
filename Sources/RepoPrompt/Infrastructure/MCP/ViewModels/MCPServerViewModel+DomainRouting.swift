@@ -1,9 +1,11 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptFileSystem
 
 extension MCPServerViewModel {
     struct DomainReadAppExecutionContext {
+        let invocationContext: ToolInvocationContext
         let metadata: RequestMetadata
         let resolvedTabContext: ResolvedTabContextSnapshot
         let lookupContext: WorkspaceLookupContext
@@ -216,7 +218,8 @@ extension MCPServerViewModel {
     @MainActor
     func resolveDomainReadContext(
         toolName: String,
-        requirement: DomainReadContextRequirement
+        requirement: DomainReadContextRequirement,
+        invocationContext explicitInvocationContext: ToolInvocationContext? = nil
     ) async throws -> DomainReadInvocationContext {
         // History and oracle transcript lookup have always been workspace-independent. Do not even
         // capture MainActor routing metadata for them.
@@ -224,26 +227,19 @@ extension MCPServerViewModel {
             return DomainReadInvocationContext(handle: nil, connectionID: nil)
         }
 
-        let metadata: RequestMetadata
+        // The actual binding supplies this captured packet explicitly. Direct internal
+        // callers must establish an explicit trusted-local scope, never infer one from nil.
+        let invocationContext = try explicitInvocationContext
+            ?? MCPInvocationContextBridge.require(toolName: toolName)
+        let metadata = invocationContext.metadata
         if let admitted = MCPDomainAdmittedContextValues.current {
-            guard admitted.windowID == windowID else {
-                throw MCPError.internalError(
-                    "Admitted domain context window \(admitted.windowID) does not match provider window \(windowID)"
-                )
+            guard admitted.windowID == windowID,
+                  admitted.connectionID == metadata.connectionID,
+                  metadata.tabContextHint?.tabID == admitted.contextID,
+                  metadata.tabContextHint?.workspaceID == admitted.workspaceID
+            else {
+                throw MCPError.internalError("Admitted domain context does not match the captured app invocation")
             }
-            metadata = await RequestMetadata(
-                connectionID: admitted.connectionID,
-                clientName: nil,
-                windowID: admitted.windowID,
-                runPurpose: ServerNetworkManager.shared.runPurpose(for: admitted.connectionID),
-                tabContextHint: TabContextHint(
-                    tabID: admitted.contextID,
-                    workspaceID: admitted.workspaceID,
-                    windowID: admitted.windowID
-                )
-            )
-        } else {
-            metadata = await captureRequestMetadata()
         }
         let connectionID = metadata.connectionID
 
@@ -272,6 +268,7 @@ extension MCPServerViewModel {
                 toolName: toolName,
                 requirement: requirement,
                 metadata: metadata,
+                invocationContext: invocationContext,
                 resolved: resolved
             )
         }
@@ -461,6 +458,7 @@ extension MCPServerViewModel {
             }
             let invocation = DomainReadInvocationContext(handle: executionHandle, connectionID: connectionID)
             domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
+                invocationContext: invocationContext,
                 metadata: metadata,
                 resolvedTabContext: resolved,
                 lookupContext: lookupContext,
@@ -488,6 +486,7 @@ extension MCPServerViewModel {
         toolName: String,
         requirement: DomainReadContextRequirement,
         metadata: RequestMetadata,
+        invocationContext: ToolInvocationContext,
         resolved: ResolvedTabContextSnapshot
     ) async throws -> DomainReadInvocationContext {
         let context = resolved.snapshot
@@ -552,6 +551,7 @@ extension MCPServerViewModel {
             }
         }
         domainReadAppExecutionContexts[invocation.invocationID] = await DomainReadAppExecutionContext(
+            invocationContext: invocationContext,
             metadata: metadata,
             resolvedTabContext: resolved,
             lookupContext: lookupContext,

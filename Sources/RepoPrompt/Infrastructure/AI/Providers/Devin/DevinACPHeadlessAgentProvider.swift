@@ -21,7 +21,7 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
     ) {
         self.config = config
         let resolvedProviderFactory = providerFactory ?? { config in
-            DevinACPAgentProvider(config: config)
+            DevinACPAgentProvider(config: config, isolateForeignMCPImports: true)
         }
         bridge = ACPHeadlessAgentProviderBridge(
             providerName: "Devin",

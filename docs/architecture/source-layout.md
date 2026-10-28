@@ -9,7 +9,6 @@ Sources/
   RepoPromptExecutable/          # thin shipped RepoPrompt executable target; sole @main and delegation only
     RepoPromptExecutable.swift
   RepoPrompt/                    # internal RepoPromptApp implementation library target (not a package product)
-    Support/                     # Obj-C bridging header / bridging-header-sensitive support owned by RepoPromptApp
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
       Notifications/
       Sparkle/
@@ -47,13 +46,19 @@ Sources/
       VCS/                       # git/VCS substrate
       WorkspaceContext/          # context store, indexing, path lookup, slices, search, token accounting
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
+  RepoPromptFileSystem/       # filesystem/FSEvents/ignore matching and injected serialized disk writer
+  RepoPromptVCS/              # repository/worktree query contracts and reusable VCS substrate
+  RepoPromptPersistence/      # CodeMap and durable artifact storage; presets remain app-owned
+  RepoPromptSettingsCore/     # app-only persisted settings values/store and global-ignore facet
+  RepoPromptProviderQuota/    # account quota values, injected acquisition coordination, cached consumer signals; no concrete IO
   RepoPromptCodeMapCore/        # internal deterministic synchronous parsing/query/extraction and canonical artifact core
   RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
-  RepoPromptWorkspaceCore/      # internal Foundation-only workspace path values and deterministic policies
+  RepoPromptWorkspaceCore/      # internal Foundation + Swift System workspace path values and deterministic policies
   RepoPromptDomainRuntime/      # internal AppKit-free MCP runtime, workspace/context persistence, routing, and launch-token authority
   RepoPromptShared/
     MCP/                         # shared app/CLI MCP control protocol definitions
-  RepoPromptMCP/                 # MCP CLI implementation
+  RepoPromptMCP/                 # thin repoprompt-mcp executable; main.swift entry only
+  RepoPromptMCPCore/             # MCP CLI implementation library (tested by RepoPromptMCPCoreTests)
   RepoPromptC/                   # C support target
   CSwiftPCRE2/                   # C PCRE2 target
   TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
@@ -62,10 +67,14 @@ Tests/
   RepoPromptRegexCoreTests/      # direct reusable regex runtime tests
   RepoPromptWorkspaceCoreTests/  # direct deterministic tests owned by RepoPromptWorkspaceCore
   RepoPromptDomainRuntimeTests/  # direct owner tests for the headless MCP runtime and workspace/context authority
+  RepoPromptProviderQuotaTests/  # direct quota model/mapper/coordination/consumer tests; injected transports only
+  RepoPromptMCPCoreTests/        # MCP CLI owner tests; no RepoPromptApp dependency
   RepoPromptTests/               # app integration, persistence, workspace, presentation, UI, and MCP tests
 ```
 
-The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and `RepoPromptDomainRuntime` are internal dependencies of `RepoPromptApp`, are not exposed as package products, and have direct owning test targets. `RepoPromptDomainRuntime` owns the AppKit-free, Sendable MCP runtime identity/lifecycle values, the canonical 28-tool name/capability/admission/client-policy catalog, immutable definitions and fingerprints, and the actor registry. App registration is process composition over that registry; no app-local registry facade or second schema authority remains. `RepoPromptCodeMapCoreTests` is the sole resource owner for pure CodeMap parser fixtures and goldens. Root app tests import `RepoPromptApp`; the separate `RepoPromptMCP` executable dependency remains unchanged.
+The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. `RepoPromptCodeMapCore`, `RepoPromptRegexCore`, `RepoPromptWorkspaceCore`, and `RepoPromptDomainRuntime` are internal dependencies of `RepoPromptApp`, are not exposed as package products, and have direct owning test targets. `RepoPromptDomainRuntime` owns the AppKit-free, Sendable MCP runtime identity/lifecycle values, the canonical 30-tool name/capability/admission/client-policy catalog, immutable definitions and fingerprints, and the actor registry. App registration is process composition over that registry; no app-local registry facade or second schema authority remains. `RepoPromptCodeMapCoreTests` is the sole resource owner for pure CodeMap parser fixtures and goldens. Root app tests import `RepoPromptApp`. The MCP CLI follows the same thin-entry pattern: `RepoPromptMCP` is a one-file `main.swift` executable over the internal `RepoPromptMCPCore` library, and CLI owner tests live in `RepoPromptMCPCoreTests` without depending on the app.
+
+`RepoPromptProviderQuota` is an internal, Foundation-only owner with no first-party target dependencies. It owns provider/account/window quota facts, pure mapping and presentation, injected acquisition ports/coordinators, and cached advisory signals. Concrete HTTP, credential access, and app-server adapters remain in the app's `Infrastructure/AI/Providers/` owners; composition stays in `App/ProviderQuotaRuntime.swift`. Settings projections depend on the quota owner, not the generic MCP runtime. Acquisition consent and presentation preferences are independent. Router policy is not part of this quota module, and cached lookup never acquires data.
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
@@ -90,14 +99,14 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 ## Placement rules for new files
 
 - `Sources/RepoPromptExecutable` is restricted to the shipped executable entry. Do not add lifecycle, feature, infrastructure, startup, or composition logic there.
-- Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket.
+- Deterministic workspace path values and policies with no app, UI, persistence, filesystem, process, or mutable authority may go under `Sources/RepoPromptWorkspaceCore`; direct tests go under `Tests/RepoPromptWorkspaceCoreTests`. The target is not a general non-UI bucket. Its only package dependency is the existing pinned Swift System `SystemPackage` product for native path representation; imports are restricted to Foundation and SystemPackage.
 - AppKit-free MCP runtime identity/lifecycle configuration, canonical tool names, capability/admission/client classification, normalized schema fingerprints, Sendable tool definitions/bindings, the actor registry, workspace/context document and journal persistence, revision/CAS/event publication, connection/context routing, and run-launch-token authority belong under `Sources/RepoPromptDomainRuntime`; owner tests belong under `Tests/RepoPromptDomainRuntimeTests`. Application-scoped app-settings and routing registration is process-lifetime composition owned: AppDelegate startup explicitly registers canonical bindings and starts transport independently of window count, while catalog readiness only observes the canonical registry with a bounded fail-closed wait. App-side window and active-context values are presentation affinity, never domain identity or mutation authority. `RepoPromptDomainRuntime` must contain no `@MainActor`, AppKit, SwiftUI, Combine, window, or view-model dependency.
 - Deterministic synchronous CodeMap grammar descriptors, CodeMap-only queries, invocation-local parsing/extraction, provenance-free decoded source values, pipeline/key canonical encoding, artifact outcomes, and path-free canonical rendering belong under `Sources/RepoPromptCodeMapCore`; pure fixtures/goldens and owner tests belong only under `Tests/RepoPromptCodeMapCoreTests`.
-- Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, CAS/persistence, workspace authority, token/path/import presentation, syntax-query validation, UI/MCP, and selection-graph policy in `RepoPromptApp`. App syntax parsing retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
+- Keep CodeMap decoding and raw-digest construction, validation/Git/worktree provenance, permits/cancellation, environment/performance aggregation, workspace authority, token/path/import presentation, syntax-query validation, UI/MCP, and selection-graph policy in `RepoPromptApp`. CodeMap artifact CAS/catalog/manifests/leases and durable artifact storage live in `RepoPromptPersistence`; app source/capability convenience adapters validate authority before handing persistence neutral values. App syntax parsing retains direct `SwiftTreeSitter` linkage; it may consume immutable core grammar descriptors but must not share parser/cursor state.
 - Reusable PCRE2 wrapper/JIT construction belongs under `Sources/RepoPromptRegexCore`; app search policy, limits, repair, and presentation remain app-owned.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
-- Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
+- Do not add an Objective-C bridging header to any target. Declare C APIs in a C target's public headers (for example `Sources/RepoPromptC/include`) and `import` that module from the Swift files that use it; `Sources/RepoPrompt/Support` is retired.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
 - Provider-neutral workflow IDs, catalog metadata, and prompt renderers go under `Sources/RepoPromptShared/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
@@ -107,11 +116,19 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`. App tool providers receive only the typed physical capability families they require; `MCPAppPhysicalCapabilityAdapters` is a namespace, not an umbrella dependency bag or dynamic-member façade.
 - Reusable AppKit-free physical workspace operations used by direct MCP belong in `RepoPromptDomainRuntime`; `RepoPromptMCP` may adapt them but must not copy read/search/tree/selection implementations. App presentation adapters may add UI-specific policy without becoming domain identity authority.
-- New CLI-only implementation code goes under `Sources/RepoPromptMCP`. Direct backend selection and stdio composition stay here; canonical schemas, workspace state roots, and reusable physical workspace operations do not.
+- New CLI-only implementation code goes under `Sources/RepoPromptMCPCore`; `Sources/RepoPromptMCP` holds only the `main.swift` entry. Tests of CLI behavior go in `Tests/RepoPromptMCPCoreTests` unless they also need the app. Direct backend selection and stdio composition stay in the CLI targets; canonical schemas, workspace state roots, and reusable physical workspace operations do not.
 - App-owned test doubles, integration fixtures, sample projects, benchmark-only data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target. Pure CodeMap parser fixtures/goldens are the documented exception and belong only to `RepoPromptCodeMapCoreTests`.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
 - Keep `App/WindowState.swift` in `App` until there is a separate composition-root refactor; physical moves must preserve initialization order.
+
+## Platform extraction boundaries
+
+`RepoPromptFileSystem` owns filesystem and ignore mechanics, neutral catalog/file values, FSEvents, secure removal, and a policy-injected disk writer. The app retains repository topology/defaults migration, diagnostic-hook composition, authenticated seed-plan adaptation, and workspace decoding/selection merge policy. One process-owned writer is injected across workspace managers; the library has no singleton.
+
+`RepoPromptVCS` owns reusable query contracts/values, pure repository resolution, GitDiff substrate, and process/clone mechanics. `GitService` remains intact in the app alongside backends, workspace authority/receipt/metadata orchestration, and materialization/merge presentation. App adapters translate loaded roots and provide existing backend operations; no second Git authority is introduced.
+
+`RepoPromptSettingsCore` owns persisted value/document/file-store codecs and the settings store, retains `.shared`, and offers typed change events and a global-ignore facet. App catalog/router/notification/telemetry policy stays in the app. It is app-only and may use the allowlisted main-bundle identity, but contains no UI framework dependency.
 
 ## Exception policy
 
@@ -122,7 +139,7 @@ Exceptions must be explicit, narrow, and documented here before they become prec
 These files are intentionally compiled as app-integrated diagnostics and live under `Sources/RepoPrompt/Features/Diagnostics`:
 
 - `Features/Diagnostics/Benchmark`: the Settings-visible Repo Bench surface, including benchmark core, settings UI/view model, run store, reporting, and local rankings. If Repo Bench needs a headless/CI runner, create a separate executable-target plan rather than hiding target churn in this layout cleanup.
-- `Features/Diagnostics/AgentMode`: debug-only Agent Mode performance instrumentation and text-derivation diagnostics.
+- `Features/Diagnostics/AgentMode`: debug-only Agent Mode performance instrumentation and text-derivation diagnostics. Release admission timing is owned by the workspace runtime as documented below; this does not enable the DEBUG-only instrumentation in release.
 - `Features/Diagnostics/AgentMode/Stress`: debug-only Agent chat stress launch configuration, harness, overlay panel, and stress support extensions on `AgentModeViewModel`, launched with `-RP_AGENT_CHAT_STRESS` and `RP_AGENT_STRESS_*` environment variables.
 - `Features/Diagnostics/MCP`: hidden DEBUG MCP diagnostics, transport diagnostics, Sparkle diagnostics, and memory sampling exposed through `__repoprompt_debug_diagnostics` / legacy debug transport tools.
 - `Features/Diagnostics/Prompt`: DEBUG prompt/token recount event forwarding, selection signatures, and selected-path watchdog state surfaced through restore performance diagnostics.
@@ -130,6 +147,12 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 - `Features/Diagnostics/App`: app-wide font-scale metrics, workspace/window restore performance logging, and DEBUG root-load trace correlation (`WorkspaceRootLoadDiagnostics`) surfaced through restore/workspace loading diagnostics.
 
 ### Documented wiring exceptions outside Diagnostics
+
+- `Features/Workspaces/Runtime/WorkspaceAgentAdmissionTiming.swift` intentionally ships in release beside `WorkspaceAgentAdmissionCoordinator`: it is per-admission runtime bookkeeping, not a DEBUG harness. Admission callers must not depend upward on the Diagnostics feature. `WorkspaceManagerViewModel.withAgentSessionAdmission` is its automatic entry point, emitting `event=agentAdmission.slow` in the `WorkspaceAgentAdmission` OSLog category on scope exit at five seconds or more. Fresh/existing tab admission explicitly propagates its recorder; retained recovery and discard have distinct kinds. See [diagnostic fields and interpretation](../testing.md#agent-admission-slow-phase-diagnostics). This narrow placement exception does not move other app-integrated diagnostic harnesses out of Diagnostics.
+
+- `App/SessionAdminWindowsHosts.swift` owns the concrete session-administration adapters over open windows, saved-session preparation, and target-owned workspace/worktree routing. The feature retains its host protocols and operation handlers; the app-level adapters compose them with `WindowStatesManager`, `WindowState`, and the UI view models. Keep these concrete window dependencies out of feature service implementations.
+
+- `Features/AgentMode/Services/BecomeOverseerMCPToolService.swift` owns the targeted activation → approval → saved-session/link/task product flow. Its MCP adapter in `Infrastructure/MCP/ViewModels/MCPServerViewModel.swift` wires this feature service; keeping the flow in Infrastructure would invert its dependencies on Agent Mode's runtime and message digest. This is a narrow composition exception, not a placement rule for other transport-only MCP services.
 
 - `App/AppLaunchConfiguration.swift` remains in `App` because it owns process arguments/environment interpretation for launch behavior. It still routes DEBUG-only Agent chat stress settings, but harness-specific configuration lives under `Features/Diagnostics/AgentMode/Stress`.
 - `App/WindowState.swift` remains the composition root and continues to instantiate/pause the DEBUG-only `AgentChatStressHarness`. This is wiring only; harness implementation lives under Diagnostics.
@@ -168,6 +191,7 @@ The guardrail script verifies:
 - `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
+- no target uses an Objective-C bridging header (`-import-objc-header`), and the retired `Sources/RepoPrompt/Support` directory stays absent;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
 - the RepoPrompt `SwiftTreeSitter` fork revision, exact runtime, and complete grammar requirement/resolved-revision set remain pinned in `Package.swift` and `Package.resolved`, `RepoPromptCodeMapCore` imports the grammar modules directly, `SyntaxManager` retains direct `SwiftTreeSitter` linkage for query compilation and validation, retired local grammar directories remain absent, and the narrow `TreeSitterScannerSupport` target contains only its approved exact-snapshot files with matching checksums;

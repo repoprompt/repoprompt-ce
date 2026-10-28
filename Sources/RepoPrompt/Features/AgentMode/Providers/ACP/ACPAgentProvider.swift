@@ -1,12 +1,6 @@
 import Foundation
-
-enum ACPProviderID: String, Codable, Hashable {
-    case openCode
-    case cursor
-    case grokBuild
-    case antigravity
-    case devin
-}
+import RepoPromptProcess
+import RepoPromptSettingsCore
 
 enum ACPSupportResult: Equatable {
     case supported
@@ -28,18 +22,26 @@ struct ACPDiscoveredSessionModels: Equatable {
     /// The session's active reasoning effort (e.g. Grok's `_meta.reasoningEffort`), when the
     /// provider advertises one. Lets the controller skip redundant effort mutations.
     var currentEffortRaw: String?
+    /// Ephemeral provenance copied from the controller's existing inbound sequence for an
+    /// applicable direct effort report (including an unresolvable report). Bootstrap/warmed
+    /// effort has no report provenance and cannot confirm a subsequent mutation.
+    var currentEffortInboundSequence: UInt64?
     var modelParameterSets: [ACPModelParameterSet]
+    /// False only for persisted model-only records written before parameter discovery.
+    var hasModelParameterMetadata: Bool
 
     init(
         options: [AgentModelOption],
         currentModelRaw: String?,
         currentEffortRaw: String? = nil,
-        modelParameterSets: [ACPModelParameterSet] = []
+        modelParameterSets: [ACPModelParameterSet] = [],
+        hasModelParameterMetadata: Bool = true
     ) {
         self.options = options
         self.currentModelRaw = currentModelRaw
         self.currentEffortRaw = currentEffortRaw
         self.modelParameterSets = modelParameterSets
+        self.hasModelParameterMetadata = hasModelParameterMetadata
     }
 
     var preferredModelRaw: String? {
@@ -122,7 +124,7 @@ struct ACPRunRequest {
     let modelString: String?
     let workspacePath: String?
     let resumeSessionID: String?
-    let attachments: [AgentImageAttachment]
+    let attachments: [AgentFileAttachment]
     let taskLabelKind: AgentModelCatalog.TaskLabelKind?
     let sessionModeID: String?
     let autoApproveAllToolPermissions: Bool
@@ -137,7 +139,7 @@ struct ACPRunRequest {
         modelString: String?,
         workspacePath: String?,
         resumeSessionID: String?,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         sessionModeID: String? = nil,
         autoApproveAllToolPermissions: Bool = false,
@@ -178,6 +180,8 @@ struct ACPLaunchConfiguration: Equatable {
     let enableDebugLogging: Bool
     let cleanupArtifact: ACPLaunchCleanupArtifact?
     let expectedExecutableIdentity: ExecutableFileIdentity?
+    /// Names of intentional launch additions, excluding any copied ambient snapshot.
+    let explicitEnvironmentKeys: Set<String>
 
     init(
         providerID: ACPProviderID,
@@ -188,7 +192,8 @@ struct ACPLaunchConfiguration: Equatable {
         additionalPathHints: [String],
         enableDebugLogging: Bool,
         cleanupArtifact: ACPLaunchCleanupArtifact? = nil,
-        expectedExecutableIdentity: ExecutableFileIdentity? = nil
+        expectedExecutableIdentity: ExecutableFileIdentity? = nil,
+        explicitEnvironmentKeys: Set<String>? = nil
     ) {
         self.providerID = providerID
         self.command = command
@@ -199,6 +204,7 @@ struct ACPLaunchConfiguration: Equatable {
         self.enableDebugLogging = enableDebugLogging
         self.cleanupArtifact = cleanupArtifact
         self.expectedExecutableIdentity = expectedExecutableIdentity
+        self.explicitEnvironmentKeys = explicitEnvironmentKeys ?? []
     }
 }
 
@@ -208,9 +214,32 @@ struct ACPSessionConfiguration: Equatable {
         case load(existingSessionID: String)
     }
 
+    struct PostOpenNotification: Equatable {
+        let method: String
+        let params: [String: AgentJSONValue]
+    }
+
     let mode: Mode
     let workingDirectory: String
     let mcpServers: [RepoPromptMCPServerConfiguration]
+    /// Provider-owned `_meta` on every session-open attempt; empty means omit the key.
+    let metadata: [String: AgentJSONValue]
+    /// Sent once after successful opening (including fallback), before the first prompt.
+    let postOpenNotification: PostOpenNotification?
+
+    init(
+        mode: Mode,
+        workingDirectory: String,
+        mcpServers: [RepoPromptMCPServerConfiguration],
+        metadata: [String: AgentJSONValue] = [:],
+        postOpenNotification: PostOpenNotification? = nil
+    ) {
+        self.mode = mode
+        self.workingDirectory = workingDirectory
+        self.mcpServers = mcpServers
+        self.metadata = metadata
+        self.postOpenNotification = postOpenNotification
+    }
 }
 
 enum NormalizedAgentRuntimeEvent {
@@ -288,6 +317,13 @@ struct ACPDirectModelSelectionRequest {
     var expectedConfirmationModelRaw: String
 }
 
+/// A report applies to the advertised base named in the same update. A nil effort means
+/// the report was applicable but unresolvable; a nil report means no applicable update.
+struct ACPDirectSessionEffortReport {
+    let baseModelRaw: String
+    let effortRaw: String?
+}
+
 /// Bounded capability for ACP providers that advertise session models outside the
 /// modern `configOptions` contract (e.g. Grok's top-level `SessionModelState`) and
 /// apply selections through a provider-specific RPC instead of
@@ -299,6 +335,12 @@ protocol ACPDirectSessionModelProvider: Sendable {
     func parseDirectSessionModelSnapshot(
         from sessionResponse: [String: Any]
     ) -> ACPProviderModelSnapshotResult
+
+    func parseDirectSessionEffortReport(
+        from configOptions: [[String: Any]],
+        sessionID: String,
+        options: [AgentModelOption]
+    ) -> ACPDirectSessionEffortReport?
 
     /// Builds the provider's selection RPC from STRUCTURED parts. The controller
     /// decomposes and validates the selection against the advertised snapshot; the
@@ -332,6 +374,12 @@ protocol ACPAgentProvider: Sendable {
     func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async
     func normalizeError(_ error: Error) -> Error
 
+    /// Recognizes a provider-owned response ID only. After ordinary request correlation fails,
+    /// the controller requires only a string `id` and no `method` before consulting this hook.
+    /// Keep this synchronous and side-effect-free.
+    /// This must be a protocol requirement so calls through an existential reach overrides.
+    func recognizesUnmatchedResponseID(_ id: String) -> Bool
+
     /// Opts a provider into ACP's parameterized model picker capability and classifies
     /// provider-owned select options without changing their exact wire identity.
     var supportsParameterizedModelPicker: Bool { get }
@@ -344,6 +392,10 @@ protocol ACPAgentProvider: Sendable {
 }
 
 extension ACPAgentProvider {
+    func recognizesUnmatchedResponseID(_: String) -> Bool {
+        false
+    }
+
     var supportsParameterizedModelPicker: Bool {
         false
     }

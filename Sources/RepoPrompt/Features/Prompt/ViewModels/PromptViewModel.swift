@@ -1,18 +1,11 @@
 import Combine
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptInstrumentation
+import RepoPromptSettingsCore
+import RepoPromptVCS
 import SwiftUI
-
-enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
-    case auto = "Auto"
-    case files = "Full"
-    case selected = "Selected"
-    case none = "None"
-
-    var id: String {
-        rawValue
-    }
-}
 
 /// Errors that can occur when publishing git diff artifacts
 enum GitArtifactPublishError: LocalizedError {
@@ -89,12 +82,7 @@ class PromptViewModel: ObservableObject {
 
     // MARK: - Type Definitions and Enums
 
-    enum PlanActMode: String, CaseIterable, Codable {
-        case chat = "Chat"
-        case plan = "Plan"
-        case edit = "Edit"
-        case review = "Review"
-    }
+    typealias PlanActMode = SettingsPlanActMode
 
     enum FileEditFormat: String, CaseIterable {
         case diff = "Diff"
@@ -284,6 +272,12 @@ class PromptViewModel: ObservableObject {
         case rejected(
             AgentAdmissionPersistenceReceipt,
             AgentSessionLifecycleAuthority.RejectionReason
+        )
+        case recoveryRequired(
+            AgentProvisionalAdmissionIdentity,
+            AgentAdmissionPersistenceReceipt,
+            AgentSessionLifecycleAuthority.RejectionReason,
+            AgentAdmissionRecoveryOutcome
         )
     }
 
@@ -550,7 +544,9 @@ class PromptViewModel: ObservableObject {
     @Published var contextBuilderAgent: AgentProviderKind = .claudeCode {
         didSet {
             guard oldValue != contextBuilderAgent else { return }
-            if isSyncingSettings { return }
+            if isSyncingSettings {
+                return
+            }
             if !isContextBuilderModelRawValidForAgent(contextBuilderAgentModelRaw, agent: contextBuilderAgent) {
                 contextBuilderAgentModelRaw = defaultModelRaw(for: contextBuilderAgent)
             }
@@ -569,7 +565,9 @@ class PromptViewModel: ObservableObject {
                 contextBuilderAgentModelRaw = effectiveRaw
                 return
             }
-            if isSyncingSettings { return }
+            if isSyncingSettings {
+                return
+            }
             if !isContextBuilderModelRawValidForAgent(effectiveRaw, agent: contextBuilderAgent) {
                 contextBuilderAgentModelRaw = defaultModelRaw(for: contextBuilderAgent)
                 return
@@ -674,7 +672,9 @@ class PromptViewModel: ObservableObject {
     @Published var planActMode: PlanActMode = .chat {
         didSet {
             guard oldValue != planActMode else { return }
-            if isSyncingSettings { return }
+            if isSyncingSettings {
+                return
+            }
             guard let workspaceID = currentWorkspaceID else { return }
 
             var settings = settingsManager.chatSettings(for: workspaceID)
@@ -740,7 +740,9 @@ class PromptViewModel: ObservableObject {
     }
 
     private func targetFileEditFormat(for model: AIModel) -> FileEditFormat {
-        if fileEditFormat == .none { return .none }
+        if fileEditFormat == .none {
+            return .none
+        }
         return model.isModelCapableOfDiff ? fileEditFormat : .whole
     }
 
@@ -861,6 +863,47 @@ class PromptViewModel: ObservableObject {
 
     /// The saved `.thinking` pin value for the current Context Builder selection, if any. The
     /// chip's saved-state input.
+    func cursorContextBuilderMenuItems(options: [AgentModelOption], canApply: @escaping () -> Bool = { true }) -> [StableMenuItem] {
+        let expectedScope = currentAgentModelsEditingScope
+        let expectedAgent = contextBuilderAgent
+        let expectedModel = contextBuilderAgentModelRaw
+        let expectedPersisted = resolvedPersistedContextBuilderSelection()
+        let pins = currentAgentModelsProfile().contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+        return AgentModelStableMenuItems.cursorModelItems(
+            options: options,
+            selectedModelRaw: expectedAgent == .cursor ? expectedModel : "",
+            selections: pins,
+            onSelectModel: { [weak self] option in
+                guard let self, canApply(), currentAgentModelsEditingScope == expectedScope,
+                      resolvedPersistedContextBuilderSelection() == expectedPersisted,
+                      contextBuilderAgent == expectedAgent, contextBuilderAgentModelRaw == expectedModel else { return }
+                contextBuilderAgent = .cursor
+                selectContextBuilderAgentModel(rawModel: option.rawValue)
+                commitContextBuilderSettings()
+            },
+            onSelectParameter: { [weak self] option, parameter in
+                guard let self, canApply(), currentAgentModelsEditingScope == expectedScope,
+                      resolvedPersistedContextBuilderSelection() == expectedPersisted,
+                      contextBuilderAgent == expectedAgent, contextBuilderAgentModelRaw == expectedModel else { return }
+                let existing = currentAgentModelsProfile().contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                settingsManager.setAgentModelsContextBuilderModelParameter(
+                    ACPModelParameterSelection.normalized(existing + [parameter]),
+                    agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue, scope: expectedScope
+                )
+            },
+            onClearParameter: { [weak self] option, identity in
+                guard let self, canApply(), currentAgentModelsEditingScope == expectedScope,
+                      resolvedPersistedContextBuilderSelection() == expectedPersisted,
+                      contextBuilderAgent == expectedAgent, contextBuilderAgentModelRaw == expectedModel else { return }
+                let existing = currentAgentModelsProfile().contextBuilderModelParametersByAgent?[AgentProviderKind.cursor.rawValue] ?? []
+                settingsManager.setAgentModelsContextBuilderModelParameter(
+                    existing.filter { $0.identity != identity },
+                    agentRaw: AgentProviderKind.cursor.rawValue, modelRaw: option.rawValue, scope: expectedScope
+                )
+            }
+        )
+    }
+
     var contextBuilderThinkingParameterValueRaw: String? {
         contextBuilderModelParameters.last { $0.kind == .thinking }?.valueRaw
     }
@@ -886,7 +929,9 @@ class PromptViewModel: ObservableObject {
             guard oldValue != fileTreeOption else { return }
             // Recompute file-tree tokens regardless of sync state
             tokenCountingViewModel.markDirty(.fileTree)
-            if isSyncingSettings { return }
+            if isSyncingSettings {
+                return
+            }
             guard let workspaceID = currentWorkspaceID else { return }
 
             var settings = settingsManager.copySettings(for: workspaceID)
@@ -965,7 +1010,9 @@ class PromptViewModel: ObservableObject {
     @Published var fileTreeOptionForChat: FileTreeOption = .auto {
         didSet {
             guard oldValue != fileTreeOptionForChat else { return }
-            if isSyncingSettings { return }
+            if isSyncingSettings {
+                return
+            }
             guard let workspaceID = currentWorkspaceID else { return }
 
             var settings = settingsManager.chatSettings(for: workspaceID)
@@ -990,7 +1037,9 @@ class PromptViewModel: ObservableObject {
             // Always refresh codemap tokens when chat usage changes
             tokenCountingViewModel.markDirty(.codeMap)
 
-            if isSyncingSettings { return }
+            if isSyncingSettings {
+                return
+            }
             guard let workspaceID = currentWorkspaceID else { return }
 
             var settings = settingsManager.chatSettings(for: workspaceID)
@@ -1011,7 +1060,9 @@ class PromptViewModel: ObservableObject {
     @Published var gitDiffInclusionModeForChat: GitDiffInclusionMode = .none {
         didSet {
             guard oldValue != gitDiffInclusionModeForChat else { return }
-            if isSyncingSettings { return }
+            if isSyncingSettings {
+                return
+            }
             guard let workspaceID = currentWorkspaceID else { return }
 
             var settings = settingsManager.chatSettings(for: workspaceID)
@@ -1609,7 +1660,8 @@ class PromptViewModel: ObservableObject {
     /// and is safe to auto-upgrade to the current canonical version.
     private var previousCanonicalBuiltIns: [UUID: [StoredPrompt]] {
         [
-            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4]
+            architectPrompt.id: [previousArchitectPromptV1, previousArchitectPromptV2, previousArchitectPromptV3, previousArchitectPromptV4],
+            reviewPrompt.id: [previousReviewPromptV2, previousReviewPromptV3]
         ]
     }
 
@@ -1618,7 +1670,7 @@ class PromptViewModel: ObservableObject {
         _ stored: StoredPrompt,
         canonical: StoredPrompt,
         promptID: BuiltInPromptID,
-        registry: BuiltInPromptRegistry = .shared
+        registry: BuiltInPromptRegistry = AppDomainRuntimeComposition.shared.builtInPromptRegistry
     ) -> Bool {
         stored.id == canonical.id && stored.title == canonical.title
             && registry.previousCanonicalTexts(promptID).contains(stored.content)
@@ -1991,7 +2043,7 @@ class PromptViewModel: ObservableObject {
     let architectPrompt = StoredPrompt(
         id: UUID(uuidString: "8E81AAC2-79CE-4897-A59E-EFD81EEBB7E9")!,
         title: "[Architect]",
-        content: BuiltInPromptRegistry.shared.text(.oraclePlan)
+        content: AppDomainRuntimeComposition.shared.builtInPromptRegistry.text(.oraclePlan)
     )
 
     private let engineerPrompt = StoredPrompt(
@@ -2083,11 +2135,100 @@ class PromptViewModel: ObservableObject {
         """
     )
 
-    /// Current canonical `[Review]` prompt. The body is the `oracle-review` built-in resource.
-    private let reviewPrompt = StoredPrompt(
+    /// Review prompt v2, kept verbatim so unedited copies upgrade to the current version.
+    let previousReviewPromptV2 = StoredPrompt(
         id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
         title: "[Review]",
-        content: BuiltInPromptRegistry.shared.text(.oracleReview)
+        content: """
+        You are reviewing code changes with git diffs included in the prompt. The git diff shows what changed; the file contents show full context. Use both.
+
+        **Review Criteria:**
+
+        1. **Correctness & Safety**:
+        \t- Do the changes achieve their intended purpose without regressions?
+        \t- Are edge cases and error paths handled?
+        \t- Any security vulnerabilities, race conditions, or resource leaks?
+        \t- Any breaking changes to APIs or contracts?
+
+        2. **Design & Complexity**:
+        \t- Do changes increase coupling or reduce separation of concerns?
+        \t- Is new complexity justified, or can the same result be achieved more simply?
+        \t- Are there DRY violations — duplicated logic that should be extracted?
+        \t- Do abstractions sit at the right level (not too early, not too late)?
+
+        3. **Intentionality**:
+        \t- Does every change have a clear purpose? Flag accidental modifications or dead code.
+        \t- Are the changes minimal and focused, or is scope creeping in?
+
+        **Severity Levels — be disciplined about classification:**
+        - **P0 (Must fix)**: Bugs, data loss, security holes, crashes — things that break correctness.
+        - **P1 (Should fix)**: Design issues that will compound — poor separation of concerns, growing complexity, DRY violations, missing error handling for reachable paths.
+        - **P2 (Consider)**: Style, naming, minor refactoring opportunities, test coverage gaps.
+
+        Most findings should be P1 or P2. Reserve P0 for genuinely broken behavior.
+
+        **Output Format:**
+        1. One-paragraph summary of what the changes accomplish.
+        2. Findings grouped by severity (P0 → P1 → P2), each with: file reference, what's wrong, and a concrete suggestion. Omit empty severity groups.
+        3. If no issues found at a severity level, skip it — don't pad the review.
+        """
+    )
+
+    /// Exact pre-merge v3 prompt used by local debug builds; only unedited copies auto-upgrade.
+    let previousReviewPromptV3 = StoredPrompt(
+        id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
+        title: "[Review]",
+        content: """
+        You are reviewing code changes with git diffs included in the prompt. The git diff shows what changed; the file contents show full context. Use both.
+
+        Your review may be one of several independent reviews of the same change that another agent will reconcile, so make every finding self-contained and comparable.
+
+        **Review Criteria:**
+
+        1. **Correctness & Safety**:
+        \t- Do the changes achieve their intended purpose without regressions?
+        \t- Are edge cases and error paths handled?
+        \t- Any security vulnerabilities, race conditions, or resource leaks?
+        \t- Any breaking changes to APIs or contracts?
+
+        2. **Design & Complexity**:
+        \t- Do changes increase coupling or reduce separation of concerns?
+        \t- Is new complexity justified, or can the same result be achieved more simply?
+        \t- Are there DRY violations — duplicated logic that should be extracted?
+        \t- Do abstractions sit at the right level (not too early, not too late)?
+
+        3. **Intentionality**:
+        \t- Does every change have a clear purpose? Flag accidental modifications or dead code.
+        \t- Are the changes minimal and focused, or is scope creeping in?
+
+        **Severity Levels — be disciplined about classification:**
+        - **P0 (Must fix)**: Bugs, data loss, security holes, crashes — things that break correctness.
+        - **P1 (Should fix)**: Design issues that will compound — poor separation of concerns, growing complexity, DRY violations, missing error handling for reachable paths.
+        - **P2 (Consider)**: Style, naming, minor refactoring opportunities, test coverage gaps.
+
+        Most findings should be P1 or P2. Reserve P0 for genuinely broken behavior.
+
+        **Each finding must include:**
+        \t- **Location**: file and line or symbol.
+        \t- **Problem**: what is wrong and the condition that triggers it.
+        \t- **Evidence**: what in the diff or code shows it; say when it is inferred rather than shown.
+        \t- **Fix**: the smallest concrete correction.
+        \t- **Confidence**: Confirmed, Likely, or Speculative.
+
+        Merge findings that share a root cause. Do not claim tests or runtime checks you did not perform.
+
+        **Output Format:**
+        1. One-paragraph summary of what the changes accomplish.
+        2. Findings grouped by severity (P0 → P1 → P2), in the format above. Omit empty severity groups and don't pad the review; keep minor style notes brief and file them as P2.
+        3. End with a single line: `Verdict: <No findings | Approve with fixes | Request changes> — <one-sentence reason>`.
+        """
+    )
+
+    /// Current canonical `[Review]` prompt. The body is the `oracle-review` built-in resource.
+    let reviewPrompt = StoredPrompt(
+        id: UUID(uuidString: "D7F1B2E4-3C5A-6B8D-CF8E-1F5D0E2A4C6B")!,
+        title: "[Review]",
+        content: AppDomainRuntimeComposition.shared.builtInPromptRegistry.text(.oracleReview)
     )
 
     private let mcpAgentPrompt = StoredPrompt(
@@ -2157,11 +2298,14 @@ class PromptViewModel: ObservableObject {
     private let settingsManager: SettingsManaging
     private let storedPromptPersistence: any StoredPromptPersistenceServing
     private let promptClipboardPasteboard: NSPasteboard
+    private let perfRecorder: any AgentModePerfRecording
 
     #if DEBUG
         var clipboardContentBuilderOverrideForTesting: (() async -> String?)?
         var clipboardCommitCompletionForTesting: ((Bool) -> Void)?
     #endif
+
+    private var initialModelRefreshTask: Task<Void, Never>?
 
     init(
         fileManager: WorkspaceFilesViewModel,
@@ -2171,7 +2315,8 @@ class PromptViewModel: ObservableObject {
         settingsManager: SettingsManaging,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         promptClipboardPasteboard: NSPasteboard = .general,
-        refreshAvailableModelsOnInit: Bool = true
+        refreshAvailableModelsOnInit: Bool = true,
+        perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2181,6 +2326,7 @@ class PromptViewModel: ObservableObject {
         self.settingsManager = settingsManager
         self.storedPromptPersistence = storedPromptPersistence ?? StoredPromptPersistenceService()
         self.promptClipboardPasteboard = promptClipboardPasteboard
+        self.perfRecorder = perfRecorder
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -2194,8 +2340,9 @@ class PromptViewModel: ObservableObject {
         updateFileTree()
 
         if refreshAvailableModelsOnInit {
-            Task {
-                await self.refreshAvailableModels()
+            initialModelRefreshTask = Task { [weak self] in
+                guard let self else { return }
+                await refreshAvailableModels()
             }
         }
 
@@ -2269,6 +2416,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$autoCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -2279,6 +2431,11 @@ class PromptViewModel: ObservableObject {
             .store(in: &cancellables)
 
         fileManager.$manualCodemapFiles
+            // Root/selection reconciliation can republish an unchanged list while a save is
+            // being prepared; only a real change may invalidate it. Dedupe before dropFirst
+            // so the initial value is the comparison baseline.
+            .map { $0.map(\.fullPath) }
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -2336,6 +2493,10 @@ class PromptViewModel: ObservableObject {
 
         // Observe git diff inclusion mode changes
         gitViewModel.$gitDiffInclusionMode
+            // Workspace settings sync can reassign the current mode while a save is
+            // being prepared. Only a changed mode may invalidate that capture.
+            // Keep the initial value as the comparison baseline before dropping it.
+            .removeDuplicates()
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -2549,7 +2710,7 @@ class PromptViewModel: ObservableObject {
         let issues = await notifyComposeTabsDidRemove(tabIDs, reason: reason, workspaceID: workspaceID)
         #if DEBUG
             for tabID in tabIDs {
-                AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
+                perfRecorder.markSidebarDeleteFullCleanupComplete(
                     tabID: tabID,
                     source: "PromptViewModel.runPostProjectionComposeTabCleanup",
                     fields: ["reason": String(describing: reason)]
@@ -2713,12 +2874,18 @@ class PromptViewModel: ObservableObject {
             let activeIdx = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == activeID })
         else { return }
 
-        let currentName = manager.workspaces[index].composeTabs[activeIdx].name
+        let storedTab = manager.workspaces[index].composeTabs[activeIdx]
         let snapshot = manager.collectComposeTabSnapshot(
-            name: currentName,
-            base: manager.workspaces[index].composeTabs[activeIdx]
+            name: storedTab.name,
+            base: storedTab
         )
-        manager.workspaces[index].composeTabs[activeIdx] = snapshot
+        // `collectComposeTabSnapshot` always stamps a fresh `lastModified`. Leaving a tab without
+        // editing it is not a modification: a timestamp-only write re-dated the outgoing session's
+        // sidebar row and forced a full sidebar row rebuild on every switch (#1373).
+        var timestampNeutral = snapshot
+        timestampNeutral.lastModified = storedTab.lastModified
+        guard timestampNeutral != storedTab else { return }
+        _ = manager.updateStoredComposeTabSnapshot(snapshot, workspaceID: manager.workspaces[index].id)
     }
 
     /// Flush pending editor state and snapshot the active tab before transitioning away.
@@ -2734,6 +2901,19 @@ class PromptViewModel: ObservableObject {
             userInfo: ["windowID": windowID]
         )
         snapshotActiveComposeTabIfNeeded(in: manager, workspaceIndex: index)
+    }
+
+    /// Preserve the active editor before a sidebar mutation republishes workspace carriers without
+    /// selecting another tab. This is an in-memory boundary, independent of save eligibility.
+    @MainActor
+    func flushActiveComposeTabBeforeWorkspaceMutation(workspaceID: UUID) -> Bool {
+        guard let manager = workspaceManager,
+              manager.activeWorkspaceID == workspaceID,
+              let index = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+              manager.workspaces[index].activeComposeTabID == activeComposeTabID
+        else { return false }
+        flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
+        return manager.activeWorkspaceID == workspaceID
     }
 
     @MainActor
@@ -2789,7 +2969,8 @@ class PromptViewModel: ObservableObject {
     private func createComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
         name: String? = nil,
-        blankAgentSessionID: UUID? = nil
+        freshAgentSessionID: UUID? = nil,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ForegroundComposeTabCreationResult {
         guard
             let manager = workspaceManager,
@@ -2803,7 +2984,7 @@ class PromptViewModel: ObservableObject {
             explicitName: name,
             workspaceIndex: index,
             manager: manager,
-            blankAgentSessionID: blankAgentSessionID
+            freshAgentSessionID: freshAgentSessionID
         ) else { return .failed }
 
         // Flush pending editor state and snapshot current tab before switching
@@ -2811,6 +2992,7 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
+        guard onCreated?(newTab) ?? true else { return .failed }
         manager.workspaces[index].composeTabs.append(newTab)
         await withComposeTabActivationSnapshotSuspended(targetTabID: newTab.id, manager: manager) {
             manager.workspaces[index].activeComposeTabID = newTab.id
@@ -2839,18 +3021,41 @@ class PromptViewModel: ObservableObject {
 
     @discardableResult
     @MainActor
-    func createBlankComposeTab(createAgentSession: Bool = false) async -> ForegroundComposeTabCreationResult {
-        let blankAgentSessionID = createAgentSession ? UUID() : nil
-        return await createComposeTab(strategy: .blank, blankAgentSessionID: blankAgentSessionID)
+    func createBlankComposeTab(
+        createAgentSession: Bool = false,
+        onAgentSessionCreated: (@MainActor (ComposeTabState, AgentSessionCreationClaim) -> Bool)? = nil
+    ) async -> ForegroundComposeTabCreationResult {
+        let creation: AgentSessionCreationClaim?
+        if createAgentSession {
+            guard let workspaceID = workspaceManager?.activeWorkspaceID else { return .failed }
+            creation = AgentSessionCreationClaim(workspaceID: workspaceID)
+        } else {
+            creation = nil
+        }
+        return await createComposeTab(strategy: .blank, freshAgentSessionID: creation?.sessionID) { tab in
+            if let creation { return onAgentSessionCreated?(tab, creation) ?? false }
+            return true
+        }
     }
 
     /// Create a fork-duplicate tab in the background (without switching to it).
     /// Copies all compose tab state (selection, prompt, expansions, overrides, etc.)
-    /// but clears agent and chat session bindings so the forked tab gets fresh sessions.
+    /// but replaces agent and chat bindings so the forked tab gets fresh sessions.
+    /// A creation owner may provide its allocated Agent identity before the tab is published.
     /// - Parameter sourceTabID: The specific tab to duplicate. Avoids racing with active-tab changes.
     @MainActor
-    func createBackgroundForkComposeTab(sourceTabID: UUID, named name: String? = nil) async -> ComposeTabState? {
-        await createBackgroundComposeTab(strategy: .forkDuplicate(sourceTabID: sourceTabID), name: name)
+    func createBackgroundForkComposeTab(
+        sourceTabID: UUID, named name: String? = nil,
+        freshAgentSessionID: UUID? = nil,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
+    ) async -> ComposeTabState? {
+        await createBackgroundComposeTab(
+            strategy: .forkDuplicate(sourceTabID: sourceTabID), name: name,
+            freshAgentSessionID: freshAgentSessionID,
+            isMutationContextCurrent: isMutationContextCurrent,
+            onCreated: onCreated
+        )
     }
 
     /// Ensure a tab is active; if the tab does not exist, create a new one with the provided strategy.
@@ -2895,7 +3100,10 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func createBackgroundComposeTab(
         strategy: ComposeTabCreationStrategy = .duplicateCurrent,
-        name: String? = nil
+        name: String? = nil,
+        freshAgentSessionID: UUID? = nil,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async -> ComposeTabState? {
         guard
             let manager = workspaceManager,
@@ -2904,9 +3112,16 @@ class PromptViewModel: ObservableObject {
         else { return nil }
 
         flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
-        guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
+        guard let newTab = makeComposeTab(
+            for: strategy, explicitName: name, workspaceIndex: index, manager: manager,
+            freshAgentSessionID: freshAgentSessionID
+        ) else { return nil }
 
+        // Re-prove delegated authority inside the tab owner, after any preparation and directly
+        // before the first visible mutation. Ordinary human creation has no additional predicate.
+        guard isMutationContextCurrent?() ?? true else { return nil }
         // Append but do NOT change activeComposeTabID
+        guard onCreated?(newTab) ?? true else { return nil }
         manager.workspaces[index].composeTabs.append(newTab)
         // Keep existing active tab; just sync lists
         loadComposeTabsFromWorkspace(manager.workspaces[index])
@@ -2948,7 +3163,8 @@ class PromptViewModel: ObservableObject {
         name: String?,
         sessionID: UUID,
         expectedWorkspaceID: UUID,
-        lifecycleAuthority: AgentSessionLifecycleAuthority
+        lifecycleAuthority: AgentSessionLifecycleAuthority,
+        onCreated: (@MainActor (ComposeTabState) -> Bool)? = nil
     ) async throws -> DurableBackgroundComposeTabCreationResult {
         guard let manager = workspaceManager else {
             return .rejected(
@@ -2960,11 +3176,24 @@ class PromptViewModel: ObservableObject {
             )
         }
 
+        let timing = manager.makeAgentAdmissionTiming()
         return try await manager.withAgentSessionAdmission(
             workspaceID: expectedWorkspaceID,
             admissionID: UUID(),
-            refreshCanonicalState: true
+            refreshCanonicalState: true,
+            kind: .freshTab,
+            classifyOutcome: { (result: DurableBackgroundComposeTabCreationResult) in
+                if case .created = result { return .committed }
+                return .rejected
+            },
+            timing: timing
         ) {
+            if let rejection = try await manager.prepareAgentAdmissionWriteBaseline(workspaceID: expectedWorkspaceID, timing: timing) {
+                return .rejected(
+                    AgentAdmissionPersistenceReceipt(outcome: rejection, commitEvidence: .none),
+                    .workspacePersistenceRejected
+                )
+            }
             guard manager.activeWorkspaceID == expectedWorkspaceID,
                   let index = manager.workspaces.firstIndex(where: { $0.id == expectedWorkspaceID })
             else {
@@ -2992,7 +3221,7 @@ class PromptViewModel: ObservableObject {
                 explicitName: name,
                 workspaceIndex: index,
                 manager: manager,
-                blankAgentSessionID: sessionID
+                freshAgentSessionID: sessionID
             ) else {
                 return .rejected(
                     AgentAdmissionPersistenceReceipt(
@@ -3038,11 +3267,19 @@ class PromptViewModel: ObservableObject {
                 in: manager,
                 workspaceIndex: index
             )
+            guard onCreated?(newTab) ?? true else {
+                return .rejected(
+                    .init(outcome: .rejected(reason: "creation_preparation_changed"), commitEvidence: .none),
+                    .sessionIdentityChanged
+                )
+            }
             manager.workspaces[index].composeTabs.append(newTab)
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             manager.markWorkspaceDirty(workspaceID: expectedWorkspaceID)
 
-            let receipt = await manager.persistAgentAdmission(provisionalIdentity)
+            timing.begin(.save)
+            let receipt = await manager.persistAgentAdmission(provisionalIdentity, timing: timing)
+            timing.end()
             await notifyAgentAdmissionPersistenceReceiptForTesting(
                 provisionalIdentity,
                 receipt: receipt
@@ -3074,14 +3311,9 @@ class PromptViewModel: ObservableObject {
                 return .rejected(receipt, reason)
             case let .recoverWorkspace(reason):
                 guard recoveryClaim.beginWorkspaceRecovery() else {
-                    await rollbackProvisionalAgentSessionTab(
-                        checkpoint: rollbackCheckpoint,
-                        manager: manager
-                    )
-                    if isCancelled {
-                        throw CancellationError()
-                    }
-                    return .rejected(receipt, reason)
+                    // A changed claim does not prove that the canonical identity was removed.
+                    // Preserve its evidence instead of authorizing a second allocation.
+                    return .recoveryRequired(provisionalIdentity, receipt, reason, .ownershipChanged)
                 }
                 let recoveryOutcome = await settleProvisionalAgentAdmissionRecovery(
                     provisionalIdentity,
@@ -3090,18 +3322,23 @@ class PromptViewModel: ObservableObject {
                     manager: manager
                 )
                 let shouldRollbackLocally: Bool
+                let requiresRecoveryEvidence: Bool
                 switch recoveryOutcome {
                 case .recovered, .alreadyRecovered, .localOnly:
                     recoveryClaim.markWorkspaceRecovered()
                     recoveryClaim.markComplete()
                     shouldRollbackLocally = true
+                    requiresRecoveryEvidence = false
                 case .ownershipChanged:
                     recoveryClaim.markComplete()
                     shouldRollbackLocally = true
+                    requiresRecoveryEvidence = true
                 case .retryablePartial:
                     shouldRollbackLocally = true
+                    requiresRecoveryEvidence = true
                 case .failed, .blockedManual:
                     shouldRollbackLocally = false
+                    requiresRecoveryEvidence = true
                 }
                 await notifyAgentAdmissionRecoveryCompletedForTesting(
                     provisionalIdentity,
@@ -3112,6 +3349,11 @@ class PromptViewModel: ObservableObject {
                         checkpoint: rollbackCheckpoint,
                         manager: manager
                     )
+                }
+                if requiresRecoveryEvidence {
+                    // Cancellation cannot erase an unproven rollback. Callers must retain this
+                    // identity even when local projection removal has already completed.
+                    return .recoveryRequired(provisionalIdentity, receipt, reason, recoveryOutcome)
                 }
                 if isCancelled {
                     throw CancellationError()
@@ -3239,7 +3481,14 @@ class PromptViewModel: ObservableObject {
                 do {
                     outcome = try await manager.withAgentSessionAdmission(
                         workspaceID: identity.workspaceID,
-                        admissionID: UUID()
+                        admissionID: UUID(),
+                        kind: .recovery,
+                        classifyOutcome: { result in
+                            switch result {
+                            case .recovered, .alreadyRecovered, .localOnly: .committed
+                            default: .rejected
+                            }
+                        }
                     ) {
                         await manager.recoverProvisionalAgentAdmission(identity)
                     }
@@ -3576,13 +3825,32 @@ class PromptViewModel: ObservableObject {
         // Flush pending editor state and snapshot current tab before switching
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
+        let switchingWasInProgress = isSwitchingComposeTab
+        var startedApply = false
+        defer {
+            // Restore only after the wrapper's cleanup, including a refused reselect of the
+            // older apply's same tab. The refusal path has not started another asynchronous apply.
+            if !startedApply { isSwitchingComposeTab = switchingWasInProgress }
+        }
         await withComposeTabSwitching(targetTabID: id) {
             await withComposeTabActivationSnapshotSuspended(targetTabID: id, manager: manager) {
-                manager.workspaces[index].activeComposeTabID = id
+                guard manager.activeWorkspaceID == workspace.id,
+                      manager.composeTabCarrierWorkspace(workspaceID: workspace.id)?.workspace.composeTabs.contains(where: { $0.id == id }) == true,
+                      manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: id),
+                      manager.activeWorkspaceID == workspace.id,
+                      manager.composeTabCarrierWorkspace(workspaceID: workspace.id)?.workspace.activeComposeTabID == id
+                else { return }
                 activeComposeTabID = id
-
-                loadComposeTabsFromWorkspace(manager.workspaces[index])
-                guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
+                guard manager.activeWorkspaceID == workspace.id,
+                      let selected = manager.composeTabCarrierWorkspace(workspaceID: workspace.id),
+                      selected.workspace.activeComposeTabID == id
+                else { return }
+                loadComposeTabsFromWorkspace(selected.workspace)
+                guard manager.activeWorkspaceID == workspace.id, activeComposeTabID == id,
+                      let current = manager.composeTabCarrierWorkspace(workspaceID: workspace.id),
+                      current.workspace.activeComposeTabID == id,
+                      let target = current.workspace.composeTabs.first(where: { $0.id == id })
+                else { return }
 
                 activeTabApplyTask?.cancel()
                 let applyGeneration = UUID()
@@ -3595,6 +3863,7 @@ class PromptViewModel: ObservableObject {
                 activeTabApplyTask = task
                 activeTabApplyTaskTabID = id
                 activeTabApplyTaskGeneration = applyGeneration
+                startedApply = true
                 await task.value
                 if activeTabApplyTaskGeneration == applyGeneration {
                     activeTabApplyTask = nil
@@ -3610,22 +3879,19 @@ class PromptViewModel: ObservableObject {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let manager = workspaceManager,
-              let workspace = manager.activeWorkspace,
-              let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-              let tabIndex = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == id }) else { return }
-        manager.workspaces[index].composeTabs[tabIndex].name = trimmed
-        manager.workspaces[index].composeTabs[tabIndex].lastModified = Date()
+              let workspace = manager.activeWorkspace else { return }
+        let changed = manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [id]) { _, tab in
+            tab.name = trimmed
+            tab.lastModified = Date()
+        }
+        guard changed.contains(id) else { return }
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        if let current = manager.activeWorkspace { loadComposeTabsFromWorkspace(current) }
         NotificationCenter.default.post(
             name: .composeTabNameChanged,
             object: nil,
-            userInfo: [
-                "tabID": id,
-                "windowID": windowID,
-                "name": trimmed
-            ]
+            userInfo: ["tabID": id, "windowID": windowID, "name": trimmed]
         )
     }
 
@@ -3794,12 +4060,18 @@ class PromptViewModel: ObservableObject {
     func stashComposeTabs(
         withIDs ids: Set<UUID>,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
+        postPreflightValidation: (@MainActor () -> Bool)? = nil,
+        expandCascade: Bool = true,
+        validateOnly: Bool = false,
         onProjectionRemovalCommitted: ComposeTabsProjectionRemovalCallback? = nil
     ) async -> ComposeTabMutationReport {
         await removeComposeTabs(
             withIDs: ids,
             reason: .stash,
+            expandCascade: expandCascade,
             isMutationContextCurrent: isMutationContextCurrent,
+            postPreflightValidation: postPreflightValidation,
+            validateOnly: validateOnly,
             onProjectionRemovalCommitted: onProjectionRemovalCommitted
         )
     }
@@ -3808,12 +4080,15 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func closeComposeTab(
         _ id: UUID,
+        deletionOrigin: AgentSessionDeletionOrigin = .current,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) async -> ComposeTabMutationReport {
-        await removeComposeTabs(
-            withIDs: [id],
-            isMutationContextCurrent: isMutationContextCurrent
-        )
+        await AgentSessionDeletionOrigin.currentTaskLocal.withValue(deletionOrigin) {
+            await removeComposeTabs(
+                withIDs: [id],
+                isMutationContextCurrent: isMutationContextCurrent
+            )
+        }
     }
 
     @MainActor
@@ -3854,6 +4129,7 @@ class PromptViewModel: ObservableObject {
         expandCascade: Bool = true,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil,
         postPreflightValidation: (@MainActor () -> Bool)? = nil,
+        validateOnly: Bool = false,
         onProjectionRemovalCommitted: ComposeTabsProjectionRemovalCallback? = nil
     ) async -> ComposeTabMutationReport {
         guard !ids.isEmpty else {
@@ -4012,6 +4288,9 @@ class PromptViewModel: ObservableObject {
                 message: "The active tab targets changed during preflight."
             )
         }
+        // Validation-only callers stop here: the required flush and every CAS re-check ran, but no
+        // tab, stashed-row, binding, or listener state has been touched.
+        if validateOnly { return report }
         let fallbackActiveID: UUID? = {
             guard let previousActiveID = manager.workspaces[index].activeComposeTabID,
                   tabsBeingClosed.contains(previousActiveID) else { return nil }
@@ -4023,15 +4302,16 @@ class PromptViewModel: ObservableObject {
         {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
+        var stashedTabs = manager.workspaces[index].stashedTabs
         if reason == .stash {
             let refreshedTabs = manager.workspaces[index].composeTabs
             for tabID in tabsBeingClosed {
                 guard let refreshedTab = refreshedTabs.first(where: { $0.id == tabID }) else { continue }
                 let stashedTab = StashedTab(tab: refreshedTab)
-                if let existingIndex = manager.workspaces[index].stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
-                    manager.workspaces[index].stashedTabs[existingIndex] = stashedTab
+                if let existingIndex = stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
+                    stashedTabs[existingIndex] = stashedTab
                 } else {
-                    manager.workspaces[index].stashedTabs.append(stashedTab)
+                    stashedTabs.append(stashedTab)
                 }
             }
             tabs = refreshedTabs
@@ -4049,20 +4329,41 @@ class PromptViewModel: ObservableObject {
             }
             return report
         }
+        let previousActiveID = manager.workspaces[index].activeComposeTabID
+        // Publish the active/stashed transition once through the workspace owner. The retained
+        // catalog can be large; unrelated carrier positions are unchanged by this local edit.
+        guard manager.replaceComposeTabCarriers(
+            workspaceID: workspace.id, composeTabs: tabs, stashedTabs: stashedTabs
+        ) else {
+            return rejection(.mutationContextChanged, message: "The workspace changed before tab removal.")
+        }
         report.removedComposeTabIDs.formUnion(tabsBeingClosed)
-
         dirtyTabIDs.subtract(resolvedIDs)
 
-        let previousActiveID = manager.workspaces[index].activeComposeTabID
-        manager.workspaces[index].composeTabs = tabs
-
+        func currentRemovalOwner() -> (index: Int, workspace: WorkspaceModel)? {
+            guard manager.activeWorkspaceID == workspace.id else { return nil }
+            return manager.composeTabCarrierWorkspace(workspaceID: workspace.id)
+        }
+        func supersededContinuation() -> ComposeTabMutationReport {
+            // The removal publication already happened. Preserve that receipt while refusing
+            // to apply selection or editor state through a replacement owner.
+            report.cleanupIssues.append(contentsOf: tabsBeingClosed.map {
+                ComposeTabPostRemovalIssue(tabID: $0, reason: reason, message: "The workspace changed after tab removal.")
+            })
+            return report
+        }
+        guard let published = currentRemovalOwner(),
+              published.workspace.composeTabs == tabs, published.workspace.stashedTabs == stashedTabs,
+              published.workspace.activeComposeTabID == previousActiveID
+        else { return supersededContinuation() }
         if tabs.isEmpty {
-            await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
-            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: published.index)
+            guard let current = currentRemovalOwner() else { return supersededContinuation() }
+            loadComposeTabsFromWorkspace(current.workspace)
             onProjectionRemovalCommitted?(tabsBeingClosed)
             #if DEBUG
                 for tabID in tabsBeingClosed {
-                    AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                    perfRecorder.markSidebarDeleteVisibleRemoved(
                         tabID: tabID,
                         source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                         fields: ["reason": String(describing: reason)]
@@ -4104,22 +4405,30 @@ class PromptViewModel: ObservableObject {
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
             await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
-                manager.workspaces[index].activeComposeTabID = newActiveID
+                guard manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: newActiveID),
+                      currentRemovalOwner()?.workspace.activeComposeTabID == newActiveID,
+                      manager.modelRoutingTab(workspaceID: workspace.id, tabID: newActiveID) == tab
+                else { return }
                 activeComposeTabID = newActiveID
                 await withComposeTabSwitching(targetTabID: newActiveID) {
+                    guard currentRemovalOwner()?.workspace.activeComposeTabID == newActiveID,
+                          manager.modelRoutingTab(workspaceID: workspace.id, tabID: newActiveID) == tab
+                    else { return }
                     await manager.applyComposeTabState(tab)
                 }
             }
-        } else {
-            manager.workspaces[index].activeComposeTabID = newActiveID
+        } else if manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: newActiveID),
+                  let selected = currentRemovalOwner(), selected.workspace.activeComposeTabID == newActiveID
+        {
             activeComposeTabID = newActiveID
         }
 
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        guard let current = currentRemovalOwner() else { return supersededContinuation() }
+        loadComposeTabsFromWorkspace(current.workspace)
         onProjectionRemovalCommitted?(tabsBeingClosed)
         #if DEBUG
             for tabID in tabsBeingClosed {
-                AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
+                perfRecorder.markSidebarDeleteVisibleRemoved(
                     tabID: tabID,
                     source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
                     fields: ["reason": String(describing: reason)]
@@ -4159,13 +4468,17 @@ class PromptViewModel: ObservableObject {
         if activeIndex + 1 < tabs.count {
             for index in (activeIndex + 1) ..< tabs.count {
                 let candidate = tabs[index].id
-                if !closingIDs.contains(candidate) { return candidate }
+                if !closingIDs.contains(candidate) {
+                    return candidate
+                }
             }
         }
         if activeIndex > 0 {
             for index in stride(from: activeIndex - 1, through: 0, by: -1) {
                 let candidate = tabs[index].id
-                if !closingIDs.contains(candidate) { return candidate }
+                if !closingIDs.contains(candidate) {
+                    return candidate
+                }
             }
         }
         return nil
@@ -4184,8 +4497,15 @@ class PromptViewModel: ObservableObject {
             workspaceIndex: workspaceIndex,
             manager: manager
         ) else { return nil }
-        manager.workspaces[workspaceIndex].composeTabs.append(blankTab)
-        manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
+        let workspace = manager.workspaces[workspaceIndex]
+        guard manager.replaceComposeTabCarriers(
+            workspaceID: workspace.id, composeTabs: [blankTab], stashedTabs: workspace.stashedTabs
+        ), manager.activeWorkspaceID == workspace.id,
+        manager.modelRoutingTab(workspaceID: workspace.id, tabID: blankTab.id) == blankTab,
+        manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: blankTab.id),
+        manager.composeTabCarrierWorkspace(workspaceID: workspace.id)?.workspace.activeComposeTabID == blankTab.id,
+        manager.modelRoutingTab(workspaceID: workspace.id, tabID: blankTab.id) == blankTab
+        else { return nil }
         dirtyTabIDs.remove(blankTab.id)
         return blankTab
     }
@@ -4197,14 +4517,23 @@ class PromptViewModel: ObservableObject {
         workspaceIndex: Int,
         applyLiveContext: Bool = true
     ) async -> ComposeTabState? {
+        let workspaceID = manager.workspaces[workspaceIndex].id
         guard let blankTab = appendStoredReplacementBlankComposeTabIfNeeded(
             manager: manager,
             workspaceIndex: workspaceIndex
         ) else { return nil }
         guard applyLiveContext else { return blankTab }
         await withComposeTabActivationSnapshotSuspended(targetTabID: blankTab.id, manager: manager) {
+            guard manager.activeWorkspaceID == workspaceID,
+                  manager.composeTabCarrierWorkspace(workspaceID: workspaceID)?.workspace.activeComposeTabID == blankTab.id,
+                  manager.modelRoutingTab(workspaceID: workspaceID, tabID: blankTab.id) == blankTab
+            else { return }
             activeComposeTabID = blankTab.id
             await withComposeTabSwitching(targetTabID: blankTab.id) {
+                guard manager.activeWorkspaceID == workspaceID,
+                      manager.composeTabCarrierWorkspace(workspaceID: workspaceID)?.workspace.activeComposeTabID == blankTab.id,
+                      manager.modelRoutingTab(workspaceID: workspaceID, tabID: blankTab.id) == blankTab
+                else { return }
                 await manager.applyComposeTabState(blankTab)
             }
         }
@@ -4540,31 +4869,19 @@ class PromptViewModel: ObservableObject {
         for tabIDs: Set<UUID>,
         isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) -> ComposeTabPinMutationReport {
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-            isMutationContextCurrent?() ?? true
+        guard let manager = workspaceManager, let workspace = manager.activeWorkspace,
+              isMutationContextCurrent?() ?? true,
+              tabIDs.allSatisfy({ manager.modelRoutingTab(workspaceID: workspace.id, tabID: $0) != nil })
         else { return ComposeTabPinMutationReport(updatedTabIDs: [], contextRejected: true) }
-        let currentTabIDs = Set(manager.workspaces[index].composeTabs.map(\.id))
-        guard tabIDs.isSubset(of: currentTabIDs) else {
-            return ComposeTabPinMutationReport(updatedTabIDs: [], contextRejected: true)
-        }
-
-        var updatedTabIDs: Set<UUID> = []
-        for tabIndex in manager.workspaces[index].composeTabs.indices {
-            let tabID = manager.workspaces[index].composeTabs[tabIndex].id
-            guard tabIDs.contains(tabID), manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { continue }
-            manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
-            if !pinned {
-                manager.workspaces[index].composeTabs[tabIndex].pinnedOrder = nil
-            }
-            updatedTabIDs.insert(tabID)
+        let updatedTabIDs = manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: tabIDs) { _, tab in
+            guard tab.isPinned != pinned else { return }
+            tab.isPinned = pinned
+            if !pinned { tab.pinnedOrder = nil }
         }
         guard !updatedTabIDs.isEmpty else {
             return ComposeTabPinMutationReport(updatedTabIDs: [], contextRejected: false)
         }
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        if let current = manager.activeWorkspace { loadComposeTabsFromWorkspace(current) }
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         return ComposeTabPinMutationReport(updatedTabIDs: updatedTabIDs, contextRejected: false)
@@ -4774,8 +5091,9 @@ class PromptViewModel: ObservableObject {
             dirtyTabIDs.insert(activeID)
             manager.markWorkspaceDirty()
         } else if !isDirty, wasDirty {
+            // Clearing a presentation-only dirty badge changes no workspace bytes.
+            // Bumping the save version here can exhaust an unrelated in-flight save.
             dirtyTabIDs.remove(activeID)
-            manager.markWorkspaceDirty()
         }
     }
 
@@ -4816,7 +5134,7 @@ class PromptViewModel: ObservableObject {
         explicitName: String?,
         workspaceIndex: Int,
         manager: WorkspaceManagerViewModel,
-        blankAgentSessionID: UUID? = nil
+        freshAgentSessionID: UUID? = nil
     ) -> ComposeTabState? {
         let existing = manager.workspaces[workspaceIndex].composeTabs
         let baseName: String = switch strategy {
@@ -4831,7 +5149,7 @@ class PromptViewModel: ObservableObject {
             guard let activeID = manager.workspaces[workspaceIndex].activeComposeTabID,
                   let activeIdx = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == activeID })
             else {
-                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, blankAgentSessionID: blankAgentSessionID)
+                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, freshAgentSessionID: freshAgentSessionID)
             }
             var snapshot = manager.collectComposeTabSnapshot(name: baseName, base: manager.workspaces[workspaceIndex].composeTabs[activeIdx])
             snapshot.id = UUID()
@@ -4842,18 +5160,18 @@ class PromptViewModel: ObservableObject {
         case let .forkDuplicate(sourceTabID):
             // Fork uses an explicit source tab ID to avoid racing with active-tab changes.
             guard let sourceIdx = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == sourceTabID }) else {
-                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, blankAgentSessionID: blankAgentSessionID)
+                return makeComposeTab(for: .blank, explicitName: explicitName, workspaceIndex: workspaceIndex, manager: manager, freshAgentSessionID: freshAgentSessionID)
             }
             var snapshot = manager.collectComposeTabSnapshot(name: baseName, base: manager.workspaces[workspaceIndex].composeTabs[sourceIdx])
             snapshot.id = UUID()
             snapshot.name = baseName
             snapshot.lastModified = Date()
             snapshot.isPinned = false
-            snapshot.activeAgentSessionID = nil
+            snapshot.activeAgentSessionID = freshAgentSessionID
             snapshot.activeChatSessionID = nil
             return snapshot
         case .blank:
-            var blank = ComposeTabState(name: baseName, activeAgentSessionID: blankAgentSessionID)
+            var blank = ComposeTabState(name: baseName, activeAgentSessionID: freshAgentSessionID)
             blank.id = UUID()
             blank.lastModified = Date()
             blank.selection = StoredSelection()
@@ -5670,7 +5988,7 @@ class PromptViewModel: ObservableObject {
 
     /// Checks if a persisted built-in prompt matches a known previous canonical version.
     /// Exact matches are preferred so we do not overwrite user-customized prompts.
-    private func isKnownPreviousCanonical(_ prompt: StoredPrompt) -> Bool {
+    func isKnownPreviousCanonical(_ prompt: StoredPrompt) -> Bool {
         if let previousVariants = previousCanonicalBuiltIns[prompt.id],
            previousVariants.contains(where: { $0.title == prompt.title && $0.content == prompt.content })
         {
@@ -5874,13 +6192,23 @@ class PromptViewModel: ObservableObject {
         }
         // Fall back to built-in presets by stable IDs even if the manager
         // hasn't finished loading yet, to avoid mode/UI mismatches.
-        if id == ChatPreset.BuiltIn.manual.id { return ChatPreset.BuiltIn.manual }
-        if id == ChatPreset.BuiltIn.chat.id { return ChatPreset.BuiltIn.chat }
-        if id == ChatPreset.BuiltIn.plan.id { return ChatPreset.BuiltIn.plan }
-        if id == ChatPreset.BuiltIn.review.id { return ChatPreset.BuiltIn.review }
+        if id == ChatPreset.BuiltIn.manual.id {
+            return ChatPreset.BuiltIn.manual
+        }
+        if id == ChatPreset.BuiltIn.chat.id {
+            return ChatPreset.BuiltIn.chat
+        }
+        if id == ChatPreset.BuiltIn.plan.id {
+            return ChatPreset.BuiltIn.plan
+        }
+        if id == ChatPreset.BuiltIn.review.id {
+            return ChatPreset.BuiltIn.review
+        }
         let legacyEditID = UUID(uuidString: "A3333333-3333-3333-3333-333333333333")!
         let legacyDelegatedEditID = UUID(uuidString: "A3333334-3334-3334-3334-333333333334")!
-        if id == legacyEditID || id == legacyDelegatedEditID { return ChatPreset.BuiltIn.chat }
+        if id == legacyEditID || id == legacyDelegatedEditID {
+            return ChatPreset.BuiltIn.chat
+        }
         return ChatPreset.BuiltIn.chat
     }
 
@@ -6045,13 +6373,21 @@ class PromptViewModel: ObservableObject {
         let persistedManualCustomizations = sanitizedManualCustomizations?.hasCustomizations == true
             ? sanitizedManualCustomizations
             : nil
-        if let v = s.manualFileTreeOption { fileTreeOption = v }
-        if let v = s.manualCodeMapUsage { codeMapUsage = v }
-        if let v = s.manualGitInclusion { gitDiffInclusionModeForCopy = v }
+        if let v = s.manualFileTreeOption {
+            fileTreeOption = v
+        }
+        if let v = s.manualCodeMapUsage {
+            codeMapUsage = v
+        }
+        if let v = s.manualGitInclusion {
+            gitDiffInclusionModeForCopy = v
+        }
         if let v = s.manualSelectedPromptIDs {
             selectedPromptIDs = v
         }
-        if let v = s.manualHasManualPromptSelection { hasManualCopyPromptSelection = v }
+        if let v = s.manualHasManualPromptSelection {
+            hasManualCopyPromptSelection = v
+        }
         workingCopyCustomizations = persistedManualCustomizations ?? .init()
         if persistedManualCustomizations != s.manualWorkingCopyCustomizations {
             var updatedSettings = s
@@ -6076,12 +6412,24 @@ class PromptViewModel: ObservableObject {
     private func restoreManualChatSettingsIfAvailable() {
         guard let workspaceID = currentWorkspaceID else { return }
         let s = settingsManager.chatSettings(for: workspaceID)
-        if let v = s.manualFileTreeOption { fileTreeOptionForChat = v }
-        if let v = s.manualCodeMapUsage { codeMapUsageForChat = v }
-        if let v = s.manualGitInclusion { gitDiffInclusionModeForChat = v }
-        if let v = s.manualPlanActMode { planActMode = v == .edit ? .chat : v }
-        if let v = s.manualSelectedPromptIDs { selectedPromptIDsForChat = v }
-        if let v = s.manualHasManualPromptSelection { hasManualChatPromptSelection = v }
+        if let v = s.manualFileTreeOption {
+            fileTreeOptionForChat = v
+        }
+        if let v = s.manualCodeMapUsage {
+            codeMapUsageForChat = v
+        }
+        if let v = s.manualGitInclusion {
+            gitDiffInclusionModeForChat = v
+        }
+        if let v = s.manualPlanActMode {
+            planActMode = v == .edit ? .chat : v
+        }
+        if let v = s.manualSelectedPromptIDs {
+            selectedPromptIDsForChat = v
+        }
+        if let v = s.manualHasManualPromptSelection {
+            hasManualChatPromptSelection = v
+        }
         updateSelectedInstructions()
     }
 
@@ -6200,7 +6548,7 @@ class PromptViewModel: ObservableObject {
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil
-    ) async -> AIMessage {
+    ) async throws -> AIMessage {
         let preset = oraclePromptConfiguration?.chatPreset ?? overrideChatPreset ?? currentChatPreset()
         var resolvedConfig: PromptContextResolved = {
             if let oraclePromptConfiguration {
@@ -6232,7 +6580,9 @@ class PromptViewModel: ObservableObject {
                 case .review: .review
                 }
             }
-            if let override = overrideMode { return override == .edit ? .chat : override }
+            if let override = overrideMode {
+                return override == .edit ? .chat : override
+            }
             if preset.id == ChatPreset.BuiltIn.manual.id {
                 return self.planActMode == .edit ? .chat : self.planActMode
             }
@@ -6295,14 +6645,26 @@ class PromptViewModel: ObservableObject {
             }
         }
 
+        // Captured Oracle configuration is the authority for fail-closed packaging.
+        let requiresSelectedFileContent = oraclePromptConfiguration != nil
         let packaged: (message: AIMessage, preAssembly: PromptContextPreAssemblyResult)
         do {
+            if requiresSelectedFileContent, activeConfig.includeFiles {
+                try await PromptSelectedFileContentRequirement.awaitAppliedIngress(
+                    selection: logicalSelection,
+                    lookupContext: lookupContext,
+                    store: workspaceFileContextStore
+                )
+            }
             packaged = try await withPreassembledPromptContext(
                 cfg: activeConfig,
                 selection: logicalSelection,
                 lookupContext: lookupContext,
                 reviewGitContext: frozenReviewGitContext
             ) { preAssembly in
+                if requiresSelectedFileContent {
+                    try PromptSelectedFileContentRequirement.validate(preAssembly, config: activeConfig)
+                }
                 let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(
                     preAssembly.entries
                 )
@@ -6333,6 +6695,7 @@ class PromptViewModel: ObservableObject {
                 return (message, preAssembly)
             }
         } catch {
+            if requiresSelectedFileContent { throw error }
             return AIMessage(systemPrompt: systemPrompt, userMessage: "")
         }
         #if DEBUG
@@ -6360,7 +6723,7 @@ class PromptViewModel: ObservableObject {
     }
 
     func getChatPrompt() -> String {
-        BuiltInPromptRegistry.shared.text(fileManager.visibleRootFolders.isEmpty ? .oracleChatNoRoots : .oracleChat)
+        AppDomainRuntimeComposition.shared.builtInPromptRegistry.text(fileManager.visibleRootFolders.isEmpty ? .oracleChatNoRoots : .oracleChat)
     }
 
     func getSystemPrompt(for model: AIModel) -> String {
@@ -6372,6 +6735,16 @@ class PromptViewModel: ObservableObject {
     }
 
     // MARK: - Model and Settings Management
+
+    /// Stop this prompt's constructor-owned refresh; the owner joins it before teardown completes.
+    func cancelInitialModelRefreshForWindowClose() {
+        initialModelRefreshTask?.cancel()
+    }
+
+    func awaitInitialModelRefreshCompletion() async {
+        await initialModelRefreshTask?.value
+        initialModelRefreshTask = nil
+    }
 
     @MainActor
     func refreshAvailableModels() async {
@@ -6453,7 +6826,9 @@ class PromptViewModel: ObservableObject {
         // Try to parse the rawValue
         if let model = AIModel.fromModelName(rawValue) {
             // Custom models are always valid (user explicitly configured them)
-            if model.isCustom { return true }
+            if model.isCustom {
+                return true
+            }
             switch model.providerType {
             case .claudeCode, .codex, .openCode, .cursor, .grokBuild:
                 return true
@@ -6581,7 +6956,9 @@ class PromptViewModel: ObservableObject {
     @MainActor
     func isModelAvailable(_ model: AIModel) -> Bool {
         // Custom models are always considered available if parseable
-        if model.isCustom { return true }
+        if model.isCustom {
+            return true
+        }
         // Check if the model's provider has an API key configured
         // This is more stable than array membership which can fail when enum definitions change
         return isProviderConfigured(for: model)
@@ -6612,6 +6989,7 @@ class PromptViewModel: ObservableObject {
     }
 
     deinit {
+        initialModelRefreshTask?.cancel()
         activeTabApplyTask?.cancel()
         cancellables.removeAll()
         /*
@@ -6750,8 +7128,12 @@ extension PromptViewModel {
         uiMode: GitDiffInclusionMode,
         isManualPreset: Bool
     ) -> GitInclusion {
-        if let c = custom { return c }
-        if let p = preset { return p }
+        if let c = custom {
+            return c
+        }
+        if let p = preset {
+            return p
+        }
         if isManualPreset {
             switch uiMode {
             case .none:
@@ -7393,9 +7775,4 @@ enum PromptError: Error {
 
 enum AIResponseError: Error {
     case invalidData
-}
-
-enum FilePathDisplay: String, CaseIterable {
-    case full = "Full"
-    case relative = "Relative"
 }

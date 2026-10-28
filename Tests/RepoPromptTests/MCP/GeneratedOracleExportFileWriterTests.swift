@@ -1,5 +1,6 @@
 import MCP
 @testable import RepoPromptApp
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class GeneratedOracleExportFileWriterTests: XCTestCase {

@@ -1,12 +1,13 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptSettingsCore
 
 @MainActor
 struct MCPOracleToolService {
-    typealias RequestMetadata = MCPServerViewModel.RequestMetadata
-    typealias ResolvedTabContextSnapshot = MCPServerViewModel.ResolvedTabContextSnapshot
-    typealias TabContextSnapshot = MCPServerViewModel.TabContextSnapshot
+    typealias RequestMetadata = MCPRequestMetadata
+    typealias ResolvedTabContextSnapshot = MCPResolvedTabContextSnapshot
+    typealias TabContextSnapshot = MCPTabContextSnapshot
     typealias ChatSendOperation = @Sendable () async throws -> [String: Value]
     typealias SendChat = @MainActor @Sendable (
         _ args: [String: Value],
@@ -29,7 +30,7 @@ struct MCPOracleToolService {
     let oracleChatLogToolName: String
     let promptVM: PromptViewModel
     let oracleVM: OracleViewModel
-    let captureRequestMetadata: () async -> RequestMetadata
+    let liveRunPurpose: MCPAppPhysicalCapabilityAdapters.LiveRunPurpose
     let resolveTabContextSnapshot: (RequestMetadata) throws -> ResolvedTabContextSnapshot
     let requireCurrentTabContext: (String) async throws -> TabContextSnapshot
     let stabilizedVirtualContext: StabilizedVirtualContext
@@ -63,8 +64,8 @@ struct MCPOracleToolService {
         }
     }
 
-    func executeOracleChatLog(args: [String: Value]) async throws -> Value {
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+    func executeOracleChatLog(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
+        guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("oracle_chat_log requires an active MCP connection")
         }
 
@@ -116,20 +117,12 @@ struct MCPOracleToolService {
 
     // MARK: - ask_oracle (agent-mode only)
 
-    func executeAskOracle(args: [String: Value]) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
-        let unsupported = args.keys
-            .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
-            .sorted()
-        if !unsupported.isEmpty {
-            throw MCPError.invalidParams(
-                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
-            )
-        }
-
+    func executeAskOracle(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
+        try Self.validateOracleArguments(toolName: MCPWindowToolName.askOracle, args: args)
         try validateCommonOracleArgs(args)
+        let attachmentRequests = try OracleAttachmentContract.parseArguments(args)
 
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+        guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
         }
 
@@ -179,19 +172,29 @@ struct MCPOracleToolService {
         }
 
         let owner = await resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
-        let tabContext: OracleViewModel.OracleSendTabContext
+        var tabContext: OracleViewModel.OracleSendTabContext
         if let virtualContext, virtualContext.tabID == tabID {
             tabContext = try await oracleSendTabContext(
                 from: virtualContext,
                 owner: owner,
                 origin: .askOracle,
-                mode: modeRaw
+                mode: modeRaw,
+                attachmentRequests: attachmentRequests
             )
         } else {
             guard let tabSnapshot = targetWindow.workspaceManager.composeTabSnapshot(for: tabID) else {
                 throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
             }
             let lookupContext = try await oraclePackagingLookupContext(owner: owner)
+            let attachments = try await loadOracleImages(
+                attachmentRequests,
+                lookupContext: lookupContext,
+                sessionAttachmentPaths: sessionAttachmentPaths(
+                    for: attachmentRequests,
+                    tabID: tabID,
+                    owner: owner
+                )
+            )
             let reviewGitContext = await promptVM.freezePromptGitReviewContext(
                 workspaceID: targetWindow.workspaceManager.activeWorkspace?.id,
                 tabID: tabID,
@@ -230,8 +233,13 @@ struct MCPOracleToolService {
                 origin: .askOracle,
                 agentModeSessionID: owner.agentSessionID,
                 agentModeRunID: owner.runID,
-                packaging: packaging
+                packaging: packaging,
+                attachments: attachments
             )
+        }
+
+        if let invocationID = invocationContext.metadata.invocationID {
+            tabContext.toolSettlement = targetWindow.agentModeViewModel.oracleToolSettlementCallbacks(tabID: tabID, sessionID: owner.agentSessionID, runID: owner.runID, invocationID: invocationID, toolName: askOracleToolName)
         }
 
         let exportDestination: OracleExportDestination? = if exportResponse {
@@ -260,28 +268,28 @@ struct MCPOracleToolService {
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
 
         let capturedChatArgs = chatArgs
+        let capturedTabContext = tabContext
         var result = try await withHeartbeat(
             connectionID,
             askOracleToolName,
             "waiting",
             "Waiting for Oracle response..."
         ) {
-            try await sendChat(capturedChatArgs, promptVM, tabContext)
+            try await sendChat(capturedChatArgs, promptVM, capturedTabContext)
         }
 
         if exportResponse {
             let groupResult = try Self.decodeOracleGroupResultForExport(result)
-            let export = try await exportOracleResponse(OracleExportRequest(
+            result = try await exportSettledOracleResponse(result, request: OracleExportRequest(
                 sourceTool: askOracleToolName,
                 mode: modeRaw,
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? continuationChatID,
                 response: result["response"]?.stringValue,
                 groupResult: groupResult,
+                reconciliationGuidance: result["oracle_reconciliation_guidance"]?.stringValue,
                 destination: exportDestination
             ))
-            result["oracle_export_path"] = .string(export.path)
-            result["oracle_export_instruction"] = .string(export.instruction)
         }
 
         await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle complete")
@@ -290,18 +298,10 @@ struct MCPOracleToolService {
 
     // MARK: - oracle_send
 
-    func executeOracleSend(args: [String: Value]) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "export_response"]
-        let unsupported = args.keys
-            .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
-            .sorted()
-        if !unsupported.isEmpty {
-            throw MCPError.invalidParams(
-                "oracle_send only accepts: message, mode, chat_id, new_chat, model, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
-            )
-        }
-
+    func executeOracleSend(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
+        try Self.validateOracleArguments(toolName: MCPWindowToolName.oracleSend, args: args)
         try validateCommonOracleArgs(args)
+        let attachmentRequests = try OracleAttachmentContract.parseArguments(args)
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         let exportResponse = try parseExportResponseFlag(args)
@@ -325,9 +325,9 @@ struct MCPOracleToolService {
         case let .continuation(chatID): chatID
         }
 
-        let connectionID = ServerNetworkManager.currentConnectionID
+        let connectionID = invocationContext.connectionID
         let runPurpose: MCPRunPurpose = if let connectionID {
-            await ServerNetworkManager.shared.runPurpose(for: connectionID)
+            await liveRunPurpose(connectionID)
         } else {
             .unknown
         }
@@ -336,7 +336,7 @@ struct MCPOracleToolService {
         } else {
             nil
         }
-        let metadata = await captureRequestMetadata()
+        let metadata = invocationContext.metadata
         let resolvedContext = try resolveTabContextSnapshot(metadata)
         var tabContext: OracleViewModel.OracleSendTabContext? = nil
 
@@ -351,14 +351,21 @@ struct MCPOracleToolService {
                 from: context,
                 owner: owner,
                 origin: .oracleSend,
-                mode: modeRaw
+                mode: modeRaw,
+                attachmentRequests: attachmentRequests
             )
         } else {
             tabContext = try await oracleSendTabContext(
                 from: context,
                 origin: .oracleSend,
-                mode: modeRaw
+                mode: modeRaw,
+                attachmentRequests: attachmentRequests
             )
+        }
+
+        if runPurpose == .agentModeRun, let targetWindow, let invocationID = metadata.invocationID {
+            let settlement = targetWindow.agentModeViewModel.oracleToolSettlementCallbacks(tabID: context.tabID, sessionID: tabContext?.agentModeSessionID, runID: tabContext?.agentModeRunID, invocationID: invocationID, toolName: oracleSendToolName)
+            tabContext?.toolSettlement = settlement
         }
 
         let exportDestination: OracleExportDestination? = if exportResponse, let targetWindow {
@@ -376,6 +383,9 @@ struct MCPOracleToolService {
 
         var chatArgs = args
         chatArgs.removeValue(forKey: "export_response")
+        for key in OracleAttachmentContract.redactedArgumentKeys {
+            chatArgs.removeValue(forKey: key)
+        }
 
         let capturedTabContext = tabContext
         let capturedChatArgs = chatArgs
@@ -391,17 +401,16 @@ struct MCPOracleToolService {
         if exportResponse {
             let groupResult = try Self.decodeOracleGroupResultForExport(result)
             let normalizedChatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let export = try await exportOracleResponse(OracleExportRequest(
+            result = try await exportSettledOracleResponse(result, request: OracleExportRequest(
                 sourceTool: oracleSendToolName,
                 mode: modeRaw,
                 message: message,
                 chatID: result["chat_id"]?.stringValue ?? ((normalizedChatID?.isEmpty == false) ? normalizedChatID : nil),
                 response: result["response"]?.stringValue,
                 groupResult: groupResult,
+                reconciliationGuidance: result["oracle_reconciliation_guidance"]?.stringValue,
                 destination: exportDestination
             ))
-            result["oracle_export_path"] = .string(export.path)
-            result["oracle_export_instruction"] = .string(export.instruction)
         }
 
         await sendStageProgress(connectionID, oracleSendToolName, "complete", "Oracle complete")
@@ -409,6 +418,36 @@ struct MCPOracleToolService {
     }
 
     // MARK: - Shared helpers
+
+    /// Optional export failures must not discard an already-settled Oracle response.
+    /// Non-group cancellation retains its request-owned cancellation contract.
+    func exportSettledOracleResponse(
+        _ reply: [String: Value], request: OracleExportRequest
+    ) async throws -> [String: Value] {
+        var result = reply
+        let cancellationNotice = Value.string(
+            "Oracle export cancelled; output may remain. Recover the settled result using the returned lane chat IDs."
+        )
+        if Task.isCancelled, request.groupResult != nil {
+            result["oracle_export_error"] = cancellationNotice
+            return result
+        }
+        do {
+            let export = try await exportOracleResponse(request)
+            result["oracle_export_path"] = .string(export.path)
+            result["oracle_export_instruction"] = .string(export.instruction)
+        } catch is CancellationError {
+            guard request.groupResult != nil else { throw CancellationError() }
+            result["oracle_export_error"] = cancellationNotice
+        } catch {
+            // Export may have written output before failing. Keep response truth and
+            // recovery handles without exposing arbitrary exporter error details.
+            result["oracle_export_error"] = .string(
+                "Oracle export failed; output may remain. Recover the settled result using the returned chat IDs."
+            )
+        }
+        return result
+    }
 
     static func decodeOracleGroupResultForExport(_ result: [String: Value]) throws -> OracleGroupResult? {
         guard result["oracle_group_id"] != nil else { return nil }
@@ -428,6 +467,27 @@ struct MCPOracleToolService {
             throw MCPError.invalidParams("export_response must be a boolean")
         }
         return boolValue
+    }
+
+    private static let oracleArgumentNames = [
+        "message", "mode", "chat_id", "new_chat", "model", OracleAttachmentContract.argumentName, "export_response"
+    ]
+
+    /// The deprecated `images` alias is accepted but deliberately not listed, so the error steers
+    /// callers to `attachments`.
+    private static let acceptedOracleArgumentNames = Set(oracleArgumentNames + [
+        OracleAttachmentContract.legacyImagesArgumentName
+    ])
+
+    private static func validateOracleArguments(toolName: String, args: [String: Value]) throws {
+        let unsupported = args.keys
+            .filter { !$0.hasPrefix("_") && !acceptedOracleArgumentNames.contains($0) }
+            .sorted()
+        if !unsupported.isEmpty {
+            throw MCPError.invalidParams(
+                "\(toolName) only accepts: \(oracleArgumentNames.joined(separator: ", ")). Unsupported args: \(unsupported.joined(separator: ", "))"
+            )
+        }
     }
 
     private func parseOracleModelOverride(_ value: Value?) throws -> String? {
@@ -673,10 +733,20 @@ struct MCPOracleToolService {
             worktreeBindingState: .notApplicable
         ),
         origin: OracleSendOrigin,
-        mode: String
+        mode: String,
+        attachmentRequests: [OracleAttachmentRequest] = []
     ) async throws -> OracleViewModel.OracleSendTabContext {
         let stabilizedContext = await stabilizedVirtualContext(context)
         let lookupContext = try await oraclePackagingLookupContext(for: stabilizedContext)
+        let attachments = try await loadOracleImages(
+            attachmentRequests,
+            lookupContext: lookupContext,
+            sessionAttachmentPaths: sessionAttachmentPaths(
+                for: attachmentRequests,
+                tabID: stabilizedContext.tabID,
+                owner: owner
+            )
+        )
         let reviewGitContext = await promptVM.freezePromptGitReviewContext(
             workspaceID: stabilizedContext.workspaceID,
             tabID: stabilizedContext.tabID,
@@ -709,8 +779,74 @@ struct MCPOracleToolService {
             origin: origin,
             agentModeSessionID: owner.agentSessionID,
             agentModeRunID: owner.runID,
-            packaging: packaging
+            packaging: packaging,
+            attachments: attachments
         )
+    }
+
+    /// Exact image files the owning Agent session attached itself; empty without an owner.
+    private func sessionAttachmentPaths(
+        for requests: [OracleAttachmentRequest],
+        tabID: UUID,
+        owner: AgentOracleOwner
+    ) -> [String] {
+        guard !requests.isEmpty, let targetWindow = try? requireTargetWindow() else { return [] }
+        return targetWindow.agentModeViewModel.oracleAuthorizedAttachmentPaths(
+            tabID: tabID,
+            agentSessionID: owner.agentSessionID
+        )
+    }
+
+    private func loadOracleImages(
+        _ requests: [OracleAttachmentRequest],
+        lookupContext: WorkspaceLookupContext,
+        sessionAttachmentPaths: [String]
+    ) async throws -> [OracleAttachment] {
+        guard !requests.isEmpty else { return [] }
+        let storeRoots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let representedPhysicalPaths = Set(storeRoots.map(\.standardizedFullPath))
+        let namespace = lookupContext.exactFileNamespace(storeRoots: storeRoots)
+
+        // Pure in-memory projection: merge every represented binding's logical aliases under
+        // its physical root. Root capture itself runs off the main actor inside
+        // deriveAuthorityDetached, and a root that fails to capture is isolated so it only
+        // fails the image requests that actually resolve under it.
+        var physicalRootOrder: [String] = []
+        var logicalRootsByPhysicalPath: [String: [String]] = [:]
+        for binding in namespace.rootBindings
+            where representedPhysicalPaths.contains(binding.lookupRoot.standardizedFullPath)
+        {
+            let physicalRootPath = binding.lookupRoot.standardizedFullPath
+            if logicalRootsByPhysicalPath[physicalRootPath] == nil {
+                physicalRootOrder.append(physicalRootPath)
+                logicalRootsByPhysicalPath[physicalRootPath] = []
+            }
+            for logicalRootPath in [physicalRootPath] + binding.clientRoots.map(\.standardizedFullPath)
+                where !(logicalRootsByPhysicalPath[physicalRootPath] ?? []).contains(logicalRootPath)
+            {
+                logicalRootsByPhysicalPath[physicalRootPath]?.append(logicalRootPath)
+            }
+        }
+        let rootSpecs = physicalRootOrder.map {
+            OracleImageRootSpec(
+                physicalRootPath: $0,
+                logicalRootPaths: logicalRootsByPhysicalPath[$0] ?? [$0]
+            )
+        }
+        do {
+            let authority = try await OracleAttachmentLoader.deriveAuthorityDetached(
+                rootSpecs: rootSpecs,
+                sessionAttachmentPaths: sessionAttachmentPaths
+            )
+            return try await OracleAttachmentLoader.loadDetached(
+                requests: requests,
+                authority: authority
+            )
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
     }
 
     private func reviewPackaging(

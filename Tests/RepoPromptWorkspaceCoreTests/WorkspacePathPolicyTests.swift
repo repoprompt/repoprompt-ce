@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPromptWorkspaceCore
 import XCTest
 
@@ -8,6 +9,15 @@ final class WorkspacePathPolicyTests: XCTestCase {
         XCTAssertTrue(StandardizedPath.isDescendant("/repo/Sources/App.swift", of: "/repo"))
         XCTAssertFalse(StandardizedPath.isDescendant("/repository/App.swift", of: "/repo"))
         XCTAssertEqual(StandardizedPath.diagnosticEscaped("bad\0path\n"), "bad\\0path\\n")
+    }
+
+    func testAbsoluteStandardizedPathIsNativeAndMatchesFoundation() {
+        for input in ["/repo/./Sources/../App.swift", "/repo/Sources/", "/tmp/Ünïcödé/./ファイル.swift"] {
+            let standardized = StandardizedPath.absolute(input)
+            XCTAssertEqual(standardized, (input as NSString).standardizingPath)
+            // Bridged NSPathStore2 strings make every catalog comparison and hash take the slow path.
+            XCTAssertTrue(standardized.isContiguousUTF8, input)
+        }
     }
 
     func testAliasResolutionUsesDeterministicGeneratedAliasesForDuplicateNames() {

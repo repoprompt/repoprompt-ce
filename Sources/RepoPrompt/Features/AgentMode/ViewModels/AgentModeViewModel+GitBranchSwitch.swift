@@ -1,4 +1,7 @@
 import Foundation
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptVCS
 
 @MainActor
 extension AgentModeViewModel {

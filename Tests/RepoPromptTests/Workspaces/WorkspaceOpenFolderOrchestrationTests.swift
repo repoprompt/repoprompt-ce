@@ -1,5 +1,10 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptSettingsCore
+import RepoPromptShared
+import RepoPromptWorkspaceCore
 import XCTest
 
 #if DEBUG
@@ -19,9 +24,10 @@ import XCTest
             originalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             storageRoot = FileManager.default.temporaryDirectory
                 .appendingPathComponent("WorkspaceOpenFolderOrchestrationTests-\(UUID().uuidString)", isDirectory: true)
+            storageRoot = AppProfileLocations.current.customWorkspaceDirectory(selectedDirectory: storageRoot)
             try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
             UserDefaults.standard.set(storageRoot.path, forKey: "GlobalCustomStorageURL")
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
         }
 
         override func tearDown() async throws {
@@ -34,7 +40,7 @@ import XCTest
                 _ = await runtime.shutdown()
             }
             domainRuntimes.removeAll()
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+            await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
             try? FileManager.default.removeItem(at: storageRoot)
             if let originalStoragePath {
                 UserDefaults.standard.set(originalStoragePath, forKey: "GlobalCustomStorageURL")
@@ -279,26 +285,23 @@ import XCTest
             await mutatingManager.awaitInitialized()
             let existingFolder = try makeFolder(named: "ExistingBeforeRootAddition")
             let requestedFolder = try makeFolder(named: "AddedDuringFolderOpen")
-            let existing = mutatingManager.createWorkspace(
+            let creation = try mutatingManager.createPersistentWorkspace(
                 name: "Existing Root Receiver",
                 repoPaths: [existingFolder.path]
             )
-            let clock = ContinuousClock()
-            let deadline = clock.now.advanced(by: .seconds(2))
-            var existingIsAuthoritative = false
-            while clock.now < deadline {
-                let snapshot = await mutatingManager.workspaceRoutingCatalogSnapshot()
-                existingIsAuthoritative = snapshot?.contains(where: { $0.id == existing.id }) == true
-                if existingIsAuthoritative { break }
-                try await clock.sleep(for: .milliseconds(10))
-            }
-            XCTAssertTrue(existingIsAuthoritative)
+            // Finish setup through its retained receipt before starting the root-edit race.
+            let existing = try await creation.publishedWorkspace()
             let mutationGate = WorkspaceRootMutationTestGate()
+            let folderOpenSnapshotBarrier = TwoPartyAsyncBarrier()
+            openingManager.setPersistentFolderOpenDidSnapshotHandlerForTesting {
+                await folderOpenSnapshotBarrier.arriveAndWait()
+            }
             await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired { workspaceID in
                 guard workspaceID == existing.id else { return }
                 await mutationGate.pauseUntilReleased()
             }
             defer {
+                openingManager.setPersistentFolderOpenDidSnapshotHandlerForTesting(nil)
                 Task {
                     await runtime.workspaceStore.testSetAfterWorkspaceMutationGateAcquired(nil)
                 }
@@ -310,7 +313,8 @@ import XCTest
                 fromFolderURL: requestedFolder,
                 behavior: .createNewWorkspace
             )
-            await Task.yield()
+            // The caller must capture a catalog without the new root while its mutation is gated.
+            await folderOpenSnapshotBarrier.arriveAndWait()
             await mutationGate.release()
             _ = try await (rootAddition, folderOpen)
 
@@ -1064,7 +1068,9 @@ import XCTest
                     matches = snapshot.filter {
                         WorkspaceFolderOpenResolver.containsExactRoot(folder.path, in: $0)
                     }
-                    if matches.count == 2 { break }
+                    if matches.count == 2 {
+                        break
+                    }
                 }
                 try await clock.sleep(for: .milliseconds(10))
             }
@@ -1099,7 +1105,7 @@ import XCTest
                 activeComposeTabID: preservedTab.id
             )
             let workspaceFile = try manager.saveWorkspaceToFile(existing)
-            await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: workspaceFile)
+            await WorkspaceDiskWriterComposition.processWriter.flush(url: workspaceFile)
             manager.workspaces.append(WorkspaceModel(
                 id: existing.id,
                 dateModified: existing.dateModified,
@@ -1448,6 +1454,388 @@ import XCTest
             }
             XCTAssertTrue(reason.contains("could not be verified for activation"))
             XCTAssertEqual(manager.activeWorkspaceID, activeIDBeforeSwitch)
+        }
+
+        func testFailedPersistentCreationBlocksSwitchWithOriginalFailureBeforeActivation() async throws {
+            try await assertFailedCreationBlocksActivation(useRequestAPI: true)
+        }
+
+        func testInternalSwitchBlocksFailedCreationBeforeActivation() async throws {
+            try await assertFailedCreationBlocksActivation(useRequestAPI: false)
+        }
+
+        private func assertFailedCreationBlocksActivation(useRequestAPI: Bool) async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "FailedCreationBarrier")
+            let activeIDBeforeCreation = manager.activeWorkspaceID
+            let activeRootsBeforeCreation = manager.activeWorkspace?.repoPaths
+            let snapshotBeforeCreation = await runtime.workspaceStore.snapshot()
+            let gate = WorkspaceRootMutationTestGate()
+            var injectedFailure: DomainWorkspaceAuthorityOperationError?
+            var creationExecutions = 0
+            manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = { _, operationID in
+                creationExecutions += 1
+                let failure = self.creationFailure(operationID: operationID, catalogRevision: snapshotBeforeCreation.catalogRevision)
+                injectedFailure = failure
+                await gate.pauseUntilReleased()
+                throw failure
+            }
+            var activationAdmissions: [UUID] = []
+            manager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting {
+                activationAdmissions.append($0)
+            }
+            defer {
+                manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = nil
+                manager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            let workspace = manager.createWorkspace(
+                name: "Failed Creation Barrier",
+                repoPaths: [folder.path]
+            )
+            await gate.waitUntilPaused()
+            let root = WorkspaceRootSetKey(paths: [folder.path])
+            let publication = try XCTUnwrap(manager.pendingPersistentWorkspacePublication(
+                workspaceID: workspace.id,
+                exactRoot: root
+            ))
+            let expectedFailure = try XCTUnwrap(injectedFailure)
+            XCTAssertEqual(expectedFailure.outcome.operationID, publication.operationID)
+
+            var switchTask: Task<WorkspaceSwitchResult, Never>?
+            await withCheckedContinuation { started in
+                switchTask = Task { @MainActor in
+                    started.resume()
+                    // The test resumes only once this actor turn suspends in the creation join.
+                    if useRequestAPI {
+                        return await manager.requestWorkspaceSwitch(
+                            to: workspace, saveState: false, reason: "failedCreationBarrierFixture"
+                        )
+                    }
+                    return await manager.switchWorkspace(
+                        to: workspace, saveState: false, reason: "failedCreationBarrierFixture"
+                    )
+                }
+            }
+            await gate.release()
+            var originalFailure: DomainWorkspaceAuthorityOperationError?
+            do {
+                _ = try await publication.join()
+                XCTFail("Expected the original creation task to fail")
+            } catch let error as DomainWorkspaceAuthorityOperationError {
+                originalFailure = error
+                XCTAssertEqual(error.outcome.operationID, publication.operationID)
+                XCTAssertEqual(error.outcome, expectedFailure.outcome)
+            }
+            let failure = try XCTUnwrap(originalFailure)
+            let pendingSwitch = try XCTUnwrap(switchTask)
+            let result = await pendingSwitch.value
+            guard case let .blocked(reason) = result else {
+                return XCTFail("Expected creation failure to block activation, got \(result)")
+            }
+            XCTAssertTrue(reason.contains(failure.localizedDescription), reason)
+            XCTAssertTrue(reason.contains(workspace.id.uuidString), reason)
+            XCTAssertTrue(reason.contains(publication.operationID.uuidString), reason)
+            if useRequestAPI {
+                XCTAssertEqual(manager.pendingWorkspaceSwitchBlockedNotice?.message, reason)
+            } else {
+                XCTAssertNil(manager.pendingWorkspaceSwitchBlockedNotice)
+            }
+            XCTAssertTrue(activationAdmissions.isEmpty, "Failed creation must not take an activation lease")
+            XCTAssertEqual(creationExecutions, 1)
+            XCTAssertEqual(manager.activeWorkspaceID, activeIDBeforeCreation)
+            XCTAssertEqual(manager.activeWorkspace?.repoPaths, activeRootsBeforeCreation)
+            let snapshot = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(snapshot.workspaces.contains { $0.document.workspaceID == workspace.id })
+            XCTAssertNil(manager.pendingPersistentWorkspacePublication(workspaceID: workspace.id, exactRoot: root))
+        }
+
+        func testRetainedCreationFailureSurvivesCompletionAndProjectionWithoutOwningSibling() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            // This fixture applies real snapshots explicitly, without a competing subscription turn.
+            let bridge = try XCTUnwrap(domainBridges.last)
+            await bridge.stopAndJoinForTesting()
+            let failedFolder = try makeFolder(named: "RetainedFailedCreation")
+            let siblingFolder = try makeFolder(named: "RetainedSiblingCreation")
+            let baseline = await runtime.workspaceStore.snapshot()
+            let activeID = manager.activeWorkspaceID
+            let activeRoots = manager.activeWorkspace?.repoPaths
+            let activeTabs = manager.activeWorkspace?.composeTabs
+            let activeTabID = manager.activeWorkspace?.activeComposeTabID
+            let siblingGate = WorkspaceRootMutationTestGate()
+            var failedWorkspaceID: UUID?
+            var expectedFailure: DomainWorkspaceAuthorityOperationError?
+            manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = { workspaceID, operationID in
+                if workspaceID == failedWorkspaceID {
+                    let failure = self.creationFailure(operationID: operationID, catalogRevision: baseline.catalogRevision)
+                    expectedFailure = failure
+                    throw failure
+                }
+                await siblingGate.pauseUntilReleased()
+            }
+            defer {
+                manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = nil
+                Task { await siblingGate.release() }
+            }
+            let failed = try manager.createPersistentWorkspace(name: "Retained Failure", repoPaths: [failedFolder.path])
+            failedWorkspaceID = failed.workspaceID
+            let sibling = try manager.createPersistentWorkspace(name: "Retained Sibling", repoPaths: [siblingFolder.path])
+            await siblingGate.waitUntilPaused()
+            // Drain first: the original task has completed and registry ownership has been dropped.
+            await manager.finishWorkspaceCreation(workspaceIDs: [failed.workspaceID])
+            let failure = try XCTUnwrap(expectedFailure)
+            let failedRoot = WorkspaceRootSetKey(paths: [failedFolder.path])
+            let siblingRoot = WorkspaceRootSetKey(paths: [siblingFolder.path])
+            XCTAssertNil(manager.pendingPersistentWorkspacePublication(workspaceID: failed.workspaceID, exactRoot: failedRoot))
+            XCTAssertNotNil(manager.workspace(withID: failed.workspaceID))
+            do {
+                _ = try await failed.publishedWorkspace()
+                XCTFail("Completed failed creation must not become successful")
+            } catch let error as DomainWorkspaceAuthorityOperationError {
+                XCTAssertEqual(error.outcome, failure.outcome)
+            }
+
+            // Use a real accepted catalog snapshot: absence removes only the completed local creation.
+            try await applyCanonicalProjection(runtime.workspaceStore.snapshot(), to: manager)
+            XCTAssertNil(manager.workspace(withID: failed.workspaceID))
+            XCTAssertNotNil(manager.workspace(withID: sibling.workspaceID))
+            let siblingToken = try XCTUnwrap(manager.pendingPersistentWorkspacePublication(workspaceID: sibling.workspaceID, exactRoot: siblingRoot))
+            XCTAssertEqual(siblingToken.operationID, sibling.operationID)
+            XCTAssertNotEqual(sibling.operationID, failed.operationID)
+            do {
+                _ = try await failed.publishedWorkspace()
+                XCTFail("Catalog absence must not replace the original failure")
+            } catch let error as DomainWorkspaceAuthorityOperationError {
+                XCTAssertEqual(error.outcome, failure.outcome)
+                XCTAssertEqual(error.outcome.operationID, failed.operationID)
+            }
+            XCTAssertEqual(manager.activeWorkspaceID, activeID)
+            XCTAssertEqual(manager.activeWorkspace?.repoPaths, activeRoots)
+            XCTAssertEqual(manager.activeWorkspace?.composeTabs, activeTabs)
+            XCTAssertEqual(manager.activeWorkspace?.activeComposeTabID, activeTabID)
+
+            await siblingGate.release()
+            let siblingWorkspace = try await sibling.publishedWorkspace()
+            let siblingOutcome = try await siblingToken.join()
+            XCTAssertEqual(siblingWorkspace.id, sibling.workspaceID)
+            XCTAssertEqual(siblingOutcome.operationID, sibling.operationID)
+            XCTAssertEqual(siblingOutcome.disposition, .applied)
+            let finalSnapshot = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(finalSnapshot.workspaces.contains { $0.document.workspaceID == failed.workspaceID })
+            XCTAssertTrue(finalSnapshot.workspaces.contains { $0.document.workspaceID == sibling.workspaceID })
+            XCTAssertNil(manager.pendingPersistentWorkspacePublication(workspaceID: sibling.workspaceID, exactRoot: siblingRoot))
+        }
+
+        func testRoutingCreationFailureNeverReportsSuccessOrAdmitsActivation() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let baseline = await runtime.workspaceStore.snapshot()
+            let activeID = manager.activeWorkspaceID
+            var activationAdmissions: [UUID] = []
+            manager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting { activationAdmissions.append($0) }
+            defer {
+                manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = nil
+                manager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting(nil)
+            }
+            for switchToCreated in [false, true] {
+                for openedNewWindow in [false, true] {
+                    var workspaceID: UUID?
+                    var failure: DomainWorkspaceAuthorityOperationError?
+                    manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = { id, operationID in
+                        workspaceID = id
+                        let original = self.creationFailure(operationID: operationID, catalogRevision: baseline.catalogRevision)
+                        failure = original
+                        throw original
+                    }
+                    do {
+                        _ = try await WindowRoutingService.createWorkspaceForRouting(
+                            workspaceManager: manager, name: "Routing Failure", repoPaths: [],
+                            windowID: -1401, switchToCreated: switchToCreated, openedNewWindow: openedNewWindow
+                        )
+                        XCTFail("Failed authority creation must not return status ok, including no-switch")
+                    } catch {
+                        let original = try XCTUnwrap(failure)
+                        let id = try XCTUnwrap(workspaceID)
+                        let message = error.localizedDescription
+                        XCTAssertTrue(message.contains(original.localizedDescription), message)
+                        XCTAssertTrue(message.contains(id.uuidString), message)
+                        XCTAssertTrue(message.contains(original.outcome.operationID.uuidString), message)
+                        XCTAssertTrue(message.contains("window -1401"), message)
+                        XCTAssertTrue(message.contains("Activation was not attempted"), message)
+                        XCTAssertEqual(message.contains("No automatic close was performed"), openedNewWindow)
+                    }
+                }
+            }
+            XCTAssertTrue(activationAdmissions.isEmpty)
+            XCTAssertEqual(manager.activeWorkspaceID, activeID)
+            let finalSnapshot = await runtime.workspaceStore.snapshot()
+            XCTAssertEqual(finalSnapshot, baseline)
+        }
+
+        func testRootlessRoutingNoSwitchAwaitsExactCreationCommit() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let activeID = manager.activeWorkspaceID
+            let gate = WorkspaceRootMutationTestGate()
+            var workspaceID: UUID?
+            var operationID: UUID?
+            var returned = false
+            manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = { id, operation in
+                workspaceID = id
+                operationID = operation
+                await gate.pauseUntilReleased()
+            }
+            defer {
+                manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = nil
+                Task { await gate.release() }
+            }
+            let request = Task { @MainActor in
+                let receipt = try await WindowRoutingService.createWorkspaceForRouting(
+                    workspaceManager: manager, name: "Rootless Routing", repoPaths: [],
+                    windowID: -1402, switchToCreated: false, openedNewWindow: true
+                )
+                returned = true
+                return receipt
+            }
+            await gate.waitUntilPaused()
+            let id = try XCTUnwrap(workspaceID)
+            XCTAssertFalse(returned)
+            let pending = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(pending.workspaces.contains { $0.document.workspaceID == id })
+            await gate.release()
+            let receipt = try await request.value
+            XCTAssertEqual(receipt.workspace.id, id)
+            XCTAssertEqual(receipt.operationID, operationID)
+            XCTAssertFalse(receipt.workspace.isEphemeral)
+            XCTAssertEqual(receipt.workspace.isSavedWorkspace, false)
+            XCTAssertEqual(manager.activeWorkspaceID, activeID)
+            let committed = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(committed.workspaces.contains { $0.document.workspaceID == id })
+        }
+
+        func testCancellingRoutingCreationPreservesSharedCommitWithoutActivation() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let folder = try makeFolder(named: "CancelledRoutingCreation")
+            let root = WorkspaceRootSetKey(paths: [folder.path])
+            let activeID = manager.activeWorkspaceID
+            let gate = WorkspaceRootMutationTestGate()
+            var workspaceID: UUID?
+            var activationAdmissions: [UUID] = []
+            manager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting { activationAdmissions.append($0) }
+            manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = { id, _ in
+                workspaceID = id
+                await gate.pauseUntilReleased()
+            }
+            defer {
+                manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = nil
+                manager.setWorkspaceActivationLeaseDidAcquireHandlerForTesting(nil)
+                Task { await gate.release() }
+            }
+            let request = Task { @MainActor in
+                try await WindowRoutingService.createWorkspaceForRouting(
+                    workspaceManager: manager, name: "Cancelled Routing", repoPaths: [folder.path],
+                    windowID: -1403, switchToCreated: true, openedNewWindow: true
+                )
+            }
+            await gate.waitUntilPaused()
+            let id = try XCTUnwrap(workspaceID)
+            let siblingJoin = try XCTUnwrap(manager.pendingPersistentWorkspacePublication(workspaceID: id, exactRoot: root))
+            request.cancel()
+            do {
+                _ = try await request.value
+                XCTFail("Cancelled request must not report success")
+            } catch {
+                let message = error.localizedDescription
+                XCTAssertTrue(message.contains(id.uuidString), message)
+                XCTAssertTrue(message.contains(siblingJoin.operationID.uuidString), message)
+                XCTAssertTrue(message.contains("window -1403"), message)
+                XCTAssertTrue(message.contains("may have committed"), message)
+                XCTAssertTrue(message.contains("No automatic close was performed"), message)
+            }
+            XCTAssertNotNil(manager.pendingPersistentWorkspacePublication(workspaceID: id, exactRoot: root))
+            let beforeRelease = await runtime.workspaceStore.snapshot()
+            XCTAssertFalse(beforeRelease.workspaces.contains { $0.document.workspaceID == id })
+            await gate.release()
+            let outcome = try await siblingJoin.join()
+            XCTAssertEqual(outcome.operationID, siblingJoin.operationID)
+            XCTAssertEqual(outcome.disposition, .applied)
+            let committed = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(committed.workspaces.contains { $0.document.workspaceID == id })
+            XCTAssertTrue(activationAdmissions.isEmpty)
+            XCTAssertEqual(manager.activeWorkspaceID, activeID)
+        }
+
+        func testRoutingActivationBlockReportsDurableCreationAndWindowIdentity() async throws {
+            let runtime = try await makeDomainRuntime()
+            let manager = makeManager(domainRuntime: runtime)
+            await manager.awaitInitialized()
+            let activeID = manager.activeWorkspaceID
+            let gate = WorkspaceRootMutationTestGate()
+            var workspaceID: UUID?
+            var operationID: UUID?
+            manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = { id, operation in
+                workspaceID = id
+                operationID = operation
+                await gate.pauseUntilReleased()
+            }
+            defer {
+                manager.isRefreshing = false
+                manager.persistentWorkspaceCreationWillExecuteHandlerForTesting = nil
+                Task { await gate.release() }
+            }
+            let request = Task { @MainActor in
+                try await WindowRoutingService.createWorkspaceForRouting(
+                    workspaceManager: manager, name: "Committed Routing Block", repoPaths: [],
+                    windowID: -1404, switchToCreated: true, openedNewWindow: true
+                )
+            }
+            await gate.waitUntilPaused()
+            manager.isRefreshing = true
+            await gate.release()
+            let id = try XCTUnwrap(workspaceID)
+            let operation = try XCTUnwrap(operationID)
+            do {
+                _ = try await request.value
+                XCTFail("Blocked activation must not imply a successful loaded scratch window")
+            } catch {
+                let message = error.localizedDescription
+                XCTAssertTrue(message.contains("creation committed"), message)
+                XCTAssertTrue(message.contains(id.uuidString), message)
+                XCTAssertTrue(message.contains(operation.uuidString), message)
+                XCTAssertTrue(message.contains("window -1404"), message)
+                XCTAssertTrue(message.contains("refresh is in progress"), message)
+                XCTAssertTrue(message.contains("No automatic close was performed"), message)
+            }
+            let committed = await runtime.workspaceStore.snapshot()
+            XCTAssertTrue(committed.workspaces.contains { $0.document.workspaceID == id })
+            XCTAssertEqual(manager.activeWorkspaceID, activeID)
+        }
+
+        func testRoutingCreationWithoutAuthorityFailsBeforeAppendingLocalModel() async throws {
+            let manager = makeManager()
+            await manager.awaitInitialized()
+            let workspaceIDs = manager.workspaces.map(\.id)
+            do {
+                _ = try await WindowRoutingService.createWorkspaceForRouting(
+                    workspaceManager: manager, name: "No Authority Receipt", repoPaths: [],
+                    windowID: -1405, switchToCreated: false, openedNewWindow: true
+                )
+                XCTFail("A missing expected authority handle cannot mean success")
+            } catch {
+                XCTAssertTrue(error.localizedDescription.contains("authority is unavailable"))
+                XCTAssertTrue(error.localizedDescription.contains("window -1405"))
+                XCTAssertTrue(error.localizedDescription.contains("No automatic close was performed"))
+            }
+            XCTAssertEqual(manager.workspaces.map(\.id), workspaceIDs)
         }
 
         func testRootlessPersistentCreationWaitsForPublicationBeforeActivation() async throws {
@@ -1867,6 +2255,36 @@ import XCTest
                 format: "00000000-0000-0000-0000-%012d",
                 suffix
             )))
+        }
+
+        private func applyCanonicalProjection(_ snapshot: DomainWorkspaceCatalogSnapshot, to manager: WorkspaceManagerViewModel) throws {
+            let workspaces = try snapshot.workspaces.map {
+                try JSONDecoder().decode(WorkspaceModel.self, from: $0.document.documentBytes)
+            }
+            manager.applyDomainWorkspaceProjection(
+                workspaces,
+                canonicalRepoPathsByWorkspaceID: Dictionary(uniqueKeysWithValues: workspaces.map { ($0.id, $0.repoPaths) }),
+                fileURLsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.fileURL) }),
+                revisionsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.revisions) }),
+                digestsByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.document.contentDigest) }),
+                healthByWorkspaceID: Dictionary(uniqueKeysWithValues: snapshot.workspaces.map { ($0.document.workspaceID, $0.health) }),
+                catalogRevision: snapshot.catalogRevision,
+                preferredActiveWorkspaceID: manager.activeWorkspaceID,
+                publicationSequence: snapshot.publicationSequence
+            )
+        }
+
+        private func creationFailure(operationID: UUID, catalogRevision: UInt64) -> DomainWorkspaceAuthorityOperationError {
+            DomainWorkspaceAuthorityOperationError(outcome: DomainCommandOutcome(
+                operationID: operationID,
+                disposition: .failed,
+                before: nil,
+                after: nil,
+                catalogRevision: catalogRevision,
+                resultingDigest: nil,
+                errorCode: .workspaceUnavailable,
+                diagnostic: "fixture_creation_unavailable"
+            ))
         }
 
         private func canonicalRootPath(_ folder: URL) throws -> String {

@@ -109,7 +109,7 @@
                 ).jsonText)
             }
             do {
-                return try await handle(args: args, service: .shared)
+                return try await handle(args: args, service: WindowStatesManager.shared.promptExperimentService)
             } catch let error as PromptExperimentMCPError {
                 throw MCPError.invalidParams(error.jsonText)
             }
@@ -289,7 +289,7 @@
             let defaults = service.targetDefaults()
             let prompts: [Value] = BuiltInPromptID.allCases.map { id in
                 var value: [String: Value] = ["prompt_id": .string(id.rawValue)]
-                if let resource = try? BuiltInPromptRegistry.shared.resource(id) {
+                if let resource = try? AppDomainRuntimeComposition.shared.builtInPromptRegistry.resource(id) {
                     value["resource_sha256"] = .string(resource.sha256)
                 }
                 do {

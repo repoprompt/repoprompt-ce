@@ -1,6 +1,8 @@
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
+import RepoPromptVCS
+import RepoPromptWorkspaceCore
 
 @MainActor
 extension MCPWorktreeToolProvider {

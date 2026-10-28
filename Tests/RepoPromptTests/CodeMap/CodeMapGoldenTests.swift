@@ -1,5 +1,4 @@
 import Foundation
-@testable import RepoPromptApp
 import XCTest
 
 final class CodeMapGoldenTests: XCTestCase {

@@ -1,9 +1,10 @@
 import Foundation
 import RepoPromptCodeMapCore
+import RepoPromptPersistence
 
 actor WorkspaceCodemapLiveOverlay {
     private struct Registration: Equatable {
-        let capability: GitCodemapRootCapability
+        let capability: WorkspaceCodemapRootCapability
         let catalogGeneration: UInt64
     }
 
@@ -317,7 +318,7 @@ actor WorkspaceCodemapLiveOverlay {
     }
 
     func register(
-        capability state: WorkspaceCodemapGitCapabilityState,
+        capability state: WorkspaceCodemapRootCapabilityState,
         catalogGeneration: UInt64
     ) -> WorkspaceCodemapLiveOverlayRegistrationDisposition {
         guard case let .eligible(capability) = state else {
@@ -411,8 +412,10 @@ actor WorkspaceCodemapLiveOverlay {
         namespace: CodeMapRootManifestNamespace
     ) -> WorkspaceCodemapLiveManifestAdoptionTicket? {
         guard var root = roots[rootEpoch], root.authorityIsCurrent, namespace.isCurrent else { return nil }
+        // Manifest namespaces and authorities exist only for Git roots.
+        guard let gitCapability = root.registration.capability.gitCapability else { return nil }
         let expectedNamespace = try? CodeMapRootManifestNamespace(
-            capability: root.registration.capability,
+            capability: gitCapability,
             pipelineIdentity: namespace.pipelineIdentity
         )
         guard expectedNamespace == namespace else { return nil }
@@ -421,7 +424,7 @@ actor WorkspaceCodemapLiveOverlay {
         } else {
             guard let authority = try? CodeMapRootManifestAuthority(
                 namespace: namespace,
-                token: root.registration.capability.repositoryAuthority
+                token: gitCapability.repositoryAuthority
             ) else { return nil }
             root.pipelines[namespace.pipelineIdentity] = PipelineManifestState(
                 namespace: namespace,
@@ -440,7 +443,7 @@ actor WorkspaceCodemapLiveOverlay {
             rootEpoch: rootEpoch,
             pipelineIdentity: namespace.pipelineIdentity,
             catalogGeneration: root.registration.catalogGeneration,
-            repositoryAuthority: root.registration.capability.repositoryAuthority,
+            repositoryAuthority: gitCapability.repositoryAuthority,
             invalidationGeneration: pipeline.invalidationGeneration
         )
     }
@@ -449,10 +452,11 @@ actor WorkspaceCodemapLiveOverlay {
         _ ticket: WorkspaceCodemapLiveManifestAdoptionTicket
     ) -> Bool {
         guard let root = roots[ticket.rootEpoch], root.authorityIsCurrent,
+              let gitCapability = root.registration.capability.gitCapability,
               let pipeline = root.pipelines[ticket.pipelineIdentity]
         else { return false }
         return ticket.catalogGeneration == root.registration.catalogGeneration &&
-            ticket.repositoryAuthority == root.registration.capability.repositoryAuthority &&
+            ticket.repositoryAuthority == gitCapability.repositoryAuthority &&
             ticket.invalidationGeneration == pipeline.invalidationGeneration
     }
 
@@ -471,8 +475,9 @@ actor WorkspaceCodemapLiveOverlay {
         guard var pipeline = root.pipelines[ticket.pipelineIdentity] else {
             return .rejected(.namespaceMismatch)
         }
-        guard ticket.catalogGeneration == root.registration.catalogGeneration,
-              ticket.repositoryAuthority == root.registration.capability.repositoryAuthority,
+        guard let gitCapability = root.registration.capability.gitCapability,
+              ticket.catalogGeneration == root.registration.catalogGeneration,
+              ticket.repositoryAuthority == gitCapability.repositoryAuthority,
               ticket.invalidationGeneration == pipeline.invalidationGeneration
         else {
             return .rejected(.staleLoad)
@@ -576,7 +581,7 @@ actor WorkspaceCodemapLiveOverlay {
             }
             guard let relativePath = loadedRootRelativePath(
                 repositoryRelativePath: entry.record.repositoryRelativePath,
-                prefix: root.registration.capability.repositoryRelativeLoadedRootPrefix
+                prefix: gitCapability.repositoryRelativeLoadedRootPrefix
             ) else {
                 return .rejected(.bindingMismatch)
             }
@@ -591,8 +596,8 @@ actor WorkspaceCodemapLiveOverlay {
                   completion.token.identity.rootLifetimeID == rootEpoch.rootLifetimeID,
                   completion.token.catalogGeneration == root.registration.catalogGeneration,
                   completion.sourceProof.sourceAuthority.rootEpoch == rootEpoch,
-                  completion.sourceProof.sourceAuthority.repositoryAuthority ==
-                  root.registration.capability.repositoryAuthority,
+                  completion.sourceProof.sourceAuthority.rootAuthority ==
+                  root.registration.capability.rootAuthority,
                   completion.sourceProof.sourceAuthority.standardizedRepositoryRelativePath ==
                   entry.record.repositoryRelativePath,
                   completion.verifiedCleanAssociation?.identity == entry.record.locatorIdentity,
@@ -649,9 +654,10 @@ actor WorkspaceCodemapLiveOverlay {
     ) -> Bool {
         guard var root = roots[ticket.rootEpoch],
               root.authorityIsCurrent,
+              let gitCapability = root.registration.capability.gitCapability,
               var pipeline = root.pipelines[ticket.pipelineIdentity],
               ticket.catalogGeneration == root.registration.catalogGeneration,
-              ticket.repositoryAuthority == root.registration.capability.repositoryAuthority,
+              ticket.repositoryAuthority == gitCapability.repositoryAuthority,
               ticket.invalidationGeneration == pipeline.invalidationGeneration,
               pipeline.adoptedInvalidationGeneration == ticket.invalidationGeneration,
               pipeline.adoptionOperationID == ticket.operationID,
@@ -797,18 +803,16 @@ actor WorkspaceCodemapLiveOverlay {
         guard token.catalogGeneration == root.registration.catalogGeneration else {
             return .rejected(.catalogGenerationMismatch)
         }
-        guard token.sourceExpectation.sourceAuthority.repositoryAuthority ==
-            root.registration.capability.repositoryAuthority
+        guard token.sourceExpectation.sourceAuthority.rootAuthority ==
+            root.registration.capability.rootAuthority
         else {
-            return .rejected(.repositoryAuthorityMismatch)
+            return .rejected(.rootAuthorityMismatch)
         }
         guard token.sourceExpectation.sourceAuthority.rootEpoch == rootEpoch else {
             return .rejected(.rootEpochMismatch)
         }
-        guard repositoryRelativePath(
-            loadedRootRelativePath: token.identity.standardizedRelativePath,
-            prefix: root.registration.capability.repositoryRelativeLoadedRootPrefix
-        ) == token.sourceExpectation.sourceAuthority.standardizedRepositoryRelativePath
+        guard token.sourceExpectation.sourceAuthority.candidateRootRelativePath ==
+            token.identity.standardizedRelativePath
         else {
             return .rejected(.pathOutsideRoot)
         }
@@ -1130,11 +1134,11 @@ actor WorkspaceCodemapLiveOverlay {
             recordStaleCompletionDrop()
             return .rejected(.catalogGenerationMismatch)
         }
-        guard ticket.token.sourceExpectation.sourceAuthority.repositoryAuthority ==
-            root.registration.capability.repositoryAuthority
+        guard ticket.token.sourceExpectation.sourceAuthority.rootAuthority ==
+            root.registration.capability.rootAuthority
         else {
             recordStaleCompletionDrop()
-            return .rejected(.repositoryAuthorityMismatch)
+            return .rejected(.rootAuthorityMismatch)
         }
         guard case let .pending(pending) = root.liveByFileID[ticket.token.identity.fileID] else {
             if case var .ready(ready)? = root.liveByFileID[ticket.token.identity.fileID],
@@ -1254,10 +1258,10 @@ actor WorkspaceCodemapLiveOverlay {
         guard ticket.token.catalogGeneration == root.registration.catalogGeneration else {
             return .rejected(.catalogGenerationMismatch)
         }
-        guard ticket.token.sourceExpectation.sourceAuthority.repositoryAuthority ==
-            root.registration.capability.repositoryAuthority
+        guard ticket.token.sourceExpectation.sourceAuthority.rootAuthority ==
+            root.registration.capability.rootAuthority
         else {
-            return .rejected(.repositoryAuthorityMismatch)
+            return .rejected(.rootAuthorityMismatch)
         }
         switch reason {
         case .unsupportedFileType, .transient, .securityExcluded:
@@ -1353,10 +1357,13 @@ actor WorkspaceCodemapLiveOverlay {
                 affectedPipelines.insert(live.pipelineIdentity)
                 removeLiveEntry(fileID: liveFileID, from: &root)
             }
+            let manifestPrefix = root.registration.capability.gitCapability?
+                .repositoryRelativeLoadedRootPrefix
             for (pipelineIdentity, pipeline) in root.pipelines where pipeline.manifest?.records.contains(where: {
-                loadedRootRelativePath(
+                guard let manifestPrefix else { return false }
+                return loadedRootRelativePath(
                     repositoryRelativePath: $0.repositoryRelativePath,
-                    prefix: root.registration.capability.repositoryRelativeLoadedRootPrefix
+                    prefix: manifestPrefix
                 ) == relativePath
             }) == true {
                 affectedPipelines.insert(pipelineIdentity)
@@ -1391,11 +1398,11 @@ actor WorkspaceCodemapLiveOverlay {
     @discardableResult
     func invalidateRootAuthority(
         rootEpoch: WorkspaceCodemapRootEpoch,
-        expectedAuthority: WorkspaceCodemapRepositoryAuthorityToken,
+        expectedAuthority: WorkspaceCodemapRootAuthorityToken,
         reason _: WorkspaceCodemapLiveOverlayInvalidationReason
     ) -> Bool {
         guard var root = roots[rootEpoch],
-              root.registration.capability.repositoryAuthority == expectedAuthority
+              root.registration.capability.rootAuthority == expectedAuthority
         else { return false }
         advanceAllManifestInvalidationGenerations(&root, rootEpoch: rootEpoch)
         root.pipelines.removeAll()
@@ -1413,7 +1420,7 @@ actor WorkspaceCodemapLiveOverlay {
         root.graphSlotsHaveCollisions = false
         root.graphLiveEntriesIndexedByPath = true
         root.graphCoverageTally = GraphCoverageTally()
-        revokeGraph(&root, rootEpoch: rootEpoch, reason: .repositoryAuthorityChanged)
+        revokeGraph(&root, rootEpoch: rootEpoch, reason: .rootAuthorityChanged)
         roots[rootEpoch] = root
         return true
     }
@@ -1426,7 +1433,7 @@ actor WorkspaceCodemapLiveOverlay {
         if let reason = root.graphRevocationReason {
             return .revoked(reason)
         }
-        guard root.authorityIsCurrent else { return .revoked(.repositoryAuthorityChanged) }
+        guard root.authorityIsCurrent else { return .revoked(.rootAuthorityChanged) }
         if root.graphCoverage.enumerationState == .notStarted,
            root.graphSlotsByFileID.isEmpty
         {
@@ -1522,7 +1529,7 @@ actor WorkspaceCodemapLiveOverlay {
     ) -> WorkspaceCodemapGraphCheckpointDisposition {
         guard let root = roots[rootEpoch] else { return .revoked(.rootUnloaded) }
         if let reason = root.graphRevocationReason { return .revoked(reason) }
-        guard root.authorityIsCurrent else { return .revoked(.repositoryAuthorityChanged) }
+        guard root.authorityIsCurrent else { return .revoked(.rootAuthorityChanged) }
         return switch checkpointDisposition(for: rootEpoch, root: root) {
         case let .resync(checkpoint, _): .checkpoint(checkpoint)
         case let .revoked(reason): .revoked(reason)
@@ -1547,7 +1554,7 @@ actor WorkspaceCodemapLiveOverlay {
                 return
             }
             guard root.authorityIsCurrent else {
-                continuation.yield(.revoked(.repositoryAuthorityChanged))
+                continuation.yield(.revoked(.rootAuthorityChanged))
                 continuation.finish()
                 return
             }
@@ -1895,7 +1902,7 @@ actor WorkspaceCodemapLiveOverlay {
         return WorkspaceCodemapLiveRootSnapshot(
             rootEpoch: rootEpoch,
             catalogGeneration: root.registration.catalogGeneration,
-            repositoryAuthority: root.registration.capability.repositoryAuthority,
+            rootAuthority: root.registration.capability.rootAuthority,
             contributionGeneration: root.contributionGeneration,
             authorityIsCurrent: root.authorityIsCurrent,
             manifestGeneration: root.pipelines.count == 1
@@ -1914,7 +1921,7 @@ actor WorkspaceCodemapLiveOverlay {
         return WorkspaceCodemapLiveOverlayBundle(
             rootEpoch: rootEpoch,
             catalogGeneration: root.registration.catalogGeneration,
-            repositoryAuthority: root.registration.capability.repositoryAuthority,
+            rootAuthority: root.registration.capability.rootAuthority,
             contributionGeneration: root.contributionGeneration,
             entries: ready.map { readySnapshot(rootEpoch: rootEpoch, ready: $0) },
             bindings: ready.map(\.binding),
@@ -1949,7 +1956,7 @@ actor WorkspaceCodemapLiveOverlay {
         return WorkspaceCodemapLiveOverlayBundle(
             rootEpoch: rootEpoch,
             catalogGeneration: root.registration.catalogGeneration,
-            repositoryAuthority: root.registration.capability.repositoryAuthority,
+            rootAuthority: root.registration.capability.rootAuthority,
             contributionGeneration: root.contributionGeneration,
             entries: [readySnapshot(rootEpoch: rootEpoch, ready: ready)],
             bindings: [ready.binding],
@@ -3052,10 +3059,10 @@ actor WorkspaceCodemapLiveOverlay {
         for rootEpoch: WorkspaceCodemapRootEpoch,
         root: RootState
     ) -> WorkspaceCodemapGraphChangesDisposition {
-        guard root.authorityIsCurrent else { return .revoked(.repositoryAuthorityChanged) }
+        guard root.authorityIsCurrent else { return .revoked(.rootAuthorityChanged) }
         guard case let .success(checkpoint) = WorkspaceCodemapGraphCheckpoint.validated(
             rootEpoch: rootEpoch,
-            repositoryAuthority: root.registration.capability.repositoryAuthority,
+            rootAuthority: root.registration.capability.rootAuthority,
             generation: root.contributionGeneration,
             schemaVersion: CodeMapSelectionGraphContribution.currentSchemaVersion,
             policyVersion: CodeMapSelectionGraphContribution.currentPolicyVersion,

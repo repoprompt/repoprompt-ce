@@ -10,7 +10,7 @@
             CommandGroup(after: .windowArrangement) {
                 Divider()
                 Button("Prompt Experiments…") {
-                    PromptExperimentStudioWindowCoordinator.shared.open()
+                    WindowStatesManager.shared.promptExperimentStudioWindowCoordinator.open()
                 }
                 .keyboardShortcut("e", modifiers: [.command, .option])
             }

@@ -21,9 +21,13 @@ import XCTest
 final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
     private var retained: [AgentModeViewModel] = []
     private var retainedWorkspaceManagers: [WorkspaceManagerViewModel] = []
+    private var deliveredRunFences: [TestReleaseFence] = []
     private var runCatalogRevision: UInt64 = 0
 
     override func tearDown() {
+        // A delivered attempt the test never completed must not stay parked in its run lease.
+        deliveredRunFences.forEach { $0.release() }
+        deliveredRunFences.removeAll()
         retained.removeAll()
         retainedWorkspaceManagers.removeAll()
         super.tearDown()
@@ -100,7 +104,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
 
         // Hop 1 → wake 2: target 2 completing the work the observer itself asked for is a genuinely
         // new edge, and it admits again. Under the retired fence this is where the pipeline stalled.
-        try await completeRun(pipeline, on: pipeline.targetTwo)
+        try await completeRun(pipeline, on: pipeline.targetTwo, afterDelivery: true)
         let wakeTwo = try XCTUnwrap(
             observer.session.oversight.pendingAutoWake,
             "the observer's own delegated work completing must admit the next wake"
@@ -132,7 +136,7 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         )
 
         // Hop 2 → wake 3.
-        try await completeRun(pipeline, on: pipeline.targetThree)
+        try await completeRun(pipeline, on: pipeline.targetThree, afterDelivery: true)
         let wakeThree = try XCTUnwrap(
             observer.session.oversight.pendingAutoWake,
             "the third session's completion must admit the third wake"
@@ -200,7 +204,21 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
     /// `idle → running → idle` observed in a single reconciliation is a net reversion it correctly
     /// drops. Observing the two transitions separately is what a real target does, and it is what
     /// produces the single `running → idle` completion edge a wake is admitted by.
-    private func completeRun(_ pipeline: Pipeline, on node: Node) async throws {
+    private func completeRun(_ pipeline: Pipeline, on node: Node, afterDelivery: Bool = false) async throws {
+        if afterDelivery {
+            // The delivered attempt's end is ordinary run work. Let the observer sample it running
+            // first, so that end is the completion edge rather than idle coverage whose running frame
+            // a refresh may or may not have caught.
+            let parked = await node.deliveredRun.waitUntilEntered()
+            XCTAssertTrue(parked, "\(node.displayName)'s delivered attempt must reach its run lease")
+            try syncRunCatalogProjection(pipeline.observer)
+            await pipeline.bridge.test_settleProjections()
+            node.deliveredRun.release()
+            try await AsyncTestWait.waitUntil("\(node.displayName)'s delivered attempt ends") {
+                node.session.activeRunOwnership == nil
+            }
+            await node.session.agentTask?.value
+        }
         node.session.runState = .running
         try syncRunCatalogProjection(pipeline.observer)
         await pipeline.bridge.test_settleProjections()
@@ -327,6 +345,8 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
 
     private struct Node {
         let viewModel: AgentModeViewModel
+        /// Parks a delivered attempt in its run lease until the test chooses when that attempt ends.
+        let deliveredRun: TestReleaseFence
         let session: AgentModeViewModel.TabSession
         let sessionID: UUID
         let tabID: UUID
@@ -379,6 +399,8 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         // parks each admitted wake in `.awaitingSettlement` and the test supplies the provider's own
         // claim/acceptance step explicitly instead of racing a stubbed provider's run.
         observer.session.runState = .running
+        // The observer never takes a delivered run; nothing of its own may park.
+        observer.deliveredRun.release()
 
         // The one input the bridge does not own: the observer's run-catalog route, published by the
         // run catalog in production. Without it the observer has no supplement-eligible prompt
@@ -397,6 +419,8 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
 
     private func makeNode(windowID: Int, displayName: String) throws -> Node {
         let tabID = UUID()
+        let deliveredRun = TestReleaseFence(name: "\(displayName) delivered attempt run lease")
+        deliveredRunFences.append(deliveredRun)
         let viewModel = AgentModeViewModel(
             testWindowID: windowID,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
@@ -406,8 +430,11 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
             },
             claudeControllerFactory: { _, _, _, _ in AutonomousPipelineStubNativeController() },
             // No real MCP policy work: a delivered send only has to reach its provider handoff, and a
-            // real installer would do process and network work in the background.
-            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            // real installer would do process and network work in the background. A run's policy
+            // install is where its attempt waits for the test's choice of when it may end.
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, purpose, _, _, _ in
+                if purpose == .agentModeRun { await deliveredRun.enterAndWait() }
+            },
             mcpServerEnabler: { true }
         )
         retained.append(viewModel)
@@ -427,12 +454,16 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
         session.installRunID(UUID())
-        let sessionID = try XCTUnwrap(
-            viewModel.test_ensureSessionBoundToTab(session),
-            "expected a durable persistent binding"
-        )
+        // Pipeline delivery begins with an existing restored conversation.
+        let sessionID = UUID()
+        _ = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID, on: session, updateWorkspaceMetadata: true
+        ))
+        session.recordRestorationAuthoritative(.persistedPayloadApplied)
+        XCTAssertTrue(session.permitsBoundOperationAndSave)
         return Node(
             viewModel: viewModel,
+            deliveredRun: deliveredRun,
             session: session,
             sessionID: sessionID,
             tabID: tabID,
@@ -486,7 +517,8 @@ final class AgentSessionLinkAutonomousPipelineTests: XCTestCase {
                 runID: runID,
                 routeToken: routeToken,
                 projectionRevision: runCatalogRevision,
-                hasAgentSessionLink: true
+                hasAgentSessionLink: true,
+                hasAnyActiveLink: true
             ),
             to: endpoint
         )
@@ -535,10 +567,34 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         viewModelsByWindowID[windowID] = viewModel
     }
 
-    func agentSessionLinkCandidates() -> [AgentSessionLinkEndpointCandidate] {
+    func agentSessionLinkCandidate(
+        for endpoint: DomainAgentSessionLinkEndpointIdentity, includeLocation: Bool
+    ) -> AgentSessionLinkEndpointCandidate? {
+        viewModelsByWindowID[endpoint.windowID]?.agentSessionLinkCandidate(for: endpoint, includeLocation: includeLocation)
+    }
+
+    func agentSessionLinkCandidates(
+        forSessionIDs sessionIDs: Set<UUID>, includeLocation: Bool
+    ) -> [UUID: [AgentSessionLinkEndpointCandidate]] {
+        var result = Dictionary(uniqueKeysWithValues: sessionIDs.map { ($0, [AgentSessionLinkEndpointCandidate]()) })
+        for windowID in viewModelsByWindowID.keys.sorted() {
+            guard let viewModel = viewModelsByWindowID[windowID] else { continue }
+            let local = viewModel.agentSessionLinkCandidates(forSessionIDs: sessionIDs, includeLocation: includeLocation)
+            for sessionID in sessionIDs {
+                result[sessionID, default: []] += local[sessionID] ?? []
+            }
+        }
+        return result
+    }
+
+    func agentSessionLinkCandidates(includeLocation _: Bool) -> [AgentSessionLinkEndpointCandidate] {
         viewModelsByWindowID.keys.sorted().flatMap { windowID in
             viewModelsByWindowID[windowID]?.agentSessionLinkCandidates(isWindowClosing: false) ?? []
         }
+    }
+
+    func agentSessionLinkRunFacts(for candidate: AgentSessionLinkEndpointCandidate, capturedStatus: DomainAgentSessionLinkStatus) -> AgentRunQuietFacts? {
+        viewModelsByWindowID[candidate.windowID]?.agentSessionLinkRunFacts(for: candidate, capturedStatus: capturedStatus)
     }
 
     func agentSessionLinkObservationSnapshot(
@@ -550,6 +606,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
                 displayName: candidate.displayName,
                 providerDisplayName: candidate.providerDisplayName,
                 status: .idle,
+                board: .empty,
                 idleForSend: false,
                 pendingInteractionKind: nil,
                 latestVisibleAssistantPreview: nil,
@@ -723,6 +780,13 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
         )
     }
 
+    func agentSessionLinkStartStopFence(for candidate: AgentSessionLinkEndpointCandidate) -> AgentRunStartStopFence? {
+        guard let viewModel = viewModelsByWindowID[candidate.windowID],
+              let session = viewModel.agentSessionLinkLiveSession(matching: candidate)
+        else { return nil }
+        return AgentRunStartStopFence(session: session)
+    }
+
     func agentSessionLinkPerformSend(
         to candidate: AgentSessionLinkEndpointCandidate,
         request: AgentSessionLinkSendRequest,
@@ -733,6 +797,23 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
             return .blocked(.endpointInvalidated)
         }
         return await viewModel.agentSessionLinkPerformSend(
+            to: candidate,
+            request: request,
+            liveness: liveness,
+            commitAuthorization: commitAuthorization
+        )
+    }
+
+    func agentSessionLinkPerformCompact(
+        to candidate: AgentSessionLinkEndpointCandidate,
+        request: AgentSessionLinkCompactRequest,
+        liveness: @escaping AgentSessionLinkSendLivenessProbe,
+        commitAuthorization: @MainActor () async -> AgentSessionLinkSendCommitOutcome
+    ) async -> AgentSessionLinkSendTransactionOutcome {
+        guard let viewModel = viewModelsByWindowID[candidate.windowID] else {
+            return .blocked(.endpointInvalidated)
+        }
+        return await viewModel.agentSessionLinkPerformCompact(
             to: candidate,
             request: request,
             liveness: liveness,
@@ -762,6 +843,7 @@ final class LiveWindowEndpointHost: AgentSessionLinkEndpointHost {
 /// Minimal native runtime stub: the pipeline only needs a delivered send to reach its provider
 /// handoff, so nothing here touches a process, a socket, or the filesystem.
 private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControlling {
+    private var configuration = SessionLinkNativeConfigurationFixture()
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
 
     init() {
@@ -789,7 +871,8 @@ private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControll
         effortLevel _: NativeAgentRuntimeEffortLevel?,
         systemPromptOverride _: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
-        NativeAgentRuntimeSessionRef(sessionID: "autonomous-pipeline-stub")
+        configuration.replaceProcess()
+        return NativeAgentRuntimeSessionRef(sessionID: "autonomous-pipeline-stub")
     }
 
     func currentSessionRef() -> NativeAgentRuntimeSessionRef {
@@ -799,7 +882,18 @@ private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControll
     func applyModelAndEffort(
         model _: String?,
         effortLevel _: NativeAgentRuntimeEffortLevel?
-    ) async throws {}
+    ) async throws {
+        _ = configuration.apply()
+    }
+
+    func applyModelAndEffortWithProof(model _: String?, effortLevel _: NativeAgentRuntimeEffortLevel?) async throws -> NativeAgentRuntimeConfigurationApplication {
+        configuration.apply()
+    }
+
+    func sendUserMessage(_: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+        try configuration.validate(proof)
+        return UUID()
+    }
 
     func sendUserMessage(_: String) async throws -> UUID {
         UUID()
@@ -809,7 +903,10 @@ private actor AutonomousPipelineStubNativeController: NativeAgentRuntimeControll
         .noTurnInFlight
     }
 
-    func shutdown() {}
+    func shutdown() {
+        configuration.replaceProcess()
+    }
+
     func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) {}
 }
 

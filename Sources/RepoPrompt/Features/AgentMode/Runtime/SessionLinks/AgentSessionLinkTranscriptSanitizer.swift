@@ -119,11 +119,21 @@ struct AgentSessionLinkTranscriptItem: Equatable {
     /// observer can never request again. The residual overshoot is therefore bounded by a small
     /// constant instead of by `narrativeItemMaxBytes`, and a grapheme too wide to clip becomes an
     /// explicit marker rather than an empty string.
-    func withTextTruncated(toRemainingBudget remainingBudget: Int, minimumTextBytes: Int) -> Self {
+    func withTextTruncated(
+        toRemainingBudget remainingBudget: Int,
+        minimumTextBytes: Int,
+        maxOutputBytes: Int,
+        wasByteCapped: Bool = false
+    ) -> Self {
         guard let text else { return self }
         let allowance = max(minimumTextBytes, remainingBudget - nonTextUTF8Cost)
-        guard text.utf8.count > allowance else { return self }
-        let clipped = AgentSessionLinkTranscriptBudget.truncatedRowText(text, maxBytes: allowance)
+        guard wasByteCapped || text.utf8.count > allowance else { return self }
+        let marker = maxOutputBytes >= AgentSessionLinkTranscriptBudget.maximumMaxOutputBytes
+            ? AgentSessionLinkTranscriptBudget.maximumBudgetClippedRowMarker
+            : AgentSessionLinkTranscriptBudget.clippedRowMarker
+        let clipped = AgentSessionLinkTranscriptBudget.truncatedRowText(
+            text, maxBytes: allowance - marker.utf8.count
+        ) + marker
         return AgentSessionLinkTranscriptItem(
             itemID: itemID,
             sequenceIndex: sequenceIndex,
@@ -232,6 +242,9 @@ enum AgentSessionLinkTranscriptBudget {
     /// cursor past it, making the content permanently unrequestable. The marker keeps forward
     /// progress while stating, visibly, that something was dropped.
     static let oversizedTextMarker = "[text omitted: exceeds byte budget]"
+    static let clippedRowMarker = "\n[row clipped; re-read with max_items: 1 and larger max_output_bytes]"
+
+    static let maximumBudgetClippedRowMarker = "\n[row clipped; exceeds maximum page budget (\(maximumMaxOutputBytes) bytes)]"
 
     static func clampedMaxItems(_ requested: Int?) -> Int {
         guard let requested else { return defaultMaxItems }
@@ -297,7 +310,7 @@ enum AgentSessionLinkTextRedactor {
     private static let rules: [Rule] = {
         let specs: [(pattern: String, template: String)] = [
             // `Authorization: Bearer …` / `Authorization: Basic …` headers in pasted logs.
-            (#"(?i)\b(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*\S+"#, "$1\(placeholder)"),
+            (#"(?i)\b(authorization\s*+[:=]\s*+)(?:(?:bearer|basic|token)\s*+)?\S+"#, "$1\(placeholder)"),
             // Bare credential schemes.
             (#"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}"#, "$1 \(placeholder)"),
             // `api_key = "…"`, `OPENAI_TOKEN=…`, `secret=…`, `password: …`, and JSON field forms.
@@ -307,25 +320,31 @@ enum AgentSessionLinkTextRedactor {
             // deliberately over-matches benign names such as `max_tokens`: for a cross-session
             // observer, a redacted number is a much cheaper failure than a leaked credential.
             (
-                #"(?i)("?[A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|"#
-                    + #"auth[_-]?token|secret[_-]?key|client[_-]?secret|private[_-]?key|credential|"#
-                    + #"password|passwd|secret|token)[A-Za-z0-9_.-]*"?"#
-                    + #"\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}\]]+)"#,
+                // Start only at an identifier boundary. The lookahead checks for a credential
+                // keyword, then the possessive key consumes the identifier once. Without these
+                // fences, a long non-credential token is rescanned at every character.
+                #"(?i)((?<![A-Za-z0-9_.-])"?(?=[A-Za-z0-9_.-]*(?:api[_-]?key|apikey|"#
+                    + #"access[_-]?token|refresh[_-]?token|auth[_-]?token|secret[_-]?key|"#
+                    + #"client[_-]?secret|private[_-]?key|credential|password|passwd|secret|token))"#
+                    + #"[A-Za-z0-9_.-]++"?\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|[^\s,;}\]]+)"#,
                 "$1\(placeholder)"
             ),
             // Well-known provider key shapes that can appear without any assignment context.
             (#"\b(?:sk|rk|pk)-[A-Za-z0-9_-]{16,}"#, placeholder),
             (#"\bgh[pousr]_[A-Za-z0-9]{16,}"#, placeholder),
             (#"\bxox[abposr]-[A-Za-z0-9-]{10,}"#, placeholder),
-            (#"\bAKIA[0-9A-Z]{16}\b"#, placeholder),
-            // PEM blocks.
-            (#"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"#, placeholder)
+            (#"\bAKIA[0-9A-Z]{16}\b"#, placeholder)
         ]
         return specs.compactMap { spec in
             guard let regex = try? NSRegularExpression(pattern: spec.pattern) else { return nil }
             return Rule(regex: regex, template: spec.template)
         }
     }()
+
+    private static let pemBlockRegex = try? NSRegularExpression(
+        pattern: #"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"#
+    )
+    private static let pemEndRegex = try? NSRegularExpression(pattern: #"-----END [A-Z ]*PRIVATE KEY-----"#)
 
     /// Redacts secrets, then normalizes home-directory paths.
     static func redact(_ text: String, homeDirectory: String = NSHomeDirectory()) -> String {
@@ -335,6 +354,19 @@ enum AgentSessionLinkTextRedactor {
                 in: result,
                 range: NSRange(result.startIndex..., in: result),
                 withTemplate: rule.template
+            )
+        }
+        if let pemBlockRegex, let pemEndRegex,
+           let lastEnd = pemEndRegex.matches(
+               in: result, range: NSRange(result.startIndex..., in: result)
+           ).last
+        {
+            // A trailing series of unclosed BEGIN markers would otherwise rescan the remaining
+            // text from each marker. A complete block cannot end after the last closing marker.
+            result = pemBlockRegex.stringByReplacingMatches(
+                in: result,
+                range: NSRange(location: 0, length: lastEnd.range.upperBound),
+                withTemplate: placeholder
             )
         }
         return normalizeHomePaths(result, homeDirectory: homeDirectory)
@@ -394,6 +426,20 @@ enum AgentSessionLinkTranscriptSanitizer {
         readerSessionID: UUID? = nil,
         homeDirectory: String = NSHomeDirectory()
     ) -> AgentSessionLinkTranscriptItem? {
+        sanitizeBounded(
+            row: row, isSummaryRow: isSummaryRow, readerSessionID: readerSessionID,
+            homeDirectory: homeDirectory,
+            narrativeMaxBytes: AgentSessionLinkTranscriptBudget.narrativeItemMaxBytes
+        )?.item
+    }
+
+    private static func sanitizeBounded(
+        row: AgentChatItem,
+        isSummaryRow: Bool,
+        readerSessionID: UUID?,
+        homeDirectory: String,
+        narrativeMaxBytes: Int
+    ) -> (item: AgentSessionLinkTranscriptItem, wasByteCapped: Bool)? {
         switch row.kind {
         case .thinking:
             // Omitted entirely; the page reports `omitted_thinking_count`.
@@ -402,7 +448,7 @@ enum AgentSessionLinkTranscriptSanitizer {
             // Structural: no text, no arguments, no result, no invocation identifier. This also
             // overrides the normal persistence exception that preserves raw `ask_user` payloads —
             // an observer sees only that `ask_user` ran and how it ended.
-            return AgentSessionLinkTranscriptItem(
+            return (AgentSessionLinkTranscriptItem(
                 itemID: row.id.uuidString,
                 sequenceIndex: row.sequenceIndex,
                 role: .tool,
@@ -411,18 +457,18 @@ enum AgentSessionLinkTranscriptSanitizer {
                 toolStatus: statusWord(for: row),
                 attachmentNote: nil,
                 timestamp: row.timestamp
-            )
+            ), false)
         case .user, .assistant, .assistantInline, .system, .error:
             let role = role(for: row.kind, isSummaryRow: isSummaryRow)
             let cap = switch role {
             case .system, .error:
                 AgentSessionLinkTranscriptBudget.diagnosticItemMaxBytes
             case .user, .assistant, .summary, .tool:
-                AgentSessionLinkTranscriptBudget.narrativeItemMaxBytes
+                narrativeMaxBytes
             }
-            let redacted = AgentSessionLinkTextRedactor.redact(row.text, homeDirectory: homeDirectory)
-            let text = AgentSessionLinkTranscriptBudget.truncatedRowText(redacted, maxBytes: cap)
-            return AgentSessionLinkTranscriptItem(
+            let narrative = sanitizedNarrative(row.text, maxBytes: cap, homeDirectory: homeDirectory)
+            let text = narrative.readText
+            return (AgentSessionLinkTranscriptItem(
                 itemID: row.id.uuidString,
                 sequenceIndex: row.sequenceIndex,
                 role: role,
@@ -433,8 +479,31 @@ enum AgentSessionLinkTranscriptSanitizer {
                 attachmentNote: attachmentNote(for: row),
                 timestamp: row.timestamp,
                 crossSessionOrigin: crossSessionOrigin(for: row, readerSessionID: readerSessionID)
-            )
+            ), role != .system && role != .error && narrative.wasByteCapped)
         }
+    }
+
+    struct SanitizedNarrative {
+        let readText: String
+        let boundedText: String
+        let fullCharacterCount: Int
+        let wasByteCapped: Bool
+    }
+
+    /// Shared Read redaction/byte-bound primitive. XML hygiene is deliberately not applied to Read.
+    static func sanitizedNarrative(
+        _ text: String,
+        maxBytes: Int = AgentSessionLinkTranscriptBudget.narrativeItemMaxBytes,
+        homeDirectory: String = NSHomeDirectory()
+    ) -> SanitizedNarrative {
+        let redacted = AgentSessionLinkTextRedactor.redact(text, homeDirectory: homeDirectory)
+        let bounded = AgentSessionLinkTranscriptBudget.truncatedUTF8(redacted, maxBytes: maxBytes)
+        return SanitizedNarrative(
+            readText: bounded.isEmpty && !redacted.isEmpty ? AgentSessionLinkTranscriptBudget.oversizedTextMarker : bounded,
+            boundedText: bounded,
+            fullCharacterCount: AgentSessionLinkMessageEnvelope.sanitizedBody(redacted).count,
+            wasByteCapped: bounded != redacted
+        )
     }
 
     /// Whether a row's observer-visible representation is final, i.e. whether a cursor may step past
@@ -682,12 +751,17 @@ enum AgentSessionLinkTranscriptSanitizer {
             // it is what makes the park harmless: nothing exists after the newest row, so parking
             // there withholds nothing, and the next appended row ends the park automatically.
             let isLiveEdge = index == rows.count - 1
-            if let item = sanitize(
+            if let sanitized = sanitizeBounded(
                 row: row,
                 isSummaryRow: summaryRowIDs.contains(row.id),
                 readerSessionID: readerSessionID,
-                homeDirectory: homeDirectory
+                homeDirectory: homeDirectory,
+                narrativeMaxBytes: max(
+                    AgentSessionLinkTranscriptBudget.firstItemMinimumTextBytes,
+                    maxOutputBytes - usedBytes
+                )
             ) {
+                let item = sanitized.item
                 if selected.count >= maxItems {
                     truncated = true
                     // A tail page is newest-anchored by construction, so a budget stop leaves only
@@ -697,19 +771,21 @@ enum AgentSessionLinkTranscriptSanitizer {
                 }
                 var emitted = item
                 var cost = item.utf8Cost
-                if usedBytes + cost > maxOutputBytes {
+                if sanitized.wasByteCapped || usedBytes + cost > maxOutputBytes {
                     guard selected.isEmpty else {
                         truncated = true
                         hasMore = !fillsFromEnd
                         break walk
                     }
                     // The first row is budgeted, not exempted. Skipping the check for it would let a
-                    // caller that asked for a few hundred bytes receive a full `narrativeItemMaxBytes`
-                    // row; refusing it outright would stall the cursor on that row forever. Shrink its
+                    // caller that asked for a few hundred bytes receive a whole narrative row;
+                    // refusing it outright would stall the cursor on that row forever. Shrink its
                     // text into the remaining page budget instead, and say the page was truncated.
                     emitted = item.withTextTruncated(
                         toRemainingBudget: maxOutputBytes - usedBytes,
-                        minimumTextBytes: AgentSessionLinkTranscriptBudget.firstItemMinimumTextBytes
+                        minimumTextBytes: AgentSessionLinkTranscriptBudget.firstItemMinimumTextBytes,
+                        maxOutputBytes: maxOutputBytes,
+                        wasByteCapped: sanitized.wasByteCapped
                     )
                     cost = emitted.utf8Cost
                     truncated = true

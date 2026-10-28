@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptVCS
 
 enum GitWorktreeDefaultPathPlanner {
     enum Purpose: Equatable {

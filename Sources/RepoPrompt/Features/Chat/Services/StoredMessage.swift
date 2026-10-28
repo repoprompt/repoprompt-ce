@@ -23,11 +23,14 @@ struct StoredMessage: Codable {
     /// (may be nil for older data).
     let allowedFilePaths: [String]?
 
+    let fileAttachments: [AIChatFileAttachment]?
+
     enum CodingKeys: String, CodingKey {
         case id, isUser, rawText, timestamp
         case sequenceIndex, allowedFilePaths
         case promptTokens, completionTokens, cost
         case modelName
+        case fileAttachments = "imageAttachments"
     }
 
     init(from decoder: Decoder) throws {
@@ -41,6 +44,8 @@ struct StoredMessage: Codable {
             try container.decodeIfPresent(Int.self, forKey: .sequenceIndex) ?? 0
         allowedFilePaths =
             try container.decodeIfPresent([String].self, forKey: .allowedFilePaths)
+        fileAttachments =
+            try container.decodeIfPresent([AIChatFileAttachment].self, forKey: .fileAttachments)
 
         promptTokens = try container.decodeIfPresent(Int.self, forKey: .promptTokens)
         completionTokens = try container.decodeIfPresent(Int.self, forKey: .completionTokens)
@@ -56,6 +61,7 @@ struct StoredMessage: Codable {
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(sequenceIndex, forKey: .sequenceIndex)
         try container.encode(allowedFilePaths, forKey: .allowedFilePaths)
+        try container.encodeIfPresent(fileAttachments, forKey: .fileAttachments)
         try container.encode(promptTokens, forKey: .promptTokens)
         try container.encode(completionTokens, forKey: .completionTokens)
         try container.encode(cost, forKey: .cost)
@@ -69,6 +75,7 @@ struct StoredMessage: Codable {
         timestamp: Date = Date(),
         sequenceIndex: Int = 0,
         allowedFilePaths: [String]? = nil,
+        fileAttachments: [AIChatFileAttachment]? = nil,
         promptTokens: Int? = nil,
         completionTokens: Int? = nil,
         cost: Double? = nil,
@@ -80,6 +87,7 @@ struct StoredMessage: Codable {
         self.timestamp = timestamp
         self.sequenceIndex = sequenceIndex
         self.allowedFilePaths = allowedFilePaths
+        self.fileAttachments = fileAttachments
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.cost = cost

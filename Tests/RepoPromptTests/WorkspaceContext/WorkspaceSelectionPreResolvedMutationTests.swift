@@ -1,5 +1,8 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptFileSystem
+import RepoPromptFoundation
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class WorkspaceSelectionPreResolvedMutationTests: XCTestCase {
@@ -302,6 +305,16 @@ private final class PreResolvedCoordinatorHarness {
 @MainActor
 private final class PreResolvedSelectionHost: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
+    var activeSelectionWorkspace: WorkspaceSelectionWorkspace? {
+        activeWorkspace.map { workspace in
+            WorkspaceSelectionWorkspace(
+                id: workspace.id,
+                activeComposeTabID: workspace.activeComposeTabID,
+                firstComposeTabID: workspace.composeTabs.first?.id
+            )
+        }
+    }
+
     var selectionMirrorContextRevision: UInt64 = 0
     private(set) var selectionStoredByPersistence: StoredSelection?
 
@@ -316,6 +329,21 @@ private final class PreResolvedSelectionHost: WorkspaceSelectionHost {
     func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState? {
         guard activeWorkspace?.id == identity.workspaceID else { return nil }
         return composeTab(with: identity.tabID)
+    }
+
+    func selectionTab(for identity: WorkspaceSelectionIdentity) -> WorkspaceSelectionTab? {
+        composeTab(for: identity).map { WorkspaceSelectionTab(id: $0.id, selection: $0.selection) }
+    }
+
+    func storeSelection(
+        _ selection: StoredSelection,
+        modifiedAt: Date,
+        for identity: WorkspaceSelectionIdentity
+    ) -> Bool {
+        guard var tab = composeTab(for: identity) else { return false }
+        tab.selection = selection
+        tab.lastModified = modifiedAt
+        return updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID)
     }
 
     func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool) {}
