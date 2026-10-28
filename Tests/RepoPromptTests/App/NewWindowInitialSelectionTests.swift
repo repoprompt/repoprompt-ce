@@ -8,6 +8,7 @@ import RepoPromptFileSystem
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared
+@testable import RepoPromptWorkspaceContext
 import SwiftUI
 import XCTest
 
