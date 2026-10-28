@@ -31,6 +31,22 @@ extension CursorACPModelPollingService {
     )
 }
 
+extension OpenCodeACPModelPollingService.Registry {
+    static var app: Self {
+        Self(
+            update: { AgentACPModelRegistry.shared.updateDiscoveredModels($0, for: .openCode) },
+            snapshot: { AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode) },
+            snapshotAfterWarm: { await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .openCode) }
+        )
+    }
+}
+
+extension OpenCodeACPModelPollingService {
+    static let shared = OpenCodeACPModelPollingService(
+        client: OpenCodeACPControllerModelDiscoveryClient(), registry: .app
+    )
+}
+
 /// App convenience boundaries retain the existing lazy persisted-catalog lookup.
 /// The interpretation owners accept that lookup explicitly and never read app storage.
 extension CodexModelSpecifier {

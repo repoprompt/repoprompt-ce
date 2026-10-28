@@ -236,9 +236,11 @@ struct OpenCodeACPModelDiscoveryResult: Equatable {
 /// exists at a time; identical jobs coalesce on a single queue entry per key and never join a
 /// different key's result. The queue is FIFO.
 actor OpenCodeACPModelPollingService {
-    static let shared = OpenCodeACPModelPollingService(
-        client: OpenCodeACPControllerModelDiscoveryClient()
-    )
+    struct Registry {
+        let update: (ACPDiscoveredSessionModels) -> Bool
+        let snapshot: () -> ACPDiscoveredSessionModels?
+        let snapshotAfterWarm: () async -> ACPDiscoveredSessionModels?
+    }
 
     enum RefreshOutcome: Equatable {
         case updated
@@ -256,6 +258,7 @@ actor OpenCodeACPModelPollingService {
     }
 
     private let client: any OpenCodeACPModelDiscoveryClient
+    private let registry: Registry
     private let intervalNanos: UInt64
 
     // Catalog broadcast state.
@@ -284,9 +287,11 @@ actor OpenCodeACPModelPollingService {
 
     init(
         client: any OpenCodeACPModelDiscoveryClient,
+        registry: Registry,
         intervalNanos: UInt64 = 300_000_000_000
     ) {
         self.client = client
+        self.registry = registry
         self.intervalNanos = intervalNanos
     }
 
@@ -353,7 +358,7 @@ actor OpenCodeACPModelPollingService {
         guard !isShutdown else { return .skipped }
         let workspace = OpenCodeACPModelParameterKey.normalizedWorkspacePath(workspacePath)
         preferredWorkspacePath = workspace
-        let previous = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)
+        let previous = registry.snapshot()
         do {
             let result = try await awaitCatalogJob(workspace: workspace)
             guard result.didObtainCatalog else {
@@ -531,8 +536,8 @@ actor OpenCodeACPModelPollingService {
     @discardableResult
     private func publishCatalog(_ discovered: ACPDiscoveredSessionModels) -> Snapshot? {
         guard !isShutdown else { return nil }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .openCode)
-        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode) else { return nil }
+        _ = registry.update(discovered)
+        guard let normalized = registry.snapshot() else { return nil }
         let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
         // The registry was updated unconditionally above; the model-equality guard only avoids
         // redundant subscriber spam. The fresh snapshot is still recorded in `latest`.
@@ -547,7 +552,7 @@ actor OpenCodeACPModelPollingService {
     }
 
     private func registrySnapshotAfterWarmingStore() async -> Snapshot? {
-        guard let models = await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .openCode) else {
+        guard let models = await registry.snapshotAfterWarm() else {
             return nil
         }
         return Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: false)

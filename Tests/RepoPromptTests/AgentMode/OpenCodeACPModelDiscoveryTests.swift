@@ -17,11 +17,49 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         }
     }
 
+    func testInjectedRegistryWarmsAndPublishesNormalizedCatalog() async {
+        final class RegistryBox {
+            var snapshot: ACPDiscoveredSessionModels?
+            var warmCount = 0
+            var updateCount = 0
+        }
+        let box = RegistryBox()
+        let input = ACPDiscoveredSessionModels(
+            options: [.init(rawValue: "input", displayName: "Input", description: nil, isPlaceholderDefault: false, isProviderDefault: false)],
+            currentModelRaw: "input"
+        )
+        let normalized = ACPDiscoveredSessionModels(
+            options: [.init(rawValue: "normalized", displayName: "Normalized", description: nil, isPlaceholderDefault: false, isProviderDefault: false)],
+            currentModelRaw: "normalized"
+        )
+        let registry = OpenCodeACPModelPollingService.Registry(
+            update: { _ in box.updateCount += 1
+                box.snapshot = normalized
+                return true
+            },
+            snapshot: { box.snapshot },
+            snapshotAfterWarm: { box.warmCount += 1
+                return box.snapshot
+            }
+        )
+        let service = OpenCodeACPModelPollingService(client: RefreshClient(result: input, failure: nil), registry: registry)
+        let before = await service.latestSnapshot()
+        XCTAssertNil(before)
+        XCTAssertEqual(box.warmCount, 1)
+        let result = await service.refreshNow(workspacePath: nil)
+        XCTAssertEqual(result, .updated)
+        let snapshot = await service.latestSnapshot()
+        XCTAssertEqual(snapshot?.models, normalized)
+        XCTAssertEqual(snapshot?.isLiveDiscovery, true)
+        XCTAssertEqual(box.updateCount, 1)
+        await service.shutdown()
+    }
+
     func testRefreshOutcomesDistinguishChangedUnchangedEmptyAndFailure() async {
         AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
         defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
         let coldEmpty = OpenCodeACPModelPollingService(
-            client: RefreshClient(result: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil)
+            client: RefreshClient(result: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil), registry: .app
         )
         let coldEmptyOutcome = await coldEmpty.refreshNow(workspacePath: nil)
         XCTAssertEqual(coldEmptyOutcome, .noModelsAdvertised)
@@ -32,7 +70,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             options: [.init(rawValue: "future-opencode", displayName: "Future", description: nil, isPlaceholderDefault: false, isProviderDefault: true)],
             currentModelRaw: "future-opencode"
         )
-        let service = OpenCodeACPModelPollingService(client: RefreshClient(result: catalog, failure: nil))
+        let service = OpenCodeACPModelPollingService(client: RefreshClient(result: catalog, failure: nil), registry: .app)
         let first = await service.refreshNow(workspacePath: nil)
         let second = await service.refreshNow(workspacePath: nil)
         XCTAssertEqual(first, .updated)
@@ -40,7 +78,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         await service.shutdown()
 
         let empty = OpenCodeACPModelPollingService(
-            client: RefreshClient(result: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil)
+            client: RefreshClient(result: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil), registry: .app
         )
         let emptyOutcome = await empty.refreshNow(workspacePath: nil)
         XCTAssertEqual(emptyOutcome, .noModelsAdvertised)
@@ -51,13 +89,13 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         )
         await empty.shutdown()
 
-        let noResult = OpenCodeACPModelPollingService(client: RefreshClient(result: nil, failure: nil))
+        let noResult = OpenCodeACPModelPollingService(client: RefreshClient(result: nil, failure: nil), registry: .app)
         let noResultOutcome = await noResult.refreshNow(workspacePath: nil)
         XCTAssertEqual(noResultOutcome, .failed)
         await noResult.shutdown()
 
         let failed = OpenCodeACPModelPollingService(
-            client: RefreshClient(result: nil, failure: AIProviderError.invalidConfiguration(detail: "offline"))
+            client: RefreshClient(result: nil, failure: AIProviderError.invalidConfiguration(detail: "offline")), registry: .app
         )
         let failedOutcome = await failed.refreshNow(workspacePath: nil)
         XCTAssertEqual(failedOutcome, .failed)
@@ -106,7 +144,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
                 try ACPAgentSessionController(provider: provider, runRequest: request, allowsProviderProcessLaunchForTesting: true)
             }
         )
-        let service = OpenCodeACPModelPollingService(client: client, intervalNanos: 60_000_000_000)
+        let service = OpenCodeACPModelPollingService(client: client, registry: .app, intervalNanos: 60_000_000_000)
         addTeardownBlock { await service.shutdown() }
 
         XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .openCode))
