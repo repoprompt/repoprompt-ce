@@ -1643,3 +1643,140 @@ packaged/vendor/live or generally windowless runtime claim.
 Scoped pinned SwiftFormat 0.61.1 and strict no-cache SwiftLint both passed for the
 changed test file. Whole-tree style remains NOT_PASSED as previously recorded;
 full integration, packaged, real vendor and live app gates remain for integration.
+
+### M6 — app-free WorkspaceContext extraction and integration (2026-10-29)
+
+This is the continuation of the single M6 PR #1415, not an additional milestone.
+The extraction is implemented; final integrated PR-ready, live smoke, independent
+review and hosted checks remain outstanding at this checkpoint. Earlier Stage 0
+NOT_PASSED entries above describe their historical heads, not the current style result.
+
+#### Surviving owners and retirement
+
+`RepoPromptWorkspaceContext` now owns the dependency-closed WorkspaceContext,
+search and CodeMap orchestration implementation, plus required Git materialization,
+identity and initialization values. Its dependencies are app-free; UI drafts,
+presentation, focus, observation and application policy composition remain in
+`RepoPromptApp`. Ten complete test/helper files moved to owning module targets.
+The existing automatic-selection ordering golden subsequently moved unchanged
+from `RepoPromptTests.ModularizationCompatibilityGoldenTests` to
+`RepoPromptWorkspaceContextTests.WorkspaceCodemapGraphFoundationModelTests`.
+Settings/provider and app-notification goldens remain with their existing app owners.
+
+`WorkspaceCodemapStructureQueryExecutor` owns query orchestration, not a new store,
+graph, cache or lifecycle authority. Existing root/catalog authority, graph receipts,
+demand cleanup and post-await revalidation remain authoritative. App adapters retain
+wire arguments, invocation authorization, DTO assembly and genuine window state.
+`MCPDomainHost` remains the sole standard-progress owner: the unused manager-owned
+direct progress state alias, context enum, overloads and send branch are removed.
+That retirement is +19/-51 combined across manager and its existing host, including
+10 DEBUG-only observation lines for deterministic tests; it is not a new shipping
+owner. No VM/bridge or headless campaign completion is claimed.
+
+#### Reproducible move and access evidence
+
+- Original-path preparation ends at `a3cac3d8f2efd3ead5421f7033bdc0c38d955e9a`.
+- Pure move: `8025ce3a48a8b1b0d9f2d94a63b8ee2b43ff0a7f`.
+- Fixture/style path changes: `d9a789d4cc7dceebcb494d93ae0bd26d75812dc2`.
+- Official move audit: **113 moves, zero violations** (103 production, 10 tests/helpers).
+  The normalized hash manifest is [m6-workspace-move-manifest.tsv](m6-workspace-move-manifest.tsv).
+  Reproduce with `python3 Scripts/modularization_move_audit.py --base a3cac3d8f2efd3ead5421f7033bdc0c38d955e9a --head 8025ce3a48a8b1b0d9f2d94a63b8ee2b43ff0a7f`.
+  Its test-discovery counts are null; it is not test parity evidence.
+- Preparation includes required assignment-equivalent initializers and access lifts.
+  The store recorder is an immutable, initializer-only reference to the existing
+  synchronous Sendable recording contract (`package nonisolated let`); mutable
+  store state remains actor-isolated. No unsafe annotation or ratchet increase was
+  introduced for that boundary.
+- Combined contract/extraction integration: `82074771975b52f19e4e26804999fae8d192ebd7`.
+  Later compiler fixes added missing direct test imports without widening production
+  test hooks. `cc7828ddf22c2fda6e1d14a70330a9f26b6446a9` repairs the structural
+  guard's package-qualified function locator and relocates the existing golden.
+- `6779a1ab81b80a86a2ca5c9cc0d7d8052863eac5` bounds the existing real-child
+  admission fixture's cleanup using prelaunch termination observation instead of
+  blocking `waitUntilExit` after suspension. Production admission is unchanged.
+  It is integrated by `be9073e082ceed303d3bab4ad41a3e521ca24323`.
+
+#### P0.6 compatibility disposition
+
+1. The 103 moved production files have no `Bundle.main`, `Bundle.module`,
+   `Bundle(for:)`, `NSImage(named:)`, standard-defaults, runtime class-name or
+   `#fileID` lookup sites. The target introduces no resources or dynamic library
+   product. Both packaged executables passed the helper/layout and resource/legal
+   validation at the head recorded below; this is not live application evidence.
+2. Swift module-qualified reflected names change. The automatic-selection and
+   presentation issue sorts compare the same concrete type on both sides, so their
+   shared module prefix does not change ordering. The existing automatic-selection
+   golden pins case/payload order, including lexical integer order, in the owning
+   test target. SearchMatch's reflected regex error diagnostic still comes from
+   RepoPromptRegexCore; SearchResults is not a persisted encoding. Symbolicated
+   module-frame names are not a persisted identity guarantee.
+3. Moved NSError bridges compare system POSIX/Cocoa domains, not Swift-generated
+   domains. Existing literal notification names, Codable raw cases and persisted
+   keys are unchanged. Relevant existing witnesses include CodeMap golden/artifact
+   tests, settings-key goldens and app selection-persistence suites; these are
+   named contracts, not a claim of exhaustive serialization coverage.
+4. The former app defaults read for `enableRepoFileReplaySignposts` now goes through
+   the existing FileSystemRuntimeHooks preference port, composed with the same
+   defaults key in FileSystemAppIntegration. This is reviewed preparation, not a
+   byte-identical move claim.
+5. GitWorkspaceStateAuthority and WorkspaceRootTargetEvidenceCoordinator retain
+   one declaration each in one SwiftPM target; app composition injects the existing
+   shared actors. No second singleton, store, dynamic image or parallel runtime
+   authority is introduced. Separate-process profile ownership remains #1408 work.
+6. The manifest and this inventory supersede old app-location rows for this slice.
+   Final integrated owning/compatibility results must be recorded before readiness.
+
+#### Measured dependency change (same c47 production baseline)
+
+These compare pristine `c47a23d61b2970625772e0b900252da9b3a2064f` with extracted
+production at `1c00dabb44c638d77dd929d054b71e40962c9945`, before the later #1538
+main integration. They are not timings or a claim about the entire campaign.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| App Swift files | 1,217 | 1,118 |
+| App Swift lines | 665,791 | 576,073 |
+| First-party Swift lines | 840,415 | 841,742 |
+| App share | 79.2% | 68.4% |
+| App-testable importing files | 340 | 330 |
+| Compiler-index app file edges | 8,081 | 7,187 |
+| Compiler-index wrong-way edges | 1,359 | 1,303 |
+| Largest component cycle | 64 | 54 |
+| Largest file cycle | 770 | 681 |
+
+The compiler exporter is current (1,118/1,118 sources, no stale or unindexed
+sources); it excludes 103 retained index units for deleted paths. The before
+index is independently fresh. This is app-only dependency evidence, not a
+whole-program cycle proof. The total implementation grew by 1,327 production
+lines including preparation/composition; moving 89,718 lines out of App is not
+presented as deleting that implementation. No aggregate net-reduction claim.
+
+#### Validation receipts and remaining gates
+
+All jobs use conductor. Queue/global-wait are not build-performance gains.
+
+| Scope / head | Ticket | Result |
+| --- | --- | --- |
+| Owning module before integration | `816c3c56-173b-4d62-aa68-99f7b7110a9b` | 35 matched, 35 passed |
+| Full lint, 1c00dabb | `01ccbe5a-44d2-4329-97a2-6f00eadd4f1e` | exit 0; 0/1,918 formatter drift, strict SwiftLint |
+| Debug package, 1c00dabb | `845d1aa9-cc82-443d-a341-9097062f8466` | exit 0; 158s execution, 50m03s queue |
+| Release preflight, 1c00dabb | `b0ac5eaf-bbf8-45d1-9e45-1aa49946625f` | exit 0 |
+| Universal Release artifact, 1c00dabb | `dcbcb25f-f3a6-4e5b-8d31-f6bf6f15d877` | exit 0; 44m58s execution, 50m27s queue |
+| Full suite, 1c00dabb | `17c94933-7b8c-4125-b457-0e96a2ad2e3e` | **not passed**: 4,524 unique passes, one guard failure, then 3,600s timeout in admission child fixture |
+| Repaired admission class, 6779a1ab | `30068d4e-5d30-458e-afd5-6ebbf7ae8999` | 19 matched, 19 passed |
+
+The Release artifact is local ad-hoc arm64+x86_64 packaging validation only,
+not notarized or distributable. ZIP SHA-256:
+`46217966d1dff7268d640cf15d55f4336e0bd52637661b0dd5889a2621d51122`;
+external artifact-manifest SHA-256:
+`19038f7720e3b29e31f4de4c96e0d866a836e2c22f3a34d1e3cd4c3bece62bfd`.
+No visible application launch, remote merge or release publication was performed.
+The admission hang's cooperative wait mechanism is supported by existing test
+history, not proven by a captured full-suite stack. Its bounded fixture repair
+must be checked in the full integrated run; the old timeout remains evidence.
+
+Remaining: current-main integrated PR-ready (including complete root suite and
+Xcode workspace validation), current-head packaging/smoke, comparable scoped
+performance receipts, final independent pinned Astra review and hosted checks.
+M7 still waits for merged M6; M8 remains independent. No later milestone is
+included to expand this first review batch.

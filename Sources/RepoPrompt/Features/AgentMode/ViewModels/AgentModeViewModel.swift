@@ -677,6 +677,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         [DomainAgentSessionLinkEndpointIdentity: AgentSessionLinkRunCatalogProjection] = [:]
 
     #if DEBUG
+        /// W0 observes the actual scheduled idle dispatch and refuses before any provider work.
+        var test_beforeRoutineIdleFollowUpStart: ((TabSession, UUID) -> Bool)?
         var test_afterClaudeAttachmentSelfCancel: (@MainActor () async -> Void)?
         var test_claudeAttachmentRestartFinished: (@MainActor () -> Void)?
         var test_afterProviderInputAugmentation: (@MainActor () async -> Void)?
@@ -1240,8 +1242,28 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             claudeCoordinator
         }
 
-        func test_initializeRunService() {
-            _ = runService
+        func test_finishQuietFeasibilityRun(_ session: TabSession) async {
+            await runService.test_publishNaturalCompletion(session)
+        }
+
+        func test_initializeRunService(
+            mcpServerEnabler: MCPServerEnabler? = nil,
+            connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
+            expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
+        ) {
+            if mcpServerEnabler == nil, connectionPolicyInstaller == nil, expectedPIDPolicyArmer == nil {
+                _ = runService
+            } else {
+                precondition(sessions.values.allSatisfy { $0.activeRunOwnership == nil })
+                runService = makeRunService(mcpServerEnabler: mcpServerEnabler, connectionPolicyInstaller: connectionPolicyInstaller, expectedPIDPolicyArmer: expectedPIDPolicyArmer)
+            }
+        }
+
+        func test_consumeClaudeTerminalEvents(
+            _ events: AsyncStream<NativeAgentRuntimeEvent>, session: TabSession,
+            runID: UUID, owner: AgentRunOwnership
+        ) async -> AgentRunTerminalCommitRevision? {
+            await runService.test_consumeClaudeTerminalEvents(events, session: session, runID: runID, owner: owner)
         }
 
         func test_startFollowUpRun(
@@ -3367,14 +3389,18 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         return false
     }
 
-    private func makeRunService() -> AgentModeRunService {
+    private func makeRunService(
+        mcpServerEnabler: MCPServerEnabler? = nil,
+        connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
+        expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
+    ) -> AgentModeRunService {
         let dependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: acpControllerFactory,
-            connectionPolicyInstaller: connectionPolicyInstaller,
-            expectedPIDPolicyArmer: { spec in
+            connectionPolicyInstaller: connectionPolicyInstaller ?? self.connectionPolicyInstaller,
+            expectedPIDPolicyArmer: expectedPIDPolicyArmer ?? { spec in
                 guard spec.requiresExpectedAgentPID, let clientName = spec.clientName else {
                     return !spec.requiresExpectedAgentPID
                 }
@@ -3384,7 +3410,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     windowID: spec.windowID
                 )
             },
-            mcpServerEnabler: mcpServerEnabler,
+            mcpServerEnabler: mcpServerEnabler ?? self.mcpServerEnabler,
             workspacePathProvider: { [weak self] session in
                 guard let self else { return nil }
                 return try effectiveWorkspacePath(for: session)
@@ -14500,6 +14526,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
 
         if scopes.contains(.transcriptRuntime) {
+            // Deferred owner-side catch-up, never on the ledger/mask callback stack.
+            // In particular an occurrence can release staged rows without adding text.
+            if !session.terminalCommitInProgress {
+                _ = withActiveUISyncSuppressed {
+                    catchUpDerivedTranscriptForActiveBindingIfNeeded(for: session, reason: .liveMutation)
+                }
+            }
             #if DEBUG
                 perfRecorder.increment("ui.refresh.flush.scope.transcriptRuntime", tabID: session.tabID)
             #endif
@@ -14860,6 +14893,16 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             session.transcriptPerformanceSnapshot.refreshRequestCount += 1
         #endif
 
+        if session.terminalCommitInProgress, case .metadataRange? = mutation {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.Transcript.scheduleRefresh,
+                scheduleSignpost,
+                EditFlowPerf.Dimensions(status: reason.rawValue, outcome: "terminal-metadata-fold")
+            )
+            session.pendingDerivedTranscriptRefreshReason = .liveMutation
+            return
+        }
+
         guard reason == .liveMutation, canScheduleAsyncRefresh else {
             EditFlowPerf.end(
                 EditFlowPerf.Stage.Transcript.scheduleRefresh,
@@ -15145,7 +15188,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
             isColdLoad: reason == .coldLoad,
-            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex
+            trustedIncrementalFinalTurnStartSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+            quietDisplayCandidate: session.quietDisplayCandidate
         )
         let fullDetailTurnEnvelopeChanged = AgentTranscriptIO.fullDetailTurnEnvelopeChanged(
             from: existingTranscript,
@@ -15389,7 +15433,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
-    private func makeDerivedTranscriptSyncState(
+    static func makeDerivedTranscriptSyncState(
         for session: TabSession,
         projectionProtection: AgentTranscriptProjectionProtection
     ) -> DerivedTranscriptSyncState {
@@ -15407,7 +15451,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session: TabSession,
         projectionProtection: AgentTranscriptProjectionProtection
     ) {
-        session.derivedTranscriptSyncState = makeDerivedTranscriptSyncState(
+        session.derivedTranscriptSyncState = Self.makeDerivedTranscriptSyncState(
             for: session,
             projectionProtection: projectionProtection
         )
@@ -15529,7 +15573,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         for session: TabSession,
         projectionProtection: AgentTranscriptProjectionProtection
     ) -> Bool {
-        session.derivedTranscriptSyncState == makeDerivedTranscriptSyncState(
+        session.derivedTranscriptSyncState == Self.makeDerivedTranscriptSyncState(
             for: session,
             projectionProtection: projectionProtection
         )
@@ -15570,7 +15614,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         projectionProtection: AgentTranscriptProjectionProtection = .none,
         isCompressedHistoryRevealed: Bool = false,
         isColdLoad: Bool = false,
-        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
+        quietDisplayCandidate: AgentRunQuietLedger.DisplayCandidate? = nil
     ) -> BuiltTranscriptPresentation {
         let processingContext = AgentToolResultProcessingContext()
         #if DEBUG || EDIT_FLOW_PERF
@@ -15674,7 +15719,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sanitizedActivityCount: sanitizeMetrics.sanitizedActivityCount
             )
         )
-        let projectionReusableTurnCount = AgentTranscriptIO.validatedReusableFrozenPrefixTurnCount(in: sanitizedTranscript) ?? 0
+        let localDisplayTranscript = AgentTranscriptIO.stagingQuietCandidate(quietDisplayCandidate, in: sanitizedTranscript)
+        let projectionReusableTurnCount = AgentTranscriptIO.validatedReusableFrozenPrefixTurnCount(in: localDisplayTranscript) ?? 0
         let baseProjection: AgentTranscriptProjection
         let updatedTurnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
         if projectionReusableTurnCount > 0,
@@ -15686,20 +15732,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 performanceSnapshot.projectionReuseAttemptCount += 1
             #endif
             if let reusedProjection = AgentTranscriptProjectionBuilder.buildReusingFrozenPrefix(
-                from: sanitizedTranscript,
+                from: localDisplayTranscript,
                 previousTranscript: previousSanitizedTranscript,
                 previousProjection: previousBaseProjection,
                 previousProtection: previousProjectionProtection,
                 protection: projectionProtection,
                 reusableFrozenPrefixTurnCount: projectionReusableTurnCount,
-                context: processingContext
+                context: processingContext,
+                excludingQuiet: true
             ) {
                 baseProjection = reusedProjection
                 updatedTurnProjectionCaches = AgentTranscriptProjectionBuilder.updatedTurnCaches(
-                    for: sanitizedTranscript,
+                    for: localDisplayTranscript,
                     projection: reusedProjection,
                     protection: projectionProtection,
-                    existingTurnCaches: previousTurnProjectionCaches
+                    existingTurnCaches: previousTurnProjectionCaches,
+                    excludingQuiet: true
                 )
                 #if DEBUG || EDIT_FLOW_PERF
                     performanceSnapshot.projectionReuseSuccessCount += 1
@@ -15707,10 +15755,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 #endif
             } else {
                 let buildResult = AgentTranscriptProjectionBuilder.buildWithCaches(
-                    from: sanitizedTranscript,
+                    from: localDisplayTranscript,
                     protection: projectionProtection,
                     turnCaches: previousTurnProjectionCaches,
-                    context: processingContext
+                    context: processingContext,
+                    excludingQuiet: true
                 )
                 baseProjection = buildResult.projection
                 updatedTurnProjectionCaches = buildResult.updatedTurnCaches
@@ -15721,10 +15770,11 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         } else {
             let buildResult = AgentTranscriptProjectionBuilder.buildWithCaches(
-                from: sanitizedTranscript,
+                from: localDisplayTranscript,
                 protection: projectionProtection,
                 turnCaches: previousTurnProjectionCaches,
-                context: processingContext
+                context: processingContext,
+                excludingQuiet: true
             )
             baseProjection = buildResult.projection
             updatedTurnProjectionCaches = buildResult.updatedTurnCaches
@@ -15762,34 +15812,37 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let canonicalVisibleRowCount = projectionCounts.canonicalVisibleRowCount
         #if DEBUG
             if AgentTranscriptDebugInstrumentation.isEnabled, let previousBaseProjection {
-                let previousRows = previousBaseProjection.archivedRows + previousBaseProjection.workingRows
-                let newRows = baseProjection.archivedRows + baseProjection.workingRows
-                let previousBlocks = previousBaseProjection.archivedBlocks + previousBaseProjection.workingBlocks
-                let newBlocks = baseProjection.archivedBlocks + baseProjection.workingBlocks
-                let previousRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(previousRows)
-                let newRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(newRows)
-                let previousRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(previousRows)
-                let newRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(newRows)
-                let previousBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(previousBlocks)
-                let newBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(newBlocks)
-                let previousBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(previousBlocks)
-                let newBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(newBlocks)
-                AgentTranscriptDebugInstrumentation.emitProjectionIdentity(.init(
-                    previousRowCount: previousRows.count,
-                    newRowCount: newRows.count,
-                    previousBlockCount: previousBlocks.count,
-                    newBlockCount: newBlocks.count,
-                    rowSemanticDigest: newRowSemanticDigest,
-                    previousRowSemanticDigest: previousRowSemanticDigest,
-                    rowIdentityDigest: newRowIdentityDigest,
-                    previousRowIdentityDigest: previousRowIdentityDigest,
-                    blockSemanticDigest: newBlockSemanticDigest,
-                    previousBlockSemanticDigest: previousBlockSemanticDigest,
-                    blockIdentityDigest: newBlockIdentityDigest,
-                    previousBlockIdentityDigest: previousBlockIdentityDigest,
-                    rowIdentityDrift: newRowSemanticDigest == previousRowSemanticDigest && newRowIdentityDigest != previousRowIdentityDigest,
-                    blockIdentityDrift: newBlockSemanticDigest == previousBlockSemanticDigest && newBlockIdentityDigest != previousBlockIdentityDigest
-                ))
+                // Keep identity hashing lazy when only other metrics are requested.
+                AgentTranscriptDebugInstrumentation.emitProjectionIdentity({
+                    let previousRows = previousBaseProjection.archivedRows + previousBaseProjection.workingRows
+                    let newRows = baseProjection.archivedRows + baseProjection.workingRows
+                    let previousBlocks = previousBaseProjection.archivedBlocks + previousBaseProjection.workingBlocks
+                    let newBlocks = baseProjection.archivedBlocks + baseProjection.workingBlocks
+                    let previousRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(previousRows)
+                    let newRowSemanticDigest = AgentTranscriptDebugInstrumentation.itemSemanticSignature(newRows)
+                    let previousRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(previousRows)
+                    let newRowIdentityDigest = AgentTranscriptDebugInstrumentation.itemIdentitySignature(newRows)
+                    let previousBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(previousBlocks)
+                    let newBlockSemanticDigest = AgentTranscriptDebugInstrumentation.blockSemanticSignature(newBlocks)
+                    let previousBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(previousBlocks)
+                    let newBlockIdentityDigest = AgentTranscriptDebugInstrumentation.blockIdentitySignature(newBlocks)
+                    return .init(
+                        previousRowCount: previousRows.count,
+                        newRowCount: newRows.count,
+                        previousBlockCount: previousBlocks.count,
+                        newBlockCount: newBlocks.count,
+                        rowSemanticDigest: newRowSemanticDigest,
+                        previousRowSemanticDigest: previousRowSemanticDigest,
+                        rowIdentityDigest: newRowIdentityDigest,
+                        previousRowIdentityDigest: previousRowIdentityDigest,
+                        blockSemanticDigest: newBlockSemanticDigest,
+                        previousBlockSemanticDigest: previousBlockSemanticDigest,
+                        blockIdentityDigest: newBlockIdentityDigest,
+                        previousBlockIdentityDigest: previousBlockIdentityDigest,
+                        rowIdentityDrift: newRowSemanticDigest == previousRowSemanticDigest && newRowIdentityDigest != previousRowIdentityDigest,
+                        blockIdentityDrift: newBlockSemanticDigest == previousBlockSemanticDigest && newBlockIdentityDigest != previousBlockIdentityDigest
+                    )
+                }())
             }
         #endif
         #if DEBUG || EDIT_FLOW_PERF
@@ -16037,6 +16090,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
     }
 
+    #if DEBUG
+        /// W0 paired harness access to the existing live-refresh commit, not a new owner.
+        func test_applyQuietW0ScalePresentation(_ presentation: BuiltTranscriptPresentation, to session: TabSession) {
+            applyBuiltTranscriptPresentation(presentation, sourceItems: session.items, isLiveRefresh: true, to: session)
+        }
+    #endif
+
     @discardableResult
     func applyTranscriptPresentation(
         _ transcript: AgentTranscript,
@@ -16063,7 +16123,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             previousProjectionProtection: session.transcriptProjectionProtection,
             projectionProtection: projectionProtection,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
-            isColdLoad: isColdLoad
+            isColdLoad: isColdLoad,
+            quietDisplayCandidate: session.quietDisplayCandidate
         )
         applyBuiltTranscriptPresentation(
             builtPresentation,
@@ -22214,15 +22275,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                   let owner = session.activeRunOwnership,
                   session.isCurrentRunAttemptForCurrentBinding(owner) else { return }
             session.noteAcceptedStream(result, owner: owner)
-            let usesMessageIdentity = session.quietLedger.usesQuietMessageBoundaries(owner: owner)
-            let startsNewMessage = usesMessageIdentity && result.contentMessageID != nil && result.contentMessageID != session.nonCodexContentMessageID
-            if usesMessageIdentity, result.type == "content" || result.type == "final_content",
-               let messageID = result.contentMessageID, messageID != session.nonCodexContentMessageID
-            {
-                flushPendingAssistantDelta(session)
-                endActiveAssistantSegment(session)
-                session.nonCodexContentMessageID = messageID
-            }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -22244,7 +22296,6 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
                 let tailAssistantIndex: Int? = {
-                    guard !startsNewMessage else { return nil }
                     if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
                         return streamingAssistantIndex
                     }

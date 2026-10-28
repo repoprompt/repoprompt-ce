@@ -82,6 +82,8 @@ struct AgentSessionLinkAutoWakeAttempt {
     /// Stored rather than re-derived because every later gate evaluates the *same* basis the
     /// reservation was made under, and a manual basis has no queue state that could recover it.
     var admissionBasis: AgentSessionLinkWakeAdmissionDecision.Basis
+    /// Original idle-route candidacy, not catalog proof. Can upgrade only before acquisition.
+    var routineQuietCandidate = false
     /// Frozen only at the physical boundary, so a later edge can never be suppressed as though it
     /// had been included in already-immutable provider text.
     var attemptedFingerprint: AgentSessionLinkPassiveStatusNotices.WakeEligibilityFingerprint?
@@ -630,6 +632,13 @@ extension AgentModeViewModel {
             }
             switch route {
             case .idleFollowUp:
+                #if DEBUG
+                    if test_beforeRoutineIdleFollowUpStart?(session, wakeID) == false {
+                        agentSessionLinkRecordPhysicalDispatchNotAttempted(for: session, dispatchID: dispatchID)
+                        cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
+                        return
+                    }
+                #endif
                 let startOutcome = await startAgentRun(
                     tabID: endpoint.tabID,
                     initialMessage: "",
@@ -844,7 +853,7 @@ extension AgentModeViewModel {
             guard let fingerprint = attempt.wakeFingerprint else { return false }
             if let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner) {
                 session.quietLedger.recordPhysicalDispatch(
-                    owner: owner, wakeID: wakeID, routineQuietCheckIn: claim.routineQuietCheckIn, alreadyAcquired: false
+                    owner: owner, wakeID: wakeID, routineQuietCheckIn: claim.routineQuietCheckIn, alreadyAcquired: false, sourceRevision: session.sourceItemsRevision
                 )
             }
             attempt.phase = .dispatching
@@ -1098,6 +1107,8 @@ extension AgentModeViewModel {
               attempt.phase == .scheduled || attempt.phase == .awaitingSettlement
         else { return nil }
         let stopFence = AgentRunStartStopFence(session: session)
+        attempt.routineQuietCandidate = attempt.admissionBasis == .routineStatusOrOverflow
+            && agentSessionLinkAutoWakeRoute(session, refusalPhase: attempt.phase) == .idleFollowUp
         attempt.phase = .preparingDispatch
         attempt.attemptedFingerprint = nil
         attempt.physicalOutcome = .notAttempted
@@ -1269,8 +1280,7 @@ extension AgentModeViewModel {
             sequenceIndex: session.nextSequenceIndex,
             displayAttribution: claim.passive?.displayAttribution
         )
-        guard marker.id == wakeID, session.quietLedger.registerHostMarker(marker) else { return }
-        session.appendItem(marker)
+        guard marker.id == wakeID, session.appendAcceptedHostMarker(marker) else { return }
         session.isDirty = true
         requestUIRefresh(tabID: endpoint.tabID)
         scheduleSave(for: endpoint.tabID)

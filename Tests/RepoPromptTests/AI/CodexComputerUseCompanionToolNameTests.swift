@@ -52,7 +52,7 @@ final class CodexComputerUseCompanionToolNameTests: XCTestCase {
             return first
         }
         await controller.shutdown()
-        guard case let .toolCall(name, _, _) = event else { return nil }
+        guard case let .toolCall(name, _, _, _) = event else { return nil }
         return name
     }
 

@@ -408,10 +408,47 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
+    func bindingQuietDeclarationObservations(
+        _ binding: AgentRunTerminalSessionBinding, session: AgentTabSession,
+        owner: AgentRunOwnership, runID: UUID
+    ) -> AgentRunTerminalSessionBinding {
+        #if DEBUG
+            if session.test_flushQuietToolObservations != nil { return binding }
+        #endif
+        var binding = binding
+        binding.hooks.flushQuietToolObservations = { [weak self, weak session] in
+            guard let self, let session, session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID),
+                  session.quietLedger.acceptedDeclarationInvocationID(owner: owner) != nil,
+                  !hasActiveMCPTools(runID),
+                  !ServerNetworkManager.shared.hasPendingToolCardObservations(windowID: windowID, runID: runID),
+                  let handler = toolHandlerByTabID[session.tabID] else { return false }
+            // Returned MCP calls may have enqueued their first host callback without delivering it.
+            // Drain that existing FIFO before requiring its exact native/host join at the second cut.
+            await handler.waitForPendingEventDeliveries()
+            return true
+        }
+        binding.hooks.quietToolObservationsAreComplete = { [weak self, weak session] in
+            guard let self, let session, session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID),
+                  let id = session.quietLedger.acceptedDeclarationInvocationID(owner: owner),
+                  !hasActiveMCPTools(runID),
+                  !ServerNetworkManager.shared.hasPendingToolCardObservations(windowID: windowID, runID: runID),
+                  let handler = toolHandlerByTabID[session.tabID] else { return false }
+            return handler.hasCompleteExactAssociation(hostInvocationID: id, owner: owner, session: session)
+                && session.quietLedger.declarationMaySeal(owner: owner, canonicalInvocations: [id])
+        }
+        return binding
+    }
+
     func ensureClaudeToolTrackingIfNeeded(for session: AgentTabSession, runID: UUID) async {
         let handler = toolHandler(for: session)
         await handler.startTracking(runID: runID, session: session, clientNameHint: session.selectedAgent.mcpClientNameHint)
     }
+
+    #if DEBUG
+        func testToolTrackingHandler(for session: AgentTabSession) -> ClaudeAgentToolTrackingHandler {
+            toolHandler(for: session)
+        }
+    #endif
 
     private func toolHandler(for session: AgentTabSession) -> ClaudeAgentToolTrackingHandler {
         if let existing = toolHandlerByTabID[session.tabID] {

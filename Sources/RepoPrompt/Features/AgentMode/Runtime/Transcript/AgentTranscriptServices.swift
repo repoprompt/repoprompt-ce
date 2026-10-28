@@ -97,6 +97,12 @@ struct AgentConversationReplaySerialization: Equatable {
         let durationMS: Double
     }
 
+    struct AgentTranscriptSummaryTraversalMetrics {
+        let phase: String
+        let turnID: UUID
+        let activityCount: Int
+    }
+
     struct AgentTranscriptRebuildMetrics: Equatable {
         let existingTurnCount: Int
         let workingItemsCount: Int
@@ -124,6 +130,7 @@ struct AgentConversationReplaySerialization: Equatable {
     }
 
     struct AgentTranscriptRefreshAttemptMetrics: Equatable {
+        let tabID: UUID
         let reason: String
         let sourceItemsRevision: Int
         let itemCount: Int
@@ -197,6 +204,7 @@ struct AgentConversationReplaySerialization: Equatable {
             let compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)?
             let workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)?
             let rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)?
+            let summaryTraversalHandler: ((AgentTranscriptSummaryTraversalMetrics) -> Void)?
             let projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)?
             let refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)?
             let presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)?
@@ -208,6 +216,7 @@ struct AgentConversationReplaySerialization: Equatable {
                 compactionHandler: ((AgentTranscriptCompactionMetrics) -> Void)? = nil,
                 workingSourceItemsHandler: ((AgentTranscriptWorkingSourceItemsMetrics) -> Void)? = nil,
                 rebuildHandler: ((AgentTranscriptRebuildMetrics) -> Void)? = nil,
+                summaryTraversalHandler: ((AgentTranscriptSummaryTraversalMetrics) -> Void)? = nil,
                 projectionBuildHandler: ((AgentTranscriptProjectionBuildMetrics) -> Void)? = nil,
                 refreshAttemptHandler: ((AgentTranscriptRefreshAttemptMetrics) -> Void)? = nil,
                 presentationPublishHandler: ((AgentTranscriptPresentationPublishMetrics) -> Void)? = nil,
@@ -218,6 +227,7 @@ struct AgentConversationReplaySerialization: Equatable {
                 self.compactionHandler = compactionHandler
                 self.workingSourceItemsHandler = workingSourceItemsHandler
                 self.rebuildHandler = rebuildHandler
+                self.summaryTraversalHandler = summaryTraversalHandler
                 self.projectionBuildHandler = projectionBuildHandler
                 self.refreshAttemptHandler = refreshAttemptHandler
                 self.presentationPublishHandler = presentationPublishHandler
@@ -291,6 +301,7 @@ struct AgentConversationReplaySerialization: Equatable {
             }
             guard let emission else { return }
             emission.0?(.init(
+                tabID: tabID,
                 reason: reason,
                 sourceItemsRevision: sourceItemsRevision,
                 itemCount: itemCount,
@@ -316,6 +327,10 @@ struct AgentConversationReplaySerialization: Equatable {
 
         static func emitWorkingSourceItems(_ metrics: @autoclosure () -> AgentTranscriptWorkingSourceItemsMetrics) {
             emit(\.workingSourceItemsHandler, metrics)
+        }
+
+        static func emitSummaryTraversal(_ metrics: @autoclosure () -> AgentTranscriptSummaryTraversalMetrics) {
+            emit(\.summaryTraversalHandler, metrics)
         }
 
         static func emitRebuild(_ metrics: @autoclosure () -> AgentTranscriptRebuildMetrics) {
@@ -1465,10 +1480,12 @@ private struct ClusterSummaryCacheKey: Hashable {
 
 private final class AgentTranscriptProjectionBuildContext {
     let processingContext: AgentToolResultProcessingContext
+    let excludingQuiet: Bool
     var clusterSummaryByRowIDs: [ClusterSummaryCacheKey: AgentTranscriptClusterSummary] = [:]
 
-    init(processingContext: AgentToolResultProcessingContext = AgentToolResultProcessingContext()) {
+    init(processingContext: AgentToolResultProcessingContext = AgentToolResultProcessingContext(), excludingQuiet: Bool = false) {
         self.processingContext = processingContext
+        self.excludingQuiet = excludingQuiet
     }
 }
 
@@ -2360,14 +2377,110 @@ enum AgentTranscriptIO {
         nextSequenceIndex: Int? = nil,
         policy: AgentTranscriptImportPolicy = .canonical,
         compact: Bool = true,
-        protection: AgentTranscriptProjectionProtection = .none
+        protection: AgentTranscriptProjectionProtection = .none,
+        quietLocalBaselines: [UUID: AgentTranscriptQuietLocalTurn] = [:]
     ) -> AgentTranscript {
         let transcript = importLegacyItems(
             filteredLegacyItems(items, policy: policy),
             terminalState: terminalState,
-            nextSequenceIndex: nextSequenceIndex
+            nextSequenceIndex: nextSequenceIndex,
+            quietLocalBaselines: quietLocalBaselines
         )
         return compact ? AgentTranscriptCompactor.compact(transcript, protection: protection) : transcript
+    }
+
+    /// Stage only the current final source unit, before any grouping/counting/anchor work.
+    /// The returned value is display input only; the caller retains the canonical transcript.
+    static func stagingQuietCandidate(
+        _ candidate: AgentRunQuietLedger.DisplayCandidate?, in transcript: AgentTranscript
+    ) -> AgentTranscript {
+        guard let candidate, let index = transcript.turns.indices.last,
+              transcript.turns[index].id == candidate.turnID,
+              transcript.turns[index].retentionTier == .full else { return transcript }
+        var local = transcript
+        for spanIndex in local.turns[index].responseSpans.indices {
+            local.turns[index].responseSpans[spanIndex].activities.removeAll {
+                $0.sequenceIndex >= candidate.startKey && ($0.itemKind != .system || $0.id == candidate.wakeID)
+            }
+            local.turns[index].responseSpans[spanIndex].fullRenderGroupedHistoryCache = nil
+        }
+        local.turns[index].summary = candidate.local.summary
+        local.turns[index].quietLocal = candidate.local
+        local.turns[index].conclusionActivityID = candidate.local.conclusionActivityID
+        local.turns[index].completedAt = candidate.local.completedAt
+        local.turns[index].terminalState = .completed
+        return local
+    }
+
+    /// A shallow view at the existing projection boundary. Activities stay canonical; the
+    /// leaf/descriptor passes exclude certified members while doing their normal work.
+    fileprivate static func quietLocalProjectionTurn(_ turn: AgentTranscriptTurn) -> AgentTranscriptTurn {
+        guard let baseline = turn.quietLocal else { return turn }
+        // Retention keeps the canonical conclusion. If it differs from the local anchor,
+        // its own certificate must still be present; damaged metadata cannot hide that row.
+        // Full source is handled in the existing leaf passes, without another history scan.
+        var retainedConclusionIsCertified = turn.retentionTier == .full || turn.conclusionActivityID == nil
+            || turn.conclusionActivityID == baseline.conclusionActivityID
+        var localConclusionIsRenderable = turn.retentionTier == .full || baseline.conclusionActivityID == nil
+            || AgentDisplayableText.hasDisplayableBody(baseline.summary?.conclusionText ?? "")
+            || AgentDisplayableText.hasDisplayableBody(baseline.summary?.compactConclusionText ?? "")
+        // Use the same retained-activity inspection for both the canonical witness and
+        // an ordinary conclusion whose text is still retained. Full turns do not scan.
+        if !retainedConclusionIsCertified || !localConclusionIsRenderable {
+            activityInspection: for span in turn.responseSpans {
+                for activity in span.activities {
+                    if activity.id == turn.conclusionActivityID, activity.quietCheckInWakeID != nil {
+                        retainedConclusionIsCertified = true
+                    }
+                    if activity.id == baseline.conclusionActivityID, AgentDisplayableText.hasDisplayableBody(activity.text) {
+                        localConclusionIsRenderable = true
+                    }
+                    if retainedConclusionIsCertified, localConclusionIsRenderable { break activityInspection }
+                }
+            }
+        }
+        let complete = retainedConclusionIsCertified && localConclusionIsRenderable && baseline.completedAt != nil && (
+            turn.retentionTier == .full ||
+                (baseline.summary != nil && (turn.retentionTier == .archived || turn.responseSpans.allSatisfy { $0.quietLocal != nil }))
+        )
+        guard complete else {
+            var ordinary = turn
+            ordinary.quietLocal = nil
+            return ordinary
+        }
+        var local = turn
+        // Saved certification excludes the canonical quiet conclusion even while a
+        // successor is active or not yet qualified. Do not complete that active turn.
+        local.conclusionActivityID = baseline.conclusionActivityID
+        if turn.isCompleted {
+            local.completedAt = baseline.completedAt
+        }
+        local.summary = baseline.summary
+        return local
+    }
+
+    #if DEBUG
+        /// Inject only the already-established ordinary baseline. No classification/lifecycle is faked.
+        static func test_installQuietLocalBaseline(
+            _ ordinaryTurn: AgentTranscriptTurn, in transcript: inout AgentTranscript
+        ) {
+            guard let index = transcript.turns.firstIndex(where: { $0.id == ordinaryTurn.id }) else {
+                preconditionFailure("The exact ordinary turn must still be retained")
+            }
+            transcript.turns[index].quietLocal = AgentTranscriptQuietLocalTurn(
+                summary: nil,
+                conclusionActivityID: ordinaryTurn.conclusionActivityID,
+                completedAt: ordinaryTurn.completedAt
+            )
+        }
+    #endif
+
+    private static func quietLocalBaselines(in transcript: AgentTranscript) -> [UUID: AgentTranscriptQuietLocalTurn] {
+        Dictionary(transcript.turns.compactMap { turn in
+            guard turn.retentionTier == .full, let baseline = turn.quietLocal,
+                  baseline.completedAt != nil else { return nil }
+            return (turn.id, baseline)
+        }, uniquingKeysWith: { _, _ in AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: nil, completedAt: nil) })
     }
 
     static func runtimeNormalizedTranscript(
@@ -2513,7 +2626,8 @@ enum AgentTranscriptIO {
                 continue
             }
             if let matchedIndex = remainingWorkingTurns.firstIndex(where: { $0.id == turn.id }) {
-                mergedTurns.append(remainingWorkingTurns.remove(at: matchedIndex))
+                let replacement = remainingWorkingTurns.remove(at: matchedIndex)
+                mergedTurns.append(replacement)
             } else if !remainingWorkingTurns.isEmpty {
                 mergedTurns.append(remainingWorkingTurns.removeFirst())
             } else {
@@ -2568,7 +2682,8 @@ enum AgentTranscriptIO {
                 nextSequenceIndex: nextSequenceIndex,
                 policy: policy,
                 compact: false,
-                protection: protection
+                protection: protection,
+                quietLocalBaselines: quietLocalBaselines(in: existingWorkingTranscript)
             )
         }
         var mergedTranscript = transcriptByReplacingWorkingTurns(
@@ -2639,7 +2754,8 @@ enum AgentTranscriptIO {
             nextSequenceIndex: nextSequenceIndex,
             policy: policy,
             compact: false,
-            protection: protection
+            protection: protection,
+            quietLocalBaselines: existingTranscript.turns.last.map { quietLocalBaselines(in: .init(turns: [$0])) } ?? [:]
         )
         guard rebuiltSuffixTranscript.turns.count == 1,
               let rebuiltFinalTurn = rebuiltSuffixTranscript.turns.first,
@@ -2923,7 +3039,8 @@ enum AgentTranscriptIO {
     static func importLegacyItems(
         _ items: [AgentChatItem],
         terminalState: AgentSessionRunState? = nil,
-        nextSequenceIndex: Int? = nil
+        nextSequenceIndex: Int? = nil,
+        quietLocalBaselines: [UUID: AgentTranscriptQuietLocalTurn] = [:]
     ) -> AgentTranscript {
         guard !items.isEmpty else {
             return AgentTranscript(version: 3, turns: [], nextSequenceIndex: nextSequenceIndex ?? 0)
@@ -2983,6 +3100,11 @@ enum AgentTranscriptIO {
                     completedAt: nil
                 )
             }
+            if let turnID = currentTurn?.id, currentTurn?.quietLocal == nil,
+               let baseline = quietLocalBaselines[turnID], baseline.completedAt != nil
+            {
+                currentTurn?.quietLocal = baseline
+            }
             if currentSpan == nil, let turnID = currentTurn?.id {
                 currentSpan = AgentTranscriptProviderResponseSpan(
                     id: deterministicSpanID(turnID: turnID, ordinal: currentTurn?.responseSpans.count ?? 0),
@@ -3006,6 +3128,9 @@ enum AgentTranscriptIO {
                     id: deterministicSpanID(turnID: item.id, ordinal: 0),
                     startedAt: item.timestamp
                 )
+                if let baseline = quietLocalBaselines[item.id], baseline.completedAt != nil {
+                    currentTurn?.quietLocal = baseline
+                }
                 continue
             }
             ensureCurrentTurn(for: item)
@@ -4556,21 +4681,43 @@ enum AgentTranscriptIO {
         } else {
             turn.completedAt = nil
         }
-        let assistantActivities = activities.filter {
-            ($0.itemKind == .assistant || $0.itemKind == .assistantInline)
-                && AgentDisplayableText.hasDisplayableBody($0.text)
+        // The same conclusion-selection pass serves canonical and certified local views.
+        // A carrier must already exist unless every certified member is an independently
+        // certified host marker. A late marker may land after a new user request; capture
+        // that recipient's ordinary state here, never borrow the older wake's baseline.
+        var canonicalConclusion = ConclusionInputs()
+        var localConclusion = ConclusionInputs()
+        var hasLocalInputs = turn.quietLocal != nil
+        var hasCertifiedMember = false
+        var allCertifiedMembersAreHostMarkers = true
+        for activity in activities {
+            if let wakeID = activity.quietCheckInWakeID {
+                hasCertifiedMember = true
+                let isHostMarker = activity.itemKind == .system && wakeID == activity.id
+                allCertifiedMembersAreHostMarkers = allCertifiedMembersAreHostMarkers && isHostMarker
+                if !hasLocalInputs, isHostMarker {
+                    localConclusion = canonicalConclusion
+                    hasLocalInputs = true
+                }
+            } else if hasLocalInputs {
+                localConclusion.append(activity)
+            }
+            canonicalConclusion.append(activity)
         }
-        let lastMiddleSequenceIndex = activities.last(where: {
-            $0.itemKind != .assistant && $0.itemKind != .assistantInline
-        })?.sequenceIndex ?? Int.min
-        let trailingAssistantActivities = assistantActivities.filter { $0.sequenceIndex > lastMiddleSequenceIndex }
-        turn.conclusionActivityID = trailingAssistantActivities.reversed().first(where: \.isSubstantiveAssistant)?.id
-            ?? trailingAssistantActivities.last?.id
-        for index in turn.responseSpans.indices {
-            turn.responseSpans[index].collapsedSummary = buildCollapsedSummary(
-                for: turn.responseSpans[index],
-                in: turn
+        turn.conclusionActivityID = canonicalConclusion.conclusionID
+        if !hasCertifiedMember { turn.quietLocal = nil }
+        if hasCertifiedMember, turn.quietLocal != nil || allCertifiedMembersAreHostMarkers {
+            turn.quietLocal = AgentTranscriptQuietLocalTurn(
+                summary: nil, conclusionActivityID: localConclusion.conclusionID,
+                completedAt: localConclusion.lastActivityAt ?? turn.request?.timestamp ?? turn.startedAt
             )
+        }
+        for index in turn.responseSpans.indices {
+            let summaries = buildCollapsedSummaries(for: turn.responseSpans[index], in: turn)
+            turn.responseSpans[index].collapsedSummary = summaries.canonical
+            if turn.quietLocal != nil {
+                turn.responseSpans[index].quietLocal = AgentTranscriptQuietLocalSpan(collapsedSummary: summaries.local)
+            }
         }
         if isCompleted, turn.retentionTier == .full {
             let toolCount = AgentTranscriptProjectionBuilder.standaloneToolBlockCount(for: turn)
@@ -4591,104 +4738,142 @@ enum AgentTranscriptIO {
         } else {
             turn.frozenDetailedToolTailLimit = nil
         }
-        turn.summary = buildSummary(for: turn)
+        // Keep both outputs from the already-required passes: this same build may
+        // downshift before a full-tier trim has cleared the canonical summary.
+        let summaries = buildSummaries(for: turn)
+        turn.summary = summaries.canonical
+        turn.quietLocal?.summary = summaries.local
+    }
+
+    private struct ConclusionInputs {
+        var lastMiddleSequenceIndex = Int.min
+        var lastAssistant: AgentTranscriptActivity?
+        var lastSubstantiveAssistant: AgentTranscriptActivity?
+        var lastActivityAt: Date?
+
+        var conclusionID: UUID? {
+            lastSubstantiveAssistant?.id ?? lastAssistant?.id
+        }
+
+        mutating func append(_ activity: AgentTranscriptActivity) {
+            lastActivityAt = activity.timestamp
+            guard activity.itemKind == .assistant || activity.itemKind == .assistantInline else {
+                lastMiddleSequenceIndex = activity.sequenceIndex
+                lastAssistant = nil
+                lastSubstantiveAssistant = nil
+                return
+            }
+            guard activity.sequenceIndex > lastMiddleSequenceIndex,
+                  AgentDisplayableText.hasDisplayableBody(activity.text) else { return }
+            lastAssistant = activity
+            if activity.isSubstantiveAssistant { lastSubstantiveAssistant = activity }
+        }
+    }
+
+    /// Both views share the existing source pass. Only execution metadata and bounded
+    /// summary contributions are accumulated, never another retained activity history.
+    private struct SummaryInputs {
+        var activityCount = 0
+        var middleCount = 0
+        var assistantCount = 0
+        var progressCount = 0
+        var noteCount = 0
+        var hadError = false
+        var conclusion: AgentTranscriptActivity?
+        var lastUserInteractionAt: Date?
+        var lastAssistantText: String?
+        var lastThinkingText: String?
+        var executionIDs: [String] = []
+        var executionByID: [String: AgentTranscriptToolExecution] = [:]
+        var recoveryDiagnostics: [AgentTranscriptRecoveryDiagnostic] = []
+
+        var executions: [AgentTranscriptToolExecution] {
+            executionIDs.compactMap { executionByID[$0] }
+        }
+
+        mutating func append(_ activity: AgentTranscriptActivity, conclusionID: UUID?) {
+            activityCount += 1
+            if activity.id == conclusionID, conclusion == nil { conclusion = activity }
+            hadError = hadError || activity.itemKind == .error
+            if activity.itemKind == .user || activity.itemKind == .toolResult,
+               AgentTranscriptIO.isUserInteractionItem(activity.toItem())
+            {
+                lastUserInteractionAt = max(lastUserInteractionAt ?? activity.timestamp, activity.timestamp)
+            }
+            if var diagnostic = activity.recoveryDiagnostic {
+                diagnostic.align(to: activity.id, timestamp: activity.timestamp, sequenceIndex: activity.sequenceIndex)
+                recoveryDiagnostics.append(diagnostic)
+            }
+            guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity(activity) else { return }
+            if activity.itemKind == .toolCall || activity.itemKind == .toolResult, let execution = activity.toolExecution {
+                if let existing = executionByID[execution.stableExecutionID] {
+                    executionByID[execution.stableExecutionID] = AgentTranscriptIO.toolStatusRank(existing.status) <= AgentTranscriptIO.toolStatusRank(execution.status)
+                        ? mergedToolExecutionMetadata(execution, with: existing)
+                        : mergedToolExecutionMetadata(existing, with: execution)
+                } else {
+                    executionIDs.append(execution.stableExecutionID)
+                    executionByID[execution.stableExecutionID] = execution
+                }
+            }
+            guard activity.id != conclusionID else { return }
+            middleCount += 1
+            if activity.itemKind == .assistant || activity.itemKind == .assistantInline, AgentDisplayableText.hasDisplayableBody(activity.text) {
+                assistantCount += 1
+                lastAssistantText = activity.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if activity.itemKind == .thinking {
+                progressCount += 1
+                lastThinkingText = activity.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if activity.itemKind == .system || activity.itemKind == .error { noteCount += 1 }
+        }
+    }
+
+    fileprivate static func buildSummaries(for turn: AgentTranscriptTurn) -> (canonical: AgentTranscriptTurnSummary?, local: AgentTranscriptTurnSummary?) {
+        let activities = turn.allActivities
+        #if DEBUG
+            AgentTranscriptDebugInstrumentation.emitSummaryTraversal(.init(phase: "turn-summary", turnID: turn.id, activityCount: activities.count))
+        #endif
+        var canonical = SummaryInputs()
+        var local = SummaryInputs()
+        for activity in activities {
+            canonical.append(activity, conclusionID: turn.conclusionActivityID)
+            if let baseline = turn.quietLocal, activity.quietCheckInWakeID == nil {
+                local.append(activity, conclusionID: baseline.conclusionActivityID)
+            }
+        }
+        return (
+            turnSummary(canonical, in: turn, previous: turn.summary),
+            turn.quietLocal.map { turnSummary(local, in: turn, previous: $0.summary) } ?? nil
+        )
     }
 
     fileprivate static func buildSummary(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnSummary? {
-        let activities = turn.allActivities
-        guard turn.request != nil || !activities.isEmpty else { return nil }
-        let conclusion = conclusionActivity(in: turn)
-        let toolActivities = activities.filter {
-            ($0.itemKind == .toolCall || $0.itemKind == .toolResult)
-                && !AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity($0)
-        }
-        let toolExecutions = latestToolExecutions(from: toolActivities)
+        buildSummaries(for: turn).canonical
+    }
+
+    private static func turnSummary(_ inputs: SummaryInputs, in turn: AgentTranscriptTurn, previous: AgentTranscriptTurnSummary?) -> AgentTranscriptTurnSummary? {
+        guard turn.request != nil || inputs.activityCount > 0 || turn.quietLocal != nil else { return nil }
+        let toolExecutions = inputs.executions
         let notableTools = Array(NSOrderedSet(array: toolExecutions.compactMap { summarizedToolName($0.toolName) })) as? [String] ?? toolExecutions.compactMap { summarizedToolName($0.toolName) }
         let keyPaths = Array(NSOrderedSet(array: toolExecutions.flatMap(\.keyPaths))) as? [String] ?? []
         let hadWarning = toolExecutions.contains { $0.status == .warning }
-        let hadError = activities.contains { $0.itemKind == .error } || toolExecutions.contains { execution in
-            execution.status == .failed || execution.status == .cancelled
-        }
-        let middleActivities = activities.filter {
-            $0.id != turn.conclusionActivityID && !AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity($0)
-        }
+        let hadError = inputs.hadError || toolExecutions.contains { $0.status == .failed || $0.status == .cancelled }
         let middleSummaryText = middleSummaryText(
-            for: turn.request,
-            activities: middleActivities,
-            toolCount: toolExecutions.count,
-            notableTools: notableTools,
-            keyPaths: keyPaths,
-            hadWarning: hadWarning,
-            hadError: hadError
+            for: turn.request, activityCount: inputs.middleCount, assistantMessageCount: inputs.assistantCount,
+            toolCount: toolExecutions.count, notableTools: notableTools, keyPaths: keyPaths, hadWarning: hadWarning, hadError: hadError
         )
-        let conclusionText = conclusion?.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        var lastUserInteractionAt = turn.request?.timestamp
-        for activity in activities where isUserInteractionItem(activity.toItem()) {
-            let timestamp = activity.timestamp
-            lastUserInteractionAt = max(lastUserInteractionAt ?? timestamp, timestamp)
-        }
+        let conclusionText = inputs.conclusion?.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let diagnostics = AgentTranscriptRecoveryDiagnostic.normalizedList((previous?.recoveryDiagnostics ?? []) + inputs.recoveryDiagnostics)
+        let lastUserInteractionAt = [turn.request?.timestamp, inputs.lastUserInteractionAt].compactMap(\.self).max()
         return AgentTranscriptTurnSummary(
-            middleSummaryItemID: deterministicSummaryItemID(for: turn.id),
-            requestText: turn.request?.text,
-            conclusionText: conclusionText,
-            compactConclusionText: compactConclusionText(from: conclusionText),
-            middleSummaryText: middleSummaryText,
-            toolCount: toolExecutions.count,
-            notableToolNames: Array(notableTools.prefix(6)),
-            keyPaths: Array(keyPaths.prefix(8)),
-            compactedActivityCount: max(0, middleActivities.count),
-            hadWarning: hadWarning,
-            hadError: hadError,
+            middleSummaryItemID: deterministicSummaryItemID(for: turn.id), requestText: turn.request?.text,
+            conclusionText: conclusionText, compactConclusionText: compactConclusionText(from: conclusionText), middleSummaryText: middleSummaryText,
+            toolCount: toolExecutions.count, notableToolNames: Array(notableTools.prefix(6)), keyPaths: Array(keyPaths.prefix(8)),
+            compactedActivityCount: inputs.middleCount, hadWarning: hadWarning, hadError: hadError,
             lastUserInteractionAt: lastUserInteractionAt,
-            recoveryDiagnostics: boundedRecoveryDiagnostics(
-                from: activities,
-                merging: turn.summary?.recoveryDiagnostics
-            )
+            recoveryDiagnostics: diagnostics.isEmpty ? nil : diagnostics
         )
-    }
-
-    /// Collects typed recovery diagnostics from the turn's activities before retention
-    /// trimming, merged with any diagnostics a prior summary already captured so a
-    /// rebuild on a partially-trimmed turn can only grow the set. Dedupe is by aligned
-    /// row identity, not content: distinct rows may share identical fields, and every
-    /// row ID must stay resolvable for cutoff anchors.
-    private static func boundedRecoveryDiagnostics(
-        from activities: [AgentTranscriptActivity],
-        merging existing: [AgentTranscriptRecoveryDiagnostic]? = nil
-    ) -> [AgentTranscriptRecoveryDiagnostic]? {
-        var collected = existing ?? []
-        for activity in activities {
-            guard var diagnostic = activity.recoveryDiagnostic else { continue }
-            diagnostic.align(
-                to: activity.id,
-                timestamp: activity.timestamp,
-                sequenceIndex: activity.sequenceIndex
-            )
-            collected.append(diagnostic)
-        }
-        let normalized = AgentTranscriptRecoveryDiagnostic.normalizedList(collected)
-        return normalized.isEmpty ? nil : normalized
-    }
-
-    private static func latestToolExecutions(from activities: [AgentTranscriptActivity]) -> [AgentTranscriptToolExecution] {
-        var orderedExecutionIDs: [String] = []
-        var latestByExecutionID: [String: AgentTranscriptToolExecution] = [:]
-        for activity in activities {
-            guard let execution = activity.toolExecution else { continue }
-            if latestByExecutionID[execution.stableExecutionID] == nil {
-                orderedExecutionIDs.append(execution.stableExecutionID)
-                latestByExecutionID[execution.stableExecutionID] = execution
-                continue
-            }
-            if let existing = latestByExecutionID[execution.stableExecutionID],
-               toolStatusRank(existing.status) <= toolStatusRank(execution.status)
-            {
-                latestByExecutionID[execution.stableExecutionID] = mergedToolExecutionMetadata(execution, with: existing)
-            } else if let existing = latestByExecutionID[execution.stableExecutionID] {
-                latestByExecutionID[execution.stableExecutionID] = mergedToolExecutionMetadata(existing, with: execution)
-            }
-        }
-        return orderedExecutionIDs.compactMap { latestByExecutionID[$0] }
     }
 
     private static func toolStatusRank(_ status: AgentTranscriptToolStatus) -> Int {
@@ -4717,39 +4902,41 @@ enum AgentTranscriptIO {
         return normalized
     }
 
-    fileprivate static func buildCollapsedSummary(
-        for span: AgentTranscriptProviderResponseSpan,
-        in turn: AgentTranscriptTurn
-    ) -> AgentTranscriptGroupedHistorySummary? {
-        let visibleActivities = span.activities.filter {
-            $0.id != turn.conclusionActivityID && !AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity($0)
+    fileprivate static func buildCollapsedSummaries(
+        for span: AgentTranscriptProviderResponseSpan, in turn: AgentTranscriptTurn
+    ) -> (canonical: AgentTranscriptGroupedHistorySummary?, local: AgentTranscriptGroupedHistorySummary?) {
+        #if DEBUG
+            AgentTranscriptDebugInstrumentation.emitSummaryTraversal(.init(phase: "span-summary", turnID: turn.id, activityCount: span.activities.count))
+        #endif
+        var canonical = SummaryInputs()
+        var local = SummaryInputs()
+        for activity in span.activities {
+            // Span tool statistics exclude the conclusion as well, matching the original owner.
+            if activity.id != turn.conclusionActivityID { canonical.append(activity, conclusionID: turn.conclusionActivityID) }
+            if let baseline = turn.quietLocal, activity.quietCheckInWakeID == nil, activity.id != baseline.conclusionActivityID {
+                local.append(activity, conclusionID: baseline.conclusionActivityID)
+            }
         }
-        guard !visibleActivities.isEmpty else { return nil }
-        let hiddenAssistantCount = visibleActivities.count(where: {
-            ($0.itemKind == .assistant || $0.itemKind == .assistantInline)
-                && AgentDisplayableText.hasDisplayableBody($0.text)
-        })
-        let hiddenProgressCount = visibleActivities.count(where: { $0.itemKind == .thinking })
-        let hiddenNoteCount = visibleActivities.count(where: {
-            $0.itemKind == .system || $0.itemKind == .error
-        })
-        let hiddenToolCardCount = latestToolExecutions(from: visibleActivities.filter {
-            $0.itemKind == .toolCall || $0.itemKind == .toolResult
-        }).count
+        return (collapsedSummary(canonical), turn.quietLocal == nil ? nil : collapsedSummary(local))
+    }
+
+    fileprivate static func buildCollapsedSummary(
+        for span: AgentTranscriptProviderResponseSpan, in turn: AgentTranscriptTurn
+    ) -> AgentTranscriptGroupedHistorySummary? {
+        buildCollapsedSummaries(for: span, in: turn).canonical
+    }
+
+    private static func collapsedSummary(_ inputs: SummaryInputs) -> AgentTranscriptGroupedHistorySummary? {
+        guard inputs.middleCount > 0 else { return nil }
         return AgentTranscriptGroupedHistorySummary(
-            hiddenToolCardCount: hiddenToolCardCount,
-            hiddenAssistantCount: hiddenAssistantCount,
-            hiddenProgressCount: hiddenProgressCount,
-            hiddenNoteCount: hiddenNoteCount,
-            toolSummary: collapsedToolSummary(from: visibleActivities)
+            hiddenToolCardCount: inputs.executions.count, hiddenAssistantCount: inputs.assistantCount,
+            hiddenProgressCount: inputs.progressCount, hiddenNoteCount: inputs.noteCount,
+            toolSummary: collapsedToolSummary(from: inputs)
         )
     }
 
-    private static func collapsedToolSummary(from activities: [AgentTranscriptActivity]) -> AgentTranscriptClusterSummary? {
-        let toolExecutions = latestToolExecutions(from: activities.filter {
-            ($0.itemKind == .toolCall || $0.itemKind == .toolResult)
-                && !AgentTranscriptToolVisibilityPolicy.shouldSuppressActivity($0)
-        })
+    private static func collapsedToolSummary(from inputs: SummaryInputs) -> AgentTranscriptClusterSummary? {
+        let toolExecutions = inputs.executions
         guard !toolExecutions.isEmpty else { return nil }
         let toolNames = Array(NSOrderedSet(array: toolExecutions.compactMap {
             summarizedToolName($0.toolName)
@@ -4761,7 +4948,7 @@ enum AgentTranscriptIO {
         }
         let keyPaths = Array(NSOrderedSet(array: toolExecutions.flatMap(\.keyPaths))) as? [String] ?? []
         let allToolNames = toolNameCounts.isEmpty ? toolNames : Array(toolNameCounts.keys.sorted())
-        let narration = latestCollapsedNarrationText(from: activities)
+        let narration = inputs.lastAssistantText ?? inputs.lastThinkingText.flatMap { $0.isEmpty ? nil : $0 }
         let shortNarration: String? = narration.flatMap {
             let sanitized = $0.sanitizedForDisplay
             guard !sanitized.isEmpty else { return nil }
@@ -4796,38 +4983,11 @@ enum AgentTranscriptIO {
         )
     }
 
-    private static func latestCollapsedNarrationText(from activities: [AgentTranscriptActivity]) -> String? {
-        let latestAssistantText = activities.reversed().first(where: {
-            ($0.itemKind == .assistant || $0.itemKind == .assistantInline)
-                && AgentDisplayableText.hasDisplayableBody($0.text)
-        })?.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let latestAssistantText {
-            return latestAssistantText
-        }
-
-        let latestThinkingText = activities.reversed().first(where: {
-            $0.itemKind == .thinking
-        })?.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let latestThinkingText, !latestThinkingText.isEmpty {
-            return latestThinkingText
-        }
-        return nil
-    }
-
     private static func middleSummaryText(
-        for request: AgentTranscriptRequestAnchor?,
-        activities: [AgentTranscriptActivity],
-        toolCount: Int,
-        notableTools: [String],
-        keyPaths: [String],
-        hadWarning: Bool,
-        hadError: Bool
+        for request: AgentTranscriptRequestAnchor?, activityCount: Int, assistantMessageCount: Int,
+        toolCount: Int, notableTools: [String], keyPaths: [String], hadWarning: Bool, hadError: Bool
     ) -> String? {
-        guard !activities.isEmpty else { return nil }
-        let assistantMessageCount = activities.count(where: {
-            ($0.itemKind == .assistant || $0.itemKind == .assistantInline)
-                && AgentDisplayableText.hasDisplayableBody($0.text)
-        })
+        guard activityCount > 0 else { return nil }
         var parts: [String] = []
         if toolCount > 0 {
             parts.append("\(toolCount) tool\(toolCount == 1 ? "" : "s") called")
@@ -5476,20 +5636,34 @@ enum AgentTranscriptCompactor {
     private static func trimTurnForRetention(_ turn: inout AgentTranscriptTurn) {
         switch turn.retentionTier {
         case .full:
+            turn.quietLocal?.summary = nil
             turn.summary = nil
             for index in turn.responseSpans.indices {
                 turn.responseSpans[index].collapsedSummary = nil
+                turn.responseSpans[index].quietLocal = nil
             }
         case .condensed, .summary, .archived:
             let snapshot = turn
+            // Capture both views in the owner's already-required summary passes, before
+            // the existing destructive trim. Never merge a lossy prefix into new work.
             if turn.summary == nil {
-                turn.summary = AgentTranscriptIO.buildSummary(for: snapshot)
+                let summaries = AgentTranscriptIO.buildSummaries(for: snapshot)
+                turn.summary = summaries.canonical
+                turn.quietLocal?.summary = summaries.local
             }
             for index in turn.responseSpans.indices {
                 trimSpanForRetention(&turn.responseSpans[index], in: snapshot, tier: turn.retentionTier)
             }
             if let summary = turn.summary {
                 turn.summary = normalizeSummaryForRetention(summary, tier: turn.retentionTier)
+            }
+            if let summary = turn.quietLocal?.summary {
+                turn.quietLocal?.summary = normalizeSummaryForRetention(summary, tier: turn.retentionTier)
+            }
+            if turn.retentionTier == .archived {
+                for index in turn.responseSpans.indices {
+                    turn.responseSpans[index].quietLocal = nil
+                }
             }
         }
     }
@@ -5504,6 +5678,11 @@ enum AgentTranscriptCompactor {
         }
         if span.completedAt == nil, span.lifecycle != .open {
             span.completedAt = span.lastActivityAt ?? span.startedAt
+        }
+        if turn.summary == nil, turn.quietLocal != nil, span.quietLocal == nil, tier != .full {
+            let summaries = AgentTranscriptIO.buildCollapsedSummaries(for: span, in: turn)
+            span.collapsedSummary = span.collapsedSummary ?? summaries.canonical
+            span.quietLocal = AgentTranscriptQuietLocalSpan(collapsedSummary: summaries.local)
         }
         switch tier {
         case .full:
@@ -5556,6 +5735,8 @@ struct AgentTranscriptTurnProjectionCache: Equatable {
         let activityCount: Int
         let conclusionActivityID: UUID?
         let frozenDetailedToolTailLimit: Int?
+        var quietLocal: AgentTranscriptQuietLocalTurn?
+        var excludingQuiet: Bool = false
     }
 
     let token: ValidationToken
@@ -6007,13 +6188,15 @@ enum AgentTranscriptProjectionBuilder {
     static func build(
         from transcript: AgentTranscript,
         protection: AgentTranscriptProjectionProtection = .none,
-        context: AgentToolResultProcessingContext? = nil
+        context: AgentToolResultProcessingContext? = nil,
+        excludingQuiet: Bool = false
     ) -> AgentTranscriptProjection {
         buildWithCaches(
             from: transcript,
             protection: protection,
             turnCaches: [:],
-            context: context
+            context: context,
+            excludingQuiet: excludingQuiet
         ).projection
     }
 
@@ -6021,14 +6204,16 @@ enum AgentTranscriptProjectionBuilder {
         from transcript: AgentTranscript,
         protection: AgentTranscriptProjectionProtection = .none,
         turnCaches: [UUID: AgentTranscriptTurnProjectionCache],
-        context: AgentToolResultProcessingContext? = nil
+        context: AgentToolResultProcessingContext? = nil,
+        excludingQuiet: Bool = false
     ) -> AgentTranscriptProjectionBuildResult {
         buildProjection(
             from: transcript,
             protection: protection,
             reusablePrefix: nil,
             turnCaches: turnCaches,
-            processingContext: context
+            processingContext: context,
+            excludingQuiet: excludingQuiet
         )
     }
 
@@ -6039,7 +6224,8 @@ enum AgentTranscriptProjectionBuilder {
         previousProtection: AgentTranscriptProjectionProtection,
         protection: AgentTranscriptProjectionProtection = .none,
         reusableFrozenPrefixTurnCount: Int,
-        context: AgentToolResultProcessingContext? = nil
+        context: AgentToolResultProcessingContext? = nil,
+        excludingQuiet: Bool = false
     ) -> AgentTranscriptProjection? {
         guard reusableFrozenPrefixTurnCount > 0,
               protection == previousProtection,
@@ -6063,7 +6249,8 @@ enum AgentTranscriptProjectionBuilder {
             protection: protection,
             reusablePrefix: reusablePrefix,
             turnCaches: [:],
-            processingContext: context
+            processingContext: context,
+            excludingQuiet: excludingQuiet
         ).projection
     }
 
@@ -6072,13 +6259,14 @@ enum AgentTranscriptProjectionBuilder {
         protection: AgentTranscriptProjectionProtection,
         reusablePrefix: ReusableProjectionPrefix?,
         turnCaches: [UUID: AgentTranscriptTurnProjectionCache],
-        processingContext: AgentToolResultProcessingContext? = nil
+        processingContext: AgentToolResultProcessingContext? = nil,
+        excludingQuiet: Bool = false
     ) -> AgentTranscriptProjectionBuildResult {
         #if DEBUG
             let startedAt = Date.timeIntervalSinceReferenceDate
         #endif
-        let context = AgentTranscriptProjectionBuildContext(processingContext: processingContext ?? AgentToolResultProcessingContext())
-        let detailedToolTailLimits = detailedToolTailLimits(for: transcript)
+        let context = AgentTranscriptProjectionBuildContext(processingContext: processingContext ?? AgentToolResultProcessingContext(), excludingQuiet: excludingQuiet)
+        let detailedToolTailLimits = detailedToolTailLimits(for: transcript, excludingQuiet: excludingQuiet)
         var workingBlocks: [AgentTranscriptRenderBlock] = reusablePrefix?.workingBlocks ?? []
         var archivedBlocks: [AgentTranscriptRenderBlock] = reusablePrefix?.archivedBlocks ?? []
         var workingRows: [AgentChatItem] = reusablePrefix?.workingRows ?? []
@@ -6090,11 +6278,13 @@ enum AgentTranscriptProjectionBuilder {
         var updatedTurnCaches = turnCaches.filter { transcriptTurnIDs.contains($0.key) }
         var cacheHitCount = 0
 
-        for turn in transcript.turns.dropFirst(reusablePrefix?.turnCount ?? 0) {
+        for canonicalTurn in transcript.turns.dropFirst(reusablePrefix?.turnCount ?? 0) {
+            let turn = excludingQuiet ? AgentTranscriptIO.quietLocalProjectionTurn(canonicalTurn) : canonicalTurn
             if let cachedProjection = cachedProjection(
                 for: turn,
                 protectedTurnID: protectedTurnID,
-                turnCaches: updatedTurnCaches
+                turnCaches: updatedTurnCaches,
+                excludingQuiet: excludingQuiet
             ) {
                 appendCachedProjectionState(
                     cachedProjection,
@@ -6123,7 +6313,7 @@ enum AgentTranscriptProjectionBuilder {
             if turn.isCompleted, turn.id != protectedTurnID {
                 updatedTurnCaches[turn.id] = projectionCache(
                     for: turn,
-                    token: validationToken(for: turn),
+                    token: validationToken(for: turn, excludingQuiet: excludingQuiet),
                     workingBlocks: appendedState.workingBlocks,
                     archivedBlocks: appendedState.archivedBlocks,
                     workingRows: appendedState.workingRows,
@@ -6177,7 +6367,8 @@ enum AgentTranscriptProjectionBuilder {
         for transcript: AgentTranscript,
         projection: AgentTranscriptProjection,
         protection: AgentTranscriptProjectionProtection = .none,
-        existingTurnCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:]
+        existingTurnCaches: [UUID: AgentTranscriptTurnProjectionCache] = [:],
+        excludingQuiet: Bool = false
     ) -> [UUID: AgentTranscriptTurnProjectionCache] {
         let transcriptTurnIDs = Set(transcript.turns.map(\.id))
         let protectedTurnID = protection.protectedTurnID
@@ -6203,7 +6394,7 @@ enum AgentTranscriptProjectionBuilder {
             let turnArchivedBlocks = archivedBlocksByTurn[turn.id] ?? []
             updatedTurnCaches[turn.id] = projectionCache(
                 for: turn,
-                token: validationToken(for: turn),
+                token: validationToken(for: turn, excludingQuiet: excludingQuiet),
                 workingBlocks: turnWorkingBlocks,
                 archivedBlocks: turnArchivedBlocks,
                 workingRows: projectionRows(for: turnWorkingBlocks),
@@ -6513,27 +6704,31 @@ enum AgentTranscriptProjectionBuilder {
         )
     }
 
-    static func validationToken(for turn: AgentTranscriptTurn) -> AgentTranscriptTurnProjectionCache.ValidationToken {
-        .init(
+    static func validationToken(for turn: AgentTranscriptTurn, excludingQuiet: Bool = false) -> AgentTranscriptTurnProjectionCache.ValidationToken {
+        let turn = excludingQuiet ? AgentTranscriptIO.quietLocalProjectionTurn(turn) : turn
+        return .init(
             turnID: turn.id,
             retentionTier: turn.retentionTier,
             isCompleted: turn.isCompleted,
             responseSpanCount: turn.responseSpans.count,
             activityCount: turn.allActivities.count,
             conclusionActivityID: turn.conclusionActivityID,
-            frozenDetailedToolTailLimit: turn.frozenDetailedToolTailLimit
+            frozenDetailedToolTailLimit: turn.frozenDetailedToolTailLimit,
+            quietLocal: turn.quietLocal,
+            excludingQuiet: excludingQuiet
         )
     }
 
     private static func cachedProjection(
         for turn: AgentTranscriptTurn,
         protectedTurnID: UUID?,
-        turnCaches: [UUID: AgentTranscriptTurnProjectionCache]
+        turnCaches: [UUID: AgentTranscriptTurnProjectionCache],
+        excludingQuiet: Bool = false
     ) -> AgentTranscriptTurnProjectionCache? {
         guard turn.isCompleted,
               turn.id != protectedTurnID,
               let cachedProjection = turnCaches[turn.id],
-              cachedProjection.token == validationToken(for: turn)
+              cachedProjection.token == validationToken(for: turn, excludingQuiet: excludingQuiet)
         else {
             return nil
         }
@@ -6648,7 +6843,8 @@ enum AgentTranscriptProjectionBuilder {
     /// Internal for tests; production callers stay inside this enum.
     static func groupedHistoryWouldCollapse(
         in turn: AgentTranscriptTurn,
-        detailedToolTailLimit: Int
+        detailedToolTailLimit: Int,
+        excludingQuiet: Bool = false
     ) -> Bool {
         guard turn.retentionTier == .full else { return false }
         var emittedConclusionActivityIDs = Set<UUID>()
@@ -6656,7 +6852,7 @@ enum AgentTranscriptProjectionBuilder {
             let leafDescriptors = fullSpanLeafDescriptors(
                 for: span,
                 in: turn,
-                emittedConclusionActivityIDs: &emittedConclusionActivityIDs
+                emittedConclusionActivityIDs: &emittedConclusionActivityIDs, excludingQuiet: excludingQuiet
             )
             if groupedHistoryDescriptorsWouldCollapse(
                 leafDescriptors,
@@ -6707,7 +6903,7 @@ enum AgentTranscriptProjectionBuilder {
         return true
     }
 
-    fileprivate static func normalizedFrozenDetailedToolTailLimit(for turn: AgentTranscriptTurn) -> Int? {
+    fileprivate static func normalizedFrozenDetailedToolTailLimit(for turn: AgentTranscriptTurn, excludingQuiet: Bool = false) -> Int? {
         guard turn.retentionTier == .full,
               turn.isCompleted,
               let rawFrozen = turn.frozenDetailedToolTailLimit
@@ -6715,21 +6911,22 @@ enum AgentTranscriptProjectionBuilder {
             return nil
         }
         let frozen = max(0, rawFrozen)
-        guard standaloneToolBlockCount(for: turn) > frozen else { return nil }
-        return groupedHistoryWouldCollapse(in: turn, detailedToolTailLimit: frozen) ? frozen : nil
+        guard standaloneToolBlockCount(for: turn, excludingQuiet: excludingQuiet) > frozen else { return nil }
+        return groupedHistoryWouldCollapse(in: turn, detailedToolTailLimit: frozen, excludingQuiet: excludingQuiet) ? frozen : nil
     }
 
-    fileprivate static func detailedToolTailLimits(for transcript: AgentTranscript) -> [UUID: Int] {
+    fileprivate static func detailedToolTailLimits(for transcript: AgentTranscript, excludingQuiet: Bool = false) -> [UUID: Int] {
         var remainingBudget = globalDetailedToolTailLimit
         var limits: [UUID: Int] = [:]
 
-        for turn in transcript.turns.reversed() {
+        for canonicalTurn in transcript.turns.reversed() {
+            let turn = excludingQuiet ? AgentTranscriptIO.quietLocalProjectionTurn(canonicalTurn) : canonicalTurn
             guard turn.retentionTier == .full else {
                 limits[turn.id] = 0
                 continue
             }
-            let visibleToolCeiling = normalizedFrozenDetailedToolTailLimit(for: turn)
-                ?? standaloneToolBlockCount(for: turn)
+            let visibleToolCeiling = normalizedFrozenDetailedToolTailLimit(for: turn, excludingQuiet: excludingQuiet)
+                ?? standaloneToolBlockCount(for: turn, excludingQuiet: excludingQuiet)
             let visibleToolCount = min(visibleToolCeiling, remainingBudget)
             limits[turn.id] = visibleToolCount
             remainingBudget = max(0, remainingBudget - visibleToolCount)
@@ -6854,13 +7051,13 @@ enum AgentTranscriptProjectionBuilder {
         return detailedToolTailBoostToolNames.contains(toolName)
     }
 
-    fileprivate static func standaloneToolBlockCount(for turn: AgentTranscriptTurn) -> Int {
+    fileprivate static func standaloneToolBlockCount(for turn: AgentTranscriptTurn, excludingQuiet: Bool = false) -> Int {
         var emittedConclusionActivityIDs = Set<UUID>()
         return turn.responseSpans.reduce(into: 0) { partial, span in
             let kinds = fullSpanLeafBlockKinds(
                 for: span,
                 in: turn,
-                emittedConclusionActivityIDs: &emittedConclusionActivityIDs
+                emittedConclusionActivityIDs: &emittedConclusionActivityIDs, excludingQuiet: excludingQuiet
             )
             // A companion cluster is one visible tool leaf for tail-budget purposes.
             partial += kinds.count(where: { $0 == .standaloneTool || $0 == .activityCluster })
@@ -6897,7 +7094,7 @@ enum AgentTranscriptProjectionBuilder {
                     context: context
                 )
             case .archived:
-                compactedBlocks(for: turn, archived: archived)
+                compactedBlocks(for: turn, archived: archived, excludingQuiet: context.excludingQuiet)
             }
         }
         return unsortedBlocks.enumerated().sorted { lhs, rhs in
@@ -7116,7 +7313,8 @@ enum AgentTranscriptProjectionBuilder {
     static func fullSpanLeafBlockKinds(
         for span: AgentTranscriptProviderResponseSpan,
         in turn: AgentTranscriptTurn,
-        emittedConclusionActivityIDs: inout Set<UUID>
+        emittedConclusionActivityIDs: inout Set<UUID>,
+        excludingQuiet: Bool = false
     ) -> [AgentTranscriptRenderBlockKind] {
         let orderedActivities = span.activities.sorted { lhs, rhs in
             if lhs.sequenceIndex == rhs.sequenceIndex {
@@ -7128,8 +7326,11 @@ enum AgentTranscriptProjectionBuilder {
         var leafIsCompanion: [Bool] = []
         var currentToolExecutionID: String?
         var emittedToolExecutionKeys = Set<String>()
+        #if DEBUG
+            AgentTranscriptDebugInstrumentation.emitSummaryTraversal(.init(phase: "projection-descriptors", turnID: turn.id, activityCount: orderedActivities.count))
+        #endif
         for activity in orderedActivities {
-            guard !isSuppressedActivity(activity) else { continue }
+            guard !(excludingQuiet && turn.quietLocal != nil && activity.quietCheckInWakeID != nil), !isSuppressedActivity(activity) else { continue }
             switch classify(activity: activity, in: turn) {
             case .conclusion:
                 currentToolExecutionID = nil
@@ -7165,7 +7366,8 @@ enum AgentTranscriptProjectionBuilder {
     static func fullSpanLeafDescriptors(
         for span: AgentTranscriptProviderResponseSpan,
         in turn: AgentTranscriptTurn,
-        emittedConclusionActivityIDs: inout Set<UUID>
+        emittedConclusionActivityIDs: inout Set<UUID>,
+        excludingQuiet: Bool = false
     ) -> [CollapsibleLeafDescriptor] {
         let orderedActivities = span.activities.sorted { lhs, rhs in
             if lhs.sequenceIndex == rhs.sequenceIndex {
@@ -7189,8 +7391,11 @@ enum AgentTranscriptProjectionBuilder {
             currentToolIsCompanion = false
         }
 
+        #if DEBUG
+            AgentTranscriptDebugInstrumentation.emitSummaryTraversal(.init(phase: "projection-descriptors", turnID: turn.id, activityCount: orderedActivities.count))
+        #endif
         for activity in orderedActivities {
-            guard !isSuppressedActivity(activity) else { continue }
+            guard !(excludingQuiet && turn.quietLocal != nil && activity.quietCheckInWakeID != nil), !isSuppressedActivity(activity) else { continue }
             switch classify(activity: activity, in: turn) {
             case .conclusion:
                 flushStandaloneToolDescriptor()
@@ -7682,7 +7887,11 @@ enum AgentTranscriptProjectionBuilder {
         // turn's summarized work — matching compactedRows, compactedBlocks, and history.
         blocks.append(contentsOf: recoveryDiagnosticBlocks(for: turn, archived: archived))
         var emittedConclusionActivityIDs = Set<UUID>()
-        for span in turn.responseSpans {
+        for canonicalSpan in turn.responseSpans {
+            var span = canonicalSpan
+            if context.excludingQuiet, turn.quietLocal != nil {
+                span.collapsedSummary = span.quietLocal?.collapsedSummary
+            }
             if span.activities.isEmpty {
                 if let collapsedSummary = span.collapsedSummary {
                     blocks.append(groupedHistoryBlock(
@@ -7705,7 +7914,7 @@ enum AgentTranscriptProjectionBuilder {
             )
             let contentBlocks = leafBlocks.filter { $0.kind != .conclusion }
             let conclusionBlocks = leafBlocks.filter { $0.kind == .conclusion }
-            if !contentBlocks.isEmpty {
+            if !contentBlocks.isEmpty || (context.excludingQuiet && turn.quietLocal != nil && span.quietLocal != nil && span.collapsedSummary != nil) {
                 blocks.append(groupedHistoryBlock(
                     for: contentBlocks,
                     frozenSummary: span.collapsedSummary,
@@ -7718,7 +7927,7 @@ enum AgentTranscriptProjectionBuilder {
             blocks.append(contentsOf: conclusionBlocks)
         }
         if emittedConclusionActivityIDs.isEmpty,
-           let conclusionRow = conclusionRow(for: turn)
+           let conclusionRow = conclusionRow(for: turn, preserveFullCondensedText: context.excludingQuiet && turn.quietLocal != nil)
         {
             blocks.append(.init(
                 id: activityBlockID(turn.conclusionActivityID ?? conclusionRow.id, fallback: turn.id),
@@ -7735,7 +7944,7 @@ enum AgentTranscriptProjectionBuilder {
         return blocks
     }
 
-    private static func compactedBlocks(for turn: AgentTranscriptTurn, archived: Bool) -> [AgentTranscriptRenderBlock] {
+    private static func compactedBlocks(for turn: AgentTranscriptTurn, archived: Bool, excludingQuiet: Bool = false) -> [AgentTranscriptRenderBlock] {
         var blocks: [AgentTranscriptRenderBlock] = []
         if let request = turn.request {
             blocks.append(.init(
@@ -7751,7 +7960,7 @@ enum AgentTranscriptProjectionBuilder {
         // Recovery diagnostics precede the summarized work; emit before the summary
         // block so all surfaces agree on request → diagnostics → summary → conclusion.
         blocks.append(contentsOf: recoveryDiagnosticBlocks(for: turn, archived: archived))
-        if let summaryRow = middleSummaryRow(for: turn) {
+        if let summaryRow = middleSummaryRow(for: turn, excludingQuiet: excludingQuiet) {
             blocks.append(.init(
                 id: summaryBlockID(summaryRow.id),
                 kind: .middleSummary,
@@ -7831,8 +8040,11 @@ enum AgentTranscriptProjectionBuilder {
             standaloneToolActivities.removeAll(keepingCapacity: true)
         }
 
+        #if DEBUG
+            AgentTranscriptDebugInstrumentation.emitSummaryTraversal(.init(phase: "projection-leaves", turnID: turn.id, activityCount: orderedActivities.count))
+        #endif
         for activity in orderedActivities {
-            guard !isSuppressedActivity(activity) else { continue }
+            guard !(context.excludingQuiet && turn.quietLocal != nil && activity.quietCheckInWakeID != nil), !isSuppressedActivity(activity) else { continue }
             let renderClass = classify(activity: activity, in: turn)
             if renderClass == .conclusion {
                 flushStandaloneToolActivities()
@@ -7916,7 +8128,7 @@ enum AgentTranscriptProjectionBuilder {
             visibleBlocks.append(bufferedLeadingAssistant)
         }
         if !plan.groupedPrefix.isEmpty {
-            let frozenSummary: AgentTranscriptGroupedHistorySummary? = if let cache = span.fullRenderGroupedHistoryCache,
+            let frozenSummary: AgentTranscriptGroupedHistorySummary? = if !(context.excludingQuiet && turn.quietLocal != nil), let cache = span.fullRenderGroupedHistoryCache,
                                                                           cache.detailedToolTailLimit == detailedToolTailLimit,
                                                                           cache.collapseDigest == plan.collapseDigest
             {
@@ -8577,15 +8789,36 @@ enum AgentTranscriptProjectionBuilder {
         }
     }
 
-    private static func middleSummaryRow(for turn: AgentTranscriptTurn) -> AgentChatItem? {
+    private static func middleSummaryRow(for turn: AgentTranscriptTurn, excludingQuiet: Bool = false) -> AgentChatItem? {
         guard let summary = turn.summary,
               let text = summary.middleSummaryText?.trimmingCharacters(in: .whitespacesAndNewlines),
               !text.isEmpty
         else {
             return nil
         }
-        let requestSequence = turn.request?.sequenceIndex ?? (turn.allActivities.first?.sequenceIndex ?? 0)
-        let conclusionSequence = conclusionRow(for: turn)?.sequenceIndex ?? (turn.allActivities.last?.sequenceIndex ?? requestSequence + 1)
+        let requestSequence: Int
+        let conclusionSequence: Int
+        if excludingQuiet, turn.quietLocal != nil {
+            // Local summary ordering uses the same retained ordinary source coordinates as
+            // exact member removal. The conclusion row itself may still synthesize its
+            // documented canonical-tail identity. Fold stamp checks into this existing
+            // coordinate-selection pass, without flattened source copies or sizing changes.
+            var firstSequence: Int?
+            var lastSequence: Int?
+            var retainedConclusionSequence: Int?
+            for span in turn.responseSpans {
+                for activity in span.activities where activity.quietCheckInWakeID == nil {
+                    if firstSequence == nil { firstSequence = activity.sequenceIndex }
+                    lastSequence = activity.sequenceIndex
+                    if activity.id == turn.conclusionActivityID { retainedConclusionSequence = activity.sequenceIndex }
+                }
+            }
+            requestSequence = turn.request?.sequenceIndex ?? firstSequence ?? 0
+            conclusionSequence = retainedConclusionSequence ?? max(turn.request?.sequenceIndex ?? 0, (lastSequence ?? 0) + 1)
+        } else {
+            requestSequence = turn.request?.sequenceIndex ?? (turn.allActivities.first?.sequenceIndex ?? 0)
+            conclusionSequence = conclusionRow(for: turn)?.sequenceIndex ?? (turn.allActivities.last?.sequenceIndex ?? requestSequence + 1)
+        }
         let sequenceIndex = min(conclusionSequence - 1, requestSequence + 1)
         return AgentChatItem(
             id: summary.middleSummaryItemID,
@@ -8597,7 +8830,7 @@ enum AgentTranscriptProjectionBuilder {
         )
     }
 
-    private static func conclusionRow(for turn: AgentTranscriptTurn) -> AgentChatItem? {
+    private static func conclusionRow(for turn: AgentTranscriptTurn, preserveFullCondensedText: Bool = false) -> AgentChatItem? {
         if let conclusionActivityID = turn.conclusionActivityID,
            let activity = turn.allActivities.first(where: { $0.id == conclusionActivityID })
         {
@@ -8614,7 +8847,11 @@ enum AgentTranscriptProjectionBuilder {
             }
         }
         guard let summary = turn.summary,
-              let text = displayableAssistantText(summary.compactConclusionText) ?? displayableAssistantText(summary.conclusionText)
+              let text = (
+                  turn.retentionTier == .condensed && preserveFullCondensedText
+                      ? displayableAssistantText(summary.conclusionText) ?? displayableAssistantText(summary.compactConclusionText)
+                      : displayableAssistantText(summary.compactConclusionText) ?? displayableAssistantText(summary.conclusionText)
+              )
         else {
             return nil
         }

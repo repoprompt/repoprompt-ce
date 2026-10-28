@@ -2082,7 +2082,7 @@ actor ACPAgentSessionController {
 
     private func handleNotification(method: String, params: [String: Any], inboundSequence: UInt64) {
         guard method == "session/update" else {
-            emitDevinQuietUncertaintyIfCurrent(params: params)
+            emitDevinSemanticUncertaintyIfCurrent(params: params)
             return
         }
         #if DEBUG
@@ -2095,7 +2095,7 @@ actor ACPAgentSessionController {
             )
         #endif
         guard let update = params["update"] as? [String: Any] else {
-            emitDevinQuietUncertaintyIfCurrent(params: params)
+            emitDevinSemanticUncertaintyIfCurrent(params: params)
             return
         }
         let sessionID = (params["sessionId"] as? String) ?? sessionID ?? ""
@@ -2188,7 +2188,7 @@ actor ACPAgentSessionController {
         }
     }
 
-    private func emitDevinQuietUncertaintyIfCurrent(params: [String: Any]) {
+    private func emitDevinSemanticUncertaintyIfCurrent(params: [String: Any]) {
         guard provider.providerID == .devin, activePromptTurnID != nil,
               !suppressSessionLoadReplayUpdates else { return }
         if let incomingSession = params["sessionId"] as? String, incomingSession != sessionID { return }

@@ -33,8 +33,8 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         )
         let canonicalNames = MCPDomainCanonicalToolDefinitions.definitions.map(\.name)
         XCTAssertEqual(canonicalNames, MCPDomainToolCatalog.orderedToolNames)
-        XCTAssertEqual(canonicalNames.count, 31)
-        XCTAssertEqual(Set(canonicalNames).count, 31)
+        XCTAssertEqual(canonicalNames.count, 32)
+        XCTAssertEqual(Set(canonicalNames).count, 32)
 
         for name in MCPGlobalToolName.orderedToolNames {
             let resolution = await runtime.toolRegistry.resolve(toolName: name, scope: .application)
@@ -46,7 +46,7 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
         }
 
         let snapshot = await runtime.toolRegistry.snapshot()
-        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 31)
+        XCTAssertEqual(snapshot.fingerprintsByToolName.count, 32)
         XCTAssertEqual(Set(snapshot.fingerprintsByToolName.keys), Set(canonicalNames))
 
         // Delegation scopes are app-owned Agent-session authority: direct-headless keeps the canonical
@@ -61,6 +61,17 @@ final class MCPDomainStandaloneCompositionTests: XCTestCase {
             XCTFail("Standalone session_admin must fail closed")
         } catch {
             XCTAssertTrue(String(describing: error).contains("session_admin is not available"), "\(error)")
+        }
+
+        let noopCandidate = await runtime.toolRegistry.resolve(
+            toolName: MCPWindowToolName.selfNoop, scope: .standalone(id: scopeID)
+        )
+        let noop = try XCTUnwrap(noopCandidate).binding
+        do {
+            _ = try await noop([:])
+            XCTFail("Standalone cannot manufacture an app-owned declaration acknowledgement")
+        } catch let denial as MCPDomainCallPolicyDenial {
+            XCTAssertEqual(denial, .missingAdditionalGrant(toolName: MCPWindowToolName.selfNoop))
         }
 
         let protectedCandidate = await runtime.toolRegistry.resolve(

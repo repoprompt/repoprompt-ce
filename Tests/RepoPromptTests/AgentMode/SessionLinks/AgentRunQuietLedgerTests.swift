@@ -4,10 +4,10 @@ import XCTest
 
 final class AgentRunQuietLedgerTests: XCTestCase {
     @MainActor
-    func testQuietAndOrdinaryClosuresAdvanceCheckedAggregateFactsOnce() {
+    func testQuietAndOrdinaryClosuresAdvanceCheckedAggregateFactsOnce() throws {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
-        let rows = fixture.rows(["[ack]"])
+        let rows = try fixture.declarationRows()
         let seal = fixture.seal(rows)
         XCTAssertEqual(seal?.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: 0))
         XCTAssertEqual(fixture.seal(fixture.rows(["later prose"])), seal)
@@ -27,7 +27,45 @@ final class AgentRunQuietLedgerTests: XCTestCase {
             owner: third, terminalState: .completed, classifiesQuietCheckIn: true,
             endKey: 29, rangeIsComplete: true, rows: [AgentChatItem]()
         )
-        XCTAssertEqual(fixture.ledger.facts, AgentRunQuietFacts(settledThrough: 3, ordinaryThrough: 2))
+        XCTAssertEqual(fixture.ledger.facts, AgentRunQuietFacts(settledThrough: 3, ordinaryThrough: 3), "An undeclared silent third close remains ordinary")
+    }
+
+    @MainActor
+    func testDeclarationRangeRequiresCompleteOrderedUniqueAllocatedRows() throws {
+        for corruption in ["none", "lost-prefix", "lost-tail", "reordered", "duplicate-identity", "streaming"] {
+            var fixture = AgentQuietCheckInFixture()
+            fixture.begin()
+            var rows = try fixture.declarationRows()
+            switch corruption {
+            case "lost-prefix": rows.removeFirst()
+            case "lost-tail": rows.removeLast()
+            case "reordered": rows.reverse()
+            case "duplicate-identity":
+                rows[1] = AgentChatItem(id: rows[0].id, timestamp: rows[1].timestamp, kind: .toolResult, text: rows[1].text, toolName: rows[1].toolName, toolInvocationID: rows[1].toolInvocationID, toolResultJSON: rows[1].toolResultJSON, toolIsError: false, sequenceIndex: 11)
+            case "streaming": rows[1].isStreaming = true
+            default: break
+            }
+            let seal = fixture.ledger.settle(owner: fixture.owner, terminalState: .completed, classifiesQuietCheckIn: true, endKey: 11, rangeIsComplete: true, rows: rows)
+            XCTAssertEqual(seal?.isQuiet, corruption == "none", corruption)
+        }
+    }
+
+    @MainActor
+    func testDeclarationMarkerRequiresPositiveRegistrationAndCanonicalSource() throws {
+        for variant in ["valid", "unregistered", "changed-text", "changed-kind", "forged-identity"] {
+            var fixture = AgentQuietCheckInFixture()
+            fixture.begin()
+            let declared = try fixture.declarationRows()
+            var marker = AgentChatItem.laneUpdateAutoWake(wakeID: fixture.wakeID, acceptedAt: Date(timeIntervalSince1970: 1), sequenceIndex: 12)
+            if variant != "unregistered" { XCTAssertTrue(fixture.ledger.registerHostMarker(marker)) }
+            switch variant {
+            case "changed-text": marker.text += " changed"
+            case "changed-kind": marker.kind = .user
+            case "forged-identity": marker = AgentChatItem(kind: .system, text: marker.text, sequenceIndex: 12)
+            default: break
+            }
+            XCTAssertEqual(fixture.seal(declared + [marker])?.isQuiet, variant == "valid", variant)
+        }
     }
 
     @MainActor
@@ -44,7 +82,7 @@ final class AgentRunQuietLedgerTests: XCTestCase {
     }
 
     @MainActor
-    func testStaleOwnerAndBindingMarksEndsAndSealsCannotMutateSuccessor() {
+    func testStaleOwnerAndBindingMarksEndsAndSealsCannotMutateSuccessor() throws {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
         let stale = AgentRunOwnership(
@@ -59,27 +97,28 @@ final class AgentRunQuietLedgerTests: XCTestCase {
             owner: stale, terminalState: .completed, classifiesQuietCheckIn: true,
             endKey: 9, rangeIsComplete: true, rows: [AgentChatItem]()
         ))
-        XCTAssertEqual(fixture.seal()?.isQuiet, true)
+        XCTAssertEqual(try fixture.sealDeclaration()?.isQuiet, true)
         let successor = AgentRunOwnership(binding: fixture.owner.binding)
         fixture.ledger.begin(owner: successor, startKey: 10, provider: .claudeCode)
         fixture.ledger.markRoutineWake(owner: successor, wakeID: UUID())
         fixture.ledger.noteOccurrence(owner: fixture.owner)
         XCTAssertFalse(fixture.ledger.end(owner: fixture.owner, authoritativeOwner: successor))
         XCTAssertNil(fixture.seal())
-        let result = fixture.ledger.settle(
+        let successorRows = try fixture.declarationRows(owner: successor)
+        let result = try fixture.ledger.settle(
             owner: successor, terminalState: .completed, classifiesQuietCheckIn: true,
-            endKey: 9, rangeIsComplete: true, rows: [AgentChatItem]()
+            endKey: XCTUnwrap(successorRows.last?.sequenceIndex), rangeIsComplete: true, rows: successorRows
         )
         XCTAssertEqual(result?.isQuiet, true)
         XCTAssertEqual(result?.facts, AgentRunQuietFacts(settledThrough: 2, ordinaryThrough: 0))
     }
 
     @MainActor
-    func testAbandonedPredecessorIsOrdinaryButSealedPredecessorIsNotRecounted() {
+    func testAbandonedPredecessorIsOrdinaryButSealedPredecessorIsNotRecounted() throws {
         for sealed in [false, true] {
             var fixture = AgentQuietCheckInFixture()
             fixture.begin()
-            if sealed { XCTAssertEqual(fixture.seal()?.isQuiet, true) }
+            if sealed { XCTAssertEqual(try fixture.sealDeclaration()?.isQuiet, true) }
             let successor = AgentRunOwnership(binding: fixture.owner.binding)
             fixture.ledger.begin(owner: successor, startKey: 10, provider: .claudeCode)
             XCTAssertEqual(fixture.ledger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: sealed ? 0 : 1))
@@ -89,54 +128,57 @@ final class AgentRunQuietLedgerTests: XCTestCase {
     }
 
     @MainActor
-    func testAcceptedOccurrenceIsInsertOnlyAcrossRepeatedBeginAndPhysicalMarks() {
+    func testAcceptedOccurrenceIsInsertOnlyAcrossRepeatedBeginAndPhysicalMarks() throws {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin(routine: false)
         fixture.ledger.noteOccurrence(owner: fixture.owner)
         fixture.begin()
         fixture.ledger.markRoutineWake(owner: fixture.owner, wakeID: fixture.wakeID)
-        XCTAssertEqual(fixture.seal()?.isQuiet, false)
+        XCTAssertEqual(try fixture.sealDeclaration()?.isQuiet, false)
         XCTAssertTrue(fixture.ledger.hiddenSourceIDs.isEmpty)
     }
 
     @MainActor
-    func testPhysicalMarkAbsentConflictingAndSameWakeReentry() {
+    func testPhysicalMarkAbsentConflictingAndSameWakeReentry() throws {
         for variant in 0 ..< 3 {
             var fixture = AgentQuietCheckInFixture()
             fixture.begin(routine: variant != 0)
             if variant == 1 { fixture.ledger.markRoutineWake(owner: fixture.owner, wakeID: UUID()) }
             if variant == 2 { fixture.ledger.markRoutineWake(owner: fixture.owner, wakeID: fixture.wakeID) }
-            XCTAssertEqual(fixture.seal()?.isQuiet, variant == 2)
+            XCTAssertEqual(try fixture.sealDeclaration()?.isQuiet, variant == 2)
         }
     }
 
     @MainActor
-    func testDefaultFalseNormalProofTerminalStateSuccessorAndRangeVetoes() {
+    func testDefaultFalseNormalProofTerminalStateSuccessorAndRangeVetoes() throws {
         for state in [AgentSessionRunState.cancelled, .failed, .running, .waitingForUser, .idle] {
             var fixture = AgentQuietCheckInFixture()
             fixture.begin()
-            XCTAssertEqual(fixture.seal(state: state)?.isQuiet, false, state.rawValue)
+            let rows = try fixture.declarationRows()
+            XCTAssertEqual(fixture.seal(rows, state: state)?.isQuiet, false, state.rawValue)
         }
         for variant in 0 ..< 4 {
             var fixture = AgentQuietCheckInFixture()
             fixture.begin()
+            let rows = try fixture.declarationRows()
             if variant == 3 { fixture.ledger.invalidateRange(owner: fixture.owner) }
-            XCTAssertEqual(fixture.seal(normal: variant != 0, successor: variant == 1, complete: variant != 2)?.isQuiet, false)
+            XCTAssertEqual(fixture.seal(rows, normal: variant != 0, successor: variant == 1, complete: variant != 2)?.isQuiet, false)
         }
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
-        let defaulted = fixture.ledger.settle(
-            owner: fixture.owner, terminalState: .completed, endKey: 9,
-            rangeIsComplete: true, rows: [AgentChatItem]()
+        let declared = try fixture.declarationRows()
+        let defaulted = try fixture.ledger.settle(
+            owner: fixture.owner, terminalState: .completed, endKey: XCTUnwrap(declared.last?.sequenceIndex),
+            rangeIsComplete: true, rows: declared
         )
         XCTAssertEqual(defaulted?.isQuiet, false)
     }
 
     @MainActor
-    func testSealIsImmutableAgainstLateInputMarksRangeLossAndDuplicateBarrier() {
+    func testSealIsImmutableAgainstLateInputMarksRangeLossAndDuplicateBarrier() throws {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
-        let rows = fixture.rows(["[ack]"])
+        let rows = try fixture.declarationRows()
         let original = fixture.seal(rows)
         let hidden = fixture.ledger.hiddenSourceIDs
         XCTAssertFalse(fixture.ledger.isOpen(owner: fixture.owner))
@@ -148,11 +190,11 @@ final class AgentRunQuietLedgerTests: XCTestCase {
     }
 
     @MainActor
-    func testCapturedActiveStatusUsesOpeningFactsAndTerminalStatusUsesSealBeforeEnd() {
+    func testCapturedActiveStatusUsesOpeningFactsAndTerminalStatusUsesSealBeforeEnd() throws {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
         let opening = fixture.ledger.facts
-        let sealed = fixture.seal()
+        let sealed = try fixture.sealDeclaration()
         for state in [AgentSessionRunState.running, .waitingForUser, .waitingForApproval, .waitingForQuestion] {
             XCTAssertEqual(fixture.ledger.sourceFacts(owner: fixture.owner, capturedState: state), opening)
         }
@@ -171,7 +213,7 @@ final class AgentRunQuietLedgerTests: XCTestCase {
         var fixture = AgentQuietCheckInFixture()
         fixture.ledger = try AgentRunQuietLedger(initialFacts: XCTUnwrap(AgentRunQuietFacts(settledThrough: UInt64.max - 1, ordinaryThrough: 7)))
         fixture.begin()
-        XCTAssertEqual(fixture.seal()?.facts, AgentRunQuietFacts(settledThrough: UInt64.max, ordinaryThrough: 7))
+        XCTAssertEqual(try fixture.sealDeclaration()?.facts, AgentRunQuietFacts(settledThrough: UInt64.max, ordinaryThrough: 7))
         let priorHidden = fixture.ledger.hiddenSourceIDs
         let successor = AgentRunOwnership(binding: fixture.owner.binding)
         fixture.ledger.begin(owner: successor, startKey: 20, provider: .claudeCode)
@@ -192,10 +234,10 @@ final class AgentRunQuietLedgerTests: XCTestCase {
     }
 
     @MainActor
-    func testPendingMarkerSurvivesEndAndUnrelatedRetirementUntilProducerNoCallOrMaterialization() {
+    func testPendingMarkerSurvivesEndAndUnrelatedRetirementUntilProducerNoCallOrMaterialization() throws {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
-        let rows = fixture.rows(["[ack]"])
+        let rows = try fixture.declarationRows()
         XCTAssertEqual(fixture.seal(rows)?.isQuiet, true)
         XCTAssertTrue(fixture.ledger.end(owner: fixture.owner, authoritativeOwner: fixture.owner))
         // Actual row retirement is not a census of IDs missing from the working suffix.
@@ -218,10 +260,10 @@ final class AgentRunQuietLedgerTests: XCTestCase {
     }
 
     @MainActor
-    func testReloadLosesHidingButKeepsMonotonicFactsAndInvalidatesOpenRange() {
+    func testDiscardingMaterializedLiveProofKeepsFactsAndInvalidatesOpenRange() throws {
         var fixture = AgentQuietCheckInFixture()
         fixture.begin()
-        let rows = fixture.rows(["[ack]"])
+        let rows = try fixture.declarationRows()
         _ = fixture.seal(rows)
         let settled = fixture.ledger.facts
         let materializedIDs = Set(rows.map(\.id))
@@ -245,33 +287,34 @@ final class AgentRunQuietLedgerTests: XCTestCase {
 
 extension AgentRunQuietLedgerTests {
     @MainActor
-    func testProducerCompletionBeforeAndAfterSealRetiresOnlyUnmaterializedMarker() {
+    func testProducerCompletionBeforeAndAfterSealRetiresOnlyUnmaterializedMarker() throws {
         for beforeSeal in [false, true] {
             var fixture = AgentQuietCheckInFixture()
             fixture.begin()
-            let rows = fixture.rows(["[ack]"])
+            let rows = try fixture.declarationRows()
             if beforeSeal { fixture.ledger.retireUnmaterializedWake(fixture.wakeID) }
             XCTAssertTrue(fixture.seal(rows)?.isQuiet == true)
             if !beforeSeal { fixture.ledger.retireUnmaterializedWake(fixture.wakeID) }
-            XCTAssertEqual(fixture.ledger.hiddenSourceIDs, Set(rows.map(\.id)))
+            XCTAssertTrue(fixture.ledger.hiddenSourceIDs.isEmpty, "Only the session stamp owner owns materialized row omission; the ledger owns the pending marker")
         }
         var materialized = AgentQuietCheckInFixture()
         materialized.begin()
         let marker = AgentChatItem.laneUpdateAutoWake(wakeID: materialized.wakeID, acceptedAt: Date(), sequenceIndex: 10)
         XCTAssertTrue(materialized.ledger.registerHostMarker(marker))
-        XCTAssertTrue(materialized.seal([marker])?.isQuiet == true)
+        let declared = try materialized.declarationRows(startKey: 11)
+        XCTAssertTrue(materialized.seal([marker] + declared)?.isQuiet == true)
         materialized.ledger.retireUnmaterializedWake(materialized.wakeID)
         XCTAssertTrue(materialized.ledger.hiddenSourceIDs.contains(marker.id))
     }
 
     @MainActor
-    func testPriorOrdinaryPhysicalDispatchAndDistinctWakeCannotGainRoutineOrigin() {
+    func testPriorOrdinaryPhysicalDispatchAndDistinctWakeCannotGainRoutineOrigin() throws {
         for ordinary in [true, false] {
             var fixture = AgentQuietCheckInFixture()
             fixture.begin(routine: false)
             fixture.ledger.recordPhysicalDispatch(owner: fixture.owner, wakeID: UUID(), routineQuietCheckIn: !ordinary, alreadyAcquired: false)
             fixture.ledger.recordPhysicalDispatch(owner: fixture.owner, wakeID: fixture.wakeID, routineQuietCheckIn: true, alreadyAcquired: false)
-            XCTAssertFalse(fixture.seal()?.isQuiet == true)
+            XCTAssertFalse(try fixture.sealDeclaration()?.isQuiet == true)
         }
     }
 }

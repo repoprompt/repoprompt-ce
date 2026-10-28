@@ -38,7 +38,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         ))
     }
 
-    func testRealBarrierSealsBeforeTeardownAndStatusFlipsBeforeEndWithoutSuppressingNotification() async {
+    func testUndeclaredBarrierSealsOrdinaryBeforeTeardownWithoutSuppressingNotification() async {
         let (h, s, owner, _) = fixture()
         var completed = 0
         h.onTurnComplete = { completed += 1 }
@@ -53,11 +53,11 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         let revision = await commit(h, s, owner, prepare: { preparingFacts = s.quietRunFacts(capturedState: .running) })
         XCTAssertNotNil(revision)
         XCTAssertEqual(preparingFacts, .zero)
-        XCTAssertEqual(idleFacts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: 0))
+        XCTAssertEqual(idleFacts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: 1))
         XCTAssertEqual(teardownFacts, idleFacts)
         XCTAssertEqual(completed, 1)
         XCTAssertNil(s.activeRunOwnership)
-        XCTAssertEqual(s.quietLedger.hiddenSourceIDs.count, 1)
+        XCTAssertTrue(s.quietLedger.hiddenSourceIDs.isEmpty)
         XCTAssertFalse(s.endRunAttempt(ifCurrent: owner, source: "duplicate"))
         XCTAssertEqual(s.quietLedger.facts, idleFacts)
     }
@@ -148,7 +148,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         XCTAssertEqual(s.quietLedger.facts, AgentRunQuietFacts(settledThrough: 2, ordinaryThrough: 2))
     }
 
-    func testFinalizationIsIdentityPreservingButOpaqueRetentionRekeyAndReloadFailOpen() async {
+    func testFinalizationPreservesIdentityWhileOpaqueRangeChangesAndUndeclaredRowsStayOrdinary() async {
         for variant in 0 ..< 5 {
             let (h, s, owner, _) = fixture()
             var row = AgentChatItem.assistant("[ack]")
@@ -161,8 +161,15 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
             case 3: s.setItemsSilently(s.items, reason: .persistedSessionHydration)
             default: _ = s.removeItem(at: 0)
             }
+            if variant == 0 {
+                XCTAssertEqual(s.items.first?.id, row.id)
+                XCTAssertEqual(s.items.first?.isStreaming, false)
+                XCTAssertNotNil(s.quietLedger.candidateStartKey(owner: owner))
+            } else {
+                XCTAssertNil(s.quietLedger.candidateStartKey(owner: owner), "Opaque range mutation cannot qualify")
+            }
             _ = await commit(h, s, owner)
-            XCTAssertEqual(s.quietLedger.facts?.ordinaryThrough, variant == 0 ? 0 : 1)
+            XCTAssertEqual(s.quietLedger.facts?.ordinaryThrough, 1, "No declaration: final text is never authority")
         }
     }
 
@@ -189,49 +196,52 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         XCTAssertEqual(s.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: 1))
         let next = s.beginRunAttempt(source: "after-clear")
         s.quietLedger.markRoutineWake(owner: next, wakeID: UUID())
+        XCTAssertNotNil(s.quietLedger.candidateStartKey(owner: next), "A fresh post-clear allocator range is valid, but still needs a declaration")
         s.appendItem(.assistant("[ack]"))
         _ = await commit(h, s, next)
-        XCTAssertEqual(s.quietLedger.facts, AgentRunQuietFacts(settledThrough: 2, ordinaryThrough: 1))
+        XCTAssertEqual(s.quietLedger.facts, AgentRunQuietFacts(settledThrough: 2, ordinaryThrough: 2))
     }
 
-    func testRawClaudeFinishedMessagesReplacementAndSilenceReachAcceptedVMAndBarrier() async {
-        let cases: [([String], Bool)] = [
-            ([#"{"type":"system","subtype":"init"}"#, #"{"type":"result","result":"[ack]"}"#], true),
-            ([
+    func testRawClaudeUndeclaredFinishedMessagesAndSilenceRemainOrdinaryAtBarrier() async {
+        let cases: [[String]] = [
+            [#"{"type":"system","subtype":"init"}"#, #"{"type":"result","subtype":"success","result":"[ack]"}"#],
+            [
                 #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#,
-                #"{"type":"result","result":"[ack]"}"#
-            ], true),
-            ([
+                #"{"type":"result","subtype":"success","result":"[ack]"}"#
+            ],
+            [
                 #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#,
                 #"{"type":"assistant","message":{"id":"two","content":[{"type":"text","text":"[ack]"}]}}"#,
-                #"{"type":"result","result":"[ack]"}"#
-            ], false),
-            ([#"{"type":"system","subtype":"init"}"#, #"{"type":"result","subtype":"success"}"#], true)
+                #"{"type":"result","subtype":"success","result":"[ack]"}"#
+            ],
+            [#"{"type":"system","subtype":"init"}"#, #"{"type":"result","subtype":"success"}"#],
+            // A result without its completion subtype is not positively successful metadata.
+            [#"{"type":"result","result":"[ack]"}"#]
         ]
-        for (wire, quiet) in cases {
+        for wire in cases {
             let (h, s, owner, runID) = fixture()
             var translator = ClaudeSDKNDJSONTranslator()
             let events = wire.flatMap { translator.parseNDJSONLine(Data($0.utf8)) }.map { NativeAgentRuntimeEvent.stream($0) }
             let runner = ClaudeIntegratedAgentModeRunner(claudeCoordinator: h.host.claudeCoordinator, hooks: h.hooks, terminalCommitBarrier: AgentRunTerminalCommitBarrier())
             await runner.testConsumeQuietEvents(events, session: s, runID: runID, owner: owner)
             _ = await commit(h, s, owner)
-            XCTAssertEqual(s.quietLedger.facts?.ordinaryThrough, quiet ? 0 : 1, "\(wire)")
+            XCTAssertEqual(s.quietLedger.facts?.ordinaryThrough, 1, "\(wire)")
         }
     }
 
-    func testClaudeControllerCodecPreservesNeutralSilenceAndHiddenOrUnknownActivity() async {
-        for (wire, quiet) in [
-            (#"{"type":"system","subtype":"init"}"#, true),
-            (#"{"type":"system","subtype":"task_started","task_id":"background"}"#, false),
-            (#"{"type":"system","subtype":"task_notification"}"#, false),
-            (#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use"}}}"#, false),
-            (#"{"type":"stream_event","event":{"type":"future_event"}}"#, false),
-            (#"{"type":"assistant","message":{"content":[{"type":"text","text":"prose"}]}}"#, false),
-            (#"{"type":"future_activity"}"#, false),
-            (#"{"type":"control_request","request_id":"unknown","request":{"subtype":"future_request"}}"#, false),
-            (#"{"type":"control_request","request_id":"permission","request":{"subtype":"can_use_tool","tool_name":"mcp__RepoPrompt__get_file_tree","input":{}}}"#, false),
-            (#"{"type":"result","result":"[ack]"}"#, false),
-            ("malformed provider line", false)
+    func testClaudeControllerCodecKeepsUndeclaredSilenceAndUnknownActivityOrdinary() async {
+        for wire in [
+            #"{"type":"system","subtype":"init"}"#,
+            #"{"type":"system","subtype":"task_started","task_id":"background"}"#,
+            #"{"type":"system","subtype":"task_notification"}"#,
+            #"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use"}}}"#,
+            #"{"type":"stream_event","event":{"type":"future_event"}}"#,
+            #"{"type":"assistant","message":{"content":[{"type":"text","text":"prose"}]}}"#,
+            #"{"type":"future_activity"}"#,
+            #"{"type":"control_request","request_id":"unknown","request":{"subtype":"future_request"}}"#,
+            #"{"type":"control_request","request_id":"permission","request":{"subtype":"can_use_tool","tool_name":"mcp__RepoPrompt__get_file_tree","input":{}}}"#,
+            #"{"type":"result","result":"[ack]"}"#,
+            "malformed provider line"
         ] {
             let (h, s, owner, runID) = fixture()
             let controller = ClaudeNativeProcessSessionController(
@@ -255,35 +265,35 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
             let completed = await runner.testConsumeQuietEvents(events, session: s, runID: runID, owner: owner)
             XCTAssertTrue(completed, "The real runner accepted its expected normal completion")
             _ = await commit(h, s, owner)
-            XCTAssertEqual(s.quietLedger.facts?.ordinaryThrough, quiet ? 0 : 1, wire)
+            XCTAssertEqual(s.quietLedger.facts?.ordinaryThrough, 1, wire)
         }
     }
 
-    func testClaudeControllerStreamingFinalizationPreservesExactMessageRange() async {
+    func testClaudeControllerStreamingFinalizationPreservesOrdinaryAuthoritativeReplacement() async {
         let start = #"{"type":"stream_event","event":{"type":"message_start","message":{"id":"one","type":"message","role":"assistant","content":[]}}}"#
         let blockStart = #"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#
         let blockStop = #"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#
         let stop = #"{"type":"stream_event","event":{"type":"message_stop"}}"#
         for text in ["[ack]", "prose"] {
             let delta = #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\#(text)"}}}"#
-            await assertClaudeControllerQuietCompletion([start, blockStart, delta, blockStop, stop], quiet: true, expectedTexts: ["[ack]"])
+            await assertClaudeControllerUndeclaredCompletion([start, blockStart, delta, blockStop, stop], expectedTexts: ["[ack]"])
         }
-        // A final authoritative result may replace streaming text in the same message, but
-        // must never erase a separate completed message from the quiet grammar's range.
+        // Final authoritative replacement follows the same ordinary bubble policy;
+        // there is no separate quiet-only message-boundary grammar.
         let prose = #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#
         let ack = #"{"type":"assistant","message":{"id":"two","content":[{"type":"text","text":"[ack]"}]}}"#
-        await assertClaudeControllerQuietCompletion([prose, stop, ack, stop], quiet: false, expectedTexts: ["prose", "[ack]"])
-        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: ["[ack]"])
-        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: [], finalText: nil)
+        await assertClaudeControllerUndeclaredCompletion([prose, stop, ack, stop], expectedTexts: ["prose", "[ack]"])
+        await assertClaudeControllerUndeclaredCompletion([], expectedTexts: ["[ack]"])
+        await assertClaudeControllerUndeclaredCompletion([], expectedTexts: [], finalText: nil)
     }
 
     func testClaudeControllerMalformedMessageStartCannotBorrowFinishedMessageQuietProof() async {
         for message in [#"{}"#, #"{"id":7}"#, #"{"id":""}"#] {
-            await assertClaudeControllerQuietCompletion([
+            await assertClaudeControllerUndeclaredCompletion([
                 #"{"type":"assistant","message":{"id":"one","content":[{"type":"text","text":"prose"}]}}"#,
                 #"{"type":"stream_event","event":{"type":"message_stop"}}"#,
                 #"{"type":"stream_event","event":{"type":"message_start","message":\#(message)}}"#
-            ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+            ], expectedTexts: ["[ack]"], expectsUncertainty: true)
         }
     }
 
@@ -292,23 +302,23 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
             for field in ["", #", "text":null"#, #", "text":42"#] {
                 // Interpolate raw JSON fields without coercing invalid values into Strings.
                 let block = #"{"type":"text"\#(field)}"#
-                await assertClaudeControllerQuietCompletion([
+                await assertClaudeControllerUndeclaredCompletion([
                     #"{"type":"\#(type)","message":{"id":"m","content":[\#(block)]}}"#
-                ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+                ], expectedTexts: ["[ack]"], expectsUncertainty: true)
             }
         }
     }
 
     func testClaudeControllerMalformedSuccessfulResultValuesRemainOrdinary() async {
         for value in [#"{"unexpected":"content"}"#, #"["content"]"#, "42", "null", "true"] {
-            await assertClaudeControllerQuietCompletion(
-                [], quiet: false, expectedTexts: [], finalResultValue: value, expectsUncertainty: true
+            await assertClaudeControllerUndeclaredCompletion(
+                [], expectedTexts: [], finalResultValue: value, expectsUncertainty: true
             )
         }
-        // Omitted output and well-formed empty output are legitimate silent completions.
-        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: [], finalText: nil)
-        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: [], finalText: "")
-        await assertClaudeControllerQuietCompletion([], quiet: true, expectedTexts: ["[ack]"])
+        // Omitted and well-formed empty output are ordinary undeclared completions, not uncertainty.
+        await assertClaudeControllerUndeclaredCompletion([], expectedTexts: [], finalText: nil)
+        await assertClaudeControllerUndeclaredCompletion([], expectedTexts: [], finalText: "")
+        await assertClaudeControllerUndeclaredCompletion([], expectedTexts: ["[ack]"])
     }
 
     func testClaudeControllerMalformedKnownDeltaPayloadsRemainOrdinary() async {
@@ -316,9 +326,9 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         for (type, field) in [("text_delta", "text"), ("thinking_delta", "thinking"), ("signature_delta", "signature")] {
             for value in [nil, "null", "42"] as [String?] {
                 let data = value.map { #", "\#(field)":\#($0)"# } ?? ""
-                await assertClaudeControllerQuietCompletion([
+                await assertClaudeControllerUndeclaredCompletion([
                     start, #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"\#(type)"\#(data)}}}"#
-                ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+                ], expectedTexts: ["[ack]"], expectsUncertainty: true)
             }
         }
     }
@@ -329,19 +339,19 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
             for value in [nil, "null", "42"] as [String?] {
                 let data = value.map { #", "\#(field)":\#($0)"# } ?? ""
                 let block = #"{"type":"\#(type)"\#(data)}"#
-                await assertClaudeControllerQuietCompletion([
+                await assertClaudeControllerUndeclaredCompletion([
                     start, #"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":\#(block)}}"#
-                ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+                ], expectedTexts: ["[ack]"], expectsUncertainty: true)
                 if type == "thinking" {
-                    await assertClaudeControllerQuietCompletion([
+                    await assertClaudeControllerUndeclaredCompletion([
                         #"{"type":"assistant","message":{"id":"m","content":[\#(block)]}}"#
-                    ], quiet: false, expectedTexts: ["[ack]"], expectsUncertainty: true)
+                    ], expectedTexts: ["[ack]"], expectsUncertainty: true)
                 }
             }
         }
     }
 
-    func testClaudeControllerWellFormedEmptyReasoningAndSameItemReplacementRemainQuiet() async {
+    func testClaudeControllerWellFormedEmptyReasoningAndSameItemReplacementStayUndeclaredOrdinaryWithoutUncertainty() async {
         for content in [
             #"[{"type":"text","text":""}]"#,
             "[]",
@@ -350,22 +360,22 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
             #"[{"type":"thinking","thinking":"reasoning"}]"#,
             #"[{"type":"thinking","thinking":""}]"#
         ] {
-            await assertClaudeControllerQuietCompletion([
+            await assertClaudeControllerUndeclaredCompletion([
                 #"{"type":"assistant","message":{"id":"m","content":\#(content)}}"#
-            ], quiet: true, expectedTexts: ["[ack]"])
+            ], expectedTexts: ["[ack]"])
         }
         let start = #"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m","content":[]}}}"#
         for (type, field) in [("text_delta", "text"), ("thinking_delta", "thinking"), ("signature_delta", "signature")] {
             for value in ["", "ordinary streamed prefix"] {
-                await assertClaudeControllerQuietCompletion([
+                await assertClaudeControllerUndeclaredCompletion([
                     start, #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"\#(type)","\#(field)":"\#(value)"}}}"#
-                ], quiet: true, expectedTexts: ["[ack]"])
+                ], expectedTexts: ["[ack]"])
             }
         }
         for (type, field) in [("text", "text"), ("thinking", "thinking")] {
-            await assertClaudeControllerQuietCompletion([
+            await assertClaudeControllerUndeclaredCompletion([
                 start, #"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"\#(type)","\#(field)":""}}}"#
-            ], quiet: true, expectedTexts: ["[ack]"])
+            ], expectedTexts: ["[ack]"])
         }
     }
 
@@ -490,9 +500,8 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         }
     }
 
-    private func assertClaudeControllerQuietCompletion(
+    private func assertClaudeControllerUndeclaredCompletion(
         _ wire: [String],
-        quiet: Bool,
         expectedTexts: [String],
         finalText: String? = "[ack]",
         finalResultValue: String? = nil,
@@ -566,9 +575,9 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
             rowAnchorIndex: projection.rowAnchorIndex, anchorBlockIndex: projection.anchorBlockIndex
         )
         let display = AgentTranscriptProjectionBuilder.maskForLocalDisplay(presentation, archivedBlocks: s.archivedTranscriptSnapshot.blocks, hiddenSourceIDs: s.quietLedger.hiddenSourceIDs)
-        XCTAssertEqual(s.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: quiet ? 0 : 1), "\(wire)", file: file, line: line)
-        XCTAssertEqual(display.presentation.visibleRows.map(\.text), quiet ? [] : expectedTexts, "\(wire)", file: file, line: line)
-        XCTAssertEqual(s.quietLedger.hiddenSourceIDs.isEmpty, !quiet, file: file, line: line)
+        XCTAssertEqual(s.quietLedger.facts, AgentRunQuietFacts(settledThrough: 1, ordinaryThrough: 1), "\(wire)", file: file, line: line)
+        XCTAssertEqual(display.presentation.visibleRows.map(\.text), expectedTexts, "\(wire)", file: file, line: line)
+        XCTAssertEqual(s.quietLedger.hiddenSourceIDs.isEmpty, true, file: file, line: line)
     }
 
     func testSemanticIngressBeforeSuppressionAndStaleCallbackCannotPoisonCurrentOwner() async {
@@ -679,5 +688,39 @@ extension AgentQuietCheckInLifecycleTests {
             }
         }
         XCTAssertFalse(AgentSessionLinkPrompts.supportsQuietCheckIn(.devin), "One shared predicate keeps future copy and classification disabled together")
+    }
+}
+
+extension AgentQuietCheckInLifecycleTests {
+    func testClaudeTranslatorAndNativeIngressPreserveUnknownOutputBeforeSuppression() async throws {
+        let cases: [(String, String)] = [
+            ("unknown-assistant-output", #"{"type":"assistant","message":{"id":"w0e-message","content":[{"type":"future_output","value":"opaque"}]}}"#),
+            ("unknown-stream-output", #"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"future_delta","value":"opaque"}}}"#),
+            ("malformed-text-output", #"{"type":"assistant","message":{"id":"w0e-message","content":[{"type":"text","text":17}]}}"#),
+            ("system-metadata", #"{"type":"system","subtype":"future_metadata","metadata":{"value":17}}"#)
+        ]
+        for (label, wire) in cases {
+            let (h, s, owner, runID) = fixture()
+            defer { s.saveDebounceTask?.cancel() }
+            var translator = ClaudeSDKNDJSONTranslator()
+            let normalized = translator.parseNDJSONLine(Data(wire.utf8))
+            XCTAssertEqual(normalized.map(\.type), ["event"], label)
+            XCTAssertNil(normalized.first?.text, "No new model-facing text: \(label)")
+            guard let decoded = try ClaudeCompatiblePluginProtocolCodec.decodeLine(Data(wire.utf8)),
+                  case let .streamPayload(payload) = decoded
+            else {
+                XCTFail("Expected the actual codec's stream payload: \(label)")
+                continue
+            }
+            var providerTranslator = ClaudeCompatiblePluginNDJSONTranslator()
+            let dtoResults = providerTranslator.parseStreamPayload(payload).map { ClaudeCompatibleProviderRuntimeBridge.streamResult(from: $0) }
+            XCTAssertEqual(dtoResults.map(\.type), normalized.map(\.type), "Both entry points preserve the same negative evidence: \(label)")
+            for result in normalized {
+                await h.host.test_handleStreamResult(result, session: s, runID: runID, runAttemptID: owner.attemptID)
+            }
+            XCTAssertNil(s.quietLedger.candidateStartKey(owner: owner), "The semantic owner sees negative evidence without the native raw guard: \(label)")
+            // Real native codec/controller emits negative evidence before the runner's VM hook.
+            await assertClaudeControllerUndeclaredCompletion([wire], expectedTexts: [], finalText: nil, expectsUncertainty: true)
+        }
     }
 }

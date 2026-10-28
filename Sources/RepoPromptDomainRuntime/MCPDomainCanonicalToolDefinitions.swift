@@ -1113,6 +1113,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
+        definitions.insert(AgentSelfNoopTool.definition, at: insertion)
         definitions.insert(agentSelfDefinition, at: insertion)
         if let linkIndex = definitions.firstIndex(where: { $0.name == MCPWindowToolName.agentSessionLink }) {
             definitions.insert(MCPDomainSessionAdminToolDefinition.definition, at: linkIndex + 1)

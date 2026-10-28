@@ -1,17 +1,37 @@
 import Foundation
+import RepoPromptDomainRuntime
+import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 /// Small source/lifecycle fixture shared by pure quiet tests and later native replay fixtures.
 @MainActor
 struct AgentQuietCheckInFixture {
     var ledger = AgentRunQuietLedger()
-    let owner = AgentRunOwnership(binding: AgentRunBindingIdentity(tabID: UUID(), persistentSessionID: UUID()))
+    let owner = AgentRunOwnership(binding: AgentRunBindingIdentity(tabID: UUID(), persistentSessionID: UUID(), persistentBindingGeneration: UUID()))
     let wakeID = UUID()
     let startKey = 10
 
     mutating func begin(provider: AgentSessionLinkPromptProviderContext = .codexExec, routine: Bool = true) {
         ledger.begin(owner: owner, startKey: startKey, provider: provider)
         if routine { ledger.markRoutineWake(owner: owner, wakeID: wakeID) }
+    }
+
+    /// Pure ledger tests explicitly enter/accept a body and provide its exact canonical
+    /// invocation. This is not a replacement classifier or automatic silence eligibility.
+    mutating func declarationRows(owner target: AgentRunOwnership? = nil, startKey: Int? = nil) throws -> [AgentChatItem] {
+        let target = target ?? owner
+        let endpoint = try DomainAgentSessionLinkEndpointIdentity(windowID: 1, workspaceID: UUID(), tabID: target.binding.tabID, sessionID: XCTUnwrap(target.binding.persistentSessionID), persistentBindingGeneration: XCTUnwrap(target.binding.persistentBindingGeneration), bindingTransitionGeneration: target.binding.bindingTransitionGeneration)
+        let invocation = UUID(), runID = UUID()
+        let eligible = ledger.candidateStartKey(owner: target) != nil
+        XCTAssertTrue(ledger.enterDeclarationBody(owner: target, hostInvocationID: invocation))
+        XCTAssertEqual(ledger.acceptDeclarationBody(owner: target, hostInvocationID: invocation, wakeID: ledger.routineWakeID(owner: target) ?? wakeID, origin: .init(endpoint: endpoint, runID: runID, runAttemptID: target.attemptID), currentEndpoint: endpoint, currentRunID: runID), eligible)
+        let start = startKey ?? self.startKey
+        return [.toolCall(name: "self_noop", invocationID: invocation, argsJSON: "{}", sequenceIndex: start), .toolResult(name: "self_noop", invocationID: invocation, resultJSON: "{\"result\":\"done\"}", isError: false, sequenceIndex: start + 1)]
+    }
+
+    mutating func sealDeclaration() throws -> AgentRunQuietLedger.Seal? {
+        let rows = try declarationRows()
+        return seal(rows)
     }
 
     func rows(_ texts: [String], kind: AgentChatItemKind = .assistant) -> [AgentChatItem] {

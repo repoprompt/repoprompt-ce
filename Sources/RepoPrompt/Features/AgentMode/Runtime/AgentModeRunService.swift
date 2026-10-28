@@ -67,6 +67,13 @@ final class AgentModeRunService {
     #if DEBUG
         var testBeforeCancellationCommit: (@MainActor (AgentTabSession) async -> Void)?
 
+        func test_consumeClaudeTerminalEvents(
+            _ events: AsyncStream<NativeAgentRuntimeEvent>, session: AgentTabSession,
+            runID: UUID, owner: AgentRunOwnership
+        ) async -> AgentRunTerminalCommitRevision? {
+            await claudeRunner.testConsumeAndFinalizeQuietEvents(events, session: session, runID: runID, owner: owner)
+        }
+
         func test_publishNaturalCompletion(_ session: AgentTabSession, supportsFollowUp: Bool = false) async {
             guard let ownership = session.activeRunOwnership else { return }
             _ = await terminalCommitBarrier.commit(.init(

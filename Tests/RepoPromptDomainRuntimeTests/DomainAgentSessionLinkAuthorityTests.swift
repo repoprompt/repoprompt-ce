@@ -3113,3 +3113,53 @@ private extension Result
         return error
     }
 }
+
+extension DomainAgentSessionLinkAuthorityTests {
+    func testW0dAtomicPrivateEnvelopeSeedsJoinsAndRejectsStaleWithoutChangingPublicCursor() async throws {
+        let authority = makeAuthority()
+        let target = makeEndpoint(windowID: 2)
+        let first = makeEndpoint()
+        let second = makeEndpoint(windowID: 3)
+        let initial = try XCTUnwrap(AgentRunQuietFacts(settledThrough: 8, ordinaryThrough: 8))
+        guard case let .reserved(reservation, _) = await authority.reserveLink(observer: first, target: target) else { return XCTFail("reservation") }
+        guard case .activated = await authority.activateLink(reservation: reservation, initialSnapshot: makeSnapshot(sessionID: target.sessionID), sourcePublicationSequence: 10, runFacts: initial) else { return XCTFail("activation") }
+        let seededValue = await authority.observationSnapshot(forTargetEndpoint: target)
+        let seeded = try XCTUnwrap(seededValue)
+        XCTAssertEqual(seeded.runFacts, initial)
+        XCTAssertEqual(seeded.endpoint, target)
+        XCTAssertEqual(seeded.sourcePublicationSequence, 10)
+        XCTAssertEqual(seeded.snapshot.idleSince, Date(timeIntervalSince1970: 1000), "authority canonicalization and producer facts are one pair")
+        let before = try await pollState(authority, observer: first, target: target)
+        guard case let .reserved(joining, _) = await authority.reserveLink(observer: second, target: target) else { return XCTFail("join reservation") }
+        guard case .activated = await authority.activateLink(reservation: joining, initialSnapshot: makeSnapshot(sessionID: target.sessionID, status: .running), sourcePublicationSequence: 999, runFacts: nil) else { return XCTFail("join activation") }
+        let joined = await authority.observationSnapshot(forTargetEndpoint: target)
+        XCTAssertEqual(joined?.sourcePublicationSequence, 10)
+        XCTAssertEqual(joined?.snapshot, seeded.snapshot)
+        XCTAssertEqual(joined?.runFacts, initial, "a joining grant cannot overwrite the installing producer")
+        let unknown = await authority.publishTargetSnapshot(endpoint: target, snapshot: makeSnapshot(sessionID: target.sessionID), sourcePublicationSequence: 11, runFacts: nil)
+        guard case .unchanged = unknown else { return XCTFail("private nil must not create a public change") }
+        let cleared = await authority.observationSnapshot(forTargetEndpoint: target)
+        XCTAssertEqual(cleared?.sourcePublicationSequence, 11)
+        XCTAssertNil(cleared?.runFacts)
+        let stale = await authority.publishTargetSnapshot(endpoint: target, snapshot: makeSnapshot(sessionID: target.sessionID, status: .running), sourcePublicationSequence: 10, runFacts: initial)
+        guard case .stale = stale else { return XCTFail("stale pair accepted") }
+        let after = try await pollState(authority, observer: first, target: target)
+        XCTAssertEqual(after.changeSequence, before.changeSequence)
+        let stillCleared = await authority.observationSnapshot(forTargetEndpoint: target)
+        XCTAssertEqual(stillCleared?.sourcePublicationSequence, 11)
+        XCTAssertNil(stillCleared?.runFacts)
+        let foreign = makeEndpoint(windowID: 2, sessionID: target.sessionID)
+        let rejected = await authority.observationSnapshot(forTargetEndpoint: foreign)
+        XCTAssertNil(rejected, "no partial envelope for an obsolete endpoint")
+        let running = await authority.publishTargetSnapshot(endpoint: target, snapshot: makeSnapshot(sessionID: target.sessionID, status: .running), sourcePublicationSequence: 12, runFacts: initial)
+        guard case .accepted = running else { return XCTFail("opening") }
+        let opening = await authority.observationSnapshot(forTargetEndpoint: target)
+        XCTAssertEqual(opening?.snapshot.status, .running)
+        XCTAssertEqual(opening?.runFacts, initial)
+        let quiet = try XCTUnwrap(AgentRunQuietFacts(settledThrough: 9, ordinaryThrough: 8))
+        _ = await authority.publishTargetSnapshot(endpoint: target, snapshot: makeSnapshot(sessionID: target.sessionID), sourcePublicationSequence: 13, runFacts: quiet)
+        let closing = await authority.observationSnapshot(forTargetEndpoint: target)
+        XCTAssertEqual(closing?.snapshot.status, .idle)
+        XCTAssertEqual(closing?.runFacts, quiet)
+    }
+}

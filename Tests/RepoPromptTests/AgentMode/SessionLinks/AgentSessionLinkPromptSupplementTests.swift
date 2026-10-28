@@ -4584,6 +4584,43 @@ final class AgentSessionLinkPromptViewModelTests: XCTestCase {
 }
 
 extension AgentSessionLinkPromptClaimStoreTests {
+    func testAcquiredOrdinaryWakeReleasesThePendingReservationWithoutRerendering() async throws {
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let live = inventory(revision: 1, targetCount: 1)
+        let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: .codexExec)
+        let claim = try XCTUnwrap(store.claim(dispatchID: .autoWake(wakeID: UUID()), epoch: epoch, inventory: live, passiveNotices: batch, render: render))
+        let proof = await AgentSessionLinkProviderInputRelease.prove(claim) { _ in false }
+        var renders = 0
+        let released = AgentSessionLinkProviderInputRelease.handoff(
+            original: claim, proof: proof,
+            current: { renders += 1
+                return .requiredLaneBatchUnavailable
+            },
+            isPending: { store.isPending($0) }, consume: { _ in false }
+        )
+        XCTAssertEqual(renders, 0, "Acquisition already validated this immutable ordinary batch")
+        XCTAssertEqual(released.claim, claim)
+        XCTAssertFalse(released.mustAbortDispatch)
+    }
+
+    func testLateQuietUpgradeKeepsReservationWhenOptionalRenderOmitsPassiveBatch() throws {
+        let store = AgentSessionLinkOutboundPromptClaimStore()
+        let live = inventory(revision: 1, targetCount: 1)
+        let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
+        let epoch = AgentSessionLinkPromptEpoch(endpoint: endpoint, allowsSupplement: true, providerContext: .codexExec)
+        let dispatch = AgentSessionLinkPromptDispatchID.autoWake(wakeID: UUID())
+        let ordinary = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, render: render))
+        let outcome = store.claimOutcome(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true) { request in
+            // The optional rendering may exhaust its passive budget. It cannot destroy the
+            // valid ordinary reservation for this same fingerprint.
+            AgentSessionLinkPromptRenderResult(fragment: self.render(request).fragment)
+        }
+        XCTAssertEqual(outcome.claim, ordinary)
+        XCTAssertFalse(outcome.mustAbortDispatch)
+        XCTAssertTrue(store.isPending(ordinary))
+    }
+
     func testRoutineBooleanIsDefaultFalseAndPartOfRenderClaimCopyAndReuseIdentity() throws {
         let live = inventory(revision: 1, targetCount: 1)
         let batch = passiveSnapshot(linkSetRevision: 1, targetIDs: [grantedTargetID(0)])
@@ -4601,8 +4638,8 @@ extension AgentSessionLinkPromptClaimStoreTests {
             let routine = try XCTUnwrap(store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render))
             let supports = provider == .codexExec || provider == .claudeCode
             XCTAssertEqual(routine.routineQuietCheckIn, supports)
-            XCTAssertEqual(routine.fragment.contains("Nothing needed? Reply [ack]."), provider == .claudeCode)
-            if provider != .claudeCode { XCTAssertEqual(routine.fragment, ordinary.fragment) }
+            XCTAssertEqual(routine.fragment.contains("Nothing needed? Call self_noop."), supports)
+            if !supports { XCTAssertEqual(routine.fragment, ordinary.fragment) }
             XCTAssertEqual(renderedBits, supports ? [false, true] : [false])
             XCTAssertEqual(Set([ordinary, routine]).count, supports ? 2 : 1)
             let retry = store.claim(dispatchID: dispatch, epoch: epoch, inventory: live, passiveNotices: batch, routineQuietCheckIn: true, render: render)
@@ -4648,7 +4685,7 @@ extension AgentSessionLinkPromptClaimStoreTests {
 
 extension AgentSessionLinkPromptClaimStoreTests {
     func testQuietCopyWholeEnvelopesAcrossProvidersBasesGuidanceAndBudgetFreezeRenderedReceipts() throws {
-        let literal = "Nothing needed? Reply [ack]."
+        let literal = "Nothing needed? Call self_noop."
         let modes = ["routine", "overflow", "attention", "manual", "periodic", "natural", "task", "piggyback", "waiting"]
         for provider in AgentSessionLinkPromptProviderContext.allCases {
             for reminder in [false, true] {
@@ -4736,7 +4773,7 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         }
                         let before = try makeClaim(offersQuiet: false)
                         let after = try makeClaim(offersQuiet: basis == "routine" || basis == "overflow" || basis == "attention")
-                        let qualifies = provider == .claudeCode && (basis == "routine" || basis == "overflow")
+                        let qualifies = AgentSessionLinkPrompts.supportsQuietCheckIn(provider) && (basis == "routine" || basis == "overflow")
                         XCTAssertEqual(
                             after.fragment.components(separatedBy: literal).count - 1,
                             qualifies ? 1 : 0,
@@ -4768,6 +4805,12 @@ extension AgentSessionLinkPromptClaimStoreTests {
                         ]
                         let data = try JSONSerialization.data(withJSONObject: measurement, options: [.sortedKeys])
                         print("QUIET_C4_ENVELOPE " + data.base64EncodedString())
+                        if qualifies, !reminder, !nearCap, basis == "routine" {
+                            let range = try XCTUnwrap(after.fragment.range(of: literal))
+                            let hint = String(after.fragment[range])
+                            print("W2_TRIAL_HINT " + Data(literal.utf8).base64EncodedString())
+                            print("W2_ACTUAL_HINT " + Data(hint.utf8).base64EncodedString())
+                        }
                     }
                 }
             }

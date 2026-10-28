@@ -850,6 +850,7 @@ allowed_tracked_docs=(
   "docs/migrations/build-modularization-2026-09-28.md"
   "docs/migrations/build-modularization/completion-plan.md"
   "docs/migrations/build-modularization/ledger.md"
+  "docs/migrations/build-modularization/m6-workspace-move-manifest.tsv"
   "docs/migrations/build-modularization/ratchets.json"
   "docs/migrations/build-modularization/build-ratchets.json"
   "docs/open-source-readiness.md"

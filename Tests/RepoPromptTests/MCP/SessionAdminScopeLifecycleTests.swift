@@ -8103,6 +8103,102 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         }
     }
 
+    /// W0(b): actual saved hydration and scheduled idle dispatch, with no pre-dispatch refresh.
+    func testQuietW0OrdinaryBaselineCurrencyAtActiveInactiveAndPreparedDispatch() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            for placement in ["active", "inactive", "prepared"] {
+                let selectedID = UUID(), targetID = placement == "active" ? selectedID : UUID()
+                let factory: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
+                    let vm = AgentModeViewModel(
+                        testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                        codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+                        headlessProviderFactory: { _, _ in XCTFail("Dispatch must stop before a provider")
+                            return AgentSessionLinkCapturingHeadlessProvider()
+                        },
+                        mcpServerEnabler: { false }, testMCPServer: server,
+                        testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    )
+                    vm.promptManager = prompt
+                    vm.workspaceManager = manager
+                    return vm
+                }
+                let fixture = try await LoadedWindowFixture.make(activeID: selectedID, parentID: nil, agentFactory: factory)
+                addTeardownBlock { @MainActor in await fixture.cleanup() }
+                var carriers = try XCTUnwrap(fixture.carriers)
+                let selectedTab = try XCTUnwrap(carriers.composeTabs.first)
+                let targetTab: ComposeTabState
+                if placement == "inactive" {
+                    targetTab = ComposeTabState(name: "Inactive W0", activeAgentSessionID: targetID)
+                    carriers.composeTabs.append(targetTab)
+                    fixture.carriers = carriers
+                } else { targetTab = selectedTab }
+                fixture.indexEntries[targetID] = AgentSessionIndexEntry(
+                    id: targetID, tabID: targetTab.id, name: "Quiet W0", savedAt: .distantPast,
+                    itemCount: 2, autoEditEnabled: false, hasUnknownConversationContent: false,
+                    isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+                )
+                try fixture.installCarriers()
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let rows = [
+                    AgentChatItem(id: UUID(), timestamp: Date(timeIntervalSince1970: 1), kind: .user, text: "Ordinary request", sequenceIndex: 0),
+                    AgentChatItem(id: UUID(), timestamp: Date(timeIntervalSince1970: 2), kind: .assistant, text: "Ordinary completion", sequenceIndex: 1)
+                ]
+                let url = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                    id: targetID, workspaceID: workspace.id, composeTabID: targetTab.id, name: "Quiet W0",
+                    transcript: AgentTranscriptIO.buildTranscript(from: rows, terminalState: .idle),
+                    agentKind: "openCode", lastRunState: "idle"
+                ), for: workspace)
+                addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+                let owner: WindowState
+                if placement == "prepared" {
+                    let resolution = await WindowStatesManager.shared.resolveSavedOversightLocation(targetID)
+                    guard case let .success(location) = resolution else { return XCTFail("Saved location unavailable: \(resolution)") }
+                    owner = WindowState.makePreparedSessionOwner(workspace: location.runtimeWorkspace, borrowing: fixture.window, agentModeViewModelFactory: factory)
+                    XCTAssertTrue(owner.isPreparedSessionOwner)
+                    XCTAssertTrue(owner.workspaceManager.isSessionRuntimeProjection)
+                    let ready = await owner.agentModeViewModel.prepareSavedOversightSession(
+                        tabID: targetTab.id, sessionID: targetID, workspaceID: workspace.id, isStillAuthorized: { true }
+                    )
+                    XCTAssertTrue(ready)
+                    addTeardownBlock { @MainActor in _ = await owner.tearDownPreparedSessionOwner() }
+                } else {
+                    owner = fixture.window
+                    _ = await owner.agentModeViewModel.ensureSessionReady(tabID: targetTab.id)
+                }
+                let vm = owner.agentModeViewModel
+                let session = try XCTUnwrap(vm.session(for: targetTab.id, createIfNeeded: false))
+                XCTAssertEqual(session.activeAgentSessionID, targetID)
+                if placement == "inactive" { XCTAssertNotEqual(vm.currentTabID, targetTab.id) }
+                session.oversight.autoWakeOnUpdates = true
+                let laterOrdinary = AgentChatItem(id: UUID(), timestamp: Date(timeIntervalSince1970: 3), kind: .assistant, text: "Later ordinary completion", sequenceIndex: 2)
+                session.appendItem(laterOrdinary)
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: targetTab.id)
+                let observed = expectation(description: "\(placement) actual routine idle boundary")
+                var currentAtDispatch = false
+                vm.test_beforeRoutineIdleFollowUpStart = { candidate, _ in
+                    XCTAssertTrue(candidate === session)
+                    let protection = vm.transcriptProjectionProtection(for: candidate)
+                    currentAtDispatch = vm.canReuseDerivedTranscriptForSave(for: candidate, projectionProtection: protection)
+                    XCTAssertEqual(candidate.transcript.turns.last?.conclusionActivityID, laterOrdinary.id)
+                    XCTAssertEqual(candidate.transcript.turns.last?.completedAt, laterOrdinary.timestamp)
+                    observed.fulfill()
+                    return false
+                }
+                defer { vm.test_beforeRoutineIdleFollowUpStart = nil }
+                vm.agentSessionLinkPublishPromptInventory(
+                    AgentSessionLinkAutoWakeTests.inventory(observerSessionID: targetID, revision: 1), to: endpoint
+                )
+                vm.agentSessionLinkPublishPassiveStatusNotices(
+                    AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: endpoint), to: endpoint
+                )
+                await fulfillment(of: [observed], timeout: 5)
+                XCTAssertTrue(currentAtDispatch, "\(placement): cannot silently manufacture baseline currency")
+                XCTAssertNil(session.activeRunOwnership, "The observer hook cannot start a fake provider run")
+                XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, selectedTab.id)
+            }
+        }
+    }
+
     func testHistoricalAndStashedMetadataResolutionDoesNotChangeVisibleBindingOrHydrate() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let current = UUID(), historical = UUID(), stashed = UUID()

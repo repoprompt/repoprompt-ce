@@ -7,6 +7,20 @@
 
     @MainActor
     final class AgentRetentionCompactionTests: XCTestCase {
+        func testMixedActivitySummaryKeepsTheLastActualUserInteractionDate() throws {
+            let start = Date(timeIntervalSince1970: 1000)
+            let request = AgentChatItem(timestamp: start, kind: .user, text: "Request", sequenceIndex: 0)
+            let answer = AgentChatItem(timestamp: start.addingTimeInterval(1), kind: .toolResult, text: "answer", toolName: "ask_user", toolResultJSON: #"{"response":"answer"}"#, sequenceIndex: 1)
+            let otherResult = AgentChatItem(timestamp: start.addingTimeInterval(2), kind: .toolResult, text: "file", toolName: "read_file", toolResultJSON: #"{"response":"not a user answer"}"#, sequenceIndex: 2)
+            let assistant = AgentChatItem(timestamp: start.addingTimeInterval(3), kind: .assistant, text: "Conclusion", sequenceIndex: 3)
+
+            var transcript = AgentTranscriptIO.buildTranscript(from: [request, answer, otherResult, assistant], terminalState: .completed)
+            transcript.turns[0].retentionTier = .condensed
+            let retained = AgentTranscriptCompactor.compact(transcript)
+
+            XCTAssertEqual(try XCTUnwrap(retained.turns.first?.summary).lastUserInteractionAt, answer.timestamp)
+        }
+
         func testFullReconciliationPreservesPayloadsAndMeasuresRetentionScan() {
             // Keep the larger timing workloads opt-in without changing the correctness oracle.
             let resultCounts = ProcessInfo.processInfo.environment["RPCE_RUN_SCALE_TESTS"] == "1"

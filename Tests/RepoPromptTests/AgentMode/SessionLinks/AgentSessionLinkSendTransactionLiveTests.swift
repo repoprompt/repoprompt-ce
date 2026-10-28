@@ -535,7 +535,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             XCTAssertFalse(f.events.contains(.providerControllerCreated))
             if afterSeal {
                 XCTAssertEqual(f.session.quietLedger.facts, before)
-                XCTAssertEqual(before?.ordinaryThrough, 0)
+                XCTAssertEqual(before?.ordinaryThrough, 1, "A routine origin without an accepted declaration seals ordinary")
             } else {
                 XCTAssertNil(f.session.quietLedger.candidateStartKey(owner: owner))
                 f.session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)

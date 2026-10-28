@@ -103,7 +103,9 @@ final class DelegationScopeRuntime: ObservableObject {
         case terminating
     }
 
-    @Published private(set) var availability: Availability
+    @Published private(set) var availability: Availability {
+        willSet { if (availability == .terminating) != (newValue == .terminating) { ServerNetworkManager.catalogAdvertisementDidChange() } }
+    }
 
     var canUseAuthority: Bool {
         availability != .terminating // Continuity availability is never a veto on a real live decision.
@@ -157,7 +159,10 @@ final class DelegationScopeRuntime: ObservableObject {
     private(set) lazy var authorization = OverseerAuthorizationEngine(scopes: self)
 
     /// Bumped on every authority change so presentation can refresh.
-    @Published private(set) var revision: UInt64 = 0
+    @Published private(set) var revision: UInt64 = 0 {
+        willSet { if revision != newValue { ServerNetworkManager.catalogAdvertisementDidChange() } }
+    }
+
     /// Separate continuity result. Grants save asynchronously; terminal decisions attempt a
     /// synchronous transaction before returning, without undoing the live denial on failure.
     @Published private(set) var lastPersistenceOutcome: DelegationScopeWriteOutcome?
@@ -523,6 +528,13 @@ final class DelegationScopeRuntime: ObservableObject {
     func hasLiveScopeForCatalog(grantedTo sessionID: UUID) -> Bool {
         guard canUseAuthority else { return false }
         return authority.hasLiveScope(grantedTo: sessionID, now: now())
+    }
+
+    /// Sampled only while returning a real catalog, from this grantee's existing index.
+    /// No timer, mutation, unrelated-scope scan, or per-send enumeration is needed.
+    func catalogOfferExpiresAt(grantedTo sessionID: UUID) -> Date? {
+        guard canUseAuthority else { return nil }
+        return authority.liveScopes(grantedTo: sessionID, now: now()).compactMap(\.grant.guardrails.expiresAt).min()
     }
 
     func hasLiveScope(grantedTo sessionID: UUID) -> Bool {

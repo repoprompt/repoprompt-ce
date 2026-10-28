@@ -464,6 +464,24 @@ The frozen branch touched these areas (`git diff --stat` [M]): MCP CLI 15 files,
 | `make dev-smoke` | MCP, agent, or packaging slices | — | MCP, agent, or packaging slices | ✓ |
 | Release build plus Repo Bench | Hot paths (C, D) | — | Hot paths (C, D) | ✓ (X9) |
 
+### Current benchmark availability (2026-10-29)
+
+The Settings-visible Repo Bench implementation was removed by
+`f861d16bb3a14305d1329e079ed393b317fc0508` ("Remove obsolete model benchmark
+and syntax highlighting"). The generic Repo Bench rows above are historical,
+not a requirement to recreate that removed feature during C3/D4. Report the old
+entry point as **not available**, never as a passing run or as an unrelated
+worktree-startup benchmark.
+
+For C3, retain Release build/peak-memory comparisons and the existing bounded
+workload contracts: graph-index publication proportional to batch size and catalog
+bulk-add scaling from 10,000 to 20,000 files. Record their exact heads, workloads,
+counts, configuration and actual results. These checks do not by themselves prove
+Release runtime or launch-time regression is below 10%; distinguish unavailable
+measurements and incomparable samples from demonstrated improvements. Do not
+weaken a numerical threshold or create a new benchmark framework to close this
+historical documentation gap.
+
 ### 4.4 Byte-identical move audit (T0)
 
 `Scripts/modularization_move_audit.py --base origin/main [--head HEAD] [--json out.json]`. Its tests run in `make conductor-selftest`. The script exits 1 on any violation.

@@ -22,6 +22,8 @@ struct AgentSelfMCPToolService {
     let requireTargetWindow: () throws -> WindowState
     let resolveObserverEndpoint: ObserverEndpointResolver
     let captureCallOrigin: () -> AgentSelfMCPCallOrigin?
+    let enterNoop: (WindowState, AgentSelfMCPCallOrigin, UUID, Bool) -> Void
+    let acceptNoop: (WindowState, AgentSelfMCPCallOrigin, Endpoint?, UUID) -> Void
     let readSelf: (WindowState, Endpoint, AgentSelfMCPCallOrigin) -> AgentSelfContextSnapshot?
     let scheduleCompact: (WindowState, Endpoint, AgentSelfMCPCallOrigin, String, String) async -> Admission
     var isToolEnabled: () -> Bool = { ToolAvailabilityStore.shared.isEnabled(MCPWindowToolName.agentSelf) }
@@ -29,6 +31,26 @@ struct AgentSelfMCPToolService {
     static let unavailableError = MCPError.invalidParams(
         "self_compact is available only to the calling Agent Mode session with a resolved live binding; no target selector grants access."
     )
+
+    /// Ordinary host policy has already admitted this Agent Mode caller. This result acknowledges
+    /// every body call, including stale/ineligible/duplicate declarations; only the ledger decides
+    /// quietness. Schema, disabled-tool and transport failures remain in the normal host envelope.
+    func executeNoop(args: [String: Value]) async throws -> Value {
+        let origin = captureCallOrigin()
+        let context = MCPInvocationContextBridge.current
+        let window = try requireTargetWindow()
+        if let origin, let context {
+            enterNoop(window, origin, context.invocationID, args.isEmpty)
+        }
+        let metadata = await captureRequestMetadata()
+        let endpoint = await AgentSessionTargetOperationGuard.resolveObserverEndpoint(
+            metadata: metadata, targetWindow: window, resolveObserverEndpoint: resolveObserverEndpoint
+        )
+        if let origin, let context {
+            acceptNoop(window, origin, window.isClosing ? nil : endpoint, context.invocationID)
+        }
+        return AgentSelfNoopTool.acknowledgement
+    }
 
     func execute(args: [String: Value]) async throws -> Value {
         guard isToolEnabled() else { throw MCPError.invalidParams("self_compact is disabled.") }
