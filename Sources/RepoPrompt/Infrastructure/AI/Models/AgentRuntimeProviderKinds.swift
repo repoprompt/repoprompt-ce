@@ -1,13 +1,13 @@
 import Foundation
 import RepoPromptAIContracts
 
-enum ClaudeCodeRuntimeVariant: String {
+package enum ClaudeCodeRuntimeVariant: String {
     case standard
     case glm
     case kimi
     case customCompatible
 
-    var agentKind: AgentProviderKind {
+    package var agentKind: AgentProviderKind {
         switch self {
         case .standard:
             .claudeCode
@@ -22,7 +22,7 @@ enum ClaudeCodeRuntimeVariant: String {
 }
 
 /// Supported autonomous agent providers shared by Agent Mode and Context Builder runtimes.
-enum AgentProviderKind: String, CaseIterable, Hashable {
+package enum AgentProviderKind: String, CaseIterable, Hashable {
     case claudeCode
     case codexExec
     case openCode
@@ -34,14 +34,14 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case kimiCode
     case customClaudeCompatible
 
-    static let claudeMCPClientID = "claude-code"
-    static let codexMCPClientID = "codex-mcp-client"
-    static let openCodeMCPClientID = "opencode"
+    package static let claudeMCPClientID = "claude-code"
+    package static let codexMCPClientID = "codex-mcp-client"
+    package static let openCodeMCPClientID = "opencode"
     /// Cursor's ACP MCP child reports this exact initialize name; pending discovery contexts use exact keys.
-    static let cursorMCPClientID = "Cursor"
+    package static let cursorMCPClientID = "Cursor"
     /// Devin's built-in Rust MCP client reports this exact initialize name.
-    static let devinMCPClientID = "rmcp"
-    var commandName: String {
+    package static let devinMCPClientID = "rmcp"
+    package var commandName: String {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             "claude"
@@ -60,7 +60,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         }
     }
 
-    var acpProviderID: ACPProviderID? {
+    package var acpProviderID: ACPProviderID? {
         switch self {
         case .openCode:
             .openCode
@@ -77,7 +77,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         }
     }
 
-    var usesClaudeNativeRuntime: Bool {
+    package var usesClaudeNativeRuntime: Bool {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
@@ -86,18 +86,18 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         }
     }
 
-    var usesClaudeTooling: Bool {
+    package var usesClaudeTooling: Bool {
         usesClaudeNativeRuntime
     }
 
-    var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
+    package var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
         case .claudeCode, .codexExec, .openCode, .cursor, .grokBuild, .antigravity, .devin, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
 
-    var requiresPrePromptAgentModeMCPRouting: Bool {
+    package var requiresPrePromptAgentModeMCPRouting: Bool {
         switch self {
         case .cursor, .grokBuild, .antigravity:
             false
@@ -107,7 +107,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     }
 
     /// Stable runtime kind identifier for MCP discovery (list_agents).
-    var runtimeKind: String {
+    package var runtimeKind: String {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             "claude_native"
@@ -126,7 +126,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         }
     }
 
-    var claudeRuntimeVariant: ClaudeCodeRuntimeVariant? {
+    package var claudeRuntimeVariant: ClaudeCodeRuntimeVariant? {
         switch self {
         case .claudeCode:
             .standard

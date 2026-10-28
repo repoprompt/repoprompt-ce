@@ -1,31 +1,31 @@
 import Foundation
 import RepoPromptAIContracts
 
-struct ACPDynamicModelRecord: Codable, Hashable {
-    let rawValue: String
-    let displayName: String
-    let description: String?
-    let isPlaceholderDefault: Bool
-    let isProviderDefault: Bool
-    let supportedReasoningEfforts: [String]
-    let defaultReasoningEffort: String?
+package struct ACPDynamicModelRecord: Codable, Hashable {
+    package let rawValue: String
+    package let displayName: String
+    package let description: String?
+    package let isPlaceholderDefault: Bool
+    package let isProviderDefault: Bool
+    package let supportedReasoningEfforts: [String]
+    package let defaultReasoningEffort: String?
     /// Variant provenance for synthesized effort options. Optional so records persisted
     /// before effort support decode unchanged.
-    var effortVariant: AgentModelEffortVariant? = nil
-    var contextWindowTokens: Int? = nil
+    package var effortVariant: AgentModelEffortVariant? = nil
+    package var contextWindowTokens: Int? = nil
 }
 
-struct ACPDynamicProviderRecord: Codable, Hashable {
-    let providerID: String
-    let currentModelRaw: String?
+package struct ACPDynamicProviderRecord: Codable, Hashable {
+    package let providerID: String
+    package let currentModelRaw: String?
     /// Active reasoning effort for providers with direct effort authority (e.g. Grok).
     /// Optional so records persisted before effort support decode unchanged.
-    var currentEffortRaw: String? = nil
-    let options: [ACPDynamicModelRecord]
+    package var currentEffortRaw: String? = nil
+    package let options: [ACPDynamicModelRecord]
     /// Optional for backward-compatible decode of model-only registry records.
-    var modelParameterSets: [ACPModelParameterSet]? = nil
+    package var modelParameterSets: [ACPModelParameterSet]? = nil
 
-    init(
+    package init(
         providerID: String,
         currentModelRaw: String?,
         currentEffortRaw: String? = nil,
@@ -40,8 +40,8 @@ struct ACPDynamicProviderRecord: Codable, Hashable {
     }
 }
 
-enum ACPDynamicModelCanonicalization {
-    static func canonicalProviderRecord(
+package enum ACPDynamicModelCanonicalization {
+    package static func canonicalProviderRecord(
         from snapshot: ACPDiscoveredSessionModels,
         providerID: ACPProviderID
     ) -> ACPDynamicProviderRecord? {
@@ -57,7 +57,7 @@ enum ACPDynamicModelCanonicalization {
         )
     }
 
-    static func snapshot(from record: ACPDynamicProviderRecord) -> ACPDiscoveredSessionModels? {
+    package static func snapshot(from record: ACPDynamicProviderRecord) -> ACPDiscoveredSessionModels? {
         let options = record.options.compactMap(modelOption(from:))
         guard !options.isEmpty else { return nil }
         let currentModelRaw = normalizedCurrentModelRaw(record.currentModelRaw, options: record.options)

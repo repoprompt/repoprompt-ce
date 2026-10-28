@@ -1,21 +1,21 @@
 import Foundation
 import RepoPromptAIContracts
 
-struct ACPDiscoveredSessionModels: Equatable {
-    let options: [AgentModelOption]
-    let currentModelRaw: String?
+package struct ACPDiscoveredSessionModels: Equatable {
+    package let options: [AgentModelOption]
+    package let currentModelRaw: String?
     /// The session's active reasoning effort (e.g. Grok's `_meta.reasoningEffort`), when the
     /// provider advertises one. Lets the controller skip redundant effort mutations.
-    var currentEffortRaw: String?
+    package var currentEffortRaw: String?
     /// Ephemeral provenance copied from the controller's existing inbound sequence for an
     /// applicable direct effort report (including an unresolvable report). Bootstrap/warmed
     /// effort has no report provenance and cannot confirm a subsequent mutation.
-    var currentEffortInboundSequence: UInt64?
-    var modelParameterSets: [ACPModelParameterSet]
+    package var currentEffortInboundSequence: UInt64?
+    package var modelParameterSets: [ACPModelParameterSet]
     /// False only for persisted model-only records written before parameter discovery.
-    var hasModelParameterMetadata: Bool
+    package var hasModelParameterMetadata: Bool
 
-    init(
+    package init(
         options: [AgentModelOption],
         currentModelRaw: String?,
         currentEffortRaw: String? = nil,
@@ -29,7 +29,7 @@ struct ACPDiscoveredSessionModels: Equatable {
         self.hasModelParameterMetadata = hasModelParameterMetadata
     }
 
-    var preferredModelRaw: String? {
+    package var preferredModelRaw: String? {
         if let current = option(matching: currentModelRaw) {
             // A confirmed non-default active effort resolves to its provenanced variant
             // (`grok-4.6` at low → `grok-4.6-low`); a default effort stays the bare base
@@ -51,14 +51,14 @@ struct ACPDiscoveredSessionModels: Equatable {
             ?? options.first?.rawValue
     }
 
-    func option(matching raw: String?) -> AgentModelOption? {
+    package func option(matching raw: String?) -> AgentModelOption? {
         guard let normalized = Self.normalizedRawModel(raw) else { return nil }
         return options.first {
             Self.normalizedRawModel($0.rawValue) == normalized
         }
     }
 
-    func contains(rawModel: String?) -> Bool {
+    package func contains(rawModel: String?) -> Bool {
         option(matching: rawModel) != nil
     }
 

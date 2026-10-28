@@ -1,6 +1,6 @@
 import Foundation
 
-enum AgentProviderBindingID: String, CaseIterable, Hashable {
+package enum AgentProviderBindingID: String, CaseIterable, Hashable {
     case codex
     case claude
     case openCode
@@ -9,7 +9,7 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
     case antigravity
     case devin
 
-    var displayName: String {
+    package var displayName: String {
         switch self {
         case .codex:
             "Codex CLI"
@@ -29,7 +29,7 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
     }
 }
 
-extension AgentProviderKind {
+package extension AgentProviderKind {
     var providerBindingID: AgentProviderBindingID {
         switch self {
         case .codexExec:

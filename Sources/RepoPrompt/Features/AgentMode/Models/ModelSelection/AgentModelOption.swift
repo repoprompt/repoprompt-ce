@@ -4,27 +4,32 @@ import RepoPromptAIContracts
 /// Provenance for a synthesized reasoning-effort variant option: the base model raw and the
 /// effort it encodes. Present only on variant options — bases and plain models leave it nil,
 /// so no layer ever re-parses compound raw strings to recover the decomposition.
-struct AgentModelEffortVariant: Hashable, Codable {
-    let baseModelRaw: String
-    let reasoningEffort: CodexReasoningEffort
+package struct AgentModelEffortVariant: Hashable, Codable {
+    package let baseModelRaw: String
+    package let reasoningEffort: CodexReasoningEffort
+
+    package init(baseModelRaw: String, reasoningEffort: CodexReasoningEffort) {
+        self.baseModelRaw = baseModelRaw
+        self.reasoningEffort = reasoningEffort
+    }
 }
 
-struct AgentModelOption: Identifiable, Hashable {
-    let rawValue: String
-    let displayName: String
-    let description: String?
-    let isPlaceholderDefault: Bool
-    let isProviderDefault: Bool
-    let supportedReasoningEfforts: [CodexReasoningEffort]
+package struct AgentModelOption: Identifiable, Hashable {
+    package let rawValue: String
+    package let displayName: String
+    package let description: String?
+    package let isPlaceholderDefault: Bool
+    package let isProviderDefault: Bool
+    package let supportedReasoningEfforts: [CodexReasoningEffort]
     /// Exact provider-advertised values, including values this app cannot yet execute.
-    let supportedReasoningEffortRawValues: [String]
-    let defaultReasoningEffort: CodexReasoningEffort?
-    let defaultReasoningEffortRawValue: String?
-    let effortVariant: AgentModelEffortVariant?
+    package let supportedReasoningEffortRawValues: [String]
+    package let defaultReasoningEffort: CodexReasoningEffort?
+    package let defaultReasoningEffortRawValue: String?
+    package let effortVariant: AgentModelEffortVariant?
     /// Provider-reported model capacity, when advertised (not a local fallback).
-    let contextWindowTokens: Int?
+    package let contextWindowTokens: Int?
 
-    init(
+    package init(
         rawValue: String,
         displayName: String,
         description: String?,
@@ -50,11 +55,11 @@ struct AgentModelOption: Identifiable, Hashable {
         self.contextWindowTokens = contextWindowTokens.flatMap { $0 > 0 ? $0 : nil }
     }
 
-    var isDefault: Bool {
+    package var isDefault: Bool {
         isPlaceholderDefault || isProviderDefault
     }
 
-    var id: String {
+    package var id: String {
         rawValue
     }
 }
