@@ -8,6 +8,36 @@ enum WorkspaceLogicalRootIdentity {
         let preferredName: String
     }
 
+    static func relativePath(
+        for file: WorkspaceFileRecord,
+        roots: [WorkspaceRootRef],
+        rootDisplayNamesByRootID: [UUID: String]
+    ) -> String? {
+        guard roots.contains(where: { $0.id == file.rootID }),
+              let rootLabel = rootDisplayNamesByRootID[file.rootID]
+        else { return nil }
+        let relativePath = file.standardizedRelativePath
+        if roots.count == 1 { return relativePath }
+        return relativePath.isEmpty ? rootLabel : "\(rootLabel)/\(relativePath)"
+    }
+
+    static func displayNames(
+        store: WorkspaceFileContextStore,
+        rootScope: WorkspaceLookupRootScope,
+        boundLogicalNames: [UUID: String]
+    ) async -> [UUID: String] {
+        let physicalRoots = await store.rootRefs(scope: rootScope)
+        let rootEpochs = await store.codemapRootEpochs(scope: rootScope)
+        return labels(for: physicalRoots.compactMap { physicalRoot in
+            guard let rootEpoch = rootEpochs[physicalRoot.id] else { return nil }
+            return RootDescriptor(
+                physicalRootID: physicalRoot.id,
+                rootEpoch: rootEpoch,
+                preferredName: boundLogicalNames[physicalRoot.id] ?? physicalRoot.name
+            )
+        })
+    }
+
     static func label(for rootEpoch: WorkspaceCodemapRootEpoch) -> String {
         "root@\(rootEpoch.rootID.uuidString.lowercased())+\(rootEpoch.rootLifetimeID.uuidString.lowercased())"
     }
@@ -63,22 +93,15 @@ extension WorkspaceLookupContext {
     func logicalRootDisplayNamesByRootID(
         store: WorkspaceFileContextStore
     ) async -> [UUID: String] {
-        let physicalRoots = await store.rootRefs(scope: rootScope)
-        let rootEpochs = await store.codemapRootEpochs(scope: rootScope)
         let boundLogicalNames = Dictionary(
             (bindingProjection?.boundRootsForMetadata ?? []).map {
                 ($0.physicalRoot.id, $0.logicalRoot.name)
             },
             uniquingKeysWith: { current, _ in current }
         )
-        return WorkspaceLogicalRootIdentity.labels(for: physicalRoots.compactMap { physicalRoot in
-            guard let rootEpoch = rootEpochs[physicalRoot.id] else { return nil }
-            return WorkspaceLogicalRootIdentity.RootDescriptor(
-                physicalRootID: physicalRoot.id,
-                rootEpoch: rootEpoch,
-                preferredName: boundLogicalNames[physicalRoot.id] ?? physicalRoot.name
-            )
-        })
+        return await WorkspaceLogicalRootIdentity.displayNames(
+            store: store, rootScope: rootScope, boundLogicalNames: boundLogicalNames
+        )
     }
 
     func logicalDisplayPath(
@@ -94,13 +117,8 @@ extension WorkspaceLookupContext {
                 display: .full
             ) ?? file.standardizedFullPath
         }
-        guard
-            let rootLabel = rootDisplayNamesByRootID[file.rootID]
-        else { return nil }
-        let relativePath = file.standardizedRelativePath
-        if roots.count == 1 {
-            return relativePath
-        }
-        return relativePath.isEmpty ? rootLabel : "\(rootLabel)/\(relativePath)"
+        return WorkspaceLogicalRootIdentity.relativePath(
+            for: file, roots: roots, rootDisplayNamesByRootID: rootDisplayNamesByRootID
+        )
     }
 }
