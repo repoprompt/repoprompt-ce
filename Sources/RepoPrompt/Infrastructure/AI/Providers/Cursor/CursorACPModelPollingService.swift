@@ -82,9 +82,11 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
 /// OpenCode model discovery path while preserving Cursor's static Auto fallback when no
 /// dynamic model metadata is available yet.
 actor CursorACPModelPollingService {
-    static let shared = CursorACPModelPollingService(
-        client: CursorACPControllerModelDiscoveryClient()
-    )
+    struct Registry {
+        let update: (ACPDiscoveredSessionModels) -> Bool
+        let snapshot: () -> ACPDiscoveredSessionModels?
+        let snapshotAfterWarm: () async -> ACPDiscoveredSessionModels?
+    }
 
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
@@ -93,6 +95,7 @@ actor CursorACPModelPollingService {
     }
 
     private let client: any CursorACPModelDiscoveryClient
+    private let registry: Registry
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
@@ -113,9 +116,11 @@ actor CursorACPModelPollingService {
 
     init(
         client: any CursorACPModelDiscoveryClient,
+        registry: Registry,
         intervalNanos: UInt64 = 300_000_000_000
     ) {
         self.client = client
+        self.registry = registry
         self.intervalNanos = intervalNanos
     }
 
@@ -290,7 +295,7 @@ actor CursorACPModelPollingService {
     private func publishLiveReadinessWithoutModels() {
         guard !isShutdown else { return }
         let models = latest?.models
-            ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)
+            ?? registry.snapshot()
             ?? ACPDiscoveredSessionModels(options: [], currentModelRaw: nil)
         let snapshot = Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: true)
         guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
@@ -302,8 +307,8 @@ actor CursorACPModelPollingService {
 
     private func applyRefreshResult(_ discovered: ACPDiscoveredSessionModels) {
         guard !isShutdown else { return }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .cursor)
-        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor) else { return }
+        _ = registry.update(discovered)
+        guard let normalized = registry.snapshot() else { return }
         let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
         guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
         latest = snapshot
@@ -313,7 +318,7 @@ actor CursorACPModelPollingService {
     }
 
     private func registrySnapshotAfterWarmingStore() async -> Snapshot? {
-        guard let models = await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .cursor) else {
+        guard let models = await registry.snapshotAfterWarm() else {
             return nil
         }
         return Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: false)

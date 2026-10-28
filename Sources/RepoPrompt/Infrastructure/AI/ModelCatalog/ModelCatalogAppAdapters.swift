@@ -14,6 +14,22 @@ extension AgentACPModelRegistry.Dependencies {
     }
 }
 
+extension CursorACPModelPollingService.Registry {
+    static var app: Self {
+        Self(
+            update: { AgentACPModelRegistry.shared.updateDiscoveredModels($0, for: .cursor) },
+            snapshot: { AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor) },
+            snapshotAfterWarm: { await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .cursor) }
+        )
+    }
+}
+
+extension CursorACPModelPollingService {
+    static let shared = CursorACPModelPollingService(
+        client: CursorACPControllerModelDiscoveryClient(), registry: .app
+    )
+}
+
 /// App convenience boundaries retain the existing lazy persisted-catalog lookup.
 /// The interpretation owners accept that lookup explicitly and never read app storage.
 extension CodexModelSpecifier {
