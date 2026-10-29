@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptShared
 import RepoPromptVCS
 

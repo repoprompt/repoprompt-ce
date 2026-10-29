@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 
 /// Claude-specific integration configuration helpers.

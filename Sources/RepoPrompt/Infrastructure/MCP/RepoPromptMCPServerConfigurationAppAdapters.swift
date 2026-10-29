@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 extension RepoPromptMCPServerConfiguration {
     init(name: String = Self.defaultServerName, args: [String] = [], env: [EnvironmentEntry] = []) {
