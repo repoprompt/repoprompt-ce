@@ -1647,8 +1647,9 @@ full integration, packaged, real vendor and live app gates remain for integratio
 ### M6 — app-free WorkspaceContext extraction and integration (2026-10-29)
 
 This is the continuation of the single M6 PR #1415, not an additional milestone.
-The extraction is implemented; final integrated PR-ready, live smoke, independent
-review and hosted checks remain outstanding at this checkpoint. Earlier Stage 0
+The extraction is implemented. The exact-head validation reconciliation below
+supersedes the provisional remaining-gates summary, without erasing historical
+failures or certifying the broader #1402/#1408 campaign. Earlier Stage 0
 NOT_PASSED entries above describe their historical heads, not the current style result.
 
 #### Surviving owners and retirement
@@ -1775,8 +1776,88 @@ The admission hang's cooperative wait mechanism is supported by existing test
 history, not proven by a captured full-suite stack. Its bounded fixture repair
 must be checked in the full integrated run; the old timeout remains evidence.
 
-Remaining: current-main integrated PR-ready (including complete root suite and
-Xcode workspace validation), current-head packaging/smoke, comparable scoped
-performance receipts, final independent pinned Astra review and hosted checks.
-M7 still waits for merged M6; M8 remains independent. No later milestone is
-included to expand this first review batch.
+#### Exact source-head reconciliation: `3d03fe5f` (2026-10-29)
+
+Source head `3d03fe5f373f57313ad96c892d679e47313140fd` includes the bounded
+buffered-process drain correction. A deterministic process-owner regression first
+failed against close-before-drain (`55c7e798`); the repaired process owner passed
+33/33 (`c9d11d3a`), and strict lint passed (`821d34c5`). The previously failing
+Devin probe passed in the exact-head shard; its original failure is consistent with,
+but not independently proven to have been caused by, that output race.
+
+- CI build `8c765e24` and four isolated CI shards `2cafe661`, `012fccf5`,
+  `ad0e486d`, `6dd9c626` passed. Listing/receipt coverage verifies **7,600
+  identities, including 16 skips**, across 16 targets; it is not 7,600 passing
+  test cases. The four prior discovery setup cases passed in these isolated suites.
+  All 15 app-free module parity runs passed, **1,190 executed, zero failures**.
+- The monolithic `99d9b3c2` at `5dbe9d08` timed out with four discovery setup
+  failures; its cause remains unresolved. Isolated shard passes do not erase or
+  diagnose it. Earlier `17c94933` and pristine graph-coverage timeout also remain
+  historical red evidence. The 113/0 move audit above is not test-discovery parity.
+- Provider-package tests `083669c8` passed 34 cases; app product `dfd3d604`, MCP
+  product `65347061`, Xcode workspace validation and Release preflight `db0d8a17`
+  passed. Exact-head Debug package `67594d42` and validation-only universal ad-hoc
+  Release artifact `42a29dc1` passed. Release ZIP SHA-256
+  `0dbabd6397b5c0d4423b2b20bbab9aa4308415b9b6f10aa2957fb1d88d28b6e1`,
+  manifest SHA-256 `fd76702ca47f8cd946dfb46218bb4280ba95d23606b069dcdef24f78dfde07cb`.
+  Packaged helper checks do not establish live MCP.
+- With user-approved Debug-only restart (`3172e791`, `4605f0f3`), exact-head basic
+  live MCP smoke `61b30de2` passed. Initial `21db94e1` failed with exit 73 before
+  the debug listener became ready and remains a failed receipt. This basic smoke
+  is not a real-vendor or standalone-headless journey. The assembled two-lane
+  journey uses controlled providers and a prepared workspace/window; it is not a
+  vendor-socket, inactive-presentation, or no-window proof.
+- Fresh compiler-index check at this source head passed: wrong-way app file edges
+  1,304/1,360 and largest component cycle 54/66 ratchet; the prior c47-to-1c00
+  app-only graph comparison above remains explicitly historical, not a final-head
+  whole-program proof. Independent pinned Astra review found no demonstrated
+  findings (`/tmp/runtime-m6-astra-review-3d03fe5f.md`, PR comment `6488277784`).
+  Hosted CI `40817649592` and Xcode `40817649498` passed for the reviewed head.
+- Existing narrow workload witnesses passed: graph publication proportionality
+  (`012fccf5`, 18.040s; 16,384-file fixture) and catalog bulk-add 10,000/20,000
+  scaling (`ad0e486d`, 5.843s). They are not Repo Bench or a launch/runtime
+  benchmark. Repo Bench was removed at `f861d16bb3a14305d1329e079ed393b317fc0508`.
+
+Release validation-artifact execution and sampled process-tree peak RSS were
+**4,957.327s / 5,867,683,840 bytes** at pristine c47 and **8,652.404s /
+5,606,113,280 bytes** at 3d03 (`42a29dc1`). These are actual receipts, not matched
+dependency-cache/host-load experiments. Both logs explicitly clean their Release
+output scratch. The final head also incorporates current-main changes beyond
+c47, so this pair does not isolate M6. Do not infer a time gain, causal regression,
+or satisfaction of the 10% runtime/launch guardrail from these receipts.
+
+#### Bounded warm-cache incremental comparison (2026-10-29)
+
+One sample per head, using the same appended nonsemantic comment
+`\n// M6 matched incremental measurement.\n` in
+`WorkspaceCodemapGraphStructureModels.swift`, separately restored after each job.
+Both heads warmed the selected test and app build first. Conductor receipt process
+execution excludes queue time; peak RSS is sampled process-tree RSS at 1-second
+intervals. All four measured jobs reported `warmLocal` and zero queue seconds. Each
+requested four global-heavy slots from the existing eight-slot configuration;
+the campaign did not alter admission capacity for these measurements.
+
+| Command | Before c47 ticket; execution / peak RSS | After 3d03 ticket; execution / peak RSS |
+| --- | --- | --- |
+| `./conductor test --filter testGraphIndexPublicationWorkStaysProportionalToBatchSize` | `4c724416-daf1-49a4-b62c-43113674b14f`; 112.784s / 2,869,116,928 bytes | `208fbe63-ce29-4cad-af65-9e84cc59ec7a`; 60.596s / 2,444,607,488 bytes |
+| `./conductor swift-build --product RepoPrompt` | `757a1e22-6096-46d6-b4bb-47024d5740dc`; 37.928s / 2,486,583,296 bytes | `88e01694-7682-4c57-b197-84c4c70207bc`; 9.500s / 1,034,797,056 bytes |
+
+Before global-heavy waits were 0.006s for each; after waits were 0.009s and
+0.008s respectively. The selected test passed exactly one case at each head:
+11.613s before and 12.910s after. Before warmups were `6ba72ae6-a047-4c3e-8c9f-7ee92cd524e4`
+and `8ee71011-9ff5-4569-83ac-2be7639618f7`; after warmups were
+`9423e42e-7073-453e-b2bf-63ad565238d3` and `b44c4b78-0552-43bb-950c-1e86fc2bcdcf`.
+The restored source SHA-256 was `32c672097bee9e983cccc47196122cf0c5e3fb8fb85520caf7466a115996f403`
+before and `cdd0afe9057708c40711fe0039cb9cc82b14272d04dd2eea28e2151a484b990a`
+after; the after backup and restored file matched after both jobs.
+
+These are bounded observations, not an isolated causal speedup: the selected
+suite/owning target differs across heads, intervening main changes c47→35 are
+included, and only one sample was taken. The app measurement followed the test
+measurement and could reuse its compiled cache; cache state is not proof of
+identical compiler work. Neither this nor the unmatched Release receipts establish
+the launch/runtime 10% guardrail. The monolithic discovery setup failures remain
+unexplained. Repo Bench is unavailable, not a passing gate. Exact-head hosted and
+packaging receipts above apply to the source head, not subsequent documentation
+edits. User review and final merge are separate; M7 still waits for merged M6,
+M8 is independent, and #1402/#1408 and snapshot-only Q2 semantics are not closed.

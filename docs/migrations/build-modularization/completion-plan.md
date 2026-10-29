@@ -482,6 +482,29 @@ measurements and incomparable samples from demonstrated improvements. Do not
 weaken a numerical threshold or create a new benchmark framework to close this
 historical documentation gap.
 
+### C3 / M6 checkpoint reconciliation (2026-10-29)
+
+The detailed receipts and limits for source head `3d03fe5f` are in the
+[M6 ledger](ledger.md#exact-source-head-reconciliation-3d03fe5f-2026-10-29).
+The four CI shards cover all 7,600 listed identities, **including 16 skips**;
+15 app-free target parity runs pass 1,190 tests. The 113-file move audit does
+not itself measure discovery parity. Basic live MCP smoke, Debug packaging,
+validation-only universal Release packaging, independent review and hosted CI
+have separate passing receipts. Controlled-provider journey coverage is not a
+real-vendor or standalone-headless acceptance claim.
+
+The earlier monolithic discovery timeouts remain unexplained despite isolated
+case passes. The ledger now records one warm-cache before/after nonsemantic edit
+sample for the selected graph test and incremental app build, with differing owning
+targets, intervening main changes and possible cache reuse limiting comparison.
+Launch/runtime comparison remains unestablished. Both recorded Release builds
+used clean output scratch, but dependency-cache warmth, host load and the
+intervening main changes were not matched; neither comparison establishes the
+10% guardrail. Repo Bench is unavailable, and the graph and catalog workload tests are
+narrow witnesses, not a replacement. Do not treat this checkpoint as closing #1402,
+#1408 or the snapshot-only Q2 requirement. The user's review and merge decision
+remain separate from validation.
+
 ### 4.4 Byte-identical move audit (T0)
 
 `Scripts/modularization_move_audit.py --base origin/main [--head HEAD] [--json out.json]`. Its tests run in `make conductor-selftest`. The script exits 1 on any violation.
