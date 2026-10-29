@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 
 /// App-owned physical approval authority. Cursor execution supplies the resolved

@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 
 /// Provider-neutral adapter that rewrites terminal ACP `tool_call_update` payloads into the

@@ -1,6 +1,5 @@
 import Foundation
 import RepoPromptACPProviders
-import RepoPromptApp
 import XCTest
 
 final class ACPToolUpdateResultAdapterOwnerTests: XCTestCase {

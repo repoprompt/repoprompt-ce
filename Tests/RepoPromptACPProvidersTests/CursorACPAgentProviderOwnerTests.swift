@@ -1,7 +1,6 @@
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
-import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
 
