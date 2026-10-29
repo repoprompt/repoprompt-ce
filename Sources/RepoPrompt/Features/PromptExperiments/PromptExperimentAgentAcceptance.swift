@@ -209,12 +209,53 @@
             """
         }
 
+        /// Darwin rejects an address-space cap below existing mappings, which can already
+        /// include hundreds of GiB of reservations. Probe its accounting before loading
+        /// candidate code; only the final cap lowers the inherited hard limit. This bounds
+        /// additional mappings, not resident memory within an existing reservation.
+        static let addressSpaceLimitProgram = """
+        def rpce_limit_address_space(resource, platform, maximum):
+            allowance = 512 * 1024 * 1024
+            original = resource.getrlimit(resource.RLIMIT_AS)
+            ceiling = min([maximum] + [value for value in original if value != resource.RLIM_INFINITY])
+            if ceiling <= 0:
+                raise RuntimeError("No usable inherited address-space allowance")
+            set_limit = resource.setrlimit
+            address_space = resource.RLIMIT_AS
+            if platform != "darwin":
+                limit = min(allowance, ceiling)
+            else:
+                def accepts(value):
+                    requested = (value, original[1])
+                    try:
+                        set_limit(address_space, requested)
+                    except ValueError:
+                        return False
+                    # Restore the prebuilt tuple before allocating any search values.
+                    set_limit(address_space, original)
+                    return True
+                lower, upper = 0, min(allowance, ceiling)
+                while not accepts(upper):
+                    if upper == ceiling:
+                        raise RuntimeError("Cannot establish the Darwin address-space baseline")
+                    lower, upper = upper, min(upper * 2, ceiling)
+                while upper - lower > 1024 * 1024:
+                    middle = (lower + upper) // 2
+                    if accepts(middle):
+                        upper = middle
+                    else:
+                        lower = middle
+                limit = min(ceiling, upper + allowance)
+            set_limit(address_space, (limit, limit))
+            return limit
+        """
+
         /// The host compares the observed result. No expected value or test manifest is
         /// present in this process. -I/-S disables user packages, startup hooks and site.py.
-        static let checkProgram = """
+        static let checkProgram = addressSpaceLimitProgram + "\n" + """
         import contextlib, importlib.util, io, json, os, resource, sys
         resource.setrlimit(resource.RLIMIT_CPU, (4, 4))
-        resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
+        rpce_limit_address_space(resource, sys.platform, sys.maxsize)
         resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
         path, function, encoded, workspace = sys.argv[1:]
         sys.path[:0] = [os.path.dirname(path), workspace]

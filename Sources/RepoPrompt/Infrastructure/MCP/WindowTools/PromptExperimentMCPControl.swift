@@ -67,7 +67,7 @@
                 case .baselineConflict: "baseline_conflict"
                 case .sourceRootUnavailable: "source_root_unavailable"
                 case .unsafeSourcePath, .archiveConflict: "unsafe_source_path"
-                case .invalidCandidate, .unchangedCandidate: "invalid_candidate"
+                case .invalidCandidate, .invalidEngineerTemplate, .unchangedCandidate: "invalid_candidate"
                 }
                 return Self(code: code, message: patch.localizedDescription, fields: [])
             }
@@ -645,52 +645,57 @@
         static func experimentValue(_ experiment: PromptExperiment) -> Value {
             let authority = experiment.authority
             let settings = authority.settings
-            return .object([
+            let definition: Value = authority.definition.flatMap { try? encodedValue($0) } ?? .null
+            let authorityValue: [String: Value] = [
+                "prompt_id": .string(authority.promptIdentifier),
+                "source": .string(authority.sourceDescription),
+                "definition": definition,
+                "prompt_resource_sha256": .string(authority.promptResourceSHA256),
+                "suite_id": .string(authority.suiteID),
+                "suite_sha256": .string(authority.suiteSHA256),
+                "rubric_sha256": authority.rubricSHA256.map(Value.string) ?? .null,
+                "execution_target": targetValue(authority.targets.execution),
+                "reflection_target": targetValue(authority.targets.reflection),
+                "judge_target": authority.targets.judge.map(targetValue) ?? .null,
+                "max_evaluations": .int(authority.maxEvaluations),
+                "calibration_evaluations": .int(authority.calibrationEvaluations),
+                "maximum_total_evaluations": .int(authority.maximumTotalEvaluations),
+                "max_provider_invocations": authority.maxProviderInvocations.map(Value.int) ?? .null,
+                "reflection_minibatch_size": .int(settings.reflectionMinibatchSize),
+                "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
+                "prompt_character_ceiling_ratio": .double(settings.promptCharacterCeilingRatio),
+                "max_prompt_characters": settings.maxPromptCharacters.map(Value.int) ?? .null,
+                "noise_floor_replicates": .int(settings.noiseFloorReplicates),
+                "max_provider_retries": .int(settings.maxProviderRetries),
+                "random_seed": .int(settings.randomSeed),
+                "gepa_revision": .string(authority.gepaRevision)
+            ]
+            let proposals: [Value] = experiment.proposals.map { proposal in
+                let value: [String: Value] = [
+                    "proposal_id": .string(proposal.id.uuidString),
+                    "run_id": .string(proposal.runID.uuidString),
+                    "candidate_index": .int(proposal.candidateIndex),
+                    "state": .string(proposal.state.rawValue)
+                ]
+                return .object(value)
+            }
+            let value: [String: Value] = [
                 "experiment_id": .string(experiment.id.uuidString),
                 "title": .string(experiment.title),
                 "status": .string(experiment.status.rawValue),
                 "next_action": .string(nextAction(experiment)),
                 "authority_digest": .string(experiment.authorityDigest),
                 "supersedes": experiment.supersedes.map { .string($0.uuidString) } ?? .null,
-                "authority": .object([
-                    "prompt_id": .string(authority.promptIdentifier),
-                    "source": .string(authority.sourceDescription),
-                    "definition": authority.definition.flatMap { try? encodedValue($0) } ?? .null,
-                    "prompt_resource_sha256": .string(authority.promptResourceSHA256),
-                    "suite_id": .string(authority.suiteID),
-                    "suite_sha256": .string(authority.suiteSHA256),
-                    "rubric_sha256": authority.rubricSHA256.map(Value.string) ?? .null,
-                    "execution_target": targetValue(authority.targets.execution),
-                    "reflection_target": targetValue(authority.targets.reflection),
-                    "judge_target": authority.targets.judge.map(targetValue) ?? .null,
-                    "max_evaluations": .int(authority.maxEvaluations),
-                    "calibration_evaluations": .int(authority.calibrationEvaluations),
-                    "maximum_total_evaluations": .int(authority.maximumTotalEvaluations),
-                    "max_provider_invocations": authority.maxProviderInvocations.map(Value.int) ?? .null,
-                    "reflection_minibatch_size": .int(settings.reflectionMinibatchSize),
-                    "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
-                    "prompt_character_ceiling_ratio": .double(settings.promptCharacterCeilingRatio),
-                    "max_prompt_characters": settings.maxPromptCharacters.map(Value.int) ?? .null,
-                    "noise_floor_replicates": .int(settings.noiseFloorReplicates),
-                    "max_provider_retries": .int(settings.maxProviderRetries),
-                    "random_seed": .int(settings.randomSeed),
-                    "gepa_revision": .string(authority.gepaRevision)
-                ]),
+                "authority": .object(authorityValue),
                 "admissions_used": .int(experiment.admissionsUsed),
                 "remaining_evaluations": .int(experiment.remainingEvaluations),
                 "calibration_admissions_used": .int(experiment.calibrationAdmissionsUsed),
                 "approval_requested_at": experiment.approvalRequest.map { .string(iso8601.string(from: $0.requestedAt)) } ?? .null,
                 "approved_at": experiment.approval.map { .string(iso8601.string(from: $0.approvedAt)) } ?? .null,
                 "runs": .array(experiment.runs.map(runValue)),
-                "proposals": .array(experiment.proposals.map { proposal in
-                    .object([
-                        "proposal_id": .string(proposal.id.uuidString),
-                        "run_id": .string(proposal.runID.uuidString),
-                        "candidate_index": .int(proposal.candidateIndex),
-                        "state": .string(proposal.state.rawValue)
-                    ])
-                })
-            ])
+                "proposals": .array(proposals)
+            ]
+            return .object(value)
         }
 
         static func runValue(_ run: PromptExperimentRun) -> Value {

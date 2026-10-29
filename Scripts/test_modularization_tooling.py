@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import io
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ import modularization_test_target as target  # noqa: E402
 import generate_xcode_workspace as xcode_workspace  # noqa: E402
 import swift_imports  # noqa: E402
 import conductor  # noqa: E402
+import ci_prompt_lab  # noqa: E402
 
 
 def fixture(root: Path) -> tuple[dict, dict]:
@@ -334,7 +336,10 @@ class CatalogTests(unittest.TestCase):
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]
         self.assertIn('name: Style', final)
-        self.assertIn('needs: [build-test-bundles, build-and-test, secret-scan]', final)
+        self.assertIn('needs: [build-test-bundles, build-and-test, secret-scan, prompt-lab-tests]', final)
+        self.assertIn('PROMPT_LAB_RESULT: ${{ needs.prompt-lab-tests.result }}', final)
+        self.assertIn('"$PROMPT_LAB_RESULT" != success', final)
+        self.assertIn('python3 Scripts/ci_prompt_lab.py test', ci)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
         self.assertEqual(ci.count('runs-on: macos-26'), 2)  # one shared job + 4 matrix children
@@ -343,6 +348,25 @@ class CatalogTests(unittest.TestCase):
         for line in ci.splitlines():
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
+
+    def test_prompt_lab_gate_rejects_skipped_empty_and_failing_suites(self) -> None:
+        cases = {
+            'pass': ('self.assertTrue(True)', True),
+            'skip': ('self.skipTest("DSPy is missing")', False),
+            'fail': ('self.fail("regression")', False),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            for name, (body, expected) in cases.items():
+                with self.subTest(name=name):
+                    path = Path(temporary) / f'{name}.py'
+                    path.write_text('import unittest\nclass Test(unittest.TestCase):\n'
+                                    f'    def test_case(self):\n        {body}\n')
+                    with mock.patch('sys.stderr', new=io.StringIO()):
+                        self.assertEqual(ci_prompt_lab.run_suite(path, stream=io.StringIO()), expected)
+            path = Path(temporary) / 'empty.py'
+            path.write_text('import unittest\n')
+            with mock.patch('sys.stderr', new=io.StringIO()):
+                self.assertFalse(ci_prompt_lab.run_suite(path, stream=io.StringIO()))
 
     def test_ci_typecheck_warning_classification(self) -> None:
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'

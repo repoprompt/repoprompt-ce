@@ -14,6 +14,30 @@ permissions:
   contents: read
 
 jobs:
+  prompt-lab-tests:
+    name: GEPA and DSPy Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python for isolated prompt lab environments
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Prepare manifest-pinned GEPA and project DSPy environments
+        run: python3 Scripts/ci_prompt_lab.py prepare --directory "$RUNNER_TEMP/prompt-lab"
+
+      - name: Run real GEPA and DSPy integration without model calls
+        run: |
+          python3 Scripts/ci_prompt_lab.py test \
+            --gepa-python "$RUNNER_TEMP/prompt-lab/gepa/python/bin/python" \
+            --dspy-python "$RUNNER_TEMP/prompt-lab/dspy/bin/python"
+
   build-test-bundles:
     name: Build and Static Gates
     runs-on: macos-26
@@ -244,7 +268,7 @@ jobs:
   style:
     # Protect main requires exactly Style: it must be the FINAL gate, not an early green row.
     name: Style
-    needs: [build-test-bundles, build-and-test, secret-scan]
+    needs: [build-test-bundles, build-and-test, secret-scan, prompt-lab-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -258,6 +282,7 @@ jobs:
           BUILD_RESULT: ${{ needs.build-test-bundles.result }}
           SECRET_RESULT: ${{ needs.secret-scan.result }}
           SHARD_RESULT: ${{ needs.build-and-test.result }}
+          PROMPT_LAB_RESULT: ${{ needs.prompt-lab-tests.result }}
         shell: bash
         run: |
           {
@@ -265,8 +290,9 @@ jobs:
             echo "- Build and Static Gates: $BUILD_RESULT"
             echo "- Root test shards: $SHARD_RESULT"
             echo "- Secret Scan: $SECRET_RESULT"
+            echo "- GEPA and DSPy Integration: $PROMPT_LAB_RESULT"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          if [[ "$BUILD_RESULT" != success || "$SHARD_RESULT" != success || "$SECRET_RESULT" != success ]]; then
+          if [[ "$BUILD_RESULT" != success || "$SHARD_RESULT" != success || "$SECRET_RESULT" != success || "$PROMPT_LAB_RESULT" != success ]]; then
             echo '::error::CI prerequisite failed, was cancelled, or was skipped. Inspect the failing job; Style is the aggregate gate.'
             exit 1
           fi

@@ -249,6 +249,74 @@ import XCTest
             XCTAssertEqual(try String(contentsOf: privateFile, encoding: .utf8), "sealed")
         }
 
+        func testAcceptanceMemoryLimitAccountsForDarwinReservationsAndPreservesInheritedBounds() async throws {
+            let python = try await availableAcceptancePython()
+            let program = PromptExperimentPythonAcceptanceRunner.addressSpaceLimitProgram + "\n" + """
+            class Kernel:
+                RLIMIT_AS, RLIM_INFINITY = 5, -1
+                def __init__(self, baseline, original=(-1, -1)):
+                    self.baseline, self.original, self.current = baseline, original, original
+                    self.changes, self.attempts = [], 0
+                def getrlimit(self, resource):
+                    assert resource == self.RLIMIT_AS
+                    return self.current
+                def setrlimit(self, resource, limits):
+                    assert resource == self.RLIMIT_AS
+                    self.attempts += 1
+                    assert self.attempts < 150, "The search must be bounded"
+                    soft, hard = limits
+                    if self.current[1] != -1 and (hard == -1 or hard > self.current[1]):
+                        raise PermissionError("The hard limit cannot be raised")
+                    if (hard != -1 and (soft == -1 or soft > hard)) or (soft != -1 and soft < self.baseline):
+                        raise ValueError("Darwin rejects a limit below mapped size")
+                    self.current = limits
+                    self.changes.append(limits)
+            mib, gib, maximum = 1024 * 1024, 1024 * 1024 * 1024, (1 << 63) - 1
+            baseline = 389 * gib + 173
+            kernel = Kernel(baseline)
+            limit = rpce_limit_address_space(kernel, "darwin", maximum)
+            assert 512 * mib <= limit - baseline < 513 * mib
+            assert kernel.current == (limit, limit)
+            for index, change in enumerate(kernel.changes[:-1]):
+                if change != kernel.original:
+                    assert change[1] == kernel.original[1], "Probes must preserve the hard limit"
+                    assert kernel.changes[index + 1] == kernel.original, "Restore immediately after every successful probe"
+            for original in [(baseline + 128 * mib, baseline + 256 * mib), (baseline + 64 * mib, baseline + 64 * mib)]:
+                kernel = Kernel(baseline, original)
+                expected = min(value for value in original if value != -1)
+                assert rpce_limit_address_space(kernel, "darwin", maximum) == expected
+                assert kernel.current == (expected, expected), "Do not relax inherited limits"
+            kernel = Kernel(64 * mib)
+            assert rpce_limit_address_space(kernel, "linux", maximum) == 512 * mib
+            assert len(kernel.changes) == 1, "Other platforms retain the absolute cap"
+            class RefusingKernel(Kernel):
+                def setrlimit(self, resource, limits):
+                    self.attempts += 1
+                    raise ValueError("Cannot apply this limit")
+            kernel = RefusingKernel(baseline)
+            try:
+                rpce_limit_address_space(kernel, "darwin", maximum)
+                raise AssertionError("Never continue without an established limit")
+            except RuntimeError:
+                assert kernel.attempts < 40
+            class BrokenKernel(Kernel):
+                def setrlimit(self, resource, limits):
+                    raise OSError("Kernel operation failed")
+            try:
+                rpce_limit_address_space(BrokenKernel(baseline), "darwin", maximum)
+                raise AssertionError("Unexpected kernel failures must escape")
+            except OSError:
+                pass
+            print("ADDRESS_SPACE_LIMIT_OK")
+            """
+            let runner = CLIProcessRunner(config: .init(command: python.path, processPurpose: .tool, shellLookupMode: .disabled))
+            let result = try await runner.run(
+                args: ["-I", "-S", "-c", program], stdin: nil, outputMode: .none, timeout: 10, cancelChildOnTaskCancellation: true
+            )
+            XCTAssertEqual(result.status, 0, String(decoding: result.stderr, as: UTF8.self))
+            XCTAssertEqual(String(decoding: result.stdout, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines), "ADDRESS_SPACE_LIMIT_OK")
+        }
+
         private func availableAcceptancePython() async throws -> URL {
             let configured = PromptExperimentGEPAWorker.configuredPythonExecutable().map { [$0] } ?? []
             let pathCandidates = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":")
