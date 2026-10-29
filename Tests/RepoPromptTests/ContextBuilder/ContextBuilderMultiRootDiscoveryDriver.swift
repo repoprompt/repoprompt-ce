@@ -468,6 +468,11 @@ import XCTest
         }
 
         private func shutdown() async {
+            // Detach the one-shot post-root-capture hook before opening gates or joining owned
+            // work, so no late file request can enter it. `window` is absent on setup failure.
+            if let window {
+                window.workspaceManager.setWorkspaceRootCatalogDidCaptureRootsHandlerForTesting(nil)
+            }
             fixture.releaseAllGates()
             if let window {
                 if let active = vm.activeRunIDForTesting(tabID: tabID) { notePendingTeardown(runID: active) }

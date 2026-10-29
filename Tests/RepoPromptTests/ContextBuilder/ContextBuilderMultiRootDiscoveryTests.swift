@@ -2,6 +2,7 @@ import Foundation
 import MCP
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceCore
 import XCTest
 
 #if DEBUG
@@ -1593,6 +1594,518 @@ import XCTest
                     storage.append(event)
                     lock.unlock()
                 }
+            }
+        }
+
+        // MARK: - Worktree-bound nested discovery authority
+
+        func testActualSocketFullyBoundDiscoveryReadsWorktree() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                rootNames: ["A", "Worktree"], routedRuntime: true, readmeContent: BoundSentinel.canonical,
+                configuration: { Array($0.prefix(1)) }
+            ) { driver in
+                let paths = driver.fixture.rootPaths
+                let discovery = try await self.prepareBoundDiscovery(driver, worktreeIndex: 1, retainedCanonicalPaths: [])
+                let ledger = BoundCallbackLedger()
+                self.installBoundStreamBody(driver, ledger: ledger) { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try self.assertNestedFrozenState(driver, child: child, discovery: discovery, runID: runID)
+                    let readme = try await self.readFile(child, path: paths[0] + "/README.md")
+                    try self.assertReadSucceeded(readme, contains: BoundSentinel.worktree, excludes: BoundSentinel.canonical)
+                    ledger.toolCalls += 1
+                    let only = try await self.readFile(child, path: paths[0] + "/" + BoundSentinel.worktreeOnlyFile)
+                    try self.assertReadSucceeded(only, contains: BoundSentinel.worktreeOnlyContent, excludes: BoundSentinel.canonical)
+                    ledger.toolCalls += 1
+                    try await self.assertWorktreeSearchAndTree(child, expectedRootCount: 1, ledger: ledger)
+                    let after = try driver.promotedSnapshot(for: child)
+                    XCTAssertEqual(after.frozenLookupContext, discovery.context.lookupContext, "Stable binding revoked nested scope")
+                    XCTAssertNil(after.frozenFileToolAuthority)
+                }
+                let completion = try await driver.fixture.perform("fully bound nested discovery") {
+                    try await driver.run(discovery.context, authority: discovery.authority)
+                }
+                XCTAssertEqual(completion.terminalDisposition, .completed)
+                try self.assertBoundCommitSafety(completion, driver: driver)
+                try await self.assertBoundRunSettled(driver, completion: completion, ledger: ledger, toolCalls: 4)
+            }
+        }
+
+        func testActualSocketMixedBoundDiscoveryReadsWorktreeAndCanonicalSibling() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                rootNames: ["A", "B", "Worktree"], routedRuntime: true, readmeContent: BoundSentinel.canonical
+            ) { driver in
+                let paths = driver.fixture.rootPaths
+                let discovery = try await self.prepareBoundDiscovery(driver, worktreeIndex: 2, retainedCanonicalPaths: [paths[1]])
+                let ledger = BoundCallbackLedger()
+                self.installBoundStreamBody(driver, ledger: ledger) { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try self.assertNestedFrozenState(driver, child: child, discovery: discovery, runID: runID)
+                    let bound = try await self.readFile(child, path: paths[0] + "/README.md")
+                    try self.assertReadSucceeded(bound, contains: BoundSentinel.worktree, excludes: BoundSentinel.canonical)
+                    ledger.toolCalls += 1
+                    let sibling = try await self.readFile(child, path: paths[1] + "/README.md")
+                    try self.assertReadSucceeded(sibling, contains: BoundSentinel.canonical, excludes: BoundSentinel.worktree)
+                    ledger.toolCalls += 1
+                    try await self.assertWorktreeSearchAndTree(child, expectedRootCount: 2, ledger: ledger)
+                    let after = try driver.promotedSnapshot(for: child)
+                    XCTAssertEqual(after.frozenLookupContext, discovery.context.lookupContext, "Stable binding revoked nested scope")
+                    XCTAssertNil(after.frozenFileToolAuthority)
+                }
+                let completion = try await driver.fixture.perform("mixed bound nested discovery") {
+                    try await driver.run(discovery.context, authority: discovery.authority)
+                }
+                XCTAssertEqual(completion.terminalDisposition, .completed)
+                try self.assertBoundCommitSafety(completion, driver: driver)
+                try await self.assertBoundRunSettled(driver, completion: completion, ledger: ledger, toolCalls: 4)
+            }
+        }
+
+        func testActualSocketBoundDiscoveryRejectsSamePathRootReplacement() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                rootNames: ["A", "B", "Worktree"], routedRuntime: true, readmeContent: BoundSentinel.canonical
+            ) { driver in
+                let paths = driver.fixture.rootPaths
+                let discovery = try await self.prepareBoundDiscovery(driver, worktreeIndex: 2, retainedCanonicalPaths: [paths[1]])
+                let ledger = BoundCallbackLedger()
+                self.installBoundStreamBody(driver, ledger: ledger) { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try self.assertNestedFrozenState(driver, child: child, discovery: discovery, runID: runID)
+                    let store = driver.files.workspaceFileContextStore
+                    let originalB = try XCTUnwrap(discovery.logicalCatalog.first { $0.standardizedFullPath == paths[1] })
+                    await store.unloadRoot(id: originalB.id)
+                    try BoundSentinel.replacement.write(toFile: paths[1] + "/README.md", atomically: true, encoding: .utf8)
+                    let reloaded = try await store.loadRoot(path: paths[1], kind: .primaryWorkspace)
+                    XCTAssertNotEqual(reloaded.id, originalB.id, "Same-path reload must mint a new root identity")
+                    XCTAssertEqual(reloaded.standardizedFullPath, originalB.standardizedFullPath)
+                    let live = await store.rootRefs(scope: .visibleWorkspace)
+                    XCTAssertEqual(
+                        Set(live.map(\.id)),
+                        Set(discovery.logicalCatalog.map(\.id)).subtracting([originalB.id]).union([reloaded.id])
+                    )
+                    let read = try await self.readFile(child, path: paths[1] + "/README.md")
+                    self.assertReadDenied(read, path: paths[1] + "/README.md", failure: .superseded)
+                    ledger.toolCalls += 1
+                    XCTAssertNil(try driver.promotedSnapshot(for: child).frozenLookupContext, "Root replacement must revoke nested scope")
+                }
+                let completion = try await driver.fixture.perform("bound same-path replacement") {
+                    try await driver.run(discovery.context, authority: discovery.authority)
+                }
+                XCTAssertEqual(completion.terminalDisposition, .completed)
+                try self.assertBoundCommitSafety(completion, driver: driver, deniedPaths: [paths[1] + "/README.md"])
+                try await self.assertBoundRunSettled(driver, completion: completion, ledger: ledger, toolCalls: 1)
+            }
+        }
+
+        func testActualSocketBoundDiscoveryRevokesOnAdditionalRootAndCannotRecover() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                rootNames: ["A", "B", "Worktree", "Unrelated"], routedRuntime: true, readmeContent: BoundSentinel.canonical
+            ) { driver in
+                let paths = driver.fixture.rootPaths
+                let discovery = try await self.prepareBoundDiscovery(driver, worktreeIndex: 2, retainedCanonicalPaths: [paths[1]])
+                let ledger = BoundCallbackLedger()
+                self.installBoundStreamBody(driver, ledger: ledger) { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try self.assertNestedFrozenState(driver, child: child, discovery: discovery, runID: runID)
+                    let store = driver.files.workspaceFileContextStore
+                    let unrelated = try await store.loadRoot(path: paths[3], kind: .primaryWorkspace)
+                    let grown = await store.rootRefs(scope: .visibleWorkspace)
+                    XCTAssertEqual(Set(grown.map(\.id)), Set(discovery.logicalCatalog.map(\.id)).union([unrelated.id]))
+                    let first = try await self.readFile(child, path: paths[0] + "/README.md")
+                    self.assertReadDenied(first, path: paths[0] + "/README.md", failure: .superseded)
+                    ledger.toolCalls += 1
+                    XCTAssertNil(try driver.promotedSnapshot(for: child).frozenLookupContext, "Catalog addition must revoke nested scope")
+
+                    await store.unloadRoot(id: unrelated.id)
+                    let restored = await store.rootRefs(scope: .visibleWorkspace)
+                    XCTAssertEqual(Set(restored), discovery.logicalCatalog, "Original logical catalog must be restored exactly")
+                    _ = try await driver.manager.awaitWorkspaceSearchReadiness(timeout: .seconds(5), admission: .rootCatalog)
+                    let retry = try await self.readFile(child, path: paths[0] + "/README.md")
+                    self.assertReadDenied(retry, path: paths[0] + "/README.md", failure: .superseded)
+                    ledger.toolCalls += 1
+                    XCTAssertNil(try driver.promotedSnapshot(for: child).frozenLookupContext, "Restored catalog must not restore authority")
+                }
+                let completion = try await driver.fixture.perform("bound catalog addition") {
+                    try await driver.run(discovery.context, authority: discovery.authority)
+                }
+                XCTAssertEqual(completion.terminalDisposition, .completed)
+                try self.assertBoundCommitSafety(completion, driver: driver, deniedPaths: [paths[0] + "/README.md"])
+                try await self.assertBoundRunSettled(driver, completion: completion, ledger: ledger, toolCalls: 2)
+            }
+        }
+
+        func testActualSocketBoundDiscoveryRevokesWhenBoundLogicalRootUnloads() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                rootNames: ["A", "B", "Worktree"], routedRuntime: true, readmeContent: BoundSentinel.canonical
+            ) { driver in
+                let paths = driver.fixture.rootPaths
+                let discovery = try await self.prepareBoundDiscovery(driver, worktreeIndex: 2, retainedCanonicalPaths: [paths[1]])
+                let ledger = BoundCallbackLedger()
+                self.installBoundStreamBody(driver, ledger: ledger) { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try self.assertNestedFrozenState(driver, child: child, discovery: discovery, runID: runID)
+                    let store = driver.files.workspaceFileContextStore
+                    let logicalA = try XCTUnwrap(discovery.logicalCatalog.first { $0.standardizedFullPath == paths[0] })
+                    await store.unloadRoot(id: logicalA.id)
+                    let live = await store.rootRefs(scope: .visibleWorkspace)
+                    XCTAssertEqual(Set(live), discovery.logicalCatalog.subtracting([logicalA]))
+                    XCTAssertEqual(live.map(\.standardizedFullPath), [paths[1]])
+                    let records = await store.roots()
+                    XCTAssertTrue(records.contains { $0.id == discovery.physicalRoot.id && $0.kind == .sessionWorktree })
+                    var isDirectory: ObjCBool = false
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: paths[2], isDirectory: &isDirectory) && isDirectory.boolValue)
+                    let read = try await self.readFile(child, path: paths[0] + "/README.md")
+                    self.assertReadDenied(read, path: paths[0] + "/README.md", failure: .superseded)
+                    ledger.toolCalls += 1
+                    XCTAssertNil(try driver.promotedSnapshot(for: child).frozenLookupContext, "Bound logical unload must revoke nested scope")
+                }
+                let completion = try await driver.fixture.perform("bound logical root unload") {
+                    try await driver.run(discovery.context, authority: discovery.authority)
+                }
+                XCTAssertEqual(completion.terminalDisposition, .completed)
+                try self.assertBoundCommitSafety(completion, driver: driver, deniedPaths: [paths[0] + "/README.md"])
+                try await self.assertBoundRunSettled(driver, completion: completion, ledger: ledger, toolCalls: 1)
+            }
+        }
+
+        func testActualSocketBoundDiscoveryRevokesCatalogChangeAfterRootCapture() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                rootNames: ["A", "B", "Worktree", "Unrelated"], routedRuntime: true, readmeContent: BoundSentinel.canonical
+            ) { driver in
+                let paths = driver.fixture.rootPaths
+                let discovery = try await self.prepareBoundDiscovery(driver, worktreeIndex: 2, retainedCanonicalPaths: [paths[1]])
+                let ledger = BoundCallbackLedger()
+                self.installBoundStreamBody(driver, ledger: ledger) { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try self.assertNestedFrozenState(driver, child: child, discovery: discovery, runID: runID)
+                    let manager = driver.manager
+                    let store = driver.files.workspaceFileContextStore
+                    let ticket = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(5), admission: .rootCatalog)
+                    let originalCatalog = await Set(store.rootRefs(scope: .visibleWorkspace))
+                    XCTAssertEqual(originalCatalog, discovery.logicalCatalog)
+                    let configuredPaths = manager.workspace(withID: driver.fixture.workspace.id)?.repoPaths
+
+                    // One-shot: clears itself on entry, so only the target read can be held here.
+                    let gate = driver.fixture.makeGate()
+                    let progressed = XCTestExpectation(description: "post-capture hook entered or target read finished")
+                    progressed.assertForOverFulfill = false
+                    var hookEntries = 0
+                    manager.setWorkspaceRootCatalogDidCaptureRootsHandlerForTesting { [weak manager] in
+                        manager?.setWorkspaceRootCatalogDidCaptureRootsHandlerForTesting(nil)
+                        hookEntries += 1
+                        progressed.fulfill()
+                        await gate.wait()
+                    }
+                    let readDone = XCTestExpectation(description: "post-capture target read finished")
+                    var readResult: Result<BoundReadOutcome, Error>?
+                    driver.fixture.startOwnedTask {
+                        do { readResult = try await .success(self.readFile(child, path: paths[0] + "/README.md")) }
+                        catch { readResult = .failure(error) }
+                        progressed.fulfill()
+                        readDone.fulfill()
+                    }
+                    try await driver.fixture.awaitGateEvent(progressed)
+                    XCTAssertEqual(hookEntries, 1, "Target read did not reach the post-root-capture point")
+                    var unrelatedID: UUID?
+                    if hookEntries == 1 {
+                        let unrelated = try await store.loadRoot(path: paths[3], kind: .primaryWorkspace)
+                        unrelatedID = unrelated.id
+                        let grown = await store.rootRefs(scope: .visibleWorkspace)
+                        XCTAssertEqual(Set(grown.map(\.id)), Set(originalCatalog.map(\.id)).union([unrelated.id]))
+                        XCTAssertEqual(manager.workspace(withID: driver.fixture.workspace.id)?.repoPaths, configuredPaths)
+                        let held = try driver.promotedSnapshot(for: child)
+                        XCTAssertEqual(held.runID, runID)
+                        XCTAssertEqual(held.activeAgentSessionID, discovery.context.parentAgentSessionID)
+                        XCTAssertEqual(held.frozenLookupContext, discovery.context.lookupContext)
+                        XCTAssertNoThrow(try manager.validateWorkspaceSearchReadiness(ticket, admission: .rootCatalog))
+                    }
+                    gate.release()
+                    try await driver.fixture.awaitGateEvent(readDone)
+                    let read = try XCTUnwrap(readResult).get()
+                    self.assertReadDenied(read, path: paths[0] + "/README.md", failure: .superseded)
+                    ledger.toolCalls += 1
+                    XCTAssertNil(try driver.promotedSnapshot(for: child).frozenLookupContext, "Post-capture catalog change must revoke nested scope")
+                    if let unrelatedID { await store.unloadRoot(id: unrelatedID) }
+                    let restored = await store.rootRefs(scope: .visibleWorkspace)
+                    XCTAssertEqual(Set(restored), originalCatalog, "Original logical catalog must be restored before callback completion")
+                    manager.setWorkspaceRootCatalogDidCaptureRootsHandlerForTesting(nil)
+                }
+                let completion = try await driver.fixture.perform("bound post-capture catalog change") {
+                    try await driver.run(discovery.context, authority: discovery.authority)
+                }
+                XCTAssertEqual(completion.terminalDisposition, .completed)
+                try self.assertBoundCommitSafety(completion, driver: driver, deniedPaths: [paths[0] + "/README.md"])
+                try await self.assertBoundRunSettled(driver, completion: completion, ledger: ledger, toolCalls: 1)
+            }
+        }
+
+        func testActualSocketBoundDiscoveryRejectsRetiredWorktreeLifetime() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(
+                rootNames: ["A", "B", "Worktree"], routedRuntime: true, readmeContent: BoundSentinel.canonical
+            ) { driver in
+                let paths = driver.fixture.rootPaths
+                let discovery = try await self.prepareBoundDiscovery(driver, worktreeIndex: 2, retainedCanonicalPaths: [paths[1]])
+                let ledger = BoundCallbackLedger()
+                self.installBoundStreamBody(driver, ledger: ledger) { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try self.assertNestedFrozenState(driver, child: child, discovery: discovery, runID: runID)
+                    let store = driver.files.workspaceFileContextStore
+                    await store.unloadRoot(id: discovery.physicalRoot.id)
+                    let availability = await store.rootScopeAvailability(discovery.scope)
+                    XCTAssertEqual(availability, .sessionWorktreeUnavailable(missingPhysicalRootPaths: [discovery.physicalRoot.standardizedFullPath]))
+                    var isDirectory: ObjCBool = false
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: paths[2], isDirectory: &isDirectory) && isDirectory.boolValue)
+                    let live = await store.rootRefs(scope: .visibleWorkspace)
+                    XCTAssertEqual(Set(live), discovery.logicalCatalog, "Physical retirement must leave the logical catalog unchanged")
+                    let read = try await self.readFile(child, path: paths[0] + "/README.md")
+                    self.assertReadDenied(read, path: paths[0] + "/README.md", failure: .worktreeScopeUnavailable)
+                    ledger.toolCalls += 1
+                    XCTAssertEqual(
+                        try driver.promotedSnapshot(for: child).frozenLookupContext, discovery.context.lookupContext,
+                        "Physical lifetime failure must not revoke the catalog-valid nested scope"
+                    )
+                }
+                let completion = try await driver.fixture.perform("bound retired worktree lifetime") {
+                    try await driver.run(discovery.context, authority: discovery.authority)
+                }
+                XCTAssertEqual(completion.terminalDisposition, .completed)
+                try self.assertBoundCommitSafety(completion, driver: driver, deniedPaths: [paths[0] + "/README.md"])
+                try await self.assertBoundRunSettled(driver, completion: completion, ledger: ledger, toolCalls: 1)
+            }
+        }
+
+        private enum BoundSentinel {
+            static let canonical = "CANONICAL_CHECKOUT_SENTINEL"
+            static let worktree = "WORKTREE_CHECKOUT_SENTINEL"
+            static let worktreeOnlyFile = "WORKTREE_ONLY_FILE.md"
+            static let worktreeOnlyContent = "WORKTREE_ONLY_CONTENT_SENTINEL"
+            static let replacement = "REPLACEMENT_SENTINEL_MUST_NOT_LEAK"
+            static let all = [canonical, worktree, worktreeOnlyContent, replacement]
+        }
+
+        private struct BoundDiscovery {
+            let binding: AgentSessionWorktreeBinding
+            let context: ContextBuilderWorkspaceContext
+            let authority: ContextBuilderResolvedRunAuthority
+            /// L: the full captured logical primary-root catalog.
+            let logicalCatalog: Set<WorkspaceRootRef>
+            let physicalRoot: WorkspaceRootRef
+            let scope: WorkspaceLookupRootScope
+        }
+
+        private struct BoundReadOutcome {
+            let reply: ToolResultDTOs.ReadFileReply
+            let text: String
+            let isError: Bool?
+        }
+
+        private enum BoundDiscoveryFailure: Error {
+            case unexpectedToolError(String)
+            case unexpectedRootScope
+        }
+
+        /// Callback entry and successful completion are counted separately: a skipped or
+        /// throwing stream body must not look like a successful nested tool sequence.
+        @MainActor
+        private final class BoundCallbackLedger {
+            var entries = 0
+            var completions = 0
+            var toolCalls = 0
+        }
+
+        /// Real linked worktree with distinct same-path README content and a worktree-only file,
+        /// written after worktree creation and before materialization.
+        private func prepareBoundDiscovery(
+            _ driver: ContextBuilderMultiRootDiscoveryDriver,
+            worktreeIndex: Int,
+            retainedCanonicalPaths: Set<String>
+        ) async throws -> BoundDiscovery {
+            let paths = driver.fixture.rootPaths
+            let worktree = paths[worktreeIndex]
+            let binding = try driver.fixture.makeWorktreeBinding(logicalRootIndex: 0, worktreeRootIndex: worktreeIndex)
+            try BoundSentinel.worktree.write(toFile: worktree + "/README.md", atomically: true, encoding: .utf8)
+            try BoundSentinel.worktreeOnlyContent.write(
+                toFile: worktree + "/" + BoundSentinel.worktreeOnlyFile, atomically: true, encoding: .utf8
+            )
+            _ = try await driver.fixture.perform("driver root-catalog readiness") {
+                try await driver.manager.awaitWorkspaceSearchReadiness(timeout: .seconds(5), admission: .rootCatalog)
+            }
+            let context = try await driver.resolve(bindings: [binding])
+            let authority = try await driver.authority(context)
+            XCTAssertNil(context.primaryRootSnapshot)
+            XCTAssertEqual(context.worktreeBindings, [binding])
+            let projection = try XCTUnwrap(context.lookupContext.bindingProjection)
+            guard case let .validatedSessionBoundWorkspace(canonical, physical, _) = context.lookupContext.rootScope else {
+                XCTFail("Bound discovery must use a validated session-bound scope")
+                throw BoundDiscoveryFailure.unexpectedRootScope
+            }
+            let logicalCatalog = Set(projection.visibleLogicalRootRefs)
+            let live = await driver.files.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+            XCTAssertEqual(logicalCatalog, Set(live), "Projection must capture the full logical catalog")
+            let configured = try XCTUnwrap(driver.manager.workspace(withID: driver.fixture.workspace.id)).repoPaths
+            XCTAssertEqual(Set(logicalCatalog.map(\.standardizedFullPath)), Set(configured))
+            XCTAssertFalse(logicalCatalog.contains { $0.standardizedFullPath == worktree }, "Worktree must never be a primary root")
+            XCTAssertEqual(Set(canonical.map(\.standardizedFullPath)), retainedCanonicalPaths)
+            XCTAssertTrue(canonical.isSubset(of: logicalCatalog))
+            XCTAssertEqual(physical.map(\.standardizedFullPath), [worktree])
+            return try BoundDiscovery(
+                binding: binding, context: context, authority: authority, logicalCatalog: logicalCatalog,
+                physicalRoot: XCTUnwrap(physical.first), scope: context.lookupContext.rootScope
+            )
+        }
+
+        private func installBoundStreamBody(
+            _ driver: ContextBuilderMultiRootDiscoveryDriver,
+            ledger: BoundCallbackLedger,
+            _ body: @escaping (UUID) async throws -> Void
+        ) {
+            driver.streamBody = { runID in
+                ledger.entries += 1
+                do {
+                    try await body(runID)
+                } catch {
+                    XCTFail("Bound nested discovery callback failed: \(error)")
+                    throw error
+                }
+                ledger.completions += 1
+            }
+        }
+
+        private func assertNestedFrozenState(
+            _ driver: ContextBuilderMultiRootDiscoveryDriver,
+            child: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection,
+            discovery: BoundDiscovery,
+            runID: UUID
+        ) throws {
+            let binding = driver.window.mcpServer.connectionBindingSnapshot(forConnection: child.connectionID)
+            XCTAssertEqual(binding.runID, runID)
+            XCTAssertEqual(binding.workspaceID, driver.fixture.workspace.id)
+            let snapshot = try driver.promotedSnapshot(for: child)
+            XCTAssertEqual(snapshot.runID, runID)
+            XCTAssertNotEqual(snapshot.runID, discovery.context.frozenTabContext.runID, "Nested run must not reuse the invoking run")
+            XCTAssertEqual(snapshot.tabID, driver.tabID)
+            XCTAssertEqual(snapshot.windowID, driver.window.windowID)
+            XCTAssertEqual(snapshot.workspaceID, driver.fixture.workspace.id)
+            XCTAssertEqual(snapshot.activeAgentSessionID, discovery.context.parentAgentSessionID)
+            XCTAssertEqual(snapshot.worktreeBindingState, .hydrated([discovery.binding]))
+            XCTAssertEqual(snapshot.frozenLookupContext, discovery.context.lookupContext)
+            XCTAssertNil(snapshot.frozenFileToolAuthority, "Nested discovery must not carry complete file authority")
+        }
+
+        private func readFile(
+            _ connection: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection,
+            path: String
+        ) async throws -> BoundReadOutcome {
+            let result = try await connection.client.callTool(name: "read_file", arguments: [
+                "path": .string(path), "_rawJSON": .bool(true)
+            ])
+            let text = ContextBuilderMultiRootDiscoveryDriver.text(result)
+            let reply = try JSONDecoder().decode(ToolResultDTOs.ReadFileReply.self, from: Data(text.utf8))
+            return BoundReadOutcome(reply: reply, text: text, isError: result.isError)
+        }
+
+        private func assertReadSucceeded(_ outcome: BoundReadOutcome, contains expected: String, excludes forbidden: String) throws {
+            XCTAssertNotEqual(outcome.isError, true, outcome.text)
+            guard outcome.reply.errorCode == nil else {
+                XCTFail("Nested read rejected: \(outcome.reply.errorCode ?? "") \(outcome.reply.displayPath ?? "")")
+                throw BoundDiscoveryFailure.unexpectedToolError(outcome.reply.errorCode ?? "")
+            }
+            XCTAssertTrue(outcome.reply.content.contains(expected), outcome.text)
+            XCTAssertFalse(outcome.text.contains(forbidden), "Read fell back to the wrong checkout")
+        }
+
+        private func assertReadDenied(_ outcome: BoundReadOutcome, path: String, failure: MCPFileToolAuthorityFailure) {
+            let reply = outcome.reply
+            XCTAssertEqual(reply.errorCode, failure.errorCode, outcome.text)
+            XCTAssertEqual(reply.errorMessage, failure.localizedDescription)
+            XCTAssertEqual(reply.message, failure.localizedDescription)
+            XCTAssertEqual(reply.content, "")
+            XCTAssertEqual(reply.totalLines, 0)
+            XCTAssertEqual(reply.firstLine, 0)
+            XCTAssertEqual(reply.lastLine, 0)
+            XCTAssertEqual(reply.displayPath, path)
+            XCTAssertEqual(reply.retryable, true)
+            XCTAssertEqual(reply.retryAfterMilliseconds, MCPFileToolAuthorityFailure.retryAfterMilliseconds)
+            XCTAssertEqual(reply.retryAfterMilliseconds, 1000)
+            for sentinel in BoundSentinel.all {
+                XCTAssertFalse(outcome.text.contains(sentinel), "Denied read leaked \(sentinel)")
+            }
+        }
+
+        private func assertWorktreeSearchAndTree(
+            _ child: ContextBuilderMultiRootDiscoveryDriver.RoutedConnection,
+            expectedRootCount: Int,
+            ledger: BoundCallbackLedger
+        ) async throws {
+            let search = try await child.client.callTool(name: "file_search", arguments: [
+                "pattern": .string(BoundSentinel.worktreeOnlyContent), "mode": .string("content"),
+                "regex": .bool(false), "_rawJSON": .bool(true)
+            ])
+            let searchText = ContextBuilderMultiRootDiscoveryDriver.text(search)
+            XCTAssertNotEqual(search.isError, true, searchText)
+            let searchReply = try JSONDecoder().decode(ToolResultDTOs.SearchResultDTO.self, from: Data(searchText.utf8))
+            guard searchReply.errorCode == nil else {
+                XCTFail("Nested search rejected: \(searchReply.errorCode ?? "")")
+                throw BoundDiscoveryFailure.unexpectedToolError(searchReply.errorCode ?? "")
+            }
+            XCTAssertEqual(
+                searchReply.contentMatchGroups.map { ($0.path as NSString).lastPathComponent },
+                [BoundSentinel.worktreeOnlyFile], searchText
+            )
+            XCTAssertTrue(searchReply.contentMatchGroups.flatMap(\.lines).contains { $0.lineText.contains(BoundSentinel.worktreeOnlyContent) })
+            ledger.toolCalls += 1
+
+            let tree = try await child.client.callTool(name: "get_file_tree", arguments: [
+                "type": .string("files"), "mode": .string("full"), "_rawJSON": .bool(true)
+            ])
+            let treeText = ContextBuilderMultiRootDiscoveryDriver.text(tree)
+            XCTAssertNotEqual(tree.isError, true, treeText)
+            let treeReply = try JSONDecoder().decode(ToolResultDTOs.FileTreeDTO.self, from: Data(treeText.utf8))
+            guard treeReply.errorCode == nil else {
+                XCTFail("Nested tree rejected: \(treeReply.errorCode ?? "")")
+                throw BoundDiscoveryFailure.unexpectedToolError(treeReply.errorCode ?? "")
+            }
+            XCTAssertEqual(treeReply.rootsCount, expectedRootCount, treeText)
+            XCTAssertTrue(treeReply.tree.contains(BoundSentinel.worktreeOnlyFile), treeText)
+            ledger.toolCalls += 1
+        }
+
+        /// Commit safety for bound runs: a completed run commits no selection at all (so none of the
+        /// denied files); any other disposition commits nothing.
+        private func assertBoundCommitSafety(
+            _ completion: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion,
+            driver: ContextBuilderMultiRootDiscoveryDriver,
+            deniedPaths: [String] = []
+        ) throws {
+            if completion.terminalDisposition == .completed {
+                let selection = try XCTUnwrap(completion.committedTab).tab.selection
+                XCTAssertTrue(selection.selectedPaths.isEmpty)
+                XCTAssertTrue(selection.manualCodemapPaths.isEmpty)
+                XCTAssertTrue(selection.slices.isEmpty)
+                let committedPaths = Set(selection.selectedPaths + selection.manualCodemapPaths + selection.slices.keys)
+                XCTAssertTrue(committedPaths.isDisjoint(with: deniedPaths), "Denied file reached the committed selection")
+            } else {
+                XCTAssertNil(completion.committedTab)
+                XCTAssertNil(driver.committed)
+            }
+        }
+
+        private func assertBoundRunSettled(
+            _ driver: ContextBuilderMultiRootDiscoveryDriver,
+            completion: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion,
+            ledger: BoundCallbackLedger,
+            toolCalls: Int
+        ) async throws {
+            XCTAssertEqual(ledger.entries, 1, "Stream callback entry count")
+            XCTAssertEqual(ledger.completions, 1, "Stream callback successful completion count")
+            XCTAssertEqual(ledger.toolCalls, toolCalls, "Completed nested tool calls")
+            try await driver.assertReleased(runID: completion.runID)
+            try await driver.assertRoutedLeaseReleasedExactlyOnce(runID: completion.runID)
+            XCTAssertEqual(driver.constructed, 1)
+            XCTAssertEqual(driver.streamStarts, 1)
+            XCTAssertEqual(driver.disposed, 1)
+            for connection in driver.connections {
+                await connection.cleanup()
+                XCTAssertEqual(connection.cleanupCount, 1)
             }
         }
     }
