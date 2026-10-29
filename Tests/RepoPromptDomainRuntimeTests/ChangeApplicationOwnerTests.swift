@@ -1,6 +1,5 @@
 import Foundation
-import RepoPromptApp
-import RepoPromptDomainRuntime
+@testable import RepoPromptDomainRuntime
 import XCTest
 
 final class ChangeApplicationOwnerTests: XCTestCase {

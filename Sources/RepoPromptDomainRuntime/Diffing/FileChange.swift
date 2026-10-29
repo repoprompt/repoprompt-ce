@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptDomainRuntime
 
 package struct FileChange: Identifiable, Equatable, Codable {
     package let id: UUID
