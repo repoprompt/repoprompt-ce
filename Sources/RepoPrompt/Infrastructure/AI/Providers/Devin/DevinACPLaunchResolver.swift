@@ -3,33 +3,32 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptFoundation
 import RepoPromptProcess
-import RepoPromptSettingsCore
 
-enum DevinACPLaunchCandidate: Equatable {
+package enum DevinACPLaunchCandidate: Equatable {
     case devinACP
 
-    var command: String {
+    package var command: String {
         CLILaunchProfiles.devin.commandName
     }
 
-    var launchArguments: [String] {
+    package var launchArguments: [String] {
         ["acp"]
     }
 
-    var helpArguments: [String] {
+    package var helpArguments: [String] {
         ["acp", "--help"]
     }
 }
 
-struct DevinACPResolvedLaunch: Equatable {
-    let command: String
-    let arguments: [String]
-    let additionalPathHints: [String]
-    let environment: [String: String]
-    let executableIdentity: ExecutableFileIdentity
+package struct DevinACPResolvedLaunch: Equatable {
+    package let command: String
+    package let arguments: [String]
+    package let additionalPathHints: [String]
+    package let environment: [String: String]
+    package let executableIdentity: ExecutableFileIdentity
 }
 
-enum DevinACPLaunchResolutionError: Error, Equatable, LocalizedError {
+package enum DevinACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case missingConfiguredCommand
     case unsafeConfiguredCommand(String)
     case exactPathNotFound(String)
@@ -37,7 +36,7 @@ enum DevinACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case environmentDiscoveryRequired(String)
     case unsafeApplicationPath(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .missingConfiguredCommand:
             "Devin CLI launch requires an exact `devin` command or absolute path."
@@ -58,32 +57,32 @@ enum DevinACPLaunchResolutionError: Error, Equatable, LocalizedError {
     }
 }
 
-final class DevinACPLaunchResolver: @unchecked Sendable {
-    typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
+package final class DevinACPLaunchResolver: @unchecked Sendable {
+    package typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
+    package typealias SupplementalPathProvider = @Sendable (_ configuredPaths: [String]) -> [String]
+    package typealias FailureRecorder = @Sendable (_ source: ShellEnvironmentSource?, _ candidateCount: Int) -> Void
 
     private let environmentProvider: EnvironmentProvider
+    private let supplementalPathProvider: SupplementalPathProvider
+    private let environmentFilter: CLIProcessConfiguration.EnvironmentFilter
+    private let recordFailure: FailureRecorder
     private let probeMutex = AsyncMutex()
     private let lock = NSLock()
     private var cachedLaunchByKey: [String: DevinACPResolvedLaunch] = [:]
 
-    init(
-        launchEnvironmentProvider: @escaping EnvironmentProvider = { enableDebugLogging in
-            let result = await ProcessEnvironmentBuilder.build(
-                ProcessEnvironmentRequest(
-                    purpose: .acpAgent(providerID: ACPProviderID.devin.rawValue),
-                    enableDebugLogging: enableDebugLogging
-                )
-            )
-            return ACPLaunchEnvironment(
-                environment: result.environment,
-                shellEnvironmentSource: result.shellEnvironmentSource
-            )
-        }
+    package init(
+        launchEnvironmentProvider: @escaping EnvironmentProvider,
+        supplementalPathProvider: @escaping SupplementalPathProvider,
+        environmentFilter: @escaping CLIProcessConfiguration.EnvironmentFilter,
+        failureRecorder: @escaping FailureRecorder
     ) {
         environmentProvider = launchEnvironmentProvider
+        self.supplementalPathProvider = supplementalPathProvider
+        self.environmentFilter = environmentFilter
+        recordFailure = failureRecorder
     }
 
-    func resolvedLaunch(for config: DevinAgentConfig) throws -> DevinACPResolvedLaunch {
+    package func resolvedLaunch(for config: DevinAgentConfig) throws -> DevinACPResolvedLaunch {
         let key = cacheKey(for: config)
         if let cached = cachedLaunch(forKey: key) {
             do {
@@ -100,7 +99,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
         return launch
     }
 
-    func probeSupport(for config: DevinAgentConfig) async throws -> ACPSupportResult {
+    package func probeSupport(for config: DevinAgentConfig) async throws -> ACPSupportResult {
         try await probeMutex.withLock { [self] in
             try await probeSupportSerially(for: config)
         }
@@ -114,7 +113,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
             let launch = try await resolveLaunchForProbe(for: config)
             let processConfig = CLIProcessConfiguration(
                 command: launch.command,
-                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .devin),
+                environmentFilter: environmentFilter,
                 additionalPaths: [],
                 enableDebugLogging: config.enableDebugLogging,
                 shellLookupMode: .fallbackOnly
@@ -166,7 +165,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
             )
         }
 
-        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
+        let effectiveHints = supplementalPathProvider(config.additionalPathHints)
         return try firstValidLaunch(
             candidates: launchCandidates(
                 additionalPathHints: effectiveHints,
@@ -188,7 +187,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
         guard configuredCommand.contains("/") else {
             throw DevinACPLaunchResolutionError.environmentDiscoveryRequired(configuredCommand)
         }
-        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
+        let effectiveHints = supplementalPathProvider(config.additionalPathHints)
         do {
             return try validatedLaunch(
                 entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
@@ -201,11 +200,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
             // (exactPathNotFound / unsafeApplicationPath) and omit the
             // fallback-PATH hint: an exact configured path does not depend on PATH discovery.
             // Record the same resolution-failure telemetry as other ACP launchers.
-            AgentCLILaunchDiagnostics.recordPathResolutionFailure(
-                providerKind: .devin,
-                shellEnvironmentSource: shellEnvironmentSource,
-                candidateCount: 1
-            )
+            recordFailure(shellEnvironmentSource, 1)
             throw error
         }
     }
@@ -317,11 +312,7 @@ final class DevinACPLaunchResolver: @unchecked Sendable {
         if failures.isEmpty {
             throw DevinACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
-        AgentCLILaunchDiagnostics.recordPathResolutionFailure(
-            providerKind: .devin,
-            shellEnvironmentSource: shellEnvironmentSource,
-            candidateCount: candidates.count
-        )
+        recordFailure(shellEnvironmentSource, candidates.count)
         throw DevinACPLaunchResolutionError.noValidLaunchCandidate(configuredCommand, failures, shellEnvironmentSource)
     }
 

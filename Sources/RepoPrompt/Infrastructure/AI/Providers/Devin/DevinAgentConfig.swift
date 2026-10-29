@@ -6,16 +6,16 @@ import RepoPromptACPProviders
 /// The per-run permission mode is intentionally NOT held here: it arrives with each
 /// `ACPRunRequest` so `.mcpSafeDefaults` / `.providerOverride` profiles stay authoritative
 /// and `ACPAgentSessionController.isCompatibleWith` can detect a changed launch flag.
-struct DevinAgentConfig {
-    let commandName: String
-    let additionalPathHints: [String]
-    let enableDebugLogging: Bool
-    let includeRepoPromptMCPServer: Bool
-    let modelString: String?
+package struct DevinAgentConfig {
+    package let commandName: String
+    package let additionalPathHints: [String]
+    package let enableDebugLogging: Bool
+    package let includeRepoPromptMCPServer: Bool
+    package let modelString: String?
 
-    init(
+    package init(
         commandName: String = "devin",
-        additionalPathHints: [String] = CLIPathHints.devin,
+        additionalPathHints: [String],
         enableDebugLogging: Bool = false,
         includeRepoPromptMCPServer: Bool = true,
         modelString: String? = nil
