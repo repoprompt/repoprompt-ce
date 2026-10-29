@@ -5,6 +5,24 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class AntigravityACPProviderTests: XCTestCase {
+    func testFailedPollingRetainsWarmedRegistrySnapshot() async {
+        struct FailingClient: AntigravityACPModelDiscoveryClient {
+            func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+                throw NSError(domain: "fixture", code: 1)
+            }
+        }
+        let registry = AgentACPModelRegistry(dependencies: .init(loadAll: { [:] }, load: { _ in nil }, save: { _, _ in }, remove: { _ in }, invalidate: { _ in }))
+        let model = AgentModelOption(rawValue: "retained-model", displayName: "Retained", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+        _ = registry.updateDiscoveredModels(.init(options: [model], currentModelRaw: model.rawValue), for: .antigravity)
+        let service = AntigravityACPModelPollingService(client: FailingClient(), registry: registry, logFailure: { _ in })
+        let success = await service.refreshNow(workspacePath: nil)
+        let snapshot = await service.latestSnapshot()
+        XCTAssertFalse(success)
+        XCTAssertEqual(snapshot?.models.options.map(\.rawValue), ["retained-model"])
+        XCTAssertEqual(snapshot?.isLiveDiscovery, false)
+        await service.shutdown()
+    }
+
     private var toolNames: ACPToolNameResolution {
         ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
     }
