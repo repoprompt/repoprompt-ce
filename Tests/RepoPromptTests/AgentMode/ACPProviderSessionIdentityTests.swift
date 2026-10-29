@@ -9,6 +9,28 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
+    func testAntigravityPollingKeepsLastGoodRegistryForEmptyDiscovery() async throws {
+        struct Client: AntigravityACPModelDiscoveryClient {
+            let models: ACPDiscoveredSessionModels
+            func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+                models
+            }
+        }
+        let registry = AgentACPModelRegistry(dependencies: .init(loadAll: { [:] }, load: { _ in nil }, save: { _, _ in }, remove: { _ in }, invalidate: { _ in }))
+        let model = AgentModelOption(rawValue: "antigravity-fixture", displayName: "Fixture", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
+        let populated = AntigravityACPModelPollingService(client: Client(models: .init(options: [model], currentModelRaw: model.rawValue)), registry: registry, logFailure: { _ in })
+        let first = try await populated.discoverOnce(workspacePath: nil)
+        XCTAssertEqual(first?.models.options.map(\.rawValue), ["antigravity-fixture"])
+        await populated.shutdown()
+        let empty = AntigravityACPModelPollingService(client: Client(models: .init(options: [], currentModelRaw: nil)), registry: registry, logFailure: { _ in })
+        let refreshed = await empty.refreshNow(workspacePath: nil)
+        let latest = await empty.latestSnapshot()
+        XCTAssertTrue(refreshed)
+        XCTAssertEqual(latest?.models.options.map(\.rawValue), ["antigravity-fixture"])
+        XCTAssertEqual(latest?.isLiveDiscovery, true)
+        await empty.shutdown()
+    }
+
     func testAntigravityPropagatesSessionHomePreparationFailure() {
         let names = ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
         let provider = AntigravityACPAgentProvider(
