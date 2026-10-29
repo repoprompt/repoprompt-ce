@@ -4,6 +4,29 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class ACPProviderContractTests: XCTestCase {
+    func testInjectedToolAuthorityControlsParenthesizedProvenance() {
+        let names = ACPToolNameResolution(
+            isRepoPromptServerIdentifier: { $0 == "trusted" },
+            canonicalRepoPromptToolName: { $0 == "alias" ? "read_file" : nil },
+            isRepoPromptToolNameWithServerPrefix: { _ in false }
+        )
+        XCTAssertEqual(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "alias (trusted)"], toolNames: names), "mcp__RepoPromptCE__read_file")
+        XCTAssertNil(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "alias (foreign)"], toolNames: names))
+    }
+
+    func testEmptyTerminalOutputKeepsLifecycleCompletion() {
+        let names = ACPToolNameResolution(
+            isRepoPromptServerIdentifier: { _ in false },
+            canonicalRepoPromptToolName: { _ in nil },
+            isRepoPromptToolNameWithServerPrefix: { _ in false }
+        )
+        let events = ACPDefaultSessionUpdateNormalizer.normalize([
+            "sessionUpdate": "tool_call_update", "toolCallId": "call", "status": "completed", "rawOutput": "[]"
+        ], providerID: .devin, toolNames: names)
+        guard case let .stream(result) = events.first else { return XCTFail("Missing terminal result") }
+        XCTAssertEqual(AgentToolResultPayloadRetention.terminalMarkerStatus(result.toolResultJSON), "completed")
+    }
+
     func testSessionContractNormalizesIdentityAndPreservesOpenMetadata() {
         let identity = ACPProviderSessionIdentity(providerID: .openCode, runtimeSessionID: "  runtime  ", loadSessionID: "  ", loadSessionIDConfidence: .verified)
         XCTAssertEqual(identity.runtimeSessionID, "runtime")
