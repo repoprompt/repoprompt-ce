@@ -72,7 +72,7 @@ final class PromptSuiteLoaderTests: XCTestCase {
             let suite = try PromptSuiteLoader.load(promptID: id)
             XCTAssertEqual(suite.promptID, id)
             XCTAssertEqual(suite.promptVariant, .builtIn)
-            XCTAssertNotNil(suite.grader.rubric, id.rawValue)
+            if suite.grader.kind == .modelJudge { XCTAssertNotNil(suite.grader.rubric, id.rawValue) }
             for split in PromptSuiteSplit.allCases {
                 XCTAssertFalse(suite.cases(in: split).isEmpty, "\(id.rawValue): \(split.rawValue)")
             }

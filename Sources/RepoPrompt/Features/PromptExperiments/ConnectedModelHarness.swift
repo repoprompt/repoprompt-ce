@@ -44,24 +44,26 @@
             return "\(output.prefix(head))\n\n[… \(omitted) characters omitted from the middle of this output; RepoPrompt retains the full text …]\n\n\(output.suffix(tail))"
         }
 
-        private let promptID: BuiltInPromptID
+        private let promptID: BuiltInPromptID?
         private let executionTarget: PromptExperimentResolvedTarget
         private let registry: BuiltInPromptRegistry
         private let invoker: PromptExperimentModelInvoker
         let grader: PromptExperimentGrader
         private let checkpoint: PromptExperimentCheckpointSink
         private let progress: @MainActor @Sendable (String) async -> Void
+        private let definition: PromptLabDefinition?
         private let uptime: @Sendable () -> TimeInterval
 
         init(
-            promptID: BuiltInPromptID,
+            promptID: BuiltInPromptID?,
             executionTarget: PromptExperimentResolvedTarget,
             registry: BuiltInPromptRegistry,
             invoker: PromptExperimentModelInvoker,
             grader: PromptExperimentGrader,
             checkpoint: @escaping PromptExperimentCheckpointSink,
             progress: @escaping @MainActor @Sendable (String) async -> Void,
-            uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+            uptime: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+            definition: PromptLabDefinition? = nil
         ) {
             self.promptID = promptID
             self.executionTarget = executionTarget
@@ -71,6 +73,7 @@
             self.checkpoint = checkpoint
             self.progress = progress
             self.uptime = uptime
+            self.definition = definition
         }
 
         /// The exact system prompt a candidate is evaluated under: the registry renders it as a
@@ -91,7 +94,30 @@
             evaluationID: UUID
         ) async throws -> PromptHarnessOutcome {
             let started = uptime()
-            let systemPrompt = try Self.renderSystemPrompt(candidate: candidate, promptID: promptID, registry: registry)
+            let systemPrompt: String
+            let userPrompt: String
+            if definition?.runner == .plainPrompt || promptID == nil {
+                if let definition, PromptLabTemplate.variables(in: candidate) != PromptLabTemplate.variables(in: definition.source.prompt) {
+                    return PromptHarnessOutcome(score: grader.minimumScore, proposerFeedback: "Preserve the starting prompt's template variable names.", output: "", failureKind: .candidate, elapsedSeconds: 0)
+                }
+                var variables = example.variables
+                variables["input"] = variables["input"] ?? example.input
+                systemPrompt = try PromptLabTemplate.render(candidate, variables: variables)
+                let renderedInput = try PromptLabTemplate.render(example.input, variables: variables)
+                if example.context == nil {
+                    userPrompt = renderedInput
+                } else {
+                    userPrompt = PromptSuiteCase(
+                        id: example.id, split: example.split, input: renderedInput,
+                        expectedOutput: nil, context: example.context
+                    ).packagedUserMessage
+                }
+            } else if let promptID {
+                systemPrompt = try Self.renderSystemPrompt(candidate: candidate, promptID: promptID, registry: registry)
+                userPrompt = example.packagedUserMessage
+            } else {
+                throw PromptExperimentAuthorityError.invalidRequest("The experiment has no task renderer.")
+            }
             await progress("Evaluating a candidate on suite case \(example.id).")
             let output: String
             let usage: PromptExperimentEvaluationUsage
@@ -100,7 +126,7 @@
                     target: executionTarget,
                     role: "execution",
                     systemPrompt: systemPrompt,
-                    userPrompt: example.packagedUserMessage,
+                    userPrompt: userPrompt,
                     onRetry: { [progress] retry, code, delay in
                         await progress("Retrying the target call after \(code.rawValue) (retry \(retry)) in \(String(format: "%.1f", delay))s.")
                     }
@@ -110,7 +136,11 @@
                     promptCharacters: candidate.count,
                     outputCharacters: output.count,
                     promptTokens: completion.promptTokens,
-                    completionTokens: completion.completionTokens
+                    completionTokens: completion.completionTokens,
+                    cachedInputTokens: completion.cachedInputTokens,
+                    cacheCreationInputTokens: completion.cacheCreationInputTokens,
+                    reportedCost: completion.cost,
+                    measurementVersion: 1
                 )
             } catch let failure as PromptExperimentProviderFailure where failure.code == .toolViolation {
                 // The candidate steered a tool-free target into a tool call: a candidate outcome.
@@ -133,7 +163,8 @@
                 gradingID: evaluationID,
                 invoker: invoker,
                 checkpoint: checkpoint,
-                progress: progress
+                progress: progress,
+                renderedInput: userPrompt
             )
             return PromptHarnessOutcome(
                 score: grade.score,

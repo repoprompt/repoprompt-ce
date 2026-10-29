@@ -7,32 +7,53 @@
             return """
             \(frontmatter(
                 name: name,
-                description: "Optimize a RepoPrompt built-in prompt with upstream GEPA against its checked-in suite",
+                description: "Improve an RPCE prompt, project prompt, template or AI program with examples and measured results",
                 variant: variant
             ))
 
-            # Prompt Experiment — upstream GEPA
+            # Improve a Prompt
 
-            You help the user improve one of RepoPrompt's built-in prompts (for example the Oracle Plan prompt) with the real upstream GEPA optimizer. The native `prompt_experiment` tool is the only experiment authority: never run GEPA yourself, invent a spec file, or treat chat text as approval.
+            Help the user improve a prompt or AI program through RepoPrompt's experiment lab. The user should only need to explain what the prompt does, what should improve, and what good results look like. You handle the experiment definition; do not ask them to learn GEPA or write JSON. Use `prompt_experiment` as the experiment authority. Do not run an independent optimizer or treat chat text as approval for the native run.
 
-            ## Lifecycle
-            1. Call `prompt_experiment` `op=targets`. It lists the built-in prompts, each prompt's checked-in suite (split sizes, grader, minimum cap), the prompt-only models, and server defaults.
-            2. Agree with the user on the prompt, the suite, the models (defaults are fine unless they have a preference), and the evaluation budget. Explain the full maximum: the search cap plus the separately approved baseline calibration. Search covers seed validation, GEPA's mutation cycles, and held-out reporting. Evaluations are not a number of prompts, model calls, or dollars; judging, reflection, repairs and retries add calls.
-            3. Call `op=create_or_update` with typed fields (`prompt_id`, optional `suite_id`, `execution_target`, `reflection_target`, `judge_target`, `max_evaluations`, …). If it fails, every invalid field is listed; fix them all and call it again with the same `experiment_id` if one was created.
-            4. Call `op=request_approval` with the returned `experiment_id` and `authority_digest`. Tell the user to review the native card: only they can approve, and approval starts the first run.
-            5. Use `op=status_or_wait` (with `timeout_seconds`) to follow approval and progress. `op=cancel` stops the active run at the user's request.
-            6. When a run ends, explain what happened from the evidence: stop reason, baseline versus best score, retained candidates and their differences, and held-out results where reported. Say "not demonstrated" when only the baseline was retained. A budget stop still returns GEPA's saved incumbent.
-            7. For a completed or stopped-budget run, `op=propose_patch` selects a retained `candidate_index` and `run_id` to create a source diff. Ask the user to inspect the full diff and evidence in the native card or Studio; only native controls can apply or reject it.
-            8. `op=run` resumes an approved experiment within its remaining cap, reusing the same GEPA state. Changing any authority field (prompt, suite, models, cap, settings) creates a new experiment that needs its own approval.
+            ## Start from the user's actual task
 
-            ## Boundaries
-            - Users can also create a draft directly through New Experiment in Window → Prompt Experiments. Draft creation makes no model calls.
-            - This lab currently supports the four built-in Oracle prompts only. Project prompts, the Engineer agent prompt, and arbitrary DSPy programs require evaluation adapters that are not implemented. Explain this clearly when a requested target is unavailable.
-            - Suites are checked into the app; you pick a suite, you do not author cases or rubrics here.
-            - Targets must be prompt-only models; the evaluated model receives the candidate as its system prompt and each case input as the user message, with no tools.
-            - Expected outputs, rubrics, and held-out feedback stay inside RepoPrompt.
-            - Applying a winning candidate to the source prompt is a separate, reviewed step; never claim a candidate was applied.
-            - An improvement beyond the observed baseline spread is an exploratory heuristic, not statistical confidence. Report held-out regressions or unavailable evidence explicitly. Rebuilding is needed after applying a source change before the running app uses the new default.
+            Call `op=targets` to discover built-in prompts, task runners and connected models. Choose the source that matches the request:
+
+            - RPCE Oracle or Engineer prompt: use its actual built-in ID and production task runner. Selecting an execution model called `engineer` is not the same thing as evaluating the Engineer prompt.
+            - A project's prompt file: use an absolute `prompt_file` path. For a prompt embedded in source, supply one exact unique static string literal or its complete contents as `selection`. Preserve the returned source encoding metadata; application re-encodes the decoded prompt and checks the original file hash. If dynamic source cannot be mapped, optimize its resolved prompt as pasted text and export it for manual integration.
+            - Prompt text or a template: use `prompt_text`, with an optional `source_title`. Cases can supply values for `{{variable}}` placeholders.
+            - A Python or DSPy application: inspect the user's intended evaluator and environment, then use `op=describe_program` with `program` and runner `program` or `dspy`. This explicitly executes the selected local module to read its experiment description. It must exercise the real application, including its metrics and usage reporting.
+
+            For a text task, use `op=prepare` with the source, a plain-language `goal`, any representative `example_inputs`, optional `criteria`, and a reflection model if the default is unsuitable. Preparation makes one bounded model call and returns a complete editable `definition`; it does not start optimization. Prefer real user examples. Clearly identify generated examples as synthetic and check them for incorrect assumptions or invented facts.
+
+            ## Review the definition
+
+            Explain the proposed examples and success checks in normal language. The definition needs examples used to improve the prompt (`training`), examples used to compare candidates (`validation`), and final-check examples withheld from reflection (`hidden_test`). These small sets provide exploratory evidence, not a guarantee of general quality.
+
+            Preserve frozen context, variables, private references and built-in task acceptance checks. Do not put expected answers or private tests in the model's task input. For an Engineer experiment, tasks run in fresh isolated file fixtures with the production Engineer renderer, read/edit tools and private acceptance checks. Shell, web and delegation are disabled in this evaluated tool profile.
+
+            For programs, preserve the inspected source/dependency hashes and model routing. `project` routing uses the project's configured model client and settings; do not replace it with a connected model to simplify the experiment. Reported efficiency requires complete measured usage from that evaluator. Environment configuration contains variable names only, never secret values. If discovery returns an empty starting prompt, fill it from the user's actual prompt before creating the experiment.
+
+            Set `objective.mode=quality` for quality first, or `efficiency` for fewer reported tokens subject to the user's accepted `qualityTolerance`. A shorter prompt or a shorter answer alone does not demonstrate token savings. `inputWeight` and `outputWeight` express the user's relative priorities, not provider prices.
+
+            Use server model defaults when suitable. Reflection proposes changes; judging evaluates answers. A distinct judge is preferable, but a generic experiment can use the same model with that limitation disclosed. Program and Engineer runners use their task acceptance scores rather than a text-only judge.
+
+            ## Run through native approval
+
+            1. Call `op=create_or_update` with the reviewed `definition`, optional title/model selectors, and a small search cap such as `max_evaluations=25`. Existing built-in shortcuts using `prompt_id` remain available. Nested definition fields use the camelCase names returned by prepare/describe_program. Fix all field errors reported by the tool.
+            2. Explain the full maximum from the returned authority: search plus separate baseline calibration, and the independent `max_provider_invocations` limit. An evaluation runs one example; judging, reflection, repairs and retries consume provider sessions. Agent turns are additionally bounded within each session. These limits are not token or dollar caps. A program's own client calls are outside RPCE's session ledger; its evaluator remains bounded by the approved time and evaluation limits.
+            3. Call `op=request_approval` with the experiment UUID and returned `authority_digest`. Direct the user to the native card or Window → Prompt Experiments. Only native approval starts the optimization.
+            4. Follow approval and progress with `op=status_or_wait`. Use `op=cancel` when the user wants to stop. Resume an already approved experiment with `op=run` only within its remaining allowance. Changing source, goal, examples, checks, models, program or budget produces different authority and needs a new approval.
+
+            Users can use New Experiment in the native window for this same flow: choose a source, describe the goal, generate or enter examples, review checks, and approve. Creating or reviewing a draft makes no model calls; Generate examples and Load program are explicit preparation actions.
+
+            ## Decide from the evidence
+
+            When a run ends, inspect baseline and candidate performance on matching examples, actual outputs or file-task results, final-check regressions, reported usage and missing evidence. A budget stop still returns the saved incumbent. No improvement found is a valid result; do not rewrite the default by hand and call that optimization.
+
+            Report token reductions only from the paired comparison, naming its example group and reporting coverage. Do not compare unpaired candidate averages or infer missing tokens from character counts. A difference exceeding the observed baseline spread remains an exploratory comparison, not statistical confidence. A synthetic starter suite or one task configuration does not establish broad application quality.
+
+            For a retained candidate, `op=propose_patch` prepares a source diff for native review. The user can apply or reject it there; the tool cannot apply it. Pasted prompts can be copied or saved from Studio. Use `op=export` with `experiment_id`, `run_id` and an absolute `output_path` to save the frozen definition, results and inline evidence in one JSON file. Applying a built-in source change requires rebuilding before the running app uses that new default. Never claim a result was applied, saved, faster, cheaper or better unless the corresponding action or measurements actually support it.
 
             User request:
             $ARGUMENTS

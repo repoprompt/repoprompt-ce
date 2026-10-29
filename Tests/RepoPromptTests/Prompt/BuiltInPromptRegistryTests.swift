@@ -60,7 +60,8 @@ final class BuiltInPromptRegistryTests: XCTestCase {
             .oraclePlan: Pinned.oraclePlanText,
             .oracleReview: Pinned.oracleReviewText,
             .oracleChat: Pinned.oracleChatText,
-            .oracleChatNoRoots: Pinned.oracleChatNoRootsText
+            .oracleChatNoRoots: Pinned.oracleChatNoRootsText,
+            .engineer: "c3e554e4148c261087afaa0c59d8c3b17262790901ac4a3b09d69a6749afaa5b"
         ]
         for id in BuiltInPromptID.allCases {
             let resource = try AppDomainRuntimeComposition.shared.builtInPromptRegistry.resource(id)

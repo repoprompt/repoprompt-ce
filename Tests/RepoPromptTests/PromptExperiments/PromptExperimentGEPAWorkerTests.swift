@@ -4,6 +4,16 @@ import XCTest
 
 #if DEBUG
     final class PromptExperimentGEPAWorkerTests: XCTestCase {
+        func testInvalidCandidateStatusSurvivesTheWorkerWireContract() {
+            let reply = GEPAWorkerProtocol.HostReply.evaluated(.init(
+                evaluationID: "evaluation", score: 0, feedback: "Malformed DSPy instructions",
+                outputExcerpt: "", replayed: true, candidateValid: false
+            )).jsonObject(id: "request")
+            XCTAssertEqual(reply["score"] as? Double, 0, "Evidence keeps the raw task score.")
+            XCTAssertEqual(reply["candidate_valid"] as? Bool, false, "Selection must distinguish malformed prompts from valid zero-scoring prompts.")
+            XCTAssertEqual(reply["replayed"] as? Bool, true, "Durable replay preserves candidate validity.")
+        }
+
         func testUnbundledWorkerLookupUsesCompiledSourceRootInsteadOfWorkingDirectory() throws {
             let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             defer { try? FileManager.default.removeItem(at: root) }

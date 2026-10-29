@@ -24,6 +24,39 @@
             let split: String
         }
 
+        struct ObjectivePolicy: Codable, Equatable {
+            let mode: String
+            let qualityTolerance: Double
+            let inputWeight: Double
+            let outputWeight: Double
+
+            init(_ objective: PromptLabObjective) {
+                mode = objective.mode.rawValue
+                qualityTolerance = objective.qualityTolerance
+                inputWeight = objective.inputWeight
+                outputWeight = objective.outputWeight
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case mode
+                case qualityTolerance = "quality_tolerance"
+                case inputWeight = "input_weight"
+                case outputWeight = "output_weight"
+            }
+        }
+
+        struct SeedMeasurement: Codable, Equatable {
+            let quality: Double
+            let promptTokens: Int?
+            let completionTokens: Int?
+
+            enum CodingKeys: String, CodingKey {
+                case quality
+                case promptTokens = "prompt_tokens"
+                case completionTokens = "completion_tokens"
+            }
+        }
+
         struct RunRequest: Encodable, Equatable {
             let runName: String
             let objective: String
@@ -48,13 +81,15 @@
             let skipPerfectScore: Bool
             let candidateSelectionStrategy: String
             /// Proposal ceiling as a multiple of the prompt being edited, plus an optional absolute cap.
-            let promptCharacterCeilingRatio: Double
+            let promptCharacterCeilingRatio: Double?
             var maxPromptCharacters: Int?
             let perfectScore: Double
             let stopAtScore: Double?
             let randomSeed: Int
             let runDir: String
             let outputDir: String
+            var objectivePolicy: ObjectivePolicy?
+            var seedMeasurements: [String: SeedMeasurement]?
 
             enum CodingKeys: String, CodingKey {
                 case runName = "run_name"
@@ -79,6 +114,8 @@
                 case randomSeed = "random_seed"
                 case runDir = "run_dir"
                 case outputDir = "output_dir"
+                case objectivePolicy = "objective_policy"
+                case seedMeasurements = "seed_measurements"
             }
         }
 
@@ -113,6 +150,8 @@
             var searchRemaining: Int?
             /// Answer length, for the worker's brevity objective (replays included).
             var outputCharacters: Int?
+            /// A malformed candidate is never an eligible winner, even at tied zero quality.
+            var candidateValid: Bool?
         }
 
         enum HostReply: Equatable {
@@ -141,6 +180,7 @@
                     if let completionTokens = reply.completionTokens { value["completion_tokens"] = completionTokens }
                     if let searchRemaining = reply.searchRemaining { value["search_remaining"] = searchRemaining }
                     if let outputCharacters = reply.outputCharacters { value["output_characters"] = outputCharacters }
+                    if let candidateValid = reply.candidateValid { value["candidate_valid"] = candidateValid }
                 case .budgetExhausted:
                     value["status"] = "budget_exhausted"
                 case let .failed(code, message):

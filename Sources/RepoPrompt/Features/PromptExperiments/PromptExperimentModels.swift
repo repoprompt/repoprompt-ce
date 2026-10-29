@@ -128,7 +128,7 @@
     /// Everything that can influence spend, scoring, or proposals. Its digest is what the
     /// native approval covers; any change is a different experiment.
     struct PromptExperimentAuthority: Codable, Equatable {
-        let promptID: BuiltInPromptID
+        let promptID: BuiltInPromptID?
         let promptResourceSHA256: String
         let suiteID: String
         let suiteSHA256: String
@@ -142,6 +142,8 @@
         let calibrationEvaluations: Int
         let pythonSealValue: String
         let gepaRevision: String
+        var definition: PromptLabDefinition?
+        var maxProviderInvocations: Int?
 
         func digest() throws -> String {
             try PromptExperimentDigest.canonicalSHA256(self)
@@ -193,6 +195,11 @@
         let outputCharacters: Int
         let promptTokens: Int?
         let completionTokens: Int?
+        var cachedInputTokens: Int?
+        var cacheCreationInputTokens: Int?
+        var reportedCost: Double?
+        /// Version 1 records cache-inclusive input totals. Older ledger entries are unpaired telemetry.
+        var measurementVersion: Int?
     }
 
     /// Per-candidate averages over every completed evaluation of that exact text.
@@ -452,6 +459,7 @@
         var state: PromptExperimentProposalState
         let createdAt: Date
         var decidedAt: Date?
+        var originalSourceEvidence: PromptExperimentArtifactReference?
     }
 
     // MARK: - Experiment

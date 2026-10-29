@@ -61,7 +61,7 @@
                         ForEach(otherExperiments) { experiment in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(experiment.title).lineLimit(1)
-                                Text("\(experiment.status.rawValue) · \(experiment.authority.promptID.rawValue)")
+                                Text("\(experiment.status.rawValue) · \(experiment.authority.promptDisplayName)")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             .tag(experiment.id)
@@ -76,7 +76,7 @@
                     ContentUnavailableView {
                         Label("No Prompt Experiment Selected", systemImage: "flask")
                     } description: {
-                        Text("Choose a built-in prompt and connected models, compare candidates on saved examples, then review the evidence and source diff.")
+                        Text("Improve a RepoPrompt prompt, a project's prompt file, pasted text, or an AI program. Describe your goal, review examples and checks, and compare the results before using a candidate.")
                     } actions: {
                         Button("New Experiment") { showsCreateExperiment = true }
                             .buttonStyle(.borderedProminent)
@@ -129,7 +129,7 @@
                     Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
                     Text(experiment.title).lineLimit(1).fontWeight(.semibold)
                 }
-                Text("\(experiment.authority.promptID.rawValue) · cap \(experiment.authority.maxEvaluations) evaluations")
+                Text("\(experiment.authority.promptDisplayName) · up to \(experiment.authority.maximumTotalEvaluations) evaluations")
                     .font(.caption).foregroundStyle(.secondary)
                 if let requestedAt = experiment.approvalRequest?.requestedAt {
                     Text("Requested \(requestedAt, style: .relative) ago")
@@ -145,7 +145,6 @@
         /// Presented via `sheet(item:)` so the sheet never renders before its ID is set
         /// (an `isPresented` sheet here showed an empty, undismissable modal).
         @State private var reviewedProposal: PromptExperimentProposalSelection?
-        @State private var proposalError: String?
 
         var body: some View {
             ScrollView {
@@ -186,36 +185,8 @@
                                     }
                                 }
                                 if let result = run.result {
-                                    if let noise = result.noiseFloor, !noise.bestIsBaseline {
-                                        PromptExperimentNoiseVerdict(noise: noise)
-                                    }
-                                    Text(result.assessment).font(.caption)
-                                    ForEach(result.candidates) { candidate in
-                                        VStack(alignment: .leading, spacing: 3) {
-                                            Text("Candidate #\(candidate.index)\(candidate.isBaseline ? " · baseline" : "")\(candidate.isBest ? " · best" : "") · score \(candidate.aggregateScore.map { String(format: "%.3f", $0) } ?? "—") · parents \(candidate.parentIndices.map(String.init).joined(separator: ", "))")
-                                                .font(.caption.bold())
-                                            if let usage = candidate.usage {
-                                                Text(usage.summary).font(.caption).foregroundStyle(.secondary)
-                                            }
-                                            Text(candidate.candidatePreview).font(.caption).lineLimit(6).textSelection(.enabled)
-                                            if run.state == .completed || run.state == .stoppedBudget {
-                                                Button("Propose source patch") {
-                                                    Task {
-                                                        do {
-                                                            let proposal = try await service.proposePatch(
-                                                                experimentID: experiment.id, runID: run.id, candidateIndex: candidate.index
-                                                            )
-                                                            reviewedProposal = .init(id: proposal.id)
-                                                        } catch {
-                                                            proposalError = error.localizedDescription
-                                                        }
-                                                    }
-                                                }
-                                                .font(.caption)
-                                            }
-                                        }
-                                        .padding(6)
-                                        .background(candidate.isBest ? Color.green.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                                    PromptLabRunResultsView(service: service, experiment: experiment, run: run, result: result) { proposalID in
+                                        reviewedProposal = .init(id: proposalID)
                                     }
                                 }
                                 if let error = run.error {
@@ -227,13 +198,14 @@
                             Text("Run \(run.ordinal)")
                         }
                     }
-                    if let proposalError {
-                        Text(proposalError).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                    }
                     GroupBox("Proposals") {
                         Group {
                             if experiment.proposals.isEmpty {
-                                Text("No source patch proposals yet. Reviewed patches for retained candidates are created separately from run approval.")
+                                Text(
+                                    experiment.authority.definition?.source.kind == .pasted
+                                        ? "Copy or save a candidate prompt from the results above."
+                                        : "Review a retained candidate's source change from the results above before applying it."
+                                )
                             } else {
                                 ForEach(experiment.proposals) { proposal in
                                     Button("Review candidate #\(proposal.candidateIndex) · \(proposal.state.rawValue)") {

@@ -117,6 +117,10 @@ package struct AIStreamResult {
     package let reasoning: String? // optional reasoning content
     package let promptTokens: Int? // token usage
     package let completionTokens: Int? // token usage
+    /// Final aggregate input, including cache reads/creation; not a live context snapshot.
+    package let totalInputTokens: Int?
+    package let cachedInputTokens: Int?
+    package let cacheCreationInputTokens: Int?
     package let cost: Double?
 
     // Tool-specific metadata (for type: "tool_call" or "tool_result")
@@ -161,13 +165,19 @@ package struct AIStreamResult {
         modelContextWindow: Int? = nil,
         contextUsedTokens: Int? = nil,
         contentMessageID: String? = nil,
-        cleanupHandle: ProviderConversationCleanupHandle? = nil
+        cleanupHandle: ProviderConversationCleanupHandle? = nil,
+        totalInputTokens: Int? = nil,
+        cachedInputTokens: Int? = nil,
+        cacheCreationInputTokens: Int? = nil
     ) {
         self.type = type
         self.text = text
         self.reasoning = reasoning
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
+        self.totalInputTokens = totalInputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
         self.cost = cost
         self.toolName = toolName
         self.toolArgs = toolArgs

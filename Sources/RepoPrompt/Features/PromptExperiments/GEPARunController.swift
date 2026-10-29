@@ -6,7 +6,7 @@
     struct PromptExperimentExecution {
         let experimentID: UUID
         let authorityDigest: String
-        let promptID: BuiltInPromptID
+        let promptID: BuiltInPromptID?
         let baseline: String
         let suite: PromptSuite
         let targets: PromptExperimentTargets
@@ -14,6 +14,7 @@
         let maxEvaluations: Int
         let calibrationEvaluations: Int
         let pythonSealValue: String
+        var definition: PromptLabDefinition?
 
         var baselineSHA256: String {
             PromptExperimentDigest.sha256(Data(baseline.utf8))
@@ -25,9 +26,13 @@
         /// code-owned judge prompt template.
         @MainActor
         func calibrationKey(registry: BuiltInPromptRegistry) throws -> String {
+            if definition != nil || promptID == .engineer {
+                return PromptExperimentDigest.sha256(Data("lab-contract-\(PromptLabDefinition.contractVersion):\(authorityDigest):\(baselineSHA256)".utf8))
+            }
+            guard let promptID else { throw PromptExperimentAuthorityError.invalidRequest("The experiment has no prompt source.") }
             let rendered = try ConnectedModelHarness.renderSystemPrompt(candidate: baseline, promptID: promptID, registry: registry)
             let judgeTemplate: String? = suite.grader.kind == .modelJudge
-                ? PromptExperimentDigest.sha256(Data(PromptExperimentChecklist.judgePrompt(
+                ? try PromptExperimentDigest.sha256(Data(PromptExperimentChecklist.judgePrompt(
                     guidance: "", checks: [], packagedInput: "", reference: nil, output: ""
                 ).utf8))
                 : nil
@@ -97,7 +102,7 @@
             let execution: PromptExperimentExecution
             let ledger: PromptExperimentBudgetLedger
             let invoker: PromptExperimentModelInvoker
-            let harness: ConnectedModelHarness
+            let harness: any PromptHarness
             let worker: GEPAWorkerRunning
             let progress: @MainActor @Sendable (String) async -> Void
             let checkpoint: PromptExperimentCheckpointSink
@@ -114,7 +119,7 @@
                 execution: PromptExperimentExecution,
                 ledger: PromptExperimentBudgetLedger,
                 invoker: PromptExperimentModelInvoker,
-                harness: ConnectedModelHarness,
+                harness: any PromptHarness,
                 worker: GEPAWorkerRunning,
                 progress: @escaping @MainActor @Sendable (String) async -> Void,
                 checkpoint: @escaping PromptExperimentCheckpointSink
@@ -159,21 +164,46 @@
             guard authority.gepaRevision == PromptExperimentGEPAConfiguration.pinnedRevision else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The experiment was approved for a different GEPA revision.")
             }
-            let resource = try registry.resource(authority.promptID)
-            guard resource.sha256 == authority.promptResourceSHA256 else {
-                throw PromptExperimentAuthorityError.runtimeUnavailable("The built-in '\(authority.promptID.rawValue)' resource changed after approval (now \(resource.sha256.prefix(12))). Create a new experiment against the current baseline.")
+            let baseline: String
+            let suite: PromptSuite
+            if let definition = authority.definition {
+                guard definition.contractVersion == PromptLabDefinition.contractVersion,
+                      definition.source.builtInPromptID == authority.promptID
+                else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("The experiment task contract changed. Create a new experiment.")
+                }
+                baseline = definition.source.prompt
+                suite = try definition.makeSuite()
+                if let promptID = authority.promptID {
+                    let resource = try registry.resource(promptID)
+                    guard resource.sha256 == authority.promptResourceSHA256, resource.text == baseline else {
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("The built-in prompt changed. Create a new experiment against the current baseline.")
+                    }
+                } else {
+                    guard PromptExperimentDigest.sha256(Data(baseline.utf8)) == authority.promptResourceSHA256 else {
+                        throw PromptExperimentAuthorityError.authorityChanged
+                    }
+                }
+                if let program = definition.program { _ = try program.sealed() }
+            } else {
+                guard let promptID = authority.promptID else { throw PromptExperimentAuthorityError.invalidRequest("The experiment has no prompt source.") }
+                let resource = try registry.resource(promptID)
+                guard resource.sha256 == authority.promptResourceSHA256 else {
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("The built-in prompt changed. Create a new experiment against the current baseline.")
+                }
+                baseline = resource.text
+                suite = try PromptSuiteLoader.load(promptID: promptID, registry: registry)
             }
-            let suite = try PromptSuiteLoader.load(promptID: authority.promptID, registry: registry)
             guard suite.suiteID == authority.suiteID,
                   suite.suiteSHA256 == authority.suiteSHA256,
                   suite.grader.rubric?.sha256 == authority.rubricSHA256
             else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("Suite '\(authority.suiteID)' or its rubric changed after approval. Create a new experiment against the current suite.")
             }
-            guard (suite.grader.kind == .modelJudge) == (authority.targets.judge != nil) else {
+            guard suite.grader.kind == .external || (suite.grader.kind == .modelJudge) == (authority.targets.judge != nil) else {
                 throw PromptExperimentAuthorityError.runtimeUnavailable("The judge target does not match the suite grader.")
             }
-            if let judge = authority.targets.judge,
+            if authority.definition == nil, let judge = authority.targets.judge,
                judge.judgmentModelIdentity == authority.targets.reflection.judgmentModelIdentity
             {
                 throw PromptExperimentAuthorityError.targetUnavailable("The approved judge and reflection targets use the same underlying model. Different effort levels do not make an independent judge; create a new experiment with a different judge model.")
@@ -197,13 +227,14 @@
                 experimentID: experiment.id,
                 authorityDigest: experiment.authorityDigest,
                 promptID: authority.promptID,
-                baseline: resource.text,
+                baseline: baseline,
                 suite: suite,
                 targets: authority.targets,
                 settings: authority.settings,
                 maxEvaluations: authority.maxEvaluations,
                 calibrationEvaluations: authority.calibrationEvaluations,
-                pythonSealValue: authority.pythonSealValue
+                pythonSealValue: authority.pythonSealValue,
+                definition: authority.definition
             )
         }
 
@@ -216,7 +247,8 @@
             runRoot: URL,
             searchRemaining: Int,
             heldOutBaseline: [String: Double]? = nil,
-            seedOutputCharacters: [String: Int] = [:]
+            seedOutputCharacters: [String: Int] = [:],
+            seedMeasurements: [String: GEPAWorkerProtocol.SeedMeasurement] = [:]
         ) -> GEPAWorkerProtocol.RunRequest {
             /// Only identifiers, splits, and development inputs cross to the worker; held-out
             /// inputs, expected outputs, and rubrics stay host-side.
@@ -224,10 +256,13 @@
                 .init(id: example.id, split: example.split.rawValue, input: example.input)
             }
             let settings = execution.settings
+            let defaultBackground = execution.promptID == .engineer
+                ? "The candidate is RPCE's Engineer system prompt template. It runs real file-editing tasks in fresh isolated fixtures. Independent acceptance checks grade the resulting files. Preserve every {{rpce.*}} runtime marker exactly once, along with the tool protocols; code supplies provider-specific fragments."
+                : "The candidate is the complete prompt body. RepoPrompt appends fixed response-format instructions to it and sends each case as a production Oracle user message (frozen file map and file contents, then the case input in <user_instructions>) to a model with no tools. Preserve the prompt's role and output contract; do not memorize individual cases."
             return GEPAWorkerProtocol.RunRequest(
                 runName: "rpce-\(execution.experimentID.uuidString.lowercased())",
-                objective: "Improve RepoPrompt's built-in '\(execution.promptID.rawValue)' system prompt so the target model's answers pass more of the checks in suite '\(execution.suite.suiteID)', with the prompt no longer than it needs to be and answers no longer than each request needs. Quality comes first; at equal quality, shorter wins.",
-                background: "The candidate is the complete prompt body. RepoPrompt appends fixed response-format instructions to it and sends each case as a production Oracle user message (frozen file map and file contents, then the case input in <user_instructions>) to a model with no tools. Preserve the prompt's role and output contract; do not memorize individual cases.",
+                objective: execution.definition?.goal ?? "Improve RepoPrompt's built-in '\(execution.promptID?.rawValue ?? "prompt")' system prompt so the target model's answers pass more of the checks in suite '\(execution.suite.suiteID)', with the prompt no longer than it needs to be and answers no longer than each request needs. Quality comes first; at equal quality, shorter wins.",
+                background: execution.definition?.background ?? defaultBackground,
                 seedCandidate: execution.baseline,
                 examples: execution.suite.cases.filter { $0.split != .hiddenTest }.map(wire),
                 heldOutExamples: execution.suite.cases.filter { $0.split == .hiddenTest }
@@ -247,13 +282,15 @@
                 maxMergeInvocations: settings.maxMergeInvocations,
                 skipPerfectScore: settings.skipPerfectScore,
                 candidateSelectionStrategy: settings.candidateSelectionStrategy,
-                promptCharacterCeilingRatio: settings.promptCharacterCeilingRatio,
+                promptCharacterCeilingRatio: execution.definition == nil ? settings.promptCharacterCeilingRatio : execution.definition?.relativePromptLimit,
                 maxPromptCharacters: settings.maxPromptCharacters,
                 perfectScore: execution.suite.grader.scoreRange.max,
                 stopAtScore: settings.stopAtScore,
                 randomSeed: settings.randomSeed,
                 runDir: runRoot.appendingPathComponent("gepa-run", isDirectory: true).path,
-                outputDir: runRoot.appendingPathComponent("gepa-output", isDirectory: true).path
+                outputDir: runRoot.appendingPathComponent("gepa-output", isDirectory: true).path,
+                objectivePolicy: execution.definition.map { .init($0.objective) },
+                seedMeasurements: seedMeasurements.isEmpty ? nil : seedMeasurements
             )
         }
 
@@ -267,6 +304,17 @@
         func preflight(_ experiment: PromptExperiment) async throws {
             let execution = try Self.resolveExecution(experiment, registry: environment.registry)
             try await environment.preflightWorker(execution.pythonSealValue)
+            if execution.definition?.runner == .engineer || execution.promptID == .engineer {
+                guard execution.promptID != .engineer || AgentModePrompts.isValidEngineerTemplate(execution.baseline) else {
+                    throw PromptExperimentAuthorityError.invalidRequest("The Engineer prompt is missing required runtime fragments.")
+                }
+                for example in execution.suite.cases {
+                    try PromptExperimentAgentHarness.validate(case: example)
+                }
+            }
+            if let definition = execution.definition, definition.runner == .program || definition.runner == .dspy {
+                try await PromptLabProgramHarness.preflight(definition: definition)
+            }
         }
 
         // MARK: - Runtime boundary
@@ -325,18 +373,33 @@
                 backoffSleep: environment.backoffSleep,
                 jitter: environment.jitter
             )
-            let harness = ConnectedModelHarness(
-                promptID: execution.promptID,
-                executionTarget: execution.targets.execution,
-                registry: environment.registry,
-                invoker: invoker,
-                grader: PromptExperimentGrader(
-                    grader: execution.suite.grader,
-                    judgeTarget: execution.targets.judge
-                ),
-                checkpoint: checkpoint,
-                progress: progress
-            )
+            let harness: any PromptHarness
+            do {
+                harness = if execution.definition?.runner == .engineer || execution.promptID == .engineer {
+                    try PromptExperimentAgentHarness(
+                        executionTarget: execution.targets.execution,
+                        evaluationRoot: runRoot.appendingPathComponent("agent-tasks", isDirectory: true),
+                        pythonExecutable: PromptExperimentGEPAWorker.resolvePythonExecutable(sealedValue: execution.pythonSealValue),
+                        usesProductionTemplate: execution.promptID == .engineer,
+                        checkpoint: checkpoint, progress: progress
+                    )
+                } else if let definition = execution.definition, definition.runner == .program || definition.runner == .dspy {
+                    try PromptLabProgramHarness(definition: definition, targets: execution.targets, invoker: invoker, progress: progress)
+                } else {
+                    ConnectedModelHarness(
+                        promptID: execution.promptID, executionTarget: execution.targets.execution,
+                        registry: environment.registry, invoker: invoker,
+                        grader: PromptExperimentGrader(
+                            grader: execution.suite.grader, judgeTarget: execution.targets.judge,
+                            useFramedData: execution.definition != nil
+                        ),
+                        checkpoint: checkpoint, progress: progress, definition: execution.definition
+                    )
+                }
+            } catch {
+                activeRunDirectories.remove(relativeRunDirectory)
+                throw PromptExperimentSubmissionError.rejected(error.localizedDescription)
+            }
             let worker = environment.makeWorker()
             let run = ActiveRun(
                 runID: runID,
@@ -364,7 +427,8 @@
                         runRoot: runRoot,
                         searchRemaining: ledger.remaining(in: .search),
                         heldOutBaseline: run.calibration.heldOutScores,
-                        seedOutputCharacters: Self.seedOutputCharacters(seedSHA256: execution.baselineSHA256, ledger: ledger)
+                        seedOutputCharacters: Self.seedOutputCharacters(seedSHA256: execution.baselineSHA256, ledger: ledger),
+                        seedMeasurements: Self.seedMeasurements(seedSHA256: execution.baselineSHA256, ledger: ledger)
                     )
                     let completion = try await worker.run(
                         request: workerRequest,
@@ -476,7 +540,8 @@
                     promptTokens: outcome.usage?.promptTokens,
                     completionTokens: outcome.usage?.completionTokens,
                     searchRemaining: run.ledger.remaining(in: .search),
-                    outputCharacters: split == .hiddenTest ? nil : outcome.usage?.outputCharacters
+                    outputCharacters: split == .hiddenTest ? nil : outcome.usage?.outputCharacters,
+                    candidateValid: outcome.failureKind != .candidate
                 ))
             }
         }
@@ -565,7 +630,8 @@
             }
             let key = try execution.calibrationKey(registry: environment.registry)
             let seedSHA256 = execution.baselineSHA256
-            let cached = PromptExperimentCalibrationCache.load(storeRoot: environment.storeRoot, key: key)
+            let cached = execution.definition == nil && execution.promptID != .engineer
+                ? PromptExperimentCalibrationCache.load(storeRoot: environment.storeRoot, key: key) : nil
             var heldOut = cached.flatMap { $0.hasHeldOutBaseline(for: cases) ? $0.heldOutScores : nil }
             var replicates = Array((cached?.completeReplicates(for: cases) ?? []).prefix(replicatesWanted))
             let missingHeldOut = !hidden.isEmpty && heldOut == nil
@@ -814,6 +880,20 @@
             return lengths.mapValues(\.characters)
         }
 
+        static func seedMeasurements(seedSHA256: String, ledger: PromptExperimentBudgetLedger) -> [String: GEPAWorkerProtocol.SeedMeasurement] {
+            var measurements: [String: GEPAWorkerProtocol.SeedMeasurement] = [:]
+            for entry in ledger.document.entries where entry.candidateSHA256 == seedSHA256
+                && entry.replicate == 0 && entry.state == .completed && entry.split != .hiddenTest
+            {
+                guard let outcome = entry.outcome else { continue }
+                measurements[entry.exampleID] = .init(
+                    quality: outcome.score, promptTokens: outcome.usage?.promptTokens,
+                    completionTokens: outcome.usage?.completionTokens
+                )
+            }
+            return measurements
+        }
+
         /// Averages over every completed evaluation of this exact text on visible splits
         /// (replays included, since the ledger holds the whole experiment).
         static func candidateUsage(text: String, ledger: PromptExperimentBudgetLedger) -> PromptExperimentCandidateUsage? {
@@ -841,6 +921,7 @@
         }
 
         static func failureReply(_ error: Error) -> GEPAWorkerProtocol.HostReply {
+            if let authorityError = error as? PromptExperimentAuthorityError, authorityError == .budgetExhausted { return .budgetExhausted }
             if error is CancellationError {
                 return .failed(code: "cancelled", message: "The run was cancelled.")
             }

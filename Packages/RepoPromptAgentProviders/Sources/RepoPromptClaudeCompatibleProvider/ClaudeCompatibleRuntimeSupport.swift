@@ -767,7 +767,14 @@ public enum ClaudeCompatibleHeadlessRuntime {
             args.append(contentsOf: ["--system-prompt", systemPromptOverride])
         }
 
-        args.append("--dangerously-skip-permissions")
+        // Headless callers choose their permission profile explicitly. Discovery keeps
+        // its historical bypass profile; isolated coding experiments use normal permissions
+        // with an exact allowlist of their approved fixture tools.
+        if request.runtimeConfig.permissionMode == "bypassPermissions" {
+            args.append("--dangerously-skip-permissions")
+        } else {
+            args.append(contentsOf: ["--permission-mode", request.runtimeConfig.permissionMode])
+        }
 
         if let mcpConfigPath = request.mcpConfigPath {
             args.append(contentsOf: ["--mcp-config", mcpConfigPath])

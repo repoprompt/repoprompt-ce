@@ -1148,7 +1148,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             }
             return MCPDomainToolDefinition(
                 name: MCPWindowToolName.promptExperiment,
-                description: "Optimize a RepoPrompt built-in prompt with upstream GEPA against its checked-in suite: targets, create_or_update (typed fields, aggregated field errors), request_approval (native card; only the user approves, which covers the whole cap and starts the first run), run (resume within the remaining approved cap), status_or_wait, cancel, propose_patch (reviewed source diff for a retained candidate). Changing an approved experiment's authority creates a new experiment. The tool cannot approve or apply a candidate.",
+                description: "Improve a RepoPrompt prompt, a project's prompt file or source passage, a pasted template, or a Python/DSPy program through one experiment lab. targets discovers prompts and models. prepare drafts examples/checks in one bounded model call; describe_program executes the selected local Python module to load a definition. Review the returned definition, then create_or_update and request_approval. Only the user can approve the full budget in native UI, which starts the first run. run resumes, status_or_wait observes, cancel stops, propose_patch prepares a reviewed source diff, export saves complete evidence. Built-in Engineer tasks run with file read/edit tools in isolated fixtures. Changes to approved authority require new approval. This tool cannot approve an optimization or apply a source patch.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
@@ -1159,23 +1159,34 @@ package enum MCPDomainCanonicalToolDefinitions {
                         "experiment_id": string("Experiment UUID. Optional for create_or_update (update) and status_or_wait (omit to list)."),
                         "expected_authority_digest": string("request_approval: the authority_digest you reviewed; refused if it changed."),
                         "title": string("create_or_update: display title."),
-                        "prompt_id": string("create_or_update: built-in prompt ID from targets."),
+                        "prompt_id": string("prepare or create_or_update: built-in prompt ID from targets. For a custom task, use definition instead of prompt_id in create_or_update."),
+                        "prompt_text": string("prepare: prompt text or template; choose exactly one of prompt_id, prompt_text and prompt_file."),
+                        "prompt_file": string("prepare: absolute path to a UTF-8 prompt/source file. Its original bytes are checked before applying a result."),
+                        "source_title": string("prepare: display name for a pasted prompt."),
+                        "selection": string("prepare with prompt_file: exact, unique prompt passage to optimize; omit to use the complete file."),
+                        "goal": string("prepare: plain-language description of the desired improvement."),
+                        "example_inputs": string("prepare: optional example requests or topics, one per line, to guide the generated cases."),
+                        "criteria": string("prepare: optional success requirements, one per line."),
+                        "definition": promptLabDefinitionSchema,
+                        "program": promptLabProgramSchema,
+                        "runner": .object(["type": .string("string"), "enum": .array([.string("program"), .string("dspy")]), "description": .string("describe_program: which kind of project evaluator to load; defaults to program.")]),
                         "suite_id": string("create_or_update: suite ID from targets; defaults to the prompt's checked-in suite."),
                         "execution_target": string("create_or_update: prompt-only target selector for the evaluated model."),
-                        "reflection_target": string("create_or_update: prompt-only target selector for GEPA reflection."),
+                        "reflection_target": string("prepare or create_or_update: model selector for drafting experiments or proposing prompt changes."),
                         "judge_target": string("create_or_update: judge target selector for model-judged suites."),
-                        "max_evaluations": integer("create_or_update: total evaluation cap the user approves."),
+                        "max_evaluations": integer("create_or_update: search evaluation cap. Approval also includes the separate baseline calibration allowance; these are not model-call or dollar caps."),
                         "reflection_minibatch_size": integer("create_or_update: GEPA reflection minibatch size, 1-100."),
                         "max_provider_retries": integer("create_or_update: retries per provider call for transient failures, 0-3."),
                         "random_seed": integer("create_or_update: GEPA random seed."),
                         "prompt_character_ceiling_ratio": .object([
                             "type": .string("number"),
-                            "description": .string("create_or_update: hard ceiling for a proposed prompt as a multiple of the prompt being edited, 0.25-4.0. Default 1.0 (proposals never grow the prompt).")
+                            "description": .string("create_or_update: optional hard ceiling for a proposed prompt as a multiple of its parent, 0.25-4.0. Generic definitions have no relative ceiling unless selected; legacy built-in requests default to 1.0.")
                         ]),
                         "max_prompt_characters": integer("create_or_update: optional absolute prompt-length ceiling in characters, 200-200000."),
-                        "noise_floor_replicates": integer("create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; cached across experiments."),
-                        "run_id": string("propose_patch: completed run UUID."),
+                        "noise_floor_replicates": integer("create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; definition-backed labs use a fresh baseline for each experiment."),
+                        "run_id": string("propose_patch or export: completed run UUID."),
                         "candidate_index": integer("propose_patch: retained GEPA candidate index."),
+                        "output_path": string("export: absolute destination for a JSON file containing the frozen definition, results and inline evidence artifacts."),
                         "timeout_seconds": .object([
                             "type": .string("number"),
                             "description": .string("status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60.")
@@ -1190,6 +1201,96 @@ package enum MCPDomainCanonicalToolDefinitions {
                     openWorldHint: false
                 )
             )
+        }
+
+        private static var promptLabProgramSchema: Value {
+            .object([
+                "type": .string("object"), "additionalProperties": .bool(false),
+                "description": .string("Project evaluator configuration. Loading or running it executes this local program. Nested names use camelCase, matching the definition returned by prepare/describe_program."),
+                "properties": .object([
+                    "pythonExecutable": .object(["type": .string("string"), "description": .string("Absolute path to the project's Python executable, with its dependencies installed.")]),
+                    "projectRoot": .object(["type": .string("string"), "description": .string("Absolute project directory.")]),
+                    "modulePath": .object(["type": .string("string"), "description": .string("Evaluation .py file inside the project; relative to projectRoot or absolute.")]),
+                    "callable": .object(["type": .string("string"), "default": .string("evaluate")]),
+                    "timeoutSeconds": .object(["type": .string("number"), "default": .int(120)]),
+                    "environmentKeys": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Names of additional environment variables the evaluator may inherit. Secret values are never stored in the definition. Defaults to none.")]),
+                    "modelRouting": .object(["type": .string("string"), "enum": .array([.string("connected"), .string("project")]), "description": .string("Routing returned by program discovery. Project routing preserves the program's own model client; its calls are outside the RPCE provider-session limit.")]),
+                    "dependencySHA256": .object(["type": .string("object"), "additionalProperties": .object(["type": .string("string")]), "description": .string("Hashes of project Python sources and dependency declarations, returned by discovery and preserved for admission and resume checks.")]),
+                    "moduleSHA256": .object(["type": .string("string"), "description": .string("Evaluator hash returned by discovery; preserves the reviewed evaluator on resume.")])
+                ]),
+                "required": .array(["pythonExecutable", "projectRoot", "modulePath"].map(Value.string))
+            ])
+        }
+
+        private static var promptLabDefinitionSchema: Value {
+            func text(_ description: String = "") -> Value {
+                .object(["type": .string("string"), "description": .string(description)])
+            }
+            func number(_ value: Double) -> Value {
+                .object(["type": .string("number"), "default": .double(value)])
+            }
+            let context: Value = .object([
+                "type": .string("object"), "additionalProperties": .bool(false),
+                "properties": .object([
+                    "fileTree": text("Optional frozen file map."),
+                    "files": .object([
+                        "type": .string("array"),
+                        "items": .object([
+                            "type": .string("object"), "additionalProperties": .bool(false),
+                            "properties": .object(["path": text(), "content": text()]),
+                            "required": .array([.string("path"), .string("content")])
+                        ])
+                    ])
+                ]), "required": .array([.string("files")])
+            ])
+            let example: Value = .object([
+                "type": .string("object"), "additionalProperties": .bool(false),
+                "properties": .object([
+                    "id": text("Unique example identifier."),
+                    "split": .object(["type": .string("string"), "enum": .array(["training", "validation", "hidden_test"].map(Value.string))]),
+                    "input": text("Actual user request sent to the task runner."),
+                    "expectedOutput": text("Optional private reference answer or agent acceptance specification. Never sent as task input."),
+                    "variables": .object(["type": .string("object"), "additionalProperties": .object(["type": .string("string")]), "description": .string("Values for {{name}} placeholders in a plain prompt template.")]),
+                    "payload": .object(["type": .string("object"), "additionalProperties": .bool(true), "description": .string("Original project/DSPy dataset fields, including nested JSON, preserved for the evaluator.")]),
+                    "context": context
+                ]), "required": .array(["id", "split", "input"].map(Value.string))
+            ])
+            return .object([
+                "type": .string("object"), "additionalProperties": .bool(false),
+                "description": .string("create_or_update: frozen task definition. Review/edit the object returned by prepare or describe_program, then submit it here. Nested fields use camelCase. Include at least one training, validation and hidden_test example."),
+                "properties": .object([
+                    "source": .object([
+                        "type": .string("object"), "additionalProperties": .bool(false),
+                        "properties": .object([
+                            "kind": .object(["type": .string("string"), "enum": .array(["builtIn", "file", "pasted"].map(Value.string))]),
+                            "title": text(), "prompt": text("Starting prompt or template."),
+                            "builtInPromptID": text(), "filePath": text(), "originalFileSHA256": text(), "selection": text(),
+                            "literal": .object([
+                                "type": .string("object"), "additionalProperties": .bool(false),
+                                "description": .string("Encoding metadata returned by source import; preserve it unchanged so source application can re-encode the decoded prompt safely."),
+                                "properties": .object([
+                                    "language": .object(["type": .string("string"), "enum": .array(["json", "python", "javascript", "swift"].map(Value.string))]),
+                                    "token": text("The complete original quoted literal, including its delimiters.")
+                                ]), "required": .array([.string("language"), .string("token")])
+                            ])
+                        ]), "required": .array(["kind", "title", "prompt"].map(Value.string))
+                    ]),
+                    "goal": text("The improvement the user wants."),
+                    "objective": .object([
+                        "type": .string("object"), "additionalProperties": .bool(false),
+                        "properties": .object([
+                            "mode": .object(["type": .string("string"), "enum": .array([.string("quality"), .string("efficiency")]), "default": .string("quality")]),
+                            "qualityTolerance": number(0), "inputWeight": number(1), "outputWeight": number(1)
+                        ])
+                    ]),
+                    "runner": .object(["type": .string("string"), "enum": .array(["plainPrompt", "oracle", "engineer", "program", "dspy"].map(Value.string)), "default": .string("plainPrompt")]),
+                    "examples": .object(["type": .string("array"), "items": example]),
+                    "criteria": text("Success requirements, one per line; saved weighted checklists are also accepted."),
+                    "program": promptLabProgramSchema,
+                    "relativePromptLimit": .object(["type": .string("number"), "description": .string("Optional prompt-length ceiling relative to a parent; omitted means no relative ceiling. An explicit 1.0 forbids growth.")]),
+                    "contractVersion": .object(["type": .string("integer"), "default": .int(1)])
+                ]), "required": .array(["source", "goal", "examples", "criteria"].map(Value.string))
+            ])
         }
     #endif
 
@@ -4099,8 +4200,8 @@ package enum MCPDefaultRepositoryElectionCopy {
     package static let manageWorktreeRepoRootProperty =
         "Optional loaded root path/name or repo/worktree specifier. When omitted, app-backed calls use the session's sole worktree binding, or declared PRIMARY with no bindings; multiple bindings require an identifying selector."
 
-    // `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
-    // inheritance copies the source session's complete binding set. The agent control provider reuses these.
+    /// `agent_run` startup keeps its own rules: explicit and created startup worktrees are PRIMARY-only, and
+    /// inheritance copies the source session's complete binding set. The agent control provider reuses these.
     static let agentRunObsoleteWorktreeArgs =
         "Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree."
     package static let agentRunWorktreeArgs =

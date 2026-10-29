@@ -47,11 +47,21 @@ struct TokenUsage {
     let inputTokens: Int
     let outputTokens: Int
     let contextUsedTokens: Int?
+    /// Verified aggregate input including cached reads/writes; distinct from a context snapshot.
+    let totalInputTokens: Int?
+    let cachedInputTokens: Int?
+    let cacheCreationInputTokens: Int?
 
-    init(inputTokens: Int, outputTokens: Int, contextUsedTokens: Int? = nil) {
+    init(
+        inputTokens: Int, outputTokens: Int, contextUsedTokens: Int? = nil,
+        totalInputTokens: Int? = nil, cachedInputTokens: Int? = nil, cacheCreationInputTokens: Int? = nil
+    ) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.contextUsedTokens = contextUsedTokens
+        self.totalInputTokens = totalInputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
     }
 }
 

@@ -926,6 +926,49 @@ import XCTest
             XCTAssertEqual(ConnectedModelHarness.outputExcerpt("short"), "short")
         }
 
+        func testProjectPromptRendersVariablesAndContextAndRejectsBrokenCandidatesBeforeCallingModel() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root)
+            let completer = FakeCompleter()
+            var example = PromptSuiteCase(
+                id: "blog", split: .validation, input: "Write about {{topic}}.", expectedOutput: "good",
+                context: .init(fileTree: nil, files: [.init(path: "facts.md", content: "Reviewed source facts")]),
+                variables: ["audience": "new readers", "topic": "Swift"]
+            )
+            let definition = PromptLabDefinition(
+                source: .init(kind: .pasted, title: "Blog prompt", prompt: "Write for {{audience}}."),
+                goal: "Improve useful writing", examples: [example], criteria: "Uses supplied facts"
+            )
+            let invoker = PromptExperimentModelInvoker(
+                completer: completer, policy: .init(maxRetries: 0), checkpoint: { _ in }, callbackRootBase: root
+            )
+            let harness = ConnectedModelHarness(
+                promptID: nil, executionTarget: Self.executionTarget, registry: registry, invoker: invoker,
+                grader: .init(grader: .init(kind: .exactMatch, scoreRange: .init(min: 0, max: 1), rubric: nil), judgeTarget: nil),
+                checkpoint: { _ in }, progress: { _ in }, definition: definition
+            )
+            completer.handler = { _, system, input in
+                XCTAssertEqual(system, "Write for new readers.")
+                XCTAssertTrue(input.contains("Reviewed source facts"))
+                XCTAssertTrue(input.contains("Write about Swift."))
+                XCTAssertFalse(input.contains("good"), "The reference answer stays out of task inputs.")
+                return "good"
+            }
+            let outcome = try await harness.evaluate(candidate: definition.source.prompt, example: example, evaluationID: UUID())
+            XCTAssertEqual(outcome.score, 1)
+            XCTAssertEqual(outcome.usage?.promptTokens, 3)
+            let invalid = try await harness.evaluate(candidate: "Drops the required variable", example: example, evaluationID: UUID())
+            XCTAssertEqual(invalid.failureKind, .candidate)
+            XCTAssertEqual(completer.executionCalls, 1, "Malformed proposals make no model calls.")
+
+            example.context = nil
+            completer.handler = { _, _, input in
+                XCTAssertEqual(input, "Write about Swift.", "A plain prompt without context uses the actual user input directly.")
+                return "good"
+            }
+            _ = try await harness.evaluate(candidate: definition.source.prompt, example: example, evaluationID: UUID())
+        }
+
         func testCaseInputIsPackagedLikeAProductionOracleUserMessage() throws {
             let example = PromptSuiteCase(
                 id: "t1", split: .training, input: "Plan the change.", expectedOutput: nil,
@@ -995,6 +1038,116 @@ import XCTest
             XCTAssertThrowsError(try GEPARunController.resolveExecution(experiment, registry: drifted)) { error in
                 XCTAssertTrue(error.localizedDescription.contains("changed after approval"))
             }
+        }
+    }
+#endif
+
+#if DEBUG
+    final class PromptLabUsageComparisonTests: XCTestCase {
+        private let reference = PromptExperimentArtifactReference(sha256: "test", relativePath: "test.txt", byteCount: 4)
+
+        private func evaluation(
+            _ candidate: Int,
+            _ id: String,
+            _ input: Int?,
+            _ output: Int?,
+            split: PromptSuiteSplit = .validation,
+            version: Int? = 1
+        ) -> PromptExperimentEvaluationEvidence {
+            .init(
+                id: UUID(),
+                candidateIndex: candidate,
+                exampleID: id,
+                split: split,
+                score: 1,
+                feedback: "passes",
+                failureKind: nil,
+                outputEvidence: nil,
+                elapsedSeconds: nil,
+                usage: .init(promptCharacters: 10, outputCharacters: 10, promptTokens: input, completionTokens: output, measurementVersion: version)
+            )
+        }
+
+        private func result(_ evaluations: [PromptExperimentEvaluationEvidence], best: Int = 1) -> PromptExperimentOptimizationResult {
+            .init(
+                engine: "gepa",
+                upstreamRevision: "test",
+                baselineScore: 1,
+                bestScore: 1,
+                bestCandidateIndex: best,
+                candidates: [0, 1].map {
+                    .init(
+                        id: UUID(),
+                        index: $0,
+                        parentIndices: [],
+                        candidateEvidence: reference,
+                        candidatePreview: "prompt",
+                        aggregateScore: 1,
+                        isBaseline: $0 == 0,
+                        isBest: $0 == best
+                    )
+                },
+                evaluations: evaluations,
+                totalEvaluations: evaluations.count,
+                wallTimeSeconds: nil,
+                proposerUsage: "",
+                rawResultEvidence: nil,
+                stopReason: nil
+            )
+        }
+
+        func testPairedInputAndOutputSavingsUseTheSameCases() throws {
+            let comparison = try XCTUnwrap(result([
+                evaluation(0, "a", 100, 50), evaluation(0, "b", 200, 150),
+                evaluation(1, "a", 80, 40), evaluation(1, "b", 160, 120),
+                evaluation(1, "training-only", 1, 1, split: .training)
+            ]).usageComparison)
+            XCTAssertEqual(comparison.caseCount, 2)
+            XCTAssertEqual(comparison.baselineInputTokens, 300)
+            XCTAssertEqual(comparison.candidateInputTokens, 240)
+            XCTAssertEqual(try XCTUnwrap(comparison.inputReduction), 0.2, accuracy: 0.000001)
+            XCTAssertEqual(try XCTUnwrap(comparison.outputReduction), 0.2, accuracy: 0.000001)
+        }
+
+        func testMissingNewestUsageDoesNotReuseAnEarlierCalibrationSample() throws {
+            let comparison = try XCTUnwrap(result([
+                evaluation(0, "a", 100, 100), evaluation(1, "a", 80, 80),
+                evaluation(1, "a", nil, nil)
+            ]).usageComparison)
+            XCTAssertNil(comparison.inputReduction)
+            XCTAssertNil(comparison.outputReduction)
+            XCTAssertEqual(comparison.pairedInputCases, 0)
+        }
+
+        func testMissingCaseAndLegacyUsageCannotBeReportedAsSavings() throws {
+            let comparison = try XCTUnwrap(result([
+                evaluation(0, "a", 100, 100, version: nil), evaluation(0, "b", 100, 100),
+                evaluation(1, "a", 1, 1)
+            ]).usageComparison)
+            XCTAssertEqual(comparison.caseCount, 2)
+            XCTAssertNil(comparison.inputReduction)
+            XCTAssertNil(comparison.outputReduction)
+            XCTAssertTrue(comparison.summary.contains("incomplete"))
+        }
+
+        func testFinalChecksTakePrecedenceOverDevelopmentSavings() throws {
+            let comparison = try XCTUnwrap(result([
+                evaluation(0, "v", 100, 100), evaluation(1, "v", 10, 10),
+                evaluation(0, "h", 100, 100, split: .hiddenTest), evaluation(1, "h", 120, 110, split: .hiddenTest)
+            ]).usageComparison)
+            XCTAssertEqual(comparison.split, .hiddenTest)
+            XCTAssertEqual(try XCTUnwrap(comparison.inputReduction), -0.2, accuracy: 0.000001)
+            XCTAssertEqual(try XCTUnwrap(comparison.outputReduction), -0.1, accuracy: 0.000001)
+        }
+
+        func testRetainedSeedReportsZeroSavingsAndRepeatsHaveNoExtraWeight() throws {
+            let comparison = try XCTUnwrap(result([
+                evaluation(0, "a", 1000, 1000), evaluation(0, "a", 100, 50)
+            ], best: 0).usageComparison)
+            XCTAssertEqual(comparison.caseCount, 1)
+            XCTAssertEqual(comparison.baselineInputTokens, 100)
+            XCTAssertEqual(comparison.inputReduction, 0)
+            XCTAssertEqual(comparison.outputReduction, 0)
         }
     }
 #endif

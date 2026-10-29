@@ -9,20 +9,103 @@
             let authority = experiment.authority
             let settings = authority.settings
             VStack(alignment: .leading, spacing: 6) {
-                field("Built-in prompt", "\(authority.promptID.rawValue) · resource \(authority.promptResourceSHA256.prefix(12))")
-                field("Suite", "\(authority.suiteID) · \(authority.suiteSHA256.prefix(12))\(authority.rubricSHA256.map { " · rubric \($0.prefix(12))" } ?? "")")
-                field("Execution model", authority.targets.execution.displayName)
-                field("Reflection model", authority.targets.reflection.displayName)
-                field("Judge", authority.targets.judge?.displayName ?? "Exact match (no judge model)")
+                field("Prompt", authority.promptDisplayName)
+                field("Source", authority.sourceDescription)
+                if let definition = authority.definition {
+                    definitionDetails(definition)
+                }
+                field(authority.definition?.program?.modelRouting == .project ? "RPCE callbacks" : "Execution model", authority.targets.execution.displayName)
+                field("Proposes changes", authority.targets.reflection.displayName)
+                field("Judge", authority.targets.judge?.displayName ?? (authority.definition?.runner.usesModelJudge == false ? "Task acceptance checks" : "Exact match (no judge model)"))
+                if let judge = authority.targets.judge, judge.judgmentModelIdentity == authority.targets.reflection.judgmentModelIdentity {
+                    Text("The same model proposes changes and judges answers. The evaluation may share that model's preferences.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 field("Maximum work", authority.approvalBudgetSummary)
+                if let cap = authority.maxProviderInvocations {
+                    field("RPCE sessions", "Up to \(cap) provider sessions across all runs, including execution, proposed changes, judging and retries. Agent turns are also bounded within each session.")
+                }
                 field("Search cap", "\(authority.maxEvaluations) · \(experiment.admissionsUsed) used · \(experiment.remainingEvaluations) remaining")
-                field("Calibration", "up to \(authority.calibrationEvaluations) more for the seed baseline (held-out + \(settings.noiseFloorReplicates) noise-floor pass\(settings.noiseFloorReplicates == 1 ? "" : "es")) · \(experiment.calibrationAdmissionsUsed) used · none when the cross-experiment cache already has it")
-                Text("An evaluation may call both the target and a judge. Reflection, repairs and retries add model calls; these counts are not a model-call or dollar cap.")
+                field("Calibration", "up to \(authority.calibrationEvaluations) more for the seed baseline (held-out + \(settings.noiseFloorReplicates) noise-floor pass\(settings.noiseFloorReplicates == 1 ? "" : "es")) · \(experiment.calibrationAdmissionsUsed) used" + (authority.definition == nil ? " · matching legacy calibration may be reused" : " · fresh baseline for this experiment"))
+                Text("An evaluation may call both the target and a judge. Proposed changes, repairs and retries add provider sessions. The evaluation count is not a dollar cap; the separate provider-session limit applies when shown.")
                     .font(.caption).foregroundStyle(.secondary)
-                field("GEPA", "minibatch \(settings.reflectionMinibatchSize) · \(settings.candidateSelectionStrategy) · merge \(settings.useMerge ? "on" : "off") · provider retries \(settings.maxProviderRetries) · judge repairs 1 per evaluation · seed \(settings.randomSeed)")
-                field("Objectives", "quality first, then brevity (prompt and answer length) · proposals ≤ \(String(format: "%.2f", settings.promptCharacterCeilingRatio))× the edited prompt\(settings.maxPromptCharacters.map { " and ≤ \($0) chars" } ?? "")")
-                field("Authority digest", String(experiment.authorityDigest.prefix(24)))
+                DisclosureGroup("Experiment settings and integrity") {
+                    field("Suite", "\(authority.suiteID) · \(authority.suiteSHA256.prefix(12))\(authority.rubricSHA256.map { " · rubric \($0.prefix(12))" } ?? "")")
+                    field("Prompt hash", authority.promptResourceSHA256)
+                    field("GEPA", "minibatch \(settings.reflectionMinibatchSize) · \(settings.candidateSelectionStrategy) · merge \(settings.useMerge ? "on" : "off") · provider retries \(settings.maxProviderRetries) · judge repairs 1 per evaluation · seed \(settings.randomSeed)")
+                    let relativeLimit = authority.definition.map { definition in
+                        definition.relativePromptLimit.map { "\(String(format: "%.2f", $0))× the edited prompt" } ?? "No relative prompt length limit"
+                    } ?? "\(String(format: "%.2f", settings.promptCharacterCeilingRatio))× the edited prompt"
+                    field("Prompt ceiling", relativeLimit + (settings.maxPromptCharacters.map { " · ≤ \($0) chars" } ?? ""))
+                    field("Authority digest", experiment.authorityDigest)
+                }
             }
+        }
+
+        @ViewBuilder
+        private func definitionDetails(_ definition: PromptLabDefinition) -> some View {
+            field("Goal", definition.goal)
+            field("Task runner", definition.runner.labDisplayName)
+            let objective = definition.objective
+            field(
+                "Priority",
+                objective.mode == .efficiency
+                    ? "Fewer reported tokens; maximum quality decrease \(String(format: "%.3f", objective.qualityTolerance)) · input weight \(objective.inputWeight) · output weight \(objective.outputWeight)"
+                    : "Quality first, then prompt and output brevity"
+            )
+            field("Examples", "\(definition.examples.count(where: { $0.split == .training })) used to improve · \(definition.examples.count(where: { $0.split == .validation })) to compare · \(definition.examples.count(where: { $0.split == .hiddenTest })) final checks")
+            if definition.runner == .engineer {
+                field("Agent scope", "Fresh fixture for each task · file read/edit tools only · no shell, web or delegation. Private acceptance checks stay outside writable files.")
+                field("Agent limits", agentLimits(definition))
+            }
+            if let program = definition.program {
+                field("Model routing", program.modelRouting == .project ? "Project's configured model client and settings; usage must be reported by its evaluator" : "Selected RPCE model for context callbacks; project code may also use its own client")
+                field("Local program", "\(program.pythonExecutable) · \(program.modulePath) · \(program.callable)")
+                field("Project", program.projectRoot)
+                field("Program limit", "\(String(format: "%.0f", program.timeoutSeconds)) seconds per example. The selected code runs with the local interpreter's access and installed dependencies.")
+                field("Environment", program.environmentKeys.isEmpty ? "No additional environment variables inherited" : program.environmentKeys.joined(separator: ", "))
+                Text("Calls made through the project's own model client are governed by that client, outside the RPCE provider-session cap. Environment values are not saved in the experiment.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            DisclosureGroup("Prompt, examples and success checks") {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(definition.source.prompt).font(.caption.monospaced()).textSelection(.enabled)
+                        Divider()
+                        Text("Success checks").font(.caption.bold())
+                        if let checks = try? PromptSuiteChecklistParser.parse(definition.criteria).checks {
+                            ForEach(checks, id: \.id) { Text("• \($0.text)").font(.caption) }
+                        } else { Text(definition.criteria).font(.caption).textSelection(.enabled) }
+                        ForEach(definition.examples, id: \.id) { example in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("\(example.id) · \(example.split.labDisplayName)").font(.caption.bold())
+                                Text(example.input).font(.caption).textSelection(.enabled)
+                                if let reference = example.expectedOutput {
+                                    DisclosureGroup("Private reference / acceptance checks") {
+                                        Text(reference).font(.caption.monospaced()).textSelection(.enabled)
+                                    }
+                                }
+                                if let context = example.context {
+                                    Text("Frozen files: \(context.files.map(\.path).joined(separator: ", "))").font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 300)
+            }
+        }
+
+        private func agentLimits(_ definition: PromptLabDefinition) -> String {
+            let checks = definition.examples.compactMap { example in
+                example.expectedOutput.flatMap { try? PromptExperimentAgentAcceptance.decode($0) }
+            }
+            guard checks.count == definition.examples.count,
+                  let turns = checks.map(\.maximumTurns).max(),
+                  let duration = checks.map(\.duration).max()
+            else { return "Each task requires explicit acceptance checks with bounded turns and time." }
+            return "At most \(turns) turns and \(Int(duration)) seconds per evaluation; individual tasks may have lower limits."
         }
 
         private func field(_ label: String, _ value: String) -> some View {

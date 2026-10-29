@@ -659,3 +659,164 @@ import XCTest
         }
     }
 #endif
+
+#if DEBUG
+    @MainActor
+    final class PromptLabDefinitionTests: XCTestCase {
+        private var roots: [URL] = []
+
+        override func tearDown() async throws {
+            for root in roots {
+                try? FileManager.default.removeItem(at: root)
+            }
+            roots = []
+            try await super.tearDown()
+        }
+
+        private func makeRoot() throws -> URL {
+            let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            roots.append(root)
+            return root
+        }
+
+        private func definition() -> PromptLabDefinition {
+            PromptLabDefinition(
+                source: .init(kind: .pasted, title: "Blog writer", prompt: "Write for {{audience}}. Use the supplied facts."),
+                goal: "Reduce input and output tokens while retaining useful, factual posts.",
+                objective: .init(mode: .efficiency),
+                examples: PromptSuiteSplit.allCases.enumerated().map { index, split in
+                    PromptSuiteCase(
+                        id: "blog_\(index)",
+                        split: split,
+                        input: "Explain topic \(index)",
+                        expectedOutput: nil,
+                        variables: ["audience": "new readers"]
+                    )
+                },
+                criteria: "Uses only supplied facts.\nAnswers the requested topic.\nKeeps a clear structure."
+            )
+        }
+
+        func testProjectExperimentResolvesWithoutBuiltInPromptAndPreservesGoal() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root)
+            let service = PromptExperimentTestFixtures.makeService(root: root, registry: registry, runtime: FakeRuntime(root: root))
+            let draft = definition()
+            let experiment = try await service.createOrUpdate(.init(maxEvaluations: 20, definition: draft))
+            XCTAssertNil(experiment.authority.promptID)
+            XCTAssertEqual(experiment.authority.definition, draft)
+            XCTAssertNotNil(experiment.authority.maxProviderInvocations)
+            let execution = try GEPARunController.resolveExecution(experiment, registry: registry)
+            XCTAssertEqual(execution.baseline, draft.source.prompt)
+            let request = GEPARunController.makeWorkerRequest(execution: execution, runRoot: root, searchRemaining: 19)
+            XCTAssertEqual(request.objective, draft.goal)
+            XCTAssertNil(request.promptCharacterCeilingRatio, "Generic optimization must not silently require a shorter prompt.")
+            XCTAssertEqual(request.examples.count, 2)
+            XCTAssertEqual(request.heldOutExamples.count, 1)
+            let restored = PromptExperimentTestFixtures.makeService(root: root, registry: registry, runtime: FakeRuntime(root: root))
+            await restored.load()
+            XCTAssertEqual(restored.experiment(id: experiment.id)?.authority, experiment.authority)
+        }
+
+        func testExplicitOneTimesPromptLimitIsSealedAndSurvivesResolution() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root)
+            let service = PromptExperimentTestFixtures.makeService(root: root, registry: registry, runtime: FakeRuntime(root: root))
+            let experiment = try await service.createOrUpdate(.init(
+                maxEvaluations: 20, promptCharacterCeilingRatio: 1, definition: definition()
+            ))
+            let execution = try GEPARunController.resolveExecution(experiment, registry: registry)
+            let request = GEPARunController.makeWorkerRequest(execution: execution, runRoot: root, searchRemaining: 19)
+            XCTAssertEqual(request.promptCharacterCeilingRatio, 1)
+            XCTAssertEqual(experiment.authority.definition?.relativePromptLimit, 1)
+            XCTAssertEqual(experiment.authority.suiteSHA256, try experiment.authority.definition?.makeSuite().suiteSHA256)
+        }
+
+        func testChangingGoalChangesExperimentAuthority() async throws {
+            let root = try makeRoot()
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root)
+            let service = PromptExperimentTestFixtures.makeService(root: root, registry: registry, runtime: FakeRuntime(root: root))
+            var draft = definition()
+            let before = try await service.createOrUpdate(.init(maxEvaluations: 20, definition: draft))
+            draft.goal = "Improve coverage of difficult topics."
+            let after = try await service.createOrUpdate(.init(experimentID: before.id, maxEvaluations: 20, definition: draft))
+            XCTAssertNotEqual(before.authorityDigest, after.authorityDigest)
+            XCTAssertNotEqual(before.authority.suiteSHA256, after.authority.suiteSHA256)
+        }
+
+        func testFileSnapshotCanResumeAfterSourceChangesButCannotOverwriteIt() async throws {
+            let root = try makeRoot()
+            let file = root.appendingPathComponent("blog-prompt.md")
+            try Data("Write a useful post.".utf8).write(to: file)
+            var draft = definition()
+            draft.source = try .importFile(url: file)
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root)
+            let service = PromptExperimentTestFixtures.makeService(root: root, registry: registry, runtime: FakeRuntime(root: root))
+            let experiment = try await service.createOrUpdate(.init(maxEvaluations: 20, definition: draft))
+            try Data("User edited this after the run began.".utf8).write(to: file)
+            let execution = try GEPARunController.resolveExecution(experiment, registry: registry)
+            XCTAssertEqual(execution.baseline, "Write a useful post.")
+            XCTAssertThrowsError(try PromptPatchProposer().apply(source: draft.source, candidate: Data("Improved prompt".utf8)))
+            XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "User edited this after the run began.")
+        }
+
+        func testMissingTemplateValueFailsBeforeAnyRun() {
+            var draft = definition()
+            draft.source.prompt = "Write for {{audience}} in ${language}."
+            XCTAssertThrowsError(try draft.validated()) { error in
+                XCTAssertTrue(error.localizedDescription.contains("language"))
+            }
+            XCTAssertEqual(PromptLabTemplate.variables(in: "{{audience}} ${language} {audience}"), ["audience", "language"])
+        }
+
+        func testTemplateValuesAreLiteralAndNotRecursivelyExpanded() throws {
+            let rendered = try PromptLabTemplate.render(
+                "Hello {{name}} / ${topic} / {name}",
+                variables: ["name": "$1\\quoted{{topic}}", "topic": "Swift"]
+            )
+            XCTAssertEqual(rendered, "Hello $1\\quoted{{topic}} / Swift / $1\\quoted{{topic}}")
+        }
+
+        func testDatasetPreservesNestedProgramFieldsAndLegacyReference() throws {
+            let data = Data(#"{"id":"a","split":"training","input":"write","expected_output":"reference","payload":{"inputs":{"facts":["a","b"],"verified":true},"threshold":0.8,"missing":null}}"#.utf8)
+            let example = try JSONDecoder().decode(PromptSuiteCase.self, from: data)
+            XCTAssertEqual(example.expectedOutput, "reference")
+            XCTAssertEqual(example.variables, [:])
+            XCTAssertEqual(example.payload?["inputs"], .object(["facts": .array([.string("a"), .string("b")]), "verified": .boolean(true)]))
+            XCTAssertEqual(example, try JSONDecoder().decode(PromptSuiteCase.self, from: JSONEncoder().encode(example)))
+        }
+
+        func testProgramSealDetectsChangedImportedHelperAndDependencyDeclaration() throws {
+            let root = try makeRoot()
+            let module = root.appendingPathComponent("evaluate.py")
+            let helper = root.appendingPathComponent("quality.py")
+            let requirements = root.appendingPathComponent("requirements.txt")
+            try Data("from quality import score\n".utf8).write(to: module)
+            try Data("def score(value): return 1\n".utf8).write(to: helper)
+            try Data("dspy==3.4.1\n".utf8).write(to: requirements)
+            let configuration = PromptLabProgram(pythonExecutable: "/usr/bin/true", projectRoot: root.path, modulePath: module.path)
+            let sealed = try configuration.sealed()
+            XCTAssertEqual(Set(sealed.dependencySHA256?.keys.map(\.self) ?? []), ["evaluate.py", "quality.py", "requirements.txt"])
+            XCTAssertNoThrow(try sealed.sealed())
+            try Data("def score(value): return 0\n".utf8).write(to: helper)
+            XCTAssertThrowsError(try sealed.sealed())
+            let resealed = try configuration.sealed()
+            try Data("dspy==3.4.2\n".utf8).write(to: requirements)
+            XCTAssertThrowsError(try resealed.sealed())
+        }
+
+        func testAllSplitsAndFiniteObjectiveAreRequired() {
+            var draft = definition()
+            draft.examples.removeAll { $0.split == .hiddenTest }
+            XCTAssertThrowsError(try draft.validated())
+            draft = definition()
+            draft.objective.inputWeight = .infinity
+            XCTAssertThrowsError(try draft.validated())
+            draft.objective.inputWeight = 0
+            draft.objective.outputWeight = 0
+            XCTAssertThrowsError(try draft.validated())
+        }
+    }
+#endif

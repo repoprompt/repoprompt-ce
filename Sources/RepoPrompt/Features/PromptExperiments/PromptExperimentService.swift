@@ -34,6 +34,7 @@
         var promptCharacterCeilingRatio: Double?
         var maxPromptCharacters: Int?
         var noiseFloorReplicates: Int?
+        var definition: PromptLabDefinition?
     }
 
     struct PromptExperimentTargetDefaults: Equatable {
@@ -203,6 +204,19 @@
             listTargets()
         }
 
+        func source(for promptID: BuiltInPromptID) throws -> PromptLabSource {
+            let resource = try registry.resource(promptID)
+            return PromptLabSource(kind: .builtIn, title: promptID.rawValue, prompt: resource.text, builtInPromptID: promptID)
+        }
+
+        func preparationTarget(_ selector: String?) throws -> PromptExperimentResolvedTarget {
+            if let selector { return try resolveTarget(selector) }
+            guard let target = targetDefaults().reflection else {
+                throw PromptExperimentAuthorityError.targetUnavailable("Connect a model before preparing examples.")
+            }
+            return target
+        }
+
         /// The default judge never shares the reflection model: a judge that grades the
         /// reflector's own proposals rewards its style (self-preference) instead of the rubric.
         func targetDefaults() -> PromptExperimentTargetDefaults {
@@ -240,19 +254,36 @@
             let base = try request.experimentID.map { try experiments[index(of: $0)] }
             var errors: [PromptExperimentFieldError] = []
 
-            var promptID = base?.authority.promptID
+            var definition = request.definition ?? base?.authority.definition
+            if request.promptID != nil, request.definition == nil { definition = nil }
+            var promptID = definition?.source.builtInPromptID ?? base?.authority.promptID
+            if definition != nil { promptID = definition?.source.builtInPromptID }
             if let raw = request.promptID?.trimmingCharacters(in: .whitespacesAndNewlines) {
                 promptID = BuiltInPromptID(rawValue: raw)
                 if promptID == nil {
                     errors.append(.init(field: "prompt_id", message: "Unknown built-in prompt '\(raw)'. Choose one of: \(BuiltInPromptID.allCases.map(\.rawValue).joined(separator: ", "))."))
                 }
-            } else if promptID == nil {
+            } else if promptID == nil, definition == nil {
                 errors.append(.init(field: "prompt_id", message: "Required: the built-in prompt to optimize."))
+            }
+            if let definition, request.promptID != nil, definition.source.builtInPromptID != promptID {
+                errors.append(.init(field: "prompt_id", message: "prompt_id must match the definition's built-in source. Omit it for project and pasted prompts."))
             }
 
             var resource: BuiltInPromptResource?
             var suite: PromptSuite?
-            if let promptID {
+            if let supplied = definition {
+                do {
+                    definition = try supplied.validated()
+                    suite = try definition?.makeSuite()
+                    if let promptID {
+                        resource = try registry.resource(promptID)
+                        guard resource?.text == supplied.source.prompt else {
+                            throw PromptExperimentAuthorityError.invalidRequest("The built-in starting prompt must match the installed resource.")
+                        }
+                    }
+                } catch { errors.append(.init(field: "definition", message: error.localizedDescription)) }
+            } else if let promptID {
                 do { resource = try registry.resource(promptID) } catch {
                     errors.append(.init(field: "prompt_id", message: error.localizedDescription))
                 }
@@ -287,7 +318,7 @@
             let reflection = target("reflection_target", request.reflectionTarget, current: base?.authority.targets.reflection, fallback: defaults.reflection)
             var judge: PromptExperimentResolvedTarget?
             if let suite {
-                if suite.grader.kind == .modelJudge {
+                if suite.grader.kind == .modelJudge || definition?.runner == .program || definition?.runner == .dspy {
                     // A changed reflection model re-derives a distinct default judge.
                     let fallback = defaults.judge?.judgmentModelIdentity == reflection?.judgmentModelIdentity
                         ? defaultJudge(distinctFrom: reflection)
@@ -295,8 +326,8 @@
                     let current = base?.authority.targets.judge.flatMap {
                         $0.judgmentModelIdentity == reflection?.judgmentModelIdentity ? nil : $0
                     }
-                    judge = target("judge_target", request.judgeTarget, current: current, fallback: fallback)
-                    if let judge, let reflection, judge.judgmentModelIdentity == reflection.judgmentModelIdentity {
+                    judge = target("judge_target", request.judgeTarget, current: current, fallback: fallback ?? (definition == nil ? nil : reflection))
+                    if definition == nil, let judge, let reflection, judge.judgmentModelIdentity == reflection.judgmentModelIdentity {
                         errors.append(.init(field: "judge_target", message: "The judge model must differ from the reflection model (\(reflection.displayName)); changing effort on the same model does not provide an independent judge."))
                     }
                 } else if request.judgeTarget != nil {
@@ -304,6 +335,7 @@
                 }
             }
 
+            if let ratio = request.promptCharacterCeilingRatio { definition?.relativePromptLimit = ratio }
             var settings = base?.authority.settings ?? PromptExperimentGEPASettings()
             func bounded(_ field: String, _ value: Int?, _ range: ClosedRange<Int>, _ apply: (Int) -> Void) {
                 guard let value else { return }
@@ -352,12 +384,14 @@
                 errors.append(.init(field: "title", message: "Must be 1-200 characters."))
             }
 
-            guard errors.isEmpty, let promptID, let resource, let suite, let execution, let reflection, let maxEvaluations else {
+            if errors.isEmpty, let definition { suite = try definition.makeSuite() }
+            let sourceSHA256 = resource?.sha256 ?? definition.map { PromptExperimentDigest.sha256(Data($0.source.prompt.utf8)) }
+            guard errors.isEmpty, let sourceSHA256, let suite, let execution, let reflection, let maxEvaluations else {
                 throw PromptExperimentAuthorityError.validation(errors)
             }
             let authority = PromptExperimentAuthority(
                 promptID: promptID,
-                promptResourceSHA256: resource.sha256,
+                promptResourceSHA256: sourceSHA256,
                 suiteID: suite.suiteID,
                 suiteSHA256: suite.suiteSHA256,
                 rubricSHA256: suite.grader.rubric?.sha256,
@@ -368,11 +402,13 @@
                     cases: suite.cases, replicates: settings.noiseFloorReplicates
                 ),
                 pythonSealValue: pythonSealValue(),
-                gepaRevision: PromptExperimentGEPAConfiguration.pinnedRevision
+                gepaRevision: PromptExperimentGEPAConfiguration.pinnedRevision,
+                definition: definition,
+                maxProviderInvocations: definition == nil ? nil : min(100_000, maxEvaluations * 8 + 32)
             )
             let digest = try authority.digest()
             let date = now()
-            let resolvedTitle = title ?? "Optimize \(promptID.rawValue)"
+            let resolvedTitle = title ?? "Optimize \(authority.promptDisplayName)"
 
             if let base, base.isApproved || !base.runs.isEmpty {
                 if digest == base.authorityDigest {
@@ -731,15 +767,21 @@
             case let .modelCall(call):
                 let targets = experiment.authority.targets
                 let expected: PromptExperimentResolvedTarget? = switch call.role {
-                case "execution": targets.execution
+                case "execution", "execution_agent", "program_execution": targets.execution
                 case "reflection": targets.reflection
                 case "judge": targets.judge
+                case "program_judge": targets.judge
                 default: nil
                 }
                 guard call.target == expected,
                       call.state == .completed || (call.promptTokens == nil && call.completionTokens == nil),
                       call.state != .started || run.cancellationRequestedAt == nil
                 else { throw PromptExperimentAuthorityError.runtimeUnavailable("Invalid model-call checkpoint.") }
+                if call.state == .started, let cap = experiment.authority.maxProviderInvocations,
+                   experiment.runs.reduce(0, { $0 + $1.modelCalls.count }) >= cap
+                {
+                    throw PromptExperimentAuthorityError.budgetExhausted
+                }
                 if let old = run.modelCalls.first(where: { $0.id == call.id }) {
                     guard old.state == .started, call.state != .started else {
                         throw PromptExperimentAuthorityError.runtimeUnavailable("Conflicting model-call checkpoint.")
@@ -916,17 +958,23 @@
                 throw PromptExperimentAuthorityError.validation([.init(field: "candidate_index", message: "Choose a retained candidate from a completed or stopped-budget run.")])
             }
             let data = try await store.readArtifact(candidate.candidateEvidence)
-            let diff = try patchProposer.proposedDiff(
-                promptID: experiment.authority.promptID,
-                baselineSHA256: experiment.authority.promptResourceSHA256,
-                candidate: data
-            )
+            let diff: String
+            var originalSource: PromptExperimentArtifactReference?
+            if let source = experiment.authority.definition?.source, source.kind == .file {
+                let baseline = try patchProposer.projectBaseline(source: source)
+                originalSource = try await store.installArtifact(baseline, fileExtension: "source")
+                diff = try patchProposer.proposedDiff(source: source, candidate: data)
+            } else if let promptID = experiment.authority.promptID {
+                diff = try patchProposer.proposedDiff(promptID: promptID, baselineSHA256: experiment.authority.promptResourceSHA256, candidate: data)
+            } else {
+                throw PromptExperimentAuthorityError.invalidRequest("This prompt has no source file. Copy or save the candidate, or export the program state.")
+            }
             let diffReference = try await store.installArtifact(Data(diff.utf8), fileExtension: "diff")
             let proposal = PromptExperimentProposal(
                 id: UUID(), runID: runID, candidateIndex: candidateIndex,
                 baselineResourceSHA256: experiment.authority.promptResourceSHA256,
                 candidateEvidence: candidate.candidateEvidence, diffEvidence: diffReference,
-                state: .proposed, createdAt: now(), decidedAt: nil
+                state: .proposed, createdAt: now(), decidedAt: nil, originalSourceEvidence: originalSource
             )
             experiments[position].proposals.append(proposal)
             experiments[position].updatedAt = now()
@@ -953,11 +1001,14 @@
             if apply {
                 let proposal = experiments[position].proposals[proposalIndex]
                 let candidate = try await store.readArtifact(proposal.candidateEvidence)
-                try patchProposer.apply(
-                    promptID: experiments[position].authority.promptID,
-                    baselineSHA256: proposal.baselineResourceSHA256,
-                    candidate: candidate
-                )
+                if let source = experiments[position].authority.definition?.source, source.kind == .file {
+                    guard proposal.originalSourceEvidence?.sha256 == source.originalFileSHA256 else {
+                        throw PromptExperimentAuthorityError.authorityChanged
+                    }
+                    try patchProposer.apply(source: source, candidate: candidate)
+                } else if let promptID = experiments[position].authority.promptID {
+                    try patchProposer.apply(promptID: promptID, baselineSHA256: proposal.baselineResourceSHA256, candidate: candidate)
+                } else { throw PromptExperimentAuthorityError.invalidRequest("There is no source destination for this prompt.") }
             }
             experiments[position].proposals[proposalIndex].state = apply ? .applied : .rejected
             experiments[position].proposals[proposalIndex].decidedAt = now()
@@ -968,6 +1019,60 @@
         func readArtifactText(_ reference: PromptExperimentArtifactReference) async -> String? {
             guard let data = try? await store.readArtifact(reference) else { return nil }
             return String(data: data, encoding: .utf8)
+        }
+
+        /// A self-contained evidence bundle. Exports never overwrite an existing project file.
+        func exportResult(experimentID: UUID, runID: UUID, to destination: URL) async throws {
+            try await requireLoaded()
+            let experiment = try experiments[index(of: experimentID)]
+            guard let selectedRun = experiment.runs.first(where: { $0.id == runID }), !selectedRun.state.isActive,
+                  destination.isFileURL, destination.path.hasPrefix("/"),
+                  !destination.pathComponents.contains(where: { $0.hasSuffix(".app") }),
+                  !FileManager.default.fileExists(atPath: destination.path)
+            else { throw PromptExperimentAuthorityError.invalidRequest("Export a settled run to a new file outside an application bundle.") }
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            var references: [PromptExperimentArtifactReference] = []
+            for run in experiment.runs {
+                references += run.result?.candidates.map(\.candidateEvidence) ?? []
+                references += run.result?.evaluations.compactMap(\.outputEvidence) ?? []
+                if let raw = run.result?.rawResultEvidence { references.append(raw) }
+                for evaluation in run.evaluations {
+                    references.append(evaluation.candidateEvidence)
+                    if let output = evaluation.evaluation.outputEvidence { references.append(output) }
+                }
+                for grading in run.gradings {
+                    references.append(grading.candidateEvidence)
+                    references.append(grading.outputEvidence)
+                    references += grading.history.compactMap(\.responseEvidence)
+                }
+            }
+            for proposal in experiment.proposals {
+                references.append(proposal.candidateEvidence)
+                if let diff = proposal.diffEvidence { references.append(diff) }
+                if let original = proposal.originalSourceEvidence { references.append(original) }
+            }
+            var artifacts: [String: String] = [:]
+            for reference in references where artifacts[reference.sha256] == nil {
+                let data = try await store.readArtifact(reference)
+                artifacts[reference.sha256] = String(decoding: data, as: UTF8.self)
+            }
+            var bundle: [String: Any] = try [
+                "format": "rpce-prompt-lab-v1", "experiment": JSONSerialization.jsonObject(with: encoder.encode(experiment)),
+                "selected_run": runID.uuidString, "artifacts": artifacts
+            ]
+            if let comparison = selectedRun.usageComparison {
+                bundle["usage_comparison"] = try JSONSerialization.jsonObject(with: encoder.encode(comparison))
+            }
+            if let definition = experiment.authority.definition, definition.runner == .dspy,
+               let best = selectedRun.result?.candidates.first(where: \.isBest),
+               let candidate = await readArtifactText(best.candidateEvidence)
+            {
+                let exported = try await PromptLabProgramHarness.export(definition: definition, candidate: candidate)
+                bundle["compiled_program"] = exported["artifact"]
+            }
+            let data = try JSONSerialization.data(withJSONObject: bundle, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: destination, options: [.withoutOverwriting])
         }
 
         func recordDirectoryURL(experimentID: UUID) async -> URL {

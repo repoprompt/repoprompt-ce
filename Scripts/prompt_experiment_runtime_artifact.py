@@ -528,23 +528,25 @@ def acquire(args: argparse.Namespace, manifest: dict) -> None:
         print(f"OK: assembled Prompt Experiment runtime: {destination}")
 
 
-def verify_worker_resource(source: Path, worker: Path) -> None:
+def verify_worker_resource(source: Path, worker: Path, *, label: str = "GEPA worker") -> None:
     """Reject incomplete or stale packages before signing/launching the debug app."""
     for path in (source, worker):
         if not path.is_file() or path.is_symlink():
-            raise ContractError(f"Expected a regular GEPA worker resource: {path}")
+            raise ContractError(f"Expected a regular {label} resource: {path}")
     source_bytes = source.read_bytes()
     if worker.read_bytes() != source_bytes:
-        raise ContractError("Packaged GEPA worker differs from the checked-in worker")
+        raise ContractError(f"Packaged {label} differs from its checked-in resource")
     try:
         compile(source_bytes, str(worker), "exec")
     except (SyntaxError, ValueError) as error:
-        raise ContractError("Packaged GEPA worker is not valid Python") from error
+        raise ContractError(f"Packaged {label} is not valid Python") from error
 
 
 def verify_worker(args: argparse.Namespace, manifest: dict) -> None:
     worker = Path(args.worker).absolute()
     verify_worker_resource(Path(args.source_worker).absolute(), worker)
+    program_runner = Path(args.program_runner).absolute()
+    verify_worker_resource(Path(args.source_program_runner).absolute(), program_runner, label="project program runner")
     bundle = Path(args.runtime_bundle).resolve()
     for target in selected_targets(args.arch):
         if target != host_architecture():
@@ -564,6 +566,16 @@ def verify_worker(args: argparse.Namespace, manifest: dict) -> None:
                 capture_output=True,
                 timeout=30,
             )
+            # The bundled runner must work without project-only dependencies. DSPy is
+            # intentionally supplied by an explicitly selected project interpreter.
+            module = root / "packaging_probe.py"
+            module.write_text("def evaluate(candidate, example, context):\n    return {'score': 1.0}\n", encoding="utf-8")
+            program_check = subprocess.run(
+                [str(executable), "-I", "-B", "-u", str(program_runner), "--project-root", str(root),
+                 "--module", str(module), "--preflight"],
+                cwd=root, env={"HOME": str(home), "PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+                stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=30,
+            )
         try:
             ready = json.loads(completed.stdout)
         except (TypeError, ValueError) as error:
@@ -577,6 +589,15 @@ def verify_worker(args: argparse.Namespace, manifest: dict) -> None:
         }
         if completed.returncode != 0 or ready != expected:
             raise ContractError("Packaged GEPA worker does not match its pinned runtime/protocol")
+        try:
+            program_ready = json.loads(program_check.stdout)
+        except (TypeError, ValueError) as error:
+            raise ContractError("Packaged project runner did not return a readiness response") from error
+        if program_check.returncode != 0 or program_ready != {
+            "protocol_version": 1, "type": "ready", "adapter": "python",
+            "python_version": expected["python_version"],
+        }:
+            raise ContractError("Packaged project runner does not match its runtime/protocol")
     print(f"OK: verified packaged GEPA worker (no model calls): {worker}")
 
 
@@ -654,6 +675,8 @@ def build_parser() -> argparse.ArgumentParser:
     worker_parser.add_argument("--arch", default="host")
     worker_parser.add_argument("--source-worker", required=True)
     worker_parser.add_argument("--worker", required=True)
+    worker_parser.add_argument("--source-program-runner", required=True)
+    worker_parser.add_argument("--program-runner", required=True)
     worker_parser.add_argument("--runtime-bundle", required=True)
 
     paths_parser = subparsers.add_parser("mach-o-paths")

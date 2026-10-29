@@ -563,6 +563,20 @@ class EmbeddedProvisioningProfileTests(unittest.TestCase):
 
 
 class PromptExperimentDebugPackagingTests(unittest.TestCase):
+    def test_project_runner_resource_verification_rejects_missing_or_stale_resource(self) -> None:
+        from prompt_experiment_runtime_artifact import ContractError, verify_worker_resource
+
+        source = SCRIPT_DIR.parent / "AppResources" / "PromptExperiments" / "prompt_program_runner.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / source.name
+            with self.assertRaisesRegex(ContractError, "regular project program runner"):
+                verify_worker_resource(source, target, label="project program runner")
+            target.write_bytes(source.read_bytes())
+            verify_worker_resource(source, target, label="project program runner")
+            target.write_text("pass\n", encoding="utf-8")
+            with self.assertRaisesRegex(ContractError, "differs"):
+                verify_worker_resource(source, target, label="project program runner")
+
     def test_worker_resource_verification_rejects_missing_stale_and_invalid_files(self) -> None:
         from prompt_experiment_runtime_artifact import ContractError, verify_worker_resource
 
@@ -608,6 +622,8 @@ class PromptExperimentDebugPackagingTests(unittest.TestCase):
             package_source,
         )
         worker_check = package_source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-worker')
+        self.assertIn('--source-program-runner "$ROOT_DIR/AppResources/PromptExperiments/prompt_program_runner.py"', package_source)
+        self.assertIn('--program-runner "$APP_BUNDLE/Contents/Resources/PromptExperiments/prompt_program_runner.py"', package_source)
         self.assertGreater(worker_check, package_source.index("--exclude='PromptExperiments/'"))
         self.assertLess(worker_check, package_source.index('phase "Signing app bundle"'))
 

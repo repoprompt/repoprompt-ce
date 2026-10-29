@@ -31,13 +31,15 @@ Reflection: the worker owns the reflection prompt through GEPA's
 `custom_candidate_proposer`, so the reflection model sees the objective, the case
 request, the score, the grader feedback, and a head+tail output excerpt per case, and
 never GEPA's internal `_budget` bookkeeping. The proposer first clusters the
-minibatch failures into root causes, then returns an edited prompt under a hard
-character ceiling (default: the current prompt's length).
+minibatch failures into root causes, then returns an edited prompt. Explicitly
+configured character ceilings are enforced; legacy requests keep their current-length
+ceiling, while new policy-bearing requests may grow unless a limit was selected.
 
-Objectives: the scalar score is quality; side_info `scores` = {quality, brevity}
-(higher is better) feeds GEPA's hybrid frontier. Acceptance is quality first, and on
-an exact quality tie only a strictly shorter prompt is accepted; the reported best is
-the shortest candidate among validation-score ties.
+Objectives: old protocol-v2 requests retain quality-first/character-brevity behavior.
+An explicit efficiency policy uses measured input/output tokens under a per-case
+quality floor. The same utility drives acceptance, parent selection and the winner;
+quality-perfect cases still search. Raw quality and paired usage remain separate
+reporting fields. Missing usage never earns efficiency credit.
 """
 
 from __future__ import annotations
@@ -82,6 +84,170 @@ SIDE_INFO_OBJECTIVES = "Scores (Higher is Better)"
 # Hidden ("_"-prefixed) so reflection never sees it; the acceptance criterion reads it.
 SIDE_INFO_PROMPT_CHARACTERS = "_prompt_characters"
 SCORE_EPSILON = 1e-9
+
+
+def token_count(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def measurement_from(response: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "quality": finite_score(response.get("quality", response.get("score"))),
+        "prompt_tokens": token_count(response.get("prompt_tokens")),
+        "completion_tokens": token_count(response.get("completion_tokens")),
+        "candidate_valid": response.get("candidate_valid") is not False,
+    }
+
+
+class ObjectivePolicy:
+    """One scalar ordering for the entire upstream search, with raw evidence retained.
+
+    Efficiency's feasible score lies in [0, 1]. A quality violation has a penalty
+    larger than the whole development set, so no aggregate can trade a failed case
+    against savings on other cases. Zero denotes unavailable usage, not zero cost.
+    """
+
+    def __init__(self, value: Any = None, *, case_count: int = 1) -> None:
+        value = {} if value is None else value
+        if not isinstance(value, dict) or value.get("mode", "quality") not in ("quality", "efficiency"):
+            raise InfrastructureFailure("unsupported objective policy")
+        self.mode = value.get("mode", "quality")
+        self.quality_tolerance = self.number(value.get("quality_tolerance", 0.0), "quality_tolerance")
+        self.input_weight = self.number(value.get("input_weight", 1.0), "input_weight")
+        self.output_weight = self.number(value.get("output_weight", 1.0), "output_weight")
+        if self.input_weight + self.output_weight <= 0:
+            raise InfrastructureFailure("objective token weights must include a positive weight")
+        self.penalty = -float(max(1, case_count) + 1)
+
+    @staticmethod
+    def number(value: Any, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise InfrastructureFailure(f"objective {name} must be finite and nonnegative")
+        return float(value)
+
+    @property
+    def efficiency(self) -> bool:
+        return self.mode == "efficiency"
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode, "quality_tolerance": self.quality_tolerance,
+            "input_weight": self.input_weight, "output_weight": self.output_weight,
+        }
+
+    def cost(self, measurement: dict[str, Any]) -> float | None:
+        total = 0.0
+        for key, weight in (("prompt_tokens", self.input_weight), ("completion_tokens", self.output_weight)):
+            if weight == 0:
+                continue
+            count = token_count(measurement.get(key))
+            if count is None:
+                return None
+            total += weight * count
+        return total if math.isfinite(total) else None
+
+    def score(self, measurement: dict[str, Any], baseline: dict[str, Any] | None) -> float:
+        quality = finite_score(measurement.get("quality"))
+        if measurement.get("candidate_valid") is False:
+            # Broken predictor mappings, required template markers and invalid program
+            # candidates cannot win a quality tie merely by being shorter or cheaper.
+            return self.penalty
+        if not self.efficiency:
+            return quality
+        if baseline is None:
+            return 0.0
+        if quality + SCORE_EPSILON < finite_score(baseline.get("quality")) - self.quality_tolerance:
+            return self.penalty
+        reference, actual = self.cost(baseline), self.cost(measurement)
+        if reference is None or reference <= 0 or actual is None:
+            return 0.0
+        return reference / (reference + actual)
+
+    def description(self) -> str:
+        if not self.efficiency:
+            return ""
+        return (
+            "Preserve each example's baseline quality within "
+            f"{self.quality_tolerance:g} score points while minimizing measured weighted tokens "
+            f"({self.input_weight:g} × total input + {self.output_weight:g} × output). "
+            "A perfect quality score still leaves room to reduce tokens. A longer prompt may "
+            "win if it reduces the configured total token cost. Missing usage is not savings."
+        )
+
+
+class ObjectiveAcceptance:
+    """Strict improvement on the same utility used by GEPA selection and reporting."""
+
+    def should_accept(self, proposal: Any, state: Any) -> bool:
+        after = proposal.subsample_scores_after or []
+        before = proposal.subsample_scores_before or []
+        return bool(after) and min(after) >= 0 and sum(after) > sum(before) + SCORE_EPSILON
+
+    def reject_reason(self, proposal: Any, state: Any) -> str:
+        return "quality floor violated or measured token objective did not improve"
+
+
+class Measurements:
+    """Durable per-case evidence survives upstream resumes without mixing sample sets."""
+
+    def __init__(self, path: pathlib.Path, *, policy: ObjectivePolicy, seed: str | None, supplied: Any) -> None:
+        self.path = path
+        self.policy = policy
+        self.seed = seed
+        self.candidates: dict[str, dict[str, dict[str, Any]]] = {}
+        self.baseline: dict[str, dict[str, Any]] = {}
+        if path.is_file():
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if saved.get("policy") != policy.document() or (seed is not None and saved.get("seed") != seed):
+                raise InfrastructureFailure("resume objective or seed changed")
+            self.seed = saved.get("seed")
+            self.candidates = saved.get("candidates", {})
+            self.baseline = saved.get("baseline", {})
+        if isinstance(supplied, dict):
+            for case_id, value in supplied.items():
+                if isinstance(value, dict):
+                    self.baseline.setdefault(str(case_id), measurement_from(value))
+
+    def record(self, text: str, example_id: str, response: dict[str, Any]) -> dict[str, Any]:
+        measurement = measurement_from(response)
+        if self.seed is None:
+            self.seed = text
+        if text == self.seed:
+            self.baseline.setdefault(example_id, measurement)
+        self.candidates.setdefault(sha256_text(text), {})[example_id] = measurement
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({
+            "policy": self.policy.document(), "seed": self.seed,
+            "baseline": self.baseline, "candidates": self.candidates,
+        }, sort_keys=True, allow_nan=False), encoding="utf-8")
+        temporary.replace(self.path)
+        return measurement
+
+    def quality_scores(self, text: str, ids: list[str]) -> dict[str, float]:
+        measured = self.candidates.get(sha256_text(text), {})
+        if text == self.seed:
+            measured = {**self.baseline, **measured}
+        return {case_id: finite_score(measured[case_id]["quality"]) for case_id in ids if case_id in measured}
+
+    def quality_average(self, text: str, ids: list[str], fallback: float | None = None) -> float | None:
+        scores = self.quality_scores(text, ids)
+        return sum(scores.values()) / len(scores) if len(scores) == len(ids) and scores else fallback
+
+    def paired_usage(self, text: str, ids: list[str]) -> dict[str, Any]:
+        best = self.candidates.get(sha256_text(text), {})
+        if text == self.seed:
+            best = {**self.baseline, **best}
+        result: dict[str, Any] = {"example_ids": ids, "baseline": {}, "best": {}, "savings": {}}
+        for field in ("prompt_tokens", "completion_tokens"):
+            before = [token_count(self.baseline.get(case_id, {}).get(field)) for case_id in ids]
+            after = [token_count(best.get(case_id, {}).get(field)) for case_id in ids]
+            complete = bool(ids) and all(value is not None for value in before + after)
+            baseline = sum(before) if complete else None
+            candidate = sum(after) if complete else None
+            result["baseline"][field] = baseline
+            result["best"][field] = candidate
+            result["savings"][field] = 1 - candidate / baseline if baseline is not None and baseline > 0 else None
+        return result
 
 
 def length_ratio_score(reference: int | None, actual: int) -> float:
@@ -201,12 +367,13 @@ def build_reflection_prompt(
     current: str,
     records: list[dict[str, Any]],
     character_ceiling: int | None = None,
+    allow_length_growth: bool = False,
 ) -> str:
     """The complete reflection request for one component. `records` are GEPA's reflective
     dataset entries (the evaluator's side_info per minibatch case). The task asks for an
     ESPO-style root-cause diagnosis across all cases first, then an edited (not appended)
     prompt within `character_ceiling`."""
-    ceiling = character_ceiling if character_ceiling is not None else len(current)
+    ceiling = character_ceiling if character_ceiling is not None else (None if allow_length_growth else len(current))
     sections = [
         "You are improving a system prompt. Analyze the evaluation evidence and propose a revised prompt.",
         "## Optimization goal\n\n" + objective,
@@ -225,12 +392,17 @@ def build_reflection_prompt(
         "together explain the failures across ALL cases above. Cluster failures that share a cause and "
         "ignore one-off noise. For each root cause give: the cause, the cases and failed checks it "
         "explains, and the current prompt text responsible (quote it, or name what is missing).\n"
-        "2. Edit, do not append. Produce an edited version of the current prompt that removes those "
-        "root causes by rewriting, merging, tightening, or deleting existing text. Do not add a list of "
-        "new rules or any case-specific content; when you add a sentence, compress or remove another.\n"
+        "2. Edit the prompt to address those causes. Rewrite, merge, tighten, delete, or add instructions "
+        "when the measured objective benefits. Do not memorize cases or add case-specific answers.\n"
         "3. Preserve what the high-scoring cases relied on, and keep the prompt's role and output contract.\n"
-        f"4. Hard length limit: the new prompt must be at most {ceiling} characters (the current prompt "
-        f"has {len(current)}). At equal quality, shorter prompts and shorter answers win.\n\n"
+        + (
+            f"4. Hard length limit: the new prompt must be at most {ceiling} characters (the current prompt "
+            f"has {len(current)}). Edit, do not append: when adding text, remove or compress elsewhere.\n\n"
+            if ceiling is not None else
+            "4. Prompt growth is allowed when it improves the configured measured objective. "
+            "Keep the prompt focused and consider input and output token use together.\n\n"
+        )
+        +
         "Write the root-cause list first, then the complete edited prompt inside the envelope."
     )
     return "\n\n".join(sections) + REFLECTION_OUTPUT_CONTRACT
@@ -458,6 +630,9 @@ class RunState:
         self.completion_tokens = 0
         self.usage_reported = 0
         self.usage_unavailable = 0
+        self.measurements: Measurements | None = None
+        self.validation_ids: list[str] = []
+        self.baseline_reserve = lambda gepa_state: 0
 
     def record_remaining(self, response: dict[str, Any]) -> None:
         remaining = response.get("search_remaining")
@@ -483,6 +658,8 @@ class RunState:
         if previous is not None:
             raise InfrastructureFailure("GEPA changed the text of an already registered candidate index")
         self.emitted_candidates[index] = digest
+        fallback = None if self.measurements and self.measurements.policy.efficiency else score
+        raw_quality = self.measurements.quality_average(text, self.validation_ids, fallback) if self.measurements else score
         emit({
             "type": "candidate",
             "event_id": f"candidate:{index}:{digest}",
@@ -490,7 +667,8 @@ class RunState:
             "candidate_sha256": digest,
             "candidate": text,
             "parent_indices": parents,
-            "aggregate_score": score if score is None or math.isfinite(score) else None,
+            "aggregate_score": raw_quality if raw_quality is None or math.isfinite(raw_quality) else None,
+            "objective_score": score if score is None or math.isfinite(score) else None,
         })
 
 
@@ -534,7 +712,7 @@ class LedgerBudgetStopper:
 
     def __call__(self, gepa_state: Any) -> bool:
         remaining = self.state.search_remaining
-        if remaining is not None and remaining < self.iteration_cost:
+        if remaining is not None and remaining < self.iteration_cost + self.state.baseline_reserve(gepa_state):
             self.state.budget_exhausted = True
             self.state.stopped_before_unfinishable_iteration = True
             return True
@@ -644,6 +822,12 @@ def main() -> int:
             # cannot fund (e.g. on resume), losing that proposal mid-way. Fail fast.
             raise InfrastructureFailure("run request is missing the host ledger's search_remaining")
         state = RunState(search_remaining=initial_remaining)
+        policy = ObjectivePolicy(body.get("objective_policy"), case_count=len(body.get("examples", [])))
+        measurements = Measurements(
+            run_dir / "measurements.json", policy=policy,
+            seed=body.get("seed_candidate"), supplied=body.get("seed_measurements"),
+        )
+        state.measurements = measurements
         supplied_lengths = body.get("seed_output_characters")
         if isinstance(supplied_lengths, dict):
             # The seed's recorded answer lengths from the ledger, so brevity keeps its real
@@ -652,12 +836,20 @@ def main() -> int:
                 if isinstance(length, int) and not isinstance(length, bool) and length >= 0:
                     state.seed_output_characters[str(case_id)] = length
         objective = str(body["objective"])
+        if policy.efficiency:
+            objective += "\n\nAuthoritative measured objective: " + policy.description()
         background = str(body.get("background") or "")
         seed_candidate = body.get("seed_candidate")
         if isinstance(seed_candidate, str):
             state.seed_text = seed_candidate
+        elif isinstance(measurements.seed, str):
+            state.seed_text = measurements.seed
         ceiling_ratio = body.get("prompt_character_ceiling_ratio")
-        ceiling_ratio = float(ceiling_ratio) if isinstance(ceiling_ratio, (int, float)) and ceiling_ratio > 0 else 1.0
+        ceiling_ratio = (
+            float(ceiling_ratio) if isinstance(ceiling_ratio, (int, float))
+            and not isinstance(ceiling_ratio, bool) and math.isfinite(ceiling_ratio) and ceiling_ratio > 0
+            else (None if body.get("objective_policy") is not None else 1.0)
+        )
         max_prompt_characters = body.get("max_prompt_characters")
         max_prompt_characters = (
             int(max_prompt_characters)
@@ -666,11 +858,11 @@ def main() -> int:
             else None
         )
 
-        def character_ceiling(current: str) -> int:
-            ceiling = math.floor(len(current) * ceiling_ratio)
+        def character_ceiling(current: str) -> int | None:
+            ceiling = math.floor(len(current) * ceiling_ratio) if ceiling_ratio is not None else None
             if max_prompt_characters is not None:
-                ceiling = min(ceiling, max_prompt_characters)
-            return max(1, ceiling)
+                ceiling = min(ceiling, max_prompt_characters) if ceiling is not None else max_prompt_characters
+            return max(1, ceiling) if ceiling is not None else None
 
         def reflect_candidate(prompt: str) -> str:
             """One host reflection call; returns the enveloped candidate or raises
@@ -716,10 +908,10 @@ def main() -> int:
                 ceiling = character_ceiling(current)
                 prompt = build_reflection_prompt(
                     objective=objective, background=background, current=current, records=records,
-                    character_ceiling=ceiling,
+                    character_ceiling=ceiling, allow_length_growth=ceiling is None,
                 )
                 text = reflect_candidate(prompt)
-                if len(text) > ceiling:
+                if ceiling is not None and len(text) > ceiling:
                     # One compression repair; a second overrun skips the proposal (no retry
                     # storm: an empty proposal is not an exception GEPA re-runs).
                     state.ceiling_repairs += 1
@@ -766,14 +958,21 @@ def main() -> int:
         def evaluate(candidate: Any, example: Any = None) -> tuple[float, dict[str, Any]]:
             text = candidate_text(candidate)
             example_value = example if isinstance(example, dict) else {"id": "single", "split": "training"}
+            example_id = str(example_value["id"])
+            # A child can first encounter a training case that was absent from the seed's
+            # validation pass. Obtain its baseline through the same durable admission ledger.
+            if policy.efficiency and example_id not in measurements.baseline and state.seed_text is not None and text != state.seed_text:
+                baseline_response = host_evaluate(state.seed_text, example_value)
+                measurements.record(state.seed_text, example_id, baseline_response)
             response = host_evaluate(text, example_value)
             score = finite_score(response.get("score"))
+            measurement = measurements.record(text, example_id, response)
+            utility = policy.score(measurement, measurements.baseline.get(example_id))
             if state.seed_text is None:
                 state.seed_text = text  # seedless: the generated seed is the reference
             output_characters = response.get("output_characters")
             if not isinstance(output_characters, int) or isinstance(output_characters, bool) or output_characters < 0:
                 output_characters = None
-            example_id = str(example_value["id"])
             if text == state.seed_text and output_characters is not None:
                 state.seed_output_characters.setdefault(example_id, output_characters)
             reference_output = state.seed_output_characters.get(example_id)
@@ -787,6 +986,7 @@ def main() -> int:
                 "example_id": str(example_value["id"]),
                 "split": str(example_value["split"]),
                 "score": score,
+                "objective_score": utility,
                 "replayed": bool(response.get("replayed", False)),
             })
             side_info: dict[str, Any] = {}
@@ -802,15 +1002,29 @@ def main() -> int:
                 side_info[SIDE_INFO_OUTPUT_CHARACTERS] = output_characters
             side_info[SIDE_INFO_PROMPT_CHARACTERS] = len(text)
             side_info["scores"] = {
-                "quality": score,
+                "quality": score if measurement["candidate_valid"] else policy.penalty,
                 "brevity": brevity_score(
                     prompt_characters=len(text),
                     seed_prompt_characters=len(state.seed_text) if state.seed_text else None,
                     output_characters=output_characters,
                     reference_output_characters=reference_output,
-                ),
+                ) if measurement["candidate_valid"] else policy.penalty,
             }
-            return score, side_info
+            if policy.efficiency:
+                baseline = measurements.baseline.get(example_id, {})
+                side_info["measured_tokens"] = {
+                    "baseline_input": baseline.get("prompt_tokens"),
+                    "baseline_output": baseline.get("completion_tokens"),
+                    "candidate_input": measurement["prompt_tokens"],
+                    "candidate_output": measurement["completion_tokens"],
+                    "quality_floor": baseline.get("quality", score) - policy.quality_tolerance,
+                    "objective_score": utility,
+                    "usage_available": policy.cost(baseline) is not None and policy.cost(measurement) is not None,
+                }
+                # Keep frontier and parent ranking on the configured utility. Quality is
+                # evidence above, not an alternative axis that can reward costly answers.
+                side_info["scores"] = {"objective": utility}
+            return utility, side_info
 
         def examples(key: str, *, with_input: bool) -> list[dict[str, Any]]:
             values = []
@@ -832,11 +1046,22 @@ def main() -> int:
             dataset, valset = valset, []
         if not dataset:
             raise InfrastructureFailure("GEPA search requires at least one development example")
+        state.validation_ids = [str(example["id"]) for example in (valset or dataset)]
 
         minibatch = int(body.get("reflection_minibatch_size", 2))
         iteration_cost = full_iteration_cost(
             minibatch=minibatch, training=len(dataset), validation=len(valset),
         )
+        if policy.efficiency:
+            def baseline_reserve(gepa_state: Any) -> int:
+                # Selecting the seed itself obtains baseline measurements as part of the
+                # ordinary parent pass. Only a child parent may need additional seed calls.
+                scores = gepa_state.program_full_scores_val_set
+                parent = max(range(len(scores)), key=lambda index: scores[index])
+                if candidate_text(gepa_state.program_candidates[parent]) == state.seed_text:
+                    return 0
+                return min(max(1, minibatch), sum(str(example["id"]) not in measurements.baseline for example in dataset))
+            state.baseline_reserve = baseline_reserve
         stop_at_score = body.get("stop_at_score")
         config = OptimizeAnythingConfig(
             engine="gepa",
@@ -848,15 +1073,16 @@ def main() -> int:
             max_concurrency=1,
             output_dir=str(output_dir),
             run_dir=str(run_dir),
-            stop_at_score=float(stop_at_score) if isinstance(stop_at_score, (int, float)) else None,
+            # The host's threshold is raw quality. It cannot stop an efficiency search.
+            stop_at_score=float(stop_at_score) if not policy.efficiency and isinstance(stop_at_score, (int, float)) else None,
             sandbox=True,
             engine_config={
                 "reflection": {
                     "reflection_lm": HostLanguageModel(),
                     "custom_candidate_proposer": propose_candidate,
                     "reflection_minibatch_size": minibatch,
-                    "skip_perfect_score": bool(body.get("skip_perfect_score", True)),
-                    "perfect_score": float(body["perfect_score"]),
+                    "skip_perfect_score": False if policy.efficiency else bool(body.get("skip_perfect_score", True)),
+                    "perfect_score": None if policy.efficiency else float(body["perfect_score"]),
                 },
                 "merge": (
                     {"max_merge_invocations": int(body.get("max_merge_invocations", 5))}
@@ -869,10 +1095,10 @@ def main() -> int:
                     "max_workers": 1,
                     "write_agent_state": True,
                     "raise_on_exception": True,
-                    "candidate_selection_strategy": str(body.get("candidate_selection_strategy") or "current_best"),
+                    "candidate_selection_strategy": "current_best" if policy.efficiency else str(body.get("candidate_selection_strategy") or "current_best"),
                     # Pareto fronts over per-case scores and the {quality, brevity} objectives.
-                    "frontier_type": "hybrid",
-                    "acceptance_criterion": QualityThenBrevityAcceptance(),
+                    "frontier_type": "instance" if policy.efficiency else "hybrid",
+                    "acceptance_criterion": ObjectiveAcceptance() if policy.efficiency else QualityThenBrevityAcceptance(),
                 },
                 "stop_callbacks": [LedgerBudgetStopper(state, iteration_cost, max_reflections=search_max_evaluations)],
                 "callbacks": build_callbacks(state),
@@ -906,6 +1132,10 @@ def main() -> int:
         baseline_score = None
         held_out_result = None
         validation_scores = None
+        objective_validation_scores = None
+        paired_usage = None
+        best_objective_score = None
+        baseline_objective_score = None
         if has_incumbent:
             texts = [candidate_text(value) for value in result.candidates]
             scores = [
@@ -916,27 +1146,46 @@ def main() -> int:
                 [int(p) for p in (values or []) if p is not None]
                 for values in result.parents
             ]
+            raw_scores = [
+                measurements.quality_average(text, state.validation_ids, None if policy.efficiency else scores[index])
+                for index, text in enumerate(texts)
+            ]
             for index, text in enumerate(texts):
                 state.emit_candidate(index, text, parents[index], scores[index])
                 candidates.append({
                     "index": index,
                     "sha256": sha256_text(text),
                     "parent_indices": parents[index],
-                    "aggregate_score": scores[index],
+                    "aggregate_score": raw_scores[index],
+                    "objective_score": scores[index],
                 })
             gepa_best = int(result.best_idx) if result.best_idx is not None else None
-            best_index = preferred_best_index(texts, scores, gepa_best)
-            best_score = scores[best_index] if best_index is not None else None
-            baseline_score = scores[0] if scores else None
+            if policy.efficiency:
+                finite_indices = [index for index, value in enumerate(scores) if value is not None]
+                best_index = max(finite_indices, key=lambda index: scores[index]) if finite_indices else None
+            else:
+                best_index = preferred_best_index(texts, scores, gepa_best)
+            best_score = raw_scores[best_index] if best_index is not None else None
+            baseline_score = raw_scores[0] if raw_scores else None
+            best_objective_score = scores[best_index] if best_index is not None else None
+            baseline_objective_score = scores[0] if scores else None
             # Paired per-case evidence for the host's noise-floor comparison: GEPA's own
             # validation pass (the seed's replicate 0) and the reported best's pass.
             subscores = list(getattr(result, "val_subscores", None) or [])
             validation_examples = valset or dataset
             if subscores and best_index is not None and best_index < len(subscores):
-                validation_scores = {
+                objective_validation_scores = {
                     "baseline": per_case_scores(subscores[0], validation_examples),
                     "best": per_case_scores(subscores[best_index], validation_examples),
                 }
+                validation_scores = {
+                    "baseline": {**({} if policy.efficiency else objective_validation_scores["baseline"]),
+                                 **measurements.quality_scores(texts[0], state.validation_ids)},
+                    "best": {**({} if policy.efficiency else objective_validation_scores["best"]),
+                             **measurements.quality_scores(texts[best_index], state.validation_ids)},
+                }
+            if best_index is not None:
+                paired_usage = measurements.paired_usage(texts[best_index], state.validation_ids)
 
             def score_held_out(text: str) -> dict[str, Any] | None:
                 """Held-out scores are report-only: an exhausted reserve or a provider/judge
@@ -954,6 +1203,7 @@ def main() -> int:
                             return None
                         raise
                     per_example[example["id"]] = finite_score(response.get("score"))
+                    measurements.record(text, str(example["id"]), response)
                 return {
                     "scores": per_example,
                     "average": sum(per_example.values()) / len(per_example),
@@ -982,10 +1232,15 @@ def main() -> int:
                 "best_candidate_index": best_index,
                 "best_score": best_score,
                 "baseline_score": baseline_score,
+                "best_objective_score": best_objective_score,
+                "baseline_objective_score": baseline_objective_score,
+                "objective_policy": policy.document(),
+                "paired_usage": paired_usage,
                 "total_metric_calls": result.total_metric_calls if isinstance(result.total_metric_calls, int) else None,
                 "wall_time_seconds": time.monotonic() - started,
                 "held_out": held_out_result,
                 "validation_scores": validation_scores,
+                "objective_validation_scores": objective_validation_scores,
                 "search_remaining": state.search_remaining,
                 "iteration_cost": iteration_cost,
                 "stopped_before_unfinishable_iteration": state.stopped_before_unfinishable_iteration,
