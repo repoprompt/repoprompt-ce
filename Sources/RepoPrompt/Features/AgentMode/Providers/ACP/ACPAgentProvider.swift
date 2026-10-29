@@ -7,7 +7,7 @@ import RepoPromptSettingsCore
 
 /// Describes whether an ACP session identifier is known to be safe for a future
 /// `session/load`.
-enum ACPLoadSessionIDConfidence: Equatable {
+package enum ACPLoadSessionIDConfidence: Equatable {
     case unavailable
     case candidate
     case verified
@@ -16,13 +16,13 @@ enum ACPLoadSessionIDConfidence: Equatable {
 /// Runtime-to-load identity reported by the ACP controller to the runner.
 /// ACP providers generally set both IDs to the same verified value when the
 /// runtime session can be used for future `session/load` calls.
-struct ACPProviderSessionIdentity: Equatable {
-    let providerID: ACPProviderID
-    let runtimeSessionID: String?
-    let loadSessionID: String?
-    let loadSessionIDConfidence: ACPLoadSessionIDConfidence
+package struct ACPProviderSessionIdentity: Equatable {
+    package let providerID: ACPProviderID
+    package let runtimeSessionID: String?
+    package let loadSessionID: String?
+    package let loadSessionIDConfidence: ACPLoadSessionIDConfidence
 
-    init(
+    package init(
         providerID: ACPProviderID,
         runtimeSessionID: String? = nil,
         loadSessionID: String? = nil,
@@ -37,22 +37,22 @@ struct ACPProviderSessionIdentity: Equatable {
     }
 }
 
-struct ACPRunRequest {
-    let agentKind: AgentProviderKind
-    let modelString: String?
-    let workspacePath: String?
-    let resumeSessionID: String?
-    let attachments: [AgentFileAttachment]
-    let taskLabelKind: AgentTaskLabelKind?
-    let sessionModeID: String?
-    let autoApproveAllToolPermissions: Bool
+package struct ACPRunRequest {
+    package let agentKind: AgentProviderKind
+    package let modelString: String?
+    package let workspacePath: String?
+    package let resumeSessionID: String?
+    package let attachments: [AgentFileAttachment]
+    package let taskLabelKind: AgentTaskLabelKind?
+    package let sessionModeID: String?
+    package let autoApproveAllToolPermissions: Bool
     /// Provider-native CLI permission mode applied by the provider at PROCESS LAUNCH
     /// (Devin `--permission-mode`). Never sent over ACP and never passed to
     /// `setSessionMode`; `nil` means "pass no flag".
-    let launchPermissionMode: String?
-    let modelParameterSelections: [ACPModelParameterSelection]
+    package let launchPermissionMode: String?
+    package let modelParameterSelections: [ACPModelParameterSelection]
 
-    init(
+    package init(
         agentKind: AgentProviderKind,
         modelString: String?,
         workspacePath: String?,
@@ -77,31 +77,42 @@ struct ACPRunRequest {
     }
 }
 
-struct ACPAuthenticationContext: Equatable {
-    let authMethodIDs: [String]
-    let environment: [String: String]
+package struct ACPAuthenticationContext: Equatable {
+    package let authMethodIDs: [String]
+    package let environment: [String: String]
+
+    package init(authMethodIDs: [String], environment: [String: String]) {
+        self.authMethodIDs = authMethodIDs
+        self.environment = environment
+    }
 }
 
-struct ACPLaunchCleanupArtifact: Equatable {
-    let providerID: ACPProviderID
-    let id: UUID
-    let kind: String
+package struct ACPLaunchCleanupArtifact: Equatable {
+    package let providerID: ACPProviderID
+    package let id: UUID
+    package let kind: String
+
+    package init(providerID: ACPProviderID, id: UUID, kind: String) {
+        self.providerID = providerID
+        self.id = id
+        self.kind = kind
+    }
 }
 
-struct ACPLaunchConfiguration: Equatable {
-    let providerID: ACPProviderID
-    let command: String
-    let arguments: [String]
-    let environment: [String: String]
-    let workingDirectory: String?
-    let additionalPathHints: [String]
-    let enableDebugLogging: Bool
-    let cleanupArtifact: ACPLaunchCleanupArtifact?
-    let expectedExecutableIdentity: ExecutableFileIdentity?
+package struct ACPLaunchConfiguration: Equatable {
+    package let providerID: ACPProviderID
+    package let command: String
+    package let arguments: [String]
+    package let environment: [String: String]
+    package let workingDirectory: String?
+    package let additionalPathHints: [String]
+    package let enableDebugLogging: Bool
+    package let cleanupArtifact: ACPLaunchCleanupArtifact?
+    package let expectedExecutableIdentity: ExecutableFileIdentity?
     /// Names of intentional launch additions, excluding any copied ambient snapshot.
-    let explicitEnvironmentKeys: Set<String>
+    package let explicitEnvironmentKeys: Set<String>
 
-    init(
+    package init(
         providerID: ACPProviderID,
         command: String,
         arguments: [String],
@@ -126,26 +137,31 @@ struct ACPLaunchConfiguration: Equatable {
     }
 }
 
-struct ACPSessionConfiguration: Equatable {
-    enum Mode: Equatable {
+package struct ACPSessionConfiguration: Equatable {
+    package enum Mode: Equatable {
         case new
         case load(existingSessionID: String)
     }
 
-    struct PostOpenNotification: Equatable {
-        let method: String
-        let params: [String: AgentJSONValue]
+    package struct PostOpenNotification: Equatable {
+        package let method: String
+        package let params: [String: AgentJSONValue]
+
+        package init(method: String, params: [String: AgentJSONValue]) {
+            self.method = method
+            self.params = params
+        }
     }
 
-    let mode: Mode
-    let workingDirectory: String
-    let mcpServers: [RepoPromptMCPServerConfiguration]
+    package let mode: Mode
+    package let workingDirectory: String
+    package let mcpServers: [RepoPromptMCPServerConfiguration]
     /// Provider-owned `_meta` on every session-open attempt; empty means omit the key.
-    let metadata: [String: AgentJSONValue]
+    package let metadata: [String: AgentJSONValue]
     /// Sent once after successful opening (including fallback), before the first prompt.
-    let postOpenNotification: PostOpenNotification?
+    package let postOpenNotification: PostOpenNotification?
 
-    init(
+    package init(
         mode: Mode,
         workingDirectory: String,
         mcpServers: [RepoPromptMCPServerConfiguration],
@@ -161,7 +177,7 @@ struct ACPSessionConfiguration: Equatable {
 }
 
 /// Result of parsing a provider-specific session-open model advertisement.
-enum ACPProviderModelSnapshotResult: Equatable {
+package enum ACPProviderModelSnapshotResult: Equatable {
     /// The provider response carries no usable model metadata.
     case absent
     /// A valid snapshot was parsed.
@@ -171,19 +187,26 @@ enum ACPProviderModelSnapshotResult: Equatable {
     case malformed(reason: String)
 }
 
-struct ACPModelParameterClassificationInput {
-    let configID: String
-    let category: String?
-    let displayName: String
-    let choices: [ACPModelParameterChoice]
+package struct ACPModelParameterClassificationInput {
+    package let configID: String
+    package let category: String?
+    package let displayName: String
+    package let choices: [ACPModelParameterChoice]
+
+    package init(configID: String, category: String?, displayName: String, choices: [ACPModelParameterChoice]) {
+        self.configID = configID
+        self.category = category
+        self.displayName = displayName
+        self.choices = choices
+    }
 }
 
-struct ACPModelParameterApplicationReport: Equatable {
-    let applied: [ACPModelParameterSelection]
-    let alreadyCurrent: [ACPModelParameterSelection]
-    let skipped: [ACPModelParameterSelection]
+package struct ACPModelParameterApplicationReport: Equatable {
+    package let applied: [ACPModelParameterSelection]
+    package let alreadyCurrent: [ACPModelParameterSelection]
+    package let skipped: [ACPModelParameterSelection]
 
-    init(
+    package init(
         applied: [ACPModelParameterSelection],
         alreadyCurrent: [ACPModelParameterSelection] = [],
         skipped: [ACPModelParameterSelection]
@@ -197,7 +220,7 @@ struct ACPModelParameterApplicationReport: Equatable {
     /// fail loudly before prompting rather than silently running at another value. This lives on
     /// the report type because the check depends only on the report — it is the shared owner for
     /// both the Agent Mode runner and the Context Builder headless provider.
-    func validateNoSkippedSelections() throws {
+    package func validateNoSkippedSelections() throws {
         guard skipped.isEmpty else {
             throw ACPModelParameterSelectionError.skipped(selections: skipped)
         }
@@ -205,10 +228,10 @@ struct ACPModelParameterApplicationReport: Equatable {
 }
 
 /// A requested ACP model parameter that could not be applied to the session.
-enum ACPModelParameterSelectionError: LocalizedError, Equatable {
+package enum ACPModelParameterSelectionError: LocalizedError, Equatable {
     case skipped(selections: [ACPModelParameterSelection])
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case let .skipped(selections):
             let values = selections.map { "\($0.configID)=\($0.valueRaw)" }.joined(separator: ", ")
@@ -219,20 +242,31 @@ enum ACPModelParameterSelectionError: LocalizedError, Equatable {
 
 /// A provider-owned direct model-selection RPC (e.g. Grok's `session/set_model`).
 /// The controller stays unaware of provider method names and parameter keys.
-struct ACPDirectModelSelectionRequest {
-    let method: String
-    let params: [String: Any]
+package struct ACPDirectModelSelectionRequest {
+    package let method: String
+    package let params: [String: Any]
     /// The model id the provider's acknowledgement must echo before the controller updates
     /// local model authority. For effort-compound selections this is the BASE model id —
     /// the wire confirms the model, not the effort suffix.
-    var expectedConfirmationModelRaw: String
+    package var expectedConfirmationModelRaw: String
+
+    package init(method: String, params: [String: Any], expectedConfirmationModelRaw: String) {
+        self.method = method
+        self.params = params
+        self.expectedConfirmationModelRaw = expectedConfirmationModelRaw
+    }
 }
 
 /// A report applies to the advertised base named in the same update. A nil effort means
 /// the report was applicable but unresolvable; a nil report means no applicable update.
-struct ACPDirectSessionEffortReport {
-    let baseModelRaw: String
-    let effortRaw: String?
+package struct ACPDirectSessionEffortReport {
+    package let baseModelRaw: String
+    package let effortRaw: String?
+
+    package init(baseModelRaw: String, effortRaw: String?) {
+        self.baseModelRaw = baseModelRaw
+        self.effortRaw = effortRaw
+    }
 }
 
 /// Bounded capability for ACP providers that advertise session models outside the
@@ -242,7 +276,7 @@ struct ACPDirectSessionEffortReport {
 ///
 /// The controller consults this ONLY when modern `configOptions` metadata is
 /// absent; a malformed modern selector never falls back to this path.
-protocol ACPDirectSessionModelProvider: Sendable {
+package protocol ACPDirectSessionModelProvider: Sendable {
     func parseDirectSessionModelSnapshot(
         from sessionResponse: [String: Any]
     ) -> ACPProviderModelSnapshotResult
@@ -264,7 +298,7 @@ protocol ACPDirectSessionModelProvider: Sendable {
     ) -> ACPDirectModelSelectionRequest
 }
 
-protocol ACPAgentProvider: Sendable {
+package protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
 
     func support(for request: ACPRunRequest) async throws -> ACPSupportResult
@@ -302,7 +336,7 @@ protocol ACPAgentProvider: Sendable {
     func shouldEmitStderrLine(_ line: String) -> Bool
 }
 
-extension ACPAgentProvider {
+package extension ACPAgentProvider {
     func recognizesUnmatchedResponseID(_: String) -> Bool {
         false
     }

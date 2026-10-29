@@ -30,6 +30,22 @@ final class GrokBuildPermissionAndIdentityTests: XCTestCase {
 
     // MARK: - MCP client identity
 
+    func testMCPServerConfigurationKeepsAppDefaultAndExplicitCommand() throws {
+        let defaulted = RepoPromptMCPServerConfiguration(name: "custom", args: ["arg"])
+        XCTAssertEqual(defaulted.command, CLISymlinkManagerUserSpace.stableCLIPath)
+        XCTAssertEqual(defaulted.name, "custom")
+        XCTAssertEqual(defaulted.args, ["arg"])
+        XCTAssertEqual(RepoPromptMCPServerConfiguration.repoPrompt.args, ["--backend", "app"])
+
+        let explicit = RepoPromptMCPServerConfiguration(command: "/usr/bin/true", env: [.init(name: "FIRST", value: "1"), .init(name: "SECOND", value: "2")])
+        XCTAssertNoThrow(try explicit.validateACPLaunchCommand())
+        let entries = try XCTUnwrap(explicit.acpJSONObject["env"] as? [[String: String]])
+        XCTAssertEqual(entries, [["name": "FIRST", "value": "1"], ["name": "SECOND", "value": "2"]])
+        XCTAssertThrowsError(try RepoPromptMCPServerConfiguration(command: "").validateACPLaunchCommand()) { error in
+            XCTAssertEqual(error as? RepoPromptMCPServerConfiguration.ACPCommandValidationError, .emptyCommand(serverName: "RepoPromptCE"))
+        }
+    }
+
     func testGrokShellFamilyMatchesLiveObservedClientName() {
         // Frozen fixture: captured from grok 1.0.3 connecting to an ACP-injected MCP server
         // named "RepoPromptCE" on 2026-08-13.
