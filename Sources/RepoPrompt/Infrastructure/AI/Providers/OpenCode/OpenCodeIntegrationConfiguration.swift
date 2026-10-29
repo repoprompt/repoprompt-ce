@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 
 /// OpenCode-specific integration configuration helpers.
 ///

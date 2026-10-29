@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 
 /// OpenCode CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
 /// Runs a fresh prompt-only-style ACP session per request while preserving OpenCode's raw model IDs.
