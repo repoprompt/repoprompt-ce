@@ -52,7 +52,7 @@ Sources/
   RepoPromptSettingsCore/     # app-only persisted settings values/store and global-ignore facet
   RepoPromptProviderQuota/    # account quota values, injected acquisition coordination, cached consumer signals; no concrete IO
   RepoPromptAIContracts/      # Foundation-only model and provider vocabulary, ACP canonicalization; no catalog or storage authority
-  RepoPromptACPProviders/    # app-free ACP model registry, Devin catalog, Cursor probing and polling
+  RepoPromptACPProviders/    # app-free ACP registry, Devin catalog, Cursor probing and ACP polling
   RepoPromptCodeMapCore/        # internal deterministic synchronous parsing/query/extraction and canonical artifact core
   RepoPromptRegexCore/          # internal reusable PCRE2 wrapper/JIT runtime
   RepoPromptWorkspaceCore/      # internal Foundation + Swift System workspace path values and deterministic policies
@@ -71,7 +71,7 @@ Tests/
   RepoPromptDomainRuntimeTests/  # direct owner tests for the headless MCP runtime and workspace/context authority
   RepoPromptProviderQuotaTests/  # direct quota model/mapper/coordination/consumer tests; injected transports only
   RepoPromptAIContractsTests/    # direct model interpretation and compatibility tests; no app dependency
-  RepoPromptACPProvidersTests/   # ACP registry, Devin catalog and Cursor probe/polling owner tests; no app dependency
+  RepoPromptACPProvidersTests/   # ACP registry, Devin catalog and Cursor/Grok owner tests; no app dependency
   RepoPromptMCPCoreTests/        # MCP CLI owner tests; no RepoPromptApp dependency
   RepoPromptTests/               # app integration, persistence, workspace, presentation, UI, and MCP tests
 ```
@@ -80,7 +80,7 @@ The external target graph is intentionally stable at its boundary: the executabl
 
 `RepoPromptAIContracts` is an internal, Foundation-only owner of neutral model selection/parameter values and the shared Codex model/effort interpretation kernel. SettingsCore depends on these values and retains configured Cursor identity policy and persistence. The app retains persisted lookup, remote conversion and configured catalog authority; lookup remains injected and lazy.
 
-`RepoPromptACPProviders` owns the existing ACP model registry, its derived Devin catalog, the Cursor resolver's physical probe and ownership coordination, neutral launch values, configuration, and injected polling service. App composition supplies persistence and invalidation operations, environment filtering, telemetry, and the controller-backed discovery client; it remains the authority for those effects. The target depends on AIContracts, Foundation and Process, not RepoPromptApp.
+`RepoPromptACPProviders` owns the existing ACP model registry, its derived Devin catalog, the Cursor resolver's physical probe and ownership coordination, neutral launch values, configuration, and the existing Cursor and Grok polling services. App composition supplies persistence and invalidation operations, environment filtering, telemetry, and the controller-backed discovery client; it remains the authority for those effects. The target depends on AIContracts, Foundation and Process, not RepoPromptApp.
 
 `RepoPromptProviderQuota` is an internal, Foundation-only owner with no first-party target dependencies. It owns provider/account/window quota facts, pure mapping and presentation, injected acquisition ports/coordinators, and cached advisory signals. Concrete HTTP, credential access, and app-server adapters remain in the app's `Infrastructure/AI/Providers/` owners; composition stays in `App/ProviderQuotaRuntime.swift`. Settings projections depend on the quota owner, not the generic MCP runtime. Acquisition consent and presentation preferences are independent. Router policy is not part of this quota module, and cached lookup never acquires data.
 
