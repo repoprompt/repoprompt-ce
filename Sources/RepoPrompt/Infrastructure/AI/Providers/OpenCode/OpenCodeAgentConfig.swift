@@ -1,19 +1,19 @@
 import Foundation
 import RepoPromptAIContracts
-import RepoPromptSettingsCore
+import RepoPromptProcess
 
 /// Configuration for the OpenCode ACP agent provider.
 ///
 /// RepoPrompt's automatic OpenCode ACP setup is process-ephemeral via
 /// `OPENCODE_CONFIG_CONTENT`. Persistent OpenCode config is modified only by explicit
 /// user install flows through `MCPIntegrationHelper.installInOpenCode()`.
-struct OpenCodeAgentConfig {
-    enum ToolProfile: Equatable {
+package struct OpenCodeAgentConfig {
+    package enum ToolProfile: Equatable {
         case agentMode
         case headless
         case noTools
 
-        var sessionModeID: String {
+        package var sessionModeID: String {
             switch self {
             case .agentMode:
                 OpenCodeAgentConfig.managedSessionModeID
@@ -26,38 +26,38 @@ struct OpenCodeAgentConfig {
     }
 
     /// RepoPrompt-managed OpenCode mode for interactive Agent Mode. Keeps bash available.
-    static let managedSessionModeID = "repoprompt_acp"
+    package static let managedSessionModeID = "repoprompt_acp"
     /// RepoPrompt-managed OpenCode mode that disables approval prompts for the managed tool surface.
-    static let managedFullAccessSessionModeID = "repoprompt_acp_full_access"
+    package static let managedFullAccessSessionModeID = "repoprompt_acp_full_access"
     /// RepoPrompt-managed OpenCode mode for discovery/delegate headless paths. Denies native tools while preserving injected RepoPrompt MCP.
-    static let managedHeadlessSessionModeID = "repoprompt_headless"
+    package static let managedHeadlessSessionModeID = "repoprompt_headless"
     /// RepoPrompt-managed OpenCode mode for chat/Oracle prompt-only paths. Exposes no tools.
-    static let managedNoToolsSessionModeID = "repoprompt_no_tools"
+    package static let managedNoToolsSessionModeID = "repoprompt_no_tools"
 
-    let commandName: String
-    let additionalPathHints: [String]
-    let modelString: String?
-    let enableDebugLogging: Bool
+    package let commandName: String
+    package let additionalPathHints: [String]
+    package let modelString: String?
+    package let enableDebugLogging: Bool
     /// Controls whether the RepoPrompt MCP entry in the ephemeral OpenCode overlay is active.
     /// When false, the overlay includes a disabled same-name MCP override to neutralize stale
     /// global/project RepoPrompt MCP config inherited by prompt-only/model-discovery launches.
-    let includeRepoPromptMCPServer: Bool
+    package let includeRepoPromptMCPServer: Bool
     /// Controls whether `OPENCODE_CONFIG_CONTENT` is injected for RepoPrompt-launched OpenCode.
-    let includeManagedConfigOverlay: Bool
+    package let includeManagedConfigOverlay: Bool
     /// Controls best-effort cleanup of legacy persistent RepoPrompt-managed OpenCode entries.
-    let cleanupLegacyPersistentConfig: Bool
-    let toolProfile: ToolProfile
+    package let cleanupLegacyPersistentConfig: Bool
+    package let toolProfile: ToolProfile
     /// Model-parameter selections (e.g. OpenCode thinking level) captured at run admission
     /// and applied by the headless provider before prompting.
-    let modelParameterSelections: [ACPModelParameterSelection]
+    package let modelParameterSelections: [ACPModelParameterSelection]
 
-    var sessionModeID: String {
+    package var sessionModeID: String {
         toolProfile.sessionModeID
     }
 
-    init(
+    package init(
         commandName: String = "opencode",
-        additionalPathHints: [String] = CLIPathHints.openCode,
+        additionalPathHints: [String] = CLILaunchProfiles.openCodeProviderSpecificPaths,
         modelString: String? = nil,
         enableDebugLogging: Bool = false,
         includeRepoPromptMCPServer: Bool = true,

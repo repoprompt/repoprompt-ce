@@ -5,20 +5,20 @@ import RepoPromptFoundation
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
-struct OpenCodeACPResolvedLaunch: Equatable {
-    let command: String
-    let arguments: [String]
-    let additionalPathHints: [String]
-    let executableIdentity: ExecutableFileIdentity
+package struct OpenCodeACPResolvedLaunch: Equatable {
+    package let command: String
+    package let arguments: [String]
+    package let additionalPathHints: [String]
+    package let executableIdentity: ExecutableFileIdentity
 }
 
-enum OpenCodeACPLaunchResolutionError: Error, Equatable, LocalizedError {
+package enum OpenCodeACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case missingConfiguredCommand
     case exactPathNotFound(String)
     case noValidLaunchCandidate(String, [String], ShellEnvironmentSource?)
     case environmentDiscoveryRequired(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .missingConfiguredCommand:
             "OpenCode ACP launch requires an `opencode` command or executable path."
@@ -35,43 +35,31 @@ enum OpenCodeACPLaunchResolutionError: Error, Equatable, LocalizedError {
     }
 }
 
-final class OpenCodeACPLaunchResolver: @unchecked Sendable {
-    typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
+package final class OpenCodeACPLaunchResolver: @unchecked Sendable {
+    package typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
+    package typealias ProbeRunner = @Sendable (_ launch: OpenCodeACPResolvedLaunch, _ config: OpenCodeAgentConfig) async throws -> CLIProcessRunner.Result
+    package typealias FailureRecorder = @Sendable (_ source: ShellEnvironmentSource?, _ candidateCount: Int) -> Void
 
     private static let launchArguments = ["acp"]
-    private static let helpArguments = ["acp", "--help"]
 
     private let environmentProvider: EnvironmentProvider
+    private let probeRunner: ProbeRunner
+    private let recordFailure: FailureRecorder
     private let probeMutex = AsyncMutex()
     private let lock = NSLock()
     private var cachedLaunchByKey: [String: OpenCodeACPResolvedLaunch] = [:]
 
-    convenience init(
-        environmentProvider: @escaping @Sendable (_ enableDebugLogging: Bool) async -> [String: String]
-    ) {
-        self.init(launchEnvironmentProvider: { enableDebugLogging in
-            await ACPLaunchEnvironment(environment: environmentProvider(enableDebugLogging))
-        })
-    }
-
-    init(
-        launchEnvironmentProvider: @escaping EnvironmentProvider = { enableDebugLogging in
-            let result = await ProcessEnvironmentBuilder.build(
-                ProcessEnvironmentRequest(
-                    purpose: .acpAgent(providerID: ACPProviderID.openCode.rawValue),
-                    enableDebugLogging: enableDebugLogging
-                )
-            )
-            return ACPLaunchEnvironment(
-                environment: result.environment,
-                shellEnvironmentSource: result.shellEnvironmentSource
-            )
-        }
+    package init(
+        launchEnvironmentProvider: @escaping EnvironmentProvider,
+        probeRunner: @escaping ProbeRunner,
+        recordFailure: @escaping FailureRecorder
     ) {
         environmentProvider = launchEnvironmentProvider
+        self.probeRunner = probeRunner
+        self.recordFailure = recordFailure
     }
 
-    func resolvedLaunch(for config: OpenCodeAgentConfig) throws -> OpenCodeACPResolvedLaunch {
+    package func resolvedLaunch(for config: OpenCodeAgentConfig) throws -> OpenCodeACPResolvedLaunch {
         let key = cacheKey(for: config)
         if let cached = cachedLaunch(forKey: key) {
             do {
@@ -88,7 +76,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
         return launch
     }
 
-    func probeSupport(for config: OpenCodeAgentConfig) async throws -> ACPSupportResult {
+    package func probeSupport(for config: OpenCodeAgentConfig) async throws -> ACPSupportResult {
         try await probeMutex.withLock { [self] in
             try await probeSupportSerially(for: config)
         }
@@ -101,20 +89,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
             // Resolve from the current effective environment on every support check. The cache only
             // bridges this successful probe to the immediately following launch configuration.
             let launch = try await resolveLaunchForProbe(for: config)
-            let processConfig = CLIProcessConfiguration(
-                command: launch.command,
-                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .openCode),
-                additionalPaths: [],
-                enableDebugLogging: config.enableDebugLogging,
-                shellLookupMode: .fallbackOnly
-            )
-            let result = try await CLIProcessRunner(config: processConfig).run(
-                args: Self.helpArguments,
-                stdin: nil,
-                outputMode: .none,
-                timeout: 10,
-                cancelChildOnTaskCancellation: true
-            )
+            let result = try await probeRunner(launch, config)
             guard result.status == 0 else {
                 return .unsupported(
                     reason: "OpenCode ACP preflight failed: `opencode acp --help` exited with status \(result.status)."
@@ -264,11 +239,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
         if failures.isEmpty {
             throw OpenCodeACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
-        AgentCLILaunchDiagnostics.recordPathResolutionFailure(
-            providerKind: .openCode,
-            shellEnvironmentSource: shellEnvironmentSource,
-            candidateCount: candidates.count
-        )
+        recordFailure(shellEnvironmentSource, candidates.count)
         throw OpenCodeACPLaunchResolutionError.noValidLaunchCandidate(configuredCommand, failures, shellEnvironmentSource)
     }
 

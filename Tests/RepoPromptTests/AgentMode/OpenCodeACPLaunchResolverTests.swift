@@ -2,10 +2,39 @@ import Foundation
 import RepoPromptACPProviders
 @testable import RepoPromptApp
 import RepoPromptFileSystem
+import RepoPromptFoundation
 @testable import RepoPromptProcess
 import XCTest
 
 final class OpenCodeACPLaunchResolverTests: XCTestCase {
+    func testInjectedFailureRecorderReceivesResolutionSourceAndCandidateCount() async throws {
+        final class Recorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: (ShellEnvironmentSource?, Int)?
+            func record(_ source: ShellEnvironmentSource?, _ count: Int) {
+                lock.withLock { value = (source, count) }
+            }
+
+            func snapshot() -> (ShellEnvironmentSource?, Int)? {
+                lock.withLock { value }
+            }
+        }
+        let directory = try makeTemporaryDirectory()
+        let recorder = Recorder()
+        let resolver = OpenCodeACPLaunchResolver(
+            launchEnvironmentProvider: { _ in ACPLaunchEnvironment(environment: ["PATH": directory.path], shellEnvironmentSource: .enrichedFallback) },
+            probeRunner: { _, _ in XCTFail("Unresolved command must not probe")
+                throw CancellationError()
+            },
+            recordFailure: { recorder.record($0, $1) }
+        )
+        let support = try await resolver.probeSupport(for: OpenCodeAgentConfig(commandName: "missing-\(UUID().uuidString)", additionalPathHints: []))
+        guard case .unsupported = support else { return XCTFail("Expected unsupported result") }
+        let recorded = try XCTUnwrap(recorder.snapshot())
+        XCTAssertEqual(recorded.0, .enrichedFallback)
+        XCTAssertGreaterThan(recorded.1, 0)
+    }
+
     func testMakeLaunchConfigurationResolvesExplicitPathWithoutPriorProbe() throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(in: directory)
