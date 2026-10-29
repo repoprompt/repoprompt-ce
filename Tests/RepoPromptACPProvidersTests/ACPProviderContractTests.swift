@@ -4,6 +4,25 @@ import RepoPromptDomainRuntime
 import XCTest
 
 final class ACPProviderContractTests: XCTestCase {
+    func testOpenCodeNormalizerUsesInjectedServerProvenance() {
+        let names = ACPToolNameResolution(
+            isRepoPromptServerIdentifier: { $0 == "trusted" },
+            canonicalRepoPromptToolName: { $0 == "alias" ? "read_file" : nil },
+            isRepoPromptToolNameWithServerPrefix: { _ in false }
+        )
+        let trusted = OpenCodeACPEventNormalizer.normalize(
+            ["sessionUpdate": "tool_call", "toolCallId": "one", "title": "alias (trusted)"],
+            toolProfile: .agentMode, toolNames: names
+        )
+        let foreign = OpenCodeACPEventNormalizer.normalize(
+            ["sessionUpdate": "tool_call", "toolCallId": "two", "title": "alias (foreign)"],
+            toolProfile: .agentMode, toolNames: names
+        )
+        guard case let .stream(trustedResult) = trusted.first else { return XCTFail("Missing trusted tool event") }
+        XCTAssertEqual(trustedResult.toolName, "mcp__RepoPromptCE__read_file")
+        XCTAssertTrue(foreign.isEmpty, "An unrecognized low-level tool payload is suppressed")
+    }
+
     func testInjectedToolAuthorityControlsParenthesizedProvenance() {
         let names = ACPToolNameResolution(
             isRepoPromptServerIdentifier: { $0 == "trusted" },

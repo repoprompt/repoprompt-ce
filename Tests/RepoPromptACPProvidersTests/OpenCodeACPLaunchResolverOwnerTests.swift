@@ -1,11 +1,34 @@
 import Foundation
 @testable import RepoPromptACPProviders
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
 @testable import RepoPromptProcess
 import XCTest
 
 final class OpenCodeACPLaunchResolverOwnerTests: XCTestCase {
+    func testProviderSkipsOverlayOperationWhenDisabled() throws {
+        let directory = try makeTemporaryDirectory()
+        let executable = try makeExecutable(in: directory)
+        let config = OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [], includeRepoPromptMCPServer: false, includeManagedConfigOverlay: false)
+        let names = ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
+        let provider = OpenCodeACPAgentProvider(
+            config: config,
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true"),
+            launchResolver: makeTestResolver(environmentProvider: { _ in [:] }),
+            toolNames: names,
+            prepareManagedOverlay: { _, _, _ in
+                XCTFail("Disabled overlay must not invoke app composition")
+                throw CancellationError()
+            }
+        )
+        let request = ACPRunRequest(agentKind: .openCode, modelString: nil, workspacePath: directory.path, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        let launch = try provider.makeLaunchConfiguration(for: request)
+        XCTAssertNil(launch.environment["OPENCODE_CONFIG_CONTENT"])
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
+    }
+
     func testInjectedFailureRecorderReceivesResolutionSourceAndCandidateCount() async throws {
         final class Recorder: @unchecked Sendable {
             private let lock = NSLock()
