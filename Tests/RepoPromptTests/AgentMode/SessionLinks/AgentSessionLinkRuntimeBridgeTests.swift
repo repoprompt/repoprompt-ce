@@ -1,8 +1,8 @@
-import RepoPromptACPProviders
 import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime

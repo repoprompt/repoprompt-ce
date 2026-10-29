@@ -1,5 +1,5 @@
-import RepoPromptACPProviders
 import AppKit
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
 import XCTest

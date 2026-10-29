@@ -1,7 +1,7 @@
-import RepoPromptACPProviders
 import AppKit
 import Combine
 import Foundation
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation

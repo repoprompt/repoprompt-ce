@@ -1,7 +1,7 @@
-import RepoPromptACPProviders
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp

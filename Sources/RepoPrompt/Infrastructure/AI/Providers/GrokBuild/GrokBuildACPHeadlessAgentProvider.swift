@@ -1,5 +1,5 @@
-import RepoPromptACPProviders
 import Foundation
+import RepoPromptACPProviders
 
 /// Headless/discovery adapter for Grok Build's ACP runtime (`grok agent stdio`).
 ///
