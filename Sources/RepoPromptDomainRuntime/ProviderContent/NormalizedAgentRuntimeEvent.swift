@@ -1,3 +1,4 @@
+
 package enum NormalizedAgentRuntimeEvent {
     case stream(RepoPromptDomainRuntime.AIStreamResult)
     case approvalRequested(AgentApprovalRequest)
