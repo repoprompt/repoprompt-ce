@@ -35,6 +35,27 @@ final class ChangeApplicationOwnerTests: XCTestCase {
         XCTAssertEqual(manager.updatedContent(), "one\r\ntwo\r\nthree\r\n")
     }
 
+    func testEarlierInsertionShiftsLaterChangeAndRevertsInReverseOrder() {
+        let first = FileChange(startLine: 0, description: "insert", diffChunk: DiffChunk(lines: [DiffLine(content: "-one"), DiffLine(content: "+ONE"), DiffLine(content: "+extra")], startLine: 0))
+        let second = FileChange(startLine: 2, description: "later", diffChunk: DiffChunk(lines: [DiffLine(content: "-three"), DiffLine(content: "+THREE")], startLine: 2))
+        let manager = ChangeManager(fileContent: ["one", "two", "three"], changes: [first, second], lineEnding: "\n", fileAction: .modify)
+        XCTAssertNil(manager.applyChange(first).error)
+        XCTAssertEqual(manager.currentChanges().first(where: { $0.id == second.id })?.startLine, 3)
+        XCTAssertEqual(manager.applyChange(second).updatedContent, ["ONE", "extra", "two", "THREE"])
+        XCTAssertEqual(manager.revertChange(second).updatedContent, ["ONE", "extra", "two", "three"])
+        XCTAssertEqual(manager.revertChange(first).updatedContent, ["one", "two", "three"])
+    }
+
+    func testRecognizedOutOfBoundsChangeDoesNotPreventLaterBatchSuccess() async {
+        let valid = FileChange(startLine: 0, description: "valid", diffChunk: DiffChunk(lines: [DiffLine(content: "-one"), DiffLine(content: "+ONE")], startLine: 0))
+        let invalid = FileChange(startLine: 99, description: "out of bounds", diffChunk: DiffChunk(lines: [DiffLine(content: "+unused")], startLine: 99))
+        let manager = ChangeManager(fileContent: ["one"], changes: [valid, invalid], lineEnding: "\n", fileAction: .modify)
+        let result = await ChangeApplier(manager: manager).apply([invalid, valid])
+        XCTAssertEqual(result.updated, ["ONE"])
+        XCTAssertEqual(result.newlyApplied, [valid.id])
+        XCTAssertEqual(result.failedIDs, [invalid.id])
+    }
+
     func testBatchedApplicationKeepsSuccessfulChangesWhenAnotherFails() async {
         let valid = FileChange(startLine: 0, description: "valid", diffChunk: DiffChunk(lines: [DiffLine(content: "-one"), DiffLine(content: "+ONE")], startLine: 0))
         let missing = FileChange(startLine: 1, description: "missing", diffChunk: DiffChunk(lines: [DiffLine(content: "+unused")], startLine: 1))
