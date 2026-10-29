@@ -205,20 +205,26 @@ package actor GrokBuildACPModelPollingService {
                 let didChange = await applyRefreshResult(discovered)
                 guard !Task.isCancelled else { return .cancelled }
                 guard didChange else { return .unchanged }
-                return previous == registry.resolvedSnapshot(for: .grokBuild)
-                    ? .unchanged
-                    : .updated
+                return await snapshotMatches(previous) ? .unchanged : .updated
             } catch is CancellationError {
                 return .cancelled
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
-                logFailure(error.localizedDescription)
+                await recordFailure(error.localizedDescription)
                 return Task.isCancelled ? .cancelled : .failed
             }
         }
         inFlightRefresh = task
         defer { inFlightRefresh = nil }
         return await task.value
+    }
+
+    private func snapshotMatches(_ previous: ACPDiscoveredSessionModels?) -> Bool {
+        previous == registry.resolvedSnapshot(for: .grokBuild)
+    }
+
+    private func recordFailure(_ message: String) {
+        logFailure(message)
     }
 
     private func publishLiveReadinessWithoutModels() {

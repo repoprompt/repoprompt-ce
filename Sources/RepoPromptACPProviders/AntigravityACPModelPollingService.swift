@@ -197,13 +197,17 @@ package actor AntigravityACPModelPollingService {
                 return true
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
-                logFailure(error.localizedDescription)
+                await recordFailure(error.localizedDescription)
                 return false
             }
         }
         inFlightRefresh = task
         defer { inFlightRefresh = nil }
         return await task.value
+    }
+
+    private func recordFailure(_ message: String) {
+        logFailure(message)
     }
 
     private func publishLiveReadinessWithoutModels() {
