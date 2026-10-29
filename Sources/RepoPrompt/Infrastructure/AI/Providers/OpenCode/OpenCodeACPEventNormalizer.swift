@@ -2,39 +2,41 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 
-enum OpenCodeACPEventNormalizer {
+package enum OpenCodeACPEventNormalizer {
     private enum ToolEventPhase {
         case call
         case update
     }
 
-    static func normalize(
+    package static func normalize(
         _ payload: [String: Any],
-        toolProfile: OpenCodeAgentConfig.ToolProfile
+        toolProfile: OpenCodeAgentConfig.ToolProfile,
+        toolNames: ACPToolNameResolution
     ) -> [NormalizedAgentRuntimeEvent] {
         guard let sessionUpdate = (payload["sessionUpdate"] as? String)?.lowercased() else {
-            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .openCode)
+            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .openCode, toolNames: toolNames)
         }
 
         switch sessionUpdate {
         case "session_info_update":
             guard !shouldSuppressStatusPayload(payload) else { return [] }
-            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .openCode)
+            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .openCode, toolNames: toolNames)
         case "tool_call":
-            return normalizeToolEvent(payload, toolProfile: toolProfile, phase: .call)
+            return normalizeToolEvent(payload, toolProfile: toolProfile, phase: .call, toolNames: toolNames)
         case "tool_call_update":
-            return normalizeToolEvent(payload, toolProfile: toolProfile, phase: .update)
+            return normalizeToolEvent(payload, toolProfile: toolProfile, phase: .update, toolNames: toolNames)
         default:
-            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .openCode)
+            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .openCode, toolNames: toolNames)
         }
     }
 
     private static func normalizeToolEvent(
         _ payload: [String: Any],
         toolProfile: OpenCodeAgentConfig.ToolProfile,
-        phase: ToolEventPhase
+        phase: ToolEventPhase,
+        toolNames: ACPToolNameResolution
     ) -> [NormalizedAgentRuntimeEvent] {
-        let isRepoPromptTool = isRepoPromptToolPayload(payload)
+        let isRepoPromptTool = isRepoPromptToolPayload(payload, toolNames: toolNames)
         let status = ACPRuntimeEventParsing.firstString(in: payload, keys: ["status"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -57,17 +59,17 @@ enum OpenCodeACPEventNormalizer {
 
         return ACPDefaultSessionUpdateNormalizer.normalize(
             adaptedPayload(payload, canonicalToolName: canonicalToolName, isRepoPromptTool: isRepoPromptTool),
-            providerID: .openCode
+            providerID: .openCode, toolNames: toolNames
         )
     }
 
-    private static func isRepoPromptToolPayload(_ payload: [String: Any]) -> Bool {
-        if ACPRuntimeEventParsing.repoPromptToolName(from: payload) != nil {
+    private static func isRepoPromptToolPayload(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> Bool {
+        if ACPRuntimeEventParsing.repoPromptToolName(from: payload, toolNames: toolNames) != nil {
             return true
         }
         for key in ["toolName", "name", "tool", "title", "kind", "toolKind"] {
             guard let value = payload[key] as? String else { continue }
-            if ACPRuntimeEventParsing.explicitRepoPromptToolName(from: value) != nil {
+            if ACPRuntimeEventParsing.explicitRepoPromptToolName(from: value, toolNames: toolNames) != nil {
                 return true
             }
             let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

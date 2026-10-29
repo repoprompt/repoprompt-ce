@@ -1,11 +1,33 @@
 import Foundation
 import RepoPromptACPProviders
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 @testable import RepoPromptProcess
 import XCTest
 
 final class OpenCodeACPLaunchResolverTests: XCTestCase {
+    func testInjectedManagedOverlayReceivesResolvedWorkingDirectoryAndFlags() throws {
+        let directory = try makeTemporaryDirectory()
+        let executable = try makeExecutable(in: directory)
+        let config = OpenCodeAgentConfig(commandName: executable.path, additionalPathHints: [], includeRepoPromptMCPServer: false, includeManagedConfigOverlay: true, cleanupLegacyPersistentConfig: false)
+        let names = ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
+        let provider = OpenCodeACPAgentProvider(
+            config: config,
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true"),
+            launchResolver: OpenCodeACPLaunchResolver(),
+            toolNames: names,
+            prepareManagedOverlay: { config, server, workingDirectory in
+                XCTAssertFalse(config.includeRepoPromptMCPServer)
+                XCTAssertFalse(config.cleanupLegacyPersistentConfig)
+                XCTAssertEqual(server.command, "/usr/bin/true")
+                return workingDirectory
+            }
+        )
+        let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
+        XCTAssertEqual(launch.environment["OPENCODE_CONFIG_CONTENT"], directory.standardizedFileURL.path)
+    }
+
     func testMakeLaunchConfigurationResolvesExplicitPathWithoutPriorProbe() throws {
         let directory = try makeTemporaryDirectory()
         let executable = try makeExecutable(in: directory)

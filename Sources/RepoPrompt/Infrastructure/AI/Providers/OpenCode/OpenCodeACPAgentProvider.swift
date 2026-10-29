@@ -5,7 +5,7 @@ import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
-struct OpenCodeACPAgentProvider: ACPAgentProvider {
+package struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private enum LaunchContract {
         static let configContentEnvironmentKey = "OPENCODE_CONFIG_CONTENT"
     }
@@ -13,32 +13,38 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private let config: OpenCodeAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: OpenCodeACPLaunchResolver
+    private let toolNames: ACPToolNameResolution
+    private let prepareManagedOverlay: @Sendable (OpenCodeAgentConfig, RepoPromptMCPServerConfiguration, String) throws -> String
 
     #if DEBUG
-        var test_config: OpenCodeAgentConfig {
+        package var test_config: OpenCodeAgentConfig {
             config
         }
     #endif
 
-    init(
+    package init(
         config: OpenCodeAgentConfig,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: OpenCodeACPLaunchResolver = OpenCodeACPLaunchResolver()
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration,
+        launchResolver: OpenCodeACPLaunchResolver,
+        toolNames: ACPToolNameResolution,
+        prepareManagedOverlay: @escaping @Sendable (OpenCodeAgentConfig, RepoPromptMCPServerConfiguration, String) throws -> String
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
+        self.toolNames = toolNames
+        self.prepareManagedOverlay = prepareManagedOverlay
     }
 
-    var providerID: ACPProviderID {
+    package var providerID: ACPProviderID {
         .openCode
     }
 
-    var supportsParameterizedModelPicker: Bool {
+    package var supportsParameterizedModelPicker: Bool {
         true
     }
 
-    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+    package func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
         let category = input.category?.trimmingCharacters(in: .whitespacesAndNewlines)
         let configID = input.configID.trimmingCharacters(in: .whitespacesAndNewlines)
         if category == "thought_level" || configID == "effort" {
@@ -47,30 +53,17 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         return nil
     }
 
-    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+    package func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
 
-    func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
+    package func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = standardizedWorkingDirectory(from: request.workspacePath)
         let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
         var environment: [String: String] = [:]
 
         if config.includeManagedConfigOverlay {
-            if config.cleanupLegacyPersistentConfig {
-                OpenCodeIntegrationConfiguration.cleanupLegacyACPConfigIfNeeded(
-                    preserveExplicitMCPInstall: MCPIntegrationHelper.isMCPServerInstalled
-                )
-            }
-            if config.includeRepoPromptMCPServer {
-                try repoPromptMCPConfiguration.validateACPLaunchCommand(
-                    workingDirectory: workingDirectory
-                )
-            }
-            environment[LaunchContract.configContentEnvironmentKey] = try OpenCodeIntegrationConfiguration.ephemeralACPConfigJSON(
-                includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
-                repoPromptMCPConfiguration: repoPromptMCPConfiguration
-            )
+            environment[LaunchContract.configContentEnvironmentKey] = try prepareManagedOverlay(config, repoPromptMCPConfiguration, workingDirectory)
         }
 
         return ACPLaunchConfiguration(
@@ -86,7 +79,7 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func makeSessionConfiguration(
+    package func makeSessionConfiguration(
         for request: ACPRunRequest,
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
@@ -105,7 +98,7 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func buildPromptBlocks(
+    package func buildPromptBlocks(
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
@@ -129,14 +122,14 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func normalizeSessionUpdate(
+    package func normalizeSessionUpdate(
         _ payload: [String: Any],
         sessionID _: String
     ) -> [NormalizedAgentRuntimeEvent] {
-        OpenCodeACPEventNormalizer.normalize(payload, toolProfile: config.toolProfile)
+        OpenCodeACPEventNormalizer.normalize(payload, toolProfile: config.toolProfile, toolNames: toolNames)
     }
 
-    func normalizeError(_ error: Error) -> Error {
+    package func normalizeError(_ error: Error) -> Error {
         if error is AIProviderError {
             return error
         }
