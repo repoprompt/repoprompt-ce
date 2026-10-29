@@ -8,13 +8,13 @@ import RepoPromptDomainRuntime
 /// update with no output. RepoPrompt's own MCP tools also get an authoritative
 /// structured result from the tool tracker, which provider echoes must not erase
 /// (that is what hid Oracle lane coverage on tool cards).
-enum AgentToolResultPayloadRetention {
+package enum AgentToolResultPayloadRetention {
     /// The payload to store, or nil to keep `existing` unchanged.
     ///
     /// With `requireObjectReplacement`, used for RepoPrompt's own MCP tools whose
     /// results are JSON objects, an earlier native result is kept over non-object
     /// echoes. Provider lifecycle content may still finish with substantive text.
-    static func resolvedPayload(
+    package static func resolvedPayload(
         existing: String?,
         incoming: String,
         incomingIsError: Bool?,
@@ -52,7 +52,7 @@ enum AgentToolResultPayloadRetention {
     }
 
     /// True when `incoming` carries no output and should not replace `existing`.
-    static func shouldKeepExisting(
+    package static func shouldKeepExisting(
         existing: String?,
         incoming: String?,
         incomingIsError: Bool?,
@@ -74,7 +74,7 @@ enum AgentToolResultPayloadRetention {
         return !isProviderLifecycle(object) && isProviderLifecycle(incomingObject)
     }
 
-    static func isThin(_ payload: String?) -> Bool {
+    package static func isThin(_ payload: String?) -> Bool {
         guard let trimmed = payload?.trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmed.isEmpty
         else { return true }
@@ -94,13 +94,13 @@ enum AgentToolResultPayloadRetention {
     }
 
     /// A provider progress update such as `{"status":"running","title":"…"}`.
-    static func isProgress(_ payload: String?) -> Bool {
+    package static func isProgress(_ payload: String?) -> Bool {
         guard let object = jsonObject(payload), isLifecycleStatus(object["status"]) else { return false }
         return Set(object.keys).isSubset(of: ["status", "title", "kind", "summary_only"])
     }
 
     /// `completed` / `failed` for a bare `{"status":…}` terminal marker.
-    static func terminalMarkerStatus(_ payload: String?) -> String? {
+    package static func terminalMarkerStatus(_ payload: String?) -> String? {
         guard let object = jsonObject(payload), object.count == 1,
               let status = (object["status"] as? String)?.lowercased(),
               status == "completed" || status == "failed"
