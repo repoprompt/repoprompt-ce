@@ -6,6 +6,7 @@ import RepoPromptSettingsCore
 final class AppearanceController: ObservableObject {
     static let shared = AppearanceController()
 
+    private let appIconController = AppIconController()
     private var lastAppliedMode: AppearanceMode?
 
     func applyFromGlobalSettings() {
@@ -18,6 +19,7 @@ final class AppearanceController: ObservableObject {
     }
 
     func apply(mode: AppearanceMode) {
+        defer { appIconController.applyFromGlobalSettings() }
         let desiredAppearance = appearance(for: mode)
         if lastAppliedMode == mode, isAppearanceApplied(desiredAppearance) {
             return
@@ -27,6 +29,10 @@ final class AppearanceController: ObservableObject {
         if !isAppearanceApplied(desiredAppearance) {
             NSApplication.shared.appearance = desiredAppearance
         }
+    }
+
+    func applyAppIconMode(_ modeRawValue: AppIconMode.RawValue) {
+        appIconController.apply(modeRawValue: modeRawValue)
     }
 
     private func appearance(for mode: AppearanceMode) -> NSAppearance? {
