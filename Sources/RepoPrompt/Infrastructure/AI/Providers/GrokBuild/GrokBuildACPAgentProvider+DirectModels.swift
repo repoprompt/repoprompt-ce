@@ -21,7 +21,7 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
     /// `session/load` response. Verified against grok 1.0.4: the response carries
     /// `{sessionId, models: {currentModelId, availableModels: [{modelId, name, description?,
     /// _meta?}]}, _meta}` and no modern `configOptions`.
-    func parseDirectSessionModelSnapshot(
+    package func parseDirectSessionModelSnapshot(
         from sessionResponse: [String: Any]
     ) -> ACPProviderModelSnapshotResult {
         func nonEmpty(_ value: String?) -> String? {
@@ -231,7 +231,7 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         ))
     }
 
-    func parseDirectSessionEffortReport(
+    package func parseDirectSessionEffortReport(
         from configOptions: [[String: Any]],
         sessionID: String,
         options: [AgentModelOption]
@@ -257,7 +257,7 @@ extension GrokBuildACPAgentProvider: ACPDirectSessionModelProvider {
         return ACPDirectSessionEffortReport(baseModelRaw: base.rawValue, effortRaw: effort?.rawValue)
     }
 
-    func makeDirectModelSelectionRequest(
+    package func makeDirectModelSelectionRequest(
         sessionID: String,
         baseModelRaw: String,
         reasoningEffortRaw: String?

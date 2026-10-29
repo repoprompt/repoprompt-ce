@@ -7,8 +7,8 @@ import RepoPromptDomainRuntime
 /// the shared canonical durable-result adapter; all other updates delegate to the
 /// default ACP normalizer. Grok's `_x.ai/*` extension updates ride separate methods
 /// and never reach this normalizer.
-enum GrokBuildACPEventNormalizer {
-    static func normalize(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> [NormalizedAgentRuntimeEvent] {
+package enum GrokBuildACPEventNormalizer {
+    package static func normalize(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> [NormalizedAgentRuntimeEvent] {
         guard let sessionUpdate = (payload["sessionUpdate"] as? String)?.lowercased() else {
             return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .grokBuild, toolNames: toolNames)
         }

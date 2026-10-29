@@ -5,7 +5,7 @@ import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
-struct GrokBuildACPAgentProvider: ACPAgentProvider {
+package struct GrokBuildACPAgentProvider: ACPAgentProvider {
     private let config: GrokBuildAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: GrokBuildACPLaunchResolver
@@ -13,12 +13,12 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
     let directEffortWireState = GrokBuildDirectEffortWireState()
 
     #if DEBUG
-        var test_config: GrokBuildAgentConfig {
+        package var test_config: GrokBuildAgentConfig {
             config
         }
     #endif
 
-    init(
+    package init(
         config: GrokBuildAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration,
         launchResolver: GrokBuildACPLaunchResolver,
@@ -35,19 +35,19 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         self.toolNames = toolNames
     }
 
-    var providerID: ACPProviderID {
+    package var providerID: ACPProviderID {
         .grokBuild
     }
 
-    func recognizesUnmatchedResponseID(_ id: String) -> Bool {
+    package func recognizesUnmatchedResponseID(_ id: String) -> Bool {
         id == "skills-reload" || id == "workflows-reload"
     }
 
-    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+    package func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
 
-    func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
+    package func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = try standardizedWorkingDirectory(from: request.workspacePath)
         let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
 
@@ -82,7 +82,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func makeSessionConfiguration(
+    package func makeSessionConfiguration(
         for request: ACPRunRequest,
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
@@ -119,7 +119,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func buildPromptBlocks(
+    package func buildPromptBlocks(
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
@@ -150,14 +150,14 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func normalizeSessionUpdate(
+    package func normalizeSessionUpdate(
         _ payload: [String: Any],
         sessionID _: String
     ) -> [NormalizedAgentRuntimeEvent] {
         GrokBuildACPEventNormalizer.normalize(payload, toolNames: toolNames)
     }
 
-    func shouldEmitStderrLine(_ line: String) -> Bool {
+    package func shouldEmitStderrLine(_ line: String) -> Bool {
         // grok's background workers (its own configured MCP servers, auth refresh, leader)
         // log fatal-looking transport errors to stderr when THEY fail; the ACP session
         // itself is unaffected and reports real failures over JSON-RPC. Suppress that
@@ -165,7 +165,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         !line.contains("worker quit with fatal: Transport channel closed")
     }
 
-    func preferredAuthMethodID(context _: ACPAuthenticationContext) -> String? {
+    package func preferredAuthMethodID(context _: ACPAuthenticationContext) -> String? {
         // Never send ACP `authenticate`: Grok checks model `api_key`/`env_key`, then a configured
         // auth-provider branch (no fallthrough without its cached token), then an eligible
         // session token, then `XAI_API_KEY`, subject to `[auth] preferred_method` and
@@ -174,7 +174,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         nil
     }
 
-    func normalizeError(_ error: Error) -> Error {
+    package func normalizeError(_ error: Error) -> Error {
         if error is AIProviderError {
             return error
         }
