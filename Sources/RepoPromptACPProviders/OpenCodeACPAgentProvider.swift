@@ -1,9 +1,7 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
-import RepoPromptSettingsCore
 
 package struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private enum LaunchContract {

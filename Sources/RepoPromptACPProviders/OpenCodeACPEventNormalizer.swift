@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 
 package enum OpenCodeACPEventNormalizer {
