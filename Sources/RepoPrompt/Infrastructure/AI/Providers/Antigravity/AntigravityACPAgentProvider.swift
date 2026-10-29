@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
 /// Google Antigravity's official ACP runtime provider.

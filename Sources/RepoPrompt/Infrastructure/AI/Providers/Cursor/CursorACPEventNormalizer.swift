@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 enum CursorACPEventNormalizer {
     static func normalize(_ payload: [String: Any]) -> [NormalizedAgentRuntimeEvent] {

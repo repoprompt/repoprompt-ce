@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Grok Build session-update normalizer. Native search_replace/write calls are
 /// classified as edit before shared transcript merging. Terminal tool updates reuse

@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 @_spi(TestSupport) @testable import RepoPromptApp

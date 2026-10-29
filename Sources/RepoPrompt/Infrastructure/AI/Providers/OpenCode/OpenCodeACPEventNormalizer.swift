@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptACPProviders
+import RepoPromptDomainRuntime
 
 enum OpenCodeACPEventNormalizer {
     private enum ToolEventPhase {
