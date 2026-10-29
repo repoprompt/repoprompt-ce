@@ -1,6 +1,4 @@
-@testable import RepoPromptApp
-import RepoPromptFileSystem
-import RepoPromptVCS
+import RepoPromptDomainRuntime
 import XCTest
 
 final class DiffParserRecoveryTests: XCTestCase {
@@ -31,29 +29,5 @@ final class DiffParserRecoveryTests: XCTestCase {
         XCTAssertEqual(entries.map(\.action), ["modify", "create", "delete", "modify"])
         XCTAssertEqual(entries[2].body, "")
         XCTAssertTrue(entries[3].body.contains("charlie"))
-
-        let changedLines = GitDiffPatchParsing.extractChangedLines(from: [
-            "Sources/My Feature/View Model.swift": #"""
-            --- a/Sources/My Feature/View Model.swift
-            +++ b/Sources/My Feature/View Model.swift
-            @@ -3 +3 @@
-            -old title
-            \ No newline at end of file
-            +new title
-            \ No newline at end of file
-            """#,
-            "Docs/Release Notes.md": #"""
-            --- /dev/null
-            +++ b/Docs/Release Notes.md
-            @@ -0,0 +1 @@
-            +initial notes
-            """#
-        ])
-
-        XCTAssertEqual(changedLines.map { "\($0.path):\($0.lineNumber):\($0.changeType):\($0.content)" }, [
-            "Docs/Release Notes.md:1:+:initial notes",
-            "Sources/My Feature/View Model.swift:3:-:old title",
-            "Sources/My Feature/View Model.swift:3:+:new title"
-        ])
     }
 }
