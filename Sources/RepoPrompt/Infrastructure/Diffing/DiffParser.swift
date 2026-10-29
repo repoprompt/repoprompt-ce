@@ -1,8 +1,5 @@
-import RepoPromptFileSystem
-
-// File: RepoPrompt/Models/DiffParserUtils.swift
-
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Central on/off switch for every debug print in the diff-parser stack.
 enum DebugFlags { nonisolated(unsafe) static var parser = false }
@@ -16,7 +13,7 @@ func dprint(_ msg: @autoclosure () -> String) {
     #endif
 }
 
-enum DiffParserUtils {
+package enum DiffParserUtils {
     private static func dbg(_ msg: @autoclosure () -> String) {
         dprint(msg())
     }
@@ -599,7 +596,7 @@ enum DiffParserUtils {
     /// Pulls out every `<file …>` … `</file>` block (or to EOF if the closer
     /// is missing) and returns a tuple with the raw path, action and body.
     /// • Handles normal quotes (") and “smart” quotes.
-    static func extractFileEntries(from input: String)
+    package static func extractFileEntries(from input: String)
         -> [(path: String, action: String, body: String)]
     {
         typealias Entry = (path: String, action: String, body: String)
@@ -1067,19 +1064,15 @@ enum DiffParserUtils {
     }
 }
 
-import Foundation
-import RepoPromptDomainRuntime
-import SwiftUI
-
-class DiffParser {
-    private let fileManager: WorkspaceFilesViewModel
+package class DiffParser {
+    private let fileSource: any DiffParserFileSource
 
     private func dbg(_ msg: @autoclosure () -> String) {
         dprint(msg())
     }
 
-    init(fileManager: WorkspaceFilesViewModel) {
-        self.fileManager = fileManager
+    package init(fileSource: any DiffParserFileSource) {
+        self.fileSource = fileSource
     }
 
     /// Merges two actions for the same file into a single effective action
@@ -1102,7 +1095,7 @@ class DiffParser {
     /// Converts a raw diff-XML string into an array of `ParsedFile`.
     /// The heavy lifting is delegated to small helpers so the core loop
     /// is straightforward and easy to unit-test.
-    func parse(_ rawInput: String) async throws -> [ParsedFile] {
+    package func parse(_ rawInput: String) async throws -> [ParsedFile] {
         var parsedFileMap: [String: ParsedFile] = [:]
         var errors: [ParserError] = []
 
@@ -1162,7 +1155,7 @@ class DiffParser {
                 return ""
             }
 
-            if let location = await fileManager.pathLocation(filePath, exactMatchOnly: isCreate || isDelete) {
+            if let location = await fileSource.pathLocation(filePath, exactMatchOnly: isCreate || isDelete) {
                 // Fetch the would-be *absolute* path for the service's correction
                 let candidateCanonical = URL(fileURLWithPath: location.rootPath)
                     .appendingPathComponent(location.correctedPath)
@@ -1198,14 +1191,10 @@ class DiffParser {
                 if useCandidate {
                     canonicalPath = candidateCanonical
 
-                    // Get latest content from FileViewModel
-                    if let file = await fileManager.findFile(
-                        atPath: location.correctedPath,
-                        rootIdentifier: location.rootIdentifier
-                    ) {
+                    // Read current content using the same resolved root and path.
+                    if let file = await fileSource.readFile(at: location) {
                         canBeLoaded = true
-                        // latestContent is an async getter
-                        loadedFile = await file.latestContent ?? ""
+                        loadedFile = file.content ?? ""
                     } else {
                         // File doesn't exist in hierarchy yet
                         canBeLoaded = false
@@ -1368,17 +1357,14 @@ class DiffParser {
         var lineEnding = "\n"
         var usesSpaces = true
 
-        if let locationOld = await fileManager.pathLocation(oldPath, exactMatchOnly: true) {
+        if let locationOld = await fileSource.pathLocation(oldPath, exactMatchOnly: true) {
             canonicalOld = URL(fileURLWithPath: locationOld.rootPath)
                 .appendingPathComponent(locationOld.correctedPath)
                 .path
 
-            // Use FileViewModel to load old file content
-            if let file = await fileManager.findFile(
-                atPath: locationOld.correctedPath,
-                rootIdentifier: locationOld.rootIdentifier
-            ) {
-                if let data = await file.latestContent {
+            // Best-effort read using the same resolved root and path.
+            if let file = await fileSource.readFile(at: locationOld) {
+                if let data = file.content {
                     loadedOld = data
                 }
             }
@@ -1456,16 +1442,16 @@ struct FileContentRequest {
     }
 }
 
-struct ParsedFile: Identifiable, Equatable {
-    let id = UUID()
-    let fileName: String
-    var changes: [Change]
-    let fileContent: String
-    var canBeLoaded: Bool
-    let action: FileAction
-    let lineEnding: String
+package struct ParsedFile: Identifiable, Equatable {
+    package let id = UUID()
+    package let fileName: String
+    package var changes: [Change]
+    package let fileContent: String
+    package var canBeLoaded: Bool
+    package let action: FileAction
+    package let lineEnding: String
 
-    static func == (lhs: ParsedFile, rhs: ParsedFile) -> Bool {
+    package static func == (lhs: ParsedFile, rhs: ParsedFile) -> Bool {
         lhs.id == rhs.id
     }
 
@@ -1497,15 +1483,15 @@ struct ParsedFile: Identifiable, Equatable {
     }
 }
 
-struct Change: Identifiable {
-    let id: UUID
-    var type: ChangeType
-    var summary: String
-    var isSelected: Bool
-    var content: [String]?
-    var startSelector: [String]?
-    var endSelector: [String]?
-    var searchBlock: [String]?
+package struct Change: Identifiable {
+    package let id: UUID
+    package var type: ChangeType
+    package var summary: String
+    package var isSelected: Bool
+    package var content: [String]?
+    package var startSelector: [String]?
+    package var endSelector: [String]?
+    package var searchBlock: [String]?
 
     func printDetails() {
         print("    Change:")
@@ -1541,33 +1527,17 @@ struct Change: Identifiable {
     }
 }
 
-enum ChangeType: String {
+package enum ChangeType: String {
     case add
     case modify
     case remove
 
-    var displayString: String {
+    package var displayString: String {
         switch self {
         case .add: "Added"
         case .modify: "Modified"
         case .remove: "Removed"
         }
-    }
-
-    var color: Color {
-        switch self {
-        case .add: .green
-        case .modify: .yellow
-        case .remove: .red
-        }
-    }
-
-    func printDetails() {
-        print("Change Type:")
-        print("  Raw Value: \(rawValue)")
-        print("  Display String: \(displayString)")
-        print("  Color: \(color)")
-        print("")
     }
 }
 
