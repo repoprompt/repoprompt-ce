@@ -146,7 +146,7 @@ let package = Package(
             name: "RepoPromptACPProviders",
             dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptProcess"],
             path: "Sources/RepoPromptACPProviders",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug)), .enableUpcomingFeature("BareSlashRegexLiterals")]
         ),
         .testTarget(
             name: "RepoPromptACPProvidersTests",

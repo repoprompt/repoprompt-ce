@@ -1,5 +1,6 @@
 #if DEBUG
     import Foundation
+    import RepoPromptACPProviders
     @testable import RepoPromptApp
     import XCTest
 
