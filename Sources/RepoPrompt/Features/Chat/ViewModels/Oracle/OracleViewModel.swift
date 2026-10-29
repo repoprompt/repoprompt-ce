@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptInstrumentation

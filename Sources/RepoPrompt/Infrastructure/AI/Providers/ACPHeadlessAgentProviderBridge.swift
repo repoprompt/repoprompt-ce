@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptACPProviders
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
 /// Shared one-shot ACP stream bridge for headless discovery/delegate providers.

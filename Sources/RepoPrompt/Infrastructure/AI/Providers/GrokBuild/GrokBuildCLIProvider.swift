@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Grok Build CLI provider for non-agent use (chat, Oracle, AI queries).
 /// Runs a fresh prompt-only one-shot process per request without injecting RepoPrompt MCP/tools.

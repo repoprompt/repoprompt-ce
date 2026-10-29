@@ -1,3 +1,4 @@
+import RepoPromptAIContracts
 import RepoPromptFoundation
 
 extension CustomOpenAIProviderError: FriendlyErrorRepresentable {

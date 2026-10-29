@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 protocol CodexManagedAuthRPCClient: Sendable {
     func updateDefaultRequestTimeout(_ timeout: TimeInterval?) async

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptProcess

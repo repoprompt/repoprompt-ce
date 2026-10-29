@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import SwiftOpenAI
 
 func openAIChatCompletionOutcome(_ finishReason: IntOrStringValue?) -> AIProviderCompletionOutcome? {

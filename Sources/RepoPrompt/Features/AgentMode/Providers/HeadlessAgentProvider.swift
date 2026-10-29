@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 /// Protocol for headless CLI-based agents that operate via MCP tools only.
 protocol HeadlessAgentProvider {

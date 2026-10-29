@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptProcess
 
 /// Devin provider for non-agent use (chat, Oracle, AI queries).
