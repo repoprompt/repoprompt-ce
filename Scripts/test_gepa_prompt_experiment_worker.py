@@ -30,6 +30,8 @@ from gepa_worker import (  # noqa: E402
     REFLECTION_BEGIN,
     REFLECTION_END,
     QualityThenBrevityAcceptance,
+    ObjectiveAcceptance,
+    ObjectivePolicy,
     brevity_score,
     build_reflection_prompt,
     delimit_for_gepa,
@@ -80,9 +82,11 @@ class FakeHost:
         output_excerpt: Callable[[str], str] | None = None,
         report_remaining: bool = True,
         output_characters: Callable[[str], int] | None = None,
+        usage: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.report_remaining = report_remaining
         self.output_characters_fn = output_characters
+        self.usage_fn = usage
         self.reflect_prompts: list[str] = []
         self.reflect_fn = reflect
         self.score_fn = score
@@ -141,6 +145,8 @@ class FakeHost:
             response["output_excerpt"] = self.output_excerpt_fn(candidate)
         if self.output_characters_fn:
             response["output_characters"] = self.output_characters_fn(candidate)
+        if self.usage_fn:
+            response.update(self.usage_fn(candidate, payload))
         self.memo[key] = response
         return self.with_remaining(dict(response), payload)
 
@@ -358,6 +364,54 @@ class ReflectionPromptTests(unittest.TestCase):
         self.assertEqual(full_iteration_cost(minibatch=3, training=1, validation=0), 3)
 
 
+class WorkerReadinessTests(unittest.TestCase):
+    def test_real_worker_preflight_is_independent_of_cwd_and_never_requests_host_calls(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="RPCE Worker Ready ") as temporary:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-B", str(WORKER), "--preflight"],
+                cwd=temporary,
+                env={"HOME": temporary, "PATH": "/usr/bin:/bin", "TMPDIR": temporary},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        messages = [json.loads(line) for line in completed.stdout.splitlines()]
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0], {
+            "protocol_version": 2,
+            "type": "ready",
+            "python_version": list(sys.version_info[:3]),
+            "gepa_version": "0.1.4",
+            "upstream_revision": "0632cdb5dcc052e690eab439e1b4a7e3e9cfe407",
+        })
+
+
+class EfficiencyPolicyTests(unittest.TestCase):
+    def test_invalid_candidate_cannot_earn_quality_or_token_credit(self) -> None:
+        baseline = {"quality": 0, "prompt_tokens": 100, "completion_tokens": 100}
+        invalid = {"quality": 0, "candidate_valid": False, "prompt_tokens": 0, "completion_tokens": 0}
+        for mode in ("quality", "efficiency"):
+            policy = ObjectivePolicy({"mode": mode})
+            self.assertLess(policy.score(invalid, baseline), policy.score(baseline, baseline))
+
+    def test_missing_usage_never_earns_savings_and_zero_weight_is_explicit(self) -> None:
+        policy = ObjectivePolicy({"mode": "efficiency"})
+        baseline = {"quality": 1.0, "prompt_tokens": 100, "completion_tokens": 100}
+        self.assertEqual(policy.score(baseline, baseline), 0.5)
+        self.assertEqual(policy.score({**baseline, "prompt_tokens": None}, baseline), 0)
+        self.assertEqual(policy.score(baseline, {**baseline, "completion_tokens": None}), 0)
+        output_only = ObjectivePolicy({"mode": "efficiency", "input_weight": 0})
+        self.assertGreater(output_only.score({**baseline, "prompt_tokens": None, "completion_tokens": 80}, baseline), 0.5)
+
+    def test_per_case_quality_violation_dominates_whole_set_savings(self) -> None:
+        policy = ObjectivePolicy({"mode": "efficiency", "quality_tolerance": 0.02}, case_count=20)
+        baseline = {"quality": 1, "prompt_tokens": 100, "completion_tokens": 100}
+        self.assertLess(policy.score({**baseline, "quality": 0.97}, baseline) + 19, 0)
+        self.assertGreater(policy.score({**baseline, "quality": 0.99, "prompt_tokens": 80}, baseline), 0.5)
+
+
 class GEPAWorkerRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -379,6 +433,170 @@ class GEPAWorkerRunTests(unittest.TestCase):
                 self.assertEqual(message["candidate_sha256"], sha(message["candidate"]))
                 texts[message["candidate_index"]] = message["candidate"]
         return texts
+
+    def test_invalid_shorter_candidate_never_displaces_valid_zero_quality_seed(self) -> None:
+        seed = '{"first":"Complete seed instructions","second":"Answer instructions"}'
+        invalid = '{}'
+        for mode in ("quality", "efficiency"):
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                root.mkdir()
+                host = FakeHost(
+                    reflect=always(invalid), score=lambda candidate, payload: 0.0,
+                    usage=lambda candidate, payload: {
+                        "candidate_valid": candidate != invalid,
+                        "prompt_tokens": 0 if candidate == invalid else 100,
+                        "completion_tokens": 0 if candidate == invalid else 100,
+                    },
+                )
+                terminal, messages, code, stderr = run_worker(
+                    root, host, seed=seed, search_max_evaluations=8,
+                    extra={"objective_policy": {"mode": mode}},
+                )
+                result = self.assert_completed(terminal, code, stderr)
+                self.assertEqual(self.registered(messages)[result["best_candidate_index"]], seed)
+                self.assertEqual(result["best_score"], 0.0)
+                invalid_evaluations = [event for event in messages if event["type"] == "evaluation"
+                                       and event["candidate_sha256"] == sha(invalid)]
+                self.assertTrue(invalid_evaluations)
+                self.assertTrue(all(event["score"] == 0 and event["objective_score"] < 0 for event in invalid_evaluations))
+
+    def test_perfect_quality_token_efficiency_search_reduces_both_dimensions_twenty_percent(self) -> None:
+        seed, improved = "seed", "longer instructions that produce a cheaper complete answer"
+        host = FakeHost(
+            reflect=always(improved), score=lambda candidate, payload: 1.0,
+            usage=lambda candidate, payload: {
+                "prompt_tokens": 80 if candidate == improved else 100,
+                "completion_tokens": 80 if candidate == improved else 100,
+            },
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, seed=seed, search_max_evaluations=8,
+            extra={"objective_policy": {"mode": "efficiency"}, "prompt_character_ceiling_ratio": None},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertGreater(host.reflections, 0, "raw perfect quality and stop_at_score=1 must not stop cost search")
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], improved)
+        self.assertEqual(result["best_score"], 1.0, "reported quality must not become utility")
+        self.assertEqual(result["baseline_score"], 1.0)
+        self.assertGreater(result["best_objective_score"], result["baseline_objective_score"])
+        for field in ("prompt_tokens", "completion_tokens"):
+            self.assertAlmostEqual(result["paired_usage"]["savings"][field], 0.2)
+        self.assertIn("Prompt growth is allowed", host.reflect_prompts[0])
+
+    def test_efficiency_rejects_shorter_prompt_with_more_expensive_answers(self) -> None:
+        seed, worse = "long seed prompt", "short"
+        host = FakeHost(
+            reflect=always(worse), score=lambda candidate, payload: 1.0,
+            usage=lambda candidate, payload: {"prompt_tokens": 99 if candidate == worse else 100,
+                                               "completion_tokens": 2000 if candidate == worse else 1000},
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, seed=seed, search_max_evaluations=6,
+            extra={"objective_policy": {"mode": "efficiency"}},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], seed)
+        self.assertEqual(result["paired_usage"]["savings"]["completion_tokens"], 0)
+
+    def test_efficiency_allows_longer_prompt_when_output_savings_outweigh_input_growth(self) -> None:
+        seed, better = "s", "Add instructions to remove unnecessary explanations."
+        host = FakeHost(
+            reflect=always(better), score=lambda candidate, payload: 1.0,
+            usage=lambda candidate, payload: {"prompt_tokens": 101 if candidate == better else 100,
+                                               "completion_tokens": 800 if candidate == better else 1000},
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, seed=seed, search_max_evaluations=6,
+            extra={"objective_policy": {"mode": "efficiency"}, "prompt_character_ceiling_ratio": None},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], better)
+        self.assertAlmostEqual(result["paired_usage"]["savings"]["prompt_tokens"], -0.01)
+        self.assertAlmostEqual(result["paired_usage"]["savings"]["completion_tokens"], 0.2)
+
+    def test_efficiency_cannot_hide_a_validation_quality_regression_in_aggregate_savings(self) -> None:
+        seed, candidate = "seed", "cheap"
+        host = FakeHost(
+            reflect=always(candidate),
+            score=lambda text, case: 0.9 if text == candidate and case["example_id"] == "v1" else 1.0,
+            usage=lambda text, case: {"prompt_tokens": 1 if text == candidate else 100,
+                                      "completion_tokens": 1 if text == candidate else 100},
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, seed=seed, search_max_evaluations=16, examples=[
+                {"id": "train", "split": "training", "input": "train"},
+                {"id": "v1", "split": "validation", "input": "first"},
+                {"id": "v2", "split": "validation", "input": "second"},
+            ], extra={"objective_policy": {"mode": "efficiency", "quality_tolerance": 0.02}},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertIn(candidate, self.registered(messages).values(), "the training gain must reach validation")
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], seed)
+        self.assertEqual(result["validation_scores"]["best"], {"v1": 1.0, "v2": 1.0})
+
+    def test_efficiency_missing_candidate_usage_cannot_win(self) -> None:
+        seed, candidate = "long seed", "s"
+        host = FakeHost(
+            reflect=always(candidate), score=lambda text, case: 1.0,
+            usage=lambda text, case: {"prompt_tokens": None if text == candidate else 100,
+                                      "completion_tokens": None if text == candidate else 100},
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, seed=seed, search_max_evaluations=6,
+            extra={"objective_policy": {"mode": "efficiency"}},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], seed)
+
+    def test_efficiency_missing_baseline_usage_is_unavailable_on_paired_report(self) -> None:
+        host = FakeHost(reflect=always("short"), score=lambda text, case: 1.0,
+                        usage=lambda text, case: {"prompt_tokens": None, "completion_tokens": 80})
+        terminal, _, code, stderr = run_worker(
+            self.root, host, seed="long seed", search_max_evaluations=6,
+            extra={"objective_policy": {"mode": "efficiency"}},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertIsNone(result["paired_usage"]["savings"]["prompt_tokens"])
+        self.assertIsNone(result["paired_usage"]["baseline"]["prompt_tokens"])
+
+    def test_efficiency_resume_preserves_raw_quality_and_paired_usage(self) -> None:
+        host = FakeHost(reflect=always("cheaper candidate"), score=lambda text, case: 1.0,
+                        usage=lambda text, case: {"prompt_tokens": 80 if text.startswith("cheaper") else 100,
+                                                  "completion_tokens": 80 if text.startswith("cheaper") else 100})
+        options = {"objective_policy": {"mode": "efficiency"}, "prompt_character_ceiling_ratio": None}
+        first, _, code, stderr = run_worker(self.root, host, search_max_evaluations=6, extra=options)
+        before = self.assert_completed(first, code, stderr)
+        resumed, _, code, stderr = run_worker(self.root, host, search_max_evaluations=6, extra=options)
+        after = self.assert_completed(resumed, code, stderr)
+        self.assertEqual(before["best_score"], after["best_score"])
+        self.assertEqual(before["paired_usage"], after["paired_usage"])
+
+    def test_efficiency_first_iteration_fits_small_budget_without_double_counting_seed_pass(self) -> None:
+        seed, candidate = "seed", "cheaper"
+        host = FakeHost(reflect=always(candidate), score=lambda text, case: 1.0, search_cap=4,
+                        usage=lambda text, case: {"prompt_tokens": 80 if text == candidate else 100,
+                                                  "completion_tokens": 80 if text == candidate else 100})
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, seed=seed, search_max_evaluations=4, minibatch=1,
+            examples=[{"id": "t", "split": "training", "input": "train"},
+                      {"id": "v", "split": "validation", "input": "validate"}],
+            extra={"objective_policy": {"mode": "efficiency"}},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], candidate)
+        self.assertEqual(host.search_admitted, 4)
+        self.assertEqual(host.budget_refusals, 0)
+
+    def test_explicit_quality_policy_allows_prompt_growth_without_an_explicit_ceiling(self) -> None:
+        candidate = "Additional instructions needed to solve the task correctly."
+        host = FakeHost(reflect=always(candidate), score=exact(candidate))
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, seed="s", extra={"objective_policy": {"mode": "quality"}, "prompt_character_ceiling_ratio": None},
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(self.registered(messages)[result["best_candidate_index"]], candidate)
+        self.assertIn("Prompt growth is allowed", host.reflect_prompts[0])
 
     def test_seeded_search_mutates_evaluates_and_streams_candidates(self) -> None:
         host = FakeHost(reflect=always("improved candidate"), score=exact("improved candidate"))
@@ -460,6 +678,34 @@ class GEPAWorkerRunTests(unittest.TestCase):
         self.assertEqual(host.reflections, 0)
         self.assertEqual(host.search_admitted, 1)
         self.assertTrue(result["stopped_before_unfinishable_iteration"])
+
+    def test_perfect_training_replays_stop_without_reflection_or_a_score_threshold(self) -> None:
+        # The app defaults to skip_perfect_score=True and stop_at_score=None. A perfect
+        # training minibatch skips reflection even when validation is imperfect; once its
+        # parent outcomes are cached, neither paid evaluations nor reflections can end the
+        # loop. The iteration bound must still return the saved incumbent and held-out score.
+        host = FakeHost(
+            reflect=always("unexpected proposal"),
+            score=lambda c, p: 0.5 if p["split"] == "validation" else 1.0,
+            search_cap=12,
+        )
+        terminal, messages, code, stderr = run_worker(
+            self.root, host, examples=self.BUDGET_EXAMPLES,
+            held_out=[{"id": "h1", "split": "hidden_test"}],
+            search_max_evaluations=12, stop_at_score=None, skip_perfect_score=True,
+            max_messages=100,
+        )
+        result = self.assert_completed(terminal, code, stderr)
+        self.assertEqual(result["stop_reason"], "iteration_limit")
+        self.assertTrue(result["iteration_limit_reached"])
+        self.assertEqual(result["iterations_started"], 12)
+        self.assertEqual(host.reflections, 0)
+        self.assertGreater(host.replays, 0)
+        self.assertEqual(host.search_admitted, 3, "only the seed's distinct development cases cost evaluations")
+        self.assertEqual(host.budget_refusals, 0)
+        self.assertEqual(result["best_candidate_index"], 0)
+        self.assertEqual(result["best_score"], 0.5, "a perfect training minibatch is not a validation win")
+        self.assertEqual(result["held_out"]["best"]["scores"], {"h1": 1.0})
 
     def test_host_budget_refusal_still_stops_cleanly_with_incumbent(self) -> None:
         # Without remaining counts the stopper cannot see the ceiling; the ledger's hard

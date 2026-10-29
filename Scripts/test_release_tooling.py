@@ -563,6 +563,45 @@ class EmbeddedProvisioningProfileTests(unittest.TestCase):
 
 
 class PromptExperimentDebugPackagingTests(unittest.TestCase):
+    def test_project_runner_resource_verification_rejects_missing_or_stale_resource(self) -> None:
+        from prompt_experiment_runtime_artifact import ContractError, verify_worker_resource
+
+        source = SCRIPT_DIR.parent / "AppResources" / "PromptExperiments" / "prompt_program_runner.py"
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / source.name
+            with self.assertRaisesRegex(ContractError, "regular project program runner"):
+                verify_worker_resource(source, target, label="project program runner")
+            target.write_bytes(source.read_bytes())
+            verify_worker_resource(source, target, label="project program runner")
+            target.write_text("pass\n", encoding="utf-8")
+            with self.assertRaisesRegex(ContractError, "differs"):
+                verify_worker_resource(source, target, label="project program runner")
+
+    def test_worker_resource_verification_rejects_missing_stale_and_invalid_files(self) -> None:
+        from prompt_experiment_runtime_artifact import ContractError, verify_worker_resource
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.py"
+            worker = root / "packaged.py"
+            source.write_text("PROTOCOL_VERSION = 2\n", encoding="utf-8")
+            with self.assertRaisesRegex(ContractError, "regular GEPA worker"):
+                verify_worker_resource(source, worker)
+            worker.write_bytes(source.read_bytes())
+            verify_worker_resource(source, worker)
+            worker.write_text("PROTOCOL_VERSION = 1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ContractError, "differs"):
+                verify_worker_resource(source, worker)
+            worker.unlink()
+            worker.symlink_to(source)
+            with self.assertRaisesRegex(ContractError, "regular GEPA worker"):
+                verify_worker_resource(source, worker)
+            worker.unlink()
+            source.write_text("def broken(:\n", encoding="utf-8")
+            worker.write_bytes(source.read_bytes())
+            with self.assertRaisesRegex(ContractError, "not valid Python"):
+                verify_worker_resource(source, worker)
+
     def test_prompt_experiment_runtime_and_workers_stay_out_of_release_packages(self) -> None:
         package_source = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
 
@@ -577,6 +616,16 @@ class PromptExperimentDebugPackagingTests(unittest.TestCase):
             package_source,
         )
         self.assertIn("--exclude='PromptExperiments/'", package_source)
+        self.assertIn(
+            'if (( ! IS_RELEASE )); then\n'
+            '    phase "Checking packaged GEPA worker before signing (no model calls)"',
+            package_source,
+        )
+        worker_check = package_source.index('"$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-worker')
+        self.assertIn('--source-program-runner "$ROOT_DIR/AppResources/PromptExperiments/prompt_program_runner.py"', package_source)
+        self.assertIn('--program-runner "$APP_BUNDLE/Contents/Resources/PromptExperiments/prompt_program_runner.py"', package_source)
+        self.assertGreater(worker_check, package_source.index("--exclude='PromptExperiments/'"))
+        self.assertLess(worker_check, package_source.index('phase "Signing app bundle"'))
 
         release_scripts = (
             "main_tip_release.sh",

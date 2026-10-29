@@ -265,6 +265,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     #endif
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
     private let windowID: Int
+    private let builtInPromptRegistry: BuiltInPromptRegistry
     private let runtimeWorkspacePathsProvider: (AgentTabSession) throws -> CodexRuntimeWorkspacePaths
     private let codexControllerFactory: CodexControllerFactory
     private let codexCapabilitiesForLaunch: (_ isMCPRelated: Bool) -> CodexCapabilitySettings
@@ -400,6 +401,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     init(
         windowID: Int,
+        builtInPromptRegistry: BuiltInPromptRegistry,
         runtimeWorkspacePathsProvider: @escaping (AgentTabSession) throws -> CodexRuntimeWorkspacePaths,
         codexControllerFactory: @escaping CodexControllerFactory,
         connectionPolicyInstaller: @escaping ConnectionPolicyInstaller,
@@ -437,6 +439,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         initialLastUsedReasoningEffortsByModelSlug: [String: CodexReasoningEffort] = [:]
     ) {
         self.windowID = windowID
+        self.builtInPromptRegistry = builtInPromptRegistry
         self.runtimeWorkspacePathsProvider = runtimeWorkspacePathsProvider
         self.codexControllerFactory = codexControllerFactory
         self.codexCapabilitiesForLaunch = codexCapabilitiesForLaunch
@@ -7441,6 +7444,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let preferenceGenerationAtStart = session.codexToolPreferencesGeneration
         let selection = effectiveCodexSelection(for: session)
         let basePrompt = SystemPromptService.agentModePrompt(
+            registry: builtInPromptRegistry,
             agentKind: .codexExec,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()

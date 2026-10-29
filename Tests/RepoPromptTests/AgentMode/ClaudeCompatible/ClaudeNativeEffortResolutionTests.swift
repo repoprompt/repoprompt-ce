@@ -206,7 +206,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
             return [:]
         }, write: { _ in })
         let coordinator = ClaudeAgentModeCoordinator(
-            windowID: 1, workspacePathProvider: { _ in nil },
+            windowID: 1, builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()), workspacePathProvider: { _ in nil },
             claudeControllerFactory: { _, _, _, _ in controller }
         )
         let session = AgentTabSession(tabID: UUID())
@@ -533,7 +533,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
     @MainActor
     private func fixture(_ controller: ClaudeNativeProcessSessionController) throws -> (ClaudeAgentModeCoordinator, AgentTabSession, ClaudeAgentModeCoordinator.NativeSessionIntent) {
         let coordinator = ClaudeAgentModeCoordinator(
-            windowID: 1, workspacePathProvider: { _ in nil },
+            windowID: 1, builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()), workspacePathProvider: { _ in nil },
             claudeControllerFactory: { _, _, _, _ in controller }, autoEffortConfigurationProvider: { .init(enabled: true, selectedBackendRawValue: nil, revision: 0) }
         )
         let session = AgentTabSession(tabID: UUID())

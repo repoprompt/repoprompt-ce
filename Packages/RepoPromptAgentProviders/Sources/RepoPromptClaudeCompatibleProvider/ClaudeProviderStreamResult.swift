@@ -10,6 +10,10 @@ public struct ClaudeProviderStreamResult: Sendable, Equatable {
     public let reasoning: String?
     public let promptTokens: Int?
     public let completionTokens: Int?
+    /// Final aggregate input, including cache reads/creation; not a live context snapshot.
+    public let totalInputTokens: Int?
+    public let cachedInputTokens: Int?
+    public let cacheCreationInputTokens: Int?
     public let cost: Double?
     public let toolName: String?
     public let toolArgs: String?
@@ -42,13 +46,19 @@ public struct ClaudeProviderStreamResult: Sendable, Equatable {
         stopReason: String? = nil,
         modelContextWindow: Int? = nil,
         contextUsedTokens: Int? = nil,
-        contentMessageID: String? = nil
+        contentMessageID: String? = nil,
+        totalInputTokens: Int? = nil,
+        cachedInputTokens: Int? = nil,
+        cacheCreationInputTokens: Int? = nil
     ) {
         self.type = type
         self.text = text
         self.reasoning = reasoning
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
+        self.totalInputTokens = totalInputTokens
+        self.cachedInputTokens = cachedInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
         self.cost = cost
         self.toolName = toolName
         self.toolArgs = toolArgs

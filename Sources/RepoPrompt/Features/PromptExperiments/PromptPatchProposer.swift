@@ -12,6 +12,7 @@
             case unsafeSourcePath
             case baselineConflict
             case invalidCandidate
+            case invalidEngineerTemplate
             case unchangedCandidate
             case archiveConflict
 
@@ -21,6 +22,7 @@
                 case .unsafeSourcePath: "The prompt source path is not a contained regular file, or includes a symbolic link."
                 case .baselineConflict: "The source prompt changed since experiment approval; no patch was written."
                 case .invalidCandidate: "The retained candidate is empty or is not valid UTF-8."
+                case .invalidEngineerTemplate: "The Engineer candidate must preserve each required runtime template marker exactly once. This candidate cannot be applied; choose a valid candidate or run a new experiment."
                 case .unchangedCandidate: "The candidate does not change the source prompt."
                 case .archiveConflict: "The previous-canonical archive path already contains different data or is unsafe."
                 }
@@ -62,7 +64,7 @@
         func proposedDiff(promptID: BuiltInPromptID, baselineSHA256: String, candidate: Data) throws -> String {
             let source = try sourceURL(for: promptID)
             let baseline = try checkedBaseline(at: source, expectedSHA256: baselineSHA256)
-            let replacement = try candidateBytes(candidate)
+            let replacement = try candidateBytes(candidate, promptID: promptID)
             guard replacement != baseline else { throw PatchError.unchangedCandidate }
             let path = "AppResources/Prompts/\(promptID.rawValue)/prompt.md"
             let chunks = UnifiedDiffGenerator.diffChunks(
@@ -75,7 +77,7 @@
         func apply(promptID: BuiltInPromptID, baselineSHA256: String, candidate: Data) throws {
             let source = try sourceURL(for: promptID)
             let baseline = try checkedBaseline(at: source, expectedSHA256: baselineSHA256)
-            let replacement = try candidateBytes(candidate)
+            let replacement = try candidateBytes(candidate, promptID: promptID)
             guard replacement != baseline else { throw PatchError.unchangedCandidate }
 
             // Archive the exact old resource bytes before changing the canonical source. This
@@ -96,6 +98,43 @@
             // No auto-merge: the final source check is immediately before the atomic replace.
             _ = try checkedBaseline(at: source, expectedSHA256: baselineSHA256)
             try replacement.write(to: source, options: .atomic)
+        }
+
+        func projectBaseline(source: PromptLabSource) throws -> Data {
+            guard source.kind == .file, let path = source.filePath, let sha256 = source.originalFileSHA256 else {
+                throw PatchError.sourceRootUnavailable
+            }
+            let selected = URL(fileURLWithPath: path).standardizedFileURL
+            let url = try PromptLabSource.canonicalSource(selected)
+            guard url == selected else { throw PatchError.unsafeSourcePath }
+            return try checkedBaseline(at: url, expectedSHA256: sha256)
+        }
+
+        func proposedDiff(source: PromptLabSource, candidate: Data) throws -> String {
+            let baseline = try projectBaseline(source: source)
+            let replacement = try projectReplacement(source: source, baseline: baseline, candidate: candidate)
+            let chunks = UnifiedDiffGenerator.diffChunks(
+                oldLines: String(decoding: baseline, as: UTF8.self).components(separatedBy: "\n"),
+                newLines: String(decoding: replacement, as: UTF8.self).components(separatedBy: "\n")
+            )
+            return UnifiedDiffGenerator.build(filePath: source.filePath ?? source.title, chunks: chunks)
+        }
+
+        func apply(source: PromptLabSource, candidate: Data) throws {
+            let baseline = try projectBaseline(source: source)
+            let replacement = try projectReplacement(source: source, baseline: baseline, candidate: candidate)
+            _ = try projectBaseline(source: source)
+            try replacement.write(to: URL(fileURLWithPath: source.filePath!), options: .atomic)
+        }
+
+        private func projectReplacement(source: PromptLabSource, baseline: Data, candidate: Data) throws -> Data {
+            guard let text = String(data: candidate, encoding: .utf8), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let original = String(data: baseline, encoding: .utf8)
+            else { throw PatchError.invalidCandidate }
+            let result = try PromptLabSourceCodec.replacement(source: source, original: original, candidate: text)
+            let replacement = Data(result.utf8)
+            guard replacement != baseline else { throw PatchError.unchangedCandidate }
+            return replacement
         }
 
         private func sourceURL(for promptID: BuiltInPromptID) throws -> URL {
@@ -125,8 +164,9 @@
             return data
         }
 
-        private func candidateBytes(_ candidate: Data) throws -> Data {
+        private func candidateBytes(_ candidate: Data, promptID: BuiltInPromptID) throws -> Data {
             guard let text = String(data: candidate, encoding: .utf8), !text.isEmpty else { throw PatchError.invalidCandidate }
+            if promptID == .engineer, !AgentModePrompts.isValidEngineerTemplate(text) { throw PatchError.invalidEngineerTemplate }
             return Data((text.hasSuffix("\n") ? text : text + "\n").utf8)
         }
 

@@ -65,4 +65,6 @@ struct TokenUsage {
     let inputTokens: Int
     let outputTokens: Int
     let contextUsedTokens: Int?
+    var cacheReadTokens: Int?
+    var cacheCreationTokens: Int?
 }

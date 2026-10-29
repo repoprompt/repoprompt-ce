@@ -1,6 +1,18 @@
 import Foundation
 import RepoPromptFoundation
 import RepoPromptProcess
+import RepoPromptShared
+
+/// Explicit bounds for a disposable, tool-using experiment. The caller supplies a
+/// private headless MCP config; this profile never connects to a window's tool authority.
+struct ClaudeCodeIsolatedExperimentConfiguration {
+    let maximumTurns: Int
+    let timeoutSeconds: TimeInterval
+
+    var allowedTools: [String] {
+        PromptExperimentAgentProfile.toolNames.sorted().map { "mcp__RepoPromptCE__\($0)" }
+    }
+}
 
 struct HeadlessAgentContext {
     let runID: UUID
@@ -36,6 +48,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     private let serverReadiness: @Sendable () async -> Bool
     private let processStarted: @Sendable (pid_t) async -> Void
     private let cleanupStarted: @Sendable () async -> Void
+    private let isolatedExperiment: ClaudeCodeIsolatedExperimentConfiguration?
     private let toolTracking = AgentToolTrackingController()
     private var streamTask: Task<Void, Never>?
 
@@ -55,7 +68,8 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             await ServerNetworkManager.shared.isRunning()
         },
         processStarted: @escaping @Sendable (pid_t) async -> Void = { _ in },
-        cleanupStarted: @escaping @Sendable () async -> Void = {}
+        cleanupStarted: @escaping @Sendable () async -> Void = {},
+        isolatedExperiment: ClaudeCodeIsolatedExperimentConfiguration? = nil
     ) {
         self.runner = runner
         self.config = config
@@ -64,6 +78,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         self.serverReadiness = serverReadiness
         self.processStarted = processStarted
         self.cleanupStarted = cleanupStarted
+        self.isolatedExperiment = isolatedExperiment
     }
 
     // MARK: - HeadlessAgentProvider
@@ -131,13 +146,19 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             resumeSessionID: resumeSessionID,
             systemPromptOverride: systemPromptOverride
         )
-        if config.toolContext == .promptOnly {
+        if config.toolContext == .promptOnly || isolatedExperiment != nil {
             args += [
                 "--input-format", "stream-json",
                 // --safe-mode also suppresses explicit MCP servers, breaking the old
                 // run-scoped routing lease. Isolate customizations without disabling MCP.
                 "--setting-sources", "", "--settings", "{\"disableAllHooks\":true,\"autoMemoryEnabled\":false,\"claudeMdExcludes\":[\"**\"]}",
                 "--disable-slash-commands", "--no-session-persistence"
+            ]
+        }
+        if let isolatedExperiment {
+            args += [
+                "--tools", "", "--allowedTools", isolatedExperiment.allowedTools.joined(separator: ","),
+                "--max-turns", String(isolatedExperiment.maximumTurns)
             ]
         }
         if enableDebugLogging {
@@ -396,7 +417,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                         if self.enableDebugLogging {
                             print("[DEBUG] ClaudeCodeAgent: Starting streamAgentMessage with runID: \(runID?.uuidString ?? "auto-generated")")
                         }
-                        if self.config.toolContext == .promptOnly {
+                        if self.config.toolContext == .promptOnly || self.isolatedExperiment != nil {
                             guard !message.systemPrompt.contains("\u{0}"), message.resumeSessionID == nil else {
                                 throw AIProviderError.invalidConfiguration(detail: "Prompt-only callbacks require a fresh session and system text without NUL.")
                             }
@@ -413,10 +434,10 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                         try await AsyncScope.withCleanup({}, cleanup: {
                             await self.cleanup(context: context)
                         }) {
-                            let nativePromptMode: ClaudeAgentToolPreferences.AgentModePromptDelivery = self.config.toolContext == .promptOnly
+                            let nativePromptMode: ClaudeAgentToolPreferences.AgentModePromptDelivery = self.config.toolContext == .promptOnly || self.isolatedExperiment != nil
                                 ? .nativeSystemPrompt
                                 : ClaudeAgentToolPreferences.agentModePromptDelivery()
-                            let userMessage: String = if self.config.toolContext == .promptOnly {
+                            let userMessage: String = if self.config.toolContext == .promptOnly || self.isolatedExperiment != nil {
                                 try Self.promptOnlyStreamInput(message.userMessage)
                             } else {
                                 ClaudeCompatibleProviderRuntimeBridge.providerBoundUserMessage(
@@ -440,16 +461,16 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                             var additionalEnvironment = self.config.effortEnvironmentOverrides.merging(
                                 context.launchEnvironment?.environmentOverrides ?? [:]
                             ) { _, resolverValue in resolverValue }
-                            if self.config.toolContext == .promptOnly {
+                            if self.config.toolContext == .promptOnly || self.isolatedExperiment != nil {
                                 additionalEnvironment["CLAUDE_CODE_DISABLE_FILE_MENTIONS"] = "1"
                             }
                             let expectedPIDRunID = context.runID
-                            let expectedPIDClientName = self.config.runtimeVariant.agentKind.mcpClientNameHint
+                            let expectedPIDClientName = self.isolatedExperiment == nil ? self.config.runtimeVariant.agentKind.mcpClientNameHint : nil
                             let stream = try await self.runner.runStreaming(
                                 args: args,
                                 stdin: userMessage, // Pass the user message via stdin
                                 outputMode: .auto(.streamJson),
-                                timeout: 6000, // 100 minute timeout (matches Codex)
+                                timeout: self.isolatedExperiment?.timeoutSeconds ?? 6000,
                                 additionalEnvironment: additionalEnvironment,
                                 additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
                                 onProcessStarted: { pid in
@@ -479,11 +500,13 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                     print("[DEBUG] ClaudeCodeAgent: CLI process streaming started")
                                 }
 
-                                self.toolTracking.startTracking(
-                                    runID: context.runID,
-                                    clientNameHint: "claude-code",
-                                    continuation: continuation
-                                )
+                                if self.isolatedExperiment == nil {
+                                    self.toolTracking.startTracking(
+                                        runID: context.runID,
+                                        clientNameHint: "claude-code",
+                                        continuation: continuation
+                                    )
+                                }
                                 var framer = LineFramer()
                                 var stdoutTail = Data()
                                 var stderrTail = Data()
@@ -660,7 +683,10 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                 promptTokens: usage?.inputTokens,
                 completionTokens: usage?.outputTokens,
                 cost: cost,
-                providerSessionID: providerSessionID
+                providerSessionID: providerSessionID,
+                totalInputTokens: usage?.totalInputTokens,
+                cachedInputTokens: usage?.cachedInputTokens,
+                cacheCreationInputTokens: usage?.cacheCreationInputTokens
             )
         }
     }
@@ -786,8 +812,18 @@ private enum ClaudeEventParser {
         guard let value else { return nil }
         let input = Self.numberToInt(value["input_tokens"]) ?? Self.numberToInt(value["inputTokens"])
         let output = Self.numberToInt(value["output_tokens"]) ?? Self.numberToInt(value["outputTokens"])
-        if let input, let output {
-            return TokenUsage(inputTokens: input, outputTokens: output)
+        let cached = Self.numberToInt(value["cache_read_input_tokens"]) ?? Self.numberToInt(value["cacheReadInputTokens"])
+        let created = Self.numberToInt(value["cache_creation_input_tokens"]) ?? Self.numberToInt(value["cacheCreationInputTokens"])
+        if let input, let output, input >= 0, output >= 0,
+           (cached ?? 0) >= 0, (created ?? 0) >= 0
+        {
+            let (first, overflowA) = input.addingReportingOverflow(cached ?? 0)
+            let (total, overflowB) = first.addingReportingOverflow(created ?? 0)
+            return TokenUsage(
+                inputTokens: input, outputTokens: output,
+                totalInputTokens: overflowA || overflowB ? nil : total,
+                cachedInputTokens: cached, cacheCreationInputTokens: created
+            )
         }
         return nil
     }
@@ -797,7 +833,7 @@ private enum ClaudeEventParser {
         case let int as Int:
             int
         case let double as Double:
-            Int(double)
+            double.isFinite && double >= 0 && double < Double(Int.max) && double.rounded(.towardZero) == double ? Int(double) : nil
         case let string as String:
             Int(string)
         default:

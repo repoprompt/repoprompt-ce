@@ -5,20 +5,25 @@
     /// Only the native controls here (or in the Studio) can approve an experiment.
     struct PromptExperimentResultCard: View {
         let item: AgentChatItem
-        @ObservedObject private var service = WindowStatesManager.shared.promptExperimentService
+        @EnvironmentObject private var service: PromptExperimentService
         @State private var isExpanded = true
         @State private var showsStudio = false
         @State private var reviewedProposal: PromptExperimentProposalSelection?
 
         private var experimentID: UUID? {
-            let keys = ["experiment_id"]
+            resultID("experiment_id")
+        }
+
+        private var preparationID: UUID? {
+            resultID("preparation_id")
+        }
+
+        private func resultID(_ key: String) -> UUID? {
             for raw in [item.toolResultJSON, item.toolArgsJSON] {
                 guard let raw, let data = raw.data(using: .utf8),
                       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
                 else { continue }
-                for key in keys {
-                    if let id = (object[key] as? String).flatMap(UUID.init(uuidString:)) { return id }
-                }
+                if let id = (object[key] as? String).flatMap(UUID.init(uuidString:)) { return id }
             }
             return nil
         }
@@ -38,6 +43,28 @@
         }
 
         var body: some View {
+            Group {
+                if let preparationID {
+                    PromptLabPreparationToolCard(
+                        item: item, preparations: service.preparationApprovals,
+                        preparationID: preparationID, isExpanded: $isExpanded
+                    ) { showsStudio = true }
+                } else {
+                    experimentCard
+                }
+            }
+            .task { await service.load() }
+            .sheet(isPresented: $showsStudio) {
+                PromptExperimentStudioView(service: service, initialSelection: preparationID ?? experimentID)
+            }
+            .sheet(item: $reviewedProposal) { selection in
+                if let experimentID {
+                    PromptExperimentProposalReviewView(service: service, experimentID: experimentID, proposalID: selection.id)
+                }
+            }
+        }
+
+        private var experimentCard: some View {
             ToolCardContainer(
                 iconName: "wand.and.stars",
                 iconColor: .pink,
@@ -72,14 +99,58 @@
                 }
                 .padding(.vertical, 2)
             }
-            .task { await service.load() }
-            .sheet(isPresented: $showsStudio) {
-                PromptExperimentStudioView(service: service, initialSelection: experimentID)
+        }
+    }
+
+    /// Observe preparation independently: its one-shot state is intentionally separate
+    /// from persisted experiments, and changes must update an already-visible transcript.
+    private struct PromptLabPreparationToolCard: View {
+        let item: AgentChatItem
+        @ObservedObject var preparations: PromptLabPreparationApprovals
+        let preparationID: UUID
+        @Binding var isExpanded: Bool
+        let openStudio: () -> Void
+
+        private var request: PromptLabPreparationRequest? {
+            preparations.request(id: preparationID)
+        }
+
+        private var status: ToolCardStatus {
+            if item.toolIsError == true { return .failure }
+            switch request?.status {
+            case .awaitingApproval, .running: return .running
+            case .completed: return .success
+            case .failed: return .warning
+            case .rejected, .cancelled, nil: return .neutral
             }
-            .sheet(item: $reviewedProposal) { selection in
-                if let experimentID {
-                    PromptExperimentProposalReviewView(service: service, experimentID: experimentID, proposalID: selection.id)
+        }
+
+        var body: some View {
+            ToolCardContainer(
+                iconName: "doc.text.magnifyingglass",
+                iconColor: .pink,
+                title: "Prepare Prompt Experiment",
+                detailText: nil,
+                subtitle: request.map { "\($0.preparationStatusLabel) · \($0.title)" },
+                status: status,
+                timestamp: item.timestamp,
+                isExpandable: true,
+                isExpanded: $isExpanded
+            ) {
+                VStack(alignment: .leading, spacing: 8) {
+                    if let request {
+                        Text(request.preparationStatusSummary).font(.caption)
+                        if let error = request.error {
+                            Text(error).font(.caption).foregroundStyle(.red)
+                        }
+                    } else {
+                        Text("This preparation request is no longer available. Ask the assistant to prepare it again.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button(request?.status == .awaitingApproval ? "Review preparation" : "Open Prompt Experiments", action: openStudio)
+                        .font(.caption)
                 }
+                .padding(.vertical, 2)
             }
         }
     }

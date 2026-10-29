@@ -33,27 +33,39 @@
             VStack(alignment: .leading, spacing: 12) {
                 Text("Review source prompt patch").font(.title2.bold())
                 if let experiment, let proposal {
-                    Text("\(experiment.authority.promptID.rawValue) · run \(run?.ordinal ?? 0) · candidate #\(proposal.candidateIndex)")
+                    Text("\(experiment.authority.promptDisplayName) · run \(run?.ordinal ?? 0) · candidate #\(proposal.candidateIndex)")
                         .font(.subheadline)
+                    Text(experiment.authority.sourceDescription).font(.caption).textSelection(.enabled)
                     Text("Baseline SHA-256: \(proposal.baselineResourceSHA256)")
                         .font(.caption.monospaced()).textSelection(.enabled)
                     if let run {
-                        Text("Run: \(run.state.rawValue) · \(run.result?.assessment ?? run.statusText)")
+                        Text("Run: \(run.state.rawValue)")
                             .font(.caption)
-                        Text("GEPA \(run.result?.upstreamRevision ?? "—") · \(run.result?.totalEvaluations ?? 0) evaluations · best score \(run.result?.bestScore.map { String(format: "%.3f", $0) } ?? "—")")
+                        Text("GEPA \(run.result?.upstreamRevision ?? "—") · \(run.result?.totalEvaluations ?? 0) evaluations · run's best: candidate #\(run.result?.bestCandidateIndex.map(String.init) ?? "—"), score \(run.result?.bestScore.map { String(format: "%.3f", $0) } ?? "—")")
                             .font(.caption).foregroundStyle(.secondary)
-                        if let heldOut = run.result?.heldOut {
-                            // Held-out cases never reach the proposer; this is the report-only check.
-                            Text("\(heldOut.summary) (best = GEPA candidate #\(run.result?.bestCandidateIndex.map(String.init) ?? "—"))")
-                                .font(.caption.bold())
-                        }
-                        if let noise = run.result?.noiseFloor {
-                            // The paired, replicate-calibrated check: is the gain larger than the judge/target noise?
-                            PromptExperimentNoiseVerdict(noise: noise)
+                        if run.result?.bestCandidateIndex == proposal.candidateIndex {
+                            if let heldOut = run.result?.heldOut {
+                                // Held-out cases never reach the proposer. This comparison is
+                                // measured only for the run's selected best, not every candidate.
+                                Text(heldOut.summary)
+                                    .font(.caption.bold())
+                            }
+                            if let noise = run.result?.noiseFloor {
+                                PromptExperimentNoiseVerdict(noise: noise)
+                            }
+                            if let comparison = run.result?.usageComparison {
+                                PromptLabUsageComparisonView(comparison: comparison)
+                            }
+                        } else {
+                            Text("Held-out improvement and baseline-spread comparison are unavailable for this proposal. The run measured that comparison for candidate #\(run.result?.bestCandidateIndex.map(String.init) ?? "—") only.")
+                                .font(.caption).foregroundStyle(.orange)
                         }
                         if let result = run.result {
+                            let proposedScore = result.candidates.first { $0.index == proposal.candidateIndex }?.aggregateScore
+                            Text("Proposed candidate validation score: \(proposedScore.map { String(format: "%.3f", $0) } ?? "unavailable")")
+                                .font(.caption.bold())
                             let usage = { (index: Int?) in result.candidates.first { $0.index == index }?.usage?.summary ?? "—" }
-                            Text("Size: baseline \(usage(0)) → proposed \(usage(proposal.candidateIndex))")
+                            Text("Recorded size and usage: baseline \(usage(0)) → proposed \(usage(proposal.candidateIndex)). These candidate averages may cover different examples.")
                                 .font(.caption).foregroundStyle(.secondary)
                             // Capped so per-case evidence never squeezes the diff out of view.
                             ScrollView {
@@ -82,6 +94,12 @@
                     if let errorText {
                         Text(errorText).foregroundStyle(.red).font(.caption).textSelection(.enabled)
                     }
+                    Text(
+                        experiment.authority.promptID != nil
+                            ? "Apply updates the source checkout. Rebuild the app to use or evaluate the new built-in default."
+                            : "Apply changes the reviewed source file only if its original content still matches. The original bytes are retained with the experiment."
+                    )
+                    .font(.caption).foregroundStyle(.secondary)
                     HStack {
                         Button("Close") { dismiss() }
                         Spacer()

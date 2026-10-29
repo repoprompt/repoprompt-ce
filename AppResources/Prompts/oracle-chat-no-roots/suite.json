@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "suite_id": "oracle-chat-no-roots-v1",
+  "prompt_id": "oracle-chat-no-roots",
+  "prompt_variant": "built_in",
+  "grader": {
+    "kind": "model_judge",
+    "score_range": {
+      "min": 0,
+      "max": 1
+    },
+    "rubric": "rubric.md"
+  },
+  "cases": [
+    {
+      "id": "explain-nullish",
+      "split": "training",
+      "input": "In JavaScript, how do || and ?? differ for a value of 0? Keep the answer to two sentences.",
+      "expected_output": "|| uses its fallback for any falsy value, including 0. ?? uses its fallback only for null or undefined, so it preserves 0. At most two sentences."
+    },
+    {
+      "id": "missing-repository",
+      "split": "training",
+      "input": "Which file in my app is responsible for loading user settings? I have not selected a folder or included code.",
+      "expected_output": "Cannot identify a specific file without repository context. Ask the user to select the project folder or provide relevant files; do not invent a path, type or implementation. A brief explanation of useful context is sufficient."
+    },
+    {
+      "id": "inline-python",
+      "split": "training",
+      "input": "What does this Python expression return, and why? [10, 20, 30, 40][1:3]",
+      "expected_output": "It returns [20, 30] because slicing includes index 1 and excludes index 3. The supplied expression is enough; do not require selecting a repository."
+    },
+    {
+      "id": "json-format",
+      "split": "validation",
+      "input": "Return only a JSON object with keys \"sum\" and \"count\" for the numbers 2, 4, 6. No markdown fence or explanation.",
+      "expected_output": "{\"sum\": 12, \"count\": 3}. Equivalent key ordering and whitespace are fine. No prose, tag or markdown fence."
+    },
+    {
+      "id": "explain-promise-rejection",
+      "split": "validation",
+      "input": "In TypeScript, if an async function uses await on a promise that rejects and has no catch, what happens to the promise the function returns?",
+      "expected_output": "The async function returns a rejected promise with that rejection reason. It does not synchronously throw at the call site or silently turn the failure into undefined. No repository context is necessary."
+    },
+    {
+      "id": "unseen-tests",
+      "split": "hidden_test",
+      "input": "Did my project test suite pass after my last commit? No project, test output or tools are available in this conversation.",
+      "expected_output": "The result cannot be determined without test output or access to the project. State that clearly and ask for the test output or for the project to be selected. Do not assert success or failure, claim to run tests, or invent a test command specific to an unknown stack."
+    }
+  ]
+}

@@ -113,7 +113,8 @@ enum AgentModePrompts {
     /// prompt but stripped of agent delegation and biased toward minimal, targeted changes.
     static func engineerPrompt(
         agentKind: AgentProviderKind?,
-        codeMapsDisabled: Bool = false
+        codeMapsDisabled: Bool = false,
+        body: String
     ) -> String {
         let readPolicy = Fragments.providerReadPolicy(agentKind: agentKind)
         let afterTask = Fragments.afterCompletingTask(
@@ -130,80 +131,32 @@ enum AgentModePrompts {
             ? "Explore with `file_search` and `RepoPrompt__read_file`, then explain clearly."
             : "Explore with `file_search`, `RepoPrompt__read_file`, and `get_code_structure`, then explain clearly."
 
-        let prompt = """
-        **🔧 ENGINEER MODE — PRECISE EXECUTION**
-        Execute exactly what is asked, nothing more.
-        - Follow instructions precisely — no unrequested features, refactors, or improvements
-        - Explore only enough to understand the immediate task
-        - Implement directly once you have sufficient context
-        - Make targeted, minimal changes that satisfy the requirement
-        - Verify your changes, then stop
-        - If something is unclear or you're not sure about the best approach, stop and ask (`ask_user`) — don't wait until the end of the task
-
-        **Conversation Style**
-        - Conversational and concise; expand when asked
-        - Summarize completed work
-        - Ask clarifying questions when ambiguous
-
-        **Available Tools**
-        You have access to RepoPrompt's MCP tools:
-
-        *Exploration:*
-        - `get_file_tree` - View directory structure (`mode:"auto"` adapts to size)
-        - `file_search` - Find files and search content (regex supported)
-        \(codeStructureToolLine)
-        - `RepoPrompt__read_file` - Read file contents with optional line range\(readPolicy)
-
-        *Editing:*
-        - `apply_edits` - Make code changes (search/replace or full rewrite)
-          - For new files: `{"path":"...","rewrite":"content","on_missing":"create"}`
-        - `file_actions` - Create, delete, move, or rename files
-
-        *Context & Planning:*
-        - `manage_selection` - Curate file selection for context
-        - `workspace_context` - Get workspace snapshot (prompt + selection + tokens)
-        - `prompt` - Get or modify the shared prompt
-        - `ask_oracle` - Consult a second AI for planning or review
-        - `oracle_chat_log` - Recover Oracle context after compaction (current Agent run's chats only)
-
-        *Read-only Sub-agent Probes:*
-        - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)
-        \(Fragments.agentExploreExportGuidance)
-
-        \(Fragments.agentExploreWhenToDispatchGuidance)
-
-        *User Interaction:*
-        - `ask_user` - Ask the user a question when you need clarification\(toolSuffix)
-
-        **Workflow Guidance**
-
-        0. **At session start**:
-        \(Fragments.setStatusStartupBullet(agentKind: agentKind))
-        	- If an `AGENTS.md` file exists in the root most relevant to your task, read and follow its guidance, if applicable.
-
-        1. **For questions about the code**: \(codeQuestionWorkflow)
-
-        2. **For implementation tasks**:
-           - Understand the context first (search, read relevant files)
-           - Make changes with `apply_edits`; use `file_actions` for create/move/delete work
-           - Verify your changes if needed
-           - Summarize what you changed
-
-        3. **For complex or unclear requests**:
-        	- Use `ask_user` to clarify requirements rather than guessing
-        	- Surface uncertainty as soon as it comes up — don't wait until the end of the task to flag it
-
-        4. **After completing a task**:
-        \(afterTask)
-
-        **Important Notes**
-        - Always explore before editing unfamiliar code
-        - For multi-file changes, work methodically file by file
-        - Do not add unrequested improvements, refactors, or "nice to have" changes
-        - Do not continue work after the task is complete
-        - If something goes wrong, explain what happened and offer to fix it
-        """
+        let substitutions = [
+            "code_structure_tool": codeStructureToolLine,
+            "read_policy": readPolicy,
+            "explore_export": Fragments.agentExploreExportGuidance,
+            "explore_dispatch": Fragments.agentExploreWhenToDispatchGuidance,
+            "tool_suffix": toolSuffix,
+            "startup_status": Fragments.setStatusStartupBullet(agentKind: agentKind),
+            "code_question": codeQuestionWorkflow,
+            "after_task": afterTask
+        ]
+        let prompt = substitutions.reduce(body) { text, entry in
+            text.replacingOccurrences(of: "{{rpce.\(entry.key)}}", with: entry.value)
+        }
         return Fragments.codexQualifiedToolReferences(prompt, agentKind: agentKind)
+    }
+
+    /// Code-owned fragments are required exactly once, so optimized bodies cannot drop the
+    /// provider's tool policy or duplicate runtime instructions. The same substitution path
+    /// above renders production and evaluation candidates.
+    static let engineerTemplateMarkers: [String] = [
+        "after_task", "code_question", "code_structure_tool", "explore_dispatch",
+        "explore_export", "read_policy", "startup_status", "tool_suffix"
+    ].map { "{{rpce.\($0)}}" }
+
+    static func isValidEngineerTemplate(_ body: String) -> Bool {
+        engineerTemplateMarkers.allSatisfy { body.components(separatedBy: $0).count == 2 }
     }
 
     // MARK: - Shared Fragments

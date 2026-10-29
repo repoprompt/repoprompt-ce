@@ -17,6 +17,9 @@ enum BuiltInPromptID: String, CaseIterable, Codable {
     /// Oracle Chat system prompt when no root folder is visible.
     case oracleChatNoRoots = "oracle-chat-no-roots"
 
+    /// Engineer role body, composed with provider-specific code-owned fragments.
+    case engineer
+
     static let promptFileName = "prompt.md"
 }
 

@@ -150,12 +150,17 @@ final class SessionAdminToolCatalogPolicyTests: XCTestCase {
     /// The administrative-principal / plain external connection catalog, pinned. Definitions of these
     /// tools are additionally byte-guarded by the generated canonical snapshot.
     func testExternalDirectAndDiscoveryCatalogsAreUnchangedAndExcludeSessionAdmin() {
-        XCTAssertEqual(MCPClientToolPolicyCatalog.resolvedToolNames(for: .direct), [
+        var directTools = [
             "app_settings", "bind_context", "manage_workspaces", "manage_selection", "file_actions",
             "get_code_structure", "get_file_tree", "read_file", "file_search", "workspace_context", "prompt",
             "apply_edits", "oracle_utils", "ask_oracle", "oracle_send", "git", "manage_worktree",
-            "context_builder", "agent_run", "agent_manage", "history"
-        ])
+            "context_builder", "agent_run", "agent_manage"
+        ]
+        #if DEBUG
+            directTools.append("prompt_experiment")
+        #endif
+        directTools.append("history")
+        XCTAssertEqual(MCPClientToolPolicyCatalog.resolvedToolNames(for: .direct), directTools)
         XCTAssertEqual(MCPClientToolPolicyCatalog.resolvedToolNames(for: .discovery), [
             "manage_selection", "get_code_structure", "get_file_tree", "read_file", "file_search",
             "workspace_context", "prompt", "git", "ask_user", "history"

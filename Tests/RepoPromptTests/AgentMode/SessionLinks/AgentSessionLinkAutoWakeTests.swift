@@ -4835,7 +4835,7 @@ final class AgentSessionLinkAutoWakeTests: XCTestCase {
             await controller.setRejectResume(true)
             var creations = 0
             let coordinator = ClaudeAgentModeCoordinator(
-                windowID: 1, workspacePathProvider: { _ in nil },
+                windowID: 1, builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()), workspacePathProvider: { _ in nil },
                 claudeControllerFactory: { _, _, _, _ in
                     creations += 1
                     return controller

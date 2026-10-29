@@ -79,6 +79,13 @@
         var canonicalSelectionID: String {
             AgentModelSelectionID(agentRaw: agentRaw, modelRaw: modelRaw).rawValue
         }
+
+        /// Effort is an execution setting, not an independent judge. Keep the full
+        /// selection ID for authority/cache identity, but compare underlying models here.
+        var judgmentModelIdentity: String {
+            let model = ClaudeModelSpecifier(raw: modelRaw).baseModel ?? modelRaw
+            return "\(agentRaw.lowercased()):\(model.lowercased())"
+        }
     }
 
     struct PromptExperimentTargets: Codable, Equatable {
@@ -121,7 +128,7 @@
     /// Everything that can influence spend, scoring, or proposals. Its digest is what the
     /// native approval covers; any change is a different experiment.
     struct PromptExperimentAuthority: Codable, Equatable {
-        let promptID: BuiltInPromptID
+        let promptID: BuiltInPromptID?
         let promptResourceSHA256: String
         let suiteID: String
         let suiteSHA256: String
@@ -135,6 +142,8 @@
         let calibrationEvaluations: Int
         let pythonSealValue: String
         let gepaRevision: String
+        var definition: PromptLabDefinition?
+        var maxProviderInvocations: Int?
 
         func digest() throws -> String {
             try PromptExperimentDigest.canonicalSHA256(self)
@@ -186,6 +195,11 @@
         let outputCharacters: Int
         let promptTokens: Int?
         let completionTokens: Int?
+        var cachedInputTokens: Int?
+        var cacheCreationInputTokens: Int?
+        var reportedCost: Double?
+        /// Version 1 records cache-inclusive input totals. Older ledger entries are unpaired telemetry.
+        var measurementVersion: Int?
     }
 
     /// Per-candidate averages over every completed evaluation of that exact text.
@@ -315,6 +329,8 @@
                 stoppedBeforeUnfinishableIteration == true
                     ? " Stopped before an iteration the remaining budget could not finish; the reported best is GEPA's saved incumbent."
                     : " Stopped at the approved evaluation budget; the reported best is GEPA's saved incumbent."
+            } else if stopReason == "iteration_limit" {
+                " Stopped at the iteration limit; perfect-score skips or cached replays can leave evaluations unused. The reported best is GEPA's saved incumbent."
             } else {
                 ""
             }
@@ -443,6 +459,7 @@
         var state: PromptExperimentProposalState
         let createdAt: Date
         var decidedAt: Date?
+        var originalSourceEvidence: PromptExperimentArtifactReference?
     }
 
     // MARK: - Experiment

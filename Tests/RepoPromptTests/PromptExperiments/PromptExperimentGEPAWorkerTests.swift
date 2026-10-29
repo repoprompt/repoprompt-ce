@@ -4,6 +4,84 @@ import XCTest
 
 #if DEBUG
     final class PromptExperimentGEPAWorkerTests: XCTestCase {
+        func testInvalidCandidateStatusSurvivesTheWorkerWireContract() {
+            let reply = GEPAWorkerProtocol.HostReply.evaluated(.init(
+                evaluationID: "evaluation", score: 0, feedback: "Malformed DSPy instructions",
+                outputExcerpt: "", replayed: true, candidateValid: false
+            )).jsonObject(id: "request")
+            XCTAssertEqual(reply["score"] as? Double, 0, "Evidence keeps the raw task score.")
+            XCTAssertEqual(reply["candidate_valid"] as? Bool, false, "Selection must distinguish malformed prompts from valid zero-scoring prompts.")
+            XCTAssertEqual(reply["replayed"] as? Bool, true, "Durable replay preserves candidate validity.")
+        }
+
+        func testUnbundledWorkerLookupUsesCompiledSourceRootInsteadOfWorkingDirectory() throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let worker = root.appendingPathComponent("AppResources/PromptExperiments/gepa_worker.py")
+            try FileManager.default.createDirectory(at: worker.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("# worker".utf8).write(to: worker)
+            let source = root.appendingPathComponent("Sources/RepoPrompt/Features/PromptExperiments/PromptExperimentGEPAWorker.swift")
+
+            XCTAssertEqual(
+                try PromptExperimentGEPAWorker.resolveWorkerURL(
+                    resourcesDirectory: nil, sourceFileURL: source, isPackagedApp: false
+                ),
+                worker
+            )
+            XCTAssertThrowsError(try PromptExperimentGEPAWorker.resolveWorkerURL(
+                resourcesDirectory: nil, sourceFileURL: source, isPackagedApp: true
+            ), "A broken app package must not silently run a source-checkout worker")
+        }
+
+        func testPackagedWorkerTakesPrecedenceAndInvalidOverrideDoesNotFallBack() throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let resources = root.appendingPathComponent("Contents/Resources")
+            let worker = resources.appendingPathComponent("PromptExperiments/gepa_worker.py")
+            try FileManager.default.createDirectory(at: worker.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("# packaged worker".utf8).write(to: worker)
+
+            XCTAssertEqual(
+                try PromptExperimentGEPAWorker.resolveWorkerURL(
+                    resourcesDirectory: resources, sourceFileURL: root, isPackagedApp: true
+                ),
+                worker
+            )
+            XCTAssertThrowsError(try PromptExperimentGEPAWorker.resolveWorkerURL(
+                resourcesDirectory: resources, sourceFileURL: root, isPackagedApp: true,
+                override: root.appendingPathComponent("missing.py").path
+            ))
+            XCTAssertThrowsError(try PromptExperimentGEPAWorker.resolveWorkerURL(
+                resourcesDirectory: resources, sourceFileURL: root, isPackagedApp: true,
+                override: resources.path
+            ), "A directory is not a readable worker file")
+        }
+
+        func testReadinessRequiresMatchingWorkerProtocolPythonAndGEPAPin() throws {
+            let ready: [String: Any] = [
+                "type": "ready",
+                "protocol_version": GEPAWorkerProtocol.version,
+                "python_version": PromptExperimentGEPAWorker.pythonVersion.split(separator: ".").compactMap { Int($0) },
+                "gepa_version": PromptExperimentGEPAConfiguration.packageVersion,
+                "upstream_revision": PromptExperimentGEPAConfiguration.pinnedRevision
+            ]
+            let data = try JSONSerialization.data(withJSONObject: ready)
+            XCTAssertNoThrow(try PromptExperimentGEPAWorker.validatePreflightResponse(data, terminationStatus: 0))
+            XCTAssertThrowsError(try PromptExperimentGEPAWorker.validatePreflightResponse(data, terminationStatus: 2))
+            for key in ready.keys {
+                var stale = ready
+                stale.removeValue(forKey: key)
+                XCTAssertThrowsError(try PromptExperimentGEPAWorker.validatePreflightResponse(
+                    JSONSerialization.data(withJSONObject: stale), terminationStatus: 0
+                ), "Missing readiness field: \(key)")
+            }
+            var stale = ready
+            stale["protocol_version"] = GEPAWorkerProtocol.version - 1
+            XCTAssertThrowsError(try PromptExperimentGEPAWorker.validatePreflightResponse(
+                JSONSerialization.data(withJSONObject: stale), terminationStatus: 0
+            ))
+        }
+
         private final class ResultBox: @unchecked Sendable {
             private let lock = NSLock()
             private var storedResult: Result<Data?, Error>?

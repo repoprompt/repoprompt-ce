@@ -15,7 +15,8 @@ import XCTest
             let properties = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
             let operations = try XCTUnwrap(properties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue))
             XCTAssertEqual(operations, [
-                "targets", "create_or_update", "request_approval", "run", "status_or_wait", "cancel", "propose_patch"
+                "targets", "prepare", "describe_program", "create_or_update", "request_approval",
+                "run", "status_or_wait", "cancel", "propose_patch", "export"
             ])
             XCTAssertEqual(properties["prompt_id"]?.objectValue?["type"]?.stringValue, "string")
             XCTAssertEqual(properties["max_evaluations"]?.objectValue?["type"]?.stringValue, "integer")

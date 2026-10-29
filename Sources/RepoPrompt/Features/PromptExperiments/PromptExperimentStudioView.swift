@@ -9,11 +9,29 @@
     /// be reviewed and approved without an Agent Mode transcript.
     struct PromptExperimentStudioView: View {
         @ObservedObject var service: PromptExperimentService
+        @ObservedObject private var preparations: PromptLabPreparationApprovals
         var initialSelection: UUID?
         /// Sheets need an explicit Close button; the standalone window uses its title bar.
         var showsCloseButton = true
         @Environment(\.dismiss) private var dismiss
         @State private var selectedExperimentID: UUID?
+        @State private var showsCreateExperiment = false
+
+        init(service: PromptExperimentService, initialSelection: UUID? = nil, showsCloseButton: Bool = true) {
+            self.service = service
+            preparations = service.preparationApprovals
+            self.initialSelection = initialSelection
+            self.showsCloseButton = showsCloseButton
+        }
+
+        private var sortedPreparations: [PromptLabPreparationRequest] {
+            preparations.requests.sorted { $0.createdAt > $1.createdAt }
+        }
+
+        private var hasSelectedItem: Bool {
+            guard let selectedExperimentID else { return false }
+            return service.experiment(id: selectedExperimentID) != nil || preparations.request(id: selectedExperimentID) != nil
+        }
 
         private var sortedExperiments: [PromptExperiment] {
             service.experiments.sorted { $0.updatedAt > $1.updatedAt }
@@ -45,6 +63,19 @@
                     if let projectionError = service.projectionError {
                         Label(projectionError, systemImage: "doc.badge.gearshape").font(.caption).foregroundStyle(.orange)
                     }
+                    if !sortedPreparations.isEmpty {
+                        Section("Preparation requests") {
+                            ForEach(sortedPreparations) { request in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Label(request.title, systemImage: request.status == .awaitingApproval ? "hand.raised.fill" : "doc.text.magnifyingglass")
+                                        .lineLimit(1)
+                                    Text(request.preparationStatusLabel)
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                .tag(request.id)
+                            }
+                        }
+                    }
                     if !awaitingApproval.isEmpty {
                         Section {
                             ForEach(awaitingApproval) { experiment in
@@ -60,7 +91,7 @@
                         ForEach(otherExperiments) { experiment in
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(experiment.title).lineLimit(1)
-                                Text("\(experiment.status.rawValue) · \(experiment.authority.promptID.rawValue)")
+                                Text("\(experiment.status.rawValue) · \(experiment.authority.promptDisplayName)")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                             .tag(experiment.id)
@@ -69,28 +100,44 @@
                 }
                 .navigationTitle("Prompt Experiments")
             } detail: {
-                if let selectedExperimentID, let experiment = service.experiment(id: selectedExperimentID) {
+                if let selectedExperimentID, let request = preparations.request(id: selectedExperimentID) {
+                    PromptLabPreparationReviewView(service: service, preparations: preparations, request: request)
+                        .id(request.id)
+                } else if let selectedExperimentID, let experiment = service.experiment(id: selectedExperimentID) {
                     PromptExperimentDetailView(service: service, experiment: experiment)
                 } else {
                     ContentUnavailableView {
                         Label("No Prompt Experiment Selected", systemImage: "flask")
                     } description: {
-                        Text("Experiments are created with the Prompt Experiment workflow or the prompt_experiment MCP tool. Approval happens here or on the in-session card.")
+                        Text("Improve a RepoPrompt prompt, a project's prompt file, pasted text, or an AI program. Describe your goal, review examples and checks, and compare the results before using a candidate.")
+                    } actions: {
+                        Button("New Experiment") { showsCreateExperiment = true }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!service.isLoaded || service.loadError != nil)
                     }
                 }
             }
             .frame(minWidth: 920, minHeight: 650)
             .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("New Experiment", systemImage: "plus") { showsCreateExperiment = true }
+                        .disabled(!service.isLoaded || service.loadError != nil)
+                }
                 if showsCloseButton {
                     ToolbarItem(placement: .cancellationAction) {
                         Button("Close") { dismiss() }
                     }
                 }
             }
+            .sheet(isPresented: $showsCreateExperiment) {
+                PromptExperimentCreateView(service: service) { selectedExperimentID = $0 }
+            }
             .task {
                 await service.load()
                 if selectedExperimentID == nil {
-                    selectedExperimentID = initialSelection ?? awaitingApproval.first?.id ?? sortedExperiments.first?.id
+                    selectedExperimentID = initialSelection
+                        ?? sortedPreparations.first(where: { $0.status == .awaitingApproval })?.id
+                        ?? awaitingApproval.first?.id ?? sortedExperiments.first?.id ?? sortedPreparations.first?.id
                 }
             }
             .onChange(of: initialSelection) { _, newSelection in
@@ -99,7 +146,13 @@
             }
             .onChange(of: awaitingApproval.map(\.id)) { oldIDs, newIDs in
                 // Surface a newly requested approval when nothing is selected yet.
-                if let selectedExperimentID, service.experiment(id: selectedExperimentID) != nil { return }
+                if hasSelectedItem { return }
+                if let newID = newIDs.first(where: { !oldIDs.contains($0) }) ?? newIDs.first {
+                    selectedExperimentID = newID
+                }
+            }
+            .onChange(of: sortedPreparations.map(\.id)) { oldIDs, newIDs in
+                if hasSelectedItem { return }
                 if let newID = newIDs.first(where: { !oldIDs.contains($0) }) ?? newIDs.first {
                     selectedExperimentID = newID
                 }
@@ -117,7 +170,7 @@
                     Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
                     Text(experiment.title).lineLimit(1).fontWeight(.semibold)
                 }
-                Text("\(experiment.authority.promptID.rawValue) · cap \(experiment.authority.maxEvaluations) evaluations")
+                Text("\(experiment.authority.promptDisplayName) · up to \(experiment.authority.maximumTotalEvaluations) evaluations")
                     .font(.caption).foregroundStyle(.secondary)
                 if let requestedAt = experiment.approvalRequest?.requestedAt {
                     Text("Requested \(requestedAt, style: .relative) ago")
@@ -133,7 +186,6 @@
         /// Presented via `sheet(item:)` so the sheet never renders before its ID is set
         /// (an `isPresented` sheet here showed an empty, undismissable modal).
         @State private var reviewedProposal: PromptExperimentProposalSelection?
-        @State private var proposalError: String?
 
         var body: some View {
             ScrollView {
@@ -154,7 +206,7 @@
                     if experiment.status == .awaitingApproval {
                         PromptExperimentApprovalRequestCallout(experiment: experiment)
                     }
-                    GroupBox(experiment.status == .awaitingApproval ? "Requested authority" : "Approved authority") {
+                    GroupBox(experiment.isApproved ? "Approved experiment" : "Experiment to review") {
                         PromptExperimentAuthorityPanel(experiment: experiment)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
@@ -174,36 +226,8 @@
                                     }
                                 }
                                 if let result = run.result {
-                                    if let noise = result.noiseFloor, !noise.bestIsBaseline {
-                                        PromptExperimentNoiseVerdict(noise: noise)
-                                    }
-                                    Text(result.assessment).font(.caption)
-                                    ForEach(result.candidates) { candidate in
-                                        VStack(alignment: .leading, spacing: 3) {
-                                            Text("Candidate #\(candidate.index)\(candidate.isBaseline ? " · baseline" : "")\(candidate.isBest ? " · best" : "") · score \(candidate.aggregateScore.map { String(format: "%.3f", $0) } ?? "—") · parents \(candidate.parentIndices.map(String.init).joined(separator: ", "))")
-                                                .font(.caption.bold())
-                                            if let usage = candidate.usage {
-                                                Text(usage.summary).font(.caption).foregroundStyle(.secondary)
-                                            }
-                                            Text(candidate.candidatePreview).font(.caption).lineLimit(6).textSelection(.enabled)
-                                            if run.state == .completed || run.state == .stoppedBudget {
-                                                Button("Propose source patch") {
-                                                    Task {
-                                                        do {
-                                                            let proposal = try await service.proposePatch(
-                                                                experimentID: experiment.id, runID: run.id, candidateIndex: candidate.index
-                                                            )
-                                                            reviewedProposal = .init(id: proposal.id)
-                                                        } catch {
-                                                            proposalError = error.localizedDescription
-                                                        }
-                                                    }
-                                                }
-                                                .font(.caption)
-                                            }
-                                        }
-                                        .padding(6)
-                                        .background(candidate.isBest ? Color.green.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 6))
+                                    PromptLabRunResultsView(service: service, experiment: experiment, run: run, result: result) { proposalID in
+                                        reviewedProposal = .init(id: proposalID)
                                     }
                                 }
                                 if let error = run.error {
@@ -215,13 +239,14 @@
                             Text("Run \(run.ordinal)")
                         }
                     }
-                    if let proposalError {
-                        Text(proposalError).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                    }
                     GroupBox("Proposals") {
                         Group {
                             if experiment.proposals.isEmpty {
-                                Text("No source patch proposals yet. Reviewed patches for retained candidates are created separately from run approval.")
+                                Text(
+                                    experiment.authority.definition?.source.kind == .pasted
+                                        ? "Copy or save a candidate prompt from the results above."
+                                        : "Review a retained candidate's source change from the results above before applying it."
+                                )
                             } else {
                                 ForEach(experiment.proposals) { proposal in
                                     Button("Review candidate #\(proposal.candidateIndex) · \(proposal.state.rawValue)") {
@@ -261,10 +286,10 @@
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Approval requested").font(.headline)
                     if let requestedAt = experiment.approvalRequest?.requestedAt {
-                        Text("Requested \(requestedAt.formatted(date: .abbreviated, time: .standard)) by an agent or MCP client.")
+                        Text("Requested \(requestedAt.formatted(date: .abbreviated, time: .standard)).")
                             .font(.caption)
                     }
-                    Text("Review the requested authority below, then approve up to \(experiment.authority.maxEvaluations) evaluations or decline under Approval and runs.")
+                    Text("Review the experiment below, then approve \(experiment.authority.approvalBudgetSummary) or decline under Approval and runs.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
@@ -273,6 +298,165 @@
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.orange.opacity(0.4)))
+        }
+    }
+
+    /// Native, one-shot consent for preparation requested through MCP. Merely displaying
+    /// this view never reads the requested file or imports the requested project module.
+    private struct PromptLabPreparationReviewView: View {
+        @ObservedObject var service: PromptExperimentService
+        @ObservedObject var preparations: PromptLabPreparationApprovals
+        let request: PromptLabPreparationRequest
+        @State private var actionError: String?
+
+        var body: some View {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(request.title).font(.title2.bold())
+                        Spacer()
+                        Text(request.preparationStatusLabel).font(.caption.bold())
+                    }
+                    Text(request.preparationStatusSummary).foregroundStyle(.secondary)
+                    GroupBox("Preparation to review") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            switch request.payload {
+                            case let .file(file): fileDetails(file)
+                            case let .program(program, runner): programDetails(program, runner: runner)
+                            }
+                            Text("Approval uses the current contents at the shown path once. You will review the prepared experiment and its budget before optimization begins.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(4)
+                    }
+                    if let definition = request.definition {
+                        GroupBox("Prepared draft") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(definition.goal)
+                                Text("\(definition.examples.count) examples · \(definition.source.title)")
+                                    .font(.caption).foregroundStyle(.secondary)
+                                Text("The assistant can retrieve this draft and prepare the experiment for your review.")
+                                    .font(.caption)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    if let error = actionError ?? request.error {
+                        Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    }
+                    controls
+                }
+                .padding(20)
+            }
+        }
+
+        private func fileDetails(_ file: PromptLabFilePreparationRequest) -> some View {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Read the selected prompt and send it, along with your goal and examples, to the model below. One model call prepares an editable draft of examples and checks.")
+                LabeledContent("Source file") {
+                    Text(file.path).font(.caption.monospaced()).textSelection(.enabled)
+                }
+                LabeledContent("Preparation model", value: file.target.displayName)
+                LabeledContent("Time limit", value: "60 seconds")
+                if let selection = file.selection {
+                    Text(selection.count > 4000 ? "Selected source text (first 4,000 characters)" : "Selected source text")
+                        .font(.caption.bold())
+                    Text(String(selection.prefix(4000))).font(.caption.monospaced()).textSelection(.enabled)
+                } else {
+                    Text("Use the whole prompt file.").font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Goal").font(.caption.bold())
+                Text(file.goal).textSelection(.enabled)
+                if !file.exampleInputs.isEmpty {
+                    Text("Example inputs").font(.caption.bold())
+                    Text(file.exampleInputs).font(.caption).textSelection(.enabled)
+                }
+                if !file.criteria.isEmpty {
+                    Text("Success criteria").font(.caption.bold())
+                    Text(file.criteria).font(.caption).textSelection(.enabled)
+                }
+            }
+        }
+
+        private func programDetails(_ program: PromptLabProgram, runner: PromptLabRunnerKind) -> some View {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Load the project's examples and checks with its Python interpreter. Importing this module executes project code with normal access to files and the network; the project may also use the environment variables listed below.")
+                LabeledContent("Program type", value: runner == .dspy ? "DSPy program" : "Python evaluator")
+                LabeledContent("Project folder") {
+                    Text(program.projectRoot).font(.caption.monospaced()).textSelection(.enabled)
+                }
+                LabeledContent("Python interpreter") {
+                    Text(program.pythonExecutable).font(.caption.monospaced()).textSelection(.enabled)
+                }
+                LabeledContent("Module") {
+                    Text(program.modulePath).font(.caption.monospaced()).textSelection(.enabled)
+                }
+                LabeledContent("Evaluation function", value: program.callable)
+                LabeledContent("Time limit", value: "\(program.timeoutSeconds.formatted()) seconds")
+                LabeledContent("Environment variables", value: program.environmentKeys.isEmpty ? "None requested" : program.environmentKeys.joined(separator: ", "))
+                Text("RepoPrompt loads the draft without starting an optimization run. Any work performed while importing the module is controlled by the project's code.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+
+        @ViewBuilder private var controls: some View {
+            switch request.status {
+            case .awaitingApproval:
+                HStack {
+                    Button("Approve and prepare") {
+                        actionError = nil
+                        Task {
+                            do { try await preparations.approve(requestID: request.id, service: service) }
+                            catch { actionError = error.localizedDescription }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Decline") {
+                        do { try preparations.reject(requestID: request.id) }
+                        catch { actionError = error.localizedDescription }
+                    }
+                }
+            case .running:
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Preparing examples and checks…").font(.caption)
+                    Button("Cancel preparation") {
+                        do { try preparations.cancel(requestID: request.id) }
+                        catch { actionError = error.localizedDescription }
+                    }
+                }
+            case .completed, .failed, .rejected, .cancelled:
+                EmptyView()
+            }
+        }
+    }
+
+    extension PromptLabPreparationRequest {
+        var preparationStatusLabel: String {
+            switch status {
+            case .awaitingApproval: "Review preparation"
+            case .running: "Preparing"
+            case .completed: "Draft ready"
+            case .failed: "Preparation failed"
+            case .rejected: "Declined"
+            case .cancelled: "Cancelled"
+            }
+        }
+
+        var preparationStatusSummary: String {
+            switch status {
+            case .awaitingApproval:
+                switch payload {
+                case .file: "Review the file and model before preparing examples and checks."
+                case .program: "Review the project and Python interpreter before loading examples and checks."
+                }
+            case .running: "Preparing examples and checks for your experiment."
+            case .completed: "The draft is ready for the assistant to turn into an experiment for your review."
+            case .failed: "Preparation could not finish. The assistant can submit a corrected request."
+            case .rejected: "Preparation was declined. A new request is needed to try again."
+            case .cancelled: "Preparation was cancelled. A new request is needed to try again."
+            }
         }
     }
 #endif
