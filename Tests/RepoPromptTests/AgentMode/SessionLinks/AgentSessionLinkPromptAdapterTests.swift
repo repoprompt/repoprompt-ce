@@ -2848,7 +2848,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
     func testClaudeNativeLosingPreseededFakeRefusesRealProviderReplacement() async throws {
         let fake = MonitorFakeNativeController()
         // Intentionally use the production factory to reproduce a fixture that loses its fake.
-        let coordinator = ClaudeAgentModeCoordinator(windowID: 1, workspacePathProvider: { _ in nil })
+        let coordinator = ClaudeAgentModeCoordinator(windowID: 1, builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()), workspacePathProvider: { _ in nil })
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
         session.hasLoadedPersistedState = true
@@ -2895,6 +2895,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         var factoryCalls = 0
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1,
+            builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()),
             workspacePathProvider: { _ in nil },
             claudeControllerFactory: { _, _, _, _ in
                 factoryCalls += 1
@@ -3194,6 +3195,7 @@ final class AgentSessionLinkNativeAndHeadlessPromptAdapterTests: XCTestCase {
         var controllers = [firstController, replacementController]
         let coordinator = ClaudeAgentModeCoordinator(
             windowID: 1,
+            builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()),
             workspacePathProvider: { _ in nil },
             claudeControllerFactory: { _, _, _, _ in
                 controllers.removeFirst()

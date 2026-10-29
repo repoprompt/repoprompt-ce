@@ -57,6 +57,28 @@ import XCTest
             XCTAssertEqual(advertised, accepted, "the schema advertises exactly the accepted arguments")
         }
 
+        func testGeneralLabSchemaSurvivesTheAppCatalogProjection() throws {
+            let definition = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.promptExperiment))
+            let adapted = try RepoPromptApp.Tool(domainBinding: MCPDomainToolBinding(definition: definition) { _ in .null })
+            let canonical = try RepoPromptApp.Tool(canonicalizing: adapted)
+            let schema = try JSONDecoder().decode(Value.self, from: JSONEncoder().encode(canonical.inputSchema))
+            let properties = try XCTUnwrap(schema.objectValue?["properties"]?.objectValue)
+            let expected = try XCTUnwrap(definition.inputSchema.objectValue?["properties"]?.objectValue)
+            XCTAssertEqual(canonical.description, definition.description)
+            XCTAssertEqual(Set(properties.keys), Set(expected.keys))
+            XCTAssertEqual(properties["op"]?.objectValue?["enum"], .array(PromptExperimentOperation.allCases.map { .string($0.rawValue) }))
+
+            let lab = try XCTUnwrap(properties["definition"]?.objectValue?["properties"]?.objectValue)
+            let source = try XCTUnwrap(lab["source"]?.objectValue?["properties"]?.objectValue)
+            XCTAssertNotNil(source["literal"], "Imported source encoding metadata must remain in the advertised contract")
+            let example = try XCTUnwrap(lab["examples"]?.objectValue?["items"]?.objectValue?["properties"]?.objectValue)
+            XCTAssertEqual(example["payload"]?.objectValue?["additionalProperties"], .bool(true), "Project datasets must preserve arbitrary nested JSON")
+            let program = try XCTUnwrap(properties["program"]?.objectValue?["properties"]?.objectValue)
+            XCTAssertNotNil(program["dependencySHA256"])
+            XCTAssertNotNil(program["environmentKeys"])
+            XCTAssertEqual(program["modelRouting"]?.objectValue?["enum"], .array([.string("connected"), .string("project")]))
+        }
+
         func testPrepareRequiresOneSourceAndDescribesAConcreteGoal() throws {
             let command = try PromptExperimentMCPControl.parse([
                 "op": "prepare", "prompt_text": "Write a useful gardening article.",

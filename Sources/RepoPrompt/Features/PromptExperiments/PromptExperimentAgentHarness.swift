@@ -104,7 +104,7 @@
                 try Data(file.content.utf8).write(to: url, options: .withoutOverwriting)
             }
             let system = usesProductionTemplate
-                ? AgentModePrompts.engineerPrompt(agentKind: AgentProviderKind(rawValue: target.agentRaw), bodyOverride: candidate)
+                ? AgentModePrompts.engineerPrompt(agentKind: AgentProviderKind(rawValue: target.agentRaw), body: candidate)
                 : candidate
             let task = """
             \(example.input)

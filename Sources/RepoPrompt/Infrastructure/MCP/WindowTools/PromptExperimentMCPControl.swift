@@ -119,7 +119,7 @@
             .exportResult: ["experiment_id", "run_id", "output_path"]
         ]
 
-        static func execute(args: [String: Value]) async throws -> Value {
+        static func execute(args: [String: Value], service: PromptExperimentService) async throws -> Value {
             if let connectionID = ServerNetworkManager.currentConnectionID,
                await ServerNetworkManager.shared.runPurpose(for: connectionID) == .discoverRun
             {
@@ -130,7 +130,7 @@
                 ).jsonText)
             }
             do {
-                return try await handle(args: args, service: WindowStatesManager.shared.promptExperimentService)
+                return try await handle(args: args, service: service)
             } catch let error as PromptExperimentMCPError {
                 throw MCPError.invalidParams(error.jsonText)
             }

@@ -109,12 +109,32 @@ import XCTest
             for example in suite.cases {
                 XCTAssertNoThrow(try PromptExperimentAgentHarness.validate(case: example))
             }
-            let body = AppDomainRuntimeComposition.shared.builtInPromptRegistry.text(.engineer)
+            let registry = AppDomainRuntimeComposition.shared.builtInPromptRegistry
+            let body = registry.text(.engineer)
             XCTAssertTrue(AgentModePrompts.isValidEngineerTemplate(body))
             XCTAssertFalse(AgentModePrompts.isValidEngineerTemplate(body + "{{rpce.after_task}}"))
-            let baseline = AgentModePrompts.engineerPrompt(agentKind: .claudeCode)
-            XCTAssertEqual(baseline, AgentModePrompts.engineerPrompt(agentKind: .claudeCode, bodyOverride: body))
-            XCTAssertFalse(baseline.contains("{{rpce."))
+            for kind: AgentProviderKind? in [nil, .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec] {
+                for codeMapsDisabled in [false, true] {
+                    let baseline = SystemPromptService.agentModePrompt(
+                        registry: registry, agentKind: kind, taskLabelKind: .engineer, codeMapsDisabled: codeMapsDisabled
+                    )
+                    XCTAssertEqual(baseline, AgentModePrompts.engineerPrompt(agentKind: kind, codeMapsDisabled: codeMapsDisabled, body: body))
+                    XCTAssertFalse(baseline.contains("{{rpce."))
+                }
+            }
+        }
+
+        func testEngineerPromptUsesInjectedRegistry() throws {
+            let root = try temporaryRoot()
+            let directory = root.appendingPathComponent(BuiltInPromptID.engineer.rawValue, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let marker = "Use the injected Engineer prompt authority."
+            let body = AppDomainRuntimeComposition.shared.builtInPromptRegistry.text(.engineer) + "\n\n" + marker
+            try (body + "\n").write(to: directory.appendingPathComponent(BuiltInPromptID.promptFileName), atomically: true, encoding: .utf8)
+            let registry = BuiltInPromptRegistry(promptsDirectory: root)
+            let prompt = SystemPromptService.agentModePrompt(registry: registry, agentKind: .claudeCode, taskLabelKind: .engineer)
+            XCTAssertEqual(prompt, AgentModePrompts.engineerPrompt(agentKind: .claudeCode, body: body))
+            XCTAssertTrue(prompt.hasSuffix(marker))
         }
 
         func testFreshWorkspacesAndPrivateChecksAreUsedForEachEvaluation() async throws {

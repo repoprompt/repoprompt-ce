@@ -114,7 +114,7 @@ enum AgentModePrompts {
     static func engineerPrompt(
         agentKind: AgentProviderKind?,
         codeMapsDisabled: Bool = false,
-        bodyOverride: String? = nil
+        body: String
     ) -> String {
         let readPolicy = Fragments.providerReadPolicy(agentKind: agentKind)
         let afterTask = Fragments.afterCompletingTask(
@@ -131,7 +131,6 @@ enum AgentModePrompts {
             ? "Explore with `file_search` and `RepoPrompt__read_file`, then explain clearly."
             : "Explore with `file_search`, `RepoPrompt__read_file`, and `get_code_structure`, then explain clearly."
 
-        let body = bodyOverride ?? AppDomainRuntimeComposition.shared.builtInPromptRegistry.text(.engineer)
         let substitutions = [
             "code_structure_tool": codeStructureToolLine,
             "read_policy": readPolicy,

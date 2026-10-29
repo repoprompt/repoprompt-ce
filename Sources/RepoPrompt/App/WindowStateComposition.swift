@@ -272,6 +272,7 @@ enum WindowStateCompositionFactory {
         // 13) Agent mode (for minimal agent UI)
         let agentModeViewModel = agentModeViewModelFactory?(windowID, promptManager, workspaceManager, mcpServer) ?? AgentModeViewModel(
             windowID: windowID,
+            builtInPromptRegistry: AppDomainRuntimeComposition.shared.builtInPromptRegistry,
             promptManager: promptManager,
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,

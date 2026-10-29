@@ -708,6 +708,7 @@ class SystemPromptService {
     ///   - agentKind: Optional active agent kind to specialize provider-specific guidance
     ///   - taskLabelKind: Optional task label to select role-specific prompt variants
     static func agentModePrompt(
+        registry: BuiltInPromptRegistry,
         agentKind: AgentProviderKind? = nil,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         codeMapsDisabled: Bool = false
@@ -722,7 +723,8 @@ class SystemPromptService {
         case .engineer:
             return AgentModePrompts.engineerPrompt(
                 agentKind: agentKind,
-                codeMapsDisabled: codeMapsDisabled
+                codeMapsDisabled: codeMapsDisabled,
+                body: registry.text(.engineer)
             )
         case .pair, .design, nil:
             break // Fall through to standard prompt

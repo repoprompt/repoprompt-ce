@@ -744,6 +744,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     // MARK: - Dependencies
 
     let windowID: Int
+    private let builtInPromptRegistry: BuiltInPromptRegistry
     weak var promptManager: PromptViewModel?
     private let workspaceFileContextStore: WorkspaceFileContextStore?
     weak var workspaceManager: WorkspaceManagerViewModel?
@@ -2536,6 +2537,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     init(
         windowID: Int,
+        builtInPromptRegistry: BuiltInPromptRegistry,
         promptManager: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
@@ -2551,6 +2553,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
         self.windowID = windowID
+        self.builtInPromptRegistry = builtInPromptRegistry
         self.promptManager = promptManager
         workspaceFileContextStore = promptManager.workspaceFileContextStore
         self.workspaceManager = workspaceManager
@@ -2651,6 +2654,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         self.usesProductionAgentDefaultsAndModelPolling = usesProductionAgentDefaultsAndModelPolling
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
+            builtInPromptRegistry: builtInPromptRegistry,
             runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
             codexControllerFactory: codexControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
@@ -2674,6 +2678,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         claudeCoordinator = ClaudeAgentModeCoordinator(
             windowID: windowID,
+            builtInPromptRegistry: builtInPromptRegistry,
             workspacePathProvider: sessionWorkspacePathProvider,
             awaitNoActiveMCPTools: { [weak mcpServer] runID in
                 guard let mcpServer else { return }
@@ -2765,6 +2770,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     #if DEBUG
         init(
             testWindowID: Int = 1,
+            testBuiltInPromptRegistry: BuiltInPromptRegistry = BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()),
             testWorkspacePath: String? = nil,
             testWorkspaceDirectory: URL? = nil,
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
@@ -2838,6 +2844,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testPerfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
         ) {
             windowID = testWindowID
+            builtInPromptRegistry = testBuiltInPromptRegistry
             promptManager = nil
             workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = nil
@@ -2892,6 +2899,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
             codexCoordinator = CodexAgentModeCoordinator(
                 windowID: testWindowID,
+                builtInPromptRegistry: testBuiltInPromptRegistry,
                 runtimeWorkspacePathsProvider: codexRuntimeWorkspacePathsProvider,
                 codexControllerFactory: codexControllerFactory,
                 connectionPolicyInstaller: connectionPolicyInstaller,
@@ -2936,6 +2944,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
             claudeCoordinator = ClaudeAgentModeCoordinator(
                 windowID: testWindowID,
+                builtInPromptRegistry: testBuiltInPromptRegistry,
                 workspacePathProvider: sessionWorkspacePathProvider,
                 claudeControllerFactory: claudeControllerFactory,
                 toolEndedCount: { [weak testMCPServer] runID in
@@ -22007,6 +22016,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         // Create agent message with system prompt for interactive assistance
         let systemPrompt = SystemPromptService.agentModePrompt(
+            registry: builtInPromptRegistry,
             agentKind: session.selectedAgent,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()

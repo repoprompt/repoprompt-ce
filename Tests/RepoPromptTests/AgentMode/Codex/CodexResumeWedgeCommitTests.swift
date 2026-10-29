@@ -1166,7 +1166,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         factory: @escaping (UUID, Bool) -> WedgeFakeCodexController
     ) -> CodexAgentModeCoordinator {
         let coordinator = CodexAgentModeCoordinator(
-            windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            windowID: 1, builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()), runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
             codexControllerFactory: { runID, _, _, _, _, _, enabled, _ in factory(runID, enabled) },
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             shouldManageCodexTooling: false, computerUseRuntimeUnavailableMessage: { nil }, computerUseCompanionReady: { true },
@@ -1185,7 +1185,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         var routeOwned = true
         var routeChecks = 0
         let coordinator = CodexAgentModeCoordinator(
-            windowID: 1, runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
+            windowID: 1, builtInPromptRegistry: BuiltInPromptRegistry(promptsDirectory: BuiltInPromptRegistry.defaultPromptsDirectory()), runtimeWorkspacePathsProvider: { _ in .uniform(nil) },
             codexControllerFactory: { runID, _, _, _, _, _, _, _ in
                 WedgeFakeCodexController(runID: runID, responses: [.success("uncommitted-computer-use")])
             },
