@@ -41,6 +41,18 @@ extension CursorACPModelPollingService {
     )
 }
 
+extension GrokBuildACPModelPollingService {
+    static let shared = GrokBuildACPModelPollingService(
+        client: GrokBuildACPControllerModelDiscoveryClient(),
+        registry: .shared,
+        logFailure: { message in
+            if AgentRuntimeProviderService.enableDebugLogging {
+                print("[GrokBuildACPModelPolling] refresh failed: \(message)")
+            }
+        }
+    )
+}
+
 extension OpenCodeACPModelPollingService.Registry {
     static var app: Self {
         Self(

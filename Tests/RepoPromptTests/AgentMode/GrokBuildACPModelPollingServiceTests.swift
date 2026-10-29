@@ -5,6 +5,10 @@ import RepoPromptAIContracts
 import XCTest
 
 final class GrokBuildACPModelPollingServiceTests: XCTestCase {
+    private func makePollingService(client: any GrokBuildACPModelDiscoveryClient) -> GrokBuildACPModelPollingService {
+        GrokBuildACPModelPollingService(client: client, registry: .shared, logFailure: { _ in })
+    }
+
     override func setUp() {
         super.setUp()
         AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
@@ -72,7 +76,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
                 )
             }
         )
-        let service = GrokBuildACPModelPollingService(client: client)
+        let service = makePollingService(client: client)
         do {
             _ = try await service.discoverOnce(workspacePath: "/unused/grok-project-a")
             let identity = await firstController.currentProviderSessionIdentity()
@@ -117,8 +121,24 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         )
     }
 
-    func testDiscoverOncePublishesLiveSnapshot() async throws {
+    func testInjectedRegistryPublishesOnlyIntoItsOwnInstance() async throws {
+        let registry = AgentACPModelRegistry(dependencies: .init(
+            loadAll: { [:] }, load: { _ in nil }, save: { _, _ in }, remove: { _ in }, invalidate: { _ in }
+        ))
         let service = GrokBuildACPModelPollingService(
+            client: StubDiscoveryClient(models: makeModels(["isolated-grok"]), failure: nil),
+            registry: registry,
+            logFailure: { _ in }
+        )
+        let snapshot = try await service.discoverOnce(workspacePath: nil)
+        XCTAssertEqual(snapshot?.models.currentModelRaw, "isolated-grok")
+        XCTAssertEqual(registry.currentSnapshot(for: .grokBuild)?.currentModelRaw, "isolated-grok")
+        XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .grokBuild))
+        await service.shutdown()
+    }
+
+    func testDiscoverOncePublishesLiveSnapshot() async throws {
+        let service = makePollingService(
             client: StubDiscoveryClient(models: makeModels(["grok-4.6", "grok-4.5"]), failure: nil)
         )
         let snapshot = try await service.discoverOnce(workspacePath: nil)
@@ -129,7 +149,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
     }
 
     func testFailedRefreshRetainsLastGoodSnapshot() async throws {
-        let service = GrokBuildACPModelPollingService(
+        let service = makePollingService(
             client: StubDiscoveryClient(models: makeModels(["grok-4.6"]), failure: nil)
         )
         _ = try await service.discoverOnce(workspacePath: nil)
@@ -137,7 +157,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
 
         // A service whose client fails keeps reporting the previously published registry data
         // (warmed from the persisted store) instead of clearing it.
-        let failing = GrokBuildACPModelPollingService(
+        let failing = makePollingService(
             client: StubDiscoveryClient(models: nil, failure: AIProviderError.invalidConfiguration(detail: "boom"))
         )
         let refreshed = await failing.refreshNow(workspacePath: nil)
@@ -149,7 +169,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
     }
 
     func testRefreshOutcomesDistinguishUpdatedUnchangedAndNoModels() async {
-        let service = GrokBuildACPModelPollingService(
+        let service = makePollingService(
             client: StubDiscoveryClient(models: makeModels(["grok-4.6"]), failure: nil)
         )
         let first = await service.refreshNow(workspacePath: nil)
@@ -158,7 +178,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         XCTAssertEqual(second, .unchanged)
         await service.shutdown()
 
-        let empty = GrokBuildACPModelPollingService(
+        let empty = makePollingService(
             client: StubDiscoveryClient(
                 models: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil),
                 failure: nil
@@ -170,7 +190,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
     }
 
     func testEmptyDiscoveryDoesNotPersistFakeDefaultSnapshot() async throws {
-        let service = GrokBuildACPModelPollingService(
+        let service = makePollingService(
             client: StubDiscoveryClient(models: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil)
         )
         let snapshot = try await service.discoverOnce(workspacePath: nil)
