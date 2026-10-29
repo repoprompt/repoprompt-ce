@@ -3,173 +3,37 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
-protocol OpenCodeACPModelDiscoveryClient: Sendable {
+package protocol OpenCodeACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?, modelRaw: String?) async throws -> OpenCodeACPModelDiscoveryResult?
-}
-
-struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClient {
-    typealias ProviderFactory = @Sendable (_ agent: AgentProviderKind, _ modelString: String?) async throws -> (any ACPAgentProvider)?
-    typealias ControllerFactory = @Sendable (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
-
-    private let providerFactory: ProviderFactory
-    private let controllerFactory: ControllerFactory
-
-    init(
-        providerFactory: @escaping ProviderFactory = { agent, modelString in
-            if agent == .openCode {
-                return OpenCodeACPAgentProvider(
-                    config: OpenCodeAgentConfig(
-                        modelString: modelString,
-                        enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-                        includeRepoPromptMCPServer: false,
-                        includeManagedConfigOverlay: true,
-                        cleanupLegacyPersistentConfig: true,
-                        toolProfile: .noTools
-                    )
-                )
-            }
-            return try await ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
-        },
-        controllerFactory: @escaping ControllerFactory = { provider, runRequest in
-            try ACPAgentSessionController(provider: provider, runRequest: runRequest)
-        }
-    ) {
-        self.providerFactory = providerFactory
-        self.controllerFactory = controllerFactory
-    }
-
-    /// Bootstraps a disposable OpenCode ACP session and returns the bootstrap catalog plus,
-    /// when `modelRaw` is non-nil, the parameter outcome for that model.
-    ///
-    /// The bootstrap catalog is the one published. OpenCode only advertises the
-    /// model-scoped `effort` selector *after* a model set, so the parameter probe mutates the
-    /// session's current model; substituting that probe session's model list would confuse
-    /// "the model we interrogated" with "the provider default" and could lose the model list.
-    /// The probe therefore runs in a disposable controller and only its *parameter outcome*
-    /// is extracted; the published catalog retains the bootstrap options and bootstrap current.
-    func discoverModels(workspacePath: String?, modelRaw: String?) async throws -> OpenCodeACPModelDiscoveryResult? {
-        let request = ACPRunRequest(
-            agentKind: .openCode,
-            modelString: nil,
-            workspacePath: workspacePath,
-            resumeSessionID: nil,
-            attachments: [],
-            taskLabelKind: nil
-        )
-        guard let provider = try await providerFactory(.openCode, nil) else { return nil }
-        let support = try await provider.support(for: request)
-        guard support == .supported else {
-            throw AIProviderError.invalidConfiguration(
-                detail: support.reason ?? "OpenCode ACP is not available."
-            )
-        }
-
-        let controller = try controllerFactory(provider, request)
-        // The disposable controller is shut down on success, failure, and cancellation.
-        do {
-            _ = try await controller.bootstrap()
-            guard let catalog = await controller.currentDiscoveredSessionModels() else {
-                await controller.shutdown()
-                return nil
-            }
-
-            var parameterState: OpenCodeACPModelParameterState?
-            if let modelRaw {
-                parameterState = await Self.probeParameters(for: modelRaw, controller: controller)
-            }
-            await controller.shutdown()
-            return OpenCodeACPModelDiscoveryResult(catalog: catalog, parameterState: parameterState)
-        } catch {
-            await controller.shutdown()
-            throw error
-        }
-    }
-
-    /// Drives the model-selector probe and reduces the verified snapshot to a terminal
-    /// parameter state for the requested model. A probe failure never throws here: the
-    /// catalog must survive a failed probe, so the outcome is `.failed(detail:)` instead.
-    private static func probeParameters(
-        for modelRaw: String,
-        controller: ACPAgentSessionController
-    ) async -> OpenCodeACPModelParameterState {
-        await classifyParameterOutcome(modelRaw: modelRaw) {
-            try await controller.discoverSessionModelParameters(for: $0)
-        }
-    }
-
-    /// The terminal classification, extracted from the transport so it is directly testable
-    /// via a scripted closure (no protocol conformance / Python subprocess needed).
-    static func classifyParameterOutcome(
-        modelRaw: String,
-        discover: (String) async throws -> ACPDiscoveredSessionModels
-    ) async -> OpenCodeACPModelParameterState {
-        let trimmed = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return .failed(detail: "Model parameter discovery requires a non-empty model.")
-        }
-        let requestedIdentity = ACPModelParameterIdentity.canonicalBaseModelRaw(
-            trimmed,
-            providerID: .openCode
-        )
-        do {
-            let verified = try await discover(trimmed)
-            // Never fall back to another model's metadata when the requested identity is
-            // missing or ambiguous in the verified post-mutation snapshot.
-            let matchingSets = verified.modelParameterSets.filter {
-                ACPModelParameterIdentity.canonicalBaseModelRaw($0.baseModelRaw, providerID: .openCode)
-                    == requestedIdentity
-            }
-            switch matchingSets.count {
-            case 0:
-                // A verified, matching model that legitimately advertises no selector is
-                // `.noUsableParameters` (a successful outcome: no parameter set exists).
-                return .noUsableParameters
-            case 1:
-                let parameterSet = matchingSets[0]
-                guard parameterSet.parameters.contains(where: { !$0.choices.isEmpty }) else {
-                    return .noUsableParameters
-                }
-                return .available(parameterSet)
-            default:
-                return .failed(
-                    detail: "Model parameter discovery for '\(trimmed)' was ambiguous: matched \(matchingSets.count) parameter sets; expected exactly one."
-                )
-            }
-        } catch is CancellationError {
-            return .failed(detail: "Model parameter discovery for '\(trimmed)' was cancelled.")
-        } catch {
-            return .failed(detail: "Model parameter discovery for '\(trimmed)' failed: \(error.localizedDescription)")
-        }
-    }
 }
 
 // MARK: - Demand-scoped model-parameter observation value types
 
 /// Identity of a demand-scoped OpenCode model-parameter observation. A `nil` workspace is a
 /// distinct context, never a wildcard for "any workspace".
-struct OpenCodeACPModelParameterKey: Hashable {
-    let workspacePath: String?
-    let canonicalBaseModelRaw: String
+package struct OpenCodeACPModelParameterKey: Hashable {
+    package let workspacePath: String?
+    package let canonicalBaseModelRaw: String
     /// The model string as requested, preserved verbatim for protocol use. The canonical form is
     /// lower-cased for comparison and must never reach the wire: the probe sets this model on the
     /// session, and an installation whose model IDs are case-sensitive would be sent an alias that
     /// does not exist — the parameter would never be advertised and the control would never
     /// appear, for that install only. Identity deliberately excludes this field, so two spellings
     /// of one model still share an observation.
-    let wireModelRaw: String
+    package let wireModelRaw: String
 
-    init(workspacePath: String?, modelRaw: String) {
+    package init(workspacePath: String?, modelRaw: String) {
         self.workspacePath = Self.normalizedWorkspacePath(workspacePath)
         wireModelRaw = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         canonicalBaseModelRaw = ACPModelIdentityNormalization.caseInsensitive(modelRaw)
     }
 
-    static func == (lhs: Self, rhs: Self) -> Bool {
+    package static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.workspacePath == rhs.workspacePath
             && lhs.canonicalBaseModelRaw == rhs.canonicalBaseModelRaw
     }
 
-    func hash(into hasher: inout Hasher) {
+    package func hash(into hasher: inout Hasher) {
         hasher.combine(workspacePath)
         hasher.combine(canonicalBaseModelRaw)
     }
@@ -177,7 +41,7 @@ struct OpenCodeACPModelParameterKey: Hashable {
     /// The single workspace normalization every (service, resolver, composer) key comparison
     /// uses, so logically identical paths (`/a/child/..` vs `/a`) always produce the same key.
     /// A nil/empty workspace is a distinct context, never a wildcard.
-    static func normalizedWorkspacePath(_ path: String?) -> String? {
+    package static func normalizedWorkspacePath(_ path: String?) -> String? {
         guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
             return nil
         }
@@ -187,13 +51,13 @@ struct OpenCodeACPModelParameterKey: Hashable {
 
 /// Model-parameter observation states. `.loading` appears only as a transient observation
 /// while a probe is in flight; the discovery client reports terminal outcomes only.
-enum OpenCodeACPModelParameterState: Equatable {
+package enum OpenCodeACPModelParameterState: Equatable {
     case loading
     case available(ACPModelParameterSet)
     case noUsableParameters
     case failed(detail: String)
 
-    var isTerminal: Bool {
+    package var isTerminal: Bool {
         switch self {
         case .loading: false
         case .available, .noUsableParameters, .failed: true
@@ -201,19 +65,30 @@ enum OpenCodeACPModelParameterState: Equatable {
     }
 }
 
-struct OpenCodeACPModelParameterSnapshot: Equatable {
-    let key: OpenCodeACPModelParameterKey
-    let state: OpenCodeACPModelParameterState
-    let updatedAt: Date
+package struct OpenCodeACPModelParameterSnapshot: Equatable {
+    package let key: OpenCodeACPModelParameterKey
+    package let state: OpenCodeACPModelParameterState
+    package let updatedAt: Date
+
+    package init(key: OpenCodeACPModelParameterKey, state: OpenCodeACPModelParameterState, updatedAt: Date) {
+        self.key = key
+        self.state = state
+        self.updatedAt = updatedAt
+    }
 }
 
 /// The outcome of one OpenCode model discovery pass: the bootstrap catalog (always, when the
 /// pass succeeds) plus the parameter outcome for a single requested model (when a probe was
 /// requested). `parameterState == nil` means "catalog-only; no probe requested" and never
 /// means `.loading`.
-struct OpenCodeACPModelDiscoveryResult: Equatable {
-    let catalog: ACPDiscoveredSessionModels
-    let parameterState: OpenCodeACPModelParameterState?
+package struct OpenCodeACPModelDiscoveryResult: Equatable {
+    package let catalog: ACPDiscoveredSessionModels
+    package let parameterState: OpenCodeACPModelParameterState?
+
+    package init(catalog: ACPDiscoveredSessionModels, parameterState: OpenCodeACPModelParameterState?) {
+        self.catalog = catalog
+        self.parameterState = parameterState
+    }
 }
 
 // SEARCH-HELPER: OpenCode ACP model polling, dynamic discovery, subscribe, registry refresh
@@ -233,14 +108,20 @@ struct OpenCodeACPModelDiscoveryResult: Equatable {
 /// Both share one serialized discovery-job runner so at most one disposable ACP controller
 /// exists at a time; identical jobs coalesce on a single queue entry per key and never join a
 /// different key's result. The queue is FIFO.
-actor OpenCodeACPModelPollingService {
-    struct Registry {
+package actor OpenCodeACPModelPollingService {
+    package struct Registry {
         let update: (ACPDiscoveredSessionModels) -> Bool
         let snapshot: () -> ACPDiscoveredSessionModels?
         let snapshotAfterWarm: () async -> ACPDiscoveredSessionModels?
+
+        package init(update: @escaping (ACPDiscoveredSessionModels) -> Bool, snapshot: @escaping () -> ACPDiscoveredSessionModels?, snapshotAfterWarm: @escaping () async -> ACPDiscoveredSessionModels?) {
+            self.update = update
+            self.snapshot = snapshot
+            self.snapshotAfterWarm = snapshotAfterWarm
+        }
     }
 
-    enum RefreshOutcome: Equatable {
+    package enum RefreshOutcome: Equatable {
         case updated
         case unchanged
         case noModelsAdvertised
@@ -249,10 +130,16 @@ actor OpenCodeACPModelPollingService {
         case cancelled
     }
 
-    struct Snapshot: Equatable {
-        let models: ACPDiscoveredSessionModels
-        let fetchedAt: Date
-        let isLiveDiscovery: Bool
+    package struct Snapshot: Equatable {
+        package let models: ACPDiscoveredSessionModels
+        package let fetchedAt: Date
+        package let isLiveDiscovery: Bool
+
+        package init(models: ACPDiscoveredSessionModels, fetchedAt: Date, isLiveDiscovery: Bool) {
+            self.models = models
+            self.fetchedAt = fetchedAt
+            self.isLiveDiscovery = isLiveDiscovery
+        }
     }
 
     private let client: any OpenCodeACPModelDiscoveryClient
@@ -283,7 +170,7 @@ actor OpenCodeACPModelPollingService {
     private var preferredWorkspacePath: String?
     private var isShutdown = false
 
-    init(
+    package init(
         client: any OpenCodeACPModelDiscoveryClient,
         registry: Registry,
         intervalNanos: UInt64 = 300_000_000_000
@@ -295,7 +182,7 @@ actor OpenCodeACPModelPollingService {
 
     // MARK: Catalog-facing API (signatures preserved for Settings / AgentMode / ContextBuilder)
 
-    func latestSnapshot() async -> Snapshot? {
+    package func latestSnapshot() async -> Snapshot? {
         if let latest {
             return latest
         }
@@ -308,14 +195,14 @@ actor OpenCodeACPModelPollingService {
     /// `AgentACPModelRegistry` before the first agent session starts. The job owns catalog
     /// publication and subscriber broadcast; the caller receives that same published snapshot
     /// and returns `nil` when the client obtained nothing.
-    func discoverOnce(workspacePath: String?) async throws -> Snapshot? {
+    package func discoverOnce(workspacePath: String?) async throws -> Snapshot? {
         guard !isShutdown else { return nil }
         let workspace = OpenCodeACPModelParameterKey.normalizedWorkspacePath(workspacePath)
         preferredWorkspacePath = workspace
         return try await awaitCatalogJob(workspace: workspace).snapshot
     }
 
-    func subscribe(workspacePath: String?) async -> AsyncStream<Snapshot> {
+    package func subscribe(workspacePath: String?) async -> AsyncStream<Snapshot> {
         guard !isShutdown else {
             return AsyncStream { continuation in continuation.finish() }
         }
@@ -352,7 +239,7 @@ actor OpenCodeACPModelPollingService {
         return stream
     }
 
-    func refreshNow(workspacePath: String?) async -> RefreshOutcome {
+    package func refreshNow(workspacePath: String?) async -> RefreshOutcome {
         guard !isShutdown else { return .skipped }
         let workspace = OpenCodeACPModelParameterKey.normalizedWorkspacePath(workspacePath)
         preferredWorkspacePath = workspace
@@ -388,7 +275,7 @@ actor OpenCodeACPModelPollingService {
     /// A second subscriber joining an already-`available` key replays that retained observation
     /// instead of starting a fresh probe, so existing subscribers keep their controls. Only a
     /// key with no retained observation (first subscriber, or after eviction) enqueues a probe.
-    func subscribeModelParameters(
+    package func subscribeModelParameters(
         workspacePath: String?,
         modelRaw: String
     ) async -> AsyncStream<OpenCodeACPModelParameterSnapshot> {
@@ -427,7 +314,7 @@ actor OpenCodeACPModelPollingService {
     /// evicted-then-recreated key may join the old in-flight job. This is the demand-scoped
     /// coalescing policy (one disposable controller at a time), not a freshness guarantee — an
     /// in-flight result is not claimed "still-fresh".
-    func discoverModelParametersOnce(
+    package func discoverModelParametersOnce(
         workspacePath: String?,
         modelRaw: String,
         forceRefresh: Bool = false
@@ -480,7 +367,7 @@ actor OpenCodeACPModelPollingService {
 
     // MARK: Shutdown
 
-    func shutdown(finishSubscribers: Bool = true) async {
+    package func shutdown(finishSubscribers: Bool = true) async {
         isShutdown = true
         refreshTask?.cancel()
         refreshTask = nil
