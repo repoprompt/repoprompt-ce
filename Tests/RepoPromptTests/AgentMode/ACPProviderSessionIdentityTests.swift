@@ -9,6 +9,21 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
+    func testInjectedToolAuthorityControlsParenthesizedProvenance() {
+        let names = ACPToolNameResolution(
+            isRepoPromptServerIdentifier: { $0 == "trusted" },
+            canonicalRepoPromptToolName: { $0 == "alias" ? "read_file" : nil },
+            isRepoPromptToolNameWithServerPrefix: { _ in false }
+        )
+        XCTAssertEqual(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "alias (trusted)"], toolNames: names), "mcp__RepoPromptCE__read_file")
+        XCTAssertNil(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "alias (foreign)"], toolNames: names))
+    }
+
+    func testAppAuthorityRejectsLookalikeServer() {
+        XCTAssertNil(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "read_file (NotRepoPromptCE)"]))
+        XCTAssertEqual(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "read_file (RepoPromptCE)"]), "mcp__RepoPromptCE__read_file")
+    }
+
     func testACPBootstrapRefusesDevinNewAndColdResumeWithoutFixtureOptIn() async throws {
         // Hydration can request a fresh controller for a persisted provider session;
         // neither that identity nor discovery is permission to start a provider in XCTest.
