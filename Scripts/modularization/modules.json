@@ -58,13 +58,13 @@
     },
     "RepoPromptACPProviders": {
       "source_root": "Sources/RepoPromptACPProviders",
-      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptFoundation", "RepoPromptProcess"],
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptProcess"],
       "test_target": "RepoPromptACPProvidersTests",
       "app_free_tests": true
     },
     "RepoPromptACPProvidersTests": {
       "source_root": "Tests/RepoPromptACPProvidersTests",
-      "allowed_dependencies": ["RepoPromptACPProviders", "RepoPromptAIContracts", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"]
+      "allowed_dependencies": ["RepoPromptACPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"]
     },
     "RepoPromptAIContracts": {
       "source_root": "Sources/RepoPromptAIContracts",

@@ -1,9 +1,7 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
-import RepoPromptSettingsCore
 
 /// Describes whether an ACP session identifier is known to be safe for a future
 /// `session/load`.

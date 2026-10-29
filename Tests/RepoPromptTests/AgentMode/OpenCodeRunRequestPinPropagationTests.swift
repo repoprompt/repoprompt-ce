@@ -1,3 +1,4 @@
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptSettingsCore

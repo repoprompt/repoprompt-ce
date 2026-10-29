@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptACPProviders
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage

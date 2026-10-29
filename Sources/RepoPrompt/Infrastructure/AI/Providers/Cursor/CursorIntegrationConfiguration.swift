@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 

@@ -144,13 +144,13 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptACPProviders",
-            dependencies: ["RepoPromptAIContracts", "RepoPromptFoundation", "RepoPromptProcess"],
+            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptProcess"],
             path: "Sources/RepoPromptACPProviders",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .testTarget(
             name: "RepoPromptACPProvidersTests",
-            dependencies: ["RepoPromptACPProviders", "RepoPromptAIContracts", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"],
+            dependencies: ["RepoPromptACPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"],
             path: "Tests/RepoPromptACPProvidersTests"
         ),
         .target(

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptACPProviders
 
 /// Immutable runtime configuration for the Grok Build ACP provider (`grok agent stdio`).
 struct GrokBuildAgentConfig {
