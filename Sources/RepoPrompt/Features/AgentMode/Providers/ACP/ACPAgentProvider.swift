@@ -43,7 +43,7 @@ struct ACPRunRequest {
     let workspacePath: String?
     let resumeSessionID: String?
     let attachments: [AgentFileAttachment]
-    let taskLabelKind: AgentModelCatalog.TaskLabelKind?
+    let taskLabelKind: AgentTaskLabelKind?
     let sessionModeID: String?
     let autoApproveAllToolPermissions: Bool
     /// Provider-native CLI permission mode applied by the provider at PROCESS LAUNCH
@@ -58,7 +58,7 @@ struct ACPRunRequest {
         workspacePath: String?,
         resumeSessionID: String?,
         attachments: [AgentFileAttachment],
-        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        taskLabelKind: AgentTaskLabelKind?,
         sessionModeID: String? = nil,
         autoApproveAllToolPermissions: Bool = false,
         launchPermissionMode: String? = nil,
@@ -158,13 +158,6 @@ struct ACPSessionConfiguration: Equatable {
         self.metadata = metadata
         self.postOpenNotification = postOpenNotification
     }
-}
-
-enum NormalizedAgentRuntimeEvent {
-    case stream(AIStreamResult)
-    case approvalRequested(AgentApprovalRequest)
-    case approvalCancelled(AgentApprovalRequestID)
-    case terminal(state: AgentSessionRunState, errorText: String?)
 }
 
 /// Result of parsing a provider-specific session-open model advertisement.

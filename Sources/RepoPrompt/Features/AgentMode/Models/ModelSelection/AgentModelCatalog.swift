@@ -1822,12 +1822,7 @@ enum AgentModelCatalog {
     // MARK: - Task Labels
 
     /// Known task label kinds for MCP agent role defaults.
-    enum TaskLabelKind: String, CaseIterable {
-        case explore
-        case engineer
-        case pair
-        case design
-    }
+    typealias TaskLabelKind = AgentTaskLabelKind
 
     /// Metadata for a task label.
     struct TaskLabel {
