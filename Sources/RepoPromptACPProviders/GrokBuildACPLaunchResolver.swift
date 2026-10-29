@@ -1,14 +1,12 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptFoundation
 import RepoPromptProcess
-import RepoPromptSettingsCore
 
-enum GrokBuildACPLaunchCandidate: Equatable {
+package enum GrokBuildACPLaunchCandidate: Equatable {
     case grokAgentStdio
 
-    var command: String {
+    package var command: String {
         CLILaunchProfiles.grokBuild.commandName
     }
 
@@ -20,24 +18,24 @@ enum GrokBuildACPLaunchCandidate: Equatable {
     /// admits the injected RepoPrompt MCP connection — the server must be a direct child
     /// of the ACP session process. The resolver deliberately caches only the executable,
     /// never per-request arguments.
-    var launchArguments: [String] {
+    package var launchArguments: [String] {
         ["agent", "--no-leader", "stdio"]
     }
 
-    var helpArguments: [String] {
+    package var helpArguments: [String] {
         ["agent", "--help"]
     }
 }
 
-struct GrokBuildACPResolvedLaunch: Equatable {
-    let command: String
-    let arguments: [String]
-    let additionalPathHints: [String]
-    let environment: [String: String]
-    let executableIdentity: ExecutableFileIdentity
+package struct GrokBuildACPResolvedLaunch: Equatable {
+    package let command: String
+    package let arguments: [String]
+    package let additionalPathHints: [String]
+    package let environment: [String: String]
+    package let executableIdentity: ExecutableFileIdentity
 }
 
-enum GrokBuildACPLaunchResolutionError: Error, Equatable, LocalizedError {
+package enum GrokBuildACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case missingConfiguredCommand
     case unsafeConfiguredCommand(String)
     case exactPathNotFound(String)
@@ -45,7 +43,7 @@ enum GrokBuildACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case environmentDiscoveryRequired(String)
     case unsafeApplicationPath(String)
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .missingConfiguredCommand:
             "Grok Build CLI launch requires an exact `grok` command or absolute path."
@@ -66,40 +64,32 @@ enum GrokBuildACPLaunchResolutionError: Error, Equatable, LocalizedError {
     }
 }
 
-final class GrokBuildACPLaunchResolver: @unchecked Sendable {
-    typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
+package final class GrokBuildACPLaunchResolver: @unchecked Sendable {
+    package typealias EnvironmentProvider = @Sendable (_ enableDebugLogging: Bool) async -> ACPLaunchEnvironment
+    package typealias SupplementalPathProvider = @Sendable (_ configuredPaths: [String]) -> [String]
+    package typealias FailureRecorder = @Sendable (_ source: ShellEnvironmentSource?, _ candidateCount: Int) -> Void
 
     private let environmentProvider: EnvironmentProvider
+    private let supplementalPathProvider: SupplementalPathProvider
+    private let environmentFilter: CLIProcessConfiguration.EnvironmentFilter
+    private let recordFailure: FailureRecorder
     private let probeMutex = AsyncMutex()
     private let lock = NSLock()
     private var cachedLaunchByKey: [String: GrokBuildACPResolvedLaunch] = [:]
 
-    convenience init(
-        environmentProvider: @escaping @Sendable (_ enableDebugLogging: Bool) async -> [String: String]
-    ) {
-        self.init(launchEnvironmentProvider: { enableDebugLogging in
-            await ACPLaunchEnvironment(environment: environmentProvider(enableDebugLogging))
-        })
-    }
-
-    init(
-        launchEnvironmentProvider: @escaping EnvironmentProvider = { enableDebugLogging in
-            let result = await ProcessEnvironmentBuilder.build(
-                ProcessEnvironmentRequest(
-                    purpose: .acpAgent(providerID: ACPProviderID.grokBuild.rawValue),
-                    enableDebugLogging: enableDebugLogging
-                )
-            )
-            return ACPLaunchEnvironment(
-                environment: result.environment,
-                shellEnvironmentSource: result.shellEnvironmentSource
-            )
-        }
+    package init(
+        launchEnvironmentProvider: @escaping EnvironmentProvider,
+        supplementalPathProvider: @escaping SupplementalPathProvider,
+        environmentFilter: @escaping CLIProcessConfiguration.EnvironmentFilter,
+        failureRecorder: @escaping FailureRecorder
     ) {
         environmentProvider = launchEnvironmentProvider
+        self.supplementalPathProvider = supplementalPathProvider
+        self.environmentFilter = environmentFilter
+        recordFailure = failureRecorder
     }
 
-    func resolvedLaunch(for config: GrokBuildAgentConfig) throws -> GrokBuildACPResolvedLaunch {
+    package func resolvedLaunch(for config: GrokBuildAgentConfig) throws -> GrokBuildACPResolvedLaunch {
         let key = cacheKey(for: config)
         if let cached = cachedLaunch(forKey: key) {
             do {
@@ -116,7 +106,7 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
         return launch
     }
 
-    func probeSupport(for config: GrokBuildAgentConfig) async throws -> ACPSupportResult {
+    package func probeSupport(for config: GrokBuildAgentConfig) async throws -> ACPSupportResult {
         try await probeMutex.withLock { [self] in
             try await probeSupportSerially(for: config)
         }
@@ -131,7 +121,7 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
             let launch = try await resolveLaunchForProbe(for: config)
             let processConfig = CLIProcessConfiguration(
                 command: launch.command,
-                environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .grokBuild),
+                environmentFilter: environmentFilter,
                 additionalPaths: [],
                 enableDebugLogging: config.enableDebugLogging,
                 shellLookupMode: .fallbackOnly
@@ -185,7 +175,7 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
             )
         }
 
-        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
+        let effectiveHints = supplementalPathProvider(config.additionalPathHints)
         return try firstValidLaunch(
             candidates: launchCandidates(
                 additionalPathHints: effectiveHints,
@@ -207,7 +197,7 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
         guard configuredCommand.contains("/") else {
             throw GrokBuildACPLaunchResolutionError.environmentDiscoveryRequired(configuredCommand)
         }
-        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
+        let effectiveHints = supplementalPathProvider(config.additionalPathHints)
         do {
             return try validatedLaunch(
                 entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
@@ -218,11 +208,7 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
         } catch {
             // Explicit-path failures intentionally keep their specific errors and omit the
             // fallback-PATH hint: an exact configured path does not depend on PATH discovery.
-            AgentCLILaunchDiagnostics.recordPathResolutionFailure(
-                providerKind: .grokBuild,
-                shellEnvironmentSource: shellEnvironmentSource,
-                candidateCount: 1
-            )
+            recordFailure(shellEnvironmentSource, 1)
             throw error
         }
     }
@@ -339,11 +325,7 @@ final class GrokBuildACPLaunchResolver: @unchecked Sendable {
         if failures.isEmpty {
             throw GrokBuildACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
-        AgentCLILaunchDiagnostics.recordPathResolutionFailure(
-            providerKind: .grokBuild,
-            shellEnvironmentSource: shellEnvironmentSource,
-            candidateCount: candidates.count
-        )
+        recordFailure(shellEnvironmentSource, candidates.count)
         throw GrokBuildACPLaunchResolutionError.noValidLaunchCandidate(configuredCommand, failures, shellEnvironmentSource)
     }
 
