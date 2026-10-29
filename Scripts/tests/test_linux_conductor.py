@@ -1,5 +1,7 @@
+import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -10,6 +12,35 @@ import conductor
 
 
 class LinuxConductorTests(unittest.TestCase):
+    def test_build_child_preserves_proxy_and_ca_configuration(self):
+        network = {
+            "HTTP_PROXY": "http://proxy.invalid:8080",
+            "HTTPS_PROXY": "http://proxy.invalid:8080",
+            "ALL_PROXY": "socks5://proxy.invalid:1080",
+            "NO_PROXY": "localhost,127.0.0.1",
+            "http_proxy": "http://proxy.invalid:8080",
+            "https_proxy": "http://proxy.invalid:8080",
+            "all_proxy": "socks5://proxy.invalid:1080",
+            "no_proxy": "localhost,127.0.0.1",
+            "SSL_CERT_FILE": "/tmp/company-ca.pem",
+            "SSL_CERT_DIR": "/tmp/company-certs",
+            "CURL_CA_BUNDLE": "/tmp/company-ca.pem",
+            "GIT_SSL_CAINFO": "/tmp/company-ca.pem",
+            "GIT_SSL_CAPATH": "/tmp/company-certs",
+            "REQUESTS_CA_BUNDLE": "/tmp/company-ca.pem",
+        }
+        with patch.dict(os.environ, {**network, "UNRELATED_SECRET": "excluded"}, clear=True):
+            snapshot = conductor.OperationRegistry.client_env_snapshot()
+        _, _, _, env, _ = conductor.OperationRegistry(Path("/tmp/repo")).prepare({
+            "operation": "swift-build", "args": {"product": "repoprompt-mcp"}, "env": snapshot,
+        })
+        child_env = json.loads(subprocess.check_output(
+            [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
+            env=env, text=True, timeout=10,
+        ))
+        self.assertEqual({key: child_env.get(key) for key in network}, network)
+        self.assertNotIn("UNRELATED_SECRET", child_env)
+
     def test_release_build_preserves_coordination_and_compiler_options(self):
         registry = conductor.OperationRegistry(Path("/tmp/rpce-build-test"))
         argv, lanes, cwd, _, _ = registry.prepare({

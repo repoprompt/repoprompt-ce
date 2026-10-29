@@ -55,6 +55,15 @@
             XCTAssertEqual(count, LinuxHTTPByteStream.maximumBufferedBytes)
         }
 
+        func testDroppingUnconsumedResponseStopsTheUnderlyingRequest() async throws {
+            let request = request("headers-only")
+            let requestURL = try XCTUnwrap(request.url)
+            let observed = LinuxHTTPFixtureProtocol.observe(requestURL)
+            defer { LinuxHTTPFixtureProtocol.removeObservation(requestURL) }
+            _ = try await client().bytes(for: request)
+            await fulfillment(of: [observed.stopped], timeout: 5)
+        }
+
         private func request(_ scenario: String) -> URLRequest {
             URLRequest(url: URL(string: "https://repoprompt-http-fixture.invalid/\(scenario)/\(UUID().uuidString)")!)
         }
@@ -118,6 +127,7 @@
             if url.path.hasPrefix("/waiting/") { return }
             let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["X-Fixture": "stream"])!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            if url.path.hasPrefix("/headers-only/") { return }
             if url.path.hasPrefix("/overflow/") {
                 client?.urlProtocol(self, didLoad: Data(repeating: 65, count: LinuxHTTPByteStream.maximumBufferedBytes + 1))
             } else {

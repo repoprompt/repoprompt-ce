@@ -5,7 +5,7 @@
     final class LinuxHTTPByteStream: NSObject, URLSessionDataDelegate, @unchecked Sendable {
         static let maximumBufferedBytes = 256 * 1024
         private let lock = NSLock()
-        private let bytes: HTTPBytes
+        private var bytes: HTTPBytes?
         private let byteContinuation: HTTPBytes.Continuation
         private var responseContinuation: CheckedContinuation<(bytes: HTTPBytes, http: HTTPURLResponse), Error>?
         private var task: URLSessionDataTask?
@@ -58,17 +58,22 @@
         }
 
         func urlSession(_ session: URLSession, dataTask _: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-            let continuation = lock.withLock {
-                defer { responseContinuation = nil }
-                return responseContinuation
+            let (continuation, bytes) = lock.withLock {
+                defer {
+                    responseContinuation = nil
+                    self.bytes = nil
+                }
+                return (responseContinuation, self.bytes)
             }
-            guard let http = response as? HTTPURLResponse else {
+            guard let http = response as? HTTPURLResponse, let bytes else {
                 continuation?.resume(throwing: URLError(.badServerResponse))
                 byteContinuation.finish(throwing: URLError(.badServerResponse))
                 completionHandler(.cancel)
                 session.invalidateAndCancel()
                 return
             }
+            // Only the caller should retain the stream after headers arrive, so
+            // dropping an unread response invokes onTermination and cancels IO.
             continuation?.resume(returning: (bytes, http))
             completionHandler(.allow)
         }

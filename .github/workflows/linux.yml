@@ -74,8 +74,8 @@ jobs:
           binary="$(swift build -c release --show-bin-path)/repoprompt-mcp"
           python3 Scripts/linux_headless_smoke.py --binary "$binary"
 
-      - name: Verify installation behavior
-        run: python3 -m unittest discover -s Scripts/tests -p test_install_linux.py
+      - name: Verify Linux build tooling and installation behavior
+        run: python3 -m unittest discover -s Scripts/tests -p 'test_*linux*.py'
 
       - name: Stage and verify installed executable
         run: |
