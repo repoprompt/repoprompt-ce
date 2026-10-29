@@ -1,5 +1,5 @@
 import Foundation
-import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 final class DiffParserFileSourceTests: XCTestCase {
