@@ -32,19 +32,32 @@
                 let metadata = directory.appendingPathComponent("metadata.txt")
                 try run(
                     commands.identify,
-                    arguments: commands.identifyArguments + limits + ["-ping", "-format", "%w %h %[channels]", format.rawValue + ":" + source.path + "[0]"],
+                    arguments: commands.identifyArguments + limits + ["-ping", "-format", "%w %h", format.rawValue + ":" + source.path + "[0]"],
                     output: metadata
                 )
                 let metadataBytes = try boundedRead(metadata, maximumBytes: 4096)
                 let values = String(decoding: metadataBytes, as: UTF8.self).split(whereSeparator: \.isWhitespace)
-                guard values.count == 3, let width = Int(values[0]), let height = Int(values[1]),
+                guard values.count == 2, let width = Int(values[0]), let height = Int(values[1]),
                       width > 0, height > 0
                 else { throw failure }
                 guard width <= AttachmentImageNormalizer.maxSourceDimension,
                       height <= AttachmentImageNormalizer.maxSourceDimension,
                       width <= AttachmentImageNormalizer.maxSourcePixelCount / height
                 else { throw AttachmentClassificationError.imageTooLarge(fileName: fileName, format: format.rawValue) }
-                let hasAlpha = values[2].lowercased().hasSuffix("a") || values[2].lowercased().contains("alpha")
+                // A header-only ping can miss TIFF alpha. Decode only after the
+                // dimension check, under the same resource and wall-clock limits.
+                let channelMetadata = directory.appendingPathComponent("channels.txt")
+                try run(
+                    commands.identify,
+                    arguments: commands.identifyArguments + limits + ["-format", "%[channels]", format.rawValue + ":" + source.path + "[0]"],
+                    output: channelMetadata
+                )
+                let channelBytes = try boundedRead(channelMetadata, maximumBytes: 4096)
+                // ImageMagick 7 appends a count ("srgba 4.0"); version 6 emits "srgba".
+                guard let channels = String(decoding: channelBytes, as: UTF8.self).split(whereSeparator: \.isWhitespace).first else {
+                    throw failure
+                }
+                let hasAlpha = channels.lowercased().hasSuffix("a") || channels.lowercased().contains("alpha")
                 let output = directory.appendingPathComponent(hasAlpha ? "output.png" : "output.jpg")
                 try run(
                     commands.convert,

@@ -144,6 +144,20 @@
             XCTAssertTrue(converted.starts(with: [0xFF, 0xD8, 0xFF]))
         }
 
+        func testTIFFConversionPreservesAlphaWithOptionalImageMagick() throws {
+            // One uncompressed RGBA pixel with 50% alpha, encoded as an 8-bit TIFF.
+            let bytes = try XCTUnwrap(Data(base64Encoded: "SUkqAAwAAAD/AAB/EAAAAQMAAQAAAAEAAAABAQMAAQAAAAEAAAACAQMABAAAANIAAAADAQMAAQAAAAEAAAAGAQMAAQAAAAIAAAAKAQMAAQAAAAEAAAARAQQAAQAAAAgAAAASAQMAAQAAAAEAAAAVAQMAAQAAAAQAAAAWAQMAAQAAAAEAAAAXAQQAAQAAAAQAAAAcAQMAAQAAAAEAAAApAQMAAgAAAAAAAQA+AQUAAgAAAAoBAAA/AQUABgAAANoAAABSAQMAAQAAAAIAAAAAAAAACAAIAAgACACF61EAAACAAMP1qAAAAAACzcxMAAAAAAHNzEwAAACAAM3MTAAAAAACj8L1AAAAABA3GqAAAAAAAiuHCgAAACAA"))
+            let result: AttachmentPayload
+            do {
+                result = try AttachmentClassifier.classify(bytes: bytes, fileName: "transparent.tiff")
+            } catch AttachmentClassificationError.imageConverterUnavailable {
+                throw XCTSkip("ImageMagick is optional; conversion requires it to be installed")
+            }
+            guard case let .image(type, converted) = result else { return XCTFail("Expected a converted image") }
+            XCTAssertEqual(type, .png)
+            XCTAssertTrue(converted.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]))
+        }
+
         private func temporaryDirectory() throws -> URL {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])

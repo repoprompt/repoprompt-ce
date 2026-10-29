@@ -41,7 +41,7 @@ jobs:
       - name: Install native build and smoke dependencies
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y binutils git procps python3 libsqlite3-dev util-linux
+          apt-get install --no-install-recommends -y binutils git imagemagick procps python3 libsqlite3-dev util-linux
           # Trust this mounted checkout across conductor's isolated HOME directories.
           git config --system --add safe.directory "$GITHUB_WORKSPACE"
           swift --version

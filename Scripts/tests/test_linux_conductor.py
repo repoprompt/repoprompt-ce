@@ -12,6 +12,38 @@ import conductor
 
 
 class LinuxConductorTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux zombie process semantics")
+    def test_exited_unreaped_child_is_not_a_live_tree_or_group(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        try:
+            # Observe termination while deliberately leaving the child unreaped,
+            # as happens to orphaned workers under a non-reaping container PID 1.
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            # Keep exited identities available to recovery/ownership checks.
+            self.assertTrue(child.pid in conductor.process_table_snapshot())
+            snapshot = conductor.process_table_snapshot(live_only=True)
+            self.assertIsNotNone(snapshot)
+            self.assertFalse(child.pid in snapshot, "unreaped exited child is still reported as live")
+            self.assertFalse(conductor.DaemonState._process_group_alive_external(child.pid))
+        finally:
+            child.wait(timeout=10)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process group inspection")
+    def test_group_cleanup_preserves_live_members_and_fails_closed(self):
+        for output, expected in (("123 Z\n123 Zs\n", False), ("123 Z\n123 S\n", True), ("123 D\n", True)):
+            with self.subTest(output=output), patch.object(conductor.os, "getpgrp", return_value=999), \
+                    patch.object(conductor.os, "killpg"), \
+                    patch.object(conductor.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output)):
+                self.assertEqual(conductor.DaemonState._process_group_alive_external(123), expected)
+        for failure in (OSError("unavailable"), subprocess.TimeoutExpired("ps", 2)):
+            with self.subTest(failure=type(failure).__name__), patch.object(conductor.os, "getpgrp", return_value=999), \
+                    patch.object(conductor.os, "killpg"), patch.object(conductor.subprocess, "run", side_effect=failure):
+                self.assertTrue(conductor.DaemonState._process_group_alive_external(123))
+        for result in (subprocess.CompletedProcess([], 1, ""), subprocess.CompletedProcess([], 0, "unparseable\n")):
+            with self.subTest(result=result), patch.object(conductor.os, "getpgrp", return_value=999), \
+                    patch.object(conductor.os, "killpg"), patch.object(conductor.subprocess, "run", return_value=result):
+                self.assertTrue(conductor.DaemonState._process_group_alive_external(123))
+
     def test_build_child_preserves_proxy_and_ca_configuration(self):
         network = {
             "HTTP_PROXY": "http://proxy.invalid:8080",

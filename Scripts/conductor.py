@@ -2610,10 +2610,11 @@ def process_start_token(pid: int) -> Optional[str]:
     return token or None
 
 
-def process_table_snapshot() -> Optional[Dict[int, Tuple[int, str]]]:
+def process_table_snapshot(live_only: bool = False) -> Optional[Dict[int, Tuple[int, str]]]:
+    linux = live_only and sys.platform.startswith("linux")
     try:
         completed = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,lstart="],
+            ["ps", "-axo", "pid=,ppid=,stat=,lstart=" if linux else "pid=,ppid=,lstart="],
             env={**os.environ, "LC_ALL": "C", "LANG": "C"},
             text=True,
             capture_output=True,
@@ -2625,16 +2626,20 @@ def process_table_snapshot() -> Optional[Dict[int, Tuple[int, str]]]:
         return None
     snapshot: Dict[int, Tuple[int, str]] = {}
     for line in completed.stdout.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) != 3:
+        parts = line.strip().split(None, 3 if linux else 2)
+        if len(parts) != (4 if linux else 3):
             continue
         try:
             pid = int(parts[0])
             ppid = int(parts[1])
         except ValueError:
             continue
-        if pid > 0 and parts[2]:
-            snapshot[pid] = (ppid, parts[2])
+        if linux and parts[2].startswith(("Z", "X")):
+            # An unreaped child cannot execute or respond to further signals.
+            continue
+        token = parts[3] if linux else parts[2]
+        if pid > 0 and token:
+            snapshot[pid] = (ppid, token)
     return snapshot
 
 
@@ -5850,7 +5855,7 @@ class DaemonState:
         job: Job,
     ) -> Tuple[Dict[int, Tuple[int, str]], Dict[int, int], bool]:
         lease = self._process_lease(job)
-        snapshot = self._external_call_while_locked(process_table_snapshot)
+        snapshot = self._external_call_while_locked(process_table_snapshot, True)
         if snapshot is None:
             return {}, {}, False
         verified, depths, tracked, root_start = self._discover_verified_processes(lease, snapshot)
@@ -5918,9 +5923,36 @@ class DaemonState:
                 return False
         try:
             os.killpg(pgid, 0)
-            return True
         except (ProcessLookupError, PermissionError, OSError):
             return False
+        if not sys.platform.startswith("linux"):
+            return True
+        # Linux retains a process group while it contains unreaped zombies.
+        # killpg(0) alone therefore reports successful cleanup as still alive in
+        # containers whose PID 1 does not reap orphaned workers.
+        try:
+            completed = subprocess.run(
+                ["ps", "-axo", "pgid=,stat="],
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+                text=True,
+                capture_output=True,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+        if completed.returncode != 0:
+            return True
+        for line in completed.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                return True
+            try:
+                member_pgid = int(parts[0])
+            except ValueError:
+                return True
+            if member_pgid == pgid and not parts[1].startswith(("Z", "X")):
+                return True
+        return False
 
     def _process_group_id_alive_locked(self, job: Job) -> bool:
         lease = self._process_lease(job)
