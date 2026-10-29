@@ -42,15 +42,17 @@ jobs:
         run: |
           apt-get update
           apt-get install --no-install-recommends -y binutils git procps python3 libsqlite3-dev util-linux
+          # Trust this mounted checkout across conductor's isolated HOME directories.
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
           swift --version
-
-      - name: Build the real Linux product
-        run: Scripts/build_linux.sh release --jobs 4 --static-swift-stdlib
 
       - name: Check production dependency boundaries
         run: |
           Scripts/source_layout_guardrails.sh
           python3 Scripts/modularization_modules.py
+
+      - name: Build the real Linux product
+        run: Scripts/build_linux.sh release --jobs 4 --static-swift-stdlib
 
       - name: Run focused Linux runtime and security tests
         run: |
