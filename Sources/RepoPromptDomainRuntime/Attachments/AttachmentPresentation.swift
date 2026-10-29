@@ -1,5 +1,7 @@
 import Foundation
-import UniformTypeIdentifiers
+#if canImport(UniformTypeIdentifiers)
+    import UniformTypeIdentifiers
+#endif
 
 package struct AttachmentFacts: Equatable {
     package let kind: AttachmentKind
@@ -131,40 +133,57 @@ package struct AttachmentPresentation: Equatable {
         }
     }
 
-    /// The type named by the file extension, trusted only where the content kind leaves it open.
-    private static func extensionType(for facts: AttachmentFacts) -> UTType? {
-        let fileExtension = (facts.fileName as NSString).pathExtension
-        guard !fileExtension.isEmpty, let type = UTType(filenameExtension: fileExtension) else { return nil }
-        switch facts.kind {
-        case .image: return type.conforms(to: .image) ? type : nil
-        case .pdf: return nil
-        case .text, .binary: return type
+    // The type named by the file extension, trusted only where the content kind leaves it open.
+    #if canImport(UniformTypeIdentifiers)
+        private static func extensionType(for facts: AttachmentFacts) -> UTType? {
+            let fileExtension = (facts.fileName as NSString).pathExtension
+            guard !fileExtension.isEmpty, let type = UTType(filenameExtension: fileExtension) else { return nil }
+            switch facts.kind {
+            case .image: return type.conforms(to: .image) ? type : nil
+            case .pdf: return nil
+            case .text, .binary: return type
+            }
         }
-    }
 
-    private static func badge(for facts: AttachmentFacts) -> String? {
-        let type: UTType? = switch facts.kind {
-        case .pdf: .pdf
-        case .image, .text, .binary: extensionType(for: facts)
+        private static func badge(for facts: AttachmentFacts) -> String? {
+            let type: UTType? = switch facts.kind {
+            case .pdf: .pdf
+            case .image, .text, .binary: extensionType(for: facts)
+            }
+            let fileExtension = (facts.fileName as NSString).pathExtension
+            let raw = type?.preferredFilenameExtension
+                ?? (fileExtension.isEmpty ? nil : fileExtension)
+                ?? (facts.kind == .text ? UTType.plainText.preferredFilenameExtension : nil)
+            guard let raw, !raw.isEmpty else { return nil }
+            return String(raw.uppercased().prefix(maxBadgeLength))
         }
-        let fileExtension = (facts.fileName as NSString).pathExtension
-        let raw = type?.preferredFilenameExtension
-            ?? (fileExtension.isEmpty ? nil : fileExtension)
-            ?? (facts.kind == .text ? UTType.plainText.preferredFilenameExtension : nil)
-        guard let raw, !raw.isEmpty else { return nil }
-        return String(raw.uppercased().prefix(maxBadgeLength))
-    }
 
-    private static func typeDescription(for facts: AttachmentFacts) -> String {
-        let type: UTType? = switch facts.kind {
-        case .pdf: .pdf
-        case .image, .text, .binary: extensionType(for: facts)
+        private static func typeDescription(for facts: AttachmentFacts) -> String {
+            let type: UTType? = switch facts.kind {
+            case .pdf: .pdf
+            case .image, .text, .binary: extensionType(for: facts)
+            }
+            if let description = type?.localizedDescription, !description.isEmpty {
+                return description
+            }
+            return fallbackTitle(for: facts.kind)
         }
-        if let description = type?.localizedDescription, !description.isEmpty {
-            return description
+
+    #else
+        private static func badge(for facts: AttachmentFacts) -> String? {
+            let fileExtension = (facts.fileName as NSString).pathExtension
+            let raw: String = switch facts.kind {
+            case .pdf: "pdf"
+            case .text: fileExtension.isEmpty ? "txt" : fileExtension
+            case .image, .binary: fileExtension
+            }
+            return raw.isEmpty ? nil : String(raw.uppercased().prefix(maxBadgeLength))
         }
-        return fallbackTitle(for: facts.kind)
-    }
+
+        private static func typeDescription(for facts: AttachmentFacts) -> String {
+            fallbackTitle(for: facts.kind)
+        }
+    #endif
 
     private static func sizeDescription(_ byteCount: Int) -> String? {
         byteCount > 0 ? ByteCountFormatter.string(fromByteCount: Int64(byteCount), countStyle: .file) : nil

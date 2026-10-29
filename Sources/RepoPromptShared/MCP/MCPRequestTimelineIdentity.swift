@@ -1,4 +1,8 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
 /// Correlation identity shared by the app, transport, bridge ledger, and CLI proxy.

@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 @testable import RepoPromptMCPCore
 import XCTest
@@ -8,6 +13,10 @@ final class MCPStdioPhysicalPipeTests: XCTestCase {
         var descriptors = [Int32](repeating: -1, count: 2)
         guard pipe(&descriptors) == 0 else { throw POSIXError(.EIO) }
         defer { descriptors.forEach { _ = close($0) } }
+        let readFlags = fcntl(descriptors[0], F_GETFL)
+        guard readFlags >= 0, fcntl(descriptors[0], F_SETFL, readFlags | O_NONBLOCK) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
         let physical = MCPStdioFileDescriptorOutputSink(descriptor: descriptors[1], pollIntervalMilliseconds: 1)
         try physical.prepare()
         let filler = Data(repeating: 0x58, count: 4096)
@@ -25,7 +34,15 @@ final class MCPStdioPhysicalPipeTests: XCTestCase {
         }
         XCTAssertTrue(encounteredEAGAIN, "The real nonblocking descriptor must reach EAGAIN")
         guard encounteredEAGAIN, filled >= 8 else { throw POSIXError(.ENOBUFS) }
-        XCTAssertEqual(try readExactly(8, from: descriptors[0]), Data(repeating: 0x58, count: 8))
+        // Linux pipes retain partially consumed pages: draining only eight bytes
+        // from a full pipe does not make room for a new write at its full tail.
+        // Empty and refill it so the final buffer has exactly eight writable bytes.
+        XCTAssertEqual(try readExactly(filled, from: descriptors[0]), Data(repeating: 0x58, count: filled))
+        let refill = Data(repeating: 0x58, count: filled - 8)
+        let refillResult = refill.withUnsafeBytes { physical.write($0) }
+        guard case let .wrote(refilled) = refillResult, refilled == filled - 8 else {
+            throw POSIXError(.ENOBUFS)
+        }
 
         let barrier = PhysicalStdioBarrier()
         let sink = PhysicalPrefixStdioSink(physical: physical, barrier: barrier)
@@ -62,8 +79,11 @@ final class MCPStdioPhysicalPipeTests: XCTestCase {
         var offset = 0
         try bytes.withUnsafeMutableBytes { buffer in
             while offset < count {
-                let result = Darwin.read(descriptor, buffer.baseAddress!.advanced(by: offset), count - offset)
-                guard result > 0 else { throw POSIXError(.EIO) }
+                let result = POSIXSystem.read(descriptor, buffer.baseAddress!.advanced(by: offset), count - offset)
+                if result < 0, errno == EINTR { continue }
+                guard result > 0 else {
+                    throw POSIXError(result < 0 ? POSIXErrorCode(rawValue: errno) ?? .EIO : .EIO)
+                }
                 offset += result
             }
         }
@@ -90,10 +110,10 @@ private final class PhysicalPrefixStdioSink: MCPStdioOutputSink, @unchecked Send
 
     func write(_ bytes: UnsafeRawBufferPointer) -> MCPStdioWriteResult {
         lock.lock()
-        let first = isFirstWrite
-        isFirstWrite = false
-        lock.unlock()
-        return physical.write(first ? UnsafeRawBufferPointer(rebasing: bytes.prefix(8)) : bytes)
+        defer { lock.unlock() }
+        let result = physical.write(isFirstWrite ? UnsafeRawBufferPointer(rebasing: bytes.prefix(8)) : bytes)
+        if case let .wrote(count) = result, count > 0 { isFirstWrite = false }
+        return result
     }
 
     func awaitWritable() async -> MCPStdioWritableResult {

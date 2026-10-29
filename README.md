@@ -36,7 +36,21 @@ tap. The cask consumes the promoted public updater ZIP from
 it does not build from source. Source-build paths remain below for contributors
 and local development.
 
-### Build and launch locally
+### Linux and Omarchy
+
+Build and install the headless context engine and MCP server on Linux:
+
+```bash
+./Scripts/build_linux.sh release
+./Scripts/install_linux.sh
+```
+
+See [Linux setup](docs/linux.md) for Omarchy/Arch, Ubuntu/Debian and Fedora
+prerequisites, MCP client configuration, profile storage and supported features.
+The Linux product is `repoprompt-mcp`; the SwiftUI/AppKit desktop interface remains
+macOS-only. Native x86_64 and aarch64 builds have dedicated Linux CI jobs.
+
+### Build and launch locally on macOS
 
 For development and quick evaluation, double-click
 [`Launch RepoPrompt CE.command`](Launch%20RepoPrompt%20CE.command) in Finder.

@@ -1,8 +1,12 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 @testable import RepoPromptCodeMapCore
 
-struct CodeMapFixture: Sendable {
+struct CodeMapFixture {
     let relativePath: String
     let content: String
 

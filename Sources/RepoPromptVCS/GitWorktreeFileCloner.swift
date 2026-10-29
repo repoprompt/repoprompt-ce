@@ -1,4 +1,10 @@
-import Darwin
+import RepoPromptC
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 package struct GitWorktreeFileClonerError: Error, Equatable, CustomStringConvertible {
@@ -35,7 +41,7 @@ package enum GitWorktreeFileCloner {
     ) -> Int32
 
     package static let systemClone: CloneSyscall = { source, directory, name, flags in
-        fclonefileat(source, directory, name, flags) == 0 ? 0 : errno
+        repo_clone_file_at(source, directory, name, flags) == 0 ? 0 : errno
     }
 
     package enum Outcome: Equatable {
@@ -90,10 +96,15 @@ package enum GitWorktreeFileCloner {
         guard fstat(source, &status) == 0 else {
             return .failed(operation: "stat-source", errno: errno)
         }
-        guard status.st_mode & S_IFMT == S_IFREG else { return .sourceTypeMismatch }
+        guard status.st_mode & POSIXSystem.fileTypeMask == POSIXSystem.regularFileType else { return .sourceTypeMismatch }
         sourceSize?(Int64(status.st_size))
 
-        let cloneResult = clone(source, destinationDirectory, name, UInt32(CLONE_NOOWNERCOPY))
+        #if canImport(Darwin)
+            let flags = UInt32(CLONE_NOOWNERCOPY)
+        #else
+            let flags: UInt32 = 0
+        #endif
+        let cloneResult = clone(source, destinationDirectory, name, flags)
         let outcome: Outcome
         switch cloneResult {
         case 0:
@@ -132,7 +143,7 @@ package enum GitWorktreeFileCloner {
             let code = errno
             return code == ENOENT ? .sourceMissing : .failed(operation: "stat-source-link", errno: code)
         }
-        guard status.st_mode & S_IFMT == S_IFLNK else { return .sourceTypeMismatch }
+        guard status.st_mode & POSIXSystem.fileTypeMask == POSIXSystem.symbolicLinkType else { return .sourceTypeMismatch }
 
         let capacity = max(Int(status.st_size), 0) + 1
         var buffer = [CChar](repeating: 0, count: capacity + 1)
@@ -162,7 +173,7 @@ package enum GitWorktreeFileCloner {
             let code = errno
             return code == EEXIST ? .destinationExists : .failed(operation: "create-destination", errno: code)
         }
-        let result = fcopyfile(source, destination, nil, copyfile_flags_t(COPYFILE_ALL))
+        let result = repo_copy_file_contents_and_metadata(source, destination)
         let copyErrno = errno
         close(destination)
         guard result == 0 else {
@@ -184,12 +195,14 @@ package enum GitWorktreeFileCloner {
         guard fstat(descriptor, &status) == 0 else {
             return .failed(operation: "stat-destination", errno: errno)
         }
-        guard status.st_mode & S_IFMT == S_IFREG else {
-            return .failed(operation: "destination-type", errno: EFTYPE)
+        guard status.st_mode & POSIXSystem.fileTypeMask == POSIXSystem.regularFileType else {
+            return .failed(operation: "destination-type", errno: EINVAL)
         }
-        if status.st_flags != 0, fchflags(descriptor, 0) != 0 {
-            return .failed(operation: "clear-flags", errno: errno)
-        }
+        #if canImport(Darwin)
+            if status.st_flags != 0, fchflags(descriptor, 0) != 0 {
+                return .failed(operation: "clear-flags", errno: errno)
+            }
+        #endif
         if let failure = removeExtendedAttributes(descriptor) {
             return failure
         }
@@ -201,22 +214,27 @@ package enum GitWorktreeFileCloner {
     }
 
     private static func removeExtendedAttributes(_ descriptor: Int32) -> Outcome? {
-        let size = flistxattr(descriptor, nil, 0, 0)
-        guard size >= 0 else { return .failed(operation: "list-xattr", errno: errno) }
-        guard size > 0 else { return nil }
-        var buffer = [CChar](repeating: 0, count: size)
-        let length = flistxattr(descriptor, &buffer, size, 0)
-        guard length >= 0 else { return .failed(operation: "list-xattr", errno: errno) }
-        var start = 0
-        for index in 0 ..< length where buffer[index] == 0 {
-            defer { start = index + 1 }
-            guard index > start else { continue }
-            let attributeName = Array(buffer[start ... index])
-            if fremovexattr(descriptor, attributeName, 0) != 0, errno != ENOATTR {
-                return .failed(operation: "remove-xattr", errno: errno)
+        #if os(Linux)
+            return repo_remove_file_extended_attributes(descriptor) == 0
+                ? nil : .failed(operation: "remove-xattr", errno: errno)
+        #else
+            let size = flistxattr(descriptor, nil, 0, 0)
+            guard size >= 0 else { return .failed(operation: "list-xattr", errno: errno) }
+            guard size > 0 else { return nil }
+            var buffer = [CChar](repeating: 0, count: size)
+            let length = flistxattr(descriptor, &buffer, size, 0)
+            guard length >= 0 else { return .failed(operation: "list-xattr", errno: errno) }
+            var start = 0
+            for index in 0 ..< length where buffer[index] == 0 {
+                defer { start = index + 1 }
+                guard index > start else { continue }
+                let attributeName = Array(buffer[start ... index])
+                if fremovexattr(descriptor, attributeName, 0) != 0, errno != ENOATTR {
+                    return .failed(operation: "remove-xattr", errno: errno)
+                }
             }
-        }
-        return nil
+            return nil
+        #endif
     }
 
     /// Walks directory descriptors below one trusted root without following symlinks.
@@ -265,7 +283,7 @@ package enum GitWorktreeFileCloner {
                 throw GitWorktreeFileClonerError(operation: "duplicate-root", code: errno)
             }
             var status = stat()
-            guard fstat(descriptor, &status) == 0, status.st_mode & S_IFMT == S_IFDIR else {
+            guard fstat(descriptor, &status) == 0, status.st_mode & POSIXSystem.fileTypeMask == POSIXSystem.directoryFileType else {
                 let code = errno
                 close(descriptor)
                 throw GitWorktreeFileClonerError(operation: "verify-root-descriptor", code: code)

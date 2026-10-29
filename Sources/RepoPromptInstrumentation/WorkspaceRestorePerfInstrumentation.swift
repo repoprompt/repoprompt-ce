@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 /// Synchronous, opt-in restore timing and structured event contract.
@@ -19,14 +20,38 @@ package protocol WorkspaceRestorePerfRecording: Sendable {
 package struct NoopWorkspaceRestorePerfRecorder: WorkspaceRestorePerfRecording {
     package init() {}
 
-    package var isEnabled: Bool { false }
-    package func timestampMSIfEnabled() -> Double? { nil }
-    package func timestampMS() -> Double { CFAbsoluteTimeGetCurrent() * 1000 }
-    package func elapsedMS(since startMS: Double) -> Double { timestampMS() - startMS }
-    package func formatMS(_ value: Double) -> String { String(format: "%.1fms", value) }
-    package func formatElapsedMS(since startMS: Double) -> String { formatMS(elapsedMS(since: startMS)) }
-    package func shortID(_ id: UUID?) -> String { id?.uuidString.prefix(8).description ?? "nil" }
-    @MainActor package func nextAgentActivationTrueCount() -> Int { 0 }
+    package var isEnabled: Bool {
+        false
+    }
+
+    package func timestampMSIfEnabled() -> Double? {
+        nil
+    }
+
+    package func timestampMS() -> Double {
+        CFAbsoluteTimeGetCurrent() * 1000
+    }
+
+    package func elapsedMS(since startMS: Double) -> Double {
+        timestampMS() - startMS
+    }
+
+    package func formatMS(_ value: Double) -> String {
+        String(format: "%.1fms", value)
+    }
+
+    package func formatElapsedMS(since startMS: Double) -> String {
+        formatMS(elapsedMS(since: startMS))
+    }
+
+    package func shortID(_ id: UUID?) -> String {
+        id?.uuidString.prefix(8).description ?? "nil"
+    }
+
+    @MainActor package func nextAgentActivationTrueCount() -> Int {
+        0
+    }
+
     package func log(_: @autoclosure () -> String) {}
     package func event(_: String, fields _: [String: String] = [:]) {}
 }

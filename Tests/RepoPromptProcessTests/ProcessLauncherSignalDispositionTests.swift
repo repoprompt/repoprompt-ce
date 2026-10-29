@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 @testable import RepoPromptProcess
 import XCTest
@@ -6,13 +11,18 @@ import XCTest
 final class ProcessLauncherSignalDispositionTests: XCTestCase {
     func testPTYKeepsLaunchPolicyAndTerminalDescriptorsAndBoundedCleanup() async throws {
         XCTAssertThrowsError(try ProcessLauncher.spawnPTY(command: "/bin/true", arguments: [], environment: [:], workingDirectory: "/tmp"))
-        let child = try ProcessLauncher.spawnPTY(command: "/bin/sh", arguments: ["-c", "test -t 0 && test -t 1 && test -t 2 && printf RPCE_PTY_OK; sleep 10"],
-            environment: ["PATH": "/usr/bin:/bin"], workingDirectory: "/tmp", allowsProviderProcessLaunchForTesting: true)
+        let child = try ProcessLauncher.spawnPTY(
+            command: "/bin/sh",
+            arguments: ["-c", "test -t 0 && test -t 1 && test -t 2 && printf RPCE_PTY_OK; sleep 10"],
+            environment: ["PATH": "/usr/bin:/bin"],
+            workingDirectory: "/tmp",
+            allowsProviderProcessLaunchForTesting: true
+        )
         XCTAssertEqual(child.processGroupID, child.pid)
         var bytes = Data()
         var buffer = [UInt8](repeating: 0, count: 1024)
         for _ in 0 ..< 50 {
-            let count = Darwin.read(child.master, &buffer, buffer.count)
+            let count = POSIXSystem.read(child.master, &buffer, buffer.count)
             if count > 0 { bytes.append(contentsOf: buffer.prefix(count)) }
             if String(decoding: bytes, as: UTF8.self).contains("RPCE_PTY_OK") { break }
             try? await Task.sleep(for: .milliseconds(20))
@@ -47,23 +57,33 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
             XCTFail("isolated SIGTERM helper did not write its completion marker:\n\(result.output)")
             return
         }
+        #if os(Linux)
+            // swift-corelibs Foundation preserves ignored dispositions. The owned
+            // POSIX launcher must still reset SIGTERM, as the helper asserts above.
+            let foundationBaseline = "inherits-ignored-sigterm"
+        #else
+            let foundationBaseline = "resets-sigterm"
+        #endif
         XCTAssertEqual(
             marker,
-            "child-helper-passed\nfoundation-process-resets-sigterm\n",
-            "Both child launch paths must restore SIGTERM: \(marker)\n\(result.output)"
+            "child-helper-passed\nfoundation-process-\(foundationBaseline)\n",
+            "ProcessLauncher must reset SIGTERM and Foundation must match its platform baseline: \(marker)\n\(result.output)"
         )
         print("ProcessLauncher SIGTERM helper observation:\n\(marker)")
     }
 
     private func runHelperTestProcess(markerURL: URL) throws -> (terminationStatus: Int32, output: String) {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
-        process.arguments = [
-            "xctest",
-            "-XCTest",
-            "RepoPromptProcessTests.ProcessLauncherSignalDispositionTests",
-            Bundle(for: ProcessLauncherSignalDispositionTests.self).bundleURL.path
-        ]
+        #if os(Linux)
+            process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+            process.arguments = ["RepoPromptProcessTests.ProcessLauncherSignalDispositionTests/testSpawnedChildResetsIgnoredParentSIGTERMToDefault"]
+        #else
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+            process.arguments = [
+                "xctest", "-XCTest", "RepoPromptProcessTests.ProcessLauncherSignalDispositionTests",
+                Bundle(for: ProcessLauncherSignalDispositionTests.self).bundleURL.path
+            ]
+        #endif
 
         var environment = ProcessInfo.processInfo.environment
         environment[HelperEnvironment.isHelper] = "1"
@@ -83,7 +103,7 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
         try process.run()
         if completion.wait(timeout: .now() + 30) == .timedOut {
             if process.isRunning {
-                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = kill(process.processIdentifier, SIGKILL)
             }
             _ = completion.wait(timeout: .now() + 5)
             throw NSError(
@@ -111,10 +131,10 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
         var childWasReaped = false
         defer {
             if !childWasReaped {
-                _ = Darwin.kill(spawned.pid, SIGKILL)
+                _ = kill(spawned.pid, SIGKILL)
                 var cleanupStatus: Int32 = 0
                 while true {
-                    let result = Darwin.waitpid(spawned.pid, &cleanupStatus, 0)
+                    let result = waitpid(spawned.pid, &cleanupStatus, 0)
                     if result == spawned.pid || (result == -1 && errno != EINTR) {
                         break
                     }
@@ -133,7 +153,7 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
 
         var status: Int32 = 0
         while true {
-            let result = Darwin.waitpid(spawned.pid, &status, 0)
+            let result = waitpid(spawned.pid, &status, 0)
             if result == spawned.pid {
                 childWasReaped = true
                 break
@@ -168,9 +188,9 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
     private func spawnWhileHelperIgnoresSIGTERM() throws -> SpawnedProcess {
         // This disposition change occurs only in the dedicated child XCTest process. The
         // shared XCTest runner never changes its SIGTERM disposition.
-        let previousDisposition = Darwin.signal(SIGTERM, SIG_IGN)
+        let previousDisposition = signal(SIGTERM, SIG_IGN)
         defer {
-            _ = Darwin.signal(SIGTERM, previousDisposition)
+            _ = signal(SIGTERM, previousDisposition)
         }
 
         return try ProcessLauncher.spawn(
@@ -223,9 +243,9 @@ final class ProcessLauncherSignalDispositionTests: XCTestCase {
         input: Pipe,
         output: Pipe
     ) {
-        let previousDisposition = Darwin.signal(SIGTERM, SIG_IGN)
+        let previousDisposition = signal(SIGTERM, SIG_IGN)
         defer {
-            _ = Darwin.signal(SIGTERM, previousDisposition)
+            _ = signal(SIGTERM, previousDisposition)
         }
 
         let process = Process()
@@ -271,8 +291,13 @@ final class ProviderProcessLaunchPolicyTests: XCTestCase {
 
         // Compile the real policy, not a copied classifier, into a non-XCTest tool fixture.
         // This runs inside the coordinated test job and never starts a provider CLI.
+        #if os(Linux)
+            let compilerLauncher = "/usr/bin/env"
+        #else
+            let compilerLauncher = "/usr/bin/xcrun"
+        #endif
         let compiled = try runProbe(
-            executable: URL(fileURLWithPath: "/usr/bin/xcrun"),
+            executable: URL(fileURLWithPath: compilerLauncher),
             arguments: [
                 "swiftc", "-package-name", "RepoPrompt", policy.path, source.path,
                 "-o", executable.path
@@ -324,7 +349,7 @@ final class ProviderProcessLaunchPolicyTests: XCTestCase {
         try process.run()
         if completion.wait(timeout: .now() + 30) == .timedOut {
             if process.isRunning {
-                _ = Darwin.kill(process.processIdentifier, SIGKILL)
+                _ = kill(process.processIdentifier, SIGKILL)
             }
             _ = completion.wait(timeout: .now() + 5)
             throw NSError(

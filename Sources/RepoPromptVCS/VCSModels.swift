@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptFileSystem
 
 // MARK: - VCS Backend Kind
 

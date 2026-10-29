@@ -178,7 +178,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptProcess",
-            dependencies: ["RepoPromptFoundation", "RepoPromptShared"],
+            dependencies: ["RepoPromptFoundation", "RepoPromptShared", "RepoPromptC"],
             path: "Sources/RepoPromptProcess",
             swiftSettings: [
                 .define("DEBUG", .when(configuration: .debug))
@@ -204,7 +204,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptVCS",
-            dependencies: ["RepoPromptFoundation", "RepoPromptProcess", "RepoPromptInstrumentation", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptWorkspaceCore"],
+            dependencies: ["RepoPromptFoundation", "RepoPromptProcess", "RepoPromptInstrumentation", "RepoPromptDomainRuntime", "RepoPromptWorkspaceCore", "RepoPromptShared", "RepoPromptC"],
             path: "Sources/RepoPromptVCS",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
@@ -302,6 +302,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptShared",
+            dependencies: ["RepoPromptC"],
             path: "Sources/RepoPromptShared",
             swiftSettings: swift6LanguageMode + [
                 .define("DEBUG", .when(configuration: .debug))
@@ -317,6 +318,8 @@ let package = Package(
             name: "RepoPromptDomainRuntimeTests",
             dependencies: [
                 "RepoPromptDomainRuntime",
+                "RepoPromptC",
+                "RepoPromptShared",
                 .product(name: "MCP", package: "swift-sdk")
             ],
             path: "Tests/RepoPromptDomainRuntimeTests",
@@ -349,7 +352,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RepoPromptProcessTests",
-            dependencies: ["RepoPromptProcess"],
+            dependencies: ["RepoPromptProcess", "RepoPromptShared"],
             path: "Tests/RepoPromptProcessTests",
             swiftSettings: [
                 .define("DEBUG", .when(configuration: .debug))
@@ -401,3 +404,46 @@ let package = Package(
     ],
     swiftLanguageModes: [.v5]
 )
+
+#if os(Linux)
+    let macOSOnlyTargets: Set<String> = [
+        "RepoPrompt", "RepoPromptApp", "RepoPromptTests", "Sparkle",
+        "RepoPromptFileSystem", "RepoPromptFileSystemTests",
+        "RepoPromptPersistence", "RepoPromptPersistenceTests",
+        "RepoPromptSettingsCore", "RepoPromptSettingsCoreTests",
+        "RepoPromptSecureStorage", "RepoPromptSecureStorageTests"
+    ]
+    let macOSOnlyPackages: Set<String> = [
+        "keyboardshortcuts", "swift-markdown-ui", "swift-markdown", "swiftanthropic",
+        "swiftopenai", "universalcharsetdetection", "jsonschema", "ontology",
+        "sentry-cocoa", "repopromptagentproviders"
+    ]
+    package.products.removeAll { $0.name == "RepoPrompt" }
+    package.targets.removeAll { macOSOnlyTargets.contains($0.name) }
+    package.dependencies.removeAll { dependency in
+        let location: String
+        switch dependency.kind {
+        case let .sourceControl(_, url, _): location = url
+        case let .fileSystem(_, path): location = path
+        default: return false
+        }
+        let identity = URL(fileURLWithPath: location).lastPathComponent
+            .replacingOccurrences(of: ".git", with: "").lowercased()
+        return macOSOnlyPackages.contains(identity)
+    }
+
+    package.dependencies.append(.package(url: "https://github.com/apple/swift-crypto.git", exact: "4.5.0"))
+    let cryptoTargets: Set<String> = [
+        "RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptCodeMapCore",
+        "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptVCS",
+        "RepoPromptCodeMapCoreTests", "RepoPromptDomainRuntimeTests", "RepoPromptMCPCoreTests"
+    ]
+    for target in package.targets {
+        if cryptoTargets.contains(target.name) {
+            target.dependencies.append(.product(name: "Crypto", package: "swift-crypto"))
+        }
+        if target.name == "RepoPromptC" {
+            target.cSettings = (target.cSettings ?? []) + [.define("_GNU_SOURCE")]
+        }
+    }
+#endif

@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptC
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import RepoPromptShared
 
@@ -197,7 +202,11 @@ package enum ProcessLauncher {
 
         _ = FDWriteSupport.configureNoSigPipe(fd: stdinPipe[1])
 
-        var fileActions: posix_spawn_file_actions_t? = nil
+        #if canImport(Darwin)
+            var fileActions: posix_spawn_file_actions_t? = nil
+        #else
+            var fileActions = posix_spawn_file_actions_t()
+        #endif
         let fileActionsInitResult: Int32 = if case let .fileActions(errno)? = initializationFailure {
             errno
         } else {
@@ -228,11 +237,7 @@ package enum ProcessLauncher {
 
         if let workingDirectory {
             let result = workingDirectory.withCString { pointer -> Int32 in
-                #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-                    return posix_spawn_file_actions_addchdir_np(&fileActions, pointer)
-                #else
-                    return 0
-                #endif
+                repo_spawn_addchdir(&fileActions, pointer)
             }
             if result != 0 {
                 closePipe(&stdinPipe)
@@ -242,7 +247,15 @@ package enum ProcessLauncher {
             }
         }
 
-        var attributes: posix_spawnattr_t? = nil
+        #if os(Linux)
+            try checkFileAction("close-extra-descriptors", result: repo_spawn_close_extra_descriptors(&fileActions))
+        #endif
+
+        #if canImport(Darwin)
+            var attributes: posix_spawnattr_t? = nil
+        #else
+            var attributes = posix_spawnattr_t()
+        #endif
         let attributesInitResult: Int32 = if case let .attributes(errno)? = initializationFailure {
             errno
         } else {

@@ -1,6 +1,10 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
-import os
+import RepoPromptC
 
 package enum OracleGroupClaimError: Error, LocalizedError, Equatable {
     case ownerMismatch
@@ -30,7 +34,7 @@ package final class OracleGroupClaim: @unchecked Sendable {
     package let invocationID: UUID
     package let runID: UUID
     package let runtimeID: UUID
-    private let state: OSAllocatedUnfairLock<State>
+    private let state: DomainLockedState<State>
 
     fileprivate init(
         id: UUID,
@@ -47,7 +51,7 @@ package final class OracleGroupClaim: @unchecked Sendable {
         self.invocationID = invocationID
         self.runID = runID
         self.runtimeID = runtimeID
-        state = OSAllocatedUnfairLock(initialState: State(descriptor: descriptor))
+        state = DomainLockedState(initialState: State(descriptor: descriptor))
     }
 
     package var isReleased: Bool {
@@ -60,7 +64,7 @@ package final class OracleGroupClaim: @unchecked Sendable {
             return state.descriptor
         }
         guard let descriptor else { return }
-        flock(descriptor, LOCK_UN)
+        repo_flock(descriptor, LOCK_UN)
         close(descriptor)
     }
 
@@ -120,7 +124,7 @@ package struct OracleGroupClaimManager {
             let url = directory.appendingPathComponent("\(group.group.id.rawValue.uuidString).lock")
             let descriptor = open(url.path, O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR)
             guard descriptor >= 0 else { throw OracleGroupClaimError.unavailable(errno) }
-            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+            guard repo_flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
                 let errorNumber = errno
                 close(descriptor)
                 if errorNumber == EWOULDBLOCK || errorNumber == EAGAIN {
@@ -142,7 +146,7 @@ package struct OracleGroupClaimManager {
                     guard let base = buffer.baseAddress else { return }
                     var written = 0
                     while written < buffer.count {
-                        let count = Darwin.write(
+                        let count = write(
                             descriptor,
                             base.advanced(by: written),
                             buffer.count - written
@@ -164,7 +168,7 @@ package struct OracleGroupClaimManager {
                     descriptor: descriptor
                 )
             } catch {
-                flock(descriptor, LOCK_UN)
+                repo_flock(descriptor, LOCK_UN)
                 close(descriptor)
                 throw error
             }

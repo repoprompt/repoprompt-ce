@@ -1,6 +1,10 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
-import os
+import RepoPromptC
 
 struct DomainPendingSave: Codable {
     let operationID: UUID
@@ -125,7 +129,7 @@ enum DomainExternalDocumentProbe {
     case cancelled
 }
 
-enum DomainSavedConsolidationMarkerStatus: Sendable {
+enum DomainSavedConsolidationMarkerStatus {
     case unmarked
     case marked
     case unreadable
@@ -193,7 +197,7 @@ enum DomainPersistenceError: Error, Equatable {
     case cancelled
 }
 
-package struct DomainPersistenceDataSnapshot: Sendable {
+package struct DomainPersistenceDataSnapshot {
     package let data: Data?
     package let digest: String?
 
@@ -204,7 +208,7 @@ package struct DomainPersistenceDataSnapshot: Sendable {
 }
 
 package final class DomainBlockingCancellation: Sendable {
-    private let state = OSAllocatedUnfairLock(initialState: false)
+    private let state = DomainLockedState(initialState: false)
 
     func cancel() {
         state.withLock { $0 = true }
@@ -395,51 +399,88 @@ package struct DomainPersistenceCoordinator {
         runtimeRoot.appendingPathComponent("oracle", isDirectory: true)
     }
 
-    private var journalDirectory: URL { runtimeRoot.appendingPathComponent("working-journals", isDirectory: true) }
-    private var revisionDirectory: URL { runtimeRoot.appendingPathComponent("revisions", isDirectory: true) }
-    private var deletionDirectory: URL { runtimeRoot.appendingPathComponent("deletion-tombstones", isDirectory: true) }
-    private var lockDirectory: URL { runtimeRoot.appendingPathComponent("locks", isDirectory: true) }
-    private var settingsDirectory: URL { runtimeRoot.appendingPathComponent("settings", isDirectory: true) }
-    private var rollbackRoot: URL { runtimeRoot.appendingPathComponent("rollback", isDirectory: true) }
-    private var policyURL: URL { settingsDirectory.appendingPathComponent("runtime-policy.json") }
+    private var journalDirectory: URL {
+        runtimeRoot.appendingPathComponent("working-journals", isDirectory: true)
+    }
+
+    private var revisionDirectory: URL {
+        runtimeRoot.appendingPathComponent("revisions", isDirectory: true)
+    }
+
+    private var deletionDirectory: URL {
+        runtimeRoot.appendingPathComponent("deletion-tombstones", isDirectory: true)
+    }
+
+    private var lockDirectory: URL {
+        runtimeRoot.appendingPathComponent("locks", isDirectory: true)
+    }
+
+    private var settingsDirectory: URL {
+        runtimeRoot.appendingPathComponent("settings", isDirectory: true)
+    }
+
+    private var rollbackRoot: URL {
+        runtimeRoot.appendingPathComponent("rollback", isDirectory: true)
+    }
+
+    private var policyURL: URL {
+        settingsDirectory.appendingPathComponent("runtime-policy.json")
+    }
+
     private var protectedMutationPolicyURL: URL {
         settingsDirectory.appendingPathComponent("protected-mutations.json")
     }
+
     private var protectedMutationPolicyLockURL: URL {
         lockDirectory.appendingPathComponent("protected-mutations.lock")
     }
+
     private var protectedMutationJournalURL: URL {
         settingsDirectory.appendingPathComponent("protected-mutation-journal.json")
     }
+
     private var protectedMutationJournalLockURL: URL {
         lockDirectory.appendingPathComponent("protected-mutation-journal.lock")
     }
+
     private var agentSessionMetadataURL: URL {
         settingsDirectory.appendingPathComponent("agent-sessions.json")
     }
+
     private var agentSessionMetadataLockURL: URL {
         lockDirectory.appendingPathComponent("agent-sessions.lock")
     }
+
     private var directSettingsURL: URL {
         settingsDirectory.appendingPathComponent("direct-settings.json")
     }
+
     private var directSettingsLockURL: URL {
         lockDirectory.appendingPathComponent("direct-settings.lock")
     }
+
     private var agentWorktreeBindingsURL: URL {
         settingsDirectory.appendingPathComponent("agent-worktree-bindings.json")
     }
+
     private var agentWorktreeBindingsLockURL: URL {
         lockDirectory.appendingPathComponent("agent-worktree-bindings.lock")
     }
+
     private var legacyAgentSessionMetadataURL: URL {
         configuration.storageDirectory
             .appendingPathComponent("DomainRuntime", isDirectory: true)
             .appendingPathComponent("v1", isDirectory: true)
             .appendingPathComponent("agent-sessions.json")
     }
-    private var catalogURL: URL { runtimeRoot.appendingPathComponent("workspace-catalog.json") }
-    private var indexURL: URL { workspaceRoot.appendingPathComponent("workspacesIndex.json") }
+
+    private var catalogURL: URL {
+        runtimeRoot.appendingPathComponent("workspace-catalog.json")
+    }
+
+    private var indexURL: URL {
+        workspaceRoot.appendingPathComponent("workspacesIndex.json")
+    }
 
     private func journalURL(_ workspaceID: UUID) -> URL {
         journalDirectory.appendingPathComponent("\(workspaceID.uuidString).json")
@@ -2192,7 +2233,7 @@ package enum DomainPersistenceLock {
         }
         defer { close(descriptor) }
         let deadline = DispatchTime.now().uptimeNanoseconds &+ waitTimeoutNanoseconds
-        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+        while repo_flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
             guard errno == EWOULDBLOCK || errno == EAGAIN else {
                 throw DomainPersistenceError.writeFailed("lock_acquire_failed_\(errno)")
             }
@@ -2202,7 +2243,7 @@ package enum DomainPersistenceLock {
             }
             usleep(retryDelayMicroseconds)
         }
-        defer { flock(descriptor, LOCK_UN) }
+        defer { repo_flock(descriptor, LOCK_UN) }
         try cancellation?.check()
         return try body()
     }
@@ -2221,7 +2262,7 @@ package enum DomainPersistenceLock {
                 guard let baseAddress = rawBuffer.baseAddress else { return }
                 var written = 0
                 while written < rawBuffer.count {
-                    let count = Darwin.write(
+                    let count = write(
                         descriptor,
                         baseAddress.advanced(by: written),
                         rawBuffer.count - written

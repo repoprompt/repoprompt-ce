@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import MCP
 import RepoPromptDomainRuntime
@@ -399,10 +403,10 @@ final class DirectHeadlessCompositionTests: XCTestCase {
 
     func testChildBridgeWriteTimeoutIsBoundedWhenDestinationStalls() throws {
         var descriptors = [Int32](repeating: -1, count: 2)
-        XCTAssertEqual(Darwin.pipe(&descriptors), 0)
+        XCTAssertEqual(pipe(&descriptors), 0)
         defer {
-            if descriptors[0] >= 0 { Darwin.close(descriptors[0]) }
-            if descriptors[1] >= 0 { Darwin.close(descriptors[1]) }
+            if descriptors[0] >= 0 { POSIXSystem.close(descriptors[0]) }
+            if descriptors[1] >= 0 { POSIXSystem.close(descriptors[1]) }
         }
 
         let payload = Data(repeating: 0x41, count: 1_000_000)

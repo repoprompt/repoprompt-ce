@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 package struct DomainMutationPathIdentity: Codable, Hashable {
@@ -93,14 +97,13 @@ package struct DomainMutationPhysicalCommitGuard {
         do {
             let destinationFD = try Self.openDirectory(for: destination)
             do {
-                let directories = try DomainMutationWorktreeDirectories(
+                return try DomainMutationWorktreeDirectories(
                     sourceFD: sourceFD,
                     destinationFD: destinationFD,
                     source: source.existingAnchor,
                     destinationDevice: destinationDevice,
                     destinationInode: destinationInode
                 )
-                return directories
             } catch {
                 close(destinationFD)
                 throw error

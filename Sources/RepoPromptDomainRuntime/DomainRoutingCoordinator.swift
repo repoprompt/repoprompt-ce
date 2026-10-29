@@ -1,5 +1,5 @@
 import Foundation
-import Security
+import RepoPromptC
 
 package struct DomainWindowDescriptor: Codable, Equatable {
     package let windowID: Int
@@ -52,7 +52,7 @@ package extension DomainBinding {
     }
 }
 
-package struct DomainConnectionBindingSnapshot: Codable, Equatable, Sendable {
+package struct DomainConnectionBindingSnapshot: Codable, Equatable {
     package let registration: DomainConnectionRegistration
     package let binding: DomainBinding
 }
@@ -137,7 +137,7 @@ package struct DomainRunLaunchReservationRequest {
     }
 }
 
-package struct DomainRunLaunchRedemption: Equatable, Sendable {
+package struct DomainRunLaunchRedemption: Equatable {
     package let binding: DomainConnectionBindingSnapshot
     package let launchID: UUID
     package let oracleGroupID: OracleGroupID?
@@ -165,7 +165,7 @@ package struct DomainRunLaunchRedemption: Equatable, Sendable {
     }
 }
 
-package enum DomainRunLaunchRedemptionResult: Equatable, Sendable {
+package enum DomainRunLaunchRedemptionResult: Equatable {
     case accepted(DomainRunLaunchRedemption)
     case unknown
     case expired
@@ -525,7 +525,7 @@ package actor DomainRoutingCoordinator {
         let oracleIdentityCount = [
             request.oracleGroupID != nil,
             request.oracleLaneID != nil,
-            request.oracleGroupClaimID != nil,
+            request.oracleGroupClaimID != nil
         ].count(where: { $0 })
         guard oracleIdentityCount == 0 || oracleIdentityCount == 3 else {
             throw DomainRunLaunchTokenError.incompleteOracleIdentity
@@ -548,7 +548,7 @@ package actor DomainRoutingCoordinator {
             throw DomainRunLaunchTokenError.runContextConflict
         }
         var bytes = [UInt8](repeating: 0, count: 32)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+        guard repo_random_bytes(&bytes, bytes.count) == 0 else {
             throw DomainRunLaunchTokenError.randomGenerationFailed
         }
         let material = Data(bytes).base64EncodedString()

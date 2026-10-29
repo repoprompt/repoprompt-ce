@@ -1,5 +1,10 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
+import RepoPromptC
 import RepoPromptWorkspaceCore
 
 package struct OracleAttachmentRequest: Equatable {
@@ -21,8 +26,26 @@ package struct OracleAttachmentRequest: Equatable {
 package struct OracleImageRootIdentity: Equatable {
     package let device: dev_t
     package let inode: ino_t
-    package let generation: UInt32
+    package let generation: UInt32?
     package let mode: mode_t
+    private let changeSeconds: Int?
+    private let changeNanoseconds: Int?
+
+    fileprivate init(_ info: stat) {
+        device = info.st_dev
+        inode = info.st_ino
+        mode = info.st_mode
+        #if os(Linux)
+            generation = nil
+            // Linux stat has no inode generation; ctime detects reuse before descriptor admission.
+            changeSeconds = info.st_ctim.tv_sec
+            changeNanoseconds = info.st_ctim.tv_nsec
+        #else
+            generation = info.st_gen
+            changeSeconds = nil
+            changeNanoseconds = nil
+        #endif
+    }
 }
 
 package struct OracleImagePhysicalRootCapture: Equatable {
@@ -36,7 +59,7 @@ package struct OracleImagePhysicalRootCapture: Equatable {
         beforeAcquiringResolvedRoot: (() throws -> Void)? = nil
     ) throws -> OracleImagePhysicalRootCapture {
         let physicalRootPath = StandardizedPath.absolute(physicalRootPath)
-        guard let resolvedPath = physicalRootPath.withCString({ Darwin.realpath($0, nil) }) else {
+        guard let resolvedPath = physicalRootPath.withCString({ realpath($0, nil) }) else {
             throw OracleAttachmentLoadError.missingOrUnreadable(index: index)
         }
         defer { free(resolvedPath) }
@@ -45,7 +68,7 @@ package struct OracleImagePhysicalRootCapture: Equatable {
         let resolvedPhysicalRootPath = String(cString: resolvedPath)
         try beforeAcquiringResolvedRoot?()
         let descriptor = try openResolvedDirectoryWithoutSymlinks(resolvedPhysicalRootPath, index: index)
-        defer { Darwin.close(descriptor) }
+        defer { close(descriptor) }
         var info = stat()
         guard fstat(descriptor, &info) == 0 else {
             throw OracleAttachmentLoadError.missingOrUnreadable(index: index)
@@ -53,25 +76,20 @@ package struct OracleImagePhysicalRootCapture: Equatable {
         return OracleImagePhysicalRootCapture(
             physicalRootPath: physicalRootPath,
             resolvedPhysicalRootPath: resolvedPhysicalRootPath,
-            rootIdentity: OracleImageRootIdentity(
-                device: info.st_dev,
-                inode: info.st_ino,
-                generation: info.st_gen,
-                mode: info.st_mode
-            )
+            rootIdentity: OracleImageRootIdentity(info)
         )
     }
 
     /// Acquire every resolved component without following a substitution made after resolution.
     package static func openResolvedDirectoryWithoutSymlinks(_ path: String, index: Int) throws -> Int32 {
-        var descriptor = Darwin.open("/", O_SEARCH | O_CLOEXEC)
+        var descriptor = open("/", repo_directory_search_flags() | O_CLOEXEC)
         guard descriptor >= 0 else { throw OracleAttachmentLoadError.missingOrUnreadable(index: index) }
         do {
             let components = path.split(separator: "/")
             for (offset, component) in components.enumerated() {
-                let access = offset == components.count - 1 ? O_RDONLY | O_DIRECTORY : O_SEARCH
+                let access = offset == components.count - 1 ? O_RDONLY | O_DIRECTORY : repo_directory_search_flags()
                 let next = String(component).withCString {
-                    Darwin.openat(descriptor, $0, access | O_NOFOLLOW | O_CLOEXEC)
+                    openat(descriptor, $0, access | O_NOFOLLOW | O_CLOEXEC)
                 }
                 guard next >= 0 else {
                     if errno == ELOOP || errno == ENOTDIR {
@@ -79,12 +97,12 @@ package struct OracleImagePhysicalRootCapture: Equatable {
                     }
                     throw OracleAttachmentLoadError.missingOrUnreadable(index: index)
                 }
-                Darwin.close(descriptor)
+                close(descriptor)
                 descriptor = next
             }
             return descriptor
         } catch {
-            Darwin.close(descriptor)
+            close(descriptor)
             throw error
         }
     }
@@ -322,8 +340,8 @@ package struct OracleAttachmentLoader {
         var opened: [OpenedImage] = []
         defer {
             for item in opened {
-                Darwin.close(item.fileDescriptor)
-                Darwin.close(item.rootDescriptor)
+                close(item.fileDescriptor)
+                close(item.rootDescriptor)
             }
         }
 
@@ -377,11 +395,11 @@ package struct OracleAttachmentLoader {
                         byteCount: byteCount
                     ))
                 } catch {
-                    Darwin.close(fileDescriptor)
+                    close(fileDescriptor)
                     throw error
                 }
             } catch {
-                Darwin.close(rootDescriptor)
+                close(rootDescriptor)
                 throw error
             }
         }
@@ -406,7 +424,7 @@ package struct OracleAttachmentLoader {
                 relativePath: item.resolution.relativePath,
                 index: item.request.index
             )
-            defer { Darwin.close(reopened) }
+            defer { close(reopened) }
             let reopenedIdentity = try fileIdentity(reopened, index: item.request.index)
             guard reopenedIdentity == item.identity else {
                 throw OracleAttachmentLoadError.changedWhileReading(index: item.request.index)
@@ -472,7 +490,7 @@ package struct OracleAttachmentLoader {
     private struct FileIdentity: Equatable {
         let device: dev_t
         let inode: ino_t
-        let generation: UInt32
+        let generation: UInt32?
         let mode: mode_t
         let size: off_t
         let modifiedSeconds: Int
@@ -607,7 +625,7 @@ package struct OracleAttachmentLoader {
         do {
             for component in components.dropLast() {
                 let next = component.withCString {
-                    Darwin.openat(
+                    openat(
                         directoryDescriptor,
                         $0,
                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
@@ -619,11 +637,11 @@ package struct OracleAttachmentLoader {
                     }
                     throw OracleAttachmentLoadError.missingOrUnreadable(index: index)
                 }
-                Darwin.close(directoryDescriptor)
+                close(directoryDescriptor)
                 directoryDescriptor = next
             }
             let descriptor = filename.withCString {
-                Darwin.openat(
+                openat(
                     directoryDescriptor,
                     $0,
                     O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
@@ -635,10 +653,10 @@ package struct OracleAttachmentLoader {
                 }
                 throw OracleAttachmentLoadError.missingOrUnreadable(index: index)
             }
-            Darwin.close(directoryDescriptor)
+            close(directoryDescriptor)
             return descriptor
         } catch {
-            Darwin.close(directoryDescriptor)
+            close(directoryDescriptor)
             throw error
         }
     }
@@ -648,12 +666,7 @@ package struct OracleAttachmentLoader {
         guard fstat(descriptor, &info) == 0 else {
             throw OracleAttachmentLoadError.changedWhileReading(index: index)
         }
-        return OracleImageRootIdentity(
-            device: info.st_dev,
-            inode: info.st_ino,
-            generation: info.st_gen,
-            mode: info.st_mode
-        )
+        return OracleImageRootIdentity(info)
     }
 
     private func fileIdentity(_ descriptor: Int32, index: Int) throws -> FileIdentity {
@@ -661,16 +674,25 @@ package struct OracleAttachmentLoader {
         guard fstat(descriptor, &info) == 0 else {
             throw OracleAttachmentLoadError.changedWhileReading(index: index)
         }
+        #if os(Linux)
+            let generation: UInt32? = nil
+            let modificationTime = info.st_mtim
+            let changeTime = info.st_ctim
+        #else
+            let generation: UInt32? = info.st_gen
+            let modificationTime = info.st_mtimespec
+            let changeTime = info.st_ctimespec
+        #endif
         return FileIdentity(
             device: info.st_dev,
             inode: info.st_ino,
-            generation: info.st_gen,
+            generation: generation,
             mode: info.st_mode,
             size: info.st_size,
-            modifiedSeconds: info.st_mtimespec.tv_sec,
-            modifiedNanoseconds: info.st_mtimespec.tv_nsec,
-            changedSeconds: info.st_ctimespec.tv_sec,
-            changedNanoseconds: info.st_ctimespec.tv_nsec
+            modifiedSeconds: modificationTime.tv_sec,
+            modifiedNanoseconds: modificationTime.tv_nsec,
+            changedSeconds: changeTime.tv_sec,
+            changedNanoseconds: changeTime.tv_nsec
         )
     }
 
@@ -684,7 +706,7 @@ package struct OracleAttachmentLoader {
             try Task.checkCancellation()
             let count = data.withUnsafeMutableBytes { buffer -> Int in
                 guard let base = buffer.baseAddress else { return 0 }
-                return Darwin.read(
+                return read(
                     descriptor,
                     base.advanced(by: offset),
                     min(64 * 1024, byteCount - offset)

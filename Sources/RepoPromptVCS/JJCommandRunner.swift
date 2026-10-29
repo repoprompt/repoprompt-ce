@@ -1,4 +1,8 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import RepoPromptProcess
 
@@ -246,9 +250,11 @@ public actor JJCommandRunner {
             let p = Pipe()
             process.standardInput = p
             inPipe = p
-            // Suppress SIGPIPE
-            let fd = p.fileHandleForWriting.fileDescriptor
-            _ = fcntl(fd, F_SETNOSIGPIPE, 1)
+            // Linux FDWriteSupport masks SIGPIPE around each write.
+            #if canImport(Darwin)
+                let fd = p.fileHandleForWriting.fileDescriptor
+                _ = fcntl(fd, F_SETNOSIGPIPE, 1)
+            #endif
         } else {
             // Set stdin to null device to prevent blocked subprocess
             process.standardInput = FileHandle.nullDevice

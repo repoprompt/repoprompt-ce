@@ -1,5 +1,11 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
+import CoreFoundation
 import Foundation
+import RepoPromptC
 
 public enum JSONRPCBridgeDirection: String, Codable, Sendable {
     case clientToServer = "client_to_server"

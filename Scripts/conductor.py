@@ -304,7 +304,7 @@ Operation commands:
   ./conductor format-tools-status    # inspect SwiftFormat/SwiftLint availability
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
-  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all [--configuration debug|release] [--jobs N] [--static-swift-stdlib]
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp --scratch <label> [--swiftc-flag=<flag>]... [--linker-flag=<flag>]...
     measurement build in .build/measure/<label>; never touches the shared .build or the build cache
   ./conductor build
@@ -849,6 +849,10 @@ def compute_paths(repo_root: Path) -> Paths:
 
     if state_override:
         state_dir = Path(state_override).expanduser().resolve()
+    elif sys.platform.startswith("linux"):
+        xdg_state = os.environ.get("XDG_STATE_HOME", "")
+        state_base = Path(xdg_state) if xdg_state and Path(xdg_state).is_absolute() else Path.home() / ".local" / "state"
+        state_dir = state_base / "repoprompt-ce" / "conductor" / repo_hash
     else:
         state_dir = (
             Path.home()
@@ -1114,7 +1118,7 @@ class BuildCacheManager:
 
     @staticmethod
     def configuration_for(operation: str, args: Dict[str, Any]) -> str:
-        if operation == "package":
+        if operation in {"package", "swift-build"}:
             return str(args.get("config") or "debug")
         return "debug"
 
@@ -3574,6 +3578,13 @@ class OperationRegistry:
         "ONLY_ACTIVE_ARCH",
         "OTHER_SWIFT_FLAGS",
         "SWIFTFLAGS",
+        "LD_LIBRARY_PATH",
+        "SWIFTPM_MODULECACHE_OVERRIDE",
+        "CLANG_MODULE_CACHE_PATH",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
         "TMPDIR",
         "HOME",
         "USER",
@@ -3701,11 +3712,19 @@ class OperationRegistry:
             product = args.get("product")
             lanes = ["build"]
             measurement = measurement_build_args(self.repo_root, args)
+            build_options = []
+            if args.get("config"):
+                build_options.extend(["--configuration", str(args["config"])])
+            if args.get("jobs"):
+                build_options.extend(["--jobs", str(args["jobs"])])
+            if args.get("staticSwiftStdlib"):
+                build_options.append("--static-swift-stdlib")
             if product == "all":
                 if measurement:
                     raise ConductorError("measurement builds need a single --product")
-                return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product), *measurement], lanes, cwd, env, effective_timeout
+                options = {"buildOptions": build_options} if build_options else {}
+                return self._internal_argv("swift_build_all", options), lanes, cwd, env, effective_timeout
+            return ["swift", "build", "--product", str(product), *build_options, *measurement], lanes, cwd, env, effective_timeout
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
@@ -3718,6 +3737,15 @@ class OperationRegistry:
             return [sys.executable, script("ci_app_test_runner.py"), "--skip-build",
                     "--shard-count", str(args["shardCount"]), "--shard-index", str(args["shardIndex"])], ["build"], cwd, env, effective_timeout
         if operation == "test":
+            if sys.platform.startswith("linux"):
+                if args.get("module") or args.get("xctestStallSeconds") is not None:
+                    raise ConductorError("Linux tests use --filter; --module and XCTest stall probes require macOS")
+                argv = ["swift", "test", "--jobs", "4", *measurement_build_args(self.repo_root, args)]
+                if args.get("testProduct"):
+                    argv.extend(["--test-product", str(args["testProduct"])])
+                if args.get("filter"):
+                    argv.extend(["--filter", str(args["filter"])])
+                return argv, ["build"], cwd, env, effective_timeout
             argv = [sys.executable, script("ci_app_test_runner.py"), "--local"]
             measurement = measurement_build_args(self.repo_root, args)
             if measurement and args.get("module"):
@@ -4727,7 +4755,7 @@ class DaemonState:
             env.pop(CONDUCTOR_JOB_TICKET_ENV, None)
             if argv_is_operation_runner(argv):
                 env[CONDUCTOR_JOB_TICKET_ENV] = job.ticket
-            if BuildCacheManager.eligible(job.operation, job.args) and (self.paths.repo_root / "Package.swift").is_file():
+            if BuildCacheManager.eligible(job.operation, job.args) and env.get("REPOPROMPT_DEV_BUILD_CACHE_DISABLE") != "1" and (self.paths.repo_root / "Package.swift").is_file():
                 with self.condition:
                     job.mark_phase("buildCachePrepareStarted")
                 with self._cache_write_lock:
@@ -8122,9 +8150,10 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
         return _operation_app_stop_unlocked(repo_root, args)
 
 
-def operation_swift_build_all(repo_root: Path) -> int:
-    for product in ["RepoPrompt", "repoprompt-mcp"]:
-        code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
+def operation_swift_build_all(repo_root: Path, build_options: Optional[List[str]] = None) -> int:
+    products = ["repoprompt-mcp"] if sys.platform.startswith("linux") else ["RepoPrompt", "repoprompt-mcp"]
+    for product in products:
+        code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product, *(build_options or [])], repo_root)
         if code != 0:
             return code
     return 0
@@ -8686,7 +8715,7 @@ def run_operation_runner(payload_json: str) -> int:
     args = payload.get("args") or {}
     repo_root = Path(payload.get("repoRoot") or resolve_repo_root()).resolve()
     if kind == "swift_build_all":
-        return operation_swift_build_all(repo_root)
+        return operation_swift_build_all(repo_root, args.get("buildOptions"))
     if kind == "cache_retry":
         return operation_cache_retry(repo_root, args)
     if kind == "app_stop":
@@ -8822,9 +8851,20 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        parser.add_argument("--configuration", choices=["debug", "release"])
+        parser.add_argument("--jobs", type=int)
+        parser.add_argument("--static-swift-stdlib", action="store_true")
         add_measurement_arguments(parser)
         ns = parser.parse_args(rest)
         args["product"] = ns.product
+        if ns.configuration:
+            args["config"] = ns.configuration
+        if ns.jobs is not None:
+            if ns.jobs < 1:
+                raise ConductorError("--jobs must be greater than zero")
+            args["jobs"] = ns.jobs
+        if ns.static_swift_stdlib:
+            args["staticSwiftStdlib"] = True
         apply_measurement_arguments(ns, args)
         if args.get("scratch") and ns.product == "all":
             raise ConductorError("measurement builds need a single --product")

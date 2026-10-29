@@ -47,6 +47,56 @@ def fixture(root: Path) -> tuple[dict, dict]:
 
 
 class CatalogTests(unittest.TestCase):
+    def test_platform_catalog_requires_exact_native_target_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            mac_package, catalog = fixture(root)
+            for name in ('RepoPromptApp', 'RepoPromptTests'):
+                catalog['modules'][name]['platforms'] = ['macos']
+            linux_package = {'targets': [row for row in mac_package['targets']
+                                         if row['name'] not in {'RepoPromptApp', 'RepoPromptTests'}]}
+            with mock.patch.object(modules, 'added_swift_paths', return_value=set()):
+                self.assertEqual(modules.check(root, mac_package, catalog, platform='macos'), [])
+                self.assertEqual(modules.check(root, linux_package, catalog, platform='linux'), [])
+                for package, platform in ((mac_package, 'linux'), (linux_package, 'macos')):
+                    with self.subTest(platform=platform):
+                        self.assertTrue(any('catalog target drift' in error
+                                            for error in modules.check(root, package, catalog, platform=platform)))
+                linux_package['targets'] = [row for row in linux_package['targets'] if row['name'] != 'CoreTests']
+                self.assertTrue(any('catalog target drift' in error
+                                    for error in modules.check(root, linux_package, catalog, platform='linux')))
+
+    def test_linux_keeps_edge_import_and_repository_placement_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package, catalog = fixture(root)
+            for name in ('RepoPromptApp', 'RepoPromptTests'):
+                catalog['modules'][name]['platforms'] = ['macos']
+            package['targets'] = [row for row in package['targets']
+                                  if row['name'] not in {'RepoPromptApp', 'RepoPromptTests'}]
+            (root / 'Sources/Core/Core.swift').write_text('import RepoPromptApp\n')
+            next(row for row in package['targets'] if row['name'] == 'Core')['dependencies'].append(
+                {'byName': ['CoreTests', None]})
+            catalog['moved_families']['MacOwner'] = {
+                'owner': 'RepoPromptApp', 'former_app_roots': ['Sources/OldMacOwner'],
+            }
+            with mock.patch.object(modules, 'added_swift_paths', return_value={'Sources/OldMacOwner/New.swift'}):
+                errors = modules.check(root, package, catalog, platform='linux')
+            self.assertTrue(any('Core: direct edges' in error for error in errors), errors)
+            self.assertTrue(any('undeclared first-party import RepoPromptApp' in error for error in errors), errors)
+            self.assertTrue(any('new Swift source belongs in RepoPromptApp' in error for error in errors), errors)
+            self.assertFalse(any('unknown owner' in error for error in errors), errors)
+
+    def test_invalid_platform_catalog_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package, catalog = fixture(root)
+            for platforms in ([], 'linux', ['linuz'], [{}]):
+                with self.subTest(platforms=platforms):
+                    catalog['modules']['Core']['platforms'] = platforms
+                    self.assertTrue(any('invalid catalog platforms' in error
+                                        for error in modules.check(root, package, catalog, platform='linux')))
+
     def test_allowed_edges_imports_and_new_file_placement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

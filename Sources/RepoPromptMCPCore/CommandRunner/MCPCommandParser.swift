@@ -6,6 +6,7 @@
 //  Handles parsing of shell-like commands into structured operations.
 //
 
+import CoreFoundation
 import Foundation
 import MCP
 

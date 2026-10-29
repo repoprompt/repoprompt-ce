@@ -1,7 +1,9 @@
-import CoreGraphics
 import Foundation
-import ImageIO
-import UniformTypeIdentifiers
+#if canImport(ImageIO)
+    import CoreGraphics
+    import ImageIO
+    import UniformTypeIdentifiers
+#endif
 
 enum ConvertibleImageFormat: String, Equatable {
     case heic = "HEIC"
@@ -22,42 +24,46 @@ enum AttachmentImageNormalizer {
         format: ConvertibleImageFormat,
         fileName: String
     ) throws(AttachmentClassificationError) -> AttachmentPayload {
-        let failed = AttachmentClassificationError.imageConversionFailed(fileName: fileName, format: format.rawValue)
-        guard let source = CGImageSourceCreateWithData(bytes as CFData, [
-            kCGImageSourceShouldCache: false
-        ] as CFDictionary),
-            let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-            let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-            let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
-            width > 0, height > 0
-        else { throw failed }
-        guard width <= maxSourceDimension, height <= maxSourceDimension,
-              width <= maxSourcePixelCount / height
-        else {
-            throw .imageTooLarge(fileName: fileName, format: format.rawValue)
-        }
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(width, height)
-        ] as CFDictionary) else { throw failed }
+        #if canImport(ImageIO)
+            let failed = AttachmentClassificationError.imageConversionFailed(fileName: fileName, format: format.rawValue)
+            guard let source = CGImageSourceCreateWithData(bytes as CFData, [
+                kCGImageSourceShouldCache: false
+            ] as CFDictionary),
+                let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+                let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+                let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+                width > 0, height > 0
+            else { throw failed }
+            guard width <= maxSourceDimension, height <= maxSourceDimension,
+                  width <= maxSourcePixelCount / height
+            else {
+                throw .imageTooLarge(fileName: fileName, format: format.rawValue)
+            }
+            guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(width, height)
+            ] as CFDictionary) else { throw failed }
 
-        let hasAlpha = switch image.alphaInfo {
-        case .none, .noneSkipFirst, .noneSkipLast: false
-        case .alphaOnly, .first, .last, .premultipliedFirst, .premultipliedLast: true
-        @unknown default: true
-        }
-        let output = NSMutableData()
-        let type = hasAlpha ? UTType.png : UTType.jpeg
-        guard let destination = CGImageDestinationCreateWithData(output, type.identifier as CFString, 1, nil) else {
-            throw failed
-        }
-        let options: CFDictionary? = hasAlpha
-            ? nil
-            : [kCGImageDestinationLossyCompressionQuality: jpegQuality] as CFDictionary
-        CGImageDestinationAddImage(destination, image, options)
-        guard CGImageDestinationFinalize(destination), output.length > 0 else { throw failed }
-        return .image(hasAlpha ? .png : .jpeg, output as Data)
+            let hasAlpha = switch image.alphaInfo {
+            case .none, .noneSkipFirst, .noneSkipLast: false
+            case .alphaOnly, .first, .last, .premultipliedFirst, .premultipliedLast: true
+            @unknown default: true
+            }
+            let output = NSMutableData()
+            let type = hasAlpha ? UTType.png : UTType.jpeg
+            guard let destination = CGImageDestinationCreateWithData(output, type.identifier as CFString, 1, nil) else {
+                throw failed
+            }
+            let options: CFDictionary? = hasAlpha
+                ? nil
+                : [kCGImageDestinationLossyCompressionQuality: jpegQuality] as CFDictionary
+            CGImageDestinationAddImage(destination, image, options)
+            guard CGImageDestinationFinalize(destination), output.length > 0 else { throw failed }
+            return .image(hasAlpha ? .png : .jpeg, output as Data)
+        #else
+            return try LinuxAttachmentImageConverter.normalize(bytes, format: format, fileName: fileName)
+        #endif
     }
 }

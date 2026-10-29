@@ -441,6 +441,7 @@ class TransferredBuildTests(unittest.TestCase):
 
 
 class LocalExecutionTests(unittest.TestCase):
+    @mock.patch("conductor.sys.platform", "darwin")
     def test_conductor_routes_root_tests_through_sandbox_runner(self) -> None:
         import conductor
 
@@ -811,6 +812,7 @@ class ModuleExecutionTests(unittest.TestCase):
         with mock.patch.object(runner.subprocess, "run", side_effect=OSError):
             self.assertIsNone(runner.developer_library_environment({}))
 
+    @mock.patch("conductor.sys.platform", "darwin")
     def test_conductor_forwards_module_and_skips_build_cache(self) -> None:
         import conductor
 
@@ -822,6 +824,7 @@ class ModuleExecutionTests(unittest.TestCase):
         self.assertFalse(conductor.BuildCacheManager.eligible("test", {"module": "RepoPromptMCPCoreTests"}))
         self.assertTrue(conductor.BuildCacheManager.eligible("test", {}))
 
+    @mock.patch("conductor.sys.platform", "darwin")
     def test_conductor_measurement_builds_use_a_separate_scratch_path(self) -> None:
         import conductor
 

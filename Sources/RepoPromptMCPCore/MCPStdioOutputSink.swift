@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
 /// The physical stdout boundary. A blocked write may suspend, but frame ownership stays with the transport.
@@ -27,16 +32,18 @@ struct MCPStdioFileDescriptorOutputSink: MCPStdioOutputSink {
 
     func prepare() throws {
         signal(SIGPIPE, SIG_IGN)
-        var noSigPipe: Int32 = 1
-        guard setsockopt(
-            descriptor,
-            SOL_SOCKET,
-            SO_NOSIGPIPE,
-            &noSigPipe,
-            socklen_t(MemoryLayout<Int32>.size)
-        ) == 0 || errno == ENOTSOCK else {
-            throw MCPStdioServerTransport.TerminalError.stdoutWrite(errno: errno, bytesWritten: 0, totalBytes: 0)
-        }
+        #if canImport(Darwin)
+            var noSigPipe: Int32 = 1
+            guard setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &noSigPipe,
+                socklen_t(MemoryLayout<Int32>.size)
+            ) == 0 || errno == ENOTSOCK else {
+                throw MCPStdioServerTransport.TerminalError.stdoutWrite(errno: errno, bytesWritten: 0, totalBytes: 0)
+            }
+        #endif
         let flags = fcntl(descriptor, F_GETFL)
         guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
             throw MCPStdioServerTransport.TerminalError.stdoutWrite(errno: errno, bytesWritten: 0, totalBytes: 0)
@@ -44,7 +51,7 @@ struct MCPStdioFileDescriptorOutputSink: MCPStdioOutputSink {
     }
 
     func write(_ bytes: UnsafeRawBufferPointer) -> MCPStdioWriteResult {
-        let count = Darwin.write(descriptor, bytes.baseAddress, bytes.count)
+        let count = POSIXSystem.write(descriptor, bytes.baseAddress, bytes.count)
         if count > 0 {
             return .wrote(count)
         }

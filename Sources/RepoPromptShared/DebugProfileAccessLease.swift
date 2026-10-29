@@ -1,5 +1,10 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
+import RepoPromptC
 
 /// A stable sibling lock, outside the directory that snapshot publication swaps.
 /// Readers/writers hold shared admission for their entire store lifetime; bootstrap
@@ -36,7 +41,7 @@ public final class DebugProfileAccessLease: @unchecked Sendable {
                   info.st_uid == getuid(), info.st_nlink == 1,
                   info.st_mode & 0o077 == 0 else { throw Failure.unsafeLock }
             let mode = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB
-            while flock(fd, mode) != 0 {
+            while repo_flock(fd, mode) != 0 {
                 if errno == EINTR { continue }
                 throw errno == EWOULDBLOCK || errno == EAGAIN ? Failure.busy : Failure.unsafeLock
             }
@@ -49,14 +54,14 @@ public final class DebugProfileAccessLease: @unchecked Sendable {
 
     /// Called before app stores open; keep admission without excluding other writers.
     public func allowWriters() throws {
-        while flock(descriptor, LOCK_SH | LOCK_NB) != 0 {
+        while repo_flock(descriptor, LOCK_SH | LOCK_NB) != 0 {
             if errno == EINTR { continue }
             throw Failure.unsafeLock
         }
     }
 
     deinit {
-        flock(descriptor, LOCK_UN)
+        repo_flock(descriptor, LOCK_UN)
         close(descriptor)
     }
 }

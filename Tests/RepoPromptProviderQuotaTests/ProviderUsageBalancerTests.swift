@@ -2,6 +2,8 @@ import Foundation
 @testable import RepoPromptProviderQuota
 import XCTest
 
+// Linux XCTest discovery requires async entry points for actor-isolated tests.
+// swiftformat:disable redundantAsync
 @MainActor
 final class ProviderUsageBalancerTests: XCTestCase {
     private let instant = Date(timeIntervalSince1970: 2_000_000_000)
@@ -24,7 +26,7 @@ final class ProviderUsageBalancerTests: XCTestCase {
         balancer.preferredPeerIndex(selected: selected, options: options, strategy: strategy, now: instant).map { options[$0] } ?? selected
     }
 
-    func testOnlyChangedSnapshotsReportAnEffectiveMutation() throws {
+    func testOnlyChangedSnapshotsReportAnEffectiveMutation() async throws {
         let balancer = ProviderUsageBalancer()
         XCTAssertFalse(balancer.update(nil, provider: "claude"))
         XCTAssertFalse(balancer.clear())
@@ -39,7 +41,7 @@ final class ProviderUsageBalancerTests: XCTestCase {
         XCTAssertTrue(balancer.clear())
     }
 
-    func testNearLimitMovesToPeerDeterministicallyForEveryStrategy() throws {
+    func testNearLimitMovesToPeerDeterministicallyForEveryStrategy() async throws {
         let balancer = ProviderUsageBalancer()
         var activities = 0
         balancer.onRoutingActivity = { activities += 1 }
@@ -56,7 +58,7 @@ final class ProviderUsageBalancerTests: XCTestCase {
         XCTAssertEqual(choose(balancer, claude, [claude, codex]), claude, "Cleared readings are unknown and attract no work")
     }
 
-    func testRouterStartingOnCodexMovesToClaudeWhoseWeeklyAllowanceExpiresFirst() throws {
+    func testRouterStartingOnCodexMovesToClaudeWhoseWeeklyAllowanceExpiresFirst() async throws {
         let balancer = ProviderUsageBalancer()
         let claude = option("claude"), codex = option("codex")
         try balancer.update(weeklySnapshot(32, resetIn: 37 * 3600), provider: claude.provider)
@@ -67,7 +69,7 @@ final class ProviderUsageBalancerTests: XCTestCase {
         XCTAssertEqual(choose(balancer, claude, [claude, codex], strategy: .evenPace), claude)
     }
 
-    func testCriticalUsageOverrideOffersOnlyTheDominantProvidersUsableModels() throws {
+    func testCriticalUsageOverrideOffersOnlyTheDominantProvidersUsableModels() async throws {
         let balancer = ProviderUsageBalancer()
         let codexStrong = option("codex"), claudeStrong = option("claude"), claudeLight = option("claude", peer: "light")
         let options = [codexStrong, claudeStrong, option("codex", fast: true), claudeLight, option("claude", peer: nil)]
@@ -109,7 +111,7 @@ final class ProviderUsageBalancerTests: XCTestCase {
         XCTAssertNil(balancer.usageOverride(options: [claudeStrong, claudeLight], now: instant), "One provider has nothing to override")
     }
 
-    func testUsageOverrideExcludesModelLimitedOptionsAndFailsOpenWhenNoneRemain() throws {
+    func testUsageOverrideExcludesModelLimitedOptionsAndFailsOpenWhenNoneRemain() async throws {
         let balancer = ProviderUsageBalancer()
         let claude = option("claude"), codex = option("codex")
         let base = try weeklySnapshot(32, resetIn: 37 * 3600), id = ProviderQuotaBucketID(rawValue: "model-limit")
@@ -120,7 +122,7 @@ final class ProviderUsageBalancerTests: XCTestCase {
         XCTAssertNil(balancer.usageOverride(options: [codex, claude], now: instant))
     }
 
-    func testUnknownAndStaleDoNotAttractWorkButKnownExhaustionCanUseUnknownPeer() throws {
+    func testUnknownAndStaleDoNotAttractWorkButKnownExhaustionCanUseUnknownPeer() async throws {
         let balancer = ProviderUsageBalancer()
         let claude = option("claude"), codex = option("codex")
         for used in [10.0, 95.0] {
@@ -135,7 +137,7 @@ final class ProviderUsageBalancerTests: XCTestCase {
         XCTAssertEqual(choose(balancer, claude, [claude, codex]), codex)
     }
 
-    func testPeerClassesSingletonsPaidFastAndModelLimitsAreRespected() throws {
+    func testPeerClassesSingletonsPaidFastAndModelLimitsAreRespected() async throws {
         let balancer = ProviderUsageBalancer()
         var activities = 0
         balancer.onRoutingActivity = { activities += 1 }

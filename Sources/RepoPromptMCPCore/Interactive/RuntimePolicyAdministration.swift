@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptShared
@@ -161,8 +165,12 @@ package enum RuntimePolicyAdministration {
     }
 
     private static func makeRuntime() throws -> MCPDomainRuntime {
-        let locations = AppProfileLocations.current
-        let root = locations.applicationSupportRoot
+        let resolved = try DirectHeadlessRuntimeLocationResolver.resolve(
+            environment: ProcessInfo.processInfo.environment,
+            currentDirectory: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        )
+        let locations = AppProfileLocations(identity: .current, profileName: resolved.profileIdentifier)
+        let root = resolved.storageDirectory
         let pathPolicy = locations.identity.buildFlavor == .debug
             ? AppMetadataPathPolicy(locations: locations, roots: [root]) : nil
         try pathPolicy?.acquireProfileAccess()
@@ -170,8 +178,9 @@ package enum RuntimePolicyAdministration {
             mode: .standalone,
             profileIdentifier: locations.profileIdentifier,
             storageDirectory: root,
-            eventDirectory: root.appendingPathComponent("Events", isDirectory: true),
-            temporaryDirectory: MCPFilesystemIdentity.current.temporaryRootURL(),
+            workspaceStorageDirectory: resolved.workspaceStorageDirectory,
+            eventDirectory: resolved.eventDirectory,
+            temporaryDirectory: resolved.temporaryDirectory,
             externalReloadInterval: nil,
             metadataPathPolicy: pathPolicy
         ))
