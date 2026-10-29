@@ -337,6 +337,35 @@
     }
   },
   "moved_families": {
+    "DomainXMLDiffParser": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/Diffing/DiffParser.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/DiffParserFileSource.swift"
+      ]
+    },
+    "DomainToolResultRetention": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": ["Sources/RepoPrompt/Features/AgentMode/Runtime/ToolTracking/AgentToolResultPayloadRetention.swift"]
+    },
+    "DomainMCPServerConfiguration": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/MCP/RepoPromptMCPServerConfiguration.swift"]
+    },
+    "AIProviderError": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderError.swift"]
+    },
+    "ACPProviderContractsAndOpenCode": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Providers/ACP/ACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPSessionUpdateNormalization.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPToolNameResolution.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeACPEventNormalizer.swift"
+      ]
+    },
     "DomainChangeApplication": {
       "owner": "RepoPromptDomainRuntime",
       "former_app_files": [
