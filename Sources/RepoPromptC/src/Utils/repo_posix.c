@@ -9,13 +9,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <sys/file.h>
-#include <unistd.h>
-
-#if defined(__linux__)
 #include <sys/random.h>
-#else
-#include <stdlib.h>
-#endif
+#include <unistd.h>
 
 int repo_flock(int descriptor, int operation) {
     return flock(descriptor, operation);
