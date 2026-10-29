@@ -337,6 +337,15 @@
     }
   },
   "moved_families": {
+    "DomainChangeApplication": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/Diffing/FileChange.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/ChangeManager.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/ChangeApplier.swift",
+        "Sources/RepoPrompt/Infrastructure/Diffing/OptimalLineFinderUtility.swift"
+      ]
+    },
     "AINeutralModelValues": {
       "owner": "RepoPromptAIContracts",
       "former_app_files": [
