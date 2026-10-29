@@ -4,8 +4,20 @@ import RepoPromptAIContracts
 import XCTest
 
 final class AgentCodexModelRegistryCacheTests: XCTestCase {
+    func testInjectedInvalidatorRunsOnlyForChangedLiveModels() {
+        let persistenceKey = "CodexDynamicModelRecords"
+        let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
+        defer { UserDefaults.standard.set(originalPersistence, forKey: persistenceKey) }
+        var invalidationCount = 0
+        let registry = AgentCodexModelRegistry(invalidate: { invalidationCount += 1 })
+        let model = remoteModel(id: "injected-future", displayName: "Future", isDefault: false)
+        XCTAssertTrue(registry.updateLiveModels([model]))
+        XCTAssertFalse(registry.updateLiveModels([model]))
+        XCTAssertEqual(invalidationCount, 1)
+    }
+
     func testSpeedOnlyRefreshInvalidatesPickerAndPersistsCapabilities() {
-        let registry = AgentCodexModelRegistry()
+        let registry = AgentCodexModelRegistry(invalidate: { AgentAdvertisedModelCatalog.shared.invalidate(.codexExec) })
         let persistenceKey = "CodexDynamicModelRecords"
         let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
         defer { UserDefaults.standard.set(originalPersistence, forKey: persistenceKey) }
@@ -37,7 +49,7 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
     }
 
     func testPreferredModelSnapshotsDoNotReuseAnotherCatalogsOptions() {
-        let registry = AgentCodexModelRegistry()
+        let registry = AgentCodexModelRegistry(invalidate: { AgentAdvertisedModelCatalog.shared.invalidate(.codexExec) })
         let first = remoteModel(id: "future-alpha", displayName: "Alpha", isDefault: true)
         let second = remoteModel(id: "future-beta", displayName: "Beta", isDefault: false)
         let changedFirst = remoteModel(id: "future-alpha", displayName: "Alpha Updated", isDefault: false)

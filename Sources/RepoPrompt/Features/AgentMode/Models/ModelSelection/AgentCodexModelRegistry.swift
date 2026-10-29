@@ -2,8 +2,11 @@ import Foundation
 import RepoPromptAIContracts
 
 final class AgentCodexModelRegistry {
-    static let shared = AgentCodexModelRegistry()
+    static let shared = AgentCodexModelRegistry(invalidate: {
+        AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
+    })
 
+    private let invalidate: () -> Void
     private let lock = NSLock()
     private var liveModels: [CodexAppServerClient.RemoteModel] = []
     private var liveModelSignature: [CodexDynamicModelRecord] = []
@@ -21,7 +24,9 @@ final class AgentCodexModelRegistry {
     /// input snapshots rather than treating the most recent sort as universal.
     private var cachedDynamicOptions: [DynamicOptionsCacheEntry] = []
 
-    init() {}
+    init(invalidate: @escaping () -> Void) {
+        self.invalidate = invalidate
+    }
 
     @discardableResult
     func updateLiveModels(_ models: [CodexAppServerClient.RemoteModel]) -> Bool {
@@ -37,7 +42,7 @@ final class AgentCodexModelRegistry {
         lock.unlock()
 
         guard didChange else { return false }
-        AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
+        invalidate()
         CodexDynamicModelStore.save(normalized)
         return true
     }
