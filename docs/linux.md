@@ -249,9 +249,9 @@ flag makes the intended mode clear and also works with the macOS executable.
 The client starts and owns the stdio server process; it is not an HTTP service
 and needs no listening TCP port.
 
-An interactive terminal invocation of `--backend headless` alone waits for MCP
-JSON-RPC on standard input. That behavior is expected; it is not a graphical
-launcher.
+`repoprompt-mcp -i` starts the terminal REPL. An MCP client supplies pipes for the
+server's standard input and output. Running `--backend headless` with either
+stream attached to a terminal prints quick-start usage and exits.
 
 ### Profiles and permissions
 
