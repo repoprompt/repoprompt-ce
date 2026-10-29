@@ -2152,13 +2152,17 @@ extension MCPServerViewModel {
         )
 
         // A nested run keeps the original root identities even if readiness for
-        // the changed catalog fails before a new snapshot can be captured.
+        // the changed catalog fails before a new snapshot can be captured. The
+        // scope's canonicalRoots are only the retained (unbound) subset, so the
+        // live catalog is compared against the captured full logical catalog.
         if authoritySnapshot.runID != nil,
            let frozenLookupContext = authoritySnapshot.frozenLookupContext,
            case let .validatedSessionBoundWorkspace(canonicalRoots, _, _) = frozenLookupContext.rootScope
         {
+            let capturedLogicalRoots = frozenLookupContext.bindingProjection.map { Set($0.visibleLogicalRootRefs) }
+                ?? canonicalRoots
             let currentRoots = await Set(promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace))
-            guard canonicalRoots == currentRoots else {
+            guard capturedLogicalRoots == currentRoots else {
                 if let connectionID = authorityConnectionID,
                    var bound = tabContextByConnectionID[connectionID],
                    fileToolLookupRouteMatches(bound, authoritySnapshot),
@@ -2197,8 +2201,10 @@ extension MCPServerViewModel {
                let frozenLookupContext = authoritySnapshot.frozenLookupContext
             {
                 if case let .validatedSessionBoundWorkspace(canonicalRoots, _, _) = frozenLookupContext.rootScope {
+                    let capturedLogicalRoots = frozenLookupContext.bindingProjection.map { Set($0.visibleLogicalRootRefs) }
+                        ?? canonicalRoots
                     let currentRoots = await Set(promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace))
-                    guard canonicalRoots == currentRoots else {
+                    guard capturedLogicalRoots == currentRoots else {
                         if let connectionID = authorityConnectionID,
                            var bound = tabContextByConnectionID[connectionID],
                            fileToolLookupRouteMatches(bound, authoritySnapshot),
