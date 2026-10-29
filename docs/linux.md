@@ -6,6 +6,11 @@ catalog and mutation policies as the macOS headless backend. The native macOS
 `RepoPrompt` graphical application uses SwiftUI and AppKit and is not part of the
 Linux product.
 
+The optional **native Linux desktop** is a Qt for Python application over that
+same engine. It provides repository browsing, source and CodeMap previews,
+content search, saved selections, prompt editing, and clipboard context assembly.
+See [Native Linux desktop](#native-linux-desktop) below.
+
 The Linux workflow targets glibc systems with a native Swift toolchain. Omarchy
 and other Arch-based systems can use the terminal commands and connect an
 MCP-capable editor or agent. No X11, Wayland or desktop service is required by the
@@ -179,6 +184,80 @@ tar -C repoprompt-ce-linux -xzf repoprompt-ce-linux-x86_64.tar.gz
 Use that executable's absolute path in the CLI or MCP configuration. The archive
 also contains this guide, the smoke script and complete license notices under
 `share/`.
+
+## Native Linux desktop
+
+The desktop frontend requires Python 3.10 or newer, pip, Qt's system libraries,
+and an X11 or Wayland desktop session. It uses the installed `repoprompt-mcp`
+executable; it does not require Swift at runtime when that executable includes
+the static Swift runtime. The GUI installer downloads **PySide6 Essentials 6.10.3** and its
+dependencies from PyPI into a private application directory. Qt's wheels have
+their own distribution/glibc requirements, separate from the engine's.
+
+Install the additional desktop prerequisites:
+
+```bash
+# Omarchy / Arch
+sudo pacman -S --needed python-pip libglvnd libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms
+
+# Ubuntu / Debian
+sudo apt-get install python3-pip libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1
+
+# Fedora
+sudo dnf install python3-pip libglvnd-egl libglvnd-glx libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms
+```
+
+After building and installing the engine:
+
+```bash
+python3 Scripts/install_linux_gui.py
+repoprompt-gui ~/src/project
+```
+
+The installer creates `~/.local/bin/repoprompt-gui` and an application-menu entry
+named **RepoPrompt CE**. It does not launch the app. Add `~/.local/bin` to your
+normal `PATH` if needed, or use its absolute path. Updating an existing managed
+installation requires `--replace`; symlinks and unrelated directories are
+preserved. A failed dependency download leaves the old installation intact.
+
+For a custom prefix or an existing Python environment containing PySide6:
+
+```bash
+python3 Scripts/install_linux_gui.py --prefix "$HOME/apps/repoprompt-ce" \
+  --engine "$HOME/.local/bin/repoprompt-mcp" --python /path/to/venv/bin/python --no-deps
+```
+
+Custom prefixes place the desktop file under that prefix's `share/applications`;
+the session must search that share directory through `XDG_DATA_DIRS` to show it
+in the application menu. The command-line launcher works directly.
+
+In the app, open a repository, click a file to preview it, and choose **Add to
+context**. Search finds literal text in the repository; double-click a result to
+open its file. **Show CodeMap** displays the engine's source signatures. Write
+instructions in the prompt editor and use **Save prompt** / Ctrl+S to persist
+them. **Copy context** assembles the current prompt text and full selected text
+files as Markdown for pasting into an editor or agent. It supports up to 100 files
+and 2 MiB; read errors leave the clipboard unchanged. Source files are read-only
+in this frontend, and symlinks are excluded from browser navigation.
+
+The window owns a persistent MCP stdio connection and shuts it down on close.
+Each repository/engine path gets a separate GUI profile under
+`$XDG_DATA_HOME/repoprompt-ce-linux-gui` (default `~/.local/share`). Desktop
+preferences use `$XDG_CONFIG_HOME/repoprompt-ce-linux-gui`. `--profile-dir`
+selects a dedicated profile; it must belong to the selected repository.
+
+This first native frontend focuses on context composition. It does not expose
+the macOS application's full Agent Mode, Overseer, session administration, or
+native editor integrations. Its clipboard assembly reads through the existing
+engine; CLI `workspace_context` snapshots retain their existing behavior.
+
+For development without installing the application menu entry, follow
+[`Apps/RepoPromptLinux/README.md`](../Apps/RepoPromptLinux/README.md), or run
+`REPOPROMPT_GUI_PYTHON=/path/to/venv/bin/python Scripts/run_linux_gui.sh /path/to/repository`.
+Linux CI exercises native x86_64 and aarch64 Qt workflows against each release
+engine, tests the desktop installer, and uploads the Python wheel and a captured
+window image. Check the workflow result for the actual commit before claiming
+an architecture passed.
 
 ## Use the terminal CLI
 

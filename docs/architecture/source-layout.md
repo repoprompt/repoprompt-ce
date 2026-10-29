@@ -124,6 +124,18 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 
 ## Platform extraction boundaries
 
+`Apps/RepoPromptLinux` owns the optional native Linux Qt/Python frontend and its
+desktop tests. It is an independent Python package over a long-lived stdio MCP
+connection to `repoprompt-mcp`, not a second Swift runtime. Qt's read-only
+filesystem model supplies lazy directory presentation, with symlinks excluded;
+file contents, searches, CodeMaps, root confinement, and durable selection/prompt
+state remain owned by the production engine. Markdown clipboard assembly is a
+presentation export of those engine reads. The frontend starts no HTTP listener
+and exposes no source-file mutation UI. `Scripts/install_linux_gui.py` owns the
+optional user-prefix package/desktop-entry installer; it does not change SwiftPM
+product or target membership. The macOS application and its ownership map remain
+under `Sources/RepoPrompt`.
+
 The Linux manifest exposes only the production `repoprompt-mcp` executable.
 `RepoPromptMCP` retains its thin entry over `RepoPromptMCPCore`; the domain,
 workspace, CodeMap, regex, process, VCS, instrumentation, foundation, shared and C

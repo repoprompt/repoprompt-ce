@@ -103,6 +103,72 @@ jobs:
           path: dist/repoprompt-ce-linux-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
+  gui:
+    name: Native GUI (${{ matrix.arch }})
+    needs: headless
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install Qt system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 xvfb xauth
+      - uses: actions/download-artifact@v4
+        with:
+          name: repoprompt-ce-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/engine-download
+      - name: Install native desktop package
+        run: |
+          mkdir -p "$RUNNER_TEMP/engine"
+          tar --no-same-owner -C "$RUNNER_TEMP/engine" -xzf "$RUNNER_TEMP/engine-download/repoprompt-ce-linux-${{ matrix.arch }}.tar.gz"
+          python -m pip install ./Apps/RepoPromptLinux
+      - name: Test desktop workflows against the release engine without a display
+        env:
+          QT_QPA_PLATFORM: offscreen
+          REPOPROMPT_GUI_TEST_ENGINE: ${{ runner.temp }}/engine/bin/repoprompt-mcp
+          REPOPROMPT_GUI_SCREENSHOT: ${{ runner.temp }}/linux-desktop.png
+        run: python -m unittest discover -s Apps/RepoPromptLinux/tests -v
+      - name: Verify the native X11 window and clipboard
+        env:
+          QT_QPA_PLATFORM: xcb
+          REPOPROMPT_GUI_TEST_ENGINE: ${{ runner.temp }}/engine/bin/repoprompt-mcp
+        run: xvfb-run -a python -m unittest discover -s Apps/RepoPromptLinux/tests -p test_window.py -v
+      - name: Verify desktop installation and launcher
+        run: |
+          python Scripts/install_linux_gui.py --prefix "$RUNNER_TEMP/desktop installation" \
+            --engine "$RUNNER_TEMP/engine/bin/repoprompt-mcp" --no-deps
+          "$RUNNER_TEMP/desktop installation/bin/repoprompt-gui" --version
+          python -m unittest discover -s Scripts/tests -p test_linux_gui_installer.py
+          QT_QPA_PLATFORM=offscreen \
+          PYTHONPATH="$RUNNER_TEMP/desktop installation/share/repoprompt-ce/linux-gui" \
+          REPOPROMPT_GUI_TEST_ENGINE="$RUNNER_TEMP/engine/bin/repoprompt-mcp" \
+            python -m unittest discover -s Apps/RepoPromptLinux/tests -p test_window.py -v
+      - name: Build portable desktop Python wheel
+        run: python -m pip wheel --no-deps ./Apps/RepoPromptLinux --wheel-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repoprompt-ce-linux-gui-${{ matrix.arch }}
+          path: |
+            dist/repoprompt_ce_gui-*.whl
+            ${{ runner.temp }}/linux-desktop.png
+          if-no-files-found: error
+
   archive-runtime:
     name: Archive runtime (${{ matrix.arch }})
     needs: headless

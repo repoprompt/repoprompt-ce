@@ -160,3 +160,13 @@ SUCH DAMAGE.
    @(#)fnmatch.h    8.1 (Berkeley) 6/2/93
    $OpenBSD: fnmatch.h,v 1.4 1997/09/22 05:25:32 millert Exp $
 ```
+## Optional Linux desktop dependencies
+
+The optional `repoprompt-ce-gui` Python package depends on Qt for Python
+(PySide6 Essentials 6.10.3), Shiboken6, and the Qt libraries provided by their official PyPI
+wheels. These are separately installed LGPL-3.0 dependencies, not linked into
+the headless Swift executable. Their upstream license files and third-party
+notices remain in the installed wheels. See
+[Qt for Python licensing](https://doc.qt.io/qtforpython-6/licenses.html),
+[PySide6 on PyPI](https://pypi.org/project/PySide6/6.10.3/), and
+[Qt source repositories](https://code.qt.io/).
