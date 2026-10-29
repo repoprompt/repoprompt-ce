@@ -478,8 +478,8 @@ final class DevinPermissionLevelTests: XCTestCase {
     }
 
     func testDevinPickersExposeOnlyAdvertisedModels() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .devin)
-        addTeardownBlock { AgentACPModelRegistry.shared.test_reset(providerID: .devin) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .devin)
+        addTeardownBlock { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .devin) }
         let availability = AgentModelCatalog.AvailabilityContext(devinAvailable: true)
 
         XCTAssertTrue(AgentModelCatalog.options(for: .devin, availability: availability).isEmpty)
@@ -489,7 +489,7 @@ final class DevinPermissionLevelTests: XCTestCase {
             AgentModelOption(rawValue: "swe-2-high", displayName: "SWE-2 High", description: nil, isDefault: true),
             AgentModelOption(rawValue: "gpt-5-6-sol-medium", displayName: "GPT-5.6 Sol Medium Thinking", description: nil, isDefault: false)
         ]
-        AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(options: options, currentModelRaw: "swe-2-high"),
             for: .devin
         )

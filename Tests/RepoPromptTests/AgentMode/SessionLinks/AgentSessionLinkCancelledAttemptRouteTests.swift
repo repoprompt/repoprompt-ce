@@ -947,12 +947,12 @@ final class AgentSessionLinkCancelledAttemptRouteTests: XCTestCase {
             await fulfillment(of: [available], timeout: 2)
             subscription.cancel()
             let raw = "routing-test-model:high"
-            AgentAdvertisedModelCatalog.shared.record([
+            AgentModelCatalogRuntime.shared.record([
                 AgentModelOption(rawValue: raw, displayName: "Routing test", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
+            ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
             defer {
                 target.saveDebounceTask?.cancel()
-                AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+                AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
             }
             let service = AgentSessionLinkMCPToolService(
                 toolName: MCPWindowToolName.agentSessionLink,

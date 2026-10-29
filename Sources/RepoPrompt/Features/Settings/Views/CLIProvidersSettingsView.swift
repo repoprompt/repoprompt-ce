@@ -2293,7 +2293,7 @@ struct CLIProvidersSettingsView: View {
                                 let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
                                 _ = try await AntigravityACPAgentProvider().support(for: request)
                                 let discovered = await AntigravityACPModelPollingService.shared.refreshNow(workspacePath: nil)
-                                let count = AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
+                                let count = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)?.options.count ?? 0
                                 await MainActor.run {
                                     isTestingAntigravity = false
                                     alertMessage = discovered && count > 0

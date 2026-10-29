@@ -22,9 +22,9 @@ enum AgentSessionLanePolicy {
         _ modelID: String,
         availability: AgentModelCatalog.AvailabilityContext
     ) throws -> RoleSelection {
-        let selection = try AgentAdvertisedModelCatalog.shared.selection(modelID, availability: availability)
+        let selection = try AgentModelCatalogRuntime.shared.selection(modelID, availability: availability)
         guard AgentModelCatalog.AgentSelectionSurface.headless.allows(selection.agent) else {
-            throw AgentAdvertisedModelCatalog.AdmissionError.unavailable
+            throw AgentModelCatalogRuntime.AdmissionError.unavailable
         }
         // Default selection label only: lane creation consumes the model fields and creates
         // an ordinary top-level session, without installing an MCP task role or permissions.

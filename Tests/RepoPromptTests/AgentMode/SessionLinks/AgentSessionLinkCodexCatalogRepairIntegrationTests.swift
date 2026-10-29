@@ -1159,8 +1159,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if inbound {
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
                     try await AsyncTestWait.waitUntil("fixture destination availability") { window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
-                    AgentAdvertisedModelCatalog.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-                    defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+                    AgentModelCatalogRuntime.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+                    defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
                     let created = try await connection.callTool(name: MCPWindowToolName.agentSessionLink, arguments: ["op": "create_lane", "model_id": "claudeCode:sonnet:high", "idempotency_key": "discovery-first-lane", "session_name": "Harmless created lane", "_rawJSON": true], timeoutSeconds: 10)
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])
@@ -1349,8 +1349,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 if activate {
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
                     try await AsyncTestWait.waitUntil("activated fixture destination availability") { window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
-                    AgentAdvertisedModelCatalog.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-                    defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+                    AgentModelCatalogRuntime.shared.record([AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+                    defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
                     let created = try await connection.callTool(name: MCPWindowToolName.agentSessionLink, arguments: ["op": "create_lane", "model_id": "claudeCode:sonnet:high", "idempotency_key": "activated-discovery-first-lane", "_rawJSON": true], timeoutSeconds: 10)
                     let object = try MCPExportWatchdogIntegrationTests.responseObject(from: created)
                     let result = try XCTUnwrap(object["result"] as? [String: Any])

@@ -653,7 +653,7 @@ extension GlobalSettingsStore {
     nonisolated static func installApplicationModelIdentityPolicy() {
         SettingsModelIdentityPolicy.installCursorCanonicalizer { raw in
             // Exact advertised identities win over historical rename aliases.
-            if AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.contains(where: { $0.rawValue == raw }) == true {
+            if AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor)?.options.contains(where: { $0.rawValue == raw }) == true {
                 return raw
             }
             if let specifier = try? CursorAIModelCatalog.ModelSpecifier(raw: raw), !specifier.overrides.isEmpty {

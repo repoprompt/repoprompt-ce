@@ -378,7 +378,7 @@ final class RoutingExecutionMetadataTests: XCTestCase {
         XCTAssertTrue(mapped.allSatisfy {
             $0.supportedReasoningEffortRawValues == ["high", "future-depth", "future-depth"]
         })
-        let projected = AgentCodexModelRegistry(invalidate: { AgentAdvertisedModelCatalog.shared.invalidate(.codexExec) }).resolvedOptions(
+        let projected = AgentCodexModelRegistry(invalidate: { AgentModelCatalogRuntime.shared.invalidate(.codexExec) }).resolvedOptions(
             staticOptions: [], preferredLiveModels: [remote]
         )
         XCTAssertTrue(projected.contains {
@@ -419,7 +419,7 @@ final class RoutingExecutionMetadataTests: XCTestCase {
             supportedReasoningEfforts: [.init(reasoningEffort: "high", description: "")],
             defaultReasoningEffort: "high"
         )
-        let options = AgentCodexModelRegistry(invalidate: { AgentAdvertisedModelCatalog.shared.invalidate(.codexExec) }).resolvedOptions(
+        let options = AgentCodexModelRegistry(invalidate: { AgentModelCatalogRuntime.shared.invalidate(.codexExec) }).resolvedOptions(
             staticOptions: [], preferredLiveModels: [remote]
         )
         let fast = try XCTUnwrap(options.first { $0.rawValue == "gpt-6-sol-fast-high" })

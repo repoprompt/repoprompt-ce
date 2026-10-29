@@ -56,7 +56,7 @@ extension AgentModeViewModel {
         let admittedAvailability = availability()
         let admittedModelID: String
         func invalid(_ detail: String, code: String = "model_catalog_admission_failed") -> AgentSessionLinkModelOutcome {
-            let alternatives = AgentAdvertisedModelCatalog.shared.modelIDs(
+            let alternatives = AgentModelCatalogRuntime.shared.modelIDs(
                 for: session.selectedAgent, availability: availability()
             )
             return .refused(
@@ -86,8 +86,8 @@ extension AgentModeViewModel {
             return invalid("set_model cannot change agent kind (current: \(session.selectedAgent.rawValue)). Use agent_manage.list_agents for a same-agent model_id.", code: "model_agent_mismatch")
         }
         do {
-            _ = try AgentAdvertisedModelCatalog.shared.selection(admittedModelID, availability: admittedAvailability)
-        } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return invalid(error.message, code: error.diagnosticCode) }
+            _ = try AgentModelCatalogRuntime.shared.selection(admittedModelID, availability: admittedAvailability)
+        } catch let error as AgentModelCatalogRuntime.AdmissionError { return invalid(error.message, code: error.diagnosticCode) }
         catch { return invalid("Model catalogue admission failed.") }
 
         let commit = await reauthorize()
@@ -110,9 +110,9 @@ extension AgentModeViewModel {
             return invalid("The target agent changed. Refresh agent_manage.list_agents and choose a same-agent model_id.", code: "model_agent_changed")
         }
         do {
-            let selection = try AgentAdvertisedModelCatalog.shared.selection(admittedModelID, availability: admittedAvailability)
+            let selection = try AgentModelCatalogRuntime.shared.selection(admittedModelID, availability: admittedAvailability)
             return .accepted(agentSessionLinkCommitModel(selection, to: session))
-        } catch let error as AgentAdvertisedModelCatalog.AdmissionError { return invalid(error.message, code: error.diagnosticCode) }
+        } catch let error as AgentModelCatalogRuntime.AdmissionError { return invalid(error.message, code: error.diagnosticCode) }
         catch { return invalid("Model catalogue admission failed.") }
     }
 
@@ -124,7 +124,7 @@ extension AgentModeViewModel {
 
     /// Synchronous commit seam: only per-session model/effort, narrow active UI, and scheduled save.
     private func agentSessionLinkCommitModel(
-        _ selection: AgentAdvertisedModelCatalog.Selection,
+        _ selection: AgentModelCatalogRuntime.Selection,
         to session: TabSession
     ) -> AgentSessionLinkModelReceipt {
         let changed = session.selectedModelRaw != selection.storedModelRaw

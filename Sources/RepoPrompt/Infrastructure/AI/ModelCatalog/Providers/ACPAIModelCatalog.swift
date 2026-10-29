@@ -71,7 +71,7 @@ enum ACPDynamicModelStore {
 
 enum ACPAIModelCatalog {
     static func openCodeModelOptionsFromStore() -> [AgentModelOption] {
-        AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode)?.options ?? []
+        AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .openCode)?.options ?? []
     }
 
     static func openCodeModelsFromStore() -> [AIModel] {

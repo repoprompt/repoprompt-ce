@@ -1331,7 +1331,7 @@ public class APISettingsViewModel: ObservableObject {
 
         // Load persisted ACP catalogs before any provider result can trigger restoration.
         // A live refresh may legitimately omit dynamic metadata, especially for Cursor.
-        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        await AgentModelCatalogRuntime.shared.acpRegistry.warmStandardStoreIfNeeded()
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isContextBuilderProviderValidationComplete { return }
         if let contextBuilderProviderValidationTask {

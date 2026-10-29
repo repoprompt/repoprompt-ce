@@ -13,9 +13,9 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
     }
 
     private func installCursorMetadata() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         // Scripted ACP advertisement: this test must not rely on offline product choices.
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     .init(rawValue: "grok-4.6", displayName: "Grok 4.6", description: nil, isDefault: false),
@@ -52,7 +52,7 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
 
     func testCursorDefinitionsPreserveExactWireIdentifiersAndChoices() {
         installCursorMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let definitions = AgentMCPModelParameterSupport.definitions(agent: .cursor, modelRaw: "grok-4.6")
 
         XCTAssertEqual(definitions.count, 2)
@@ -64,7 +64,7 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
 
     func testCursorDefinitionValuesPreserveListAgentsWireShape() {
         installCursorMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let values = AgentMCPModelParameterSupport.definitionValues(agent: .cursor, modelRaw: "grok-4.6")
 
         XCTAssertEqual(values.count, 2)
@@ -148,7 +148,7 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
 
     func testResolveRejectsUnknownConfigBeforeProducingSelections() throws {
         installCursorMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let requested: Value = .array([
             .object(["config_id": .string("unknown"), "value": .string("high")])
         ])
@@ -164,7 +164,7 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
 
     func testResolveRejectsUnknownValueBeforeProducingSelections() throws {
         installCursorMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let requested: Value = .array([
             .object(["config_id": .string("effort"), "value": .string("maximum")])
         ])
@@ -180,7 +180,7 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
 
     func testResolvePreservesExactProviderWireValueAndCanonicalBase() throws {
         installCursorMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let requested: Value = .array([
             .object(["config_id": .string("effort"), "value": .string("HIGH")]),
             .object(["config_id": .string("fast"), "value": .string("true")])
@@ -199,7 +199,7 @@ final class AgentMCPModelParameterSupportTests: XCTestCase {
 
     func testResolveCanonicalizesLegacyComposer2BaseModel() throws {
         installCursorMetadata()
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let selections = try AgentMCPModelParameterSupport.resolve(
             value: .array([
                 .object(["config_id": .string("fast"), "value": .string("true")])

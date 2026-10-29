@@ -59,7 +59,7 @@ actor DevinModelDiscoveryService {
             inFlightID += 1
             requestID = inFlightID
             task = Task { [isInstalled, runSession] in
-                await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+                await AgentModelCatalogRuntime.shared.acpRegistry.warmStandardStoreIfNeeded()
                 if force {
                     await CLIEnvironmentCache.shared.invalidate()
                 }
@@ -153,7 +153,7 @@ actor DevinModelDiscoveryService {
                 currentModelRaw: initial.currentModelRaw,
                 modelParameterSets: parameterSets
             )
-            _ = AgentACPModelRegistry.shared.updateDiscoveredModels(complete, for: .devin)
+            _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(complete, for: .devin)
             let count = initial.options.count
             await controller.shutdown()
             return count

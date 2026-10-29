@@ -2,10 +2,6 @@ import Foundation
 import RepoPromptAIContracts
 
 final class AgentCodexModelRegistry {
-    static let shared = AgentCodexModelRegistry(invalidate: {
-        AgentAdvertisedModelCatalog.shared.invalidate(.codexExec)
-    })
-
     private let invalidate: () -> Void
     private let lock = NSLock()
     private var liveModels: [CodexAppServerClient.RemoteModel] = []

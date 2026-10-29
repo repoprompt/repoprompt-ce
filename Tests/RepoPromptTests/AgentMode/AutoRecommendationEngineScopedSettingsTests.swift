@@ -264,7 +264,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
 
     func testRoleDefaultsRecommendationUsesActualAvailabilityAndFilteredRecommendations() throws {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         let providers: [ACPProviderID] = [.grokBuild, .openCode]
         for provider in providers {
             registry.test_reset(providerID: provider)
@@ -341,7 +341,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
 
     func testRuntimeOwnedRolePinsUseRecommendationAvailability() throws {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         let providers: [(id: ACPProviderID, agent: AgentProviderKind)] = [
             (.antigravity, .antigravity), (.devin, .devin)
         ]

@@ -1609,7 +1609,7 @@ final class ACPIntegratedAgentModeRunner {
         }
         if agentKind == .grokBuild || agentKind == .antigravity,
            let providerID = agentKind.acpProviderID,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)?.contains(rawModel: model) != true
+           AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: providerID)?.contains(rawModel: model) != true
         {
             // These ACP providers have no provider-side alias surface: an unknown
             // concrete model fails instead of silently running the provider's default.
@@ -2481,7 +2481,7 @@ final class ACPIntegratedAgentModeRunner {
     ) -> Bool {
         guard let providerID = agentKind.acpProviderID,
               providerID != .cursor,
-              let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID)
+              let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: providerID)
         else {
             return false
         }

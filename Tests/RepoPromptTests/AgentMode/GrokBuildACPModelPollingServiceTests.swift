@@ -6,16 +6,16 @@ import XCTest
 
 final class GrokBuildACPModelPollingServiceTests: XCTestCase {
     private func makePollingService(client: any GrokBuildACPModelDiscoveryClient) -> GrokBuildACPModelPollingService {
-        GrokBuildACPModelPollingService(client: client, registry: .shared, logFailure: { _ in })
+        GrokBuildACPModelPollingService(client: client, registry: AgentModelCatalogRuntime.shared.acpRegistry, logFailure: { _ in })
     }
 
     override func setUp() {
         super.setUp()
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
         super.tearDown()
     }
 
@@ -133,7 +133,7 @@ final class GrokBuildACPModelPollingServiceTests: XCTestCase {
         let snapshot = try await service.discoverOnce(workspacePath: nil)
         XCTAssertEqual(snapshot?.models.currentModelRaw, "isolated-grok")
         XCTAssertEqual(registry.currentSnapshot(for: .grokBuild)?.currentModelRaw, "isolated-grok")
-        XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .grokBuild))
+        XCTAssertNil(AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .grokBuild))
         await service.shutdown()
     }
 }

@@ -7430,7 +7430,7 @@ final class AgentSessionLinkRuntimeBridge {
     // MARK: - Configuration-only model selection
 
     nonisolated static var invalidModelIDMessage: String {
-        AgentAdvertisedModelCatalog.AdmissionError.invalidID.message
+        AgentModelCatalogRuntime.AdmissionError.invalidID.message
     }
 
     nonisolated static func isValidModelID(_ raw: String) -> Bool {
@@ -8615,7 +8615,7 @@ final class AgentSessionLinkRuntimeBridge {
                 )
             } else {
                 // Role/default selections retain persisted-catalog warming. Explicit selections never warm.
-                await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+                await AgentModelCatalogRuntime.shared.acpRegistry.warmStandardStoreIfNeeded()
                 selection = try AgentSessionLanePolicy.resolveRole(
                     request.role,
                     availability: host.agentSessionLinkModelAvailability(windowID: destination.windowID),

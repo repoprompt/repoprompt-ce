@@ -199,10 +199,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertEqual(AgentSessionLaneMCPToolService.resolveDestination(
                 workspaceSelector: fixture.workspaceID.uuidString, callerWindow: fixture.window
             ), destination)
-            AgentAdvertisedModelCatalog.shared.record([
+            AgentModelCatalogRuntime.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+            defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
             fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
             try await AsyncTestWait.waitUntil("scoped destination model availability") {
                 fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
@@ -701,10 +701,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertNil(creator.oversight.pendingAutoWake, "consent cannot start a turn")
             let noLinks = await authority.links(forObserver: creatorID)
             XCTAssertTrue(noLinks.items.isEmpty, "consent manufactures no grants")
-            AgentAdvertisedModelCatalog.shared.record([
+            AgentModelCatalogRuntime.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+            defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
             try await withSecondRegisteredWindow { destinationWindow in
                 // Simulate only the destination's published CLI-availability input; never run a provider.
                 destinationWindow.apiSettingsViewModel.isClaudeCodeConnected = true
@@ -952,10 +952,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             }
             await bridge.bootstrapIntentStore(store)
             await bridge.test_settleLaunchReconciliation()
-            AgentAdvertisedModelCatalog.shared.record([
+            AgentModelCatalogRuntime.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+            defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
             fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
             try await AsyncTestWait.waitUntil("ABA creation model availability") {
                 fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
@@ -1136,10 +1136,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 }
                 await bridge.bootstrapIntentStore(store)
                 await bridge.test_settleLaunchReconciliation()
-                AgentAdvertisedModelCatalog.shared.record([
+                AgentModelCatalogRuntime.shared.record([
                     AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-                ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-                defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+                ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+                defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
                 fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
                 try await AsyncTestWait.waitUntil("entry lifecycle model availability") {
                     fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
@@ -1330,10 +1330,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 endpoint: endpoint, isEnabled: { true }, revalidateRoute: { true }, commitIfCurrent: { $0() }
             )
             XCTAssertNotNil(activated)
-            AgentAdvertisedModelCatalog.shared.record([
+            AgentModelCatalogRuntime.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+            defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
             fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
             try await AsyncTestWait.waitUntil("nested creation model availability") {
                 fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable
@@ -1585,7 +1585,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
 
     func testPersistedDevinRoleLanesSaveLinkAndDispatchFirstTask() async throws {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .devin)
         defer { registry.test_reset(providerID: .devin) }
         XCTAssertTrue(registry.updateDiscoveredModels(
@@ -2450,7 +2450,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
         idempotencyKey: String,
         omitWorkspaceSelector: Bool = false
     ) async throws -> (sessionID: UUID, tabID: UUID) {
-        let catalog = AgentAdvertisedModelCatalog.shared
+        let catalog = AgentModelCatalogRuntime.shared
         catalog.record([
             AgentModelOption(
                 rawValue: "sonnet:high", displayName: "Fixture model", description: nil,
@@ -3364,10 +3364,10 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             }
             let actor = await store.roots().filter { $0.kind == .primaryWorkspace }.map(\.standardizedFullPath)
             XCTAssertEqual(actor, [beta.path, alpha.path], "actor install order must be reversed")
-            AgentAdvertisedModelCatalog.shared.record([
+            AgentModelCatalogRuntime.shared.record([
                 AgentModelOption(rawValue: "sonnet:high", displayName: "Fixture model", description: nil, isPlaceholderDefault: false, isProviderDefault: false)
-            ], for: .claudeCode, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: .claudeCode))
-            defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+            ], for: .claudeCode, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: .claudeCode))
+            defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
             fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
             try await AsyncTestWait.waitUntil("startup model availability") {
                 fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable

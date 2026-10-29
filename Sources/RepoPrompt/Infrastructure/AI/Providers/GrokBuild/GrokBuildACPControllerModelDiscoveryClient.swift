@@ -68,7 +68,7 @@ actor GrokBuildACPControllerModelDiscoveryClient: GrokBuildACPModelDiscoveryClie
         do {
             _ = try await controller.bootstrap()
             await retainVerifiedIdentity(controller.currentProviderSessionIdentity())
-            let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .grokBuild)
+            let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .grokBuild)
             await controller.shutdown()
             return snapshot
         } catch {

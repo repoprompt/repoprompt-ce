@@ -190,7 +190,7 @@ struct AIModelDropdown: View {
                 guard let raw = specifier.replacing(configID: definition.configID, valueRaw: choice.rawValue) else { return nil }
                 return .action(choice.displayName, isSelected: saved?.overrides.contains(where: { $0.configID == definition.configID && $0.valueRaw == choice.rawValue }) == true) {
                     guard let current = try? CursorAIModelCatalog.ModelSpecifier(raw: raw),
-                          (try? current.selections(in: AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor))) != nil else { return }
+                          (try? current.selections(in: AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor))) != nil else { return }
                     apply(raw)
                 }
             })

@@ -20,11 +20,11 @@ private actor OneShotFilteringPolicyWitness {
 final class GrokBuildModelRoutingTests: XCTestCase {
     override func setUp() {
         super.setUp()
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
         super.tearDown()
     }
 
@@ -45,7 +45,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             [.grokBuildCustom(name: AgentModel.defaultModel.rawValue)]
         )
 
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     AgentModelOption(
@@ -778,7 +778,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
     @MainActor
     func testDropdownDisplaysGrokBuildCatalogName() {
         let model = AIModel.grokBuildCustom(name: "grok-4.6")
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     AgentModelOption(
@@ -824,7 +824,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             isProviderDefault: false,
             effortVariant: AgentModelEffortVariant(baseModelRaw: base.rawValue, reasoningEffort: .xhigh)
         )
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         XCTAssertTrue(registry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(options: [base, variant], currentModelRaw: base.rawValue),
             for: .grokBuild
@@ -891,7 +891,7 @@ final class GrokBuildModelRoutingTests: XCTestCase {
             ("effort-suffixed base without variant record", [base, suffixBase], suffixBase.rawValue, false, nil),
             ("no catalog", nil, variant.rawValue, false, nil)
         ]
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         for row in cases {
             registry.test_reset(providerID: .grokBuild)
             if let options = row.options {

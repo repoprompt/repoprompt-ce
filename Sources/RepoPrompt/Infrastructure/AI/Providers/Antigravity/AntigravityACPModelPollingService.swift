@@ -56,7 +56,7 @@ actor AntigravityACPControllerModelDiscoveryClient: AntigravityACPModelDiscovery
         do {
             _ = try await controller.bootstrap()
             await retainVerifiedIdentity(controller.currentProviderSessionIdentity(), workspaceKey: workspaceKey)
-            let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .antigravity)
+            let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .antigravity)
             await controller.shutdown()
             return snapshot
         } catch {
@@ -300,7 +300,7 @@ actor AntigravityACPModelPollingService {
     private func publishLiveReadinessWithoutModels() {
         guard !isShutdown else { return }
         let models = latest?.models
-            ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity)
+            ?? AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity)
             ?? ACPDiscoveredSessionModels(options: [], currentModelRaw: nil)
         let snapshot = Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: true)
         guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
@@ -318,8 +318,8 @@ actor AntigravityACPModelPollingService {
             publishLiveReadinessWithoutModels()
             return
         }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .antigravity)
-        guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .antigravity) else { return }
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(discovered, for: .antigravity)
+        guard let normalized = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .antigravity) else { return }
         let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
         guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
         latest = snapshot
@@ -329,7 +329,7 @@ actor AntigravityACPModelPollingService {
     }
 
     private func registrySnapshotAfterWarmingStore() async -> Snapshot? {
-        guard let models = await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .antigravity) else {
+        guard let models = await AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotAfterWarmingStandardStore(for: .antigravity) else {
             return nil
         }
         return Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: false)

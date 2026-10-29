@@ -1,20 +1,103 @@
+import Dispatch
 import Foundation
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// Admission over the already-advertised catalogue, never a discovery or persistence entrypoint.
 /// Producers refresh this index while building ordinary picker/list_agents options. A cold or
 /// invalidated index fails closed; an oversight request must not warm it on the caller's behalf.
-final class AgentAdvertisedModelCatalog: @unchecked Sendable {
-    static let shared: AgentAdvertisedModelCatalog = {
-        let catalogue = AgentAdvertisedModelCatalog()
-        ClaudeCodeCompatibleBackendStore.setConfigurationChangeHandler { [weak catalogue] in
+final class AgentModelCatalogRuntime: @unchecked Sendable {
+    static let shared = AgentModelCatalogRuntime(registerBackendChanges: { handler in
+        ClaudeCodeCompatibleBackendStore.setConfigurationChangeHandler(handler)
+    })
+
+    private let registerBackendChanges: (@escaping @Sendable () -> Void) -> Void
+    private let activation = NSCondition()
+    private var activationState = 0 // 0: cold, 1: installing, 2: installed
+    #if DEBUG
+        private let activationWaiterArrived = DispatchSemaphore(value: 0)
+    #endif
+    private let acpSlotLock = NSLock()
+    private var acpSlot: AgentACPModelRegistry?
+    private let codexSlotLock = NSLock()
+    private var codexSlot: AgentCodexModelRegistry?
+
+    init(registerBackendChanges: @escaping (@escaping @Sendable () -> Void) -> Void) {
+        self.registerBackendChanges = registerBackendChanges
+    }
+
+    /// Only pure construction occurs under these slot locks. Neither registry constructor nor
+    /// dependency assembly invokes storage, invalidation, or other runtime operations.
+    var acpRegistry: AgentACPModelRegistry {
+        acpSlotLock.withLock {
+            if let acpSlot { return acpSlot }
+            let registry = AgentACPModelRegistry(dependencies: .app(invalidate: { [weak self] agent in
+                self?.invalidate(agent)
+            }))
+            acpSlot = registry
+            return registry
+        }
+    }
+
+    var codexRegistry: AgentCodexModelRegistry {
+        codexSlotLock.withLock {
+            if let codexSlot { return codexSlot }
+            let registry = AgentCodexModelRegistry(invalidate: { [weak self] in
+                self?.invalidate(.codexExec)
+            })
+            codexSlot = registry
+            return registry
+        }
+    }
+
+    /// The production registrar only installs a handler; it never invokes it synchronously.
+    /// Release the activation lock before invoking it; concurrent users wait until installation
+    /// completes so that no advertised producer can publish before subscription is active.
+    private func ensureAdvertisedActive() {
+        activation.lock()
+        #if DEBUG
+            var reportedWaiter = false
+        #endif
+        while activationState == 1 {
+            #if DEBUG
+                if !reportedWaiter {
+                    reportedWaiter = true
+                    activationWaiterArrived.signal()
+                }
+            #endif
+            activation.wait()
+        }
+        if activationState == 2 {
+            activation.unlock()
+            return
+        }
+        activationState = 1
+        activation.unlock()
+
+        registerBackendChanges { [weak self] in
             for agent in [AgentProviderKind.claudeCodeGLM, .kimiCode, .customClaudeCompatible] {
-                catalogue?.invalidate(agent)
+                self?.invalidate(agent)
             }
         }
-        return catalogue
-    }()
+
+        activation.lock()
+        activationState = 2
+        activation.broadcast()
+        activation.unlock()
+    }
+
+    #if DEBUG
+        func test_waitForActivationWaiter() -> Bool {
+            activationWaiterArrived.wait(timeout: .now() + 5) == .success
+        }
+
+        var test_initializedSlots: (acp: Bool, codex: Bool) {
+            let acp = acpSlotLock.withLock { acpSlot != nil }
+            let codex = codexSlotLock.withLock { codexSlot != nil }
+            return (acp, codex)
+        }
+    #endif
 
     private let lock = NSLock()
     private struct Entry {
@@ -27,11 +110,13 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
 
     /// Capture before reading any source snapshot, not after options have been built.
     func productionGeneration(for agent: AgentProviderKind) -> UInt64 {
-        lock.withLock { generationsByAgent[agent, default: 0] }
+        ensureAdvertisedActive()
+        return lock.withLock { generationsByAgent[agent, default: 0] }
     }
 
     @discardableResult
     func record(_ options: [AgentModelOption], for agent: AgentProviderKind, generation: UInt64) -> Bool {
+        ensureAdvertisedActive()
         // Decomposition belongs to the producer too: Codex's legacy parser can consult persisted
         // discovery for extended effort suffixes. Never invoke that default parser during admission.
         let index = options.reduce(into: [String: Entry]()) { index, option in
@@ -50,6 +135,7 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
     }
 
     func invalidate(_ agent: AgentProviderKind) {
+        ensureAdvertisedActive()
         lock.withLock {
             generationsByAgent[agent, default: 0] &+= 1
             optionsByAgent.removeValue(forKey: agent)
@@ -60,6 +146,7 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
         _ modelID: String,
         availability: AgentModelCatalog.AvailabilityContext
     ) throws -> Selection {
+        ensureAdvertisedActive()
         guard let id = AgentModelSelectionID.parse(modelID),
               let agent = AgentProviderKind(rawValue: id.agentRaw),
               id.rawValue == modelID
@@ -77,6 +164,7 @@ final class AgentAdvertisedModelCatalog: @unchecked Sendable {
 
     /// Bounded memory-only recovery hints; never discover or warm a provider catalogue on refusal.
     func modelIDs(for agent: AgentProviderKind, availability: AgentModelCatalog.AvailabilityContext) -> [String] {
+        ensureAdvertisedActive()
         guard AgentModelCatalog.isAgentAvailable(agent, availability: availability) else { return [] }
         return lock.withLock {
             (optionsByAgent[agent]?.keys.sorted() ?? []).prefix(8).map {

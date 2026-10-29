@@ -1466,7 +1466,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         guard Self.shouldAdoptDiscoveredPreferredModel(for: agent) else { return }
         guard selectedAgent == agent,
               let providerID = agent.acpProviderID,
-              let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: providerID),
+              let snapshot = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: providerID),
               let preferredModelRaw = snapshot.preferredModelRaw
         else {
             return

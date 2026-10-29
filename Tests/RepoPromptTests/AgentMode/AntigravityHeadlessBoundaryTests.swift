@@ -31,7 +31,7 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
 
     @MainActor
     func testExplicitSelectionAllowsGeneralButRejectsHeadlessAntigravity() throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .antigravity)
         defer { registry.test_reset(providerID: .antigravity) }
         let model = "gemini-test-model"
@@ -54,7 +54,7 @@ final class AntigravityHeadlessBoundaryTests: XCTestCase {
 
     @MainActor
     func testStoredExploreOverridePreservesGeneralPinButFailsClosedHeadlessly() throws {
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         registry.test_reset(providerID: .antigravity)
         let settings = GlobalSettingsStore.shared
         let previousOverrides = settings.mcpAgentRoleOverrides(scope: .global)
@@ -238,7 +238,7 @@ final class AgentMCPSelectionResolverTests: XCTestCase {
     private func withFixture(_ body: (GlobalSettingsStore) throws -> Void) throws {
         let settings = GlobalSettingsStore.shared
         let originalProfile = settings.globalAgentModelsProfile()
-        let registry = AgentACPModelRegistry.shared
+        let registry = AgentModelCatalogRuntime.shared.acpRegistry
         defer {
             settings.setGlobalAgentModelsProfile(originalProfile, contextBuilderWriteIntent: .preserveExistingOwnership)
             registry.test_reset(providerID: .openCode)

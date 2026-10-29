@@ -13,11 +13,11 @@ import XCTest
 final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     override func setUp() {
         super.setUp()
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
         super.tearDown()
     }
 
@@ -59,7 +59,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
         let harness = try makeHarness(advertiseConfigOptions: true)
         let provider = harness.makeHeadlessProvider(modelString: AgentModel.defaultModel.rawValue)
         try await drain(provider, message: "hi")
-        let raws = AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.options.map(\.rawValue) ?? []
+        let raws = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .grokBuild)?.options.map(\.rawValue) ?? []
         XCTAssertTrue(raws.contains("grok-4.6-xhigh"), "expected direct effort variants, got \(raws)")
         XCTAssertTrue(raws.contains("grok-4.6-low"), "expected direct effort variants, got \(raws)")
     }
@@ -555,7 +555,7 @@ final class GrokBuildACPHeadlessAgentProviderTests: XCTestCase {
     }
 
     private func seedRegistry(with models: [String], current: String) {
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: models.map {
                     AgentModelOption(

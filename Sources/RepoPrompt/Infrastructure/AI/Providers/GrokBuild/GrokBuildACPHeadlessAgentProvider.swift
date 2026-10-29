@@ -97,7 +97,7 @@ final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
         }
         // No silent substitution: a concrete model must exist in the current Grok registry
         // snapshot; anything else fails before the prompt instead of running a stale model.
-        guard AgentACPModelRegistry.shared.resolvedSnapshot(for: .grokBuild)?.contains(rawModel: model) == true else {
+        guard AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .grokBuild)?.contains(rawModel: model) == true else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build model `\(model)` is not in the discovered model set. Refresh Grok Build models and retry."
             )

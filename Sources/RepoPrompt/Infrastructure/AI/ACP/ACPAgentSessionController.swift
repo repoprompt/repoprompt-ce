@@ -1148,7 +1148,7 @@ actor ACPAgentSessionController {
                 // recovery options here — an appended compound would lack effortVariant
                 // provenance and later read back as a real base.
                 let updatedOptions = discoveredSessionModels?.options
-                    ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID)?.options
+                    ?? AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: provider.providerID)?.options
                     ?? []
                 // The Ok confirms only the base. Preserve effort only from a report that
                 // arrived after dispatch and names this acknowledged base; a newer model-only
@@ -1208,7 +1208,7 @@ actor ACPAgentSessionController {
             }
             throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
         }
-        if let warmed = AgentACPModelRegistry.shared.resolvedSnapshot(for: provider.providerID),
+        if let warmed = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: provider.providerID),
            let match = warmed.option(matching: requestedValue)
         {
             return (match, warmed.options, false)
@@ -3504,7 +3504,7 @@ actor ACPAgentSessionController {
 
     private func publishDiscoveredSessionModelsIfGloballyAuthoritative(_ models: ACPDiscoveredSessionModels) {
         guard !provider.supportsParameterizedModelPicker else { return }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(models, for: provider.providerID)
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(models, for: provider.providerID)
     }
 
     private func parseModernModelSnapshot(from response: [String: Any]) -> ParsedModernModelSnapshot {
@@ -3654,7 +3654,7 @@ actor ACPAgentSessionController {
         guard provider.providerID == .cursor else { return selectedModel }
         let normalizedSelection = normalizedCursorModelAlias(selectedModel)
         guard !normalizedSelection.isEmpty else { return selectedModel }
-        let snapshot = discoveredSessionModels ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)
+        let snapshot = discoveredSessionModels ?? AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor)
 
         if normalizedSelection == AgentModel.cursorAuto.rawValue {
             guard let snapshot else { return nil }

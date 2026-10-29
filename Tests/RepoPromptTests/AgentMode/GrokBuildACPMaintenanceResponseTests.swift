@@ -9,11 +9,11 @@ final class GrokBuildACPMaintenanceResponseTests: XCTestCase {
     override func setUp() {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         super.setUp()
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .grokBuild)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .grokBuild)
         super.tearDown()
     }
 

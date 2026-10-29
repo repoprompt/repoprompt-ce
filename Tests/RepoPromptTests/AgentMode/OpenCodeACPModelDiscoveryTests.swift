@@ -56,15 +56,15 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
     }
 
     func testRefreshOutcomesDistinguishChangedUnchangedEmptyAndFailure() async {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         let coldEmpty = OpenCodeACPModelPollingService(
             client: RefreshClient(result: ACPDiscoveredSessionModels(options: [], currentModelRaw: nil), failure: nil), registry: .app
         )
         let coldEmptyOutcome = await coldEmpty.refreshNow(workspacePath: nil)
         XCTAssertEqual(coldEmptyOutcome, .noModelsAdvertised)
         await coldEmpty.shutdown()
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
 
         let catalog = ACPDiscoveredSessionModels(
             options: [.init(rawValue: "future-opencode", displayName: "Future", description: nil, isPlaceholderDefault: false, isProviderDefault: true)],
@@ -83,7 +83,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         let emptyOutcome = await empty.refreshNow(workspacePath: nil)
         XCTAssertEqual(emptyOutcome, .noModelsAdvertised)
         XCTAssertEqual(
-            AgentACPModelRegistry.shared.currentSnapshot(for: .openCode)?.options.map(\.rawValue),
+            AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .openCode)?.options.map(\.rawValue),
             ["future-opencode"],
             "empty discovery must retain the last known good registry catalog"
         )
@@ -107,8 +107,8 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
     /// `effort`. Effort appears only after a model set, so a catalog-only pass has empty
     /// `modelParameterSets`.
     func testControllerDiscoveryReturnsLiveBootstrapCatalogWithoutRegistryPublication() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
 
         let workspace = try makeTestDirectory(name: "OpenCodeACPModelDiscoveryTests")
         let provider = try makeFaithfulDiscoveryProvider(in: workspace)
@@ -129,12 +129,12 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         )
         // No model set was issued, so OpenCode has not advertised effort yet.
         XCTAssertTrue(snapshot.modelParameterSets.isEmpty)
-        XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .openCode))
+        XCTAssertNil(AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .openCode))
     }
 
     func testPollingServicePublishesDiscoveryResultToRegistryAfterColdStart() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
 
         let workspace = try makeTestDirectory(name: "OpenCodeACPModelPollingTests")
         let provider = try makeFaithfulDiscoveryProvider(in: workspace)
@@ -147,7 +147,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         let service = OpenCodeACPModelPollingService(client: client, registry: .app, intervalNanos: 60_000_000_000)
         addTeardownBlock { await service.shutdown() }
 
-        XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .openCode))
+        XCTAssertNil(AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .openCode))
 
         let snapshot = try await service.discoverOnce(workspacePath: workspace.path)
         let published = try XCTUnwrap(snapshot)
@@ -155,7 +155,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
         // Catalog-only discovery: bootstrap advertises no effort, so no parameter sets.
         XCTAssertTrue(published.models.modelParameterSets.isEmpty)
         XCTAssertEqual(
-            AgentACPModelRegistry.shared.currentSnapshot(for: .openCode)?.currentModelRaw,
+            AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .openCode)?.currentModelRaw,
             "ollama-cloud/kimi-k3"
         )
     }
@@ -339,8 +339,8 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             _ recordURL: URL
         ) async throws -> Result
     ) async throws -> Result {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         let workspace = try makeTestDirectory(name: name)
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
         let controller = try makeParameterDiscoveryController(
@@ -381,7 +381,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             })
 
             // The disposable controller never publishes to the global registry.
-            XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .openCode))
+            XCTAssertNil(AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .openCode))
         }
     }
 
@@ -407,7 +407,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
                 $0.method == "session/set_config_option" && $0.params["configId"] as? String == "model"
             }
             XCTAssertEqual(modelMutations.map { $0.params["value"] as? String }, ["openrouter/x-ai/grok-4.6"])
-            XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .openCode))
+            XCTAssertNil(AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .openCode))
         }
     }
 
@@ -558,8 +558,8 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             _ recordURL: URL
         ) async throws -> Result
     ) async throws -> Result {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         let workspace = try makeTestDirectory(name: "OpenCodeACPDiscoveryContract")
         let recordURL = workspace.appendingPathComponent("requests.jsonl")
         let provider = try makeFaithfulDiscoveryProvider(
@@ -623,7 +623,7 @@ final class OpenCodeACPModelDiscoveryTests: XCTestCase {
             XCTAssertTrue(recordedRequests(at: recordURL).allSatisfy {
                 $0.method != "session/set_config_option" || $0.params["configId"] as? String == "model"
             })
-            XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .openCode))
+            XCTAssertNil(AgentModelCatalogRuntime.shared.acpRegistry.currentSnapshot(for: .openCode))
         }
     }
 

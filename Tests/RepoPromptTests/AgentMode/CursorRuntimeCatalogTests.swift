@@ -13,12 +13,12 @@ final class CursorRuntimeCatalogTests: XCTestCase {
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         super.tearDown()
     }
 
     func testRefreshPublishesNewModelAcrossAgentAndChatCatalogsWithExactParameters() throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         let model = AgentModelOption(rawValue: "grok-4.7", displayName: "Grok 4.7", description: nil, isDefault: false)
         let definition = ACPModelParameterDefinition(
             kind: .thinking,
@@ -27,7 +27,7 @@ final class CursorRuntimeCatalogTests: XCTestCase {
             choices: [.init(rawValue: "extra-high", displayName: "Extra High")],
             currentValueRaw: "extra-high"
         )
-        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+        XCTAssertTrue(AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [model],
                 currentModelRaw: model.rawValue,
@@ -70,7 +70,7 @@ final class CursorRuntimeCatalogTests: XCTestCase {
             choices: [.init(rawValue: "vendor-value", displayName: "Vendor Effort")],
             currentValueRaw: "vendor-value"
         )
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             .init(
                 options: [model],
                 currentModelRaw: model.rawValue,
@@ -102,7 +102,7 @@ final class CursorRuntimeCatalogTests: XCTestCase {
 
     func testExactAdvertisedAliasKeepsItsOwnParameterIdentity() {
         let raws = ["grok-4.6", "cursor-grok-4.6"]
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             .init(
                 options: raws.map { .init(rawValue: $0, displayName: $0, description: nil, isDefault: false) },
                 currentModelRaw: raws[0],
@@ -137,7 +137,7 @@ final class CursorRuntimeCatalogTests: XCTestCase {
             XCTAssertEqual(record.modelParameterSets != nil, hasMetadata)
             let decoded = try JSONDecoder().decode(ACPDynamicProviderRecord.self, from: JSONEncoder().encode(record))
             XCTAssertEqual(try XCTUnwrap(ACPDynamicModelCanonicalization.snapshot(from: decoded)).hasModelParameterMetadata, hasMetadata)
-            _ = AgentACPModelRegistry.shared.updateDiscoveredModels(snapshot, for: .cursor)
+            _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(snapshot, for: .cursor)
             XCTAssertNil(CursorAIModelCatalog.parameterSet(for: model.rawValue))
         }
     }

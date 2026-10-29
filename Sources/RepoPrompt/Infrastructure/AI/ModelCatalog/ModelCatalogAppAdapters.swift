@@ -2,25 +2,21 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 
-extension AgentACPModelRegistry {
-    static let shared = AgentACPModelRegistry(dependencies: .app)
-}
-
 extension DevinModelCatalog {
     static var current: DevinModelCatalog {
-        AgentACPModelRegistry.shared.currentDevinCatalog()
+        AgentModelCatalogRuntime.shared.acpRegistry.currentDevinCatalog()
     }
 }
 
 extension AgentACPModelRegistry.Dependencies {
     /// Construct operations without touching the store or advertised catalog until invoked.
-    static var app: Self {
+    static func app(invalidate: @escaping (AgentProviderKind) -> Void) -> Self {
         Self(
             loadAll: { ACPDynamicModelStore.loadAll() },
             load: { ACPDynamicModelStore.load(providerID: $0) },
             save: { ACPDynamicModelStore.save($0, for: $1) },
             remove: { ACPDynamicModelStore.remove(providerID: $0) },
-            invalidate: { AgentAdvertisedModelCatalog.shared.invalidate($0) }
+            invalidate: invalidate
         )
     }
 }
@@ -28,9 +24,9 @@ extension AgentACPModelRegistry.Dependencies {
 extension CursorACPModelPollingService.Registry {
     static var app: Self {
         Self(
-            update: { AgentACPModelRegistry.shared.updateDiscoveredModels($0, for: .cursor) },
-            snapshot: { AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor) },
-            snapshotAfterWarm: { await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .cursor) }
+            update: { AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels($0, for: .cursor) },
+            snapshot: { AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor) },
+            snapshotAfterWarm: { await AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotAfterWarmingStandardStore(for: .cursor) }
         )
     }
 }
@@ -44,7 +40,7 @@ extension CursorACPModelPollingService {
 extension GrokBuildACPModelPollingService {
     static let shared = GrokBuildACPModelPollingService(
         client: GrokBuildACPControllerModelDiscoveryClient(),
-        registry: .shared,
+        registry: AgentModelCatalogRuntime.shared.acpRegistry,
         logFailure: { message in
             if AgentRuntimeProviderService.enableDebugLogging {
                 print("[GrokBuildACPModelPolling] refresh failed: \(message)")
@@ -56,9 +52,9 @@ extension GrokBuildACPModelPollingService {
 extension OpenCodeACPModelPollingService.Registry {
     static var app: Self {
         Self(
-            update: { AgentACPModelRegistry.shared.updateDiscoveredModels($0, for: .openCode) },
-            snapshot: { AgentACPModelRegistry.shared.resolvedSnapshot(for: .openCode) },
-            snapshotAfterWarm: { await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .openCode) }
+            update: { AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels($0, for: .openCode) },
+            snapshot: { AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .openCode) },
+            snapshotAfterWarm: { await AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotAfterWarmingStandardStore(for: .openCode) }
         )
     }
 }

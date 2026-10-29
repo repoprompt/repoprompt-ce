@@ -18,7 +18,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     // MARK: - Configuration-only model transaction
 
     private func advertiseModel(_ raw: String = "test-native:high", agent: AgentProviderKind = .claudeCode) -> String {
-        AgentAdvertisedModelCatalog.shared.record([
+        AgentModelCatalogRuntime.shared.record([
             AgentModelOption(
                 rawValue: raw,
                 displayName: "Test model",
@@ -26,7 +26,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
                 isPlaceholderDefault: false,
                 isProviderDefault: false
             )
-        ], for: agent, generation: AgentAdvertisedModelCatalog.shared.productionGeneration(for: agent))
+        ], for: agent, generation: AgentModelCatalogRuntime.shared.productionGeneration(for: agent))
         return AgentModelSelectionID(agentRaw: agent.rawValue, modelRaw: raw).rawValue
     }
 
@@ -50,7 +50,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
                 defer { fixture.session.saveDebounceTask?.cancel() }
                 let agent: AgentProviderKind = crossProvider ? .codexExec : .claudeCode
                 _ = advertiseModel("test-native:high", agent: agent)
-                defer { AgentAdvertisedModelCatalog.shared.invalidate(agent) }
+                defer { AgentModelCatalogRuntime.shared.invalidate(agent) }
                 let before = fixture.session.selectedModelRaw
                 let generation = fixture.session.saveRequestGeneration
                 let result = await fixture.viewModel.agentSessionLinkPerformSetModel(
@@ -79,7 +79,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
 
     func testModelRefusalOffersOnlyBoundedAdvertisedSameAgentAlternatives() async throws {
         let fixture = try makeFixture()
-        let catalog = AgentAdvertisedModelCatalog.shared
+        let catalog = AgentModelCatalogRuntime.shared
         defer { catalog.invalidate(.claudeCode) }
         let options = (0 ..< 20).map { index in
             AgentModelOption(
@@ -106,7 +106,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     func testSetModelChangesOnlyNextTurnConfigurationAndPreservesStagedHandoff() async throws {
         let fixture = try makeFixture()
         defer { fixture.session.saveDebounceTask?.cancel()
-            AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+            AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
         }
         let modelID = advertiseModel()
         fixture.session.pendingHandoff = AgentModeViewModel.PendingHandoffState(
@@ -192,7 +192,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     func testSetModelRejectsCrossAgentBeforeColdCatalogueAdmission() async throws {
         let fixture = try makeFixture()
         fixture.session.selectedAgent = .codexExec
-        AgentAdvertisedModelCatalog.shared.invalidate(.devin)
+        AgentModelCatalogRuntime.shared.invalidate(.devin)
         let originalModel = fixture.session.selectedModelRaw
         let originalEffort = fixture.session.selectedReasoningEffortRaw
         let saveGeneration = fixture.session.saveRequestGeneration
@@ -222,7 +222,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         let fixture = try makeFixture()
         let original = fixture.session.selectedModelRaw
         let modelID = advertiseModel()
-        defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+        defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
         let result = await setModel(fixture, modelID: modelID) {
             fixture.manager.workspaces[0].composeTabs[0].activeAgentSessionID = UUID()
             return .committed
@@ -261,7 +261,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
                 fixture.session.isChangingExecutionLocation = false
             }
         }
-        AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+        AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
     }
 
     func testSetModelRechecksCatalogueAndExactLivenessAfterFinalFence() async throws {
@@ -273,7 +273,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
             let result = await setModel(fixture, modelID: modelID, liveness: {
                 .init(observerEndpointIsLive: live, targetEndpointIsLive: true, targetWindowIsClosing: false)
             }) {
-                if removeCatalogue { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+                if removeCatalogue { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
                 else { live = false }
                 return .committed
             }
@@ -292,7 +292,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
         let fixture = try makeFixture()
         let modelID = advertiseModel()
         defer { fixture.session.saveDebounceTask?.cancel()
-            AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode)
+            AgentModelCatalogRuntime.shared.invalidate(.claudeCode)
         }
         let otherTab = UUID()
         fixture.viewModel.test_setCurrentTabIDOverride(otherTab)
@@ -306,7 +306,7 @@ final class AgentSessionLinkSendTransactionLiveTests: XCTestCase {
     func testSetModelLosesToComposerClaimDuringFinalHop() async throws {
         let fixture = try makeFixture()
         let modelID = advertiseModel()
-        defer { AgentAdvertisedModelCatalog.shared.invalidate(.claudeCode) }
+        defer { AgentModelCatalogRuntime.shared.invalidate(.claudeCode) }
         let before = fixture.session.selectedModelRaw
         let target = try XCTUnwrap(fixture.viewModel.makeComposerSubmitTarget(tabID: fixture.tabID, session: fixture.session))
         let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: "local")

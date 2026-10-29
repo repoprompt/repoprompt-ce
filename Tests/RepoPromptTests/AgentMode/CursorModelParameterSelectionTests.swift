@@ -16,14 +16,14 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     private func installCursorFixture() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         // Scripted runtime metadata for picker tests; never a production/offline authority.
         let speed = ACPModelParameterDefinition(
             kind: .speed, configID: "fast", displayName: "Speed",
             choices: [.init(rawValue: "false", displayName: "Standard"), .init(rawValue: "true", displayName: "Fast")],
             currentValueRaw: "true"
         )
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     .init(rawValue: "auto", displayName: "Auto", description: nil, isDefault: true),
@@ -51,7 +51,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     override func tearDown() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
         super.tearDown()
     }
 
@@ -559,7 +559,7 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         XCTAssertEqual(inherited.map(\.valueRaw), ["false"])
         let semanticReplacement = try specifier.selections(in: fresh, excludingConfigIDs: ["legacy-effort-id"], supersededKinds: [.thinking])
         XCTAssertEqual(semanticReplacement.map(\.configID), ["fast"], "Legacy explicit selectors supersede by parameter identity")
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(fresh, for: .cursor)
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(fresh, for: .cursor)
         let projected = ACPModelParameterResolver.effectiveSelections(providerID: .cursor, selectedModelRaw: raw, persistedSelections: [cursorEffortSelection(valueRaw: "low")])
         XCTAssertEqual(projected.first(where: { $0.kind == .thinking })?.valueRaw, "low")
         XCTAssertEqual(projected.first(where: { $0.kind == .speed })?.valueRaw, "false")
@@ -633,8 +633,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testActiveCursorRunLocksParameterControlsAndRejectsDefensiveSelection() {
-        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .cursor) }
         let viewModel = makeViewModel()
         let tabID = UUID()
         viewModel.test_setCurrentTabIDOverride(tabID)
@@ -1243,8 +1243,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     /// control must still render.
     @MainActor
     func testComposerObservationThroughInjectedStreamAcceptsNormalizedKeyEquivalence() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         // `/workspace-root/child/..` and `/workspace-root` are the same logical directory.
         let rawWorkspacePath = "/workspace-root/child/.."
         let recorder = SubscriptionRecorder()
@@ -1305,8 +1305,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     }
 
     func testComposerReconcilesRestoredModelWithoutResubscribingUnchangedTarget() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         let workspacePath = "/workspace-a"
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(
@@ -1375,9 +1375,9 @@ final class CursorModelParameterSelectionTests: XCTestCase {
         // Two valid OpenCode models so the target switch is a real (accepted) change.
         let modelA = "ollama-cloud/kimi-k3"
         let modelB = "anthropic/claude-sonnet"
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
-        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
+        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(
             ACPDiscoveredSessionModels(
                 options: [
                     .init(rawValue: modelA, displayName: "Kimi K3", description: nil, isPlaceholderDefault: false, isProviderDefault: true),
@@ -1461,8 +1461,8 @@ final class CursorModelParameterSelectionTests: XCTestCase {
     /// clearing and termination.
     @MainActor
     func testComposerObservationCancellationClearsOnProviderSwitch() async throws {
-        AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        defer { AgentACPModelRegistry.shared.test_reset(providerID: .openCode) }
+        AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode)
+        defer { AgentModelCatalogRuntime.shared.acpRegistry.test_reset(providerID: .openCode) }
         let workspacePath = "/workspace-a"
         let recorder = SubscriptionRecorder()
         let viewModel = AgentModeViewModel(
