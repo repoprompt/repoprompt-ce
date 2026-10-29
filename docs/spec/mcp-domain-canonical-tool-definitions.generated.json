@@ -2444,7 +2444,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Improve a RepoPrompt prompt, a project's prompt file or source passage, a pasted template, or a Python/DSPy program through one experiment lab. targets discovers prompts and models. prepare drafts examples/checks in one bounded model call; describe_program executes the selected local Python module to load a definition. Review the returned definition, then create_or_update and request_approval. Only the user can approve the full budget in native UI, which starts the first run. run resumes, status_or_wait observes, cancel stops, propose_patch prepares a reviewed source diff, export saves complete evidence. Built-in Engineer tasks run with file read/edit tools in isolated fixtures. Changes to approved authority require new approval. This tool cannot approve an optimization or apply a source patch.",
+      "description" : "Improve a RepoPrompt prompt, a project's prompt file or source passage, a pasted template, or a Python/DSPy program through one experiment lab. targets discovers prompts and models. prepare drafts examples/checks in one bounded model call. For prompt_file, prepare first queues native approval to read the file and make that call. describe_program queues native approval to execute the selected local Python module. Poll status_or_wait with the returned preparation_id; the definition is available only after native approval and completion. Review it, then create_or_update and request_approval. Only the user can approve the full budget in native UI, which starts the first run. run resumes, status_or_wait observes, cancel stops, propose_patch prepares a reviewed source diff, export saves complete evidence. Built-in Engineer tasks run with file read/edit tools in isolated fixtures. Changes to approved authority require new approval. This tool cannot approve preparation or optimization, or apply a source patch.",
       "inputSchema" : {
         "properties" : {
           "candidate_index" : {
@@ -2579,7 +2579,7 @@
               },
               "program" : {
                 "additionalProperties" : false,
-                "description" : "Project evaluator configuration. Loading or running it executes this local program. Nested names use camelCase, matching the definition returned by prepare/describe_program.",
+                "description" : "Project evaluator configuration. Inspection requires native approval and executes this module with the selected interpreter's normal project access, including any code it runs during import. Nested names use camelCase, matching the completed preparation definition.",
                 "properties" : {
                   "callable" : {
                     "default" : "evaluate",
@@ -2739,7 +2739,7 @@
             "type" : "string"
           },
           "experiment_id" : {
-            "description" : "Experiment UUID. Optional for create_or_update (update) and status_or_wait (omit to list).",
+            "description" : "Experiment UUID. Optional for create_or_update (update) and status_or_wait. In status_or_wait, mutually exclusive with preparation_id; omit both IDs to list.",
             "type" : "string"
           },
           "goal" : {
@@ -2785,9 +2785,13 @@
             "description" : "export: absolute destination for a JSON file containing the frozen definition, results and inline evidence artifacts.",
             "type" : "string"
           },
+          "preparation_id" : {
+            "description" : "status_or_wait: UUID returned by file preparation or program inspection. Mutually exclusive with experiment_id. A definition is returned only after native approval and completion.",
+            "type" : "string"
+          },
           "program" : {
             "additionalProperties" : false,
-            "description" : "Project evaluator configuration. Loading or running it executes this local program. Nested names use camelCase, matching the definition returned by prepare/describe_program.",
+            "description" : "Project evaluator configuration. Inspection requires native approval and executes this module with the selected interpreter's normal project access, including any code it runs during import. Nested names use camelCase, matching the completed preparation definition.",
             "properties" : {
               "callable" : {
                 "default" : "evaluate",
@@ -2848,7 +2852,7 @@
             "type" : "number"
           },
           "prompt_file" : {
-            "description" : "prepare: absolute path to a UTF-8 prompt/source file. Its original bytes are checked before applying a result.",
+            "description" : "prepare: absolute path to a UTF-8 prompt/source file. Queues native approval before reading the file or sending its contents to the preparation model. Its original bytes are checked before applying a result.",
             "type" : "string"
           },
           "prompt_id" : {
@@ -2876,7 +2880,7 @@
             "type" : "string"
           },
           "runner" : {
-            "description" : "describe_program: which kind of project evaluator to load; defaults to program.",
+            "description" : "describe_program: which kind of project evaluator to inspect after native approval; defaults to program.",
             "enum" : [
               "program",
               "dspy"
@@ -2888,7 +2892,7 @@
             "type" : "string"
           },
           "source_title" : {
-            "description" : "prepare: display name for a pasted prompt.",
+            "description" : "prepare: display name for a pasted or project prompt.",
             "type" : "string"
           },
           "suite_id" : {
@@ -2896,7 +2900,7 @@
             "type" : "string"
           },
           "timeout_seconds" : {
-            "description" : "status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60.",
+            "description" : "status_or_wait: seconds to wait for a preparation, approval or run change, 0-3600. Default 60. Completed preparations return immediately.",
             "type" : "number"
           },
           "title" : {

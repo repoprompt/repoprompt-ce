@@ -1148,7 +1148,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             }
             return MCPDomainToolDefinition(
                 name: MCPWindowToolName.promptExperiment,
-                description: "Improve a RepoPrompt prompt, a project's prompt file or source passage, a pasted template, or a Python/DSPy program through one experiment lab. targets discovers prompts and models. prepare drafts examples/checks in one bounded model call; describe_program executes the selected local Python module to load a definition. Review the returned definition, then create_or_update and request_approval. Only the user can approve the full budget in native UI, which starts the first run. run resumes, status_or_wait observes, cancel stops, propose_patch prepares a reviewed source diff, export saves complete evidence. Built-in Engineer tasks run with file read/edit tools in isolated fixtures. Changes to approved authority require new approval. This tool cannot approve an optimization or apply a source patch.",
+                description: "Improve a RepoPrompt prompt, a project's prompt file or source passage, a pasted template, or a Python/DSPy program through one experiment lab. targets discovers prompts and models. prepare drafts examples/checks in one bounded model call. For prompt_file, prepare first queues native approval to read the file and make that call. describe_program queues native approval to execute the selected local Python module. Poll status_or_wait with the returned preparation_id; the definition is available only after native approval and completion. Review it, then create_or_update and request_approval. Only the user can approve the full budget in native UI, which starts the first run. run resumes, status_or_wait observes, cancel stops, propose_patch prepares a reviewed source diff, export saves complete evidence. Built-in Engineer tasks run with file read/edit tools in isolated fixtures. Changes to approved authority require new approval. This tool cannot approve preparation or optimization, or apply a source patch.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
@@ -1156,20 +1156,21 @@ package enum MCPDomainCanonicalToolDefinitions {
                             "type": .string("string"),
                             "enum": .array(operations.map(Value.string))
                         ]),
-                        "experiment_id": string("Experiment UUID. Optional for create_or_update (update) and status_or_wait (omit to list)."),
+                        "experiment_id": string("Experiment UUID. Optional for create_or_update (update) and status_or_wait. In status_or_wait, mutually exclusive with preparation_id; omit both IDs to list."),
+                        "preparation_id": string("status_or_wait: UUID returned by file preparation or program inspection. Mutually exclusive with experiment_id. A definition is returned only after native approval and completion."),
                         "expected_authority_digest": string("request_approval: the authority_digest you reviewed; refused if it changed."),
                         "title": string("create_or_update: display title."),
                         "prompt_id": string("prepare or create_or_update: built-in prompt ID from targets. For a custom task, use definition instead of prompt_id in create_or_update."),
                         "prompt_text": string("prepare: prompt text or template; choose exactly one of prompt_id, prompt_text and prompt_file."),
-                        "prompt_file": string("prepare: absolute path to a UTF-8 prompt/source file. Its original bytes are checked before applying a result."),
-                        "source_title": string("prepare: display name for a pasted prompt."),
+                        "prompt_file": string("prepare: absolute path to a UTF-8 prompt/source file. Queues native approval before reading the file or sending its contents to the preparation model. Its original bytes are checked before applying a result."),
+                        "source_title": string("prepare: display name for a pasted or project prompt."),
                         "selection": string("prepare with prompt_file: exact, unique prompt passage to optimize; omit to use the complete file."),
                         "goal": string("prepare: plain-language description of the desired improvement."),
                         "example_inputs": string("prepare: optional example requests or topics, one per line, to guide the generated cases."),
                         "criteria": string("prepare: optional success requirements, one per line."),
                         "definition": promptLabDefinitionSchema,
                         "program": promptLabProgramSchema,
-                        "runner": .object(["type": .string("string"), "enum": .array([.string("program"), .string("dspy")]), "description": .string("describe_program: which kind of project evaluator to load; defaults to program.")]),
+                        "runner": .object(["type": .string("string"), "enum": .array([.string("program"), .string("dspy")]), "description": .string("describe_program: which kind of project evaluator to inspect after native approval; defaults to program.")]),
                         "suite_id": string("create_or_update: suite ID from targets; defaults to the prompt's checked-in suite."),
                         "execution_target": string("create_or_update: prompt-only target selector for the evaluated model."),
                         "reflection_target": string("prepare or create_or_update: model selector for drafting experiments or proposing prompt changes."),
@@ -1189,7 +1190,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                         "output_path": string("export: absolute destination for a JSON file containing the frozen definition, results and inline evidence artifacts."),
                         "timeout_seconds": .object([
                             "type": .string("number"),
-                            "description": .string("status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60.")
+                            "description": .string("status_or_wait: seconds to wait for a preparation, approval or run change, 0-3600. Default 60. Completed preparations return immediately.")
                         ])
                     ]),
                     "required": .array([.string("op")])
@@ -1206,7 +1207,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         private static var promptLabProgramSchema: Value {
             .object([
                 "type": .string("object"), "additionalProperties": .bool(false),
-                "description": .string("Project evaluator configuration. Loading or running it executes this local program. Nested names use camelCase, matching the definition returned by prepare/describe_program."),
+                "description": .string("Project evaluator configuration. Inspection requires native approval and executes this module with the selected interpreter's normal project access, including any code it runs during import. Nested names use camelCase, matching the completed preparation definition."),
                 "properties": .object([
                     "pythonExecutable": .object(["type": .string("string"), "description": .string("Absolute path to the project's Python executable, with its dependencies installed.")]),
                     "projectRoot": .object(["type": .string("string"), "description": .string("Absolute project directory.")]),

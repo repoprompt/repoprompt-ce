@@ -36,6 +36,7 @@
         case requestApproval(experimentID: UUID, expectedAuthorityDigest: String?)
         case run(experimentID: UUID)
         case statusOrWait(experimentID: UUID?, timeoutSeconds: TimeInterval)
+        case preparationStatusOrWait(preparationID: UUID, timeoutSeconds: TimeInterval)
         case cancel(experimentID: UUID)
         case proposePatch(experimentID: UUID, runID: UUID, candidateIndex: Int)
         case exportResult(experimentID: UUID, runID: UUID, outputPath: String)
@@ -113,7 +114,7 @@
             .createOrUpdate: createArguments,
             .requestApproval: ["experiment_id", "expected_authority_digest"],
             .run: ["experiment_id"],
-            .statusOrWait: ["experiment_id", "timeout_seconds"],
+            .statusOrWait: ["experiment_id", "preparation_id", "timeout_seconds"],
             .cancel: ["experiment_id"],
             .proposePatch: ["experiment_id", "run_id", "candidate_index"],
             .exportResult: ["experiment_id", "run_id", "output_path"]
@@ -144,14 +145,20 @@
                 case .targets:
                     return await targetsValue(service: service)
                 case let .prepare(request):
+                    if let path = request.promptFile {
+                        let pending = try service.preparationApprovals.submit(.file(.init(
+                            path: path, selection: request.selection, sourceTitle: request.sourceTitle,
+                            goal: request.goal, exampleInputs: request.exampleInputs, criteria: request.criteria,
+                            target: service.preparationTarget(request.targetSelector)
+                        )))
+                        return try preparationValue(pending)
+                    }
                     let source: PromptLabSource
                     if let rawID = request.promptID {
                         guard let id = BuiltInPromptID(rawValue: rawID) else {
                             throw PromptExperimentAuthorityError.invalidRequest("Unknown built-in prompt. Call targets to list the available prompts.")
                         }
                         source = try service.source(for: id)
-                    } else if let path = request.promptFile {
-                        source = try PromptLabSource.importFile(url: URL(fileURLWithPath: path), selection: request.selection)
                     } else {
                         source = PromptLabSource(kind: .pasted, title: request.sourceTitle ?? "Pasted prompt", prompt: request.promptText ?? "")
                     }
@@ -164,11 +171,7 @@
                         "next_action": .string("Review the generated examples and criteria with the user; then pass definition to create_or_update. This preparation made one model call and did not approve or start optimization.")
                     ])
                 case let .describeProgram(program, runner):
-                    let definition = try await service.describeProgram(program, runner: runner)
-                    return try .object([
-                        "definition": encodedValue(definition),
-                        "next_action": .string("Review this program's prompt, examples, checks and model routing; supply the user's starting prompt if source.prompt is empty, then pass definition to create_or_update. Loading the description executed the selected local Python module, not an optimization run.")
-                    ])
+                    return try preparationValue(service.preparationApprovals.submit(.program(program, runner)))
                 case let .createOrUpdate(request):
                     return try await experimentValue(service.createOrUpdate(request))
                 case let .requestApproval(experimentID, digest):
@@ -178,9 +181,14 @@
                 case let .statusOrWait(experimentID, timeout):
                     guard let experimentID else {
                         await service.load()
-                        return .object(["experiments": .array(service.experiments.map(summaryValue))])
+                        return .object([
+                            "experiments": .array(service.experiments.map(summaryValue)),
+                            "preparation_requests": .array(service.preparationApprovals.requests.map(preparationSummaryValue))
+                        ])
                     }
                     return try await experimentValue(service.statusOrWait(experimentID: experimentID, timeoutSeconds: timeout))
+                case let .preparationStatusOrWait(preparationID, timeout):
+                    return try await preparationValue(service.preparationApprovals.statusOrWait(id: preparationID, timeoutSeconds: timeout))
                 case let .cancel(experimentID):
                     return try await experimentValue(service.cancel(experimentID: experimentID))
                 case let .proposePatch(experimentID, runID, candidateIndex):
@@ -258,7 +266,7 @@
                     return nil
                 }
                 guard let id = UUID(uuidString: text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                    errors.append(.init(field: key, message: "Must be an experiment UUID."))
+                    errors.append(.init(field: key, message: "Must be a UUID."))
                     return nil
                 }
                 return id
@@ -327,6 +335,12 @@
                 command = uuid("experiment_id", required: true).map { .run(experimentID: $0) }
             case .statusOrWait:
                 let id = uuid("experiment_id", required: false)
+                let preparationID = uuid("preparation_id", required: false)
+                if args["experiment_id"] != nil, args["experiment_id"] != .null,
+                   args["preparation_id"] != nil, args["preparation_id"] != .null
+                {
+                    errors.append(.init(field: "preparation_id", message: "Use either preparation_id or experiment_id, not both."))
+                }
                 var timeout = defaultWaitSeconds
                 if let value = args["timeout_seconds"], value != .null {
                     let seconds: Double? = switch value {
@@ -340,7 +354,11 @@
                         errors.append(.init(field: "timeout_seconds", message: "Must be a number between 0 and 3600."))
                     }
                 }
-                command = .statusOrWait(experimentID: id, timeoutSeconds: id == nil ? 0 : timeout)
+                command = if let preparationID {
+                    .preparationStatusOrWait(preparationID: preparationID, timeoutSeconds: timeout)
+                } else {
+                    .statusOrWait(experimentID: id, timeoutSeconds: id == nil ? 0 : timeout)
+                }
             case .cancel:
                 command = uuid("experiment_id", required: true).map { .cancel(experimentID: $0) }
             case .proposePatch:
@@ -525,11 +543,11 @@
                 ]),
                 "notes": .array([
                     "One lab optimizes RPCE prompts, project prompt files or selected source passages, pasted templates, and Python/DSPy programs. A frozen definition records the goal, examples, criteria and actual task runner.",
-                    "prepare drafts examples and checks with one bounded model call. describe_program executes the selected local Python module to load its description. Review the returned definition before create_or_update; neither operation approves optimization.",
+                    "prepare drafts examples and checks with one bounded model call. With prompt_file it first returns a preparation_id for native approval to read the file and send its prompt to the selected model. describe_program also returns a preparation_id; native approval is required before importing project Python. Poll status_or_wait with that ID to receive the prepared definition, then review it before create_or_update. Preparation approval does not authorize optimization.",
                     "New Experiment in Window ▸ Prompt Experiments… (⌥⌘E) creates a draft without an agent. request_approval shows a native review; only the user can approve. Approval covers max_evaluations plus the separate calibration_evaluations and starts the first run. Evaluation counts are not model-call or dollar caps.",
                     "Oracle uses production prompt packaging. Engineer evaluates real file tasks in separate fixtures with read/edit tools and private acceptance checks; shell, web and delegation are disabled. Python/DSPy programs execute the selected project evaluator and its dependencies.",
                     "run resumes an approved experiment within its remaining cap. Changing any authority field creates a new experiment that needs its own approval.",
-                    "status_or_wait with experiment_id blocks until the approval or run state changes, or timeout_seconds elapses.",
+                    "status_or_wait accepts either experiment_id or preparation_id and blocks until its state changes or timeout_seconds elapses. A preparation request can only be approved, declined or cancelled in native UI; a completed request cannot execute again.",
                     "propose_patch selects a retained candidate from a completed run; only native UI can apply or reject its source diff. Pasted prompts can be copied or saved in Studio. export writes a JSON evidence file with the frozen definition and result artifacts.",
                     "Token reductions require reported usage on matching examples. Inspect comparison coverage, final-check quality and baseline variability before claiming an improvement."
                 ].map(Value.string))
@@ -614,6 +632,42 @@
                 "model": .string(target.modelRaw),
                 "prompt_only": .bool(PromptExperimentConnectedModelRunner.supportsPromptOnlyCallbacks(target))
             ])
+        }
+
+        /// Pending responses contain only caller-supplied metadata. Local content is returned
+        /// only after the user has explicitly authorized preparation in native UI.
+        static func preparationSummaryValue(_ request: PromptLabPreparationRequest) -> Value {
+            .object([
+                "preparation_id": .string(request.id.uuidString),
+                "title": .string(request.title),
+                "status": .string(request.status.rawValue)
+            ])
+        }
+
+        static func preparationValue(_ request: PromptLabPreparationRequest) throws -> Value {
+            let nextAction = switch request.status {
+            case .awaitingApproval:
+                "Ask the user to review this preparation in the native card or Window ▸ Prompt Experiments… (⌥⌘E). Only native controls can approve reading the prompt file or importing project Python. Poll status_or_wait with preparation_id; do not resubmit the request."
+            case .running:
+                "Poll status_or_wait with preparation_id for the prepared definition. The native review can cancel preparation."
+            case .completed:
+                "Review the returned prompt, examples, checks and model routing with the user, then pass definition to create_or_update. Supply the starting prompt if source.prompt is empty. Preparation did not approve or start optimization."
+            case .failed:
+                "Review the preparation error. Correct the inputs and submit a new request if needed; new file access or program inspection requires its own native approval."
+            case .rejected, .cancelled:
+                "The user declined or cancelled this preparation. Do not retry without a new user request."
+            }
+            var value: [String: Value] = [
+                "preparation_id": .string(request.id.uuidString),
+                "title": .string(request.title),
+                "status": .string(request.status.rawValue),
+                "next_action": .string(nextAction)
+            ]
+            if request.status == .completed, let definition = request.definition {
+                value["definition"] = try encodedValue(definition)
+            }
+            if let error = request.error { value["error"] = .string(error) }
+            return .object(value)
         }
 
         static func nextAction(_ experiment: PromptExperiment) -> String {

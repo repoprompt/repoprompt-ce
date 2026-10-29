@@ -154,6 +154,94 @@ import XCTest
             XCTAssertNil(program.moduleSHA256)
         }
 
+        func testPreparationStatusParsesItsOwnIDAndRejectsAmbiguousAuthority() throws {
+            let preparationID = UUID()
+            XCTAssertEqual(try PromptExperimentMCPControl.parse([
+                "op": "status_or_wait", "preparation_id": .string(preparationID.uuidString), "timeout_seconds": .int(0)
+            ]), .preparationStatusOrWait(preparationID: preparationID, timeoutSeconds: 0))
+            XCTAssertEqual(try PromptExperimentMCPControl.parse([
+                "op": "status_or_wait", "preparation_id": .string(preparationID.uuidString)
+            ]), .preparationStatusOrWait(preparationID: preparationID, timeoutSeconds: 60))
+            XCTAssertThrowsError(try PromptExperimentMCPControl.parse([
+                "op": "status_or_wait", "preparation_id": .string(preparationID.uuidString),
+                "experiment_id": .string(UUID().uuidString)
+            ])) { error in
+                XCTAssertEqual((error as? PromptExperimentMCPError)?.fields.map(\.field), ["preparation_id"])
+            }
+            XCTAssertThrowsError(try PromptExperimentMCPControl.parse([
+                "op": "status_or_wait", "preparation_id": "invalid", "timeout_seconds": .int(-1)
+            ])) { error in
+                XCTAssertEqual(Set((error as? PromptExperimentMCPError)?.fields.map(\.field) ?? []), ["preparation_id", "timeout_seconds"])
+            }
+            XCTAssertThrowsError(try PromptExperimentMCPControl.parse([
+                "op": "status_or_wait", "preparation_id": .string(preparationID.uuidString), "approve": .bool(true)
+            ])) { error in
+                XCTAssertEqual((error as? PromptExperimentMCPError)?.fields.map(\.field), ["approve"])
+            }
+        }
+
+        func testProgramInspectionQueuesNativeReviewWithoutReadingOrExecutingProject() async throws {
+            let (service, runtime) = try makeService()
+            let response = try await PromptExperimentMCPControl.handle(args: [
+                "op": "describe_program", "runner": "dspy",
+                "program": .object([
+                    "pythonExecutable": "/does/not/exist/python", "projectRoot": "/does/not/exist/project", "modulePath": "evaluation.py"
+                ])
+            ], service: service)
+            let object = try XCTUnwrap(response.objectValue)
+            let id = try XCTUnwrap(object["preparation_id"]?.stringValue)
+            XCTAssertEqual(object["status"]?.stringValue, "awaitingApproval")
+            XCTAssertNil(object["definition"], "Unapproved inspection must not disclose a local program or dataset")
+            XCTAssertEqual(service.preparationApprovals.requests.count, 1)
+            XCTAssertTrue(runtime.submitted.isEmpty)
+            let polled = try await PromptExperimentMCPControl.handle(args: [
+                "op": "status_or_wait", "preparation_id": .string(id), "timeout_seconds": .int(0)
+            ], service: service)
+            XCTAssertEqual(polled, response, "Observation cannot import the module or grant authority")
+            let listed = try await PromptExperimentMCPControl.handle(args: ["op": "status_or_wait"], service: service)
+            let summary = try XCTUnwrap(listed.objectValue?["preparation_requests"]?.arrayValue?.first?.objectValue)
+            XCTAssertEqual(summary["preparation_id"]?.stringValue, id)
+            XCTAssertNil(summary["definition"])
+            XCTAssertNil(summary["program"])
+        }
+
+        func testFilePreparationQueuesNativeReviewBeforeFileReadOrModelCall() async throws {
+            let (service, runtime) = try makeService()
+            let response = try await PromptExperimentMCPControl.handle(args: [
+                "op": "prepare", "prompt_file": "/does/not/exist/private-prompt.md", "goal": "Use fewer tokens while preserving facts."
+            ], service: service)
+            let object = try XCTUnwrap(response.objectValue)
+            let id = try XCTUnwrap(object["preparation_id"]?.stringValue)
+            XCTAssertEqual(object["status"]?.stringValue, "awaitingApproval")
+            XCTAssertNil(object["definition"], "An unread file cannot be included in the preparation response")
+            XCTAssertNil(object["prompt"])
+            XCTAssertEqual(service.preparationApprovals.requests.count, 1)
+            XCTAssertTrue(runtime.submitted.isEmpty)
+            let polled = try await PromptExperimentMCPControl.handle(args: [
+                "op": "status_or_wait", "preparation_id": .string(id), "timeout_seconds": .int(0)
+            ], service: service)
+            XCTAssertEqual(polled, response)
+        }
+
+        func testPreparationEncodingReleasesDefinitionOnlyAfterNativeCompletion() async throws {
+            let (service, _) = try makeService()
+            let definition = PromptLabDefinition(
+                source: .init(kind: .pasted, title: "Inspected prompt", prompt: "Private program prompt"),
+                goal: "Preserve quality.", examples: [], criteria: "Stay factual."
+            )
+            let approvals = PromptLabPreparationApprovals(executor: { _, _ in definition })
+            let request = try approvals.submit(.program(.init(
+                pythonExecutable: "/project/python", projectRoot: "/project", modulePath: "evaluate.py"
+            ), .program))
+            XCTAssertNil(try PromptExperimentMCPControl.preparationValue(request).objectValue?["definition"])
+            try await approvals.approve(requestID: request.id, service: service)
+            let completed = try XCTUnwrap(approvals.request(id: request.id))
+            let response = try PromptExperimentMCPControl.preparationValue(completed)
+            XCTAssertEqual(response.objectValue?["status"]?.stringValue, "completed")
+            XCTAssertEqual(response.objectValue?["definition"], try PromptExperimentMCPControl.encodedValue(definition))
+            XCTAssertNil(PromptExperimentMCPControl.preparationSummaryValue(completed).objectValue?["definition"], "Listing requests must not disclose their source contents")
+        }
+
         func testDiscoveredProgramPreservesRoutingEnvironmentAndDependencySeals() throws {
             var errors: [PromptExperimentFieldError] = []
             let program = try XCTUnwrap(PromptExperimentMCPControl.decodeProgram(.object([

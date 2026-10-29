@@ -9,6 +9,7 @@
             exampleInputs: String,
             criteria: String,
             targetSelector: String?,
+            expectedTarget: PromptExperimentResolvedTarget? = nil,
             completer: PromptExperimentModelCompleting? = nil
         ) async throws -> PromptLabDefinition {
             _ = try source.validated()
@@ -16,6 +17,11 @@
                 throw PromptExperimentAuthorityError.invalidRequest("Describe what you want to improve first.")
             }
             let target = try preparationTarget(targetSelector)
+            if let expectedTarget,
+               target.agentRaw != expectedTarget.agentRaw || target.modelRaw != expectedTarget.modelRaw
+            {
+                throw PromptExperimentAuthorityError.invalidRequest("The preparation model changed while awaiting review. Request a new preparation for the current model.")
+            }
             let request: [String: Any] = [
                 "prompt": source.prompt, "goal": goal, "supplied_examples": exampleInputs,
                 "criteria": criteria, "template_variables": PromptLabTemplate.variables(in: source.prompt)

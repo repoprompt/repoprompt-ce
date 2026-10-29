@@ -662,6 +662,243 @@ import XCTest
 
 #if DEBUG
     @MainActor
+    final class PromptLabPreparationApprovalTests: XCTestCase {
+        private var roots: [URL] = []
+
+        private final class CountingCompleter: PromptExperimentModelCompleting {
+            var calls = 0
+
+            func complete(
+                target _: PromptExperimentResolvedTarget,
+                systemPrompt _: String,
+                userPrompt _: String,
+                callbackRoot _: URL
+            ) async throws -> PromptExperimentConnectedModelCompletion {
+                calls += 1
+                throw PromptExperimentAuthorityError.invalidRequest("Unexpected preparation call")
+            }
+        }
+
+        override func tearDown() async throws {
+            for root in roots {
+                try? FileManager.default.removeItem(at: root)
+            }
+            roots = []
+            try await super.tearDown()
+        }
+
+        private func service() throws -> PromptExperimentService {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            roots.append(root)
+            let registry = try PromptExperimentTestFixtures.makeRegistry(root: root)
+            return PromptExperimentTestFixtures.makeService(root: root, registry: registry, runtime: FakeRuntime(root: root))
+        }
+
+        private func filePayload(path: String = "/missing/rpce-preparation-prompt.md") -> PromptLabPreparationPayload {
+            .file(.init(
+                path: path, selection: nil, sourceTitle: "Blog prompt", goal: "Make useful, concise posts.",
+                exampleInputs: "Explain gardening", criteria: "Uses the supplied facts", target: PromptExperimentTestFixtures.reflection
+            ))
+        }
+
+        private func definition() -> PromptLabDefinition {
+            PromptLabDefinition(
+                source: .init(kind: .pasted, title: "Blog prompt", prompt: "Use the supplied facts."),
+                goal: "Make useful posts.", examples: [], criteria: "Uses the supplied facts"
+            )
+        }
+
+        func testSubmittingFileAndProgramRequestsDoesNotReadOrExecute() throws {
+            var calls = 0
+            let approvals = PromptLabPreparationApprovals { _, _ in
+                calls += 1
+                return self.definition()
+            }
+            let file = try approvals.submit(filePayload())
+            let program = try approvals.submit(.program(.init(
+                pythonExecutable: "/missing/python", projectRoot: "/missing/project", modulePath: "evaluate.py"
+            ), .dspy))
+            XCTAssertEqual(calls, 0)
+            XCTAssertEqual(file.status, .awaitingApproval)
+            XCTAssertEqual(program.status, .awaitingApproval)
+            XCTAssertNil(file.definition)
+            XCTAssertNil(program.definition)
+            XCTAssertNil(file.error)
+        }
+
+        func testNativeApprovalExecutesExactlyOnceAndPreservesSubmittedArguments() async throws {
+            let service = try service()
+            var calls: [PromptLabPreparationPayload] = []
+            let approvals = PromptLabPreparationApprovals { payload, _ in
+                calls.append(payload)
+                return self.definition()
+            }
+            var program = PromptLabProgram(pythonExecutable: "/missing/python", projectRoot: "/missing/project", modulePath: "original.py")
+            let requested = PromptLabPreparationPayload.program(program, .program)
+            let request = try approvals.submit(requested)
+            program.modulePath = "changed.py"
+            try await approvals.approve(requestID: request.id, service: service)
+            XCTAssertEqual(calls, [requested])
+            XCTAssertEqual(approvals.request(id: request.id)?.status, .completed)
+            XCTAssertNotNil(approvals.request(id: request.id)?.definition)
+            do {
+                try await approvals.approve(requestID: request.id, service: service)
+                XCTFail("Settled approval cannot be replayed")
+            } catch PromptExperimentAuthorityError.invalidRequest {}
+            XCTAssertEqual(calls.count, 1)
+            let changed = try approvals.submit(.program(program, .program))
+            XCTAssertNotEqual(request.id, changed.id)
+            XCTAssertEqual(changed.status, .awaitingApproval)
+        }
+
+        func testRejectedAndCancelledRequestsNeverExecute() async throws {
+            let service = try service()
+            var calls = 0
+            let approvals = PromptLabPreparationApprovals { _, _ in
+                calls += 1
+                return self.definition()
+            }
+            let rejected = try approvals.submit(filePayload())
+            try approvals.reject(requestID: rejected.id)
+            let cancelled = try approvals.submit(filePayload())
+            try approvals.cancel(requestID: cancelled.id)
+            for request in [rejected, cancelled] {
+                do {
+                    try await approvals.approve(requestID: request.id, service: service)
+                    XCTFail("Rejected or cancelled requests cannot execute")
+                } catch PromptExperimentAuthorityError.invalidRequest {}
+                XCTAssertNil(approvals.request(id: request.id)?.definition)
+            }
+            XCTAssertEqual(calls, 0)
+        }
+
+        func testCancellationDiscardsAResultEvenWhenExecutorReturnsLate() async throws {
+            let service = try service()
+            let started = expectation(description: "executor started")
+            var finish: CheckedContinuation<Void, Never>?
+            let approvals = PromptLabPreparationApprovals { _, _ in
+                await withCheckedContinuation { continuation in
+                    finish = continuation
+                    started.fulfill()
+                }
+                return self.definition()
+            }
+            let request = try approvals.submit(filePayload())
+            let approval = Task { try await approvals.approve(requestID: request.id, service: service) }
+            await fulfillment(of: [started], timeout: 2)
+            try approvals.cancel(requestID: request.id)
+            finish?.resume()
+            try await approval.value
+            XCTAssertEqual(approvals.request(id: request.id)?.status, .cancelled)
+            XCTAssertNil(approvals.request(id: request.id)?.definition)
+        }
+
+        func testProductionFileAccessOccursOnlyAfterApprovalAndFailureCannotBeReplayed() async throws {
+            let service = try service()
+            let approvals = PromptLabPreparationApprovals()
+            let request = try approvals.submit(filePayload(path: "/missing/\(UUID().uuidString)/prompt.md"))
+            XCTAssertEqual(request.status, .awaitingApproval)
+            try await approvals.approve(requestID: request.id, service: service)
+            XCTAssertEqual(approvals.request(id: request.id)?.status, .failed)
+            XCTAssertNotNil(approvals.request(id: request.id)?.error)
+            XCTAssertNil(approvals.request(id: request.id)?.definition)
+            do {
+                try await approvals.approve(requestID: request.id, service: service)
+                XCTFail("Failed preparations require fresh consent")
+            } catch PromptExperimentAuthorityError.invalidRequest {}
+        }
+
+        func testChangedPreparationModelFailsBeforeSendingSourceToProvider() async throws {
+            let service = try service()
+            let completer = CountingCompleter()
+            let reviewed = PromptExperimentResolvedTarget(role: "design", agentRaw: "reviewed-provider", modelRaw: "reviewed-model", displayName: "Reviewed model")
+            do {
+                _ = try await service.prepareDefinition(
+                    source: .init(kind: .pasted, title: "Private prompt", prompt: "Use the supplied facts."),
+                    goal: "Improve quality", exampleInputs: "", criteria: "", targetSelector: "design",
+                    expectedTarget: reviewed, completer: completer
+                )
+                XCTFail("A changed target requires new native review")
+            } catch PromptExperimentAuthorityError.invalidRequest {}
+            XCTAssertEqual(completer.calls, 0)
+        }
+
+        func testCancelledExecutionsRemainWithinPendingLimitUntilTheySettle() async throws {
+            let service = try service()
+            var finishes: [CheckedContinuation<Void, Never>] = []
+            let started = expectation(description: "all executions started")
+            started.expectedFulfillmentCount = 20
+            let approvals = PromptLabPreparationApprovals { _, _ in
+                await withCheckedContinuation { continuation in
+                    finishes.append(continuation)
+                    started.fulfill()
+                }
+                return self.definition()
+            }
+            var tasks: [Task<Void, Error>] = []
+            for _ in 0 ..< 20 {
+                let request = try approvals.submit(filePayload())
+                tasks.append(Task { try await approvals.approve(requestID: request.id, service: service) })
+            }
+            await fulfillment(of: [started], timeout: 2)
+            for request in approvals.requests {
+                try approvals.cancel(requestID: request.id)
+            }
+            XCTAssertThrowsError(try approvals.submit(filePayload()), "Cancelling a slow process cannot free its active admission before settlement")
+            for finish in finishes {
+                finish.resume()
+            }
+            for task in tasks {
+                try await task.value
+            }
+            XCTAssertTrue(approvals.requests.allSatisfy { $0.status == .cancelled && $0.definition == nil })
+            XCTAssertNoThrow(try approvals.submit(filePayload()))
+        }
+
+        func testWaitReturnsTerminalStateAndCancellationDoesNotApprove() async throws {
+            let approvals = PromptLabPreparationApprovals()
+            let request = try approvals.submit(filePayload())
+            let waiter = Task { try await approvals.statusOrWait(id: request.id, timeoutSeconds: 60) }
+            await Task.yield()
+            try approvals.reject(requestID: request.id)
+            let rejected = try await waiter.value
+            XCTAssertEqual(rejected.status, .rejected)
+            let settled = try await approvals.statusOrWait(id: request.id, timeoutSeconds: 3600)
+            XCTAssertEqual(settled.status, .rejected)
+            let pending = try approvals.submit(filePayload())
+            let cancelledWaiter = Task { try await approvals.statusOrWait(id: pending.id, timeoutSeconds: 60) }
+            cancelledWaiter.cancel()
+            do {
+                _ = try await cancelledWaiter.value
+                XCTFail("Waiting must respect cancellation")
+            } catch is CancellationError {}
+            XCTAssertEqual(approvals.request(id: pending.id)?.status, .awaitingApproval)
+            let timedOut = try await approvals.statusOrWait(id: pending.id, timeoutSeconds: 0.01)
+            XCTAssertEqual(timedOut.status, .awaitingApproval)
+        }
+
+        func testPendingAndHistoryQueuesAreBounded() throws {
+            let approvals = PromptLabPreparationApprovals()
+            for _ in 0 ..< 20 {
+                try approvals.submit(filePayload())
+            }
+            XCTAssertThrowsError(try approvals.submit(filePayload()))
+            for request in approvals.requests {
+                try approvals.reject(requestID: request.id)
+            }
+            for _ in 0 ..< 60 {
+                let request = try approvals.submit(filePayload())
+                try approvals.reject(requestID: request.id)
+            }
+            XCTAssertEqual(approvals.requests.count, 50)
+            XCTAssertThrowsError(try approvals.submit(filePayload(path: "relative.md")))
+        }
+    }
+#endif
+
+#if DEBUG
+    @MainActor
     final class PromptLabDefinitionTests: XCTestCase {
         private var roots: [URL] = []
 

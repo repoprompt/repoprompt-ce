@@ -61,6 +61,8 @@
         @Published private(set) var isLoaded = false
         @Published private(set) var discardedLegacyLabData = false
 
+        let preparationApprovals = PromptLabPreparationApprovals()
+
         private let store: PromptExperimentStore
         private let runtime: PromptExperimentRuntime
         private let patchProposer: PromptPatchProposer
