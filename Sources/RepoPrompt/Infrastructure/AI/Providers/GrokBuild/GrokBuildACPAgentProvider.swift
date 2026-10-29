@@ -9,6 +9,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
     private let config: GrokBuildAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: GrokBuildACPLaunchResolver
+    private let toolNames: ACPToolNameResolution
     let directEffortWireState = GrokBuildDirectEffortWireState()
 
     #if DEBUG
@@ -19,8 +20,9 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
 
     init(
         config: GrokBuildAgentConfig,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: GrokBuildACPLaunchResolver = GrokBuildACPLaunchResolver()
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration,
+        launchResolver: GrokBuildACPLaunchResolver,
+        toolNames: ACPToolNameResolution
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = RepoPromptMCPServerConfiguration(
@@ -30,6 +32,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
             env: repoPromptMCPConfiguration.env
         )
         self.launchResolver = launchResolver
+        self.toolNames = toolNames
     }
 
     var providerID: ACPProviderID {
@@ -151,7 +154,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         _ payload: [String: Any],
         sessionID _: String
     ) -> [NormalizedAgentRuntimeEvent] {
-        GrokBuildACPEventNormalizer.normalize(payload)
+        GrokBuildACPEventNormalizer.normalize(payload, toolNames: toolNames)
     }
 
     func shouldEmitStderrLine(_ line: String) -> Bool {

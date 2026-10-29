@@ -8,16 +8,16 @@ import RepoPromptDomainRuntime
 /// default ACP normalizer. Grok's `_x.ai/*` extension updates ride separate methods
 /// and never reach this normalizer.
 enum GrokBuildACPEventNormalizer {
-    static func normalize(_ payload: [String: Any]) -> [NormalizedAgentRuntimeEvent] {
+    static func normalize(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> [NormalizedAgentRuntimeEvent] {
         guard let sessionUpdate = (payload["sessionUpdate"] as? String)?.lowercased() else {
-            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .grokBuild)
+            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .grokBuild, toolNames: toolNames)
         }
 
         switch sessionUpdate {
         case "tool_call", "tool_call_update":
             var normalizedPayload = payload
             if sessionUpdate == "tool_call" {
-                let nativeName = ACPRuntimeEventParsing.normalizedToolName(from: payload)
+                let nativeName = ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
                 if nativeName == "search_replace" || nativeName == "write" {
                     normalizedPayload["toolName"] = "edit"
                 }
@@ -38,9 +38,9 @@ enum GrokBuildACPEventNormalizer {
                 }
                 normalizedPayload["rawOutput"] = result
             }
-            return ACPDefaultSessionUpdateNormalizer.normalize(normalizedPayload, providerID: .grokBuild)
+            return ACPDefaultSessionUpdateNormalizer.normalize(normalizedPayload, providerID: .grokBuild, toolNames: toolNames)
         default:
-            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .grokBuild)
+            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .grokBuild, toolNames: toolNames)
         }
     }
 
