@@ -161,10 +161,7 @@ struct OpenCodeACPModelParameterKey: Hashable {
     init(workspacePath: String?, modelRaw: String) {
         self.workspacePath = Self.normalizedWorkspacePath(workspacePath)
         wireModelRaw = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        canonicalBaseModelRaw = ACPModelParameterIdentity.canonicalBaseModelRaw(
-            modelRaw,
-            providerID: .openCode
-        )
+        canonicalBaseModelRaw = ACPModelIdentityNormalization.caseInsensitive(modelRaw)
     }
 
     static func == (lhs: Self, rhs: Self) -> Bool {

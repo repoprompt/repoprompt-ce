@@ -63,6 +63,6 @@ package struct ACPModelParameterIdentity: Hashable {
         if providerID == .cursor {
             return SettingsModelIdentityPolicy.canonicalCursorModelRaw(raw)
         }
-        return raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ACPModelIdentityNormalization.caseInsensitive(raw)
     }
 }

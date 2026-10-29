@@ -6,6 +6,15 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class OpenCodeACPModelDiscoveryTests: XCTestCase {
+    func testObservationKeySharesSettingsIdentityWithoutChangingWireModel() {
+        let key = OpenCodeACPModelParameterKey(workspacePath: "/tmp/parent/../workspace", modelRaw: "  Vendor/Model-X  ")
+        let equivalent = OpenCodeACPModelParameterKey(workspacePath: "/tmp/workspace", modelRaw: "vendor/model-x")
+        XCTAssertEqual(key, equivalent)
+        XCTAssertEqual(key.wireModelRaw, "Vendor/Model-X")
+        XCTAssertEqual(key.canonicalBaseModelRaw, ACPModelParameterIdentity.canonicalBaseModelRaw("  Vendor/Model-X  ", providerID: .openCode))
+        XCTAssertNotEqual(key, OpenCodeACPModelParameterKey(workspacePath: nil, modelRaw: "vendor/model-x"))
+    }
+
     private struct RefreshClient: OpenCodeACPModelDiscoveryClient {
         let result: ACPDiscoveredSessionModels?
         let failure: (any Error)?
