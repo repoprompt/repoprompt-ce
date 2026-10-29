@@ -1,12 +1,13 @@
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
-@testable import RepoPromptApp
+import RepoPromptDomainRuntime
+import RepoPromptProcess
 import XCTest
 
 /// Provider-boundary coverage for exact Grok reasoning-effort wire values and fail-closed
 /// interpretation of malformed or ambiguous advertisements.
-final class GrokBuildReasoningEffortAdvertisementTests: XCTestCase {
+final class GrokBuildReasoningEffortAdvertisementOwnerTests: XCTestCase {
     func testExactAdvertisedAliasIsUsedOnWire() throws {
         let provider = makeProvider()
         let models = try validModels(provider.parseDirectSessionModelSnapshot(from: response(
@@ -128,7 +129,19 @@ final class GrokBuildReasoningEffortAdvertisementTests: XCTestCase {
 
     private func makeProvider() -> GrokBuildACPAgentProvider {
         GrokBuildACPAgentProvider(
-            config: GrokBuildAgentConfig(includeRepoPromptMCPServer: false)
+            config: GrokBuildAgentConfig(additionalPathHints: [], includeRepoPromptMCPServer: false),
+            repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration(command: "/usr/bin/true"),
+            launchResolver: GrokBuildACPLaunchResolver(
+                launchEnvironmentProvider: { _ in ACPLaunchEnvironment(environment: [:]) },
+                supplementalPathProvider: { $0 },
+                environmentFilter: { environment, _ in environment },
+                failureRecorder: { _, _ in }
+            ),
+            toolNames: ACPToolNameResolution(
+                isRepoPromptServerIdentifier: { _ in false },
+                canonicalRepoPromptToolName: { _ in nil },
+                isRepoPromptToolNameWithServerPrefix: { _ in false }
+            )
         )
     }
 
