@@ -1,27 +1,27 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptDomainRuntime
 
-enum CursorACPEventNormalizer {
-    static func normalize(_ payload: [String: Any]) -> [NormalizedAgentRuntimeEvent] {
+package enum CursorACPEventNormalizer {
+    package static func normalize(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> [NormalizedAgentRuntimeEvent] {
         guard let sessionUpdate = (payload["sessionUpdate"] as? String)?.lowercased() else {
-            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .cursor)
+            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .cursor, toolNames: toolNames)
         }
 
         switch sessionUpdate {
         case "tool_call", "tool_call_update":
-            guard !shouldSuppressPlaceholderToolEvent(payload) else { return [] }
+            guard !shouldSuppressPlaceholderToolEvent(payload, toolNames: toolNames) else { return [] }
             return ACPDefaultSessionUpdateNormalizer.normalize(
                 ACPToolUpdateResultAdapter.adaptedTerminalToolUpdatePayload(payload, sessionUpdate: sessionUpdate),
-                providerID: .cursor
+                providerID: .cursor,
+                toolNames: toolNames
             )
         default:
-            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .cursor)
+            return ACPDefaultSessionUpdateNormalizer.normalize(payload, providerID: .cursor, toolNames: toolNames)
         }
     }
 
-    private static func shouldSuppressPlaceholderToolEvent(_ payload: [String: Any]) -> Bool {
-        let toolName = ACPRuntimeEventParsing.normalizedToolName(from: payload)
+    private static func shouldSuppressPlaceholderToolEvent(_ payload: [String: Any], toolNames: ACPToolNameResolution) -> Bool {
+        let toolName = ACPRuntimeEventParsing.normalizedToolName(from: payload, toolNames: toolNames)
         let normalized = toolName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard normalized == "other" || normalized == "tool" else { return false }
         return !hasMeaningfulPlaceholderPayload(payload)

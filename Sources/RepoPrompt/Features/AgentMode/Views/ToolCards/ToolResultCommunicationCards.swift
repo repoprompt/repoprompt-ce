@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import SwiftUI
 
 func oracleToolResultPopoverUserInfo(

@@ -1,8 +1,7 @@
 import Foundation
-import RepoPromptDomainRuntime
 
-enum AgentOracleAuthoritativeChatIDPolicy {
-    static func extract(fromSerializedJSON json: String?) -> String? {
+package enum AgentOracleAuthoritativeChatIDPolicy {
+    package static func extract(fromSerializedJSON json: String?) -> String? {
         guard let json else { return nil }
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
@@ -12,7 +11,7 @@ enum AgentOracleAuthoritativeChatIDPolicy {
         return extract(fromRootObject: object)
     }
 
-    static func extract(fromRootObject object: [String: Any]) -> String? {
+    package static func extract(fromRootObject object: [String: Any]) -> String? {
         guard !object.keys.contains("chatID"),
               let chatID = object["chat_id"] as? String
         else { return nil }
@@ -22,7 +21,7 @@ enum AgentOracleAuthoritativeChatIDPolicy {
         return hasCanonicalGroupIdentity(object, primaryChatID: trimmed) ? trimmed : nil
     }
 
-    static func allowsLatestFallback(fromSerializedJSON json: String?) -> Bool {
+    package static func allowsLatestFallback(fromSerializedJSON json: String?) -> Bool {
         guard let json else { return false }
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
