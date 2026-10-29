@@ -4297,9 +4297,16 @@ final class MonitorFakeCodexController: CodexSessionControllerPassiveStubDefault
 
 actor MonitorStubCodexAuthRecovery: CodexManagedAuthRecovering {
     private(set) var didRefresh = false
+    private(set) var didCheck = false
 
     func refreshManagedAccount() async -> CodexManagedAuthRefreshResult {
         didRefresh = true
+        return .recovered(account: nil)
+    }
+
+    /// Passive status checks never count as a forced token refresh.
+    func checkManagedAccount() async -> CodexManagedAuthRefreshResult {
+        didCheck = true
         return .recovered(account: nil)
     }
 
