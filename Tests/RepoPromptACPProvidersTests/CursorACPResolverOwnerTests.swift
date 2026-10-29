@@ -797,7 +797,7 @@ private func makeTestResolver(
     environmentFilter: @escaping CLIProcessConfiguration.EnvironmentFilter = { environment, _ in environment },
     failureRecorder: @escaping CursorACPLaunchResolver.FailureRecorder = { _, _ in },
     nowProvider: @escaping CursorACPLaunchResolver.NowProvider = { ProcessInfo.processInfo.systemUptime },
-    deadlineWaiter: @escaping CursorACPLaunchResolver.DeadlineWaiter = CursorACPLaunchResolver.defaultDeadlineWaiter,
+    deadlineWaiter: @escaping CursorACPLaunchResolver.DeadlineWaiter = { deadline in await CursorACPLaunchResolver.defaultDeadlineWaiter(deadline) },
     aggregateProbeTimeout: TimeInterval = 10,
     sharingProbeOwnershipWith shared: CursorACPLaunchResolver? = nil
 ) -> CursorACPLaunchResolver {
@@ -821,7 +821,7 @@ private func makeTestResolver(
     environmentFilter: @escaping CLIProcessConfiguration.EnvironmentFilter = { environment, _ in environment },
     failureRecorder: @escaping CursorACPLaunchResolver.FailureRecorder = { _, _ in },
     nowProvider: @escaping CursorACPLaunchResolver.NowProvider = { ProcessInfo.processInfo.systemUptime },
-    deadlineWaiter: @escaping CursorACPLaunchResolver.DeadlineWaiter = CursorACPLaunchResolver.defaultDeadlineWaiter,
+    deadlineWaiter: @escaping CursorACPLaunchResolver.DeadlineWaiter = { deadline in await CursorACPLaunchResolver.defaultDeadlineWaiter(deadline) },
     aggregateProbeTimeout: TimeInterval = 10,
     sharingProbeOwnershipWith shared: CursorACPLaunchResolver? = nil
 ) -> CursorACPLaunchResolver {

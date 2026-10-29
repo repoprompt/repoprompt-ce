@@ -5,36 +5,42 @@ import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
-struct CursorACPAgentProvider: ACPAgentProvider {
+package struct CursorACPAgentProvider: ACPAgentProvider {
     private let config: CursorAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: CursorACPLaunchResolver
+    private let toolNames: ACPToolNameResolution
+    private let projectMCPApproval: any CursorACPProjectMCPApproval
 
     #if DEBUG
-        var test_config: CursorAgentConfig {
+        package var test_config: CursorAgentConfig {
             config
         }
     #endif
 
-    init(
+    package init(
         config: CursorAgentConfig,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: CursorACPLaunchResolver = CursorACPLaunchResolver()
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration,
+        launchResolver: CursorACPLaunchResolver,
+        toolNames: ACPToolNameResolution,
+        projectMCPApproval: any CursorACPProjectMCPApproval
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
+        self.toolNames = toolNames
+        self.projectMCPApproval = projectMCPApproval
     }
 
-    var providerID: ACPProviderID {
+    package var providerID: ACPProviderID {
         .cursor
     }
 
-    var supportsParameterizedModelPicker: Bool {
+    package var supportsParameterizedModelPicker: Bool {
         true
     }
 
-    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+    package func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
         let category = Self.semanticToken(input.category)
         let configID = Self.semanticToken(input.configID)
         let displayName = Self.semanticToken(input.displayName)
@@ -75,22 +81,22 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         return nil
     }
 
-    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+    package func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
 
-    func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
+    package func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = try standardizedWorkingDirectory(from: request.workspacePath)
         let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
         var environment: [String: String] = [:]
         var cleanupArtifact: ACPLaunchCleanupArtifact?
         if config.includeRepoPromptMCPServer {
-            let cursorDataDirectory = CursorIntegrationConfiguration.cursorDataDirectoryURL(
+            let cursorDataDirectory = projectMCPApproval.cursorDataDirectoryURL(
                 workingDirectory: workingDirectory,
                 environment: resolvedLaunch.environment
             )
             environment["CURSOR_DATA_DIR"] = cursorDataDirectory.path
-            cleanupArtifact = try CursorIntegrationConfiguration.prepareProjectMCPApproval(
+            cleanupArtifact = try projectMCPApproval.prepareProjectMCPApproval(
                 workingDirectory: workingDirectory,
                 cursorDataDirectory: cursorDataDirectory,
                 repoPromptMCPConfiguration: repoPromptMCPConfiguration,
@@ -112,7 +118,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func makeSessionConfiguration(
+    package func makeSessionConfiguration(
         for request: ACPRunRequest,
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
@@ -131,7 +137,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func buildPromptBlocks(
+    package func buildPromptBlocks(
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
@@ -155,14 +161,14 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func normalizeSessionUpdate(
+    package func normalizeSessionUpdate(
         _ payload: [String: Any],
         sessionID _: String
     ) -> [NormalizedAgentRuntimeEvent] {
-        CursorACPEventNormalizer.normalize(payload)
+        CursorACPEventNormalizer.normalize(payload, toolNames: toolNames)
     }
 
-    func preferredAuthMethodID(context: ACPAuthenticationContext) -> String? {
+    package func preferredAuthMethodID(context: ACPAuthenticationContext) -> String? {
         let envTokenKeys = ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"]
         let hasEnvironmentToken = envTokenKeys.contains { key in
             context.environment[key]?
@@ -175,17 +181,17 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         }
     }
 
-    func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
+    package func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
         guard let artifact = configuration.cleanupArtifact,
               artifact.providerID == providerID,
-              artifact.kind == CursorIntegrationConfiguration.cleanupArtifactKind
+              artifact.kind == projectMCPApproval.cleanupArtifactKind
         else {
             return
         }
-        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
+        projectMCPApproval.cleanupProjectMCPApproval(leaseID: artifact.id)
     }
 
-    func normalizeError(_ error: Error) -> Error {
+    package func normalizeError(_ error: Error) -> Error {
         if error is AIProviderError {
             return error
         }
