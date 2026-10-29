@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Core Agent Mode contract for native CLI runtimes that keep an interactive
 /// process/session alive across turns.

@@ -2,6 +2,7 @@ import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
 

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Notification-action capability surface. Every mutator re-checks the exact pending id and reports
 /// whether *that* interaction was consumed, and every path forwards to the same API the in-app card

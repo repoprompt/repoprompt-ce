@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import OSLog
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 
 @MainActor

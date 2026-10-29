@@ -3,6 +3,7 @@ import Foundation
 import os
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptProcess
 import RepoPromptSettingsCore

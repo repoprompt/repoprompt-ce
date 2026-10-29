@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import XCTest
 
 private struct AgentSessionLinkAsyncWaitTimeout: Error, LocalizedError {

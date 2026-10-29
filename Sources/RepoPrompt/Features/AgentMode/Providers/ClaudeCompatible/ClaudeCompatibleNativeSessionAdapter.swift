@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 /// Interactive native-runtime seam for the Claude-compatible plugin path.
 ///

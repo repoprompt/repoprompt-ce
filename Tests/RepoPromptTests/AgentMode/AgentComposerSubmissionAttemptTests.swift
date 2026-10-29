@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore

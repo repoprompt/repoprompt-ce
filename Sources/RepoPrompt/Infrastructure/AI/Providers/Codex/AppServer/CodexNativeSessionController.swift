@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptInstrumentation
 

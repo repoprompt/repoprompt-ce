@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 
 /// A question asked by an agent awaiting user response

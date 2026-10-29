@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptVCS
 @_spi(TestSupport) @testable import RepoPromptApp

@@ -2,6 +2,7 @@
     import Foundation
     import MCP
     import RepoPromptAIContracts
+    import RepoPromptDomainRuntime
     import SwiftUI
 
     struct AgentChatStressTelemetrySnapshot: Codable, Equatable {

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 enum AgentSessionRestoreSupport {
     static func normalizedSessionTitle(_ raw: String?) -> String {

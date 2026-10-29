@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 struct AgentCodexHookReviewHook: Hashable {
     let key: String
