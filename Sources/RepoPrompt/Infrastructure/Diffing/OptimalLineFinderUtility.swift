@@ -2,8 +2,8 @@ import Dispatch
 import Foundation
 import RepoPromptDomainRuntime
 
-class OptimalLineFinderUtility {
-    static func findOptimalLine(for change: FileChange, in content: [String], around startLine: Int, searchRadius: Int = 5) -> Int {
+package class OptimalLineFinderUtility {
+    package static func findOptimalLine(for change: FileChange, in content: [String], around startLine: Int, searchRadius: Int = 5) -> Int {
         // Check if the first context line has high similarity
         if let firstContextLine = change.diffChunk.lines.first(where: { $0.type == .context }) {
             if startLine < content.count,
@@ -73,7 +73,7 @@ class OptimalLineFinderUtility {
         return maxScore > 0 ? Int((Double(score) / Double(maxScore)) * 100) : 0
     }
 
-    static func findOptimalLinesInParallel(for changes: [FileChange], in content: [String], searchRadius: Int = 5) -> [UUID: Int] {
+    package static func findOptimalLinesInParallel(for changes: [FileChange], in content: [String], searchRadius: Int = 5) -> [UUID: Int] {
         let queue = DispatchQueue(label: "com.repoprompt.optimallinefinder", attributes: .concurrent)
         let group = DispatchGroup()
 

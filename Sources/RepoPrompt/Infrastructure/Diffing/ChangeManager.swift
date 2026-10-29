@@ -1,8 +1,7 @@
 import Foundation
 import RepoPromptDomainRuntime
-import RepoPromptFileSystem
 
-class ChangeManager {
+package class ChangeManager {
     private var fileContent: [String]
     private var changes: [FileChange]
     private var appliedChanges: [FileChange] = []
@@ -10,7 +9,7 @@ class ChangeManager {
     private let fileAction: FileAction
     private let hadTrailingNewline: Bool
 
-    init(
+    package init(
         fileContent: [String],
         changes: [FileChange],
         lineEnding: String,
@@ -39,7 +38,7 @@ class ChangeManager {
         }
     }
 
-    func applyChange(_ change: FileChange) -> (updatedContent: [String], appliedChangeIds: Set<UUID>, error: Error?) {
+    package func applyChange(_ change: FileChange) -> (updatedContent: [String], appliedChangeIds: Set<UUID>, error: Error?) {
         guard let index = changes.firstIndex(where: { $0.id == change.id }) else {
             return (fileContent, Set(), DiffApplicationError.invalidChange)
         }
@@ -56,7 +55,7 @@ class ChangeManager {
         }
     }
 
-    func revertChange(_ change: FileChange) -> (updatedContent: [String], appliedChangeIds: Set<UUID>, error: Error?) {
+    package func revertChange(_ change: FileChange) -> (updatedContent: [String], appliedChangeIds: Set<UUID>, error: Error?) {
         guard let index = appliedChanges.firstIndex(where: { $0.id == change.id }) else {
             return (fileContent, Set(appliedChanges.map(\.id)), DiffApplicationError.changeNotApplied)
         }
@@ -92,7 +91,7 @@ class ChangeManager {
         }
     }
 
-    func updateContent(_ newContent: [String], lineEnding: String) {
+    package func updateContent(_ newContent: [String], lineEnding: String) {
         fileContent = newContent
         self.lineEnding = lineEnding
         appliedChanges.removeAll()
@@ -100,7 +99,7 @@ class ChangeManager {
         changes = changes.sorted(by: { $0.startLine < $1.startLine })
     }
 
-    func changeGroups(threshold: Int = 3) -> [ChangeGroup] {
+    package func changeGroups(threshold: Int = 3) -> [ChangeGroup] {
         var groups: [ChangeGroup] = []
         var currentGroup: ChangeGroup?
 
@@ -124,42 +123,42 @@ class ChangeManager {
     }
 
     /// ChangeManager.swift
-    func currentChanges() -> [FileChange] {
+    package func currentChanges() -> [FileChange] {
         changes
     }
 
     /// Returns the joined content, re-appending the terminating newline in case
     /// the original file ended with one.
-    func updatedContent() -> String {
+    package func updatedContent() -> String {
         let joined = fileContent.joined(separator: lineEnding)
         return hadTrailingNewline ? joined + lineEnding : joined
     }
 
     /// Returns the current file content as an array of lines
-    func currentContentLines() -> [String] {
+    package func currentContentLines() -> [String] {
         fileContent
     }
 }
 
-enum ChangeApplicationError: Error {
+package enum ChangeApplicationError: Error {
     case invalidChange
     case changeNotApplied
 }
 
-class ChangeGroup {
-    let startLine: Int
-    private(set) var changes: [FileChange] = []
+package class ChangeGroup {
+    package let startLine: Int
+    package private(set) var changes: [FileChange] = []
 
-    init(startLine: Int) {
+    package init(startLine: Int) {
         self.startLine = startLine
     }
 
-    func canAddChange(_ change: FileChange, threshold: Int) -> Bool {
+    package func canAddChange(_ change: FileChange, threshold: Int) -> Bool {
         guard let lastChange = changes.last else { return true }
         return change.startLine - (lastChange.startLine + lastChange.diffChunk.lines.count) <= threshold
     }
 
-    func addChange(_ change: FileChange) {
+    package func addChange(_ change: FileChange) {
         changes.append(change)
     }
 }
