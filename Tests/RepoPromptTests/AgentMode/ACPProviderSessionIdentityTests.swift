@@ -9,6 +9,51 @@ import RepoPromptSettingsCore
 import XCTest
 
 final class ACPProviderSessionIdentityTests: XCTestCase {
+    func testAntigravityPropagatesSessionHomePreparationFailure() {
+        let names = ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
+        let provider = AntigravityACPAgentProvider(
+            executablePath: "fallback", harnessPath: nil, installedRuntime: { nil },
+            prepareSessionHome: { throw NSError(domain: "fixture-home", code: 7) }, toolNames: names
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: nil, resumeSessionID: nil, attachments: [], taskLabelKind: nil)
+        XCTAssertThrowsError(try provider.makeLaunchConfiguration(for: request)) { error in
+            XCTAssertEqual((error as NSError).domain, "fixture-home")
+        }
+    }
+
+    func testAntigravityReadsRuntimeFreshForSupportAndLaunch() async throws {
+        final class RuntimeSequence: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func next() -> (command: String, harness: String)? {
+                lock.withLock {
+                    count += 1
+                    return count == 1 ? ("/usr/bin/true", "first") : ("/second/runtime", "second")
+                }
+            }
+        }
+        let sequence = RuntimeSequence()
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent("antigravity-seam-home")
+        let names = ACPToolNameResolution(isRepoPromptServerIdentifier: { _ in false }, canonicalRepoPromptToolName: { _ in nil }, isRepoPromptToolNameWithServerPrefix: { _ in false })
+        let provider = AntigravityACPAgentProvider(
+            executablePath: "fallback", harnessPath: "explicit-harness", installedRuntime: { sequence.next() },
+            prepareSessionHome: { home }, toolNames: names
+        )
+        let request = ACPRunRequest(agentKind: .antigravity, modelString: nil, workspacePath: "/tmp/workspace", resumeSessionID: "resume", attachments: [], taskLabelKind: nil)
+        let support = try await provider.support(for: request)
+        XCTAssertEqual(support, .supported)
+        let launch = try provider.makeLaunchConfiguration(for: request)
+        XCTAssertEqual(launch.command, "/second/runtime")
+        XCTAssertEqual(launch.environment["ANTIGRAVITY_HARNESS_PATH"], "explicit-harness")
+        XCTAssertEqual(launch.environment["GEMINI_HOME"], home.path)
+        XCTAssertEqual(launch.environment["AGY_ACP_FORCE_FILE_STORAGE"], "1")
+        XCTAssertEqual(launch.workingDirectory, "/tmp/workspace")
+        let server = RepoPromptMCPServerConfiguration(command: "/usr/bin/true")
+        let session = try provider.makeSessionConfiguration(for: request, mcpServer: server)
+        XCTAssertEqual(session.mode, .load(existingSessionID: "resume"))
+        XCTAssertEqual(session.mcpServers, [server])
+    }
+
     func testAppAuthorityRejectsLookalikeServer() {
         XCTAssertNil(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "read_file (NotRepoPromptCE)"]))
         XCTAssertEqual(ACPRuntimeEventParsing.repoPromptToolName(from: ["title": "read_file (RepoPromptCE)"]), "mcp__RepoPromptCE__read_file")
