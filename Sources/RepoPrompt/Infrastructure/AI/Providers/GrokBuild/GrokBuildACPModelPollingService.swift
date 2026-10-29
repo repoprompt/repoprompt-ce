@@ -2,7 +2,7 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 
-protocol GrokBuildACPModelDiscoveryClient: Sendable {
+package protocol GrokBuildACPModelDiscoveryClient: Sendable {
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels?
 }
 
@@ -10,8 +10,8 @@ protocol GrokBuildACPModelDiscoveryClient: Sendable {
 /// Centralized polling service for Grok Build ACP dynamic model options. Mirrors the Cursor
 /// polling behavior: poll only while subscribed, coalesce refreshes, keep the last good
 /// snapshot on failure, and warm the persisted registry before live discovery completes.
-actor GrokBuildACPModelPollingService {
-    enum RefreshOutcome: Equatable {
+package actor GrokBuildACPModelPollingService {
+    package enum RefreshOutcome: Equatable {
         case updated
         case unchanged
         case noModelsAdvertised
@@ -20,10 +20,10 @@ actor GrokBuildACPModelPollingService {
         case cancelled
     }
 
-    struct Snapshot: Equatable {
-        let models: ACPDiscoveredSessionModels
-        let fetchedAt: Date
-        let isLiveDiscovery: Bool
+    package struct Snapshot: Equatable {
+        package let models: ACPDiscoveredSessionModels
+        package let fetchedAt: Date
+        package let isLiveDiscovery: Bool
     }
 
     private let client: any GrokBuildACPModelDiscoveryClient
@@ -41,7 +41,7 @@ actor GrokBuildACPModelPollingService {
     private var preferredWorkspacePath: String?
     private var isShutdown = false
 
-    init(
+    package init(
         client: any GrokBuildACPModelDiscoveryClient,
         registry: AgentACPModelRegistry,
         logFailure: @escaping (String) -> Void,
@@ -53,13 +53,13 @@ actor GrokBuildACPModelPollingService {
         self.intervalNanos = intervalNanos
     }
 
-    func latestSnapshot() async -> Snapshot? {
+    package func latestSnapshot() async -> Snapshot? {
         if let latest { return latest }
         return await registrySnapshotAfterWarmingStore()
     }
 
     #if DEBUG
-        func test_refreshNowInFlightJoinEvents() -> AsyncStream<Void> {
+        package func test_refreshNowInFlightJoinEvents() -> AsyncStream<Void> {
             let id = UUID()
             let (stream, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
             testRefreshNowInFlightJoinObservers[id] = continuation
@@ -70,7 +70,7 @@ actor GrokBuildACPModelPollingService {
         }
     #endif
 
-    func discoverOnce(workspacePath: String?) async throws -> Snapshot? {
+    package func discoverOnce(workspacePath: String?) async throws -> Snapshot? {
         guard !isShutdown else { return nil }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         guard let discovered = try await client.discoverModels(workspacePath: preferredWorkspacePath) else {
@@ -80,7 +80,7 @@ actor GrokBuildACPModelPollingService {
         return await latestSnapshot()
     }
 
-    func subscribe(workspacePath: String?) async -> AsyncStream<Snapshot> {
+    package func subscribe(workspacePath: String?) async -> AsyncStream<Snapshot> {
         guard !isShutdown else {
             return AsyncStream { continuation in
                 continuation.finish()
@@ -113,7 +113,7 @@ actor GrokBuildACPModelPollingService {
         return stream
     }
 
-    func refreshNow(workspacePath: String?) async -> RefreshOutcome {
+    package func refreshNow(workspacePath: String?) async -> RefreshOutcome {
         guard !isShutdown else { return .skipped }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
@@ -125,7 +125,7 @@ actor GrokBuildACPModelPollingService {
         return await performRefresh()
     }
 
-    func shutdown(finishSubscribers: Bool = true) async {
+    package func shutdown(finishSubscribers: Bool = true) async {
         isShutdown = true
         pollingTask?.cancel()
         pollingTask = nil
