@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAIContracts
 
 private struct GrokBuildAdvertisedEffortEntry {
