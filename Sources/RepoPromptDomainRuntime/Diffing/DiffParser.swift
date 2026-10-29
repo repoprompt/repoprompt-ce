@@ -20,7 +20,11 @@ package enum DiffParserUtils {
     // MARK: - Regex cache & helpers (perf)
 
     /// Small thread-safe cache for compiled regexes keyed by their pattern string.
-    private static let _regexCache = NSCache<NSString, NSRegularExpression>()
+    /// Safety: only NSCache's documented thread-safe lookup/set operations are used;
+    /// keys and expressions are immutable, the cache never escapes, and no delegate
+    /// or configuration is mutated. Remove the annotation when Foundation supplies
+    /// Sendable conformance; keep synchronous parsing off the main actor meanwhile.
+    private nonisolated(unsafe) static let _regexCache = NSCache<NSString, NSRegularExpression>()
 
     /// Returns a cached compiled regex for `pattern` or compiles & caches it.
     /// Default options match the heavy extractors' needs.
