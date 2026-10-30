@@ -96,6 +96,28 @@ struct ACPAgentSessionAppHost: ACPAgentSessionHost {
 }
 
 extension ACPAgentSessionController {
+    /// Cursor persists bracket overrides in existing model strings; ACP requires separate exact model/config calls.
+    func applyCursorModelSelection(
+        _ raw: String,
+        overrides: [CursorAIModelCatalog.ModelSpecifier.Override] = []
+    ) async throws {
+        let specifier = try CursorAIModelCatalog.ModelSpecifier(raw: raw)
+        try await setSessionModel(specifier.baseModelRaw)
+        var encoded = raw
+        for override in overrides {
+            guard let updated = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).replacing(configID: override.configID, valueRaw: override.valueRaw) else {
+                throw CursorAIModelCatalog.ModelSpecifier.invalid(override.configID)
+            }
+            encoded = updated
+        }
+        let values = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).selections(in: currentDiscoveredSessionModels())
+        let selections = values.map {
+            ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw)
+        }
+        let report = try await applySessionModelParameterSelections(selections)
+        try report.validateNoSkippedSelections()
+    }
+
     init(
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,

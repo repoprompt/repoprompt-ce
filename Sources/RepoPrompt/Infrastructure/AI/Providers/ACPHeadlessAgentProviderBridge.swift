@@ -9,20 +9,20 @@ import RepoPromptDomainRuntime
 /// `HeadlessAgentProvider` lifecycle used by discovery/delegate-edit paths while
 /// centralizing cancellation, controller registration, prompt forwarding, and
 /// approval fallback handling for ACP-backed providers.
-final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
-    enum ApprovalPolicy {
+package final class ACPHeadlessAgentProviderBridge {
+    package enum ApprovalPolicy {
         case declineUnsupported
         case acceptForSession
     }
 
-    typealias ProviderFactory = () async throws -> any ACPAgentProvider
-    typealias RequestFactory = (_ message: AgentMessage, _ runID: UUID) -> ACPRunRequest
-    typealias ControllerFactory = (
+    package typealias ProviderFactory = () async throws -> any ACPAgentProvider
+    package typealias RequestFactory = (_ message: AgentMessage, _ runID: UUID) -> ACPRunRequest
+    package typealias ControllerFactory = (
         _ provider: any ACPAgentProvider,
         _ request: ACPRunRequest,
         _ diagnosticSink: ACPAgentSessionController.DiagnosticSink?
     ) throws -> ACPAgentSessionController
-    typealias BeforePrompt = (_ controller: ACPAgentSessionController, _ request: ACPRunRequest) async throws -> Void
+    package typealias BeforePrompt = (_ controller: ACPAgentSessionController, _ request: ACPRunRequest) async throws -> Void
 
     private let providerName: String
     private let makeProvider: ProviderFactory
@@ -32,7 +32,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
     private let approvalPolicy: ApprovalPolicy
     private let lifecycle = ACPHeadlessProviderLifecycle()
 
-    init(
+    package init(
         providerName: String,
         makeProvider: @escaping ProviderFactory,
         makeRequest: @escaping RequestFactory,
@@ -48,10 +48,10 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         self.approvalPolicy = approvalPolicy
     }
 
-    func streamAgentMessage(
+    package func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let actualRunID = runID ?? UUID()
         let request = makeRequest(message, actualRunID)
         let provider = try await makeProvider()
@@ -83,7 +83,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         }
     }
 
-    func dispose() async {
+    package func dispose() async {
         await lifecycle.dispose()
     }
 
@@ -93,7 +93,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         provider: any ACPAgentProvider,
         runID: UUID,
         generation: UInt64,
-        continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
+        continuation: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Continuation
     ) async {
         defer { lifecycle.clearStreamTask(generation: generation) }
 
@@ -158,7 +158,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         controller: ACPAgentSessionController,
         providerName: String,
         approvalPolicy: ApprovalPolicy,
-        to continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
+        to continuation: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Continuation
     ) async {
         var terminalError: String?
         for await event in events {

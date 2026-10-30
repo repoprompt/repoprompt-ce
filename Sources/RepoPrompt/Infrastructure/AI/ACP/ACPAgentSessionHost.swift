@@ -2,18 +2,29 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 
-struct ACPDevinThinkingSelection {
-    let advertisedModelRaw: String
-    let configID: String
-    let choiceRaw: String
+package struct ACPDevinThinkingSelection {
+    package let advertisedModelRaw: String
+    package let configID: String
+    package let choiceRaw: String
+
+    package init(advertisedModelRaw: String, configID: String, choiceRaw: String) {
+        self.advertisedModelRaw = advertisedModelRaw
+        self.configID = configID
+        self.choiceRaw = choiceRaw
+    }
 }
 
-struct ACPGrokModelDecomposition {
-    let base: AgentModelOption
-    let explicitEffort: CodexReasoningEffort?
+package struct ACPGrokModelDecomposition {
+    package let base: AgentModelOption
+    package let explicitEffort: CodexReasoningEffort?
+
+    package init(base: AgentModelOption, explicitEffort: CodexReasoningEffort?) {
+        self.base = base
+        self.explicitEffort = explicitEffort
+    }
 }
 
-protocol ACPAgentSessionHost: Sendable {
+package protocol ACPAgentSessionHost: Sendable {
     var applicationVersion: String { get }
     var cursorAutoModelRaw: String { get }
     func mcpClientNameHint(for kind: AgentProviderKind) -> String?

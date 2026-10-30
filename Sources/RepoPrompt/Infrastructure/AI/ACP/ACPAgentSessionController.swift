@@ -8,14 +8,16 @@ import RepoPromptFoundation
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
-actor ACPAgentSessionController {
+package actor ACPAgentSessionController {
     /// A successful pipe write is not provider acceptance or turn completion. It only proves
     /// that retrying after a lost response could duplicate input. Independent of controller
     /// teardown so the caller can classify an interrupted, dequeued steering batch.
-    final class PromptWriteReceipt: Sendable {
+    package final class PromptWriteReceipt: Sendable {
+        package init() {}
+
         private let written = OSAllocatedUnfairLock(initialState: false)
 
-        var wasWritten: Bool {
+        package var wasWritten: Bool {
             written.withLock { $0 }
         }
 
@@ -24,22 +26,22 @@ actor ACPAgentSessionController {
         }
     }
 
-    struct RequestTimeouts {
-        let bootstrapSeconds: TimeInterval
-        let operationalSeconds: TimeInterval
+    package struct RequestTimeouts {
+        package let bootstrapSeconds: TimeInterval
+        package let operationalSeconds: TimeInterval
 
-        init(bootstrapSeconds: TimeInterval, operationalSeconds: TimeInterval = 30) {
+        package init(bootstrapSeconds: TimeInterval, operationalSeconds: TimeInterval = 30) {
             self.bootstrapSeconds = bootstrapSeconds
             self.operationalSeconds = operationalSeconds
         }
 
-        static let `default` = RequestTimeouts(
+        package static let `default` = RequestTimeouts(
             bootstrapSeconds: 30,
             operationalSeconds: 30
         )
     }
 
-    enum DiagnosticEvent {
+    package enum DiagnosticEvent {
         case phaseStarted(String)
         case phaseCompleted(String)
         case outboundJSON(String)
@@ -50,9 +52,9 @@ actor ACPAgentSessionController {
         case unmatchedResponse(id: String, line: String)
     }
 
-    typealias DiagnosticSink = @Sendable (DiagnosticEvent) -> Void
+    package typealias DiagnosticSink = @Sendable (DiagnosticEvent) -> Void
 
-    enum State: String {
+    package enum State: String {
         case idle
         case launching
         case initialized
@@ -69,32 +71,32 @@ actor ACPAgentSessionController {
     /// Scoped to the provider session that advertised them: each update replaces the whole list, and
     /// the snapshot is dropped when a session starts opening and whenever the controller enters
     /// `.failed`, `.closing`, or `.closed`. Names are stored without a leading `/`.
-    struct AdvertisedCommands: Equatable {
-        let sessionID: String
-        let names: Set<String>
+    package struct AdvertisedCommands: Equatable {
+        package let sessionID: String
+        package let names: Set<String>
     }
 
     /// Why an advertised provider command was refused before anything was written to the provider.
-    struct ProviderCommandRefusal: LocalizedError, Equatable {
-        let reason: String
+    package struct ProviderCommandRefusal: LocalizedError, Equatable {
+        package let reason: String
         /// False when the refusal is because this controller can no longer run turns (not open, no
         /// process), so its owner should retire it as after any failed turn.
-        let sessionIsUsable: Bool
+        package let sessionIsUsable: Bool
 
-        var errorDescription: String? {
+        package var errorDescription: String? {
             reason
         }
     }
 
     /// The caller's task was cancelled before an advertised provider command was written.
-    struct ProviderCommandCancelledBeforeSend: Error {}
+    package struct ProviderCommandCancelledBeforeSend: Error {}
 
-    struct BootstrapResult {
-        let sessionID: String
-        let providerSessionIdentity: ACPProviderSessionIdentity
-        let loadSessionSupported: Bool
-        let didFallbackToNewSessionAfterLoadFailure: Bool
-        let invalidatedResumeSessionID: String?
+    package struct BootstrapResult {
+        package let sessionID: String
+        package let providerSessionIdentity: ACPProviderSessionIdentity
+        package let loadSessionSupported: Bool
+        package let didFallbackToNewSessionAfterLoadFailure: Bool
+        package let invalidatedResumeSessionID: String?
     }
 
     private enum ControllerError: LocalizedError {
@@ -264,11 +266,11 @@ actor ACPAgentSessionController {
 
     private var eventsContinuation: AsyncStream<NormalizedAgentRuntimeEvent>.Continuation?
     private var eventsStream: AsyncStream<NormalizedAgentRuntimeEvent>
-    var events: AsyncStream<NormalizedAgentRuntimeEvent> {
+    package var events: AsyncStream<NormalizedAgentRuntimeEvent> {
         eventsStream
     }
 
-    func currentEventsStream() -> AsyncStream<NormalizedAgentRuntimeEvent> {
+    package func currentEventsStream() -> AsyncStream<NormalizedAgentRuntimeEvent> {
         eventsStream
     }
 
@@ -307,7 +309,7 @@ actor ACPAgentSessionController {
     }
 
     /// Provider-owned execution readiness, independent of the app's published run state.
-    var hasExecutionInFlight: Bool {
+    package var hasExecutionInFlight: Bool {
         if activePromptTurnID != nil { return true }
         switch state {
         case .launching, .initialized, .openingSession, .promptRunning, .closing:
@@ -380,11 +382,11 @@ actor ACPAgentSessionController {
         private let rawACPCaptureURL: URL?
     #endif
 
-    func currentDiscoveredSessionModels() -> ACPDiscoveredSessionModels? {
+    package func currentDiscoveredSessionModels() -> ACPDiscoveredSessionModels? {
         discoveredSessionModels
     }
 
-    func cursorAvailableModelCatalog() async throws -> ACPDiscoveredSessionModels {
+    package func cursorAvailableModelCatalog() async throws -> ACPDiscoveredSessionModels {
         guard provider.providerID == .cursor else {
             throw ControllerError.requestFailed("Cursor model catalog is only available for Cursor ACP sessions.")
         }
@@ -418,7 +420,7 @@ actor ACPAgentSessionController {
         )
     }
 
-    init(
+    package init(
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,
         host: any ACPAgentSessionHost,
@@ -466,20 +468,20 @@ actor ACPAgentSessionController {
         #endif
     }
 
-    var hasReusableSession: Bool {
+    package var hasReusableSession: Bool {
         state == .sessionOpen && process != nil && sessionID != nil
     }
 
     /// Whether a provider session is live right now — open or running a turn — as opposed to
     /// starting up, closed, or never begun. Busy still counts as live; turn admission is a
     /// separate question from whether the session exists at all.
-    var hasLiveProviderSession: Bool {
+    package var hasLiveProviderSession: Bool {
         (state == .sessionOpen || state == .promptRunning) && process != nil && sessionID != nil
     }
 
     /// Whether this controller can never run another turn (failed, closing, closed, or without a
     /// process), as opposed to being merely busy with one.
-    var isRetired: Bool {
+    package var isRetired: Bool {
         switch state {
         case .failed, .closing, .closed:
             true
@@ -488,7 +490,7 @@ actor ACPAgentSessionController {
         }
     }
 
-    func isCompatibleWith(request: ACPRunRequest) -> Bool {
+    package func isCompatibleWith(request: ACPRunRequest) -> Bool {
         guard let providerID = request.agentKind.acpProviderID,
               provider.providerID == providerID,
               normalizedWorkspacePath(runRequest.workspacePath) == normalizedWorkspacePath(request.workspacePath)
@@ -528,15 +530,15 @@ actor ACPAgentSessionController {
         return true
     }
 
-    func normalizeError(_ error: Error) -> Error {
+    package func normalizeError(_ error: Error) -> Error {
         provider.normalizeError(error)
     }
 
-    func setExpectedMCPRunID(_ runID: UUID?) {
+    package func setExpectedMCPRunID(_ runID: UUID?) {
         expectedMCPRunID = runID
     }
 
-    func setAutoApproveAllToolPermissions(_ enabled: Bool) {
+    package func setAutoApproveAllToolPermissions(_ enabled: Bool) {
         autoApproveAllToolPermissions = enabled
     }
 
@@ -547,7 +549,7 @@ actor ACPAgentSessionController {
         private var testSteeringInterruptEntryWaiter: CheckedContinuation<Void, Never>?
         private var testSteeringInterruptGate: CheckedContinuation<Void, Never>?
 
-        func test_replayQuietNotifications(
+        package func test_replayQuietNotifications(
             _ packets: [(String, [String: Any])], sessionID: String, loadReplay: Bool, activePrompt: Bool = true
         ) async -> [NormalizedAgentRuntimeEvent] {
             self.sessionID = sessionID
@@ -564,28 +566,28 @@ actor ACPAgentSessionController {
             return results
         }
 
-        func test_rejectNextTurnPreparation() {
+        package func test_rejectNextTurnPreparation() {
             testRejectNextTurnPreparation = true
         }
 
-        func test_holdNextSteeringInterrupt() {
+        package func test_holdNextSteeringInterrupt() {
             testHoldNextSteeringInterrupt = true
             testSteeringInterruptEntered = false
         }
 
-        func test_waitForSteeringInterruptEntry() async {
+        package func test_waitForSteeringInterruptEntry() async {
             if testSteeringInterruptEntered { return }
             await withCheckedContinuation { testSteeringInterruptEntryWaiter = $0 }
         }
 
-        func test_releaseSteeringInterrupt() {
+        package func test_releaseSteeringInterrupt() {
             testSteeringInterruptGate?.resume()
             testSteeringInterruptGate = nil
         }
     #endif
 
     @discardableResult
-    func prepareForNextTurn() -> Bool {
+    package func prepareForNextTurn() -> Bool {
         #if DEBUG
             if testRejectNextTurnPreparation {
                 testRejectNextTurnPreparation = false
@@ -599,7 +601,7 @@ actor ACPAgentSessionController {
         return true
     }
 
-    func bootstrap() async throws -> BootstrapResult {
+    package func bootstrap() async throws -> BootstrapResult {
         guard state == .idle else {
             throw ControllerError.invalidState(expected: "idle", actual: state)
         }
@@ -762,29 +764,29 @@ actor ACPAgentSessionController {
         )
     }
 
-    func currentProviderSessionIdentity() -> ACPProviderSessionIdentity {
+    package func currentProviderSessionIdentity() -> ACPProviderSessionIdentity {
         providerSessionIdentity
     }
 
-    func refreshProviderSessionIdentityAfterPromptInterruption() async -> ACPProviderSessionIdentity {
+    package func refreshProviderSessionIdentityAfterPromptInterruption() async -> ACPProviderSessionIdentity {
         providerSessionIdentity
     }
 
     /// Whether the live provider session `sessionID` currently advertises the slash command `name`
     /// (given without its leading `/`). A snapshot from any other session never answers. Matching is
     /// deliberately exact and case-sensitive: a differently spelled command is not the one admitted.
-    nonisolated func advertisesCommand(_ name: String, inProviderSession sessionID: String) -> Bool {
+    package nonisolated func advertisesCommand(_ name: String, inProviderSession sessionID: String) -> Bool {
         advertisedCommandsState.withLock { snapshot in
             guard let snapshot, snapshot.sessionID == sessionID else { return false }
             return snapshot.names.contains(name)
         }
     }
 
-    nonisolated func currentAdvertisedCommands() -> AdvertisedCommands? {
+    package nonisolated func currentAdvertisedCommands() -> AdvertisedCommands? {
         advertisedCommandsState.withLock { $0 }
     }
 
-    func prompt(
+    package func prompt(
         _ message: AgentMessage,
         request overrideRunRequest: ACPRunRequest? = nil,
         writeReceipt: PromptWriteReceipt? = nil
@@ -802,7 +804,7 @@ actor ACPAgentSessionController {
     /// request must remain compatible with the live process, including its launch-time permission
     /// mode. All checks and the prompt write run on this actor without an intervening suspension;
     /// refusal writes nothing and retains a usable controller. No provider framing or model RPC.
-    func promptAdvertisedCommand(
+    package func promptAdvertisedCommand(
         _ name: String,
         expectedSessionID: String,
         request overrideRunRequest: ACPRunRequest? = nil
@@ -991,7 +993,7 @@ actor ACPAgentSessionController {
     /// only advertise model-scoped parameter metadata (e.g. OpenCode `effort`) *after* a model
     /// set; callers with pending parameter selections pass `true` so the metadata is advertised
     /// before the selections are applied.
-    func setSessionModel(_ rawModel: String, forceRPC: Bool = false) async throws {
+    package func setSessionModel(_ rawModel: String, forceRPC: Bool = false) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
             try await setSessionModelSerialized(rawModel, forceRPC: forceRPC)
@@ -1239,7 +1241,7 @@ actor ACPAgentSessionController {
     /// is already current would return bootstrap metadata unchanged and hide `effort`
     /// entirely. The response flows through the same verified mutation path as interactive
     /// selection — there is no second, unverified writer.
-    func discoverSessionModelParameters(for modelRaw: String) async throws -> ACPDiscoveredSessionModels {
+    package func discoverSessionModelParameters(for modelRaw: String) async throws -> ACPDiscoveredSessionModels {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
             return try await discoverSessionModelParametersSerialized(modelRaw)
@@ -1323,36 +1325,14 @@ actor ACPAgentSessionController {
         )
     }
 
-    func setSessionMode(_ modeID: String) async throws {
+    package func setSessionMode(_ modeID: String) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
             try await setSessionModeSerialized(modeID)
         }
     }
 
-    /// Cursor persists bracket overrides in existing model strings; ACP requires separate exact model/config calls.
-    func applyCursorModelSelection(
-        _ raw: String,
-        overrides: [CursorAIModelCatalog.ModelSpecifier.Override] = []
-    ) async throws {
-        let specifier = try CursorAIModelCatalog.ModelSpecifier(raw: raw)
-        try await setSessionModel(specifier.baseModelRaw)
-        var encoded = raw
-        for override in overrides {
-            guard let updated = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).replacing(configID: override.configID, valueRaw: override.valueRaw) else {
-                throw CursorAIModelCatalog.ModelSpecifier.invalid(override.configID)
-            }
-            encoded = updated
-        }
-        let values = try CursorAIModelCatalog.ModelSpecifier(raw: encoded).selections(in: currentDiscoveredSessionModels())
-        let selections = values.map {
-            ACPModelParameterSelection(providerID: .cursor, baseModelRaw: $0.baseModelRaw, kind: $0.kind, configID: $0.configID, valueRaw: $0.valueRaw)
-        }
-        let report = try await applySessionModelParameterSelections(selections)
-        try report.validateNoSkippedSelections()
-    }
-
-    func applySessionModelParameterSelections(
+    package func applySessionModelParameterSelections(
         _ selections: [ACPModelParameterSelection]
     ) async throws -> ACPModelParameterApplicationReport {
         try await configurationMutationMutex.withLock { [weak self] in
@@ -1493,7 +1473,7 @@ actor ACPAgentSessionController {
         )
     }
 
-    enum OverseerPermissionResponseResult: Equatable {
+    package enum OverseerPermissionResponseResult: Equatable {
         case submitted
         /// The request vanished or authorization failed at the final check. Nothing was sent.
         case notSubmitted
@@ -1507,7 +1487,7 @@ actor ACPAgentSessionController {
     /// Accept selects only a genuine one-time allow option; decline selects only a one-time reject
     /// and otherwise reports `cancelled`, never a persistent reject; cancel reports `cancelled`.
     /// Session-wide decisions are refused. `authorize` is the final suspension point before sending.
-    func respondToPermissionRequestForOverseer(
+    package func respondToPermissionRequestForOverseer(
         id: String,
         decision: AgentApprovalDecision,
         authorize: @MainActor @Sendable () async -> Bool
@@ -1557,7 +1537,7 @@ actor ACPAgentSessionController {
     /// Applying full access to an already surfaced prompt uses the same per-request
     /// policy as a new request. Ineligible prompts remain available for manual approval.
     @discardableResult
-    func respondToPendingPermissionRequestForFullAccess(id: String) -> Bool {
+    package func respondToPendingPermissionRequestForFullAccess(id: String) -> Bool {
         guard state == .promptRunning,
               let storageKey = permissionStorageKeyByApprovalID[id],
               let pending = pendingPermissionRequests[storageKey],
@@ -1575,7 +1555,7 @@ actor ACPAgentSessionController {
         }
     }
 
-    func respondToPermissionRequest(
+    package func respondToPermissionRequest(
         id: String,
         decision: AgentApprovalDecision
     ) async {
@@ -1635,7 +1615,7 @@ actor ACPAgentSessionController {
         }
     }
 
-    func cancelPrompt() async {
+    package func cancelPrompt() async {
         guard sessionID != nil else { return }
         do {
             try sendSessionCancelNotification()
@@ -1646,12 +1626,12 @@ actor ACPAgentSessionController {
     }
 
     #if DEBUG
-        func debugPromptSettlementWaiterCount() -> Int {
+        package func debugPromptSettlementWaiterCount() -> Int {
             promptSettlementWaitersByTurnID.values.reduce(0) { $0 + $1.count }
         }
     #endif
 
-    func interruptActivePromptForSteering(timeoutSeconds: TimeInterval = 15) async throws {
+    package func interruptActivePromptForSteering(timeoutSeconds: TimeInterval = 15) async throws {
         guard sessionID != nil else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
@@ -1822,7 +1802,7 @@ actor ACPAgentSessionController {
         }
     }
 
-    func shutdown() async {
+    package func shutdown() async {
         #if DEBUG
             debugResumeConfigurationMutationPostcheck()
         #endif
@@ -1982,7 +1962,7 @@ actor ACPAgentSessionController {
 
     /// The caller must first route server requests and exhaust owned-request correlation.
     /// Known maintenance replies are ignored regardless of their payload or protocol version.
-    nonisolated static func isRecognizedUnmatchedResponse(
+    package nonisolated static func isRecognizedUnmatchedResponse(
         _ json: [String: Any],
         provider: any ACPAgentProvider
     ) -> Bool {
@@ -3213,15 +3193,15 @@ actor ACPAgentSessionController {
     }
 
     #if DEBUG
-        func debugSuspendNextConfigurationMutationPostcheck() {
+        package func debugSuspendNextConfigurationMutationPostcheck() {
             debugShouldSuspendNextConfigurationMutationPostcheck = true
         }
 
-        func debugIsConfigurationMutationPostcheckSuspended() -> Bool {
+        package func debugIsConfigurationMutationPostcheckSuspended() -> Bool {
             debugConfigurationMutationPostcheckIsSuspended
         }
 
-        func debugResumeConfigurationMutationPostcheck() {
+        package func debugResumeConfigurationMutationPostcheck() {
             debugShouldSuspendNextConfigurationMutationPostcheck = false
             debugConfigurationMutationPostcheckIsSuspended = false
             let waiters = debugConfigurationMutationPostcheckResumeWaiters
@@ -3738,11 +3718,11 @@ actor ACPAgentSessionController {
         }
     }
 
-    func messageStopResult(
+    package func messageStopResult(
         from response: [String: Any],
         sessionID: String,
         stopReason: String?
-    ) -> AIStreamResult {
+    ) -> RepoPromptDomainRuntime.AIStreamResult {
         // Grok Build carries usage under `_meta.usage` with the same field names; top-level
         // `usage` remains the preferred ACP-standard location.
         let usage = (response["usage"] as? [String: Any])
@@ -4319,17 +4299,17 @@ actor ACPAgentSessionController {
             )
         }
 
-        static func debugLaunchConfigurationTracePayloadForTesting(
+        package static func debugLaunchConfigurationTracePayloadForTesting(
             _ launchConfiguration: ACPLaunchConfiguration
         ) -> [String: Any] {
             launchConfigurationTracePayload(launchConfiguration)
         }
 
-        static func debugSanitizedRawCapturePayloadForTesting(_ payload: [String: Any]) -> [String: Any] {
+        package static func debugSanitizedRawCapturePayloadForTesting(_ payload: [String: Any]) -> [String: Any] {
             sanitizeRawCaptureDictionary(payload)
         }
 
-        static func debugWriteRawACPEventForTesting(to url: URL, payload: [String: Any]) {
+        package static func debugWriteRawACPEventForTesting(to url: URL, payload: [String: Any]) {
             writeRawACPEvent(
                 to: url,
                 kind: "test",
@@ -4802,13 +4782,13 @@ actor ACPAgentSessionController {
     #if DEBUG
         /// Test seam for the composed option line, covering the name-then-identifier
         /// fallback rather than the sanitiser alone.
-        static func test_optionLabel(name: String?, optionID: String) -> String {
+        package static func test_optionLabel(name: String?, optionID: String) -> String {
             optionLabel(name: name, optionID: optionID)
         }
 
         /// Test seam for approval-card option labelling: collapses an agent-authored
         /// option string onto one line, or returns nil when nothing visible remains.
-        static func test_displayableOptionLabel(_ raw: String) -> String? {
+        package static func test_displayableOptionLabel(_ raw: String) -> String? {
             displayableOptionLabel(raw)
         }
     #endif
