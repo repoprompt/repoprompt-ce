@@ -9,25 +9,26 @@ import RepoPromptProcess
 /// Text-only Grok Build adapter for chat, Oracle, and other non-Agent-Mode requests.
 /// Agent Mode continues to use `grok agent stdio`; this adapter uses the documented
 /// one-shot prompt-file CLI and rejects images before launch.
-final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
-    typealias APIKeyProvider = @Sendable () async throws -> String?
+package final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
+    package typealias APIKeyProvider = @Sendable () async throws -> String?
 
+    private let host: any GrokBuildOneShotHost
     private let config: GrokBuildAgentConfig
     private let launchResolver: GrokBuildACPLaunchResolver
     private let requestTimeout: TimeInterval
     private let apiKeyProvider: APIKeyProvider
-    private let removedNamesProvider: ProviderEnvironmentFiltering.RemovedNamesProvider?
+    private let removedNamesProvider: ProviderRemovedEnvironmentNames?
     private let activeRuns = ActiveGrokBuildOneShotRunStore()
 
-    init(
+    package init(
+        host: any GrokBuildOneShotHost,
         config: GrokBuildAgentConfig,
-        launchResolver: GrokBuildACPLaunchResolver = GrokBuildACPLaunchResolver(),
+        launchResolver: GrokBuildACPLaunchResolver,
         requestTimeout: TimeInterval = 6000,
-        apiKeyProvider: @escaping APIKeyProvider = {
-            try await KeyManager().getAPIKey(for: .grok)
-        },
-        removedNamesProvider: ProviderEnvironmentFiltering.RemovedNamesProvider? = nil
+        apiKeyProvider: @escaping APIKeyProvider,
+        removedNamesProvider: ProviderRemovedEnvironmentNames? = nil
     ) {
+        self.host = host
         self.config = config
         self.launchResolver = launchResolver
         self.requestTimeout = requestTimeout
@@ -35,10 +36,10 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         self.removedNamesProvider = removedNamesProvider
     }
 
-    func streamAgentMessage(
+    package func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         guard message.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build one-shot requests cannot resume a previous session."
@@ -70,7 +71,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         }
     }
 
-    func dispose() async {
+    package func dispose() async {
         let tasks = activeRuns.removeAll()
         for task in tasks {
             task.cancel()
@@ -81,10 +82,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     }
 
     private func runOneShot(_ message: AgentMessage) async throws -> GrokBuildOneShotCompletion {
-        let selection = try await Self.resolveModelSelection(
-            modelString: config.modelString,
-            snapshot: AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshotAfterWarmingStandardStore(for: .grokBuild)
-        )
+        let selection = try await host.resolveModelSelection(modelString: config.modelString)
         try Task.checkCancellation()
 
         let support = try await launchResolver.probeSupport(for: config)
@@ -115,9 +113,8 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         let ambientEnvironment = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(purpose: .cliRunner, overrides: launch.environment)
         ).environment
-        let environment = await ProviderEnvironmentFiltering.filter(
+        let environment = await host.filterEnvironment(
             ambientEnvironment,
-            for: .grokBuild,
             explicitOverrides: Self.launchEnvironment(apiKey: apiKey),
             removedNamesProvider: removedNamesProvider
         )
@@ -252,7 +249,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
 
     /// Failed deletion is diagnostic and must not replace a successful completion,
     /// original request failure, or cancellation.
-    static func withRequestCleanup<Value>(
+    package static func withRequestCleanup<Value>(
         promptDirectory: URL,
         environment: [String: String],
         removeItem: (URL) throws -> Void = { try FileManager.default.removeItem(at: $0) },
@@ -354,7 +351,7 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
     }
 
     /// Process-local overrides, kept separate from Grok's inherited credential/config environment.
-    static func launchEnvironment(apiKey: String?) -> [String: String] {
+    package static func launchEnvironment(apiKey: String?) -> [String: String] {
         var environment = GrokBuildAgentConfig.importIsolationEnvironment
         environment["GROK_CLAUDE_HOOKS_ENABLED"] = "0"
         environment["GROK_CURSOR_HOOKS_ENABLED"] = "0"
@@ -454,32 +451,6 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         return systemPrompt + "\n\n" + userMessage
     }
 
-    private static func resolveModelSelection(
-        modelString: String?,
-        snapshot: ACPDiscoveredSessionModels?
-    ) throws -> (model: String?, effort: String?) {
-        guard let modelString = modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !modelString.isEmpty,
-              modelString.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else {
-            return (nil, nil)
-        }
-        guard let snapshot, snapshot.contains(rawModel: modelString) else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build model `\(modelString)` is not in the discovered model set. Refresh Grok Build models and retry."
-            )
-        }
-        guard let decomposed = GrokBuildModelSpecifier.decompose(
-            raw: modelString,
-            options: snapshot.options
-        ) else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build model `\(modelString)` could not be resolved from the discovered model set. Refresh Grok Build models and retry."
-            )
-        }
-        return (decomposed.base.rawValue, decomposed.explicitEffort?.rawValue)
-    }
-
     private static let successfulTerminalStopReasons: Set<String> = [
         "end_turn",
         "stop",
@@ -522,18 +493,18 @@ final class GrokBuildOneShotHeadlessAgentProvider: HeadlessAgentProvider {
         return message.isEmpty ? nil : message
     }
 
-    private static func streamResults(from completion: GrokBuildOneShotCompletion) -> [AIStreamResult] {
-        var results: [AIStreamResult] = []
+    private static func streamResults(from completion: GrokBuildOneShotCompletion) -> [RepoPromptDomainRuntime.AIStreamResult] {
+        var results: [RepoPromptDomainRuntime.AIStreamResult] = []
         if let thought = completion.thought,
            !thought.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
-            results.append(AIStreamResult(type: "reasoning", text: nil, reasoning: thought))
+            results.append(RepoPromptDomainRuntime.AIStreamResult(type: "reasoning", text: nil, reasoning: thought))
         }
         if !completion.text.isEmpty {
-            results.append(AIStreamResult(type: "content", text: completion.text))
+            results.append(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: completion.text))
         }
         results.append(
-            AIStreamResult(
+            RepoPromptDomainRuntime.AIStreamResult(
                 type: "message_stop",
                 text: nil,
                 promptTokens: completion.promptTokens,

@@ -2,59 +2,39 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// Headless/discovery adapter for Grok Build's ACP runtime (`grok agent stdio`).
 ///
 /// Agent Mode owns the long-lived ACP runner; headless discovery paths use
 /// the shared one-shot ACP headless bridge configured with Grok Build's launch
 /// and model-selection behavior.
-final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
-    typealias ProviderFactory = @Sendable (_ config: GrokBuildAgentConfig) async throws -> any ACPAgentProvider
-    typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
+package final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
+    package typealias ProviderFactory = @Sendable (_ config: GrokBuildAgentConfig) async throws -> any ACPAgentProvider
+    package typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
 
     private let config: GrokBuildAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
 
     #if DEBUG
-        var test_config: GrokBuildAgentConfig {
+        package var test_config: GrokBuildAgentConfig {
             config
         }
     #endif
 
-    init(
+    package init(
+        host: any GrokBuildACPHeadlessHost,
         config: GrokBuildAgentConfig,
         workspacePath: String? = nil,
-        providerFactory: ProviderFactory? = nil,
-        controllerFactory: @escaping ControllerFactory = { provider, request, diagnosticSink in
-            try ACPAgentSessionController(
-                provider: provider,
-                runRequest: request,
-                diagnosticSink: diagnosticSink
-            )
-        }
+        providerFactory: @escaping ProviderFactory,
+        controllerFactory: @escaping ControllerFactory
     ) {
         self.config = config
-        let resolvedProviderFactory = providerFactory ?? { config in
-            // Resolve the stored Grok key here (async) — `AgentRuntimeProviderService.makeProvider`
-            // is synchronous and cannot read the keychain, so headless configs arrive without it.
-            try await GrokBuildACPAgentProvider(
-                config: GrokBuildAgentConfig(
-                    commandName: config.commandName,
-                    additionalPathHints: config.additionalPathHints,
-                    enableDebugLogging: config.enableDebugLogging,
-                    modelString: config.modelString,
-                    includeRepoPromptMCPServer: config.includeRepoPromptMCPServer,
-                    alwaysApproveTools: config.alwaysApproveTools,
-                    discoveryMode: config.discoveryMode,
-                    apiKey: KeyManager().getAPIKey(for: .grok),
-                    backgroundFeatureEnvironment: config.backgroundFeatureEnvironment
-                )
-            )
-        }
+
         bridge = ACPHeadlessAgentProviderBridge(
             providerName: "Grok Build",
             makeProvider: {
-                try await resolvedProviderFactory(config)
+                try await providerFactory(config)
             },
             makeRequest: { message, _ in
                 ACPRunRequest(
@@ -70,40 +50,22 @@ final class GrokBuildACPHeadlessAgentProvider: HeadlessAgentProvider {
             },
             makeController: controllerFactory,
             beforePrompt: { controller, _ in
-                try await Self.applySelectedModelIfNeeded(config: config, controller: controller)
+                if let model = try host.selectedModel(config: config) {
+                    try await controller.setSessionModel(model)
+                }
             },
             approvalPolicy: .declineUnsupported
         )
     }
 
-    func streamAgentMessage(
+    package func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         try await bridge.streamAgentMessage(message, runID: runID)
     }
 
-    func dispose() async {
+    package func dispose() async {
         await bridge.dispose()
-    }
-
-    private static func applySelectedModelIfNeeded(
-        config: GrokBuildAgentConfig,
-        controller: ACPAgentSessionController
-    ) async throws {
-        guard let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else {
-            return
-        }
-        // No silent substitution: a concrete model must exist in the current Grok registry
-        // snapshot; anything else fails before the prompt instead of running a stale model.
-        guard AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .grokBuild)?.contains(rawModel: model) == true else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Grok Build model `\(model)` is not in the discovered model set. Refresh Grok Build models and retry."
-            )
-        }
-        try await controller.setSessionModel(model)
     }
 }

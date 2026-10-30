@@ -1,33 +1,26 @@
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
+import RepoPromptDomainRuntime
 
-final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
-    typealias ProviderFactory = @Sendable (_ config: DevinAgentConfig) -> any ACPAgentProvider
-    typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
+package final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
+    package typealias ProviderFactory = @Sendable (_ config: DevinAgentConfig) -> any ACPAgentProvider
+    package typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
 
     private let config: DevinAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
 
-    init(
+    package init(
+        isDefaultModel: @escaping @Sendable (String) -> Bool,
         config: DevinAgentConfig,
         workspacePath: String? = nil,
-        providerFactory: ProviderFactory? = nil,
-        controllerFactory: @escaping ControllerFactory = { provider, request, diagnosticSink in
-            try ACPAgentSessionController(
-                provider: provider,
-                runRequest: request,
-                diagnosticSink: diagnosticSink
-            )
-        }
+        providerFactory: @escaping ProviderFactory,
+        controllerFactory: @escaping ControllerFactory
     ) {
         self.config = config
-        let resolvedProviderFactory = providerFactory ?? { config in
-            DevinACPAgentProvider(config: config, isolateForeignMCPImports: true)
-        }
         bridge = ACPHeadlessAgentProviderBridge(
             providerName: "Devin",
-            makeProvider: { resolvedProviderFactory(config) },
+            makeProvider: { providerFactory(config) },
             makeRequest: { message, _ in
                 Self.makeRunRequest(config: config, workspacePath: workspacePath, message: message)
             },
@@ -35,7 +28,7 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
             beforePrompt: { controller, request in
                 guard let model = request.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !model.isEmpty,
-                      model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+                      !isDefaultModel(model)
                 else { return }
                 try await controller.setSessionModel(model)
             },
@@ -43,7 +36,7 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
         )
     }
 
-    static func makeRunRequest(
+    package static func makeRunRequest(
         config: DevinAgentConfig,
         workspacePath: String?,
         message: AgentMessage
@@ -59,14 +52,14 @@ final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
         )
     }
 
-    func streamAgentMessage(
+    package func streamAgentMessage(
         _ message: AgentMessage,
         runID: UUID? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         try await bridge.streamAgentMessage(message, runID: runID)
     }
 
-    func dispose() async {
+    package func dispose() async {
         await bridge.dispose()
     }
 }
