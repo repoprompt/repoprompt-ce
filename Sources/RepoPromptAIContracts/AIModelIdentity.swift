@@ -38,6 +38,11 @@ public enum AIModel: Equatable, Hashable {
     case gpt6AstraHigh
     case gpt6AstraXHigh
     case gpt6AstraMax
+    case gpt6AstraPro
+    case gpt6AstraProLow
+    case gpt6AstraProHigh
+    case gpt6AstraProXHigh
+    case gpt6AstraProMax
     case gpt6Luna
     case gpt6LunaLow
     case gpt6LunaHigh
@@ -283,6 +288,11 @@ public enum AIModel: Equatable, Hashable {
         case gpt6AstraHigh
         case gpt6AstraXHigh
         case gpt6AstraMax
+        case gpt6AstraPro
+        case gpt6AstraProLow
+        case gpt6AstraProHigh
+        case gpt6AstraProXHigh
+        case gpt6AstraProMax
         case gpt6Luna
         case gpt6LunaLow
         case gpt6LunaHigh
@@ -524,6 +534,16 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt6AstraXHigh)
         case .gpt6AstraMax:
             .staticCase(.gpt6AstraMax)
+        case .gpt6AstraPro:
+            .staticCase(.gpt6AstraPro)
+        case .gpt6AstraProLow:
+            .staticCase(.gpt6AstraProLow)
+        case .gpt6AstraProHigh:
+            .staticCase(.gpt6AstraProHigh)
+        case .gpt6AstraProXHigh:
+            .staticCase(.gpt6AstraProXHigh)
+        case .gpt6AstraProMax:
+            .staticCase(.gpt6AstraProMax)
         case .gpt6Luna:
             .staticCase(.gpt6Luna)
         case .gpt6LunaLow:

@@ -10,6 +10,7 @@ package protocol OpenAIProviderHost {
     func serviceTierBase(for model: AIModel) -> AIModel
     func serviceTierOverride(for model: AIModel) -> String?
     func usesResponsesAPI(for model: AIModel) -> Bool
+    func reasoningMode(for model: AIModel) -> String?
     func canStream(for model: AIModel) -> Bool
     func providerModel(for model: AIModel) -> SwiftOpenAI.Model
     func defaultReasoningEffort(for model: AIModel) -> String?

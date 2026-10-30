@@ -22,6 +22,10 @@ struct OpenAIProviderAppHost: OpenAIProviderHost {
         model.usesResponsesAPI
     }
 
+    func reasoningMode(for model: AIModel) -> String? {
+        model.openAIReasoningMode
+    }
+
     func canStream(for model: AIModel) -> Bool {
         model.canStream
     }

@@ -374,6 +374,10 @@ private final class HTTPTestHost: OpenAIProviderHost {
         return false
     }
 
+    func reasoningMode(for _: AIModel) -> String? {
+        nil
+    }
+
     func canStream(for _: AIModel) -> Bool {
         calls.append("canStream")
         return canStreamAnswers.isEmpty ? true : canStreamAnswers.removeFirst()
