@@ -71,6 +71,15 @@ enum AgentSessionLinkCatalogDiagnostics {
         category: "AgentSessionLinkCatalog"
     )
 
+    typealias LaneCreationAddFailureBranch = WorkspaceRestoreLaneAddFailureBranch
+
+    static func laneCreationAddFailed(
+        branch: LaneCreationAddFailureBranch,
+        reason: String? = nil
+    ) {
+        logger.notice("event=create-lane-add-failed branch=\(branch.rawValue, privacy: .public) reason=\(reason ?? "none", privacy: .public)")
+    }
+
     #if DEBUG
         private final class TestCapture: @unchecked Sendable {
             private let lock = NSLock()

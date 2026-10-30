@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import os
+import RepoPromptInstrumentation
 
 /// Always-on, low-volume startup phase timing for launch-latency diagnosis.
 ///
@@ -11,8 +12,8 @@ import os
 ///     log show --style compact --last 15m \
 ///         --predicate 'processID == <pid> AND category == "Startup"'
 ///
-/// Marker content is restricted to phase names, durations, window ordinals and counts.
-/// No paths, workspace or chat names, identifiers or other user data are emitted.
+/// Phase markers contain durations, window ordinals and counts. Oversight attempt records also
+/// identify the observer/target session UUIDs and typed outcomes; no paths, names or content are logged.
 enum StartupPhaseLog {
     /// Static phase identifiers; new phases are added here, never interpolated at call sites.
     enum Phase: String, CaseIterable {
@@ -22,6 +23,13 @@ enum StartupPhaseLog {
         case workspaceCorpusLoad
         case authorityBootstrapWait
         case bridgeInitialProjection
+        case oversightIntentLoad
+        case oversightLaunchSeed
+        case oversightRestoreAttempt
+        case oversightRestoreAdmission
+        case oversightDiscoveryAdoption
+        case oversightDiscoveryCompletion
+        case oversightDiscoveryBarrier
         case windowAttached
         case windowAppeared
         case restoreEntryAssigned
@@ -63,6 +71,7 @@ enum StartupPhaseLog {
         var uptime: @Sendable () -> TimeInterval
         var processStartUptime: TimeInterval
         var emit: @Sendable (String) -> Void
+        var debugEmit: (@Sendable (String) -> Void)?
     }
 
     /// A `begin` boundary's token; `end` emits the matching `end` line with `span_ms`.
@@ -96,7 +105,8 @@ enum StartupPhaseLog {
     private static let productionRuntime = Runtime(
         uptime: { ProcessInfo.processInfo.systemUptime },
         processStartUptime: processStartUptime(),
-        emit: { message in logger.log("\(message, privacy: .public)") }
+        emit: { message in logger.log("\(message, privacy: .public)") },
+        debugEmit: { message in logger.debug("\(message, privacy: .public)") }
     )
 
     private static func runtime() -> Runtime {
@@ -121,6 +131,40 @@ enum StartupPhaseLog {
                 fields: fields
             )
         )
+    }
+
+    /// Uses the same bounded fields and test capture as `mark`, but emits at debug level.
+    static func debugMark(_ phase: Phase, window: Int? = nil, fields: [String: Int] = [:]) {
+        let runtime = runtime()
+        (runtime.debugEmit ?? runtime.emit)(
+            render(
+                phase: phase,
+                boundary: "event",
+                window: window,
+                elapsedMS: elapsedMilliseconds(now: runtime.uptime(), processStart: runtime.processStartUptime),
+                spanMS: nil,
+                fields: fields
+            )
+        )
+    }
+
+    typealias OversightRestoreOutcome = WorkspaceRestoreOversightOutcome
+
+    static func oversightRestoreAttempt(
+        observer: UUID,
+        target: UUID,
+        outcome: OversightRestoreOutcome,
+        reason: String? = nil
+    ) {
+        let runtime = runtime()
+        var message = render(
+            phase: .oversightRestoreAttempt, boundary: "event", window: nil,
+            elapsedMS: elapsedMilliseconds(now: runtime.uptime(), processStart: runtime.processStartUptime),
+            spanMS: nil, fields: [:]
+        )
+        message += " observer=\(observer.uuidString) target=\(target.uuidString) outcome=\(outcome.rawValue)"
+        if let reason { message += " reason=\(reason)" }
+        runtime.emit(message)
     }
 
     /// The emitted `begin` line keeps the request-time `elapsed_ms`, but the returned

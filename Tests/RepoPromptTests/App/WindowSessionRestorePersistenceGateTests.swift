@@ -7,6 +7,16 @@ import XCTest
 /// snapshot (and the workspace whose agent/oracle settings it points at) is not
 /// overwritten by the transient default/system-workspace startup state.
 final class WindowSessionRestorePersistenceGateTests: XCTestCase {
+    func testAbandonedEntriesNeverProveAbsenceAfterPendingWindowExecutionFinishes() {
+        var gate = WindowSessionRestorePersistenceGate()
+        gate.finishRestoreSessionLoad(pendingEntryCount: 1)
+        gate.abandonPendingRestoreEntries()
+        XCTAssertEqual(gate.oversightTopologyState(hasPendingWindowExecution: true, abandonedEntryCount: 1), .pending)
+        let settled = gate.oversightTopologyState(hasPendingWindowExecution: false, abandonedEntryCount: 1)
+        XCTAssertEqual(settled, .incompleteLeftoversAbandoned(count: 1))
+        XCTAssertFalse(settled.provesAbsence)
+    }
+
     func testIdleGateAllowsImmediatePersistAndHasNothingToFlush() {
         var gate = WindowSessionRestorePersistenceGate()
 
