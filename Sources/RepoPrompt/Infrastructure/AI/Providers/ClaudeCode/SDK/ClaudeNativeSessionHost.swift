@@ -19,6 +19,12 @@ protocol ClaudeNativeSessionHosting: Sendable {
     func mergeCurrentCarrier(into environment: [String: String]) -> [String: String]
     func supplementedPathHints(_ hints: [String]) -> [String]
     func expectedAgentClientName(for variant: ClaudeCodeRuntimeVariant) -> String?
+    func isRawEventFileLoggingEnabled() -> Bool
+    func makeRawEventLogFileURL(workspacePath: String?, sessionID: String) -> URL?
+    func recordLastRawEventLogFileURL(_ url: URL)
+    func isReasoningExtractionEnabled() -> Bool
+    func appendReasoningDebug(_ line: String)
+    func isRepoPromptToolName(_ name: String) -> Bool
     #if DEBUG
         func debugStatusLineArguments(launchArguments: [String], isFirstParty: Bool, providerArguments: [String]) -> [String]
     #endif

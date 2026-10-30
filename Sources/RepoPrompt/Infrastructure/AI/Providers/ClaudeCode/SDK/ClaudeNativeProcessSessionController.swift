@@ -7,8 +7,6 @@ import RepoPromptProcess
 import RepoPromptProviderQuota
 
 final actor ClaudeNativeProcessSessionController {
-    private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
-    private static let lastRawEventLogFilePathKey = "claudeLastRawEventLogFilePath"
     private static let rawEventTimestampFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -239,10 +237,10 @@ final actor ClaudeNativeProcessSessionController {
 
     #if DEBUG
         private func reasoningDebug(_ message: @autoclosure () -> String) {
-            guard ClaudeReasoningExtractionFeature.isEnabled else { return }
+            guard host.isReasoningExtractionEnabled() else { return }
             let line = "[ClaudeReasoningDebug][Controller] run=\(runID.uuidString) tab=\(tabID.uuidString) \(message())"
             print(line)
-            ClaudeReasoningDebugLog.append(line)
+            host.appendReasoningDebug(line)
         }
     #else
         private func reasoningDebug(_ message: @autoclosure () -> String) {}
@@ -275,10 +273,12 @@ final actor ClaudeNativeProcessSessionController {
         self.config = config
         self.environmentResolver = environmentResolver
         self.authoritativeTurnIdleFallbackSeconds = authoritativeTurnIdleFallbackSeconds
-        rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
+        rawEventFileLoggingEnabled = host.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
         rawEventLogFileSessionID = nil
-        translator = ClaudeSDKNDJSONTranslator(enableDebugLogging: config.enableDebugLogging)
+        translator = ClaudeSDKNDJSONTranslator(enableDebugLogging: config.enableDebugLogging) { name in
+            host.isRepoPromptToolName(name)
+        }
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
         eventsContinuation = stream.continuation
@@ -1412,7 +1412,7 @@ final actor ClaudeNativeProcessSessionController {
         guard !isShuttingDown else { return }
         recordObservedSessionID(Self.firstSessionIdentifier(in: payload))
         #if DEBUG
-            if ClaudeReasoningExtractionFeature.isEnabled {
+            if host.isReasoningExtractionEnabled() {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
                 if debugPayloadType == "stream_event" || debugPayloadType == "assistant" || debugPayloadType == "message" || debugPayloadType == "result" {
                     let event = payload["event"] as? [String: Any]
@@ -1487,7 +1487,7 @@ final actor ClaudeNativeProcessSessionController {
             emitSemanticUncertainty("Unclassified provider activity")
         }
         #if DEBUG
-            if ClaudeReasoningExtractionFeature.isEnabled {
+            if host.isReasoningExtractionEnabled() {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
                 if streamResults.isEmpty {
                     let event = payload["event"] as? [String: Any]
@@ -1519,7 +1519,7 @@ final actor ClaudeNativeProcessSessionController {
         // arrive per turn.
         for result in streamResults {
             #if DEBUG
-                if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
+                if host.isReasoningExtractionEnabled(), result.type == "reasoning" {
                     let text = result.reasoning ?? result.text ?? ""
                     reasoningDebug("emitting reasoning stream result len=\(text.count) snippet=\(reasoningDebugSnippet(text))")
                 }
@@ -1949,10 +1949,6 @@ final actor ClaudeNativeProcessSessionController {
             _ controlRequest: @escaping @Sendable ([String: Any]) async throws -> [String: Any]
         ) {
             configurationTestControlRequest = controlRequest
-        }
-
-        static func test_isRawEventFileLoggingEnabled() -> Bool {
-            isRawEventFileLoggingEnabled()
         }
 
         func test_determineTurnStatus(payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
@@ -2561,22 +2557,6 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    private static let rawEventLoggingEnabledKey = "claudeRawEventLoggingEnabled"
-
-    private static func isRawEventFileLoggingEnabled(defaults: UserDefaults = .standard) -> Bool {
-        #if DEBUG
-            defaults.bool(forKey: rawEventLoggingEnabledKey)
-        #else
-            false
-        #endif
-    }
-
-    #if DEBUG
-        static func test_isRawEventFileLoggingEnabled(defaults: UserDefaults) -> Bool {
-            isRawEventFileLoggingEnabled(defaults: defaults)
-        }
-    #endif
-
     private static func normalizedSessionIdentifier(_ raw: String?) -> String {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return "unknown-session" }
@@ -2588,58 +2568,19 @@ final actor ClaudeNativeProcessSessionController {
         return normalized.isEmpty ? "unknown-session" : normalized
     }
 
-    private static func makeRawEventLogFileURL(
-        workspacePath: String?,
-        sessionID: String,
-        defaults: UserDefaults = .standard
-    ) -> URL? {
-        let overridePath = defaults.string(forKey: rawEventLogFilePathKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseDirectory: URL = {
-            if let overridePath, !overridePath.isEmpty {
-                let expanded = NSString(string: overridePath).expandingTildeInPath
-                return URL(fileURLWithPath: expanded, isDirectory: true)
-            }
-            return MCPFilesystemConstants.identity.temporaryRootURL()
-                .appendingPathComponent("ClaudeRawEvents", isDirectory: true)
-        }()
-        do {
-            try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
-        } catch {
-            return nil
-        }
-        let timestampFormatter = DateFormatter()
-        timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
-        timestampFormatter.timeZone = TimeZone(secondsFromGMT: 0)
-        timestampFormatter.dateFormat = "yyyyMMdd-HHmmss"
-        let timestamp = timestampFormatter.string(from: Date())
-        let fileName = "claude-session-\(sessionID)-\(timestamp).jsonl"
-        return baseDirectory.appendingPathComponent(fileName)
-    }
-
-    #if DEBUG
-        static func test_makeRawEventLogFileURL(
-            workspacePath: String?,
-            sessionID: String,
-            defaults: UserDefaults
-        ) -> URL? {
-            makeRawEventLogFileURL(workspacePath: workspacePath, sessionID: sessionID, defaults: defaults)
-        }
-    #endif
-
     private func ensureRawEventLogFileReadyIfNeeded(sessionIDHint: String?) {
         guard rawEventFileLoggingEnabled else { return }
         let effectiveSessionID = Self.normalizedSessionIdentifier(sessionIDHint ?? sessionID ?? tabID.uuidString)
         if rawEventLogFileURL != nil, rawEventLogFileSessionID == effectiveSessionID {
             return
         }
-        guard let fileURL = Self.makeRawEventLogFileURL(workspacePath: workspacePath, sessionID: effectiveSessionID) else {
+        guard let fileURL = host.makeRawEventLogFileURL(workspacePath: workspacePath, sessionID: effectiveSessionID) else {
             return
         }
         rawEventLogFileURL = fileURL
         rawEventLogFileSessionID = effectiveSessionID
         hasWrittenRawEventLogHeader = false
-        UserDefaults.standard.set(fileURL.path, forKey: Self.lastRawEventLogFilePathKey)
+        host.recordLastRawEventLogFileURL(fileURL)
     }
 
     private func appendRawEventLogRecord(_ record: [String: Any]) {
@@ -2793,7 +2734,7 @@ final actor ClaudeNativeProcessSessionController {
 
     private func emit(_ event: Event) {
         #if DEBUG
-            if ClaudeReasoningExtractionFeature.isEnabled,
+            if host.isReasoningExtractionEnabled(),
                case let .stream(result) = event,
                result.type == "reasoning"
             {

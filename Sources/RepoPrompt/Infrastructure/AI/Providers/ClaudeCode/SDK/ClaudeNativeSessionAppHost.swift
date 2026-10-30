@@ -43,6 +43,56 @@ struct ClaudeNativeSessionAppHost: ClaudeNativeSessionHosting {
         }
     #endif
 
+    func isRawEventFileLoggingEnabled() -> Bool {
+        #if DEBUG
+            UserDefaults.standard.bool(forKey: "claudeRawEventLoggingEnabled")
+        #else
+            false
+        #endif
+    }
+
+    func makeRawEventLogFileURL(workspacePath _: String?, sessionID: String) -> URL? {
+        let overridePath = UserDefaults.standard.string(forKey: "claudeRawEventLogFilePath")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseDirectory: URL = {
+            if let overridePath, !overridePath.isEmpty {
+                let expanded = NSString(string: overridePath).expandingTildeInPath
+                return URL(fileURLWithPath: expanded, isDirectory: true)
+            }
+            return MCPFilesystemConstants.identity.temporaryRootURL()
+                .appendingPathComponent("ClaudeRawEvents", isDirectory: true)
+        }()
+        do {
+            try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        let timestampFormatter = DateFormatter()
+        timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
+        timestampFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        timestampFormatter.dateFormat = "yyyyMMdd-HHmmss"
+        let timestamp = timestampFormatter.string(from: Date())
+        return baseDirectory.appendingPathComponent("claude-session-\(sessionID)-\(timestamp).jsonl")
+    }
+
+    func recordLastRawEventLogFileURL(_ url: URL) {
+        UserDefaults.standard.set(url.path, forKey: "claudeLastRawEventLogFilePath")
+    }
+
+    func isReasoningExtractionEnabled() -> Bool {
+        ClaudeReasoningExtractionFeature.isEnabled
+    }
+
+    func appendReasoningDebug(_ line: String) {
+        #if DEBUG
+            ClaudeReasoningDebugLog.append(line)
+        #endif
+    }
+
+    func isRepoPromptToolName(_ name: String) -> Bool {
+        MCPIntegrationHelper.isRepoPromptToolName(name)
+    }
+
     func isMCPServerRunning() async -> Bool {
         await ServerNetworkManager.shared.isRunning()
     }

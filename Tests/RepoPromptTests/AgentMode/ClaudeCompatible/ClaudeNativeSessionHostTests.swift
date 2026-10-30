@@ -29,6 +29,13 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
             nil
         }
 
+        nonisolated func isRawEventFileLoggingEnabled() -> Bool { false }
+        nonisolated func makeRawEventLogFileURL(workspacePath _: String?, sessionID _: String) -> URL? { nil }
+        nonisolated func recordLastRawEventLogFileURL(_: URL) {}
+        nonisolated func isReasoningExtractionEnabled() -> Bool { false }
+        nonisolated func appendReasoningDebug(_: String) {}
+        nonisolated func isRepoPromptToolName(_: String) -> Bool { false }
+
         #if DEBUG
             nonisolated func debugStatusLineArguments(launchArguments _: [String], isFirstParty _: Bool, providerArguments _: [String]) -> [String] {
                 []

@@ -1832,7 +1832,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             let turn = "w2-exact-turn-\(owner.attemptID)"
             let raw = (claude ? "toolu_w2_queued_host" : "w2_original_native_call_string") + "-\(owner.attemptID)"
             let mailbox = TestReleaseFence(name: "before first registered noop host callback")
-            var translator = ClaudeSDKNDJSONTranslator()
+            var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
             var nativeTask: Task<Void, Never>?
             var terminalTask: Task<Void, Never>?
             var nativeIDs: [UUID] = []
