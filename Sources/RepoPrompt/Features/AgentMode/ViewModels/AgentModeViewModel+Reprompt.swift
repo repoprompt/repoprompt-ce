@@ -25,6 +25,18 @@ extension AgentModeViewModel {
         return !trimmed.isEmpty && !trimmed.hasPrefix("/") && !hasStagedCommand
     }
 
+    /// Called after UI publication commits. The operation owns the generated draft;
+    /// the native editor may still show the preceding chunk, but any native edit/IME
+    /// takeover fences automatic dispatch synchronously before changing that text.
+    func consumeRepromptAutoSend(
+        _ request: AgentRepromptUIStore.AutoSendRequest, tabID: UUID?, visibleDraft: String, hasMarkedText: Bool
+    ) -> Bool {
+        guard repromptEnabled, currentTabID == tabID, request.tabID == tabID,
+              repromptUIStore.autoSendRequest == request, visibleDraft == request.text, !hasMarkedText,
+              let operation = repromptOperation, operation.id == request.operationID else { return false }
+        return operation.consumeAutoSend(request)
+    }
+
     /// Mouse Send and Return share this preparation boundary; dispatch still requires a fresh claim.
     /// A second explicit send accepts the visible draft in every phase, including failure and clarification.
     func prepareRepromptForComposerSend(target: AgentComposerSubmitTarget, text: String) -> Bool {
@@ -135,6 +147,7 @@ extension AgentModeViewModel {
                 let liveMode = workspaceID.map { self.modelRouterSettingsStore.workspaceAgentModelsSettings(for: $0).inheritanceMode }
                 return sessions[target.tabID] === session && currentTabID == target.tabID
                     && workspaceManager?.activeWorkspaceID == workspaceID
+                    && (operation.mode != .sendAutomatically || repromptEnabled)
                     && makeComposerSubmitTarget(tabID: target.tabID, session: session) == target
                     && (operation.isPublishing || (session.draftText == operation.expectedDraft && session.draftMutationGeneration == operation.expectedDraftGeneration))
                     && Self.pendingUserTurnState(from: session) == capturedPending

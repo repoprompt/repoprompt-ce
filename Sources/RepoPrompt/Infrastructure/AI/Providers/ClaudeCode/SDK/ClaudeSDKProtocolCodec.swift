@@ -62,8 +62,8 @@ enum ClaudeSDKProtocolCodec {
         try ClaudeCompatiblePluginProtocolCodec.encodeControlResponseError(requestID: requestID, error: error)
     }
 
-    static func encodeUserMessage(text: String, sessionID: String?) throws -> Data {
-        try ClaudeCompatiblePluginProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
+    static func encodeUserMessage(text: String, sessionID: String?, uuid: UUID? = nil) throws -> Data {
+        try ClaudeCompatiblePluginProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID, uuid: uuid)
     }
 
     private static func mapInboundMessage(_ inbound: ClaudeCompatiblePluginProtocolCodec.InboundMessage) -> InboundMessage {

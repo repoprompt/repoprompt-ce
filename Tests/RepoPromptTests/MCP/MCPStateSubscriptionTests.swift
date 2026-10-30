@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptShared
 @testable import RepoPromptWorkspaceContext
@@ -616,6 +617,35 @@ private final class ExecutionCounter: @unchecked Sendable {
             XCTAssertEqual(events.generations.count, 1)
         }
 
+        /// Avoid blocking Process.waitUntilExit across actor hops and bound cleanup.
+        /// The exact mechanism of the CI hang was not identified.
+        private func withAdmissionChild(_ operation: (ChildProcessExitObserver) async throws -> Void) async throws {
+            let process = try ProcessLauncher.spawn(
+                command: "/bin/sleep", arguments: ["60"], environment: [:], workingDirectory: nil, purpose: .tool
+            )
+            let child = ChildProcessExitObserver.observe(pid: process.pid)
+            process.stdin?.closeFile()
+            process.stdout.closeFile()
+            process.stderr.closeFile()
+            do {
+                try await operation(child)
+            } catch {
+                _ = await stopAdmissionChild(child)
+                throw error
+            }
+            _ = await stopAdmissionChild(child)
+        }
+
+        private func stopAdmissionChild(_ child: ChildProcessExitObserver) async -> Bool {
+            // The observer owns reaping and closes signaling before PID reuse.
+            // Repeated cleanup after an explicit stop is therefore safe.
+            _ = child.signalRootProcessFamilyIfUnreaped(processGroupID: nil, signal: SIGKILL)
+            let outcome = await child.wait(timeout: 5)
+            let expected = ChildProcessExitObserver.Outcome.exited(.uncaughtSignal(signal: SIGKILL))
+            XCTAssertEqual(outcome, expected, "Synthetic admission child exit/cleanup was not confirmed within five seconds")
+            return outcome == expected
+        }
+
         /// Uses real OS child lifetimes to exercise process resolution and consent;
         /// bundled-executable verification and the MCP socket path are separate boundaries.
         func testRealChildRespawnsShareLauncherConsentEvenAfterPromptingChildExits() async throws {
@@ -624,7 +654,7 @@ private final class ExecutionCounter: @unchecked Sendable {
                 let events = AdmissionEvents()
                 await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
                 try await withAdmissionChild { first in
-                    let firstPID = first.process.processIdentifier
+                    let firstPID = first.pid
                     let firstPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: firstPID))
                     let launcher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: firstPID, bundledHelper: true))
                     XCTAssertEqual(launcher.pid, getpid())
@@ -634,9 +664,9 @@ private final class ExecutionCounter: @unchecked Sendable {
                         isConnectionLive: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
                         approve: { events.decide("unexpected") }, deny: { events.decide("old-helper-denied") }
                     )
-                    try await first.stop()
+                    guard await stopAdmissionChild(first) else { return }
                     try await withAdmissionChild { second in
-                        let secondPID = second.process.processIdentifier
+                        let secondPID = second.pid
                         let secondPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: secondPID))
                         let secondLauncher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: secondPID, bundledHelper: true))
                         XCTAssertEqual(secondLauncher, launcher)
@@ -652,42 +682,6 @@ private final class ExecutionCounter: @unchecked Sendable {
                     }
                 }
             }
-        }
-
-        private final class AdmissionChild {
-            let process = Process()
-            private let exited = XCTestExpectation(description: "owned admission child exited")
-            private var stopped = false
-
-            init() {
-                process.executableURL = URL(fileURLWithPath: "/bin/sleep")
-                process.arguments = ["60"]
-                // Install before launch: waitUntilExit can lose its wakeup after an await.
-                process.terminationHandler = { [exited] _ in exited.fulfill() }
-            }
-
-            func stop() async throws {
-                guard !stopped else { return }
-                stopped = true
-                if process.isRunning { _ = kill(process.processIdentifier, SIGKILL) }
-                let result = await XCTWaiter.fulfillment(of: [exited], timeout: 5)
-                guard result == .completed else {
-                    XCTFail("Owned admission child did not report exit: \(result)")
-                    throw CancellationError()
-                }
-            }
-        }
-
-        private func withAdmissionChild(_ body: (AdmissionChild) async throws -> Void) async throws {
-            let child = AdmissionChild()
-            try child.process.run()
-            do {
-                try await body(child)
-            } catch {
-                try? await child.stop()
-                throw error
-            }
-            try await child.stop()
         }
 
         func testClosedQueuedConnectionNeverPresentsAnotherDialog() async {

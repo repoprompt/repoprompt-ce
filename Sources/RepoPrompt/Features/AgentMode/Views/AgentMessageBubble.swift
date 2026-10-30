@@ -384,10 +384,13 @@ struct AgentMessageBubble: View {
                     if !item.taggedFileAttachments.isEmpty {
                         TaggedFilesBadge(attachments: item.taggedFileAttachments)
                     }
-                    CollapsibleUserMessage(
+                    MarkdownTextView(
                         text: item.text,
+                        isMarkdown: true,
+                        allowInteraction: true,
                         bareURLLinkificationPolicy: .httpHTTPSOnly
                     )
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(12)
                 .background(BubbleColors.lightBlue)

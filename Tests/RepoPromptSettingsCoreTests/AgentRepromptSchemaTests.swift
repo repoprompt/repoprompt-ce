@@ -14,6 +14,39 @@ final class AgentRepromptSchemaTests: XCTestCase {
         XCTAssertEqual(scoped.requiredSchemaVersion, 13)
     }
 
+    func testWorkspaceActivationPersistsIndependentlyOfProfileInheritance() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = "AgentRepromptActivationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let url = root.appendingPathComponent("settings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: url)
+        let workspaceID = UUID(), otherWorkspaceID = UUID()
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertNil(store.workspaceAgentModelsSettings(for: workspaceID).agentRepromptEnabled)
+        store.setWorkspaceAgentRepromptEnabled(workspaceID: workspaceID, enabled: true)
+        XCTAssertEqual(store.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode, .useGlobalSettings)
+        store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: .init(planningModelRaw: "custom"))
+        store.copyAgentModelsProfile(from: .global, to: .workspace(workspaceID))
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useGlobalSettings)
+        let fresh = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertEqual(fresh.workspaceAgentModelsSettings(for: workspaceID).agentRepromptEnabled, true)
+        XCTAssertNil(fresh.workspaceAgentModelsSettings(for: otherWorkspaceID).agentRepromptEnabled)
+        XCTAssertEqual(fresh.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode, .useGlobalSettings)
+        fresh.setWorkspaceAgentRepromptEnabled(workspaceID: workspaceID, enabled: false)
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertFalse(reloaded.workspaceAgentModelsSettings(for: workspaceID).agentRepromptEnabled ?? false)
+        let legacy = try JSONDecoder().decode(WorkspaceAgentModelsSettings.self, from: Data("{}".utf8))
+        XCTAssertNil(legacy.agentRepromptEnabled, "Existing workspaces remain off until explicitly enabled")
+        let activated = GlobalSettingsDocument(agentModelsSettings: [workspaceID: .init(agentRepromptEnabled: true)])
+        XCTAssertEqual(activated.requiredSchemaVersion, 14)
+        XCTAssertEqual(GlobalSettingsFileStore.preservationBlockReason(
+            schemaVersion: 14, schemaLineage: activated.schemaLineage, supportedVersion: 13
+        ), .unsupportedFutureSchema(onDiskVersion: 14, supportedVersion: 13))
+    }
+
     func testOldDecodeAndFeatureFence() throws {
         let profile = try JSONDecoder().decode(AgentModelsSettingsProfile.self, from: Data("{}".utf8))
         XCTAssertNil(profile.agentRepromptGuidance)

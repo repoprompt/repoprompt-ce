@@ -36,6 +36,20 @@ enum AgentRepromptDisclosure {
 }
 
 extension AgentModeViewModel {
+    var repromptEnabled: Bool {
+        get {
+            guard let workspaceID = workspaceManager?.activeWorkspaceID else { return unscopedRepromptEnabled }
+            return modelRouterSettingsStore.workspaceAgentModelsSettings(for: workspaceID).agentRepromptEnabled ?? false
+        }
+        set {
+            guard let workspaceID = workspaceManager?.activeWorkspaceID else {
+                unscopedRepromptEnabled = newValue
+                return
+            }
+            modelRouterSettingsStore.setWorkspaceAgentRepromptEnabled(workspaceID: workspaceID, enabled: newValue)
+        }
+    }
+
     var repromptIncludesRecentChat: Bool {
         modelRouterSettingsStore.effectiveAgentModelsProfile(workspaceID: workspaceManager?.activeWorkspaceID).agentRepromptIncludesRecentChat ?? true
     }
