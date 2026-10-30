@@ -1861,3 +1861,84 @@ unexplained. Repo Bench is unavailable, not a passing gate. Exact-head hosted an
 packaging receipts above apply to the source head, not subsequent documentation
 edits. User review and final merge are separate; M7 still waits for merged M6,
 M8 is independent, and #1402/#1408 and snapshot-only Q2 semantics are not closed.
+
+#### M6 integration repair and acceptance boundary (2026-10-31)
+
+This follow-up starts from PR head `0c541c01877fd646ad255ec18d82afd988761f2c`
+and normally integrates main `135ffde7` (#1566). The MCP admission-test merge
+retains upstream's `ChildProcessExitObserver` implementation and M6's
+`RepoPromptWorkspaceContext` import. The superseded `AdmissionChild` helper
+must not survive beside the upstream `withAdmissionChild` overload: the newer
+helper owns signaling and reaping through one observer and bounded exit wait.
+Independent source review confirms that this file differs from the integrated
+main file only by the WorkspaceContext import.
+
+The existing assembled contract is now named
+`AgentSessionLinkLiveDiscoveryTests.testActivatedTwoLaneContractInSelectedWorkspaceUsesProductionAdmissionAndReturnedCalls`
+(formerly `testActivatedTwoLaneContractUsesProductionAgentAdmissionAndReturnedCalls`).
+Its helper receives the fixture's expected workspace ID rather than deriving its
+expected value from the active workspace under test. Setup, Overseer activation,
+lane creation and final cleanup assert that exact selected workspace. The real
+serialized ingress, controlled replies, returned bare cursors, recovery replay,
+durable effects and unchanged foreground tab/draft checks remain in the journey.
+Historical receipts under the old name remain historical; the rename does not
+create new executed evidence.
+
+**Scope disposition: #1402's without-selecting-a-workspace acceptance remains
+unsatisfied.** The demonstrated journey requires an already selected workspace
+and does not attach an NSWindow or change selection. These are distinct
+contracts. `AgentSessionLaneMCPToolService` enumerates active window workspaces;
+`WindowStatesManager+AgentSessionLanes` and
+`AgentModeViewModel+SessionLinkLanes` recheck that workspace before allocation
+and retirement. Removing those fences is not a valid test fix. The nonvisual
+saved-oversight owner prepares existing saved sessions, with a single-carrier
+workspace projection that cannot persist UI placement; it is not an existing
+owner for arbitrary new lanes. A bounded no-selection implementation needs
+durable lane placement, discovery, authority and retirement coverage. It does
+not require completion of the entire separate #1408 campaign. This follow-up
+does not waive #1402's acceptance or close that issue.
+
+The following historical performance evidence from the PR description remains
+open, rather than being replaced by later passing checks:
+
+- At `0c541c018`, the local 300-chat scale case recorded warm-refresh/menu p95
+  of **67.141833/195.427625 ms**, each against **50 ms**. Its 4 restore reads,
+  470 visits and 35 publications do not explain the elapsed-time failure. The
+  diagnostic and hosted passes demonstrate other successful executions, not a
+  cause for this failure. The test matches pinned upstream `76998e93`, which
+  narrows the changed surface but does not exonerate all runtime dependencies.
+- The five retained fresh-profile Debug launches compared old main `35d141ad9`
+  with `0c541c018`, despite the candidate incorporating newer upstream
+  `76998e93`. Window-appearance medians **2,585/2,861 ms (+10.68%)** did not meet
+  the 10% acceptance budget. Different upstream changes and overlapping heavy
+  work prevent attributing that observation to M6. No threshold is changed.
+- The `0c541c018` experiment verified bootstrap ownership but did not execute
+  its MCP helper probe. The live pass at `3d03fe5f` remains pinned to that head.
+
+To close these gates, record the final candidate SHA and its integrated upstream
+baseline, then use the same macOS host/toolchain, configuration, architecture,
+profile and secure-storage policy. Finish builds before measurement, establish
+exclusive heavy-work admission for the measurement interval, and retain a
+predeclared balanced launch sequence (two warm-ups and twenty retained samples
+per head). Keep every valid slow sample; record invalid attempts and their
+predeclared environmental reason instead of replacing them until the gate
+passes. Report raw window-appearance/attachment samples, their p50 and
+nearest-rank p95, and sampled RSS separately from exact peak memory. Compare the
+unchanged 10% budget without claiming that a numerical pass diagnoses the
+historical failure. Run the unchanged 30/300-chat scale case on both matched
+heads with load evidence; disposition of the old failure must distinguish an
+observed result from an established mechanism.
+
+The existing `Release Candidate` workflow can validate basic live MCP on the
+final branch: it packages the artifact, then
+`Scripts/smoke_packaged_mcp_roundtrip.sh` proves the launched process owns its
+socket and performs `windows`, `initialize` and `tools/list` through that
+artifact's embedded helper before shutdown. This is basic packaged live evidence,
+not a real-provider or full Overseer journey. Do not run the release-socket
+smoke against a Debug bundle or substitute a build/test pass for this check.
+
+Readiness and merge approval remain separate: unresolved acceptance or missing
+final-source validation can keep the PR Draft; the user's review is the later
+merge gate. The eight passing hosted checks at `0c541c018` are not validation of
+this integration repair. Fresh hosted results and the final published SHA belong
+in the PR readiness record.

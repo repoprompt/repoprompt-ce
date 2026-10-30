@@ -561,7 +561,7 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             }
         }
 
-        func testActivatedTwoLaneContractUsesProductionAgentAdmissionAndReturnedCalls() async throws {
+        func testActivatedTwoLaneContractInSelectedWorkspaceUsesProductionAdmissionAndReturnedCalls() async throws {
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 try await self.exerciseLiveDiscovery(activate: true, contractJourney: true)
             }
@@ -821,8 +821,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
 
         /// Serialized app ingress and native event consumption with controlled providers.
         /// Socket approval/full-access inputs are explicit test grants, never inferred from a reply.
-        private func exerciseTwoLaneContract(
-            connection: PersistentMCPTestEndpoint, window: WindowState, observerID: UUID,
+        private func exerciseTwoLaneContractInSelectedWorkspace(
+            connection: PersistentMCPTestEndpoint, window: WindowState, observerID: UUID, workspaceID: UUID,
             controllers: @escaping @MainActor () -> [UUID: MonitorFakeNativeController]
         ) async throws {
             let settings = GlobalSettingsStore.shared
@@ -853,7 +853,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 return try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any], response.rawJSON)
             }
             let vm = window.agentModeViewModel
-            let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID, "This contract requires its routed workspace to be selected")
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspaceID)
             let foregroundTab = window.promptManager.activeComposeTabID
             let foregroundDraft = window.promptManager.promptText
             XCTAssertNil(window.nsWindow, "The routed caller has no attached presentation window")
@@ -967,7 +968,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
             XCTAssertEqual(released["result"] as? String, "released")
             let remaining = await AppDomainRuntimeComposition.shared.runtime.agentSessionLinkAuthority.links(forObserver: observerID)
             XCTAssertTrue(remaining.items.isEmpty)
-            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID)
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspaceID, "The lane journey must preserve the selected workspace")
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspaceID)
             XCTAssertEqual(window.promptManager.activeComposeTabID, foregroundTab)
             XCTAssertEqual(window.promptManager.promptText, foregroundDraft)
             XCTAssertNil(window.nsWindow, "The tool journey must not attach a presentation window")
@@ -1142,6 +1144,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 let initialTabID = window.promptManager.activeComposeTabID
                 let initialDraft = window.promptManager.promptText
                 if contractJourney {
+                    XCTAssertEqual(initialWorkspaceID, workspace.id, "Fixture setup explicitly selects the contract workspace")
+                    XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspace.id)
                     XCTAssertNil(window.nsWindow, "Fixture setup routes a workspace without attaching an NSWindow")
                     // The observer represents an already-active Agent Mode session. Enter through
                     // the real UI lifecycle and wait for its ordinary workspace-switch fence.
@@ -1241,6 +1245,8 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                 XCTAssertEqual(window.mcpServer.connectionIDByRunID[runID], connection.connectionID)
 
                 if contractJourney {
+                    XCTAssertEqual(window.workspaceManager.activeWorkspaceID, workspace.id)
+                    XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspace.id)
                     let activation = try await connection.callTool(name: MCPWindowToolName.becomeOverseer, arguments: [:])
                     let activated = try XCTUnwrap(try MCPExportWatchdogIntegrationTests.responseObject(from: activation)["result"] as? [String: Any])
                     XCTAssertNotEqual(activated["isError"] as? Bool, true, activation.rawJSON)
@@ -1249,11 +1255,12 @@ final class AgentSessionLinkCodexCatalogRepairIntegrationTests: XCTestCase {
                     XCTAssertTrue(noLinks.items.isEmpty, "Bootstrap grants no target authority")
                     let refreshed = try await provider.listTools()
                     XCTAssertTrue(refreshed.contains(MCPWindowToolName.agentSessionLink))
-                    try await exerciseTwoLaneContract(
-                        connection: connection, window: window, observerID: observerID,
+                    try await exerciseTwoLaneContractInSelectedWorkspace(
+                        connection: connection, window: window, observerID: observerID, workspaceID: workspace.id,
                         controllers: { laneControllers }
                     )
                     XCTAssertEqual(window.workspaceManager.activeWorkspaceID, initialWorkspaceID)
+                    XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspace.id)
                     XCTAssertEqual(window.promptManager.activeComposeTabID, initialTabID)
                     XCTAssertEqual(window.promptManager.promptText, initialDraft)
                     let finalTurn = await provider.heldTurnSnapshot
