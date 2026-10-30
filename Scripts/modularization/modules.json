@@ -68,7 +68,7 @@
     },
     "RepoPromptClaudeProviderTests": {
       "source_root": "Tests/RepoPromptClaudeProviderTests",
-      "allowed_dependencies": ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
+      "allowed_dependencies": ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess"]
     },
     "RepoPromptAgentProviderContracts": {
       "source_root": "Sources/RepoPromptAgentProviderContracts",

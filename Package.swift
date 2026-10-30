@@ -164,7 +164,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RepoPromptClaudeProviderTests",
-            dependencies: ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
+            dependencies: ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess"],
             path: "Tests/RepoPromptClaudeProviderTests"
         ),
         .target(
