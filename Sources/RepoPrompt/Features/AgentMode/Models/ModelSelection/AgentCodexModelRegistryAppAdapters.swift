@@ -17,16 +17,6 @@ extension AgentCodexModelRegistry {
             invalidate: invalidate
         )
     }
-
-    #if DEBUG
-        @_spi(TestSupport)
-        public func test_mergeCodexOptions(
-            primary: [AgentModelOption],
-            fallback: [AgentModelOption]
-        ) -> [AgentModelOption] {
-            AgentCodexModelPolicy.mergeCodexOptions(primary: primary, fallback: fallback)
-        }
-    #endif
 }
 
 /// The existing App picker/recommendation policy, without registry state or a second catalog.
@@ -132,7 +122,7 @@ private enum AgentCodexModelPolicy {
         return options
     }
 
-    static func mergeCodexOptions(
+    private static func mergeCodexOptions(
         primary: [AgentModelOption],
         fallback: [AgentModelOption]
     ) -> [AgentModelOption] {
