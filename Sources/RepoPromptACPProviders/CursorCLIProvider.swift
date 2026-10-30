@@ -1,41 +1,34 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// Cursor CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
 /// Runs a fresh ACP session per request, switches to Cursor's official `ask` mode (prompt-only/no tools), and never injects RepoPrompt MCP/tools.
-final class CursorCLIProvider: AIProvider {
-    typealias HeadlessProviderFactory = @Sendable (_ config: CursorAgentConfig, _ workspacePath: String?) -> CursorACPHeadlessAgentProvider
+package final class CursorCLIProvider: AIProvider {
+    package typealias HeadlessProviderFactory = @Sendable (_ config: CursorAgentConfig, _ workspacePath: String?) -> CursorACPHeadlessAgentProvider
 
+    package typealias ConfigurationFactory = (_ model: AIModel) -> CursorAgentConfig
+
+    private let configurationFactory: ConfigurationFactory
     private let activeProviders = ActiveCursorCLIProviderStore()
     private let headlessProviderFactory: HeadlessProviderFactory
 
-    init(
-        headlessProviderFactory: @escaping HeadlessProviderFactory = { config, workspacePath in
-            CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
-        }
+    package init(
+        configurationFactory: @escaping ConfigurationFactory,
+        headlessProviderFactory: @escaping HeadlessProviderFactory
     ) {
+        self.configurationFactory = configurationFactory
         self.headlessProviderFactory = headlessProviderFactory
     }
 
-    #if DEBUG
-        static func test_makeHeadlessConfig(modelName: String?) -> CursorAgentConfig {
-            makeHeadlessConfig(modelName: modelName)
-        }
-
-        static func test_makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
-            CursorCLIProvider().makeAgentMessage(from: aiMessage)
-        }
-    #endif
-
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let provider = headlessProviderFactory(
-            Self.makeHeadlessConfig(modelName: cursorModelName(for: model)),
+            configurationFactory(model),
             nil
         )
         activeProviders.insert(provider)
-        let upstream: AsyncThrowingStream<AIStreamResult, Error>
+        let upstream: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>
         do {
             upstream = try await provider.streamAgentMessage(makeAgentMessage(from: aiMessage), runID: nil)
         } catch {
@@ -72,7 +65,7 @@ final class CursorCLIProvider: AIProvider {
         }
     }
 
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AICompletionResult {
+    package func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let stream = try await streamMessage(aiMessage, model: model, maxTokens: maxTokens)
         var textParts: [String] = []
         var finalContent: String?
@@ -116,26 +109,16 @@ final class CursorCLIProvider: AIProvider {
         )
     }
 
-    func dispose() async {
+    package func dispose() async {
         let providers = activeProviders.removeAll()
         for provider in providers {
             await provider.dispose()
         }
     }
 
-    private static func makeHeadlessConfig(modelName: String?) -> CursorAgentConfig {
-        CursorAgentConfig(
-            enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-            modelString: modelName,
-            includeRepoPromptMCPServer: false,
-            cleanupProjectMCPApproval: true,
-            sessionModeID: CursorAgentConfig.promptOnlySessionModeID
-        )
-    }
-
     private static let noToolsSuffix = "\n\nIMPORTANT: Do not use any tools, function calls, or external commands. Respond with text only. Any tool invocation will cause task failure."
 
-    private func makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
+    package func makeAgentMessage(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> RepoPromptDomainRuntime.AgentMessage {
         let systemPrompt = aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         return AgentMessage(
             systemPrompt: systemPrompt.isEmpty ? systemPrompt : systemPrompt + Self.noToolsSuffix,
@@ -145,7 +128,7 @@ final class CursorCLIProvider: AIProvider {
         )
     }
 
-    private func buildPrompt(from aiMessage: AIMessage) -> String {
+    private func buildPrompt(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> String {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         var conversation = ""
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
@@ -167,12 +150,6 @@ final class CursorCLIProvider: AIProvider {
             conversation = "User: \(tail)"
         }
         return conversation
-    }
-
-    private func cursorModelName(for model: AIModel) -> String? {
-        guard model.providerType == .cursor else { return nil }
-        let trimmed = model.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

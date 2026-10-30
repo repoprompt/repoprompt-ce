@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
-import RepoPromptACPProviders
+@testable import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
@@ -92,13 +93,19 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
     let providerID: ACPProviderID
     let script: String
     let observations: String
+    var emitsFixtureText = false
+    var responseText: String?
 
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         .supported
     }
 
     func makeLaunchConfiguration(for _: ACPRunRequest) throws -> ACPLaunchConfiguration {
-        ACPLaunchConfiguration(providerID: providerID, command: "/usr/bin/python3", arguments: ["-u", script], environment: ["OBS_FILE": observations], workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false)
+        var environment = ["OBS_FILE": observations]
+        if let responseText {
+            environment["FIXTURE_RESPONSE"] = responseText
+        }
+        return ACPLaunchConfiguration(providerID: providerID, command: "/usr/bin/python3", arguments: ["-u", script], environment: environment, workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false)
     }
 
     func makeSessionConfiguration(for request: ACPRunRequest, mcpServer: RepoPromptMCPServerConfiguration) throws -> ACPSessionConfiguration {
@@ -116,8 +123,9 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
         []
     }
 
-    func normalizeSessionUpdate(_: [String: Any], sessionID _: String) -> [NormalizedAgentRuntimeEvent] {
-        []
+    func normalizeSessionUpdate(_ update: [String: Any], sessionID _: String) -> [NormalizedAgentRuntimeEvent] {
+        guard emitsFixtureText, let text = update["fixtureText"] as? String else { return [] }
+        return [.stream(AIStreamResult(type: "content", text: text))]
     }
 
     func normalizeError(_ error: Error) -> Error {
@@ -142,6 +150,14 @@ private final class RecordingHost: ACPAgentSessionHost, @unchecked Sendable {
     private var recorded: [String] = []
     private var snapshot: ACPDiscoveredSessionModels?
     private var initialConfiguration: ACPSessionConfiguration?
+    private let clearedExpectation: XCTestExpectation?
+    private let allowsDiagnostics: Bool
+
+    init(clearedExpectation: XCTestExpectation? = nil, allowsDiagnostics: Bool = false) {
+        self.clearedExpectation = clearedExpectation
+        self.allowsDiagnostics = allowsDiagnostics
+    }
+
     private func record(_ event: String) {
         lock.withLock { recorded.append(event) }
     }
@@ -258,6 +274,7 @@ private final class RecordingHost: ACPAgentSessionHost, @unchecked Sendable {
     func clearExpectedAgentPID(_: pid_t, clientName: String, runID _: UUID?) async {
         XCTAssertEqual(clientName, "fixture-client")
         record("clear")
+        clearedExpectation?.fulfill()
     }
 
     func permissionIsAutoSelectable(optionID _: String?, providerID _: ACPProviderID) -> Bool {
@@ -280,8 +297,210 @@ private final class RecordingHost: ACPAgentSessionHost, @unchecked Sendable {
             "fixture"
         }
 
-        func recordRunRoutingEvent(runID _: UUID, event _: String, fields _: [String: String]) async {
-            XCTFail("Unexpected diagnostics")
+        func recordRunRoutingEvent(runID _: UUID, event: String, fields _: [String: String]) async {
+            if allowsDiagnostics {
+                record("routing:\(event)")
+            } else {
+                XCTFail("Unexpected diagnostics")
+            }
         }
     #endif
+}
+
+final class ACPCLIProviderExecutionTests: XCTestCase {
+    func testInjectedConfigurationIsResolvedPerRequestAndTerminalStreamsReleaseEachProcess() async throws {
+        for consumer in Consumer.allCases {
+            let fixture = try makeFixture(consumer: consumer, holdPrompt: false)
+            defer { try? FileManager.default.removeItem(at: fixture.directory) }
+            let cleared = expectation(description: "\(consumer) terminal processes released")
+            cleared.expectedFulfillmentCount = 2
+            let host = RecordingHost(clearedExpectation: cleared, allowsDiagnostics: true)
+            var configuredModels: [AIModel] = []
+            let cli = makeCLI(consumer: consumer, fixture: fixture.provider, host: host) { model in
+                configuredModels.append(model)
+                return model == consumer.model("second") ? "second" : "first"
+            }
+            XCTAssertTrue(configuredModels.isEmpty, "Construction must not eagerly snapshot request policy")
+            for name in ["first", "second"] {
+                let result = try await cli.completeMessage(AIMessage(systemPrompt: "", userMessage: "Execute"), model: consumer.model(name), maxTokens: nil)
+                XCTAssertEqual(result.text, name, "Injected config must reach the actual provider process for this request")
+            }
+            await fulfillment(of: [cleared], timeout: 10)
+            await cli.dispose()
+            await cli.dispose()
+            XCTAssertEqual(configuredModels, [consumer.model("first"), consumer.model("second")])
+            XCTAssertEqual(host.events().count(where: { $0 == "register" }), 2)
+            XCTAssertEqual(host.events().count(where: { $0 == "clear" }), 2)
+            let methods = try recordedMethods(at: fixture.observations)
+            XCTAssertEqual(methods.count(where: { $0 == "session/new" }), 2)
+            XCTAssertEqual(methods.count(where: { $0 == "session/prompt" }), 2)
+            XCTAssertFalse(methods.contains("session/load"), "CLI requests must not resume an earlier conversation")
+        }
+    }
+
+    func testCancellingCLIConsumptionDisposesTheExistingHeadlessController() async throws {
+        for consumer in Consumer.allCases {
+            let fixture = try makeFixture(consumer: consumer, holdPrompt: true)
+            defer { try? FileManager.default.removeItem(at: fixture.directory) }
+            let cleared = expectation(description: "\(consumer) cancelled process released")
+            let content = expectation(description: "\(consumer) partial content received")
+            let host = RecordingHost(clearedExpectation: cleared, allowsDiagnostics: true)
+            let cli = makeCLI(consumer: consumer, fixture: fixture.provider, host: host) { _ in "partial" }
+            let stream = try await cli.streamMessage(AIMessage(systemPrompt: "", userMessage: "Wait for cancellation"), model: consumer.model("partial"), maxTokens: nil)
+            let execution = Task {
+                do {
+                    for try await result in stream {
+                        if result.type == "content", result.text == "partial" {
+                            content.fulfill()
+                        }
+                    }
+                } catch {
+                    if !Task.isCancelled {
+                        XCTFail("Unexpected stream failure: \(error)")
+                    }
+                }
+            }
+            await fulfillment(of: [content], timeout: 10)
+            execution.cancel()
+            _ = await execution.result
+            await fulfillment(of: [cleared], timeout: 10)
+            await cli.dispose()
+            await cli.dispose()
+            XCTAssertEqual(host.events().count(where: { $0 == "register" }), 1)
+            XCTAssertEqual(host.events().count(where: { $0 == "clear" }), 1)
+        }
+    }
+
+    func testOpenCodeStaleTerminationCannotRemoveTheReplacementProvider() {
+        final class Provider {}
+        let first = Provider()
+        let second = Provider()
+        let third = Provider()
+        let store = ActiveOpenCodeCLIProviderStore<Provider>()
+        XCTAssertNil(store.replace(first))
+        XCTAssertTrue(store.replace(second) === first)
+        XCTAssertTrue(store.remove(first))
+        XCTAssertTrue(store.contains(second))
+        XCTAssertTrue(store.replace(third) === second)
+        XCTAssertTrue(store.remove(second))
+        XCTAssertTrue(store.contains(third))
+        let remaining = store.removeAll()
+        XCTAssertEqual(remaining.count, 1)
+        XCTAssertTrue(remaining.first === third)
+        XCTAssertFalse(store.contains(third))
+        XCTAssertNil(store.replace(first), "Draining must retire the current-provider identity too")
+    }
+
+    private enum Consumer: CaseIterable {
+        case cursor
+        case openCode
+
+        var providerID: ACPProviderID {
+            switch self {
+            case .cursor: .cursor
+            case .openCode: .openCode
+            }
+        }
+
+        var sessionMode: String {
+            switch self {
+            case .cursor: CursorAgentConfig.promptOnlySessionModeID
+            case .openCode: OpenCodeAgentConfig.managedNoToolsSessionModeID
+            }
+        }
+
+        func model(_ name: String) -> AIModel {
+            switch self {
+            case .cursor: .cursorCustom(name: name)
+            case .openCode: .openCodeCustom(name: name)
+            }
+        }
+    }
+
+    private func makeCLI(
+        consumer: Consumer,
+        fixture: FixtureProvider,
+        host: RecordingHost,
+        resolveConfiguration: @escaping (AIModel) -> String
+    ) -> any AIProvider {
+        switch consumer {
+        case .cursor:
+            CursorCLIProvider(
+                configurationFactory: { model in
+                    let name = resolveConfiguration(model)
+                    return CursorAgentConfig(enableDebugLogging: name == "second", modelString: name, includeRepoPromptMCPServer: false, sessionModeID: CursorAgentConfig.promptOnlySessionModeID)
+                },
+                headlessProviderFactory: { config, workspacePath in
+                    XCTAssertNil(workspacePath)
+                    var configured = fixture
+                    configured.responseText = config.modelString
+                    let provider = configured
+                    return CursorACPHeadlessAgentProvider(
+                        config: config, workspacePath: workspacePath, baseModel: nil,
+                        providerFactory: { _ in provider },
+                        controllerFactory: { provider, request, diagnosticSink in
+                            try ACPAgentSessionController(provider: provider, runRequest: request, host: host, diagnosticSink: diagnosticSink, allowsProviderProcessLaunchForTesting: true)
+                        },
+                        applySelectedModel: { _, _ in }
+                    )
+                }
+            )
+        case .openCode:
+            OpenCodeCLIProvider(
+                configurationFactory: { model in
+                    let name = resolveConfiguration(model)
+                    return OpenCodeAgentConfig(modelString: name, enableDebugLogging: name == "second", includeRepoPromptMCPServer: false, toolProfile: .noTools)
+                },
+                headlessProviderFactory: { config, workspacePath in
+                    XCTAssertNil(workspacePath)
+                    var configured = fixture
+                    configured.responseText = config.modelString
+                    let provider = configured
+                    return OpenCodeACPHeadlessAgentProvider(
+                        config: config, workspacePath: workspacePath,
+                        providerFactory: { _ in provider },
+                        controllerFactory: { provider, request, diagnosticSink in
+                            try ACPAgentSessionController(provider: provider, runRequest: request, host: host, diagnosticSink: diagnosticSink, allowsProviderProcessLaunchForTesting: true)
+                        },
+                        selectedModel: { _ in nil }
+                    )
+                }
+            )
+        }
+    }
+
+    private func makeFixture(consumer: Consumer, holdPrompt: Bool) throws -> (directory: URL, observations: URL, provider: FixtureProvider) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ACPCLI-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let observations = directory.appendingPathComponent(holdPrompt ? "hold.jsonl" : "terminal.jsonl")
+        let script = directory.appendingPathComponent("server.py")
+        try #"""
+        import json, os, sys
+        for line in sys.stdin:
+            request = json.loads(line)
+            with open(os.environ['OBS_FILE'], 'a') as output:
+                output.write(json.dumps(request) + '\n')
+            if 'id' not in request: continue
+            method = request.get('method')
+            if method == 'initialize':
+                result = {'agentCapabilities': {}}
+            elif method == 'session/new':
+                result = {'sessionId': 'fixture-session', 'configOptions': [{'id': 'mode', 'name': 'Mode', 'category': 'mode', 'type': 'select', 'currentValue': '\#(consumer.sessionMode)', 'options': [{'value': '\#(consumer.sessionMode)', 'name': 'Fixture'}]}]}
+            elif method == 'session/prompt':
+                print(json.dumps({'jsonrpc': '2.0', 'method': 'session/update', 'params': {'sessionId': 'fixture-session', 'update': {'sessionUpdate': 'agent_message_chunk', 'fixtureText': os.environ['FIXTURE_RESPONSE']}}}), flush=True)
+                if os.environ['OBS_FILE'].endswith('hold.jsonl'): continue
+                result = {'stopReason': 'end_turn'}
+            else:
+                result = {}
+            print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+        """#.write(to: script, atomically: true, encoding: .utf8)
+        return (directory, observations, FixtureProvider(providerID: consumer.providerID, script: script.path, observations: observations.path, emitsFixtureText: true))
+    }
+
+    private func recordedMethods(at url: URL) throws -> [String] {
+        try String(contentsOf: url, encoding: .utf8).split(separator: "\n").compactMap { line in
+            let request = try JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any]
+            return request?["method"] as? String
+        }
+    }
 }

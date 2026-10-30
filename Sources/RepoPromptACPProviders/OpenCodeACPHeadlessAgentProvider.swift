@@ -1,45 +1,40 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// Headless/discovery adapter for OpenCode's ACP runtime.
 ///
 /// Agent Mode owns the long-lived ACP runner; headless discovery paths use
 /// the shared one-shot ACP headless bridge configured with OpenCode's managed
 /// headless session mode and optional selected model.
-final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
-    typealias ProviderFactory = @Sendable (_ config: OpenCodeAgentConfig) -> any ACPAgentProvider
-    typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
+package final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
+    package typealias ProviderFactory = @Sendable (_ config: OpenCodeAgentConfig) -> any ACPAgentProvider
+    package typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
+
+    package typealias SelectedModel = (_ config: OpenCodeAgentConfig) -> String?
 
     private let config: OpenCodeAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
 
     #if DEBUG
-        var test_config: OpenCodeAgentConfig {
+        package var test_config: OpenCodeAgentConfig {
             config
         }
     #endif
 
-    init(
+    package init(
         config: OpenCodeAgentConfig,
         workspacePath: String? = nil,
-        providerFactory: ProviderFactory? = nil,
-        controllerFactory: @escaping ControllerFactory = { provider, request, diagnosticSink in
-            try ACPAgentSessionController(
-                provider: provider,
-                runRequest: request,
-                diagnosticSink: diagnosticSink
-            )
-        }
+        providerFactory: @escaping ProviderFactory,
+        controllerFactory: @escaping ControllerFactory,
+        selectedModel: @escaping SelectedModel
     ) {
         self.config = config
-        let resolvedProviderFactory = providerFactory ?? { config in
-            OpenCodeACPAgentProvider(config: config)
-        }
         bridge = ACPHeadlessAgentProviderBridge(
             providerName: "OpenCode",
             makeProvider: {
-                resolvedProviderFactory(config)
+                providerFactory(config)
             },
             makeRequest: { message, _ in
                 ACPRunRequest(
@@ -59,7 +54,7 @@ final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
                 // set model → apply selections → validate → set mode. A pin that cannot be
                 // honoured fails here, before `session/prompt`, rather than silently running at
                 // another level.
-                let modelToApply = Self.selectedModelToApply(config: config)
+                let modelToApply = selectedModel(config)
                 let selections = request.modelParameterSelections
                 if let modelToApply {
                     // Force the model-selector RPC when a pin is pending: OpenCode advertises
@@ -75,24 +70,14 @@ final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
         )
     }
 
-    func streamAgentMessage(
-        _ message: AgentMessage,
+    package func streamAgentMessage(
+        _ message: RepoPromptDomainRuntime.AgentMessage,
         runID: UUID? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         try await bridge.streamAgentMessage(message, runID: runID)
     }
 
-    func dispose() async {
+    package func dispose() async {
         await bridge.dispose()
-    }
-
-    private static func selectedModelToApply(config: OpenCodeAgentConfig) -> String? {
-        guard let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else {
-            return nil
-        }
-        return model
     }
 }

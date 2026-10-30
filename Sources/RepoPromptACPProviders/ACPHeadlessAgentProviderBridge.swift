@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
@@ -8,7 +9,7 @@ import RepoPromptDomainRuntime
 /// `HeadlessAgentProvider` lifecycle used by discovery/delegate-edit paths while
 /// centralizing cancellation, controller registration, prompt forwarding, and
 /// approval fallback handling for ACP-backed providers.
-package final class ACPHeadlessAgentProviderBridge {
+package final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
     package enum ApprovalPolicy {
         case declineUnsupported
         case acceptForSession

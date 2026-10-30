@@ -1,42 +1,37 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// Headless/discovery adapter for Cursor's ACP runtime.
 ///
 /// Agent Mode owns the long-lived ACP runner; headless discovery paths use
 /// the shared one-shot ACP headless bridge configured with Cursor's launch,
 /// session-mode, and model-selection behavior.
-final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
-    typealias ProviderFactory = @Sendable (_ config: CursorAgentConfig) -> any ACPAgentProvider
-    typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
+package final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
+    package typealias ProviderFactory = @Sendable (_ config: CursorAgentConfig) -> any ACPAgentProvider
+    package typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
+
+    package typealias ModelSelection = (_ controller: ACPAgentSessionController, _ config: CursorAgentConfig) async throws -> Void
 
     private let config: CursorAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
 
     #if DEBUG
-        var test_config: CursorAgentConfig {
+        package var test_config: CursorAgentConfig {
             config
         }
     #endif
 
-    init(
+    package init(
         config: CursorAgentConfig,
         workspacePath: String? = nil,
-        providerFactory: ProviderFactory? = nil,
-        controllerFactory: @escaping ControllerFactory = { provider, request, diagnosticSink in
-            try ACPAgentSessionController(
-                provider: provider,
-                runRequest: request,
-                diagnosticSink: diagnosticSink
-            )
-        }
+        baseModel: String?,
+        providerFactory: @escaping ProviderFactory,
+        controllerFactory: @escaping ControllerFactory,
+        applySelectedModel: @escaping ModelSelection
     ) {
         self.config = config
-        let resolvedProviderFactory = providerFactory ?? { config in
-            CursorACPAgentProvider(config: config)
-        }
-        let baseModel = config.modelString.map { raw in (try? CursorAIModelCatalog.ModelSpecifier(raw: raw).baseModelRaw) ?? raw }
         let launchConfig = CursorAgentConfig(
             commandName: config.commandSelection == .automatic ? nil : config.commandName,
             additionalPathHints: config.additionalPathHints,
@@ -48,7 +43,7 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
         bridge = ACPHeadlessAgentProviderBridge(
             providerName: "Cursor",
             makeProvider: {
-                resolvedProviderFactory(launchConfig)
+                providerFactory(launchConfig)
             },
             makeRequest: { message, _ in
                 ACPRunRequest(
@@ -63,9 +58,7 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
             },
             makeController: controllerFactory,
             beforePrompt: { controller, _ in
-                if let model = Self.selectedModelToApply(config: config) {
-                    try await controller.applyCursorModelSelection(model, overrides: config.modelOverrides)
-                }
+                try await applySelectedModel(controller, config)
                 if let sessionMode = Self.sessionModeToApply(config: config) {
                     try await controller.setSessionMode(sessionMode)
                 }
@@ -74,14 +67,14 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
         )
     }
 
-    func streamAgentMessage(
-        _ message: AgentMessage,
+    package func streamAgentMessage(
+        _ message: RepoPromptDomainRuntime.AgentMessage,
         runID: UUID? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         try await bridge.streamAgentMessage(message, runID: runID)
     }
 
-    func dispose() async {
+    package func dispose() async {
         await bridge.dispose()
     }
 
@@ -92,18 +85,5 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
             return nil
         }
         return mode
-    }
-
-    private static func selectedModelToApply(config: CursorAgentConfig) -> String? {
-        guard let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else {
-            return nil
-        }
-        if model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame {
-            return model
-        }
-        return model
     }
 }

@@ -237,12 +237,8 @@ final class OracleImageSerializationTests: XCTestCase {
 
     func testACPCLIAdaptersPreserveTransientImages() {
         let message = makeMessage()
-        let openCode = OpenCodeCLIProvider.test_makeAgentMessage(from: message)
-        let cursor = CursorCLIProvider.test_makeAgentMessage(from: message)
         let devin = DevinCLIProvider.test_makeImageAgentMessage(from: message)
 
-        XCTAssertEqual(openCode.attachments, message.attachments)
-        XCTAssertEqual(cursor.attachments, message.attachments)
         XCTAssertEqual(devin.attachments, message.attachments)
     }
 
