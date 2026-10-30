@@ -11,7 +11,7 @@ import Foundation
 /// Related:
 /// - ClaudeAbortArtifactFilter (analogous filter for Claude Code)
 /// - CodexExecAgentProvider.streamAgentMessage (call site)
-enum CodexExecDiagnosticNoiseFilter {
+package enum CodexExecDiagnosticNoiseFilter {
     /// Known internal lifecycle/transport markers that indicate diagnostic noise.
     private static let lifecycleMarkers = [
         "process_terminal",
@@ -27,7 +27,7 @@ enum CodexExecDiagnosticNoiseFilter {
 
     /// Returns `true` when the stderr line is internal diagnostic noise that
     /// should not be surfaced to the user.
-    static func shouldSuppress(_ message: String) -> Bool {
+    package static func shouldSuppress(_ message: String) -> Bool {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return true }
 

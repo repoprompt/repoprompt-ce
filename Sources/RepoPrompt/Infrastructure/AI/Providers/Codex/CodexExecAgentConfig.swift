@@ -2,21 +2,21 @@ import Foundation
 import RepoPromptProcess
 
 /// Configuration for Codex Exec agent provider.
-struct CodexExecAgentConfig {
-    let commandName: String
-    let additionalPathHints: [String]
-    let modelString: String?
-    let enableDebugLogging: Bool
-    let fullAccess: Bool
+package struct CodexExecAgentConfig {
+    package let commandName: String
+    package let additionalPathHints: [String]
+    package let modelString: String?
+    package let enableDebugLogging: Bool
+    package let fullAccess: Bool
 
-    init(
-        commandName: String? = nil,
-        additionalPathHints: [String] = CLIPathHints.codex,
-        modelString: String? = nil,
-        enableDebugLogging: Bool = false,
-        fullAccess: Bool = false
+    package init(
+        commandName: String,
+        additionalPathHints: [String],
+        modelString: String?,
+        enableDebugLogging: Bool,
+        fullAccess: Bool
     ) {
-        self.commandName = commandName ?? CLILaunchProfiles.codex.commandName
+        self.commandName = commandName
         self.additionalPathHints = additionalPathHints
         self.modelString = modelString
         self.enableDebugLogging = enableDebugLogging

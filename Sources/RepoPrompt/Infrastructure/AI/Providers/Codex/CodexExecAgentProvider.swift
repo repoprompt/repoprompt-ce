@@ -1,10 +1,12 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptCodexProvider
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptProcess
 
-final class CodexExecAgentProvider: HeadlessAgentProvider {
+package final class CodexExecAgentProvider: HeadlessAgentProvider {
     private enum StreamRetryAction {
         case none
         case modelFallback(String)
@@ -15,10 +17,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     private var runner: CLIProcessRunner?
     private let config: CodexExecAgentConfig
-    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
-    private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
-    private let configService = MCPConfigExportService.shared
-    private let toolTracking = AgentToolTrackingController()
+    private let host: any CodexExecAgentHost
     private var streamTask: Task<Void, Never>?
     private var codexItemInvocationIDs: [String: UUID] = [:]
 
@@ -26,25 +25,19 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         config.enableDebugLogging
     }
 
-    init(
-        config: CodexExecAgentConfig,
-        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
-        runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
-            try $0.prepareState()
-        }
-    ) {
+    package init(config: CodexExecAgentConfig, host: any CodexExecAgentHost) {
         self.config = config
-        self.launchSnapshot = launchSnapshot
-        self.runtimeStatePreparer = runtimeStatePreparer
+        self.host = host
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Initialized provider with model: \(config.modelString ?? "default")")
         }
     }
 
     static func codexModelCLIArgs(
-        selectedModelString: String?
+        selectedModelString: String?,
+        host: any CodexExecAgentHost
     ) -> (modelArgs: [String], configArgs: [String], specifier: CodexModelSpecifier) {
-        let specifier = CodexModelSpecifier(raw: selectedModelString)
+        let specifier = host.modelSpecifier(raw: selectedModelString)
         return (
             specifier.cliModelArgs,
             specifier.cliReasoningConfigArgs + specifier.cliServiceTierConfigArgs,
@@ -54,12 +47,13 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     static func buildCodexExecArguments(
         selectedModelString: String?,
-        serverEntries: [MCPIntegrationHelper.CodexServerEntry],
+        serverEntries: [CodexExecServerEntry],
         brokenServers: Set<String>,
-        fullAccess: Bool = false
+        fullAccess: Bool = false,
+        host: any CodexExecAgentHost
     ) -> (args: [String], modelSpecifier: CodexModelSpecifier) {
         var args: [String] = []
-        let modelCLIArgs = codexModelCLIArgs(selectedModelString: selectedModelString)
+        let modelCLIArgs = codexModelCLIArgs(selectedModelString: selectedModelString, host: host)
         let modelSpecifier = modelCLIArgs.specifier
 
         // Add model argument BEFORE exec if specified (and not "default").
@@ -67,21 +61,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             args.append(contentsOf: modelCLIArgs.modelArgs)
         }
 
-        let toolPolicy = CodexOverrides.ToolPolicy(
-            toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
-            shellToolEnabled: false,
-            webSearchRequestEnabled: nil,
-            multiAgentEnabled: false,
-            modelReasoningSummary: nil
-        )
-        let toolOverrideArgs = CodexOverrides.cliConfigArgs(toolPolicy: toolPolicy)
-        let serverOverrideArgs = CodexOverrides.cliMCPServerArgs(
-            entries: serverEntries,
-            policy: .enableOnlyRepoPrompt(
-                repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
-                exceptBroken: brokenServers
-            )
-        )
+        let toolOverrideArgs = host.toolOverrideArguments()
+        let serverOverrideArgs = host.serverOverrideArguments(entries: serverEntries, brokenServers: brokenServers)
 
         // Add exec subcommand and its arguments.
         args.append("exec")
@@ -99,13 +80,14 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     }
 
     static func processConfiguration(
-        for resolution: CodexProviderHelpers.CodexExecutableResolution,
-        enableDebugLogging: Bool
+        for resolution: CodexProviderExecutableResolution,
+        enableDebugLogging: Bool,
+        host: any CodexExecAgentHost
     ) -> CLIProcessConfiguration {
         CLIProcessConfiguration(
             command: resolution.resolvedCommand,
             environment: resolution.environmentOverrides,
-            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .codexExec, explicitOverrides: resolution.environmentOverrides),
+            environmentFilter: host.environmentFilter(explicitOverrides: resolution.environmentOverrides),
             enableDebugLogging: enableDebugLogging,
             captureStdoutTailBytes: 128 * 1024,
             captureStderrTailBytes: 256 * 1024,
@@ -115,16 +97,15 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     // MARK: - HeadlessAgentProvider
 
-    func prepare(runID: UUID? = nil) async throws -> HeadlessAgentContext {
+    package func prepare(runID: UUID? = nil) async throws -> CodexExecLaunchContext {
         let actualRunID = runID ?? UUID()
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Preparing context for run \(actualRunID)")
         }
-        let resolution = await CodexProviderHelpers.preflightCodexExecutable(
+        let resolution = await host.preflight(
             commandName: config.commandName,
             additionalPathHints: config.additionalPathHints,
-            enableDebugLogging: enableDebugLogging,
-            launchSnapshot: launchSnapshot
+            enableDebugLogging: enableDebugLogging
         )
         if enableDebugLogging {
             print("[DEBUG] CodexExec: \(resolution.debugMessage)")
@@ -135,7 +116,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             throw AIProviderError.invalidConfiguration(detail: resolution.userMessage)
         }
         do {
-            try runtimeStatePreparer(runtime)
+            try host.prepareState(runtime)
         } catch {
             throw AIProviderError.invalidConfiguration(
                 detail: "RepoPrompt could not start Codex: unable to prepare its isolated Codex state (\(error.localizedDescription))."
@@ -144,7 +125,8 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
         var processConfig = Self.processConfiguration(
             for: resolution,
-            enableDebugLogging: enableDebugLogging
+            enableDebugLogging: enableDebugLogging,
+            host: host
         )
         processConfig.ensureAdditionalPaths(config.additionalPathHints)
         runner = CLIProcessRunner(config: processConfig)
@@ -153,7 +135,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Verifying MCP server is running")
         }
-        guard await ServerNetworkManager.shared.isRunning() else {
+        guard await host.isMCPServerRunning() else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
         if enableDebugLogging {
@@ -164,7 +146,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Ensuring Codex MCP server entry")
         }
-        let ensureResult = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
+        let ensureResult = host.ensureServer(runtime: runtime)
         guard ensureResult.success else {
             throw AIProviderError.invalidConfiguration(
                 detail: ensureResult.errorMessage ?? "Failed to install RepoPrompt MCP config for Codex."
@@ -174,14 +156,14 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             print("[DEBUG] CodexExec: MCP server ensured (wasAlreadyPresent: \(ensureResult.wasAlreadyPresent))")
         }
 
-        return HeadlessAgentContext(
+        return CodexExecLaunchContext(
             runID: actualRunID,
             configURL: nil,
             environment: ProcessInfo.processInfo.environment.merging(runtime.statePaths.environment) { _, ownedValue in ownedValue }
         )
     }
 
-    func cleanup(context: HeadlessAgentContext) async {
+    func cleanup(context: CodexExecLaunchContext) async {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Cleaning up context \(context.runID)")
         }
@@ -189,7 +171,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
     // MARK: - Streaming
 
-    func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamAgentMessage(_ message: RepoPromptDomainRuntime.AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         AsyncThrowingStream { continuation in
             // Cancel any previous lingering task (defensive)
             self.streamTask?.cancel()
@@ -232,13 +214,14 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                 \(userMessage)
                                 """
 
-                                let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
-                                let brokenServers = await CodexBrokenServersCache.shared.getAll()
+                                let serverEntries = self.host.serverEntries()
+                                let brokenServers = await self.host.brokenServers()
                                 let command = Self.buildCodexExecArguments(
                                     selectedModelString: selectedModelString,
                                     serverEntries: serverEntries,
                                     brokenServers: brokenServers,
-                                    fullAccess: config.fullAccess
+                                    fullAccess: config.fullAccess,
+                                    host: self.host
                                 )
                                 let args = command.args
                                 let modelSpecifier = command.modelSpecifier
@@ -266,13 +249,13 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                 // Register tool observer with cleanup
                                 try await AsyncScope.withCleanup({}, cleanup: {
                                     await runner.cancelAll()
-                                    await self.toolTracking.stopTracking()
+                                    await self.host.toolTracking.stopTracking()
                                 }) {
                                     if self.enableDebugLogging {
                                         print("[DEBUG] CodexExec: CLI process streaming started")
                                     }
 
-                                    self.toolTracking.startTracking(
+                                    self.host.toolTracking.startTracking(
                                         runID: context.runID,
                                         clientNameHint: Self.codexMCPClientID,
                                         continuation: continuation
@@ -288,19 +271,11 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                         stdin: combinedPrompt,
                                         outputMode: .none,
                                         timeout: 6000,
-                                        onProcessStarted: { pid in
-                                            await ServerNetworkManager.shared.registerExpectedAgentPID(
-                                                pid,
-                                                for: Self.codexMCPClientID,
-                                                runID: expectedPIDRunID
-                                            )
+                                        onProcessStarted: { [host = self.host] pid in
+                                            await host.registerExpectedPID(pid, runID: expectedPIDRunID)
                                         },
-                                        onProcessTerminated: { pid in
-                                            await ServerNetworkManager.shared.clearExpectedAgentPID(
-                                                pid,
-                                                for: Self.codexMCPClientID,
-                                                runID: expectedPIDRunID
-                                            )
+                                        onProcessTerminated: { [host = self.host] pid in
+                                            await host.clearExpectedPID(pid, runID: expectedPIDRunID)
                                         }
                                     )
 
@@ -354,7 +329,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
                                                 if !CodexExecDiagnosticNoiseFilter.shouldSuppress(message) {
                                                     continuation.yield(
-                                                        AIStreamResult(
+                                                        RepoPromptDomainRuntime.AIStreamResult(
                                                             type: "system",
                                                             text: message,
                                                             reasoning: nil,
@@ -404,7 +379,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                         else { return }
                                         if !CodexExecDiagnosticNoiseFilter.shouldSuppress(message) {
                                             continuation.yield(
-                                                AIStreamResult(
+                                                RepoPromptDomainRuntime.AIStreamResult(
                                                     type: "system",
                                                     text: message,
                                                     reasoning: nil,
@@ -447,7 +422,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                                 continuation: continuation
                                             )
                                         case let .brokenServer(brokenServer):
-                                            await CodexBrokenServersCache.shared.add(brokenServer)
+                                            await self.host.addBrokenServer(brokenServer)
                                             didRetryBrokenServer = true
                                             shouldRetryBrokenServer = true
                                             if self.enableDebugLogging {
@@ -472,7 +447,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                             print("[DEBUG] CodexExec: Injecting message_stop event")
                                         }
                                         continuation.yield(
-                                            AIStreamResult(
+                                            RepoPromptDomainRuntime.AIStreamResult(
                                                 type: "message_stop",
                                                 text: nil,
                                                 reasoning: nil,
@@ -536,7 +511,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
     }
 
-    func dispose() async {
+    package func dispose() async {
         if enableDebugLogging {
             print("[DEBUG] CodexExec: Disposing provider, cancelling stream task & runners")
         }
@@ -561,7 +536,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         // Check stdout first for model-not-found fallback; otherwise preserve stdout as the primary error.
         if let stdoutMessage {
             if !didRetryModelFallback,
-               let fallbackModel = CodexProviderHelpers.codexFallbackModelIfNeeded(
+               let fallbackModel = host.fallbackModel(
                    attemptedModel: attemptedModel,
                    errorDetail: stdoutMessage
                )
@@ -573,7 +548,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
         // Fall back to stderr checks.
         if !didRetryModelFallback,
-           let fallbackModel = CodexProviderHelpers.codexFallbackModelIfNeeded(
+           let fallbackModel = host.fallbackModel(
                attemptedModel: attemptedModel,
                errorDetail: stderrString
            )
@@ -582,7 +557,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
 
         if !didRetryBrokenServer,
-           let brokenServer = CodexProviderHelpers.extractBrokenServerName(from: stderrString)
+           let brokenServer = host.brokenServerName(stderr: stderrString)
         {
             return .brokenServer(brokenServer)
         }
@@ -593,11 +568,11 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     private func emitModelFallbackNotice(
         from attemptedModel: String?,
         to fallbackModel: String,
-        continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
+        continuation: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Continuation
     ) {
         let modelLabel = attemptedModel ?? "default"
         continuation.yield(
-            AIStreamResult(
+            RepoPromptDomainRuntime.AIStreamResult(
                 type: "system",
                 text: "Requested model \(modelLabel) is unavailable. Retrying with \(fallbackModel).",
                 reasoning: nil,
@@ -611,7 +586,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         }
     }
 
-    func parseJSONLEvent(_ data: Data) -> AIStreamResult? {
+    func parseJSONLEvent(_ data: Data) -> RepoPromptDomainRuntime.AIStreamResult? {
         guard let trimmed = trimmedASCIIWhitespace(data) else { return nil }
         guard let raw = try? JSONSerialization.jsonObject(with: trimmed) as? [String: Any] else { return nil }
 
@@ -633,19 +608,19 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         if let typeValue = raw["type"] as? String,
            typeValue == "done" || typeValue == "message_stop"
         {
-            return AIStreamResult(type: "message_stop", text: nil)
+            return RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil)
         }
 
         if let message = (raw["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
            !message.isEmpty
         {
-            return AIStreamResult(type: "system", text: message)
+            return RepoPromptDomainRuntime.AIStreamResult(type: "system", text: message)
         }
 
         return nil
     }
 
-    private func parseCurrentFormatExec(_ raw: [String: Any], typeValue: String) -> AIStreamResult? {
+    private func parseCurrentFormatExec(_ raw: [String: Any], typeValue: String) -> RepoPromptDomainRuntime.AIStreamResult? {
         switch typeValue {
         case "item.started", "item.completed":
             guard let item = raw["item"] as? [String: Any],
@@ -657,11 +632,11 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                 switch itemType {
                 case "agent_message", "message", "assistant":
                     if let text = item["text"] as? String, !text.isEmpty {
-                        return AIStreamResult(type: "content", text: text, reasoning: nil, promptTokens: nil, completionTokens: nil, cost: nil)
+                        return RepoPromptDomainRuntime.AIStreamResult(type: "content", text: text, reasoning: nil, promptTokens: nil, completionTokens: nil, cost: nil)
                     }
                 case "reasoning":
                     if let text = item["text"] as? String, !text.isEmpty {
-                        return AIStreamResult(type: "reasoning", text: nil, reasoning: text, promptTokens: nil, completionTokens: nil, cost: nil)
+                        return RepoPromptDomainRuntime.AIStreamResult(type: "reasoning", text: nil, reasoning: text, promptTokens: nil, completionTokens: nil, cost: nil)
                     }
                 default:
                     break
@@ -674,7 +649,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             let promptTokens = usage?["input_tokens"] as? Int
             let completionTokens = usage?["output_tokens"] as? Int
             let cost = raw["total_cost_usd"] as? Double
-            return AIStreamResult(
+            return RepoPromptDomainRuntime.AIStreamResult(
                 type: "message_stop",
                 text: nil,
                 reasoning: nil,
@@ -685,7 +660,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
         case "error":
             let message = (raw["message"] as? String) ?? (raw["content"] as? String) ?? "Codex CLI reported an error."
-            return AIStreamResult(type: "error", text: message, reasoning: nil, promptTokens: nil, completionTokens: nil, cost: nil)
+            return RepoPromptDomainRuntime.AIStreamResult(type: "error", text: message, reasoning: nil, promptTokens: nil, completionTokens: nil, cost: nil)
 
         default:
             return nil
@@ -696,7 +671,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         item: [String: Any],
         isStarted: Bool,
         isCompleted: Bool
-    ) -> AIStreamResult? {
+    ) -> RepoPromptDomainRuntime.AIStreamResult? {
         guard let itemTypeRaw = item["type"] as? String else { return nil }
         let itemType = itemTypeRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard itemType != "agent_message",
@@ -718,7 +693,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
 
         if isStarted {
             if toolName == "bash" {
-                return AIStreamResult(
+                return RepoPromptDomainRuntime.AIStreamResult(
                     type: "tool_result",
                     text: nil,
                     reasoning: nil,
@@ -734,7 +709,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                     toolIsError: false
                 )
             }
-            return AIStreamResult(
+            return RepoPromptDomainRuntime.AIStreamResult(
                 type: "tool_call",
                 text: nil,
                 reasoning: nil,
@@ -755,7 +730,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             if let itemID {
                 codexItemInvocationIDs.removeValue(forKey: itemID)
             }
-            return AIStreamResult(
+            return RepoPromptDomainRuntime.AIStreamResult(
                 type: "tool_result",
                 text: nil,
                 reasoning: nil,
@@ -872,19 +847,19 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
     }
 
     private func isRepoPromptTool(item: [String: Any], toolName: String) -> Bool {
-        if MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(toolName) {
+        if host.isRepoPromptToolName(toolName) {
             return true
         }
         for key in ["name", "tool_name", "toolName", "function_name", "functionName", "call_name", "callName"] {
             if let value = item[key] as? String,
-               MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(value)
+               host.isRepoPromptToolName(value)
             {
                 return true
             }
         }
         for key in ["server", "server_name", "serverName", "mcp_server", "mcpServer"] {
             if let value = item[key] as? String,
-               MCPIntegrationHelper.isRepoPromptServerIdentifier(value)
+               host.isRepoPromptServerIdentifier(value)
             {
                 return true
             }
@@ -892,18 +867,18 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
         return false
     }
 
-    private func parseNewerFormatExec(_ msg: [String: Any], msgType: String) -> AIStreamResult? {
+    private func parseNewerFormatExec(_ msg: [String: Any], msgType: String) -> RepoPromptDomainRuntime.AIStreamResult? {
         switch msgType {
         case "agent_message":
             // Newer format uses "message" field instead of "text"
             if let text = msg["message"] as? String, !text.isEmpty {
-                return AIStreamResult(type: "content", text: text, reasoning: nil, promptTokens: nil, completionTokens: nil, cost: nil)
+                return RepoPromptDomainRuntime.AIStreamResult(type: "content", text: text, reasoning: nil, promptTokens: nil, completionTokens: nil, cost: nil)
             }
             return nil
 
         case "agent_reasoning":
             if let text = msg["text"] as? String, !text.isEmpty {
-                return AIStreamResult(type: "reasoning", text: nil, reasoning: text, promptTokens: nil, completionTokens: nil, cost: nil)
+                return RepoPromptDomainRuntime.AIStreamResult(type: "reasoning", text: nil, reasoning: text, promptTokens: nil, completionTokens: nil, cost: nil)
             }
             return nil
 
@@ -915,7 +890,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                 let promptTokens = totalUsage["input_tokens"] as? Int
                 let completionTokens = totalUsage["output_tokens"] as? Int
                 // Cost is not in the newer format, set to nil
-                return AIStreamResult(
+                return RepoPromptDomainRuntime.AIStreamResult(
                     type: "message_stop",
                     text: nil,
                     reasoning: nil,
@@ -989,7 +964,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             )
         }
         if lower.contains("not authenticated") || lower.contains("unauthorized") {
-            return AIProviderError.invalidConfiguration(detail: CodexManagedAuthRecoveryClassifier.manualLoginGuidanceMessage)
+            return AIProviderError.invalidConfiguration(detail: host.manualLoginGuidanceMessage)
         }
         if lower.contains("rate limit") || lower.contains("too many requests") {
             return AIProviderError.invalidConfiguration(detail: "Codex CLI rate limited. Please wait and try again.")
