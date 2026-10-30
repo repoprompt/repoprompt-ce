@@ -2,32 +2,36 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// OpenCode CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
 /// Runs a fresh prompt-only-style ACP session per request while preserving OpenCode's raw model IDs.
-final class OpenCodeCLIProvider: AIProvider {
+package final class OpenCodeCLIProvider: AIProvider {
+    package typealias ConfigurationFactory = (_ model: AIModel) -> OpenCodeAgentConfig
+    package typealias HeadlessProviderFactory = (_ config: OpenCodeAgentConfig, _ workspacePath: String?) -> OpenCodeACPHeadlessAgentProvider
+
+    private let configurationFactory: ConfigurationFactory
+    private let headlessProviderFactory: HeadlessProviderFactory
     private let activeProviders = ActiveOpenCodeCLIProviderStore<OpenCodeACPHeadlessAgentProvider>()
 
-    #if DEBUG
-        static func test_makeHeadlessConfig(modelName: String?) -> OpenCodeAgentConfig {
-            makeHeadlessConfig(modelName: modelName)
-        }
+    package init(
+        configurationFactory: @escaping ConfigurationFactory,
+        headlessProviderFactory: @escaping HeadlessProviderFactory
+    ) {
+        self.configurationFactory = configurationFactory
+        self.headlessProviderFactory = headlessProviderFactory
+    }
 
-        static func test_makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
-            OpenCodeCLIProvider().makeAgentMessage(from: aiMessage)
-        }
-    #endif
-
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let provider = OpenCodeACPHeadlessAgentProvider(
-            config: Self.makeHeadlessConfig(modelName: openCodeModelName(for: model)),
-            workspacePath: nil
+    package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
+        let provider = headlessProviderFactory(
+            configurationFactory(model),
+            nil
         )
         if let replacedProvider = activeProviders.replace(provider) {
             await replacedProvider.dispose()
         }
 
-        let upstream: AsyncThrowingStream<AIStreamResult, Error>
+        let upstream: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>
         do {
             upstream = try await provider.streamAgentMessage(makeAgentMessage(from: aiMessage), runID: nil)
         } catch {
@@ -71,7 +75,7 @@ final class OpenCodeCLIProvider: AIProvider {
         }
     }
 
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AICompletionResult {
+    package func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let stream = try await streamMessage(aiMessage, model: model, maxTokens: maxTokens)
         var textParts: [String] = []
         var finalContent: String?
@@ -115,25 +119,14 @@ final class OpenCodeCLIProvider: AIProvider {
         )
     }
 
-    func dispose() async {
+    package func dispose() async {
         let providers = activeProviders.removeAll()
         for provider in providers {
             await provider.dispose()
         }
     }
 
-    private static func makeHeadlessConfig(modelName: String?) -> OpenCodeAgentConfig {
-        OpenCodeAgentConfig(
-            modelString: modelName,
-            enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-            includeRepoPromptMCPServer: false,
-            includeManagedConfigOverlay: true,
-            cleanupLegacyPersistentConfig: true,
-            toolProfile: .noTools
-        )
-    }
-
-    private func makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
+    package func makeAgentMessage(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> RepoPromptDomainRuntime.AgentMessage {
         AgentMessage(
             systemPrompt: aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
             userMessage: buildPrompt(from: aiMessage),
@@ -142,7 +135,7 @@ final class OpenCodeCLIProvider: AIProvider {
         )
     }
 
-    private func buildPrompt(from aiMessage: AIMessage) -> String {
+    private func buildPrompt(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> String {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         var conversation = ""
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
@@ -164,12 +157,6 @@ final class OpenCodeCLIProvider: AIProvider {
             conversation = "User: \(tail)"
         }
         return conversation
-    }
-
-    private func openCodeModelName(for model: AIModel) -> String? {
-        guard model.providerType == .openCode else { return nil }
-        let trimmed = model.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
