@@ -49,6 +49,7 @@ STYLE_PATHS=(
     "Tests/RepoPromptAIContractsTests"
     "Tests/RepoPromptACPProvidersTests"
     "Tests/RepoPromptAgentProviderContractsTests"
+    "Tests/RepoPromptClaudeProviderTests"
     "Tests/RepoPromptCodexProviderTests"
     "Tests/RepoPromptTests"
     "Tests/RepoPromptMCPCoreTests"

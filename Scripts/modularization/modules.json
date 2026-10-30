@@ -61,7 +61,13 @@
     },
     "RepoPromptClaudeProvider": {
       "source_root": "Sources/RepoPromptClaudeProvider",
-      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess", "RepoPromptProviderQuota"]
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess", "RepoPromptProviderQuota"],
+      "test_target": "RepoPromptClaudeProviderTests",
+      "app_free_tests": true
+    },
+    "RepoPromptClaudeProviderTests": {
+      "source_root": "Tests/RepoPromptClaudeProviderTests",
+      "allowed_dependencies": ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
     },
     "RepoPromptAgentProviderContracts": {
       "source_root": "Sources/RepoPromptAgentProviderContracts",
