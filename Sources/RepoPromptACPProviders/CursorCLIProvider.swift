@@ -1,18 +1,18 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 
-/// OpenCode CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
-/// Runs a fresh prompt-only-style ACP session per request while preserving OpenCode's raw model IDs.
-package final class OpenCodeCLIProvider: AIProvider {
-    package typealias ConfigurationFactory = (_ model: AIModel) -> OpenCodeAgentConfig
-    package typealias HeadlessProviderFactory = (_ config: OpenCodeAgentConfig, _ workspacePath: String?) -> OpenCodeACPHeadlessAgentProvider
+/// Cursor CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.
+/// Runs a fresh ACP session per request, switches to Cursor's official `ask` mode (prompt-only/no tools), and never injects RepoPrompt MCP/tools.
+package final class CursorCLIProvider: AIProvider {
+    package typealias HeadlessProviderFactory = @Sendable (_ config: CursorAgentConfig, _ workspacePath: String?) -> CursorACPHeadlessAgentProvider
+
+    package typealias ConfigurationFactory = (_ model: AIModel) -> CursorAgentConfig
 
     private let configurationFactory: ConfigurationFactory
+    private let activeProviders = ActiveCursorCLIProviderStore()
     private let headlessProviderFactory: HeadlessProviderFactory
-    private let activeProviders = ActiveOpenCodeCLIProviderStore<OpenCodeACPHeadlessAgentProvider>()
 
     package init(
         configurationFactory: @escaping ConfigurationFactory,
@@ -27,10 +27,7 @@ package final class OpenCodeCLIProvider: AIProvider {
             configurationFactory(model),
             nil
         )
-        if let replacedProvider = activeProviders.replace(provider) {
-            await replacedProvider.dispose()
-        }
-
+        activeProviders.insert(provider)
         let upstream: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>
         do {
             upstream = try await provider.streamAgentMessage(makeAgentMessage(from: aiMessage), runID: nil)
@@ -38,10 +35,6 @@ package final class OpenCodeCLIProvider: AIProvider {
             activeProviders.remove(provider)
             await provider.dispose()
             throw error
-        }
-        guard activeProviders.contains(provider) else {
-            await provider.dispose()
-            throw CancellationError()
         }
 
         return AsyncThrowingStream { continuation in
@@ -58,18 +51,15 @@ package final class OpenCodeCLIProvider: AIProvider {
                         continuation.finish(throwing: error)
                     }
                 }
-                if self.activeProviders.remove(provider) {
-                    await provider.dispose()
-                }
+                await provider.dispose()
+                self.activeProviders.remove(provider)
             }
 
-            continuation.onTermination = { [activeProviders] termination in
+            continuation.onTermination = { _ in
                 bridgeTask.cancel()
-                guard case .cancelled = termination else { return }
                 Task {
-                    if activeProviders.remove(provider) {
-                        await provider.dispose()
-                    }
+                    await provider.dispose()
+                    self.activeProviders.remove(provider)
                 }
             }
         }
@@ -100,7 +90,7 @@ package final class OpenCodeCLIProvider: AIProvider {
                 if let value = result.completionTokens { completionTokens = value }
                 if let value = result.cost { cost = value }
             case "error":
-                throw AIProviderError.invalidConfiguration(detail: result.text ?? "OpenCode ACP reported an error")
+                throw AIProviderError.invalidConfiguration(detail: result.text ?? "Cursor ACP reported an error")
             default:
                 continue
             }
@@ -108,7 +98,7 @@ package final class OpenCodeCLIProvider: AIProvider {
 
         let text = textParts.isEmpty ? (finalContent ?? "") : textParts.joined()
         guard sawMessageStop || !text.isEmpty else {
-            throw AIProviderError.invalidResponse(detail: "OpenCode returned no completion")
+            throw AIProviderError.invalidResponse(detail: "Cursor returned no completion")
         }
 
         return AICompletionResult(
@@ -126,9 +116,12 @@ package final class OpenCodeCLIProvider: AIProvider {
         }
     }
 
+    private static let noToolsSuffix = "\n\nIMPORTANT: Do not use any tools, function calls, or external commands. Respond with text only. Any tool invocation will cause task failure."
+
     package func makeAgentMessage(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> RepoPromptDomainRuntime.AgentMessage {
-        AgentMessage(
-            systemPrompt: aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines),
+        let systemPrompt = aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        return AgentMessage(
+            systemPrompt: systemPrompt.isEmpty ? systemPrompt : systemPrompt + Self.noToolsSuffix,
             userMessage: buildPrompt(from: aiMessage),
             attachments: aiMessage.attachments,
             resumeSessionID: nil
@@ -160,52 +153,27 @@ package final class OpenCodeCLIProvider: AIProvider {
     }
 }
 
-final class ActiveOpenCodeCLIProviderStore<Provider: AnyObject>: @unchecked Sendable {
+private final class ActiveCursorCLIProviderStore: @unchecked Sendable {
     private let lock = NSLock()
-    private var providers: [ObjectIdentifier: Provider] = [:]
-    private var currentProviderID: ObjectIdentifier?
+    private var providers: [ObjectIdentifier: CursorACPHeadlessAgentProvider] = [:]
 
-    func replace(_ provider: Provider) -> Provider? {
+    func insert(_ provider: CursorACPHeadlessAgentProvider) {
         lock.lock()
-        let providerID = ObjectIdentifier(provider)
-        let previousProvider = currentProviderID.flatMap { providers[$0] }
-        providers[providerID] = provider
-        currentProviderID = providerID
+        providers[ObjectIdentifier(provider)] = provider
         lock.unlock()
-        guard let previousProvider,
-              previousProvider !== provider
-        else {
-            return nil
-        }
-        return previousProvider
     }
 
-    func contains(_ provider: Provider) -> Bool {
+    func remove(_ provider: CursorACPHeadlessAgentProvider) {
         lock.lock()
-        defer { lock.unlock() }
-
-        return providers[ObjectIdentifier(provider)] != nil
+        providers.removeValue(forKey: ObjectIdentifier(provider))
+        lock.unlock()
     }
 
-    @discardableResult
-    func remove(_ provider: Provider) -> Bool {
+    func removeAll() -> [CursorACPHeadlessAgentProvider] {
         lock.lock()
-        defer { lock.unlock() }
-
-        let providerID = ObjectIdentifier(provider)
-        let removedProvider = providers.removeValue(forKey: providerID)
-        if currentProviderID == providerID {
-            currentProviderID = nil
-        }
-        return removedProvider != nil
-    }
-
-    func removeAll() -> [Provider] {
-        lock.lock()
-        let currentProviders = Array(providers.values)
+        let current = Array(providers.values)
         providers.removeAll()
-        currentProviderID = nil
         lock.unlock()
-        return currentProviders
+        return current
     }
 }

@@ -206,13 +206,13 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptACPProviders",
-            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
+            dependencies: ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
             path: "Sources/RepoPromptACPProviders",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug)), .enableUpcomingFeature("BareSlashRegexLiterals")]
         ),
         .testTarget(
             name: "RepoPromptACPProvidersTests",
-            dependencies: ["RepoPromptACPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"],
+            dependencies: ["RepoPromptACPProviders", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFileSystem", "RepoPromptFoundation", "RepoPromptProcess"],
             path: "Tests/RepoPromptACPProvidersTests"
         ),
         .target(
