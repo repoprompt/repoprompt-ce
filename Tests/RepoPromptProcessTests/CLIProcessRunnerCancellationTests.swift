@@ -4,6 +4,124 @@ import Foundation
 import XCTest
 
 final class CLIProcessRunnerCancellationTests: XCTestCase {
+    func testNonStreamingNormalCompletionDrainsBothPipesAfterChildExit() async throws {
+        let readers = DispatchSemaphore(value: 0)
+        let runner = CLIProcessRunner(
+            config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
+            beforeNonStreamingRead: { readers.wait() },
+            beforeNonStreamingDrain: {
+                readers.signal()
+                readers.signal()
+            }
+        )
+        addTeardownBlock {
+            readers.signal()
+            readers.signal()
+            await runner.cancelAll()
+        }
+        let result = try await runner.run(
+            args: ["-c", "printf 'stdout-before-exit\\n'; printf 'stderr-before-exit\\n' >&2"],
+            stdin: nil, outputMode: .none, timeout: 2
+        )
+        XCTAssertEqual(result.status, 0)
+        XCTAssertFalse(result.timedOut)
+        XCTAssertEqual(result.stdout, Data("stdout-before-exit\n".utf8))
+        XCTAssertEqual(result.stderr, Data("stderr-before-exit\n".utf8))
+    }
+
+    func testNonStreamingDrainDeadlineFailsAndReleasesGate() async throws {
+        let readers = DispatchSemaphore(value: 0)
+        let runner = CLIProcessRunner(
+            config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
+            beforeNonStreamingRead: { readers.wait() }, nonStreamingDrainTimeout: 0.2
+        )
+        addTeardownBlock {
+            for _ in 0 ..< 4 {
+                readers.signal()
+            }
+            await runner.cancelAll()
+        }
+        do {
+            _ = try await runner.run(args: ["-c", "printf buffered"], stdin: nil, outputMode: .none, timeout: 2)
+            XCTFail("An incomplete drain must not return success")
+        } catch let CLIProcessRunnerError.waitFailed(message) {
+            XCTAssertTrue(message.contains("did not drain successfully before deadline"))
+        }
+        for _ in 0 ..< 4 {
+            readers.signal()
+        }
+        let control = try await runner.run(args: ["-c", "printf control"], stdin: nil, outputMode: .none, timeout: 2)
+        XCTAssertEqual(control.stdout, Data("control".utf8))
+        XCTAssertEqual(control.status, 0)
+    }
+
+    func testNonStreamingRetainedOutputPipeFailsAtDeadline() async throws {
+        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+        }
+        let runner = CLIProcessRunner(
+            config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
+            nonStreamingDrainTimeout: 0.2
+        )
+        do {
+            _ = try await runner.run(
+                args: ["-c", "(/bin/sleep 30) & echo $! > '\(pidFile.path)'; exit 0"],
+                stdin: nil, outputMode: .none, timeout: 2
+            )
+            XCTFail("A retained output writer must not return truncated success")
+        } catch let CLIProcessRunnerError.waitFailed(message) {
+            XCTAssertTrue(message.contains("did not drain successfully before deadline"))
+        }
+    }
+
+    func testNonStreamingBlockedInputDoesNotPreventCompletion() async throws {
+        let pidFile = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+        }
+        let runner = CLIProcessRunner(config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false))
+        let result = try await runner.run(
+            args: ["-c", "exec 3<&0; (/bin/sleep 30 <&3) >/dev/null 2>&1 & echo $! > '\(pidFile.path)'; printf done"],
+            stdin: String(repeating: "x", count: 2_000_000), outputMode: .none, timeout: 2
+        )
+        XCTAssertEqual(result.stdout, Data("done".utf8))
+        XCTAssertEqual(result.status, 0)
+    }
+
+    func testNonStreamingTimeoutReapsChildAndReusesGate() async throws {
+        let runner = CLIProcessRunner(config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false))
+        let timed = try await runner.run(args: ["-c", "exec /bin/sleep 30"], stdin: nil, outputMode: .none, timeout: 0.1)
+        XCTAssertTrue(timed.timedOut)
+        let control = try await runner.run(args: ["-c", "printf control"], stdin: nil, outputMode: .none, timeout: 2)
+        XCTAssertEqual(control.stdout, Data("control".utf8))
+    }
+
+    func testNonStreamingCancellationDuringDrainDoesNotPublishOutput() async throws {
+        let entered = expectation(description: "child exited before drain")
+        let release = DispatchSemaphore(value: 0)
+        let runner = CLIProcessRunner(
+            config: CLIProcessConfiguration(command: "/bin/sh", processPurpose: .tool, enableDebugLogging: false),
+            beforeNonStreamingDrain: { entered.fulfill()
+                release.wait()
+            }
+        )
+        addTeardownBlock { release.signal()
+            await runner.cancelAll()
+        }
+        let task = Task {
+            try await runner.run(args: ["-c", "printf output"], stdin: nil, outputMode: .none, timeout: 2, cancelChildOnTaskCancellation: true)
+        }
+        await fulfillment(of: [entered], timeout: 5)
+        task.cancel()
+        release.signal()
+        do { _ = try await task.value
+            XCTFail("Cancelled drain must not publish output")
+        } catch is CancellationError {}
+    }
+
     func testStreamingCancellationInvokesOneLifecycleCallbackAndReusesGate() async throws {
         let reaper = RecordingChildStatusObserver()
         let lifecycle = ProcessLifecycleProbe()
