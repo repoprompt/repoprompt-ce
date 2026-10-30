@@ -3,18 +3,24 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
-protocol ClaudeNativeConfigLease: Sendable {
+package protocol ClaudeNativeConfigLease: Sendable {
     var url: URL { get }
     func release()
 }
 
-struct ClaudeNativePermissionMatch {
-    let source: String
-    let normalizedToolName: String?
-    let serverIdentifier: String?
+package struct ClaudeNativePermissionMatch {
+    package let source: String
+    package let normalizedToolName: String?
+    package let serverIdentifier: String?
+
+    package init(source: String, normalizedToolName: String?, serverIdentifier: String?) {
+        self.source = source
+        self.normalizedToolName = normalizedToolName
+        self.serverIdentifier = serverIdentifier
+    }
 }
 
-protocol ClaudeNativeSessionHosting: Sendable {
+package protocol ClaudeNativeSessionHosting: Sendable {
     func repoPromptPermissionMatch(toolName: String, requestPayload: [String: Any]) -> ClaudeNativePermissionMatch?
     func filterEnvironment(_ environment: [String: String], variant: ClaudeCodeRuntimeVariant) async -> [String: String]
     func mergeCurrentCarrier(into environment: [String: String]) -> [String: String]

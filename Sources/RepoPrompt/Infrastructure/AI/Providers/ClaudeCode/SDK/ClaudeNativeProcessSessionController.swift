@@ -7,19 +7,19 @@ import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
 
-final actor ClaudeNativeProcessSessionController {
+package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeControlling {
     private static let rawEventTimestampFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
 
-    typealias TurnStatus = NativeAgentRuntimeTurnStatus
-    typealias RuntimeInitStatus = NativeAgentRuntimeRuntimeInitStatus
-    typealias Event = NativeAgentRuntimeEvent
-    typealias SessionRef = NativeAgentRuntimeSessionRef
-    typealias InterruptOutcome = NativeAgentRuntimeInterruptOutcome
-    typealias ControllerError = NativeAgentRuntimeControllerError
+    package typealias TurnStatus = NativeAgentRuntimeTurnStatus
+    package typealias RuntimeInitStatus = NativeAgentRuntimeRuntimeInitStatus
+    package typealias Event = NativeAgentRuntimeEvent
+    package typealias SessionRef = NativeAgentRuntimeSessionRef
+    package typealias InterruptOutcome = NativeAgentRuntimeInterruptOutcome
+    package typealias ControllerError = NativeAgentRuntimeControllerError
 
     private struct PendingPermissionRequest {
         let requestID: String
@@ -146,11 +146,11 @@ final actor ClaudeNativeProcessSessionController {
 
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     private var eventsStream: AsyncStream<Event>
-    var events: AsyncStream<Event> {
+    package var events: AsyncStream<Event> {
         eventsStream
     }
 
-    var hasActiveSession: Bool {
+    package var hasActiveSession: Bool {
         #if DEBUG
             if configurationTestWrite != nil { return true }
         #endif
@@ -232,7 +232,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    var hasTurnInFlight: Bool {
+    package var hasTurnInFlight: Bool {
         turnInFlight
     }
 
@@ -256,7 +256,7 @@ final actor ClaudeNativeProcessSessionController {
             .description
     }
 
-    init(
+    package init(
         host: any ClaudeNativeSessionHosting,
         runID: UUID,
         tabID: UUID,
@@ -285,7 +285,7 @@ final actor ClaudeNativeProcessSessionController {
         eventsContinuation = stream.continuation
     }
 
-    func ensureEventsStreamReady() {
+    package func ensureEventsStreamReady() {
         guard eventsContinuation == nil else { return }
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
@@ -295,7 +295,7 @@ final actor ClaudeNativeProcessSessionController {
     /// Finish the old events stream and create a fresh one.  Call this when starting a new
     /// run after a previous run was cancelled, to discard any buffered stale events and to
     /// avoid reusing an AsyncStream whose iterator may have been poisoned by task cancellation.
-    func resetEventsStreamForNewRun() {
+    package func resetEventsStreamForNewRun() {
         eventsContinuation?.finish()
         eventsContinuation = nil
         let stream = Self.makeEventsStream()
@@ -303,7 +303,7 @@ final actor ClaudeNativeProcessSessionController {
         eventsContinuation = stream.continuation
     }
 
-    func startOrResume(
+    package func startOrResume(
         existingSessionID: String?,
         model: String?,
         effortLevel: ClaudeCodeEffortLevel? = nil,
@@ -354,16 +354,16 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func currentSessionRef() async -> SessionRef {
+    package func currentSessionRef() async -> SessionRef {
         SessionRef(sessionID: sessionID)
     }
 
-    func availableSlashCommands() async -> [RuntimeInitStatus.InitializeResponseSnapshot.Command] {
+    package func availableSlashCommands() async -> [RuntimeInitStatus.InitializeResponseSnapshot.Command] {
         guard hasActiveSession, !isShuttingDown else { return [] }
         return initializeResponseSnapshot?.commands ?? []
     }
 
-    func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
+    package func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
         do {
             guard try await applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: nil) == .applied else {
                 throw ControllerError.invalidControlResponse("Flag settings application was superseded")
@@ -374,7 +374,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func applyModelAndEffortForTurn(
+    package func applyModelAndEffortForTurn(
         model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?
     ) async throws -> NativeAgentRuntimeTurnConfigurationOutcome {
         switch try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure) {
@@ -385,14 +385,14 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func applyModelAndEffortWithProof(
+    package func applyModelAndEffortWithProof(
         model: String?,
         effortLevel: ClaudeCodeEffortLevel?
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
         try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: nil)
     }
 
-    func applyModelAndEffortWithProof(
+    package func applyModelAndEffortWithProof(
         model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
         try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure)
@@ -487,7 +487,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+    package func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         #if DEBUG
             await configurationTestBeforeProofSend?()
         #endif
@@ -503,7 +503,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     @discardableResult
-    func sendUserMessage(_ text: String) async throws -> UUID {
+    package func sendUserMessage(_ text: String) async throws -> UUID {
         try writeUserMessage(text)
     }
 
@@ -519,7 +519,7 @@ final actor ClaudeNativeProcessSessionController {
         return id
     }
 
-    func interruptTurn(reason: String) async -> InterruptOutcome {
+    package func interruptTurn(reason: String) async -> InterruptOutcome {
         guard process != nil else { return .failed }
         return await interruptRunningTurn(reason: reason)
     }
@@ -574,7 +574,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
+    package func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
         guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
             return
         }
@@ -597,7 +597,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func shutdown() async {
+    package func shutdown() async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
         configurationLifetime = UUID()
@@ -1316,7 +1316,7 @@ final actor ClaudeNativeProcessSessionController {
         #endif
     }
 
-    static func recoverablePlaintextAssistantFragment(from lineData: Data) -> String? {
+    package static func recoverablePlaintextAssistantFragment(from lineData: Data) -> String? {
         guard let rawText = String(data: lineData, encoding: .utf8) else {
             return nil
         }
@@ -1710,7 +1710,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func shouldSuppressUserFacingStreamResult(_ result: AIStreamResult) -> Bool {
+    package func shouldSuppressUserFacingStreamResult(_ result: RepoPromptDomainRuntime.AIStreamResult) -> Bool {
         // Reasoning is forwarded to Agent Mode as runtime-only status preview data.
         // Transcript suppression belongs in the view-model layer, not at this transport boundary.
         // Suppress Claude background task lifecycle notifications (task_started /
@@ -1776,7 +1776,7 @@ final actor ClaudeNativeProcessSessionController {
 
     /// Best-effort parser for the initialize control response.
     /// Malformed entries are skipped; missing fields become nil/empty.
-    static func parseInitializeResponseSnapshot(
+    package static func parseInitializeResponseSnapshot(
         from response: [String: Any]
     ) -> RuntimeInitStatus.InitializeResponseSnapshot {
         let commands: [RuntimeInitStatus.InitializeResponseSnapshot.Command] = if let rawCommands = response["commands"] as? [[String: Any]] {
@@ -1897,21 +1897,21 @@ final actor ClaudeNativeProcessSessionController {
 
     #if DEBUG
         /// In-memory transport for deterministic control-ACK/write races; never starts a provider.
-        func test_handleConfigurationStdoutChunk(_ data: Data) async {
+        package func test_handleConfigurationStdoutChunk(_ data: Data) async {
             await handleStdoutChunk(data)
         }
 
-        func test_handleStdoutEOF() async {
+        package func test_handleStdoutEOF() async {
             await handleStdoutEOF()
         }
 
         /// Exercises the real interrupt body without claiming the fake owns an OS process.
-        func test_interruptRunningTurn(reason: String) async -> InterruptOutcome {
+        package func test_interruptRunningTurn(reason: String) async -> InterruptOutcome {
             guard hasActiveSession else { return .failed }
             return await interruptRunningTurn(reason: reason)
         }
 
-        func test_installConfigurationTransport(
+        package func test_installConfigurationTransport(
             initialized: Bool = true,
             controlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])? = { _ in [:] },
             write: @escaping @Sendable (Data) throws -> Void
@@ -1932,35 +1932,35 @@ final actor ClaudeNativeProcessSessionController {
             configurationTestWrite = write
         }
 
-        func test_setBeforeApplicationErrorReturn(_ action: @escaping @Sendable () async -> Void) {
+        package func test_setBeforeApplicationErrorReturn(_ action: @escaping @Sendable () async -> Void) {
             configurationTestBeforeApplicationErrorReturn = action
         }
 
         /// Pauses at controller entry, before the non-suspending proof-check/write segment.
-        func test_setBeforeConfigurationSend(_ beforeSend: @escaping @Sendable () async -> Void) {
+        package func test_setBeforeConfigurationSend(_ beforeSend: @escaping @Sendable () async -> Void) {
             configurationTestBeforeProofSend = beforeSend
         }
 
         /// Exercises the real codec, request correlation, and success/error continuation path.
-        func test_receiveConfigurationResponseLine(_ line: Data) async {
+        package func test_receiveConfigurationResponseLine(_ line: Data) async {
             await handleLine(line)
         }
 
-        func test_setConfigurationControlRequest(
+        package func test_setConfigurationControlRequest(
             _ controlRequest: @escaping @Sendable ([String: Any]) async throws -> [String: Any]
         ) {
             configurationTestControlRequest = controlRequest
         }
 
-        func test_determineTurnStatus(payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
+        package func test_determineTurnStatus(payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
             determineTurnStatus(from: payload, stopReasonHint: stopReasonHint)
         }
 
-        func test_setTurnWasInterrupted(_ value: Bool) {
+        package func test_setTurnWasInterrupted(_ value: Bool) {
             turnWasInterrupted = value
         }
 
-        func test_effectiveLaunchEnvironment(
+        package func test_effectiveLaunchEnvironment(
             base: [String: String],
             resolverOverrides: [String: String] = [:],
             resolverRemovedKeys: Set<String> = []
@@ -1972,7 +1972,7 @@ final actor ClaudeNativeProcessSessionController {
             )
         }
 
-        func test_liveFlagSettingsRequiresProcessRestart(
+        package func test_liveFlagSettingsRequiresProcessRestart(
             activeLaunchEnvironment: ClaudeCompatiblePluginLaunchEnvironment,
             nextLaunchEnvironment: ClaudeCompatiblePluginLaunchEnvironment
         ) -> Bool {
@@ -1981,19 +1981,19 @@ final actor ClaudeNativeProcessSessionController {
         }
 
         /// Build the initialize control request payload for testing.
-        func test_buildInitializeRequest(systemPromptOverride: String? = nil) -> [String: Any] {
+        package func test_buildInitializeRequest(systemPromptOverride: String? = nil) -> [String: Any] {
             Self.buildInitializeRequest(systemPromptOverride: systemPromptOverride)
         }
 
         /// Build the initial flag-settings control request payload for testing.
-        func test_buildApplyFlagSettingsRequest(
+        package func test_buildApplyFlagSettingsRequest(
             model: String? = nil,
             effortLevel: ClaudeCodeEffortLevel? = nil
         ) -> [String: Any]? {
             buildApplyFlagSettingsRequest(model: model, effortLevel: effortLevel)
         }
 
-        func test_resolveApplyFlagSettingsRequest(
+        package func test_resolveApplyFlagSettingsRequest(
             model: String? = nil,
             effortLevel: ClaudeCodeEffortLevel? = nil
         ) async throws -> [String: Any]? {
@@ -2001,12 +2001,12 @@ final actor ClaudeNativeProcessSessionController {
         }
 
         /// Build the initial permission-mode control request payload for testing.
-        func test_buildSetPermissionModeRequest(permissionMode: String? = nil) -> [String: Any]? {
+        package func test_buildSetPermissionModeRequest(permissionMode: String? = nil) -> [String: Any]? {
             Self.buildSetPermissionModeRequest(permissionMode: permissionMode ?? config.permissionMode)
         }
 
         /// Build CLI arguments for testing (verifies prompt flags are absent).
-        func test_buildArguments(
+        package func test_buildArguments(
             existingSessionID: String?,
             model: String?
         ) -> [String] {
@@ -2014,15 +2014,15 @@ final actor ClaudeNativeProcessSessionController {
         }
 
         @discardableResult
-        func test_beginTurnTracking() -> UUID {
+        package func test_beginTurnTracking() -> UUID {
             beginTurnTracking()
         }
 
-        func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
+        package func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
             pendingPermissionRequests[id] = PendingPermissionRequest(requestID: id, request: request)
         }
 
-        func test_handleControlRequest(
+        package func test_handleControlRequest(
             requestID: String,
             subtype: String,
             request: [String: Any]
@@ -2418,7 +2418,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    nonisolated static func allowPermissionResponsePayload(
+    package nonisolated static func allowPermissionResponsePayload(
         pendingRequest: [String: Any],
         includeUpdatedPermissions: Bool
     ) -> [String: Any] {
