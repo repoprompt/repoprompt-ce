@@ -7,12 +7,14 @@
 
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import SwiftOpenAI
 
-final class FireworksProvider: OpenAIProvider {
-    init(apiKey: String) {
+package final class FireworksProvider: OpenAIProvider {
+    package init(host: any OpenAIProviderHost, apiKey: String) {
         let baseURL = URL(string: "https://api.fireworks.ai/inference")!
         super.init(
+            host: host,
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil, // Use model-specific max tokens
@@ -21,11 +23,11 @@ final class FireworksProvider: OpenAIProvider {
     }
 
     /// Override to provide model-specific max tokens
-    override func providerSpecificMaxTokens(for model: AIModel) -> Int? {
-        model.maxTokens
+    override package func providerSpecificMaxTokens(for model: AIModel) -> Int? {
+        host.maxTokens(for: model)
     }
 
-    override func testAPIKey(model: AIModel = .fireworksDeepseekV3p1Terminus) async throws -> Bool {
+    override package func testAPIKey(model: AIModel = .fireworksDeepseekV3p1Terminus) async throws -> Bool {
         let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         do {
             // Use a model known to exist on Fireworks for testing
@@ -42,7 +44,7 @@ final class FireworksProvider: OpenAIProvider {
             // Check for a common greeting word
             return response.lowercased().contains("hello") || response.lowercased().contains("hi")
         } catch {
-            print("Fireworks AI API Key Test Failed: \(error.asFriendlyString())")
+            print("Fireworks AI API Key Test Failed: \(host.friendlyErrorDescription(error))")
             return false
         }
     }

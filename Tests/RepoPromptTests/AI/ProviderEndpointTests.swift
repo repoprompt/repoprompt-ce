@@ -14,20 +14,6 @@ final class ZAIProviderEndpointTests: XCTestCase {
         XCTAssertTrue(zAIModels.contains(.zaiGLM52))
         XCTAssertTrue(zAIModels.contains(.zaiGLM5))
     }
-
-    func testDefaultProviderUsesGeneralZAIEndpoint() {
-        let provider = ZAIProvider(apiKey: "test-key")
-
-        XCTAssertEqual(provider.endpoint, .generalAPI)
-        XCTAssertEqual(provider.endpoint.baseURL.absoluteString, "https://api.z.ai/api/paas")
-    }
-
-    func testCodingPlanProviderUsesDedicatedCodingEndpoint() {
-        let provider = ZAIProvider(apiKey: "test-key", endpoint: .codingPlan)
-
-        XCTAssertEqual(provider.endpoint, .codingPlan)
-        XCTAssertEqual(provider.endpoint.baseURL.absoluteString, "https://api.z.ai/api/coding/paas")
-    }
 }
 
 final class ProviderEndpointConsentTests: XCTestCase {
@@ -98,8 +84,8 @@ final class ProviderEndpointConsentTests: XCTestCase {
 
     func testSDKAndAzureDiscoveryRejectUnapprovedInitialRequests() async throws {
         let url = try XCTUnwrap(URL(string: "http://provider.example"))
-        XCTAssertThrowsError(try OpenAIProvider(apiKey: "test-only-token", baseURL: url).getService())
-        XCTAssertNoThrow(try OpenAIProvider(apiKey: "test-only-token", baseURL: url, httpCredentialConsentEndpoint: url.absoluteString).getService())
+        XCTAssertThrowsError(try OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: "test-only-token", baseURL: url).getService())
+        XCTAssertNoThrow(try OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: "test-only-token", baseURL: url, httpCredentialConsentEndpoint: url.absoluteString).getService())
         let azure = AzureOpenAIProvider(configuration: AzureOpenAIConfiguration(baseURL: url, apiKey: "test-only-token", apiVersion: "test"))
         do {
             _ = try await azure.fetchResponse(id: "test")

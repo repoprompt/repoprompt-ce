@@ -1,9 +1,10 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import SwiftOpenAI
 
-func openAIChatCompletionOutcome(_ finishReason: IntOrStringValue?) -> AIProviderCompletionOutcome? {
+package func openAIChatCompletionOutcome(_ finishReason: IntOrStringValue?) -> RepoPromptDomainRuntime.AIProviderCompletionOutcome? {
     guard let finishReason else { return nil }
     switch finishReason {
     case .string("stop"):
@@ -15,7 +16,8 @@ func openAIChatCompletionOutcome(_ finishReason: IntOrStringValue?) -> AIProvide
     }
 }
 
-class OpenAIProvider: AIProvider {
+package class OpenAIProvider: AIProvider {
+    let host: any OpenAIProviderHost
     // Instance-level cache
     private let cachedApiKey: String?
     private let cachedBaseURL: URL?
@@ -26,7 +28,8 @@ class OpenAIProvider: AIProvider {
     private let includeUsageInStream: Bool // Whether to include usage in streamed responses
     private let serviceTier: String? // Service tier for Responses API (auto/default/flex/priority)
 
-    init(apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil, httpCredentialConsentEndpoint: String? = nil) {
+    package init(host: any OpenAIProviderHost, apiKey: String? = nil, baseURL: URL? = nil, configuredMaxTokens: Int? = nil, overrideVersion: String? = nil, includeUsageInStream: Bool = true, serviceTier: String? = nil, httpCredentialConsentEndpoint: String? = nil) {
+        self.host = host
         cachedApiKey = apiKey
         cachedBaseURL = baseURL
         self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
@@ -49,7 +52,7 @@ class OpenAIProvider: AIProvider {
         let apiKey = cachedApiKey ?? ""
 
         if let baseURL = cachedBaseURL {
-            try ProviderEndpointConsent.validate(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
+            try host.validateEndpoint(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
             let configuration = URLSessionConfiguration.default
             configuration.timeoutIntervalForRequest = 21600 // 6 hours
             configuration.timeoutIntervalForResource = 21600 // 6 hours
@@ -128,7 +131,7 @@ class OpenAIProvider: AIProvider {
     private func shouldOmitMaxOutputTokens(for model: AIModel) -> Bool {
         // Respect explicit user configuration
         if configuredMaxTokens != nil { return false }
-        let baseModel = model.openAIServiceTierBase
+        let baseModel = host.serviceTierBase(for: model)
         // Don't pass max_output_tokens for first-party OpenAI models — let the API handle defaults
         switch baseModel {
         case .gpt5Pro, .gpt5ProXHigh, .gpt54Pro, .gpt54ProXHigh,
@@ -147,23 +150,23 @@ class OpenAIProvider: AIProvider {
         }
     }
 
-    // The createMessages method has been removed in favor of using AIMessage.openAIChatMessages
+    // The createMessages method has been removed in favor of using RepoPromptDomainRuntime.AIMessage.openAIChatMessages
 
     // MARK: Helper – build the `input` array for the Responses API
 
-    private func createResponseInput(for aiMessage: AIMessage) throws -> SwiftOpenAI.InputType {
-        // Forward to the centralised builder defined on AIMessage
+    private func createResponseInput(for aiMessage: RepoPromptDomainRuntime.AIMessage) throws -> SwiftOpenAI.InputType {
+        // Forward to the centralised builder defined on RepoPromptDomainRuntime.AIMessage
         try aiMessage.openAIResponsesInput()
     }
 
     // MARK: - Helper to decide whether to route via Responses-API
 
     private func shouldUseResponsesAPI(for model: AIModel) -> Bool {
-        model.usesResponsesAPI
+        host.usesResponsesAPI(for: model)
     }
 
     func buildForegroundResponseParameters(
-        _ aiMessage: AIMessage,
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int?,
         stream: Bool
@@ -172,7 +175,7 @@ class OpenAIProvider: AIProvider {
 
         var parameters = try ModelResponseParameter(
             input: createResponseInput(for: aiMessage),
-            model: baseModel.toProviderModel() as! SwiftOpenAI.Model
+            model: host.providerModel(for: baseModel)
         )
 
         if !aiMessage.systemPrompt.isEmpty {
@@ -234,15 +237,15 @@ class OpenAIProvider: AIProvider {
         )
     }
 
-    func streamMessage(
-        _ aiMessage: AIMessage,
+    package func streamMessage(
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int?
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let finalMaxTokens = resolvedMaxTokens(for: model, override: maxTokens)
 
         // Honour user / model override that disables streaming entirely
-        let forceCompletion = !model.canStream
+        let forceCompletion = !host.canStream(for: model)
 
         // Route via Responses-API when required
         if shouldUseResponsesAPI(for: model) {
@@ -267,15 +270,15 @@ class OpenAIProvider: AIProvider {
         }
 
         // Handle other non-streaming models via completeMessage
-        if !model.canStream {
+        if !host.canStream(for: model) {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: finalMaxTokens)
             return AsyncThrowingStream { continuation in
-                continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: result.completionTokens))
+                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: result.completionTokens))
                 switch result.completionOutcome {
                 case .completed:
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
                 case let .incomplete(reason):
-                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
                 }
                 continuation.finish()
             }
@@ -299,7 +302,7 @@ class OpenAIProvider: AIProvider {
         let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
-            model: effectiveModel.toProviderModel() as! SwiftOpenAI.Model
+            model: host.providerModel(for: effectiveModel)
         )
 
         if finalMaxTokens != 2048 {
@@ -317,8 +320,8 @@ class OpenAIProvider: AIProvider {
             parameters.reasoningEffort = "low"
         }
 
-        // Apply temperature from AIMessage if provided for models that support it
-        if let messageTemperature = aiMessage.effectiveTemperature(for: effectiveModel),
+        // Apply temperature from RepoPromptDomainRuntime.AIMessage if provided for models that support it
+        if let messageTemperature = host.effectiveTemperature(for: aiMessage, model: effectiveModel),
            ![.o3, .o1Mini, .o1Preview].contains(effectiveModel)
         {
             parameters.temperature = messageTemperature
@@ -332,7 +335,7 @@ class OpenAIProvider: AIProvider {
                 do {
                     var promptTokens: Int? = nil
                     var completionTokens: Int? = nil
-                    var observedCompletionOutcome: AIProviderCompletionOutcome?
+                    var observedCompletionOutcome: RepoPromptDomainRuntime.AIProviderCompletionOutcome?
 
                     for try await result in stream {
                         // Check cancellation to exit promptly when consumer stops reading
@@ -340,7 +343,7 @@ class OpenAIProvider: AIProvider {
 
                         if Self.isTransportActivityChunk(result) {
                             continuation.yield(
-                                AIStreamResult(type: AIStreamResult.transportActivityType, text: nil)
+                                RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.transportActivityType, text: nil)
                             )
                             continue
                         }
@@ -358,7 +361,7 @@ class OpenAIProvider: AIProvider {
 
                         if !content.isEmpty || !reasoning.isEmpty {
                             continuation.yield(
-                                AIStreamResult(type: "content", text: content, reasoning: reasoning, promptTokens: promptTokens, completionTokens: completionTokens)
+                                RepoPromptDomainRuntime.AIStreamResult(type: "content", text: content, reasoning: reasoning, promptTokens: promptTokens, completionTokens: completionTokens)
                             )
                         }
                         if let completionOutcome = openAIChatCompletionOutcome(finishReason) {
@@ -367,9 +370,9 @@ class OpenAIProvider: AIProvider {
                     }
                     switch observedCompletionOutcome {
                     case .completed:
-                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
                     case let .incomplete(reason):
-                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
                     case nil:
                         break
                     }
@@ -385,10 +388,10 @@ class OpenAIProvider: AIProvider {
 
     /// Method to handle o1pro using the Responses API
     private func getResponseViaResponsesAPI(
-        _ aiMessage: AIMessage,
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel, // Keep model parameter for clarity and potential future use
         maxTokens: Int? // Keep maxTokens parameter
-    ) async throws -> AICompletionResult {
+    ) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let service = try getService()
         let parameters = try buildForegroundResponseParameters(
             aiMessage,
@@ -401,7 +404,7 @@ class OpenAIProvider: AIProvider {
             // Assuming responseCreate exists in the service layer as per previous code.
             let response = try await service.responseCreate(parameters)
 
-            let completionOutcome: AIProviderCompletionOutcome
+            let completionOutcome: RepoPromptDomainRuntime.AIProviderCompletionOutcome
             if response.status == .completed {
                 completionOutcome = .completed
             } else if response.status == .incomplete {
@@ -426,7 +429,7 @@ class OpenAIProvider: AIProvider {
                 completionTokens = usage.outputTokens
             }
 
-            return AICompletionResult(
+            return RepoPromptDomainRuntime.AICompletionResult(
                 text: responseText,
                 promptTokens: promptTokens,
                 completionTokens: completionTokens,
@@ -449,12 +452,12 @@ class OpenAIProvider: AIProvider {
     // MARK: – Streaming helper for the Responses API
 
     /// Creates an *async* stream backed by the `responseCreateStream` SSE
-    /// endpoint and converts `ResponseStreamEvent`s into `AIStreamResult`s.
+    /// endpoint and converts `ResponseStreamEvent`s into `RepoPromptDomainRuntime.AIStreamResult`s.
     private func getResponseStreamViaResponsesAPI(
-        _ aiMessage: AIMessage,
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int?
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let service = try getService()
         let parameters = try buildForegroundResponseParameters(
             aiMessage,
@@ -467,11 +470,11 @@ class OpenAIProvider: AIProvider {
         return bridgeResponseStream(sseStream)
     }
 
-    func completeMessage(
-        _ aiMessage: AIMessage,
+    package func completeMessage(
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int? = nil
-    ) async throws -> AICompletionResult {
+    ) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let finalMaxTokens = resolvedMaxTokens(for: model, override: maxTokens)
 
         if shouldUseResponsesAPI(for: model) {
@@ -486,7 +489,7 @@ class OpenAIProvider: AIProvider {
         let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
-            model: model.toProviderModel() as! SwiftOpenAI.Model
+            model: host.providerModel(for: model)
         )
 
         // NEW o3 flags
@@ -516,7 +519,7 @@ class OpenAIProvider: AIProvider {
         }
 
         // Apply user-defined temperature if override is enabled for models that support it
-        if let messageTemperature = aiMessage.effectiveTemperature(for: effectiveModel),
+        if let messageTemperature = host.effectiveTemperature(for: aiMessage, model: effectiveModel),
            ![.o3, .o1Mini, .o1Preview].contains(effectiveModel)
         {
             parameters.temperature = messageTemperature
@@ -534,8 +537,8 @@ class OpenAIProvider: AIProvider {
         let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
             ?? .incomplete(reason: "missing_finish_reason")
 
-        // Return an AICompletionResult with content and token counts
-        return AICompletionResult(
+        // Return an RepoPromptDomainRuntime.AICompletionResult with content and token counts
+        return RepoPromptDomainRuntime.AICompletionResult(
             text: content,
             promptTokens: promptTokens,
             completionTokens: completionTokens,
@@ -544,8 +547,8 @@ class OpenAIProvider: AIProvider {
     }
 
     /// Example testKey usage
-    func testAPIKey(model: AIModel = .gpt54Mini) async throws -> Bool {
-        let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
+    package func testAPIKey(model: AIModel = .gpt54Mini) async throws -> Bool {
+        let testMessage = RepoPromptDomainRuntime.AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         // Don't set max tokens for test - let the API use defaults to avoid minimum token errors
 
         // Try the requested model first
@@ -553,7 +556,7 @@ class OpenAIProvider: AIProvider {
             let response = try await callAppropriateCompletion(for: model, message: testMessage, nil)
             if response.lowercased().contains("hello") { return true }
         } catch {
-            print("Initial model \(model.displayName) failed in testAPIKey: \(error)")
+            print("Initial model \(host.displayName(for: model)) failed in testAPIKey: \(error)")
         }
 
         // Fallback chain: gpt41 -> gpt5Low
@@ -573,13 +576,13 @@ class OpenAIProvider: AIProvider {
         return false
     }
 
-    private func bridgeResponseStream(_ stream: AsyncThrowingStream<ResponseStreamEvent, Error>) -> AsyncThrowingStream<AIStreamResult, Error> {
+    private func bridgeResponseStream(_ stream: AsyncThrowingStream<ResponseStreamEvent, Error>) -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     var promptTokens: Int?
                     var completionTokens: Int?
-                    var observedCompletionOutcome: AIProviderCompletionOutcome?
+                    var observedCompletionOutcome: RepoPromptDomainRuntime.AIProviderCompletionOutcome?
 
                     for try await event in stream {
                         if Task.isCancelled { break }
@@ -587,7 +590,7 @@ class OpenAIProvider: AIProvider {
                         case let .outputTextDelta(delta):
                             if !delta.delta.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: delta.delta,
                                         reasoning: nil,
@@ -600,7 +603,7 @@ class OpenAIProvider: AIProvider {
                         case let .reasoningSummaryTextDelta(delta):
                             if !delta.delta.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: nil,
                                         reasoning: delta.delta,
@@ -632,7 +635,7 @@ class OpenAIProvider: AIProvider {
                     switch observedCompletionOutcome {
                     case .completed:
                         continuation.yield(
-                            AIStreamResult(
+                            RepoPromptDomainRuntime.AIStreamResult(
                                 type: "message_stop",
                                 text: nil,
                                 reasoning: nil,
@@ -643,8 +646,8 @@ class OpenAIProvider: AIProvider {
                         )
                     case let .incomplete(reason):
                         continuation.yield(
-                            AIStreamResult(
-                                type: AIStreamResult.incompleteType,
+                            RepoPromptDomainRuntime.AIStreamResult(
+                                type: RepoPromptDomainRuntime.AIStreamResult.incompleteType,
                                 text: nil,
                                 promptTokens: promptTokens,
                                 completionTokens: completionTokens,
@@ -665,14 +668,14 @@ class OpenAIProvider: AIProvider {
     }
 
     private func buildBackgroundResponseParameters(
-        _ aiMessage: AIMessage,
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int?
     ) throws -> ModelResponseParameter {
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
         var parameters = try ModelResponseParameter(
             input: aiMessage.openAIResponsesInput(),
-            model: baseModel.toProviderModel() as! SwiftOpenAI.Model
+            model: host.providerModel(for: baseModel)
         )
 
         if !aiMessage.systemPrompt.isEmpty {
@@ -689,7 +692,7 @@ class OpenAIProvider: AIProvider {
         }
 
         // Only apply temperature for non-reasoning models (reasoning models don't support it)
-        if reasoningEffort == nil, let temperature = aiMessage.effectiveTemperature(for: baseModel) {
+        if reasoningEffort == nil, let temperature = host.effectiveTemperature(for: aiMessage, model: baseModel) {
             parameters.temperature = temperature
         }
 
@@ -702,9 +705,9 @@ class OpenAIProvider: AIProvider {
     }
 
     /// Helper function to decide whether to use completeMessage or getResponseViaResponsesAPI
-    private func callAppropriateCompletion(for model: AIModel, message: AIMessage, _ maxTokens: Int?) async throws -> String {
+    private func callAppropriateCompletion(for model: AIModel, message: RepoPromptDomainRuntime.AIMessage, _ maxTokens: Int?) async throws -> String {
         if shouldUseResponsesAPI(for: model) {
-            // Pass the AIMessage and maxTokens directly
+            // Pass the RepoPromptDomainRuntime.AIMessage and maxTokens directly
             let result = try await getResponseViaResponsesAPI(message, model: model, maxTokens: maxTokens)
             return result.text
         } else {
@@ -717,7 +720,7 @@ class OpenAIProvider: AIProvider {
         }
     }
 
-    func dispose() async {
+    package func dispose() async {
         // No resources to free in this example
     }
 
@@ -725,13 +728,13 @@ class OpenAIProvider: AIProvider {
 
     /// Returns the effective service tier for a request - prefers per-model override over global setting
     private func resolvedServiceTier(for model: AIModel) -> String? {
-        switch model.openAIServiceTierBase {
+        switch host.serviceTierBase(for: model) {
         case .openaiCustomResponses, .openaiCustomReasoning:
             return nil
         default:
             break
         }
-        return model.openAIServiceTierOverride ?? serviceTier
+        return host.serviceTierOverride(for: model) ?? serviceTier
     }
 
     // MARK: - Variant Mapping Helper
@@ -742,7 +745,7 @@ class OpenAIProvider: AIProvider {
         -> (baseModel: AIModel, reasoningEffort: String?)
     {
         // Unwrap tier variants first
-        let model = model.openAIServiceTierBase
+        let model = host.serviceTierBase(for: model)
         switch model {
         case .gpt5Pro: return (.gpt5Pro, "high")
         case .gpt5ProXHigh: return (.gpt5Pro, "xhigh")
@@ -761,7 +764,7 @@ class OpenAIProvider: AIProvider {
         case .gpt54: return (.gpt54, "medium")
         // ── GPT-6 family (no none/minimal on 6.1 Sol or Astra) ──
         case .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax:
-            return (.gpt61Terra, model.defaultReasoningEffort)
+            return (.gpt61Terra, host.defaultReasoningEffort(for: model))
         case .gpt61SolMax: return (.gpt61Sol, "max")
         case .gpt61SolXHigh: return (.gpt61Sol, "xhigh")
         case .gpt61SolHigh: return (.gpt61Sol, "high")
@@ -788,15 +791,15 @@ class OpenAIProvider: AIProvider {
         case .gpt54MiniLow: return (.gpt54Mini, "low")
         case .gpt54Mini: return (.gpt54Mini, "medium")
         case .openaiCustomReasoning:
-            return (model, model.defaultReasoningEffort)
+            return (model, host.defaultReasoningEffort(for: model))
         default: return (model, nil)
         }
     }
 }
 
 extension OpenAIProvider: ResponsesJobProvider {
-    func createBackgroundResponse(
-        _ message: AIMessage,
+    package func createBackgroundResponse(
+        _ message: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int?
     ) async throws -> ResponseModel {
@@ -810,11 +813,11 @@ extension OpenAIProvider: ResponsesJobProvider {
         return response
     }
 
-    func fetchResponse(id: String) async throws -> ResponseModel {
+    package func fetchResponse(id: String) async throws -> ResponseModel {
         try await getService().responseModel(id: id, parameters: nil)
     }
 
-    func streamResponse(id: String) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamResponse(id: String) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let service = try getService()
 
         // Use polling instead of SSE for more reliable background job monitoring
@@ -830,7 +833,7 @@ extension OpenAIProvider: ResponsesJobProvider {
                     }
 
                     continuation.yield(
-                        AIStreamResult(
+                        RepoPromptDomainRuntime.AIStreamResult(
                             type: "content",
                             text: nil,
                             reasoning: "Background job started, polling for updates...\n",
@@ -857,7 +860,7 @@ extension OpenAIProvider: ResponsesJobProvider {
                             }
                             if !statusMessage.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: nil,
                                         reasoning: statusMessage,
@@ -894,7 +897,7 @@ extension OpenAIProvider: ResponsesJobProvider {
 
                             if !reasoningText.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: nil,
                                         reasoning: reasoningText,
@@ -907,7 +910,7 @@ extension OpenAIProvider: ResponsesJobProvider {
 
                             if !outputText.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: outputText,
                                         reasoning: nil,
@@ -920,8 +923,8 @@ extension OpenAIProvider: ResponsesJobProvider {
 
                             let didComplete = response.status == .completed
                             continuation.yield(
-                                AIStreamResult(
-                                    type: didComplete ? "message_stop" : AIStreamResult.incompleteType,
+                                RepoPromptDomainRuntime.AIStreamResult(
+                                    type: didComplete ? "message_stop" : RepoPromptDomainRuntime.AIStreamResult.incompleteType,
                                     text: nil,
                                     reasoning: nil,
                                     promptTokens: response.usage?.inputTokens,
@@ -965,7 +968,7 @@ extension OpenAIProvider: ResponsesJobProvider {
         }
     }
 
-    func cancelResponse(id: String) async throws -> ResponseModel {
+    package func cancelResponse(id: String) async throws -> ResponseModel {
         try await getService().responseCancel(id: id)
     }
 }

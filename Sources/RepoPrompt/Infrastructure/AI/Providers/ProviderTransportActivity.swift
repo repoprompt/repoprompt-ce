@@ -10,27 +10,27 @@ import RepoPromptDomainRuntime
 /// Liveness must come from a live transport (bytes received, or a child process
 /// still running); a dead process or socket stops producing it, so a real hang
 /// still exhausts the budget.
-enum ProviderTransportActivity {
+package enum ProviderTransportActivity {
     /// Interval between liveness results while a buffered child-process request is in flight.
-    static let pendingCompletionHeartbeatInterval: TimeInterval = 30
+    package static let pendingCompletionHeartbeatInterval: TimeInterval = 30
     /// Minimum spacing between liveness results derived from received transport bytes.
-    static let receivedBytesMinimumInterval: Duration = .seconds(5)
+    package static let receivedBytesMinimumInterval: Duration = .seconds(5)
 
-    static func result() -> AIStreamResult {
-        AIStreamResult(type: AIStreamResult.transportActivityType, text: nil)
+    package static func result() -> RepoPromptDomainRuntime.AIStreamResult {
+        RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.transportActivityType, text: nil)
     }
 }
 
 /// Rate-limits liveness results derived from received transport bytes.
-struct ProviderTransportActivityThrottle {
+package struct ProviderTransportActivityThrottle {
     let minimumInterval: Duration
     private var lastEmission: ContinuousClock.Instant?
 
-    init(minimumInterval: Duration = ProviderTransportActivity.receivedBytesMinimumInterval) {
+    package init(minimumInterval: Duration = ProviderTransportActivity.receivedBytesMinimumInterval) {
         self.minimumInterval = minimumInterval
     }
 
-    mutating func shouldEmit(at now: ContinuousClock.Instant) -> Bool {
+    package mutating func shouldEmit(at now: ContinuousClock.Instant) -> Bool {
         if let lastEmission, now - lastEmission < minimumInterval {
             return false
         }
@@ -50,14 +50,14 @@ struct ProviderTransportActivityThrottle {
 ///
 /// Cancelling the consuming task cancels `complete` and surfaces
 /// `CancellationError`, matching the behavior of awaiting `complete` directly.
-enum ProviderPendingCompletionStream {
-    typealias Sleep = @Sendable (_ seconds: TimeInterval) async throws -> Void
+package enum ProviderPendingCompletionStream {
+    package typealias Sleep = @Sendable (_ seconds: TimeInterval) async throws -> Void
 
-    static func make(
+    package static func make(
         heartbeatInterval: TimeInterval = ProviderTransportActivity.pendingCompletionHeartbeatInterval,
         sleep: @escaping Sleep = { seconds in try await Task.sleep(for: .seconds(seconds)) },
-        complete: @escaping @Sendable () async throws -> AICompletionResult
-    ) -> AsyncThrowingStream<AIStreamResult, Error> {
+        complete: @escaping @Sendable () async throws -> RepoPromptDomainRuntime.AICompletionResult
+    ) -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         // Start the request on the consumer's first pull, not here. `AsyncThrowingStream(unfolding:)`
         // never calls `produce` for a consumer that is already cancelled when it pulls; it ends that
         // iteration with `nil`. Starting eagerly therefore raced the consumer's first pull: a consumer
@@ -72,7 +72,7 @@ enum ProviderPendingCompletionStream {
                 complete: complete
             )
         }
-        return AsyncThrowingStream<AIStreamResult, Error>(unfolding: {
+        return AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>(unfolding: {
             if let next = try await iterator.next() {
                 return next
             }
@@ -84,9 +84,9 @@ enum ProviderPendingCompletionStream {
     private static func startPendingCompletion(
         heartbeatInterval: TimeInterval,
         sleep: @escaping Sleep,
-        complete: @escaping @Sendable () async throws -> AICompletionResult
-    ) -> AsyncThrowingStream<AIStreamResult, Error>.Iterator {
-        let (events, continuation) = AsyncThrowingStream<AIStreamResult, Error>.makeStream()
+        complete: @escaping @Sendable () async throws -> RepoPromptDomainRuntime.AICompletionResult
+    ) -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Iterator {
+        let (events, continuation) = AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.makeStream()
         let heartbeat = Task {
             while !Task.isCancelled {
                 do {
@@ -106,9 +106,9 @@ enum ProviderPendingCompletionStream {
                 // No liveness may be reported once the request has settled.
                 heartbeat.cancel()
                 await heartbeat.value
-                continuation.yield(AIStreamResult(type: "content", text: completion.text))
+                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: completion.text))
                 continuation.yield(
-                    AIStreamResult(
+                    RepoPromptDomainRuntime.AIStreamResult(
                         type: "message_stop",
                         text: nil,
                         reasoning: nil,
@@ -138,14 +138,14 @@ enum ProviderPendingCompletionStream {
 
 /// Serially consumed by the single pulling task of the outer unfolding stream.
 private final class PendingCompletionIterator: @unchecked Sendable {
-    private let start: () -> AsyncThrowingStream<AIStreamResult, Error>.Iterator
-    private var iterator: AsyncThrowingStream<AIStreamResult, Error>.Iterator?
+    private let start: () -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Iterator
+    private var iterator: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Iterator?
 
-    init(start: @escaping () -> AsyncThrowingStream<AIStreamResult, Error>.Iterator) {
+    init(start: @escaping () -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Iterator) {
         self.start = start
     }
 
-    func next() async throws -> AIStreamResult? {
+    func next() async throws -> RepoPromptDomainRuntime.AIStreamResult? {
         var current = iterator ?? start()
         defer { iterator = current }
         return try await current.next()

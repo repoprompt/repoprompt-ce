@@ -7,12 +7,14 @@
 
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import SwiftOpenAI
 
-final class DeepSeekProvider: OpenAIProvider {
-    init(apiKey: String) {
+package final class DeepSeekProvider: OpenAIProvider {
+    package init(host: any OpenAIProviderHost, apiKey: String) {
         let baseURL = URL(string: "https://api.deepseek.com")!
         super.init(
+            host: host,
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil,
@@ -20,7 +22,7 @@ final class DeepSeekProvider: OpenAIProvider {
         )
     }
 
-    override func testAPIKey(model: AIModel = .deepseekChat) async throws -> Bool {
+    override package func testAPIKey(model: AIModel = .deepseekChat) async throws -> Bool {
         let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         do {
             let stream = try await streamMessage(testMessage, model: model)
@@ -35,7 +37,7 @@ final class DeepSeekProvider: OpenAIProvider {
             }
             return response.lowercased().contains("hello")
         } catch {
-            print("DeepSeek API Key Test Failed: \(error.asFriendlyString())")
+            print("DeepSeek API Key Test Failed: \(host.friendlyErrorDescription(error))")
             return false
         }
     }

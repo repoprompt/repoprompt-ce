@@ -1,8 +1,9 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
-final class ZAIProvider: OpenAIProvider {
-    enum Endpoint: Equatable {
+package final class ZAIProvider: OpenAIProvider {
+    package enum Endpoint: Equatable {
         case generalAPI
         case codingPlan
 
@@ -18,9 +19,10 @@ final class ZAIProvider: OpenAIProvider {
 
     let endpoint: Endpoint
 
-    init(apiKey: String, endpoint: Endpoint = .generalAPI) {
+    package init(host: any OpenAIProviderHost, apiKey: String, endpoint: Endpoint = .generalAPI) {
         self.endpoint = endpoint
         super.init(
+            host: host,
             apiKey: apiKey,
             baseURL: endpoint.baseURL,
             configuredMaxTokens: nil,
@@ -28,7 +30,7 @@ final class ZAIProvider: OpenAIProvider {
         )
     }
 
-    override func testAPIKey(model: AIModel = .zaiGLM45) async throws -> Bool {
+    override package func testAPIKey(model: AIModel = .zaiGLM45) async throws -> Bool {
         let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         do {
             let stream = try await streamMessage(testMessage, model: model)
@@ -45,7 +47,7 @@ final class ZAIProvider: OpenAIProvider {
 
             return response.lowercased().contains("hello")
         } catch {
-            print("Z.AI API Key Test Failed: \(error.asFriendlyString())")
+            print("Z.AI API Key Test Failed: \(host.friendlyErrorDescription(error))")
             return false
         }
     }

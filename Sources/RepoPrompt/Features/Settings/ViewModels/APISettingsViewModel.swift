@@ -2780,6 +2780,7 @@ public class APISettingsViewModel: ObservableObject {
         if !userModel.isEmpty {
             // User specified a model → validate it with a test completion (skip model list fetch)
             let testProvider = OpenAIProvider(
+                host: OpenAIProviderAppHost(),
                 apiKey: apiKey,
                 baseURL: URL(string: baseURL),
                 configuredMaxTokens: 16,

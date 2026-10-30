@@ -75,10 +75,10 @@ class AIProviderFactory {
             let storedVersion = UserDefaults.standard.string(forKey: "customOpenAIVersionOverride")
             let finalVersion = storedVersion ?? split.version
             let serviceTier = UserDefaults.standard.string(forKey: "openAIServiceTier")
-            return OpenAIProvider(apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier, httpCredentialConsentEndpoint: UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint"))
+            return OpenAIProvider(host: OpenAIProviderAppHost(), apiKey: key, baseURL: baseURL, configuredMaxTokens: nil, overrideVersion: finalVersion, serviceTier: serviceTier, httpCredentialConsentEndpoint: UserDefaults.standard.string(forKey: "openAIHTTPConsentEndpoint"))
         case .ollama:
             let baseURL = ollamaURL ?? URL(string: "http://localhost:11434")!
-            return OllamaProvider(baseURL: baseURL)
+            return OllamaProvider(host: OpenAIProviderAppHost(), baseURL: baseURL)
         case .azure:
             guard let config = azureConfiguration else {
                 return BlankProvider()
@@ -87,17 +87,17 @@ class AIProviderFactory {
         case .openRouter:
             return OpenRouterProvider(apiKey: key)
         case .gemini:
-            return GeminiProvider(apiKey: key)
+            return GeminiProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .deepseek:
-            return DeepSeekProvider(apiKey: key)
+            return DeepSeekProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .fireworks: // <-- Add Fireworks case
-            return FireworksProvider(apiKey: key)
+            return FireworksProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .grok: // <-- Add Grok case
-            return GrokProvider(apiKey: key)
+            return GrokProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .groq: // <-- Add Groq case
-            return GroqProvider(apiKey: key)
+            return GroqProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .zAI:
-            return ZAIProvider(apiKey: key)
+            return ZAIProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .claudeCode: // <-- Add Claude Code case
             return ClaudeCodeProvider()
         case .codex:
@@ -150,6 +150,7 @@ class AIProviderFactory {
                     throw AIProviderError.missingURL
                 }
                 return OpenAIProvider(
+                    host: OpenAIProviderAppHost(),
                     apiKey: key,
                     baseURL: baseURL,
                     configuredMaxTokens: configuredMaxTokens,

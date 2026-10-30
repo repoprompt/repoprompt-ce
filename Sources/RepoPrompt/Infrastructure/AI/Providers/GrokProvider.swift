@@ -7,12 +7,14 @@
 
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import SwiftOpenAI
 
-final class GrokProvider: OpenAIProvider {
-    init(apiKey: String) {
+package final class GrokProvider: OpenAIProvider {
+    package init(host: any OpenAIProviderHost, apiKey: String) {
         let baseURL = URL(string: "https://api.x.ai")! // Per user instruction
         super.init(
+            host: host,
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil, // Grok models might have their own defaults, or can be set per model
@@ -32,7 +34,7 @@ final class GrokProvider: OpenAIProvider {
     //     }
     // }
 
-    override func testAPIKey(model: AIModel = .grokCodeFast1) async throws -> Bool {
+    override package func testAPIKey(model: AIModel = .grokCodeFast1) async throws -> Bool {
         let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         do {
             let stream = try await streamMessage(testMessage, model: model)
@@ -48,7 +50,7 @@ final class GrokProvider: OpenAIProvider {
             // Check for a common greeting word
             return response.lowercased().contains("hello") || response.lowercased().contains("hi")
         } catch {
-            print("Grok AI API Key Test Failed: \(error.asFriendlyString())")
+            print("Grok AI API Key Test Failed: \(host.friendlyErrorDescription(error))")
             return false
         }
     }
