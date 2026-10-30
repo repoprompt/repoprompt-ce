@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodexProvider
 
 enum CodexOverrides {
     private static let forcedDisabledConfig: [String: Bool] = [

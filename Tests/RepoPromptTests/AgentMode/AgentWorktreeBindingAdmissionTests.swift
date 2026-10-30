@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore

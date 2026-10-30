@@ -5,6 +5,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
+import RepoPromptShared
 
 /// Preserve the app's transport vocabulary while sharing the same typed boundary value
 /// with the app-free quota runtime. Encoding/decoding behavior is unchanged.

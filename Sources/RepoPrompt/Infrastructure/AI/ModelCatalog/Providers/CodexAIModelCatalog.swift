@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptCodexProvider
 
 enum CodexDynamicModelStore {
     private static let storageKey = "CodexDynamicModelRecords"

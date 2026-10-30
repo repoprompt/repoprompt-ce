@@ -4,6 +4,7 @@ import Foundation
 import MCP
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptShared

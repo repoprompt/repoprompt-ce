@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodexProvider
 import RepoPromptProcess
 
 extension CodexProviderRuntime.Runtime {

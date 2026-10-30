@@ -2,6 +2,7 @@
     import Foundation
     import MCP
     import RepoPromptAIContracts
+    import RepoPromptCodexProvider
     import RepoPromptDomainRuntime
     import SwiftUI
 

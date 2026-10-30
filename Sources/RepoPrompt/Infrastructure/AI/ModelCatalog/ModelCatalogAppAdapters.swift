@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptCodexProvider
 
 extension DevinModelCatalog {
     static var current: DevinModelCatalog {

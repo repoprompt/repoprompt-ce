@@ -1,5 +1,5 @@
 import Foundation
-import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptShared
 import XCTest
 

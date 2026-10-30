@@ -4,6 +4,7 @@ import Foundation
 import MCP
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptFileSystem
 import RepoPromptFoundation
