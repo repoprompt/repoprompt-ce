@@ -379,7 +379,7 @@ final class ClaudeIntegratedAgentModeRunner {
             return false
         }
 
-        func testConsumeTurnStatus(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> ClaudeNativeProcessSessionController.TurnStatus {
+        func testConsumeTurnStatus(_ events: [NativeAgentRuntimeEvent], session: AgentTabSession, runID: UUID, owner: AgentRunOwnership) async -> NativeAgentRuntimeTurnStatus {
             let stream = AsyncStream<NativeAgentRuntimeEvent> { continuation in
                 for event in events {
                     continuation.yield(event)
@@ -403,7 +403,7 @@ final class ClaudeIntegratedAgentModeRunner {
         var exitedDueToAttemptMismatch = false
         // Keyed answers may settle several unprotected inputs across separate events.
         // Keep their strongest outcome until the existing settlement boundary is terminal.
-        var unprotectedTurnStatus: ClaudeNativeProcessSessionController.TurnStatus = .completed
+        var unprotectedTurnStatus: NativeAgentRuntimeTurnStatus = .completed
         // Only first-party Claude owns this subscription telemetry. No extra request or
         // process is started; compatible launchers cannot populate Claude account usage.
         var quotaLease: UUID?
@@ -499,7 +499,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 }
             case .turnCompleted, .turnsCompleted:
                 let ids: [UUID]
-                let turnStatus: ClaudeNativeProcessSessionController.TurnStatus
+                let turnStatus: NativeAgentRuntimeTurnStatus
                 let keyed: Bool
                 switch event {
                 case let .turnCompleted(id, status): (ids, turnStatus, keyed) = ([id], status, false)
