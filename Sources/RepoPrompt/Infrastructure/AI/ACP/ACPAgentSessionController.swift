@@ -273,6 +273,7 @@ actor ACPAgentSessionController {
     }
 
     private let provider: any ACPAgentProvider
+    private let host: any ACPAgentSessionHost
     private let allowsProviderProcessLaunchForTesting: Bool
     private let runRequest: ACPRunRequest
     private let launchConfiguration: ACPLaunchConfiguration
@@ -420,11 +421,13 @@ actor ACPAgentSessionController {
     init(
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,
+        host: any ACPAgentSessionHost,
         diagnosticSink: DiagnosticSink? = nil,
         requestTimeouts: RequestTimeouts = .default,
         allowsProviderProcessLaunchForTesting: Bool = false
     ) throws {
         self.provider = provider
+        self.host = host
         self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
         providerSessionIdentity = ACPProviderSessionIdentity(
             providerID: provider.providerID,
@@ -439,12 +442,11 @@ actor ACPAgentSessionController {
         try Self.preflightInjectedMCPServers(in: sessionConfiguration)
         self.sessionConfiguration = sessionConfiguration
         launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
-        launchedPermissionMode = Self.normalizedLaunchPermissionMode(
-            runRequest.launchPermissionMode,
-            providerID: provider.providerID
-        )
+        launchedPermissionMode = provider.providerID == .devin
+            ? host.normalizedDevinPermissionMode(runRequest.launchPermissionMode)
+            : runRequest.launchPermissionMode
         autoApproveAllToolPermissions = runRequest.autoApproveAllToolPermissions
-        mcpClientNameHint = runRequest.agentKind.mcpClientNameHint
+        mcpClientNameHint = host.mcpClientNameHint(for: runRequest.agentKind)
         logPrefix = "[ACP][\(provider.providerID.rawValue)]"
         self.diagnosticSink = diagnosticSink
         self.requestTimeouts = requestTimeouts
@@ -497,16 +499,14 @@ actor ACPAgentSessionController {
         // into the running process's argv; compare its normalized launched value so later
         // request-carrier changes cannot drift the reuse key from the process.
         if provider.providerID == .devin {
-            guard DevinAgentToolPreferences.PermissionLevel.isRecognizedCLIPermissionMode(
-                request.launchPermissionMode
-            ) else {
+            guard host.recognizedDevinPermissionMode(request.launchPermissionMode) else {
                 return false
             }
         }
-        guard launchedPermissionMode == Self.normalizedLaunchPermissionMode(
-            request.launchPermissionMode,
-            providerID: provider.providerID
-        ) else {
+        let requestedPermissionMode = provider.providerID == .devin
+            ? host.normalizedDevinPermissionMode(request.launchPermissionMode)
+            : request.launchPermissionMode
+        guard launchedPermissionMode == requestedPermissionMode else {
             return false
         }
         if provider.providerID == .grokBuild {
@@ -526,14 +526,6 @@ actor ACPAgentSessionController {
         // workspace are the safety boundary; model aliases/defaults/discovered
         // current-model values should not prevent session/cancel from being sent.
         return true
-    }
-
-    private static func normalizedLaunchPermissionMode(
-        _ mode: String?,
-        providerID: ACPProviderID
-    ) -> String? {
-        guard providerID == .devin else { return mode }
-        return DevinAgentToolPreferences.PermissionLevel.from(cliPermissionMode: mode).cliPermissionMode
     }
 
     func normalizeError(_ error: Error) -> Error {
@@ -716,7 +708,7 @@ actor ACPAgentSessionController {
                 "protocolVersion": 1,
                 "clientInfo": [
                     "name": "RepoPrompt",
-                    "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+                    "version": host.applicationVersion
                 ],
                 "clientCapabilities": clientCapabilities
             ]
@@ -1035,7 +1027,7 @@ actor ACPAgentSessionController {
                 // plus an explicit effort. Bare raws resolve to the model's advertised
                 // default effort so a bare pick after a variant pick resets effort instead
                 // of silently keeping the previous one.
-                guard let decomposition = GrokBuildModelSpecifier.decompose(
+                guard let decomposition = host.grokDecomposition(
                     raw: matchedOption.rawValue,
                     options: snapshotOptions
                 ) else {
@@ -1073,10 +1065,7 @@ actor ACPAgentSessionController {
                         )
                     }
                 }
-                let canonicalModel = GrokBuildModelSpecifier(
-                    baseModel: baseModel,
-                    reasoningEffort: resolvedEffort
-                ).compoundRaw
+                let canonicalModel = host.grokCompoundRaw(base: baseModel, effort: resolvedEffort)
                 // A nil resolved effort means "no effort mutation requested" (effort-free
                 // model), not "no active effort" — it always no-ops when the base matches.
                 let effortAlreadyMatches = resolvedEffort.map {
@@ -1149,7 +1138,7 @@ actor ACPAgentSessionController {
                 // recovery options here — an appended compound would lack effortVariant
                 // provenance and later read back as a real base.
                 let updatedOptions = discoveredSessionModels?.options
-                    ?? AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: provider.providerID)?.options
+                    ?? host.resolvedModelSnapshot(for: provider.providerID)?.options
                     ?? []
                 // The Ok confirms only the base. Preserve effort only from a report that
                 // arrived after dispatch and names this acknowledged base; a newer model-only
@@ -1167,14 +1156,13 @@ actor ACPAgentSessionController {
                 return
             }
             if provider.providerID == .cursor,
-               normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
+               normalizedCursorModelAlias(model) == host.cursorAutoModelRaw,
                sessionModelConfigOptionID == nil
             {
                 return
             }
             if provider.providerID == .devin,
-               let entry = DevinModelCatalog.current.entry(matching: model),
-               let thinking = entry.thinking
+               let entry = host.devinThinkingSelection(for: model)
             {
                 // Devin ACP rejects effort-encoded IDs as `model` values: select the advertised
                 // family model, then its `thought_level`. The choice is validated against the
@@ -1186,8 +1174,8 @@ actor ACPAgentSessionController {
                         providerID: .devin,
                         baseModelRaw: entry.advertisedModelRaw,
                         kind: .thinking,
-                        configID: thinking.configID,
-                        valueRaw: thinking.choiceRaw
+                        configID: entry.configID,
+                        valueRaw: entry.choiceRaw
                     )
                 ])
                 try report.validateNoSkippedSelections()
@@ -1209,7 +1197,7 @@ actor ACPAgentSessionController {
             }
             throw ControllerError.requestFailed("Grok Build session does not advertise model '\(requestedValue)'.")
         }
-        if let warmed = AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: provider.providerID),
+        if let warmed = host.resolvedModelSnapshot(for: provider.providerID),
            let match = warmed.option(matching: requestedValue)
         {
             return (match, warmed.options, false)
@@ -1531,13 +1519,13 @@ actor ACPAgentSessionController {
         let selectedOptionID: String?
         switch decision {
         case .accept:
-            guard let optionID = ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+            guard let optionID = host.permissionOneTimeAllow(
                 options: options,
                 providerID: provider.providerID
             ) else { return .noOneTimeOption }
             selectedOptionID = optionID
         case .decline:
-            selectedOptionID = ACPPermissionOptionPolicy.overseerOneTimeRejectOptionID(options: options)
+            selectedOptionID = host.permissionOneTimeReject(options: options)
         case .cancel:
             selectedOptionID = nil
         case .acceptForSession, .acceptWithExecpolicyAmendment:
@@ -2323,11 +2311,11 @@ actor ACPAgentSessionController {
             reason: toolTitle,
             command: rawInputJSON,
             cwd: sessionConfiguration.workingDirectory,
-            overseerOneTimeAllowAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+            overseerOneTimeAllowAvailable: host.permissionOneTimeAllow(
                 options: options.map { (optionID: $0.optionID, kind: $0.kind) },
                 providerID: provider.providerID
             ) != nil,
-            plainApproveAvailable: ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+            plainApproveAvailable: host.permissionOneTimeAllow(
                 options: plainAllowOptions.map { (optionID: $0.optionID, kind: $0.kind) },
                 providerID: provider.providerID
             ) != nil,
@@ -2409,14 +2397,14 @@ actor ACPAgentSessionController {
 
     private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {
         guard let clientName = mcpClientNameHint else { return }
-        await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: expectedMCPRunID)
+        await host.registerExpectedAgentPID(pid, clientName: clientName, runID: expectedMCPRunID)
         registeredExpectedAgentPID = pid
         log("Registered expected MCP parent PID \(pid) for \(clientName) runID=\(expectedMCPRunID?.uuidString ?? "nil")")
     }
 
     private func clearExpectedAgentPIDIfNeeded() async {
         guard let registeredExpectedAgentPID, let clientName = mcpClientNameHint else { return }
-        await ServerNetworkManager.shared.clearExpectedAgentPID(registeredExpectedAgentPID, for: clientName, runID: expectedMCPRunID)
+        await host.clearExpectedAgentPID(registeredExpectedAgentPID, clientName: clientName, runID: expectedMCPRunID)
         self.registeredExpectedAgentPID = nil
         log("Cleared expected MCP parent PID for \(clientName) runID=\(expectedMCPRunID?.uuidString ?? "nil")")
     }
@@ -2861,11 +2849,11 @@ actor ACPAgentSessionController {
                 fields["acp_pid"] = String(pid)
             }
             if let error {
-                fields["error_kind"] = runDiagnosticErrorKind(error)
+                fields["error_kind"] = host.diagnosticErrorKind(error)
                 fields["error_type"] = boundedRunDiagnosticField(String(reflecting: type(of: error)))
                 fields["error_code"] = String((error as NSError).code)
             }
-            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+            await host.recordRunRoutingEvent(
                 runID: runID,
                 event: event,
                 fields: fields
@@ -3004,22 +2992,6 @@ actor ACPAgentSessionController {
         return "~" + String(value.dropFirst(home.count))
     }
 
-    private func runDiagnosticErrorKind(_ error: Error) -> String {
-        if error is ExecutableFileIdentityError {
-            return "executable_identity"
-        }
-        if error is CursorACPLaunchResolutionError || error is OpenCodeACPLaunchResolutionError {
-            return "launch_resolution"
-        }
-        if error is CLIProcessRunnerError {
-            return "process_runner"
-        }
-        if error is CancellationError {
-            return "cancelled"
-        }
-        return "other"
-    }
-
     private func resolvedEnvironment() async -> [String: String] {
         let result = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(
@@ -3028,12 +3000,12 @@ actor ACPAgentSessionController {
                 enableDebugLogging: launchConfiguration.enableDebugLogging
             )
         )
-        let filtered = await ProviderEnvironmentFiltering.filterACP(
+        let filtered = await host.filterEnvironment(
             result.environment,
             launchConfiguration: launchConfiguration,
-            for: runRequest.agentKind
+            kind: runRequest.agentKind
         )
-        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: filtered)
+        return host.mergingCurrentCarrier(into: filtered)
     }
 
     private func beginOpeningSessionConfiguration() {
@@ -3505,7 +3477,7 @@ actor ACPAgentSessionController {
 
     private func publishDiscoveredSessionModelsIfGloballyAuthoritative(_ models: ACPDiscoveredSessionModels) {
         guard !provider.supportsParameterizedModelPicker else { return }
-        _ = AgentModelCatalogRuntime.shared.acpRegistry.updateDiscoveredModels(models, for: provider.providerID)
+        host.publishDiscoveredModels(models, for: provider.providerID)
     }
 
     private func parseModernModelSnapshot(from response: [String: Any]) -> ParsedModernModelSnapshot {
@@ -3655,9 +3627,9 @@ actor ACPAgentSessionController {
         guard provider.providerID == .cursor else { return selectedModel }
         let normalizedSelection = normalizedCursorModelAlias(selectedModel)
         guard !normalizedSelection.isEmpty else { return selectedModel }
-        let snapshot = discoveredSessionModels ?? AgentModelCatalogRuntime.shared.acpRegistry.resolvedSnapshot(for: .cursor)
+        let snapshot = discoveredSessionModels ?? host.resolvedModelSnapshot(for: .cursor)
 
-        if normalizedSelection == AgentModel.cursorAuto.rawValue {
+        if normalizedSelection == host.cursorAutoModelRaw {
             guard let snapshot else { return nil }
             if snapshot.contains(rawModel: selectedModel) {
                 return selectedModel
@@ -3684,8 +3656,8 @@ actor ACPAgentSessionController {
     }
 
     private func isCursorAutoConfigOption(_ option: AgentModelOption) -> Bool {
-        normalizedCursorModelAlias(option.rawValue) == AgentModel.cursorAuto.rawValue
-            || normalizedCursorModelAlias(option.displayName) == AgentModel.cursorAuto.rawValue
+        normalizedCursorModelAlias(option.rawValue) == host.cursorAutoModelRaw
+            || normalizedCursorModelAlias(option.displayName) == host.cursorAutoModelRaw
     }
 
     private func normalizedCursorModelAlias(_ value: String) -> String {
@@ -4079,7 +4051,7 @@ actor ACPAgentSessionController {
                         && normalizedPermissionOptionValue(option.optionID) == "allow-edits-session"
                         && normalizedPermissionOptionValue(option.kind) == "allow_always"
                 )
-                    || ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+                    || host.permissionOneTimeAllow(
                         options: [(optionID: option.optionID, kind: option.kind)], providerID: .grokBuild
                     ) != nil
             }
@@ -4133,7 +4105,7 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             // Full access auto-approves each request once; it must not persist a grant.
-            return ACPPermissionOptionPolicy.overseerOneTimeAllowOptionID(
+            return host.permissionOneTimeAllow(
                 options: options.map { (optionID: $0.optionID, kind: $0.kind) }, providerID: provider.providerID
             )
         case .openCode, .grokBuild, .antigravity, .devin:
@@ -4167,7 +4139,7 @@ actor ACPAgentSessionController {
     /// bare kind match would select it — it is excluded by explicit ID before any matching.
     private func safePermissionOptionsForAutoSelection(_ options: [PermissionOption]) -> [PermissionOption] {
         options.filter { option in
-            ACPPermissionOptionPolicy.isAutoSelectable(optionID: option.optionID, for: provider.providerID)
+            host.permissionIsAutoSelectable(optionID: option.optionID, providerID: provider.providerID)
         }
     }
 
@@ -4242,7 +4214,7 @@ actor ACPAgentSessionController {
     private func terminalErrorText(for stopReason: String?) -> String? {
         switch stopReason?.lowercased() {
         case "refusal":
-            "\(runRequest.agentKind.displayName) ACP refused to continue this turn."
+            "\(host.displayName(for: runRequest.agentKind)) ACP refused to continue this turn."
         default:
             nil
         }
