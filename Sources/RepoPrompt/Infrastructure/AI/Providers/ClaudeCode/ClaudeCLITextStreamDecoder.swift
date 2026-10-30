@@ -1,16 +1,17 @@
 import Foundation
 import RepoPromptAIContracts
 
-enum ClaudeCLITextStreamFailure: Error { case incomplete }
+package enum ClaudeCLITextStreamFailure: Error { case incomplete }
 
 /// Bounded NDJSON text-only decoder for an isolated Claude print stream.
-struct ClaudeCLITextStreamDecoder {
+package struct ClaudeCLITextStreamDecoder {
+    package init() {}
     private var pending = Data()
     private var emittedDelta = false
-    private(set) var completed = false
+    package private(set) var completed = false
     private var incomplete = false
 
-    mutating func append(_ data: Data) throws -> [String] {
+    package mutating func append(_ data: Data) throws -> [String] {
         pending.append(data)
         guard pending.count <= 1024 * 1024 else { throw AIProviderError.invalidResponse(detail: "Claude stream exceeded its frame limit") }
         var deltas: [String] = []
@@ -22,7 +23,7 @@ struct ClaudeCLITextStreamDecoder {
         return deltas
     }
 
-    mutating func finish() throws -> [String] {
+    package mutating func finish() throws -> [String] {
         var tail: [String] = []
         if !pending.isEmpty, let text = try decode(pending) { tail.append(text) }
         pending.removeAll()

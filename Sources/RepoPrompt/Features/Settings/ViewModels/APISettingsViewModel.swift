@@ -1,6 +1,7 @@
 import Combine
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptCodexProvider
 import RepoPromptHTTPProviders
 import RepoPromptProcess
@@ -849,7 +850,11 @@ public class APISettingsViewModel: ObservableObject {
         let provider = ClaudeCodeProvider()
         let start = Date()
         do {
-            let ok = try await provider.testCompatibleBackendConnection(id, timeout: 30)
+            let ok = try await provider.testCompatibleBackendConnection(
+                variant: ClaudeCLIAppModelPolicy.runtimeVariant(for: id),
+                requestedModel: { ClaudeCLIAppModelPolicy.compatibleBackendTestRequestedModel(for: id) },
+                timeout: 30
+            )
             await provider.dispose()
             let elapsed = max(1, Int(Date().timeIntervalSince(start) * 1000))
             let result: ClaudeCompatibleBackendTestResult = ok

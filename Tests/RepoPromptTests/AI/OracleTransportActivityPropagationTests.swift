@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptHTTPProviders
 import RepoPromptSecureStorage

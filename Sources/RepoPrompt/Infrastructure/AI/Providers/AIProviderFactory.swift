@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptHTTPProviders
 import RepoPromptInstrumentation
