@@ -75,21 +75,22 @@ extension NativeAgentRuntimeControlling {
     }
 }
 
-// MARK: - Current Claude-compatible native runtime aliases
+extension NativeAgentRuntimeRuntimeInitStatus {
+    var repoPromptServerStatus: String? {
+        mcpServerStatuses.first {
+            $0.key.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
+        }?.value
+    }
 
-// Native process control is still core-owned in this wave. These compatibility
-// aliases let coordinators/runners depend on the provider-neutral contract
-// while preserving the current Claude runtime DTO shapes. When a second native
-// provider lands, the aliases become proper neutral DTOs and the Claude
-// controller conforms via its own mapping.
-// See docs/architecture/provider-plugins.md for the full bridge/adapter layout.
-typealias NativeAgentRuntimeEvent = ClaudeNativeProcessSessionController.Event
-typealias NativeAgentRuntimeSessionRef = ClaudeNativeProcessSessionController.SessionRef
-typealias NativeAgentRuntimeTurnStatus = ClaudeNativeProcessSessionController.TurnStatus
-typealias NativeAgentRuntimeRuntimeInitStatus = ClaudeNativeProcessSessionController.RuntimeInitStatus
-typealias NativeAgentRuntimeSlashCommand = ClaudeNativeProcessSessionController.RuntimeInitStatus.InitializeResponseSnapshot.Command
-typealias NativeAgentRuntimeInterruptOutcome = ClaudeNativeProcessSessionController.InterruptOutcome
-typealias NativeAgentRuntimeControllerError = ClaudeNativeProcessSessionController.ControllerError
+    var isRepoPromptServerFailed: Bool {
+        guard let status = repoPromptServerStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return false
+        }
+        return status == "failed"
+    }
+}
+
+// The value vocabulary is provider-neutral; the concrete controller conforms here.
 typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel
 
 extension ClaudeNativeProcessSessionController: NativeAgentRuntimeControlling {}
