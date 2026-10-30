@@ -12,18 +12,28 @@ import SwiftUI
 
 // MARK: - Token Usage Indicator
 
+enum TokenUsagePresentation {
+    static func text(inputTokens: Int?, outputTokens: Int?) -> String {
+        guard inputTokens != nil || outputTokens != nil else {
+            return "Usage unavailable"
+        }
+        return "Tokens: \(format(inputTokens)) in | \(format(outputTokens)) out"
+    }
+
+    private static func format(_ tokens: Int?) -> String {
+        guard let tokens else { return "unavailable" }
+        // Keep small counts exact so a measured zero never resembles a positive count.
+        return tokens < 1000 ? String(tokens) : String(format: "%.2fk", Double(tokens) / 1000.0)
+    }
+}
+
 private struct TokenUsageIndicator: View {
-    let inputTokens: Int
-    let outputTokens: Int
+    let inputTokens: Int?
+    let outputTokens: Int?
     let modelName: String?
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
-    }
-
-    // helper: 1 k = 1000 tokens, always 2 decimals
-    private func format(_ tokens: Int) -> String {
-        String(format: "%.2fk", Double(tokens) / 1000.0)
     }
 
     var body: some View {
@@ -33,7 +43,7 @@ private struct TokenUsageIndicator: View {
                     .font(fontPreset.captionFont)
                     .foregroundColor(.secondary.opacity(0.6))
             }
-            Text("Tokens: \(format(inputTokens)) in | \(format(outputTokens)) out")
+            Text(TokenUsagePresentation.text(inputTokens: inputTokens, outputTokens: outputTokens))
                 .font(fontPreset.captionFont)
                 .foregroundColor(.secondary.opacity(0.8))
         }
@@ -506,13 +516,10 @@ struct MessageBubble: View {
                         }
                     }
 
-                    if actionPolicy.showsTokenUsage,
-                       let inTok = message.promptTokens,
-                       let outTok = message.completionTokens
-                    {
+                    if actionPolicy.showsTokenUsage {
                         TokenUsageIndicator(
-                            inputTokens: inTok,
-                            outputTokens: outTok,
+                            inputTokens: message.promptTokens,
+                            outputTokens: message.completionTokens,
                             modelName: message.modelName
                         )
                     } else if let modelName = message.modelName {

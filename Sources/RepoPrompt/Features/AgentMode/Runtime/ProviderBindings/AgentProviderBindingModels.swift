@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
 extension CodexIntegrationConfiguration.ServerEntry: Equatable {

@@ -1,8 +1,10 @@
 import Darwin
+import RepoPromptAgentProviderContracts
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
+import RepoPromptProviderQuota
 
 final actor ClaudeNativeProcessSessionController {
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
@@ -13,131 +15,12 @@ final actor ClaudeNativeProcessSessionController {
         return formatter
     }()
 
-    enum TurnStatus {
-        case completed
-        case cancelled
-        case failed
-    }
-
-    struct RuntimeInitStatus: Equatable {
-        struct InitializeResponseSnapshot: Equatable {
-            struct Command: Equatable {
-                let name: String
-                let description: String
-                let argumentHint: String
-                let builtin: Bool
-
-                init(name: String, description: String, argumentHint: String, builtin: Bool = false) {
-                    self.name = name
-                    self.description = description
-                    self.argumentHint = argumentHint
-                    self.builtin = builtin
-                }
-            }
-
-            struct Agent: Equatable {
-                let name: String
-                let description: String
-                let model: String?
-            }
-
-            struct Account: Equatable {
-                let email: String?
-                let organization: String?
-                let subscriptionType: String?
-                let tokenSource: String?
-                let apiKeySource: String?
-                let apiProvider: String?
-            }
-
-            let commands: [Command]
-            let agents: [Agent]
-            let outputStyle: String?
-            let availableOutputStyles: [String]
-            let account: Account?
-            let pid: Int?
-            let modelsJSON: String?
-            let fastModeStateJSON: String?
-        }
-
-        let sessionID: String?
-        let tools: [String]
-        let mcpServerStatuses: [String: String]
-        let initializeResponse: InitializeResponseSnapshot?
-
-        var repoPromptServerStatus: String? {
-            mcpServerStatuses.first {
-                $0.key.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
-            }?.value
-        }
-
-        var isRepoPromptServerFailed: Bool {
-            guard let status = repoPromptServerStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
-                return false
-            }
-            return status == "failed"
-        }
-    }
-
-    enum Event {
-        case stream(AIStreamResult)
-        case rateLimit(ClaudeCompatiblePluginRateLimitInfo)
-        case runtimeInit(RuntimeInitStatus)
-        case approvalRequest(AgentApprovalRequest)
-        case approvalCancelled(requestID: String)
-        case turnCompleted(turnID: UUID, status: TurnStatus)
-        case error(String)
-    }
-
-    struct SessionRef {
-        var sessionID: String?
-    }
-
-    /// Outcome of an interrupt control request, used by the coordinator to decide
-    /// whether it is safe to proceed with a superseding user turn.
-    enum InterruptOutcome: Equatable {
-        /// Claude acknowledged the interrupt via control_response success.
-        case acknowledged
-        /// No turn was in flight; the turn likely completed naturally before the interrupt.
-        case noTurnInFlight
-        /// The interrupt control request timed out without an acknowledgement.
-        case timedOut
-        /// The interrupt request failed (e.g. process not running or write error).
-        case failed
-    }
-
-    enum ControllerError: Error, LocalizedError {
-        case processNotRunning
-        case initializationFailed(String)
-        case invalidControlResponse(String)
-        case inputWriteFailed(String)
-        case controlRequestTimedOut(requestID: String)
-        case liveModelSwitchRequiresRestart
-        case configurationNotCurrent
-        /// Cancellation observed at the proof-bearing send entry, before any user-message write.
-        case cancelledBeforeWrite
-
-        var errorDescription: String? {
-            switch self {
-            case .processNotRunning:
-                "Claude process is not running."
-            case let .initializationFailed(message):
-                "Claude initialization failed: \(message)"
-            case let .invalidControlResponse(message):
-                "Claude control response failed: \(message)"
-            case let .inputWriteFailed(message):
-                "Failed writing to Claude process stdin: \(message)"
-            case let .controlRequestTimedOut(requestID):
-                "Claude control request timed out: \(requestID)"
-            case .cancelledBeforeWrite:
-                "Claude dispatch was cancelled before writing. No message was sent."
-            case .configurationNotCurrent:
-                "Claude model configuration is not current. No message was sent; retry the turn."
-            case .liveModelSwitchRequiresRestart:
-                "Changing to the selected model requires restarting Claude because its launch environment changes."
-            }
-        }
-    }
+    typealias TurnStatus = NativeAgentRuntimeTurnStatus
+    typealias RuntimeInitStatus = NativeAgentRuntimeRuntimeInitStatus
+    typealias Event = NativeAgentRuntimeEvent
+    typealias SessionRef = NativeAgentRuntimeSessionRef
+    typealias InterruptOutcome = NativeAgentRuntimeInterruptOutcome
+    typealias ControllerError = NativeAgentRuntimeControllerError
 
     private struct PendingPermissionRequest {
         let requestID: String
@@ -162,7 +45,7 @@ final actor ClaudeNativeProcessSessionController {
     private let workspacePath: String?
     private let config: ClaudeCodeAgentConfig
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
-    private let configService = MCPConfigExportService.shared
+    private let host: any ClaudeNativeSessionHosting
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
     private var rawEventLogFileSessionID: String?
@@ -176,7 +59,7 @@ final actor ClaudeNativeProcessSessionController {
     private var stderrChunkChannel: FileHandleChunkChannel?
     private var stdoutConsumerTask: Task<Void, Never>?
     private var stderrConsumerTask: Task<Void, Never>?
-    private var configLease: MCPConfigLease?
+    private var configLease: (any ClaudeNativeConfigLease)?
     private var configURL: URL? {
         configLease?.url
     }
@@ -210,12 +93,11 @@ final actor ClaudeNativeProcessSessionController {
     private var translator: ClaudeSDKNDJSONTranslator
     private var sessionID: String?
     private var turnInFlight: Bool {
-        pendingTurnIDHead < pendingTurnIDBuffer.count
+        correlation.hasOutstanding || !deferredCompletions.isEmpty
     }
 
-    /// FIFO queue of turn IDs (head-pointer deque to avoid O(n) removeFirst).
-    private var pendingTurnIDBuffer: ContiguousArray<UUID> = []
-    private var pendingTurnIDHead: Int = 0
+    private var correlation = ClaudeNativeTurnCorrelation()
+    private var correlationFailed = false
     private var turnWasInterrupted = false
 
     // MARK: - Authoritative lifecycle (session_state_changed)
@@ -225,10 +107,15 @@ final actor ClaudeNativeProcessSessionController {
     /// timeout) rather than completing immediately on `result/message_stop`.
     private var observedSessionStateChangedEvents = false
 
-    /// FIFO queue of result-derived turn statuses waiting for an `idle` signal.
-    /// Turn IDs remain in `pendingTurnIDBuffer` until the deferred completion fires
-    /// so that `turnInFlight` stays true during the result→idle window.
-    private var pendingAuthoritativeTurnStatuses: [TurnStatus] = []
+    private struct DeferredCompletion {
+        let executionID: UUID
+        let inputIDs: [UUID]
+        let status: TurnStatus
+        var keyed = false
+    }
+
+    /// Targets are resolved at result receipt, never paired with later sends at idle.
+    private var deferredCompletions: [DeferredCompletion] = []
 
     /// Fallback task that fires when `idle` does not arrive within the expected window.
     private var authoritativeIdleFallbackTask: Task<Void, Never>?
@@ -340,13 +227,14 @@ final actor ClaudeNativeProcessSessionController {
         }
         let pid = registeredExpectedAgentPID
         let runID = runID
+        let host = host
         Task {
-            await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            await host.clearExpectedAgentPID(pid, clientName: clientName, runID: runID)
         }
     }
 
     var hasTurnInFlight: Bool {
-        pendingTurnIDHead < pendingTurnIDBuffer.count
+        turnInFlight
     }
 
     #if DEBUG
@@ -370,6 +258,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     init(
+        host: any ClaudeNativeSessionHosting,
         runID: UUID,
         tabID: UUID,
         windowID: Int,
@@ -378,6 +267,7 @@ final actor ClaudeNativeProcessSessionController {
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
         authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
     ) {
+        self.host = host
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
@@ -620,26 +510,44 @@ final actor ClaudeNativeProcessSessionController {
         guard hasActiveSession else {
             throw ControllerError.processNotRunning
         }
-        let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
+        guard !correlationFailed else { throw ControllerError.processNotRunning }
+        let id = UUID()
+        let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID, uuid: id)
         try sendLine(payload)
-        return beginTurnTracking()
+        correlation.register(id)
+        return id
     }
 
     func interruptTurn(reason: String) async -> InterruptOutcome {
         guard process != nil else { return .failed }
-        guard turnInFlight else { return .noTurnInFlight }
+        return await interruptRunningTurn(reason: reason)
+    }
+
+    private func interruptRunningTurn(reason: String) async -> InterruptOutcome {
+        guard correlation.hasOutstanding else { return .noTurnInFlight }
+        let target = correlation.enabled ? correlation.beginInterrupt() : nil
         do {
             // Wait for interrupt control-response ACK to confirm Claude received the interrupt.
             _ = try await sendControlRequest(
                 request: ["subtype": "interrupt", "reason": reason],
                 timeoutSeconds: 1.5
             )
-            turnWasInterrupted = true
+            guard hasActiveSession, isInitialized, !isShuttingDown else { return .failed }
+            if let target {
+                guard correlation.isInterruptPending(target) else { return .noTurnInFlight }
+                correlation.acknowledgeInterrupt(target)
+            }
+            if target == nil, !correlation.enabled { turnWasInterrupted = true }
             writeRawEventLogRecord(kind: "turn.interrupted", payload: [
                 "reason": reason
             ] as [String: Any])
             return .acknowledged
         } catch let controllerError as ControllerError {
+            guard hasActiveSession, isInitialized, !isShuttingDown else { return .failed }
+            if let target {
+                guard correlation.isInterruptPending(target) else { return .noTurnInFlight }
+                correlation.abandonInterrupt(target)
+            }
             if case .controlRequestTimedOut = controllerError {
                 writeRawEventLogRecord(kind: "turn.interrupt.timedOut", payload: [
                     "reason": reason
@@ -652,6 +560,11 @@ final actor ClaudeNativeProcessSessionController {
             ] as [String: Any])
             return .failed
         } catch {
+            guard hasActiveSession, isInitialized, !isShuttingDown else { return .failed }
+            if let target {
+                guard correlation.isInterruptPending(target) else { return .noTurnInFlight }
+                correlation.abandonInterrupt(target)
+            }
             writeRawEventLogRecord(kind: "turn.interrupt.failed", payload: [
                 "reason": reason,
                 "error": error.localizedDescription
@@ -692,8 +605,8 @@ final actor ClaudeNativeProcessSessionController {
 
         failPendingControlRequests(with: ControllerError.processNotRunning)
         pendingPermissionRequests.removeAll()
-        clearTurnIDQueue()
         cancelAuthoritativeLifecycleState()
+        clearTurnIDQueue()
 
         closeOutputChannelsAndInput()
 
@@ -727,11 +640,11 @@ final actor ClaudeNativeProcessSessionController {
             return
         }
 
-        let isRunning = await ServerNetworkManager.shared.isRunning()
+        let isRunning = await host.isMCPServerRunning()
         guard isRunning else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
-        configLease = try await configService.prepareLaunchConfig()
+        configLease = try await host.prepareMCPLaunchConfig()
     }
 
     private func startProcessIfNeeded(
@@ -800,6 +713,8 @@ final actor ClaudeNativeProcessSessionController {
         // don't inherit the previous process's capability negotiation.
         observedSessionStateChangedEvents = false
         cancelAuthoritativeLifecycleState()
+        correlation = ClaudeNativeTurnCorrelation()
+        correlationFailed = false
         // Reset runtime init aggregation state so stale metadata doesn't leak across runs.
         initializeResponseSnapshot = nil
         latestRuntimeInitTools = []
@@ -1377,8 +1292,10 @@ final actor ClaudeNativeProcessSessionController {
             "preview": String(text.prefix(200)),
             "length": text.count
         ] as [String: Any])
-        // Decode salvage is not a fully classified normal stream, even if a later result succeeds.
-        emit(.stream(AIStreamResult(type: "content", text: text)))
+        // Recovery is still subject to execution ownership; a queued host input is not its owner.
+        if !correlationFailed, !correlation.enabled || correlation.ownsOutput {
+            emit(.stream(AIStreamResult(type: "content", text: text)))
+        }
         return true
     }
 
@@ -1492,6 +1409,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private func handleStreamPayload(_ payload: [String: Any]) {
+        guard !isShuttingDown else { return }
         recordObservedSessionID(Self.firstSessionIdentifier(in: payload))
         #if DEBUG
             if ClaudeReasoningExtractionFeature.isEnabled {
@@ -1506,6 +1424,9 @@ final actor ClaudeNativeProcessSessionController {
             }
         #endif
         if let (tools, mcpStatuses) = Self.parseSystemInitFields(from: payload) {
+            let wasEnabled = correlation.enabled
+            correlation.observeInit(payload)
+            if !wasEnabled, correlation.enabled { turnWasInterrupted = false }
             latestRuntimeInitTools = tools
             latestRuntimeInitMcpServerStatuses = mcpStatuses
             writeRawEventLogRecord(kind: "runtime.init.stream", payload: [
@@ -1524,9 +1445,44 @@ final actor ClaudeNativeProcessSessionController {
         if payload["type"] as? String == "rate_limit_event",
            let rateLimit = ClaudeCompatiblePluginRateLimitInfo.decodeEvent(data)
         {
-            emit(.rateLimit(rateLimit))
+            emit(.rateLimit(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: rateLimit)))
         }
+        // Translation always runs, even when output has no host owner: it maintains
+        // provider session/model and tool-invocation context.
         let streamResults = translator.parseNDJSONLine(data)
+        guard !correlationFailed else { return }
+        let isResultPayload = payload["type"] as? String == "result"
+        var completion: DeferredCompletion?
+        var ownsOutput = true
+        if correlation.enabled {
+            do {
+                var frameOwnsOutput: Bool?
+                if Self.isMainThreadActivity(payload) {
+                    frameOwnsOutput = try correlation.observeActivity(payload)
+                } else if payload["type"] as? String == "command_lifecycle",
+                          payload["state"] as? String == "started",
+                          let commandID = payload["command_uuid"] as? String,
+                          UUID(uuidString: commandID) != nil
+                {
+                    frameOwnsOutput = try correlation.observeActivity(["user_message_uuid": commandID])
+                }
+                if isResultPayload {
+                    let resolved = try correlation.resolve(payload)
+                    ownsOutput = !resolved.inputIDs.isEmpty
+                    let stopReason = streamResults.last(where: { $0.type == "message_stop" })?.stopReason
+                    let status: TurnStatus = resolved.interrupted ? .cancelled : determineTurnStatus(from: payload, stopReasonHint: stopReason)
+                    completion = DeferredCompletion(executionID: resolved.executionID, inputIDs: resolved.inputIDs, status: status, keyed: true)
+                } else {
+                    // Subagent frames have their own stream. Reject them without
+                    // changing the main-thread message's ownership for later deltas.
+                    ownsOutput = !Self.isSubagentActivity(payload) && (frameOwnsOutput ?? correlation.ownsOutput)
+                }
+            } catch {
+                correlationFailed = true
+                failProtocolAndShutdownSoon(message: "Claude input correlation failed; the process must be restarted.")
+                ownsOutput = false
+            }
+        }
         if !streamResults.contains(where: { $0.type == "event" }), Self.hasUnattributedAssistantMessage(payload) {
             emitSemanticUncertainty("Unclassified provider activity")
         }
@@ -1561,9 +1517,6 @@ final actor ClaudeNativeProcessSessionController {
         // "message_stop" results, but they are NOT turn boundaries; using them would
         // cause pendingTurnIDs to desynchronize when multiple message_stop results
         // arrive per turn.
-        let payloadType = (payload["type"] as? String) ?? ""
-        let isResultPayload = payloadType == "result"
-
         for result in streamResults {
             #if DEBUG
                 if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
@@ -1596,6 +1549,10 @@ final actor ClaudeNativeProcessSessionController {
                 continue
             }
 
+            if correlation.enabled, !ownsOutput, Self.requiresHostOutputOwner(result) {
+                writeRawEventLogRecord(kind: "translator.unownedStreamResult", payload: logPayload)
+                continue
+            }
             if Self.shouldSuppressUserFacingStreamResult(result) {
                 emitSemanticUncertainty("Suppressed provider activity")
                 writeRawEventLogRecord(kind: "translator.streamResultSuppressed", payload: logPayload)
@@ -1603,18 +1560,17 @@ final actor ClaudeNativeProcessSessionController {
             }
             writeRawEventLogRecord(kind: "translator.streamResult", payload: logPayload)
             emit(.stream(result))
-            if isResultPayload, result.type == "message_stop" {
+            if isResultPayload, result.type == "message_stop", !correlation.enabled {
                 guard hasPendingTurnIDs else {
                     assertionFailure("[ClaudeController] result message_stop with no pending turn IDs — possible protocol drift")
                     continue
                 }
                 let status = determineTurnStatus(from: payload, stopReasonHint: result.stopReason)
                 if observedSessionStateChangedEvents {
-                    // Defer completion until `idle` arrives or fallback timer fires.
-                    // Do NOT dequeue the turn ID yet — keep turnInFlight == true so
-                    // callers (e.g. coordinator steering) don't send a new user message
-                    // before the authoritative idle boundary.
-                    pendingAuthoritativeTurnStatuses.append(status)
+                    // The resolved record keeps host work in flight until idle/fallback,
+                    // without letting another send change this result's target.
+                    let id = dequeueTurnID()
+                    deferredCompletions.append(DeferredCompletion(executionID: id, inputIDs: [id], status: status))
                     scheduleAuthoritativeIdleFallbackIfNeeded()
                 } else {
                     // Legacy mode: complete immediately on result/message_stop.
@@ -1623,23 +1579,54 @@ final actor ClaudeNativeProcessSessionController {
                 }
             }
         }
+        if let completion, !completion.inputIDs.isEmpty {
+            if observedSessionStateChangedEvents {
+                deferredCompletions.append(completion)
+                scheduleAuthoritativeIdleFallbackIfNeeded()
+            } else {
+                emitCompletion(completion)
+            }
+        }
     }
 
-    /// Completes the next deferred turn waiting for `idle`, if any, and reschedules/cancels
-    /// the fallback timer as needed. Dequeues the turn ID from `pendingTurnIDBuffer` at
-    /// this point so `turnInFlight` transitions to false.
+    private static func isSubagentActivity(_ payload: [String: Any]) -> Bool {
+        ["parent_tool_use_id", "parentToolUseId"].contains { key in
+            guard let parent = payload[key] as? String else { return false }
+            return !parent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    private static func isMainThreadActivity(_ payload: [String: Any]) -> Bool {
+        guard !isSubagentActivity(payload) else { return false }
+        switch payload["type"] as? String {
+        case "assistant", "message": return true
+        case "stream_event": return (payload["event"] as? [String: Any])?["type"] as? String == "message_start"
+        default: return false
+        }
+    }
+
+    private static func requiresHostOutputOwner(_ result: AIStreamResult) -> Bool {
+        switch result.type {
+        case "content", "final_content", "reasoning", "usage", "message_stop", "tool_call", "tool_result",
+             "harness_empty_output_reprompt_candidate": true
+        default: false
+        }
+    }
+
+    private func emitCompletion(_ completion: DeferredCompletion) {
+        if !completion.keyed, let id = completion.inputIDs.first {
+            emit(.turnCompleted(turnID: id, status: completion.status))
+        } else if !completion.inputIDs.isEmpty {
+            emit(.turnsCompleted(turnIDs: completion.inputIDs, status: completion.status))
+        }
+    }
+
     private func completeNextDeferredTurnIfPending() {
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
-        let status = pendingAuthoritativeTurnStatuses.removeFirst()
+        guard !deferredCompletions.isEmpty else { return }
+        let completion = deferredCompletions.removeFirst()
         authoritativeIdleFallbackTask?.cancel()
         authoritativeIdleFallbackTask = nil
-        guard hasPendingTurnIDs else {
-            assertionFailure("[ClaudeController] deferred idle completion with no pending turn IDs — possible protocol drift")
-            return
-        }
-        let turnID = dequeueTurnID()
-        emit(.turnCompleted(turnID: turnID, status: status))
-        // If more deferred completions remain, schedule a new fallback.
+        emitCompletion(completion)
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
 
@@ -1648,7 +1635,7 @@ final actor ClaudeNativeProcessSessionController {
     /// the turn completes anyway. Each task carries a generation token so stale
     /// tasks that wake after cancellation are safely ignored.
     private func scheduleAuthoritativeIdleFallbackIfNeeded() {
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else {
+        guard !deferredCompletions.isEmpty else {
             authoritativeIdleFallbackTask?.cancel()
             authoritativeIdleFallbackTask = nil
             return
@@ -1669,19 +1656,14 @@ final actor ClaudeNativeProcessSessionController {
         // Ignore stale firings from superseded tasks.
         guard generation == authoritativeIdleFallbackGeneration else { return }
         authoritativeIdleFallbackTask = nil
-        guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
+        guard !deferredCompletions.isEmpty else { return }
         emitSemanticUncertainty("Provider completion recovery")
-        let status = pendingAuthoritativeTurnStatuses.removeFirst()
-        guard hasPendingTurnIDs else {
-            assertionFailure("[ClaudeController] idle fallback with no pending turn IDs — possible protocol drift")
-            return
-        }
-        let turnID = dequeueTurnID()
+        let completion = deferredCompletions.removeFirst()
         writeRawEventLogRecord(kind: "lifecycle.idleFallback", payload: [
-            "turnID": turnID.uuidString,
-            "status": String(describing: status)
+            "executionID": completion.executionID.uuidString,
+            "status": String(describing: completion.status)
         ] as [String: Any])
-        emit(.turnCompleted(turnID: turnID, status: status))
+        emitCompletion(completion)
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
 
@@ -1693,13 +1675,12 @@ final actor ClaudeNativeProcessSessionController {
         authoritativeIdleFallbackTask = nil
         // Emit deferred completions with their original status — the result/message_stop
         // already established the correct turn outcome; only idle was missing.
-        for status in pendingAuthoritativeTurnStatuses {
-            guard hasPendingTurnIDs else { break }
+        let completions = deferredCompletions
+        deferredCompletions.removeAll()
+        for completion in completions {
             emitSemanticUncertainty("Provider completion recovery")
-            let turnID = dequeueTurnID()
-            emit(.turnCompleted(turnID: turnID, status: status))
+            emitCompletion(completion)
         }
-        pendingAuthoritativeTurnStatuses.removeAll()
     }
 
     /// Preserve negative evidence before transport/UI suppression, on the qualified first-party
@@ -1919,6 +1900,16 @@ final actor ClaudeNativeProcessSessionController {
             await handleStdoutChunk(data)
         }
 
+        func test_handleStdoutEOF() async {
+            await handleStdoutEOF()
+        }
+
+        /// Exercises the real interrupt body without claiming the fake owns an OS process.
+        func test_interruptRunningTurn(reason: String) async -> InterruptOutcome {
+            guard hasActiveSession else { return .failed }
+            return await interruptRunningTurn(reason: reason)
+        }
+
         func test_installConfigurationTransport(
             initialized: Bool = true,
             controlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])? = { _ in [:] },
@@ -1932,6 +1923,7 @@ final actor ClaudeNativeProcessSessionController {
             requestedConfiguration = nil
             initialFlagSettingsRequest = nil
             isShuttingDown = false
+            clearTurnIDQueue()
             isInitialized = initialized
             hasCompletedInitialFlagSettings = initialized
             sessionID = "application-proof-session"
@@ -2088,6 +2080,8 @@ final actor ClaudeNativeProcessSessionController {
         ] as [String: Any])
         switch request.subtype {
         case "can_use_tool":
+            // An approval may be the first evidence of a provider-started execution.
+            try? correlation.observeActivity([:])
             let payload = request.request
             let toolName = (payload["tool_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let input = payload["input"] as? [String: Any] ?? [:]
@@ -2479,9 +2473,9 @@ final actor ClaudeNativeProcessSessionController {
             return
         }
         registeredExpectedAgentPID = pid
-        await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID)
+        await host.registerExpectedAgentPID(pid, clientName: clientName, runID: runID)
         if isShuttingDown {
-            await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            await host.clearExpectedAgentPID(pid, clientName: clientName, runID: runID)
             if registeredExpectedAgentPID == pid {
                 registeredExpectedAgentPID = nil
             }
@@ -2498,7 +2492,7 @@ final actor ClaudeNativeProcessSessionController {
         else {
             return
         }
-        await ServerNetworkManager.shared.clearExpectedAgentPID(registeredExpectedAgentPID, for: clientName, runID: runID)
+        await host.clearExpectedAgentPID(registeredExpectedAgentPID, clientName: clientName, runID: runID)
         self.registeredExpectedAgentPID = nil
         if config.enableDebugLogging {
             print("[ClaudeNativeSession] Cleared expected MCP parent PID for \(clientName) runID=\(runID.uuidString)")
@@ -2513,6 +2507,7 @@ final actor ClaudeNativeProcessSessionController {
         guard !isShuttingDown else { return }
         writeRawEventLogRecord(kind: "session.failProtocol", payload: ["message": message])
         emit(.error(message))
+        cancelAuthoritativeLifecycleState()
         let staleIDs = drainAllTurnIDs()
         if !staleIDs.isEmpty {
             for id in staleIDs {
@@ -2787,45 +2782,33 @@ final actor ClaudeNativeProcessSessionController {
     @discardableResult
     private func beginTurnTracking() -> UUID {
         let id = UUID()
-        pendingTurnIDBuffer.append(id)
+        correlation.register(id)
         return id
     }
 
-    // MARK: - Pending turn ID deque helpers
+    // MARK: - Legacy positional settlement
 
-    /// O(1) check whether the FIFO queue has entries.
+    /// Unresolved host inputs only; deferred completions have their own resolved owner.
     private var hasPendingTurnIDs: Bool {
-        pendingTurnIDHead < pendingTurnIDBuffer.count
+        correlation.hasOutstanding
     }
 
-    /// O(1) dequeue from the front.  Compacts the buffer when half is consumed.
+    /// Unsupported runtimes retain acceptance-order matching.
     private func dequeueTurnID() -> UUID {
-        let id = pendingTurnIDBuffer[pendingTurnIDHead]
-        pendingTurnIDHead += 1
-        compactTurnIDBufferIfNeeded()
-        return id
+        // Legacy callers check hasPendingTurnIDs before dequeuing.
+        correlation.takeFirst()!
     }
 
     /// Drain all remaining IDs and reset.
     private func drainAllTurnIDs() -> [UUID] {
-        guard hasPendingTurnIDs else { return [] }
-        let remaining = Array(pendingTurnIDBuffer[pendingTurnIDHead...])
-        clearTurnIDQueue()
-        return remaining
+        correlation.drain()
     }
 
     /// Reset the queue to empty.
     private func clearTurnIDQueue() {
-        pendingTurnIDBuffer.removeAll(keepingCapacity: false)
-        pendingTurnIDHead = 0
-    }
-
-    private func compactTurnIDBufferIfNeeded() {
-        // Compact when more than half is consumed and at least 4 slots are wasted.
-        if pendingTurnIDHead > 4, pendingTurnIDHead >= pendingTurnIDBuffer.count / 2 {
-            pendingTurnIDBuffer.removeFirst(pendingTurnIDHead)
-            pendingTurnIDHead = 0
-        }
+        correlation = ClaudeNativeTurnCorrelation()
+        correlationFailed = false
+        turnWasInterrupted = false
     }
 
     private func emit(_ event: Event) {

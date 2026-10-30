@@ -426,7 +426,7 @@ import XCTest
                 })
                 if kind == .claudeCode {
                     window.apiSettingsViewModel.isClaudeCodeConnected = true
-                    let controller = ClaudeNativeProcessSessionController(runID: runID, tabID: observerTab, windowID: windowID, workspacePath: nil, config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard))
+                    let controller = ClaudeNativeProcessSessionController(host: ClaudeNativeSessionAppHost(), runID: runID, tabID: observerTab, windowID: windowID, workspacePath: nil, config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard))
                     native = controller
                     await controller.test_installConfigurationTransport(initialized: reusesConnection, controlRequest: { _ in ["session_id": "late-catalog-claude"] }, write: { frames.append($0) })
                     observer.claudeController = controller

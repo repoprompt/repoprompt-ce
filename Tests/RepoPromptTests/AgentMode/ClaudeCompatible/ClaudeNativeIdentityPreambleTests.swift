@@ -19,6 +19,7 @@ final class ClaudeNativeIdentityPreambleTests: XCTestCase {
         // buildArguments' append logic keys only on `runtimeVariant`; the other fields .agentMode
         // derives from UserDefaults do not affect the assertions below.
         ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

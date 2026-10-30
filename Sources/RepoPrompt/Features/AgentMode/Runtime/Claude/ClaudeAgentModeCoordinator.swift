@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import MCP
 import OSLog
 import RepoPromptAIContracts
@@ -286,6 +287,7 @@ final class ClaudeAgentModeCoordinator {
         let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: coreConfig, mode: .agentMode)
         return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig) {
             ClaudeNativeProcessSessionController(
+                host: ClaudeNativeSessionAppHost(),
                 runID: runID,
                 tabID: tabID,
                 windowID: windowID,

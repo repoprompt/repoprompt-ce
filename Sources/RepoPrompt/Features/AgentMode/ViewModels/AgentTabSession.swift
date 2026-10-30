@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptAgentProviderContracts
 import Foundation
 import MCP
 import RepoPromptACPProviders

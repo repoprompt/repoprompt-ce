@@ -6,6 +6,7 @@
 //
 
 import Combine
+import RepoPromptAgentProviderContracts
 import Foundation
 import RepoPromptAIContracts
 

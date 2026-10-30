@@ -374,6 +374,43 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         fixture.host.descriptors = candidates.map { descriptor(for: $0) }
     }
 
+    func testRecoveredInitialLoadSeedsRealBridgeOnceWithoutPendingWrites() async throws {
+        try seedSavedPair()
+        // A file in place of the database directory fails the first real repository read only.
+        let obstruction = directory.appendingPathComponent("Overseer")
+        try Data("temporary obstruction".utf8).write(to: obstruction)
+        let fixture = makeFixture()
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        replaceTopology(fixture, with: [observer, target])
+
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        XCTAssertNil(fixture.bridge.test_launchEntryState(for: pair))
+        let initialDiagnostic = await fixture.store.diagnostic
+        XCTAssertNotNil(initialDiagnostic)
+        let initialLoad = await fixture.store.readyLaunchLoad
+        XCTAssertNil(initialLoad)
+        try FileManager.default.removeItem(at: obstruction)
+
+        // No manual retry/bootstrap: the store's scheduled retry must publish recovery itself.
+        try await AsyncTestWait.waitUntil("recovered continuity restores saved pair", timeout: 5) {
+            await self.isRestored(fixture)
+        }
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .active)
+        let restoredReference = await liveReference(fixture)
+        let reference = try XCTUnwrap(restoredReference)
+        let saveState = await fixture.store.saveState
+        XCTAssertEqual(saveState, "saved")
+
+        NotificationCenter.default.post(name: .agentOverseerContinuityDidChange, object: nil)
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let repeatedReference = await liveReference(fixture)
+        XCTAssertEqual(repeatedReference, reference, "Repeated ready/save events cannot mint a successor grant")
+        XCTAssertEqual(fixture.host.providerTaskRequests, 0)
+    }
+
     func testUnscopedLaunchIntentDoesNotConstructBackgroundRuntime() async throws {
         final class Registry: PreparedAgentSessionRuntimeRegistry {
             var preparations = 0
@@ -824,15 +861,146 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
     }
 
+    func testCatalogDeferredRestoreCannotProveAbsenceBeforeLastDispatchFinishes() async throws {
+        for targetAppears in [true, false] {
+            try seedSavedPair()
+            let fixture = makeFixture()
+            defer { fixture.bridge.freezeForTermination() }
+            var gate = WindowSessionRestorePersistenceGate()
+            gate.beginRestoreSessionLoad()
+            gate.finishRestoreSessionLoad(pendingEntryCount: 2)
+            var lifetimes = [WindowRestoreLifetime(), WindowRestoreLifetime()]
+            for index in lifetimes.indices {
+                let windowID = index + 1
+                gate.consumePendingRestoreEntry()
+                gate.beginRestoringWindow(windowID)
+                let entry = WindowSessionEntry(
+                    windowKind: .standard, workspaceID: UUID(), workspaceName: nil,
+                    isSystemWorkspace: false, isEphemeral: false, primaryRepoPath: nil,
+                    lastFocused: false, workspaceInstanceNumber: nil
+                )
+                _ = lifetimes[index].accept(entry) { gate.finishRestoringWindow(windowID) }
+                // Catalog failure abandons execution while preserving the queued entry.
+                lifetimes[index].releasePendingCompletion()?()
+            }
+            XCTAssertFalse(gate.isRestoreInProgress, "Persistence may recover while catalog acceptance is deferred")
+            func topology() -> AgentSessionOversightRestoreTopologyState {
+                gate.oversightTopologyState(
+                    hasPendingWindowExecution: lifetimes.contains { $0.hasUnfinishedExecution },
+                    abandonedEntryCount: lifetimes.reduce(0) { $0 + $1.abandonedRestoreCount }
+                )
+            }
+            fixture.host.topology = topology()
+            XCTAssertEqual(fixture.host.topology, .incompleteLeftoversAbandoned(count: 2))
+            await fixture.bridge.bootstrapIntentStore(fixture.store)
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(
+                fixture.bridge.test_launchEntryState(for: pair),
+                .waiting,
+                "Initial/default-workspace discovery cannot terminalize the saved pair"
+            )
+
+            let first = try XCTUnwrap(lifetimes[0].takePendingForDispatch())
+            let last = try XCTUnwrap(lifetimes[1].takePendingForDispatch())
+            XCTAssertEqual(topology(), .pending, "Dispatched switches remain outstanding")
+            lifetimes[0].finishDispatch(acceptanceSequence: first.acceptanceSequence)
+            let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+            fixture.host.candidates = [observer]
+            fixture.host.descriptors = [descriptor(for: observer)]
+            fixture.host.topology = topology()
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.host.topology, .pending, "The last in-flight switch still fences absence")
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), .waiting)
+
+            if targetAppears {
+                let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+                fixture.host.candidates.append(target)
+                fixture.host.descriptors.append(descriptor(for: target))
+            }
+            lifetimes[1].finishDispatch(acceptanceSequence: last.acceptanceSequence)
+            fixture.host.topology = topology()
+            XCTAssertEqual(fixture.host.topology, .completeAllEntriesConsumed)
+            fixture.bridge.noteTopologyMayHaveChanged()
+            await fixture.bridge.test_settleLaunchReconciliation()
+            XCTAssertEqual(fixture.bridge.test_launchEntryState(for: pair), targetAppears ? .active : .terminal(.missing))
+            let token = await fixture.store.token(for: pair)
+            XCTAssertNotNil(token, "A missing session retires only this launch, never durable intent")
+            XCTAssertFalse(AgentSessionOversightLaunchTerminalReason.missing.removesDurableIntent)
+        }
+    }
+
+    func testAbandonedCatalogAdmitsVisiblePairsAndWaitsForMissingPairsUntilRecovery() async throws {
+        let absent = AgentSessionOversightIntent(observerSessionID: UUID(), targetSessionID: UUID())
+        try JSONEncoder().encode(AgentSessionOversightIntentDocument(links: [pair, absent])).write(
+            to: directory.appendingPathComponent(AgentSessionOversightIntentStore.filename), options: .atomic
+        )
+        let fixture = makeFixture()
+        defer { fixture.bridge.freezeForTermination() }
+        let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
+        let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
+        fixture.host.candidates = [observer, target]
+        fixture.host.descriptors = [descriptor(for: observer), descriptor(for: target)]
+        var gate = WindowSessionRestorePersistenceGate()
+        gate.finishRestoreSessionLoad(pendingEntryCount: 1)
+        gate.consumePendingRestoreEntry()
+        gate.beginRestoringWindow(3)
+        var lifetime = WindowRestoreLifetime()
+        let entry = WindowSessionEntry(
+            windowKind: .standard, workspaceID: UUID(), workspaceName: nil,
+            isSystemWorkspace: false, isEphemeral: false, primaryRepoPath: nil,
+            lastFocused: false, workspaceInstanceNumber: nil
+        )
+        _ = lifetime.accept(entry) { gate.finishRestoringWindow(3) }
+        lifetime.releasePendingCompletion()?()
+        XCTAssertTrue(lifetime.hasPendingEntry)
+        XCTAssertFalse(lifetime.hasUnfinishedExecution)
+        XCTAssertEqual(lifetime.abandonedRestoreCount, 1)
+        XCTAssertNil(lifetime.releasePendingCompletion(), "Repeated failure keeps exactly one abandoned entry")
+        func topology() -> AgentSessionOversightRestoreTopologyState {
+            gate.oversightTopologyState(
+                hasPendingWindowExecution: lifetime.hasUnfinishedExecution,
+                abandonedEntryCount: lifetime.abandonedRestoreCount
+            )
+        }
+        fixture.host.topology = topology()
+        XCTAssertEqual(fixture.host.topology, .incompleteLeftoversAbandoned(count: 1))
+        await fixture.bridge.bootstrapIntentStore(fixture.store)
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(
+            fixture.bridge.test_launchEntryState(for: pair),
+            .active,
+            "A permanently failed catalog cannot block unrelated visible pairs"
+        )
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: absent), .waiting)
+
+        let dispatch = try XCTUnwrap(lifetime.takePendingForDispatch())
+        XCTAssertEqual(lifetime.abandonedRestoreCount, 0)
+        fixture.host.topology = topology()
+        XCTAssertEqual(fixture.host.topology, .pending, "Late dispatch reopens the execution barrier")
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: absent), .waiting)
+
+        lifetime.finishDispatch(acceptanceSequence: dispatch.acceptanceSequence)
+        fixture.host.topology = topology()
+        XCTAssertEqual(fixture.host.topology, .completeAllEntriesConsumed)
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        XCTAssertEqual(fixture.bridge.test_launchEntryState(for: absent), .terminal(.missing))
+        let retained = await fixture.store.token(for: absent)
+        XCTAssertNotNil(retained)
+    }
+
     func testNothingIsReservedWhileAWindowsDiscoveryLevelIsIncomplete() async throws {
         try seedSavedPair()
         let fixture = makeFixture()
-        fixture.host.discovery = [
+        fixture.host.discovery = (1 ... 35).map { windowID in
             AgentSessionLinkDiscoveryState(
-                epoch: AgentSessionLinkDiscoveryEpoch(windowID: 1, workspaceID: UUID(), generation: 2),
-                isComplete: false
+                epoch: AgentSessionLinkDiscoveryEpoch(windowID: windowID, workspaceID: UUID(), generation: 2),
+                isComplete: windowID != 35
             )
-        ]
+        }
         let observer = makeReadyCandidate(windowID: 1, sessionID: observerSessionID)
         let target = makeReadyCandidate(windowID: 2, sessionID: targetSessionID)
         fixture.host.candidates = [observer, target]
@@ -842,7 +1010,14 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
         await fixture.bridge.test_settleLaunchReconciliation()
 
         let restored = await isRestored(fixture)
-        XCTAssertFalse(restored)
+        XCTAssertFalse(restored, "One unrelated incomplete window blocks the otherwise-ready saved pair")
+        XCTAssertEqual(fixture.bridge.test_launchReservationStartCount(), 0)
+        let incomplete = fixture.host.discovery[34]
+        fixture.host.discovery[34] = AgentSessionLinkDiscoveryState(epoch: incomplete.epoch, isComplete: true)
+        fixture.bridge.noteTopologyMayHaveChanged()
+        await fixture.bridge.test_settleLaunchReconciliation()
+        let restoredAfterCompletion = await isRestored(fixture)
+        XCTAssertTrue(restoredAfterCompletion)
     }
 
     func testSameWindowReopenRestoresAfterPassiveHydrationIsInterruptedByDiscoveryChange() async throws {

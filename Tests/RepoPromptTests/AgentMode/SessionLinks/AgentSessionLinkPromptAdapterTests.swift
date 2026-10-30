@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import MCP
 import RepoPromptAIContracts
 import RepoPromptCodexProvider
