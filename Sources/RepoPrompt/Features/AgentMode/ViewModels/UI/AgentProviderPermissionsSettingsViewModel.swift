@@ -6,8 +6,8 @@
 //
 
 import Combine
-import RepoPromptAgentProviderContracts
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
 @MainActor

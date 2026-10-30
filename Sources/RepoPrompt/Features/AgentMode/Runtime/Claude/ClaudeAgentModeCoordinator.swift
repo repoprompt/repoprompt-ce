@@ -1,7 +1,7 @@
 import Foundation
-import RepoPromptAgentProviderContracts
 import MCP
 import OSLog
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore

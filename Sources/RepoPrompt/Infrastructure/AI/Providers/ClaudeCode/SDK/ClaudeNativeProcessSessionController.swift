@@ -1,6 +1,6 @@
 import Darwin
-import RepoPromptAgentProviderContracts
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess

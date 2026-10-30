@@ -1,6 +1,6 @@
 import Combine
-import RepoPromptAgentProviderContracts
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime

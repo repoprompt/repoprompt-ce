@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptAgentProviderContracts
 import MCP
+import RepoPromptAgentProviderContracts
 @testable import RepoPromptApp
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
