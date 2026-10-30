@@ -48,9 +48,7 @@ enum ClaudeCodeAIModelCatalog {
     ]
 
     static func normalizedSpecifier(_ specifier: String) -> String {
-        specifier
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
+        normalizedClaudeCodeModelIdentitySpecifier(specifier)
     }
 
     static func runtimeSpecifierRaw(for model: AIModel) -> String? {
