@@ -230,6 +230,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
     func testNativeControllerPreservesAllowedTelemetryOutsideTranscript() async {
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false")
         )
@@ -282,6 +283,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     func testNativeFlagResolutionPassesEncodedGLMModelToResolver() async throws {
         let resolver = RecordingLaunchEnvironmentResolver()
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
@@ -306,6 +308,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
     func testNativeLiveModelSwitchRequiresRestartWhenLaunchEnvironmentChanges() async {
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
@@ -407,6 +410,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
     private func applicationController() -> ClaudeNativeProcessSessionController {
         ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
             environmentResolver: PassthroughResolver()
@@ -552,6 +556,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     func testSupersessionDuringResolutionNeverWritesStaleSettings() async throws {
         let gate = ApplicationGate()
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
             environmentResolver: GatedResolver(gate: gate)
@@ -585,6 +590,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     func testSupersededResolutionErrorReturnsSuperseded() async throws {
         let gate = ApplicationGate()
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
             environmentResolver: GatedResolver(gate: gate, rejectFirst: true)
@@ -1375,6 +1381,7 @@ final class ClaudeUsageSetupTests: XCTestCase {
 final class ClaudeNativeTurnCorrelationTests: XCTestCase {
     private func controller(fallback: TimeInterval = 1) async -> ClaudeNativeProcessSessionController {
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false"),
             authoritativeTurnIdleFallbackSeconds: fallback

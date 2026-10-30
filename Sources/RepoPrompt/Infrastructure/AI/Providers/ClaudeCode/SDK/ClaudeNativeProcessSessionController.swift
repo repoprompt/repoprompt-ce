@@ -44,7 +44,7 @@ final actor ClaudeNativeProcessSessionController {
     private let workspacePath: String?
     private let config: ClaudeCodeAgentConfig
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
-    private let configService = MCPConfigExportService.shared
+    private let host: any ClaudeNativeSessionHosting
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
     private var rawEventLogFileSessionID: String?
@@ -58,7 +58,7 @@ final actor ClaudeNativeProcessSessionController {
     private var stderrChunkChannel: FileHandleChunkChannel?
     private var stdoutConsumerTask: Task<Void, Never>?
     private var stderrConsumerTask: Task<Void, Never>?
-    private var configLease: MCPConfigLease?
+    private var configLease: (any ClaudeNativeConfigLease)?
     private var configURL: URL? {
         configLease?.url
     }
@@ -226,8 +226,9 @@ final actor ClaudeNativeProcessSessionController {
         }
         let pid = registeredExpectedAgentPID
         let runID = runID
+        let host = host
         Task {
-            await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            await host.clearExpectedAgentPID(pid, clientName: clientName, runID: runID)
         }
     }
 
@@ -256,6 +257,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     init(
+        host: any ClaudeNativeSessionHosting,
         runID: UUID,
         tabID: UUID,
         windowID: Int,
@@ -264,6 +266,7 @@ final actor ClaudeNativeProcessSessionController {
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
         authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
     ) {
+        self.host = host
         self.runID = runID
         self.tabID = tabID
         self.windowID = windowID
@@ -636,11 +639,11 @@ final actor ClaudeNativeProcessSessionController {
             return
         }
 
-        let isRunning = await ServerNetworkManager.shared.isRunning()
+        let isRunning = await host.isMCPServerRunning()
         guard isRunning else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
-        configLease = try await configService.prepareLaunchConfig()
+        configLease = try await host.prepareMCPLaunchConfig()
     }
 
     private func startProcessIfNeeded(
@@ -2469,9 +2472,9 @@ final actor ClaudeNativeProcessSessionController {
             return
         }
         registeredExpectedAgentPID = pid
-        await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID)
+        await host.registerExpectedAgentPID(pid, clientName: clientName, runID: runID)
         if isShuttingDown {
-            await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            await host.clearExpectedAgentPID(pid, clientName: clientName, runID: runID)
             if registeredExpectedAgentPID == pid {
                 registeredExpectedAgentPID = nil
             }
@@ -2488,7 +2491,7 @@ final actor ClaudeNativeProcessSessionController {
         else {
             return
         }
-        await ServerNetworkManager.shared.clearExpectedAgentPID(registeredExpectedAgentPID, for: clientName, runID: runID)
+        await host.clearExpectedAgentPID(registeredExpectedAgentPID, clientName: clientName, runID: runID)
         self.registeredExpectedAgentPID = nil
         if config.enableDebugLogging {
             print("[ClaudeNativeSession] Cleared expected MCP parent PID for \(clientName) runID=\(runID.uuidString)")

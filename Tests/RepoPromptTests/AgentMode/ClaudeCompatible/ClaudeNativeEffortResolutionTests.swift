@@ -198,6 +198,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
     func testNativeConfigurationUsesSessionEffortRatherThanSharedOrEncodedEffort() async {
         let requests = EffortRequests()
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(), tabID: UUID(), windowID: 1, workspacePath: nil,
             config: .discovery(commandName: "/usr/bin/false", runtimeVariant: .standard),
             environmentResolver: FixedModelResolver()
@@ -222,6 +223,7 @@ final class ClaudeNativeEffortResolutionTests: XCTestCase {
 
     func testTurnScopedEffortOverridesEncodedModelEffortInFlagSettings() async throws {
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
@@ -522,6 +524,7 @@ final class ClaudeNativeAutoFallbackTests: XCTestCase {
 
     private func controller() -> ClaudeNativeProcessSessionController {
         .init(
+            host: ClaudeNativeSessionAppHost(),
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

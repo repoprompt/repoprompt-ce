@@ -247,6 +247,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         ] {
             let (h, s, owner, runID) = fixture()
             let controller = ClaudeNativeProcessSessionController(
+                host: ClaudeNativeSessionAppHost(),
                 runID: runID, tabID: s.tabID, windowID: -1, workspacePath: nil,
                 config: .agentMode(commandName: "/usr/bin/false")
             )
@@ -514,6 +515,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
         let (h, s, owner, runID) = fixture()
         XCTAssertNotNil(s.quietLedger.candidateStartKey(owner: owner), file: file, line: line)
         let controller = ClaudeNativeProcessSessionController(
+            host: ClaudeNativeSessionAppHost(),
             runID: runID, tabID: s.tabID, windowID: -1, workspacePath: nil,
             config: .agentMode(commandName: "/usr/bin/false")
         )
