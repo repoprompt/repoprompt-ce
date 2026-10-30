@@ -76,6 +76,14 @@ struct WindowSessionRestorePersistenceGate {
         isRestoreSessionLoadPending || pendingRestoreEntryCount > 0 || !restoringWindowIDs.isEmpty
     }
 
+    /// A failed catalog can release persistence before its accepted restore entry executes.
+    /// Absence requires both the persistence gate and every accepted restore execution to finish.
+    func oversightTopologyState(hasPendingWindowExecution: Bool, abandonedEntryCount: Int) -> AgentSessionOversightRestoreTopologyState {
+        guard !isRestoreInProgress, !hasPendingWindowExecution else { return .pending }
+        guard abandonedEntryCount == 0 else { return .incompleteLeftoversAbandoned(count: abandonedEntryCount) }
+        return .completeAllEntriesConsumed
+    }
+
     mutating func beginRestoreSessionLoad() {
         isRestoreSessionLoadPending = true
     }
@@ -748,11 +756,16 @@ class WindowStatesManager: ObservableObject {
     private func computeAgentSessionOversightTopologyState() -> AgentSessionOversightRestoreTopologyState {
         if AppLaunchConfiguration.current.suppressesAgentSessionOversightPersistence { return .suppressed }
         guard autoRestoreWorkspacesEnabled else { return .dormantAutoRestoreDisabled }
-        guard hasLoadedRestoreSession, !restorePersistenceGate.isRestoreInProgress else { return .pending }
-        guard abandonedRestoreEntryCount == 0 else {
-            return .incompleteLeftoversAbandoned(count: abandonedRestoreEntryCount)
-        }
-        return .completeAllEntriesConsumed
+        guard hasLoadedRestoreSession else { return .pending }
+        let restoringWindows = allWindows.filter { !$0.isClosing }
+        return restorePersistenceGate.oversightTopologyState(
+            hasPendingWindowExecution: restoringWindows.contains { $0.hasUnfinishedRestoreExecution },
+            abandonedEntryCount: abandonedRestoreEntryCount + restoringWindows.reduce(0) { $0 + $1.abandonedRestoreCount }
+        )
+    }
+
+    func windowRestoreExecutionDidChange() {
+        updateAgentSessionOversightTopologyState()
     }
 
     func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {

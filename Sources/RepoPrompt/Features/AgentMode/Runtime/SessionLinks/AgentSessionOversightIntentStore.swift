@@ -161,6 +161,8 @@ struct AgentSessionOversightIntentReadyLoad: Equatable {
         case quarantined
     }
 
+    var repositoryRowCount: Int = 0
+    var invalidRowCount: Int = 0
     let source: Source
     let storeRevision: UInt64
     let tokenByPair: [AgentSessionOversightIntent: AgentSessionOversightIntentToken]
@@ -328,6 +330,9 @@ actor AgentSessionOversightIntentStore {
         return lastFailure != nil || !rejectedOperations.isEmpty ? "failed" : !pending.isEmpty ? "pending" : "saved"
     }
 
+    private var repositoryRowCount = 0
+    private var invalidRowCount = 0
+
     func loadForLaunch() async -> AgentSessionOversightIntentLoadResult {
         guard mode.performsProductionFileIO else { return .suppressed }
         if !didLoad {
@@ -346,6 +351,8 @@ actor AgentSessionOversightIntentStore {
                         return nil
                     }
                 }
+                repositoryRowCount = rows.count
+                invalidRowCount = invalidIDs.count
                 recoveryWarning = invalidIDs.isEmpty ? nil : "Invalid link entries remain preserved and inactive for recovery: \(invalidIDs.joined(separator: ", ")). Other valid rows restore normally."
                 for (row, pair) in validated {
                     savedRevisions[pair] = max(savedRevisions[pair] ?? 0, row.revision)
@@ -355,13 +362,21 @@ actor AgentSessionOversightIntentStore {
                 }
                 didLoad = true
                 lastFailure = nil
+                // A recovered read may have no pending writes to publish its ready transition.
+                postContinuityChange()
             } catch {
                 lastFailure = "Link continuity could not open (\(error)). Current explicit links remain usable in this process; saved links were preserved and saving will retry."
                 scheduleRetry()
                 return .blocked(.unreadable)
             }
         }
-        return .ready(.init(source: tokenByPair.isEmpty ? .missing : .loaded, storeRevision: storeRevision, tokenByPair: tokenByPair))
+        return .ready(.init(repositoryRowCount: repositoryRowCount, invalidRowCount: invalidRowCount, source: tokenByPair.isEmpty ? .missing : .loaded, storeRevision: storeRevision, tokenByPair: tokenByPair))
+    }
+
+    /// Observes readiness without starting another read or retry from a notification consumer.
+    var readyLaunchLoad: AgentSessionOversightIntentReadyLoad? {
+        guard didLoad else { return nil }
+        return .init(repositoryRowCount: repositoryRowCount, invalidRowCount: invalidRowCount, source: tokenByPair.isEmpty ? .missing : .loaded, storeRevision: storeRevision, tokenByPair: tokenByPair)
     }
 
     func insert(_ pair: AgentSessionOversightIntent) async -> AgentSessionOversightIntentMutationReceipt {
