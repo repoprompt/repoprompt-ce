@@ -98,7 +98,7 @@
     },
     "RepoPromptCodexProviderTests": {
       "source_root": "Tests/RepoPromptCodexProviderTests",
-      "allowed_dependencies": ["RepoPromptCodexProvider", "RepoPromptAIContracts", "RepoPromptShared"]
+      "allowed_dependencies": ["RepoPromptCodexProvider", "RepoPromptAIContracts", "RepoPromptShared", "RepoPromptDomainRuntime", "RepoPromptProcess"]
     },
     "RepoPromptACPProviders": {
       "source_root": "Sources/RepoPromptACPProviders",
