@@ -16,14 +16,6 @@ import RepoPromptVCS
 import RepoPromptWorkspaceCore
 import SwiftUI
 
-struct AgentContextUsage: Codable, Equatable {
-    var modelContextWindow: Int?
-    var lastTotalTokens: Int?
-    var totalTotalTokens: Int?
-    /// Optional for backward-compatible decoding of older usage snapshots; nil means not pending.
-    var awaitingPostCompactionUsage: Bool? = nil
-}
-
 // MARK: - Agent Mode View Model
 
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
