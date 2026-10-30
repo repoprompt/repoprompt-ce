@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
 protocol ClaudeNativeConfigLease: Sendable {
@@ -18,6 +19,8 @@ protocol ClaudeNativeSessionHosting: Sendable {
     func filterEnvironment(_ environment: [String: String], variant: ClaudeCodeRuntimeVariant) async -> [String: String]
     func mergeCurrentCarrier(into environment: [String: String]) -> [String: String]
     func processEnvironmentOverrides(for context: AgentCLIToolContext) -> [String: String]
+    func hasModelSpecifier(_ model: String?) -> Bool
+    func explicitEffortLevel(for model: String?) -> ClaudeCodeEffortLevel?
     func supplementedPathHints(_ hints: [String]) -> [String]
     func expectedAgentClientName(for variant: ClaudeCodeRuntimeVariant) -> String?
     func isRawEventFileLoggingEnabled() -> Bool

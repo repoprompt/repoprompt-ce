@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptShared
@@ -23,6 +24,14 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
 
         nonisolated func processEnvironmentOverrides(for _: AgentCLIToolContext) -> [String: String] {
             ["HOST_ROUTING_WITNESS": "host"]
+        }
+
+        nonisolated func hasModelSpecifier(_ model: String?) -> Bool {
+            model != nil
+        }
+
+        nonisolated func explicitEffortLevel(for model: String?) -> ClaudeCodeEffortLevel? {
+            model == "host-effort-witness" ? .high : nil
         }
 
         nonisolated func supplementedPathHints(_ hints: [String]) -> [String] {
@@ -100,6 +109,18 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
             }
             XCTAssertEqual(approvals, expectApproval ? 1 : 0)
         }
+    }
+
+    func testFlagSettingsUseRequiredHostModelEffort() async throws {
+        let controller = ClaudeNativeProcessSessionController(
+            host: RefusingHost(), runID: UUID(), tabID: UUID(), windowID: 1,
+            workspacePath: nil, config: .discovery(commandName: "/usr/bin/false")
+        )
+        let request = try await controller.test_resolveApplyFlagSettingsRequest(model: "host-effort-witness")
+        XCTAssertEqual((request?["settings"] as? [String: Any])?["effortLevel"] as? String, "high")
+        let override = try await controller.test_resolveApplyFlagSettingsRequest(model: "host-effort-witness", effortLevel: .low)
+        XCTAssertEqual((override?["settings"] as? [String: Any])?["effortLevel"] as? String, "low")
+        await controller.shutdown()
     }
 
     func testLaunchEnvironmentUsesRequiredHostOverrides() async {

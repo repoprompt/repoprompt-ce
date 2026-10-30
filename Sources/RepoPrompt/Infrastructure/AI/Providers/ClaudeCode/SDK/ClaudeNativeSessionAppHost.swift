@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptClaudeProvider
 
@@ -28,6 +29,14 @@ struct ClaudeNativeSessionAppHost: ClaudeNativeSessionHosting {
 
     func processEnvironmentOverrides(for context: AgentCLIToolContext) -> [String: String] {
         ClaudeCodeAgentConfig.processEnvironmentOverrides(for: context)
+    }
+
+    func hasModelSpecifier(_ model: String?) -> Bool {
+        model.map { ClaudeModelSpecifier(raw: $0) } != nil
+    }
+
+    func explicitEffortLevel(for model: String?) -> ClaudeCodeEffortLevel? {
+        ClaudeModelSpecifier(raw: model).explicitEffortLevel
     }
 
     func supplementedPathHints(_ hints: [String]) -> [String] {

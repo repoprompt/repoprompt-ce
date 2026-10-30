@@ -319,7 +319,7 @@ final actor ClaudeNativeProcessSessionController {
                 let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
                 storeFlagSettingsRequest(resolved.request, selection: .init(
                     model: model,
-                    effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+                    effortLevel: resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
                 ))
                 try await initializeIfNeeded(systemPromptOverride: systemPromptOverride)
                 return SessionRef(sessionID: sessionID)
@@ -410,7 +410,7 @@ final actor ClaudeNativeProcessSessionController {
         // No suspension between failure-token validation and consuming its intent.
         let selection = ConfigurationSelection(
             model: model,
-            effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+            effortLevel: resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         )
         if hasActiveSession, isInitialized, !isShuttingDown,
            requestedConfiguration == selection, let proof = appliedConfigurationProof,
@@ -677,7 +677,7 @@ final actor ClaudeNativeProcessSessionController {
         )
         storeFlagSettingsRequest(resolvedFlags.request, selection: .init(
             model: model,
-            effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+            effortLevel: resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         var arguments = buildArguments(
@@ -773,11 +773,11 @@ final actor ClaudeNativeProcessSessionController {
         model: String?,
         effortLevel suppliedEffortLevel: ClaudeCodeEffortLevel?
     ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?) {
-        let modelSpecifier = model.map { ClaudeModelSpecifier(raw: $0) }
-        let requestedModel = modelSpecifier != nil
+        let hasModelSpecifier = host.hasModelSpecifier(model)
+        let requestedModel = hasModelSpecifier
             ? model
             : config.modelString
-        let effectiveEffortLevel = Self.resolvedEffortLevel(
+        let effectiveEffortLevel = resolvedEffortLevel(
             model: model,
             suppliedEffortLevel: suppliedEffortLevel,
             fallbackEffortLevel: config.effortLevel
@@ -798,13 +798,13 @@ final actor ClaudeNativeProcessSessionController {
 
     /// A turn-scoped effort override must win over the picker's encoded baseline. Otherwise
     /// `claude-opus-5-5:high` silently defeats an Auto effort choice of low or medium.
-    private nonisolated static func resolvedEffortLevel(
+    private func resolvedEffortLevel(
         model: String?,
         suppliedEffortLevel: ClaudeCodeEffortLevel?,
         fallbackEffortLevel: ClaudeCodeEffortLevel?
     ) -> ClaudeCodeEffortLevel? {
         suppliedEffortLevel
-            ?? ClaudeModelSpecifier(raw: model).explicitEffortLevel
+            ?? host.explicitEffortLevel(for: model)
             ?? fallbackEffortLevel
     }
 
