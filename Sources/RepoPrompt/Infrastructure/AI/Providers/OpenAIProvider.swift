@@ -563,11 +563,11 @@ package class OpenAIProvider: AIProvider {
         let fallbacks: [AIModel] = [.gpt41, .gpt5Low].filter { $0 != model }
         for fallback in fallbacks {
             do {
-                print("Falling back to \(fallback.displayName) in testAPIKey...")
+                print("Falling back to \(host.displayName(for: fallback)) in testAPIKey...")
                 let response = try await callAppropriateCompletion(for: fallback, message: testMessage, nil)
                 if response.lowercased().contains("hello") { return true }
             } catch {
-                print("Fallback model \(fallback.displayName) failed in testAPIKey: \(error)")
+                print("Fallback model \(host.displayName(for: fallback)) failed in testAPIKey: \(error)")
             }
         }
 
