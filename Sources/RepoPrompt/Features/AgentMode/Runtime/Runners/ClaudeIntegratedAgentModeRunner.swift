@@ -451,7 +451,7 @@ final class ClaudeIntegratedAgentModeRunner {
                 await hooks.transcript.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .rateLimit(info):
                 if session.selectedAgent == .claudeCode, let quotaLease {
-                    await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
+                    await quotaService.observe(info, lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
                 // Persist provider session ID as soon as it becomes available from

@@ -238,7 +238,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         let wire = #"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","resetsAt":1900000300}}"# + "\n"
         await controller.test_handleConfigurationStdoutChunk(Data(wire.utf8))
         await controller.shutdown()
-        var received: [ClaudeCompatiblePluginRateLimitInfo] = []
+        var received: [ClaudeProviderQuotaObservation] = []
         for await event in stream {
             switch event {
             case let .rateLimit(info): received.append(info)
@@ -249,8 +249,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(received.count, 1)
         XCTAssertEqual(received.first?.status, .allowed)
         XCTAssertNil(received.first?.utilization)
-        if let info = received.first {
-            let observation = ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info)
+        if let observation = received.first {
             XCTAssertEqual(observation.status, .allowed)
             XCTAssertEqual(observation.resetsAt, 1_900_000_300)
             XCTAssertNil(observation.utilization)

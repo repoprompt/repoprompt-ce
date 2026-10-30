@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
+import RepoPromptProviderQuota
 
 final actor ClaudeNativeProcessSessionController {
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
@@ -81,7 +82,7 @@ final actor ClaudeNativeProcessSessionController {
 
     enum Event {
         case stream(AIStreamResult)
-        case rateLimit(ClaudeCompatiblePluginRateLimitInfo)
+        case rateLimit(ClaudeProviderQuotaObservation)
         case runtimeInit(RuntimeInitStatus)
         case approvalRequest(AgentApprovalRequest)
         case approvalCancelled(requestID: String)
@@ -1561,7 +1562,7 @@ final actor ClaudeNativeProcessSessionController {
         if payload["type"] as? String == "rate_limit_event",
            let rateLimit = ClaudeCompatiblePluginRateLimitInfo.decodeEvent(data)
         {
-            emit(.rateLimit(rateLimit))
+            emit(.rateLimit(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: rateLimit)))
         }
         // Translation always runs, even when output has no host owner: it maintains
         // provider session/model and tool-invocation context.
