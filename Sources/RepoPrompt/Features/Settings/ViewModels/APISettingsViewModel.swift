@@ -1,6 +1,7 @@
 import Combine
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore

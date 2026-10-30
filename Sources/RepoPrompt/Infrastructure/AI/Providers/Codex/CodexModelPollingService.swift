@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCodexProvider
 
 protocol CodexModelListingClient: Sendable {
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel]

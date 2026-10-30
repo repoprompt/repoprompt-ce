@@ -16,6 +16,7 @@
       "source_root": "Sources/RepoPrompt",
       "allowed_dependencies": [
         "RepoPromptACPProviders",
+        "RepoPromptCodexProvider",
         "RepoPromptAIContracts",
         "CSwiftPCRE2",
         "RepoPromptC",
@@ -55,6 +56,16 @@
       "allowed_dependencies": [
         "RepoPromptCodeMapCore"
       ]
+    },
+    "RepoPromptCodexProvider": {
+      "source_root": "Sources/RepoPromptCodexProvider",
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared"],
+      "test_target": "RepoPromptCodexProviderTests",
+      "app_free_tests": true
+    },
+    "RepoPromptCodexProviderTests": {
+      "source_root": "Tests/RepoPromptCodexProviderTests",
+      "allowed_dependencies": ["RepoPromptCodexProvider", "RepoPromptShared"]
     },
     "RepoPromptACPProviders": {
       "source_root": "Sources/RepoPromptACPProviders",
@@ -277,6 +288,7 @@
       "source_root": "Tests/RepoPromptTests",
       "allowed_dependencies": [
         "RepoPromptACPProviders",
+        "RepoPromptCodexProvider",
         "RepoPromptAIContracts",
         "RepoPromptApp",
         "RepoPromptCodeMapCore",
@@ -337,6 +349,17 @@
     }
   },
   "moved_families": {
+    "CodexAppServerTransport": {
+      "owner": "RepoPromptCodexProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexAppServerClient.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProcessStderrCapture.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexAppServerLaunchHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProviderRuntime.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProcessConfiguration.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexCapabilitySettings.swift"
+      ]
+    },
     "DomainXMLDiffParser": {
       "owner": "RepoPromptDomainRuntime",
       "former_app_files": [

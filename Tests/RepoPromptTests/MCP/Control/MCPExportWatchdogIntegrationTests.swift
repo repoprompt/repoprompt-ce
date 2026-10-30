@@ -3,6 +3,7 @@ import Foundation
 import JSONSchema
 import MCP
 @testable import RepoPromptApp
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
