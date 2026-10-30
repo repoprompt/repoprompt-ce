@@ -1,45 +1,19 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
-import RepoPromptClaudeProvider
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptProcess
 
-struct HeadlessAgentContext {
-    let runID: UUID
-    let configURL: URL?
-    let configLease: MCPConfigLease?
-    /// Working directory for the agent. Defaults to temp directory to avoid macOS security popups.
-    let workingDirectory: String
-    let environment: [String: String]
-    let launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment?
-
-    init(
-        runID: UUID,
-        configURL: URL? = nil,
-        configLease: MCPConfigLease? = nil,
-        workingDirectory: String? = nil,
-        environment: [String: String],
-        launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment? = nil
-    ) {
-        self.runID = runID
-        self.configLease = configLease
-        self.configURL = configLease?.url ?? configURL
-        self.workingDirectory = workingDirectory ?? FileManager.default.temporaryDirectory.path
-        self.environment = environment
-        self.launchEnvironment = launchEnvironment
-    }
-}
-
-final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
+package final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     private let runner: CLIProcessRunner
     private let config: ClaudeCodeAgentConfig
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
-    private let configService: MCPConfigExportService
+    private let configService: any ClaudeHeadlessConfigPreparing
     private let serverReadiness: @Sendable () async -> Bool
     private let processStarted: @Sendable (pid_t) async -> Void
     private let cleanupStarted: @Sendable () async -> Void
-    private let toolTracking = AgentToolTrackingController()
+    private let host: any ClaudeHeadlessHosting
     private var streamTask: Task<Void, Never>?
 
     private var enableDebugLogging: Bool {
@@ -49,29 +23,36 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
     // Built-in tool policy is configured in ClaudeCodeAgentConfig.
     // Agent mode can run with native Bash enabled/disabled based on tool preferences.
 
-    init(
-        runner: CLIProcessRunner,
+    package init(
+        composedRunner runner: CLIProcessRunner,
         config: ClaudeCodeAgentConfig,
-        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
-        configService: MCPConfigExportService = .shared,
-        serverReadiness: @escaping @Sendable () async -> Bool = {
-            await ServerNetworkManager.shared.isRunning()
-        },
-        processStarted: @escaping @Sendable (pid_t) async -> Void = { _ in },
-        cleanupStarted: @escaping @Sendable () async -> Void = {}
+        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving,
+        configService: any ClaudeHeadlessConfigPreparing,
+        host: any ClaudeHeadlessHosting,
+        serverReadiness: @escaping @Sendable () async -> Bool,
+        processStarted: @escaping @Sendable (pid_t) async -> Void,
+        cleanupStarted: @escaping @Sendable () async -> Void
     ) {
         self.runner = runner
         self.config = config
         self.environmentResolver = environmentResolver
         self.configService = configService
+        self.host = host
         self.serverReadiness = serverReadiness
         self.processStarted = processStarted
         self.cleanupStarted = cleanupStarted
     }
 
+    #if DEBUG
+        /// The same immutable configuration consumed by buildArguments, not a second snapshot.
+        package var configurationForTesting: ClaudeCodeAgentConfig {
+            config
+        }
+    #endif
+
     // MARK: - HeadlessAgentProvider
 
-    func prepare(runID: UUID? = nil) async throws -> HeadlessAgentContext {
+    package func prepare(runID: UUID? = nil) async throws -> ClaudeHeadlessAgentContext {
         let actualRunID = runID ?? UUID()
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Preparing context for run \(actualRunID)")
@@ -90,7 +71,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: Preparing config file")
             }
-            let configLease = try await configService.prepareLaunchConfig()
+            let configLease = try await configService.prepareClaudeHeadlessLaunchConfig()
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: Config file at: \(configLease.url.path)")
             }
@@ -98,7 +79,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                 variant: config.runtimeVariant,
                 requestedModel: config.modelString
             )
-            return HeadlessAgentContext(
+            return ClaudeHeadlessAgentContext(
                 runID: actualRunID,
                 configLease: configLease,
                 environment: ProcessInfo.processInfo.environment,
@@ -117,8 +98,8 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         }
     }
 
-    func buildArguments(
-        context: HeadlessAgentContext,
+    package func buildArguments(
+        context: ClaudeHeadlessAgentContext,
         resumeSessionID: String? = nil,
         systemPromptOverride: String? = nil
     ) -> [String] {
@@ -128,7 +109,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging, let model = context.launchEnvironment?.effectiveModel {
             print("[DEBUG] ClaudeCodeAgent: Using model: \(model)")
         }
-        let args = ClaudeCompatibleProviderRuntimeBridge.buildHeadlessArguments(
+        let args = host.buildArguments(
             config: config,
             context: context,
             resumeSessionID: resumeSessionID,
@@ -140,7 +121,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         return args
     }
 
-    func parseStreamEvents(_ lineData: Data) throws -> [AgentStreamEvent] {
+    package func parseStreamEvents(_ lineData: Data) throws -> [AgentStreamEvent] {
         guard let trimmed = trimmedASCIIWhitespace(lineData), !trimmed.isEmpty else { return [] }
         let raw = try JSONSerialization.jsonObject(with: trimmed)
         if let json = raw as? [String: Any] {
@@ -198,7 +179,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                             events.append(.message(content: text, reasoning: nil))
                         }
                     case "thinking":
-                        guard ClaudeReasoningExtractionFeature.isEnabled else { continue }
+                        guard host.isReasoningExtractionEnabled() else { continue }
                         if let thinking = block["thinking"] as? String, !thinking.isEmpty {
                             events.append(.message(content: "", reasoning: thinking))
                         }
@@ -226,7 +207,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             } else {
                 // Fallback to old format for compatibility
                 let content = ClaudeEventParser.extractString(json["content"]) ?? ""
-                let reasoning = ClaudeReasoningExtractionFeature.isEnabled ? ClaudeEventParser.extractString(json["reasoning"]) : nil
+                let reasoning = host.isReasoningExtractionEnabled() ? ClaudeEventParser.extractString(json["reasoning"]) : nil
                 if !content.isEmpty || reasoning != nil {
                     return [.message(content: content, reasoning: reasoning)]
                 }
@@ -258,7 +239,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                 guard let text = delta["text"] as? String, !text.isEmpty else { return [] }
                 return [.message(content: text, reasoning: nil)]
             case "thinking_delta":
-                guard ClaudeReasoningExtractionFeature.isEnabled else { return [] }
+                guard host.isReasoningExtractionEnabled() else { return [] }
                 guard let thinking = delta["thinking"] as? String, !thinking.isEmpty else { return [] }
                 return [.message(content: "", reasoning: thinking)]
             default:
@@ -342,7 +323,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         }
     }
 
-    func cleanup(context: HeadlessAgentContext) async {
+    package func cleanup(context: ClaudeHeadlessAgentContext) async {
         await cleanupStarted()
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Cleaning up context \(context.runID)")
@@ -358,7 +339,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
 
     // MARK: - Streaming
 
-    func streamAgentMessage(_ message: AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamAgentMessage(_ message: RepoPromptDomainRuntime.AgentMessage, runID: UUID? = nil) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         AsyncThrowingStream { continuation in
             // Cancel any previous lingering task (defensive)
             self.streamTask?.cancel()
@@ -372,19 +353,15 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                         try await AsyncScope.withCleanup({}, cleanup: {
                             await self.cleanup(context: context)
                         }) {
-                            let nativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
-                            let userMessage = ClaudeCompatibleProviderRuntimeBridge.providerBoundUserMessage(
-                                message.userMessage,
-                                instructions: message.systemPrompt,
-                                delivery: nativePromptMode
-                            )
+                            let nativePromptMode = self.host.currentPromptDelivery()
+                            let userMessage = nativePromptMode.userMessage(message.userMessage, message.systemPrompt)
                             if self.enableDebugLogging {
                                 print("[DEBUG] ClaudeCodeAgent: User message length: \(userMessage.count)")
                             }
                             let args = self.buildArguments(
                                 context: context,
                                 resumeSessionID: message.resumeSessionID,
-                                systemPromptOverride: nativePromptMode.nativeSystemPromptOverride(instructions: message.systemPrompt)
+                                systemPromptOverride: nativePromptMode.nativeSystemPromptOverride(message.systemPrompt)
                             )
 
                             if self.enableDebugLogging {
@@ -394,7 +371,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                 context.launchEnvironment?.environmentOverrides ?? [:]
                             ) { _, resolverValue in resolverValue }
                             let expectedPIDRunID = context.runID
-                            let expectedPIDClientName = self.config.runtimeVariant.agentKind.mcpClientNameHint
+                            let expectedPIDClientName = self.host.expectedClientName(for: self.config.runtimeVariant)
                             let stream = try await self.runner.runStreaming(
                                 args: args,
                                 stdin: userMessage, // Pass the user message via stdin
@@ -404,9 +381,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                 additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
                                 onProcessStarted: { pid in
                                     if let expectedPIDClientName {
-                                        await ServerNetworkManager.shared.registerExpectedAgentPID(
+                                        await self.host.registerExpectedAgentPID(
                                             pid,
-                                            for: expectedPIDClientName,
+                                            clientName: expectedPIDClientName,
                                             runID: expectedPIDRunID
                                         )
                                     }
@@ -414,22 +391,22 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                 },
                                 onProcessTerminated: { pid in
                                     guard let expectedPIDClientName else { return }
-                                    await ServerNetworkManager.shared.clearExpectedAgentPID(
+                                    await self.host.clearExpectedAgentPID(
                                         pid,
-                                        for: expectedPIDClientName,
+                                        clientName: expectedPIDClientName,
                                         runID: expectedPIDRunID
                                     )
                                 }
                             )
                             try await AsyncScope.withCleanup({}, cleanup: {
                                 await self.runner.cancelAll()
-                                await self.toolTracking.stopTracking()
+                                await self.host.stopTracking()
                             }) {
                                 if self.enableDebugLogging {
                                     print("[DEBUG] ClaudeCodeAgent: CLI process streaming started")
                                 }
 
-                                self.toolTracking.startTracking(
+                                self.host.startTracking(
                                     runID: context.runID,
                                     clientNameHint: "claude-code",
                                     continuation: continuation
@@ -568,7 +545,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         }
     }
 
-    func dispose() async {
+    package func dispose() async {
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Disposing provider, cancelling stream task & runners")
         }
@@ -645,7 +622,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         return error
     }
 
-    func extractCLIErrorDetail(fromStdout data: Data) -> String? {
+    package func extractCLIErrorDetail(fromStdout data: Data) -> String? {
         guard !data.isEmpty else { return nil }
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

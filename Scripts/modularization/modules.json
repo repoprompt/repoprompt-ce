@@ -62,7 +62,7 @@
     },
     "RepoPromptClaudeProvider": {
       "source_root": "Sources/RepoPromptClaudeProvider",
-      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess", "RepoPromptProviderQuota"],
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptProcess", "RepoPromptProviderQuota"],
       "test_target": "RepoPromptClaudeProviderTests",
       "app_free_tests": true
     },

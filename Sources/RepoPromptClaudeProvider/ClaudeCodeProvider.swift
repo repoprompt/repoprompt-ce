@@ -4,10 +4,7 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 
-package protocol ClaudeCLIConfigLease: Sendable {
-    var url: URL { get }
-    func release()
-}
+package typealias ClaudeCLIConfigLease = LaunchConfigLease
 
 package protocol ClaudeCLIConfigPreparing: Actor {
     func prepareClaudeEmptyLaunchConfig() throws -> any ClaudeCLIConfigLease

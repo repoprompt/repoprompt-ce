@@ -202,10 +202,10 @@ The Agent Mode side of the bridge ships three small adapters under `Sources/Repo
 - Today the factory returns a `ClaudeNativeProcessSessionController` (core-owned process control). A future slice can replace the factory body with a package-driven controller without changing the adapter's public shape.
 - `AgentModeViewModel.makeClaudeCompatibleNativeController(...)` is the single call site that constructs and hands the adapter to `ClaudeAgentModeCoordinator`.
 
-### `ClaudeCompatibleHeadlessProviderAdapter`
+### Canonical Claude headless provider
 
-- Wraps a concrete `HeadlessAgentProvider` (currently `ClaudeCodeAgentProvider`) and carries a `ClaudeCompatiblePluginRuntimeConfig` for parity with the interactive adapter.
-- `AgentRuntimeProviderService.makeProvider(...)` branches for `.claudeCode | .claudeCodeGLM | .kimiCode | .customClaudeCompatible` build the underlying provider and wrap it in this adapter. Non-Claude providers (Codex, Gemini, OpenCode, Cursor) bypass the adapter.
+- `AgentRuntimeProviderService.makeProvider(...)` returns `ClaudeCodeAgentProvider` directly for `.claudeCode | .claudeCodeGLM | .kimiCode | .customClaudeCompatible`; the delegation-only `ClaudeCompatibleHeadlessProviderAdapter` is retired.
+- App composition supplies synchronous policy and the existing MCP tool tracker; the provider retains process, stream-task, and cleanup ownership. The feature facade still delegates package-value translation through the infrastructure bridge.
 
 ### `ClaudeCompatibleModelCatalogAdapter`
 
