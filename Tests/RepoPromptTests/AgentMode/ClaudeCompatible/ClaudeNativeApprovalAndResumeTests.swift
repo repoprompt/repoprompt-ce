@@ -1045,11 +1045,11 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             "permission_suggestions": [["type": "tool", "name": "mcp__RepoPromptCE__read_file"]]
         ]
 
-        let match = try XCTUnwrap(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+        let match = try XCTUnwrap(ClaudeNativeSessionAppHost().repoPromptPermissionMatch(
             toolName: "mcp__RepoPromptCE__read_file",
             requestPayload: repoPromptPayload
         ))
-        XCTAssertEqual(match.source, .topLevelToolName)
+        XCTAssertEqual(match.source, MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch.Source.topLevelToolName.rawValue)
         XCTAssertEqual(match.normalizedToolName, "read_file")
 
         let allowOnce = ClaudeNativeProcessSessionController.allowPermissionResponsePayload(
@@ -1068,7 +1068,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual((allowForSession["updatedPermissions"] as? [[String: Any]])?.first?["name"] as? String, "mcp__RepoPromptCE__read_file")
 
         // A RepoPrompt permission suggestion must not authorize a different actual invocation.
-        XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+        XCTAssertNil(ClaudeNativeSessionAppHost().repoPromptPermissionMatch(
             toolName: "Bash",
             requestPayload: [
                 "permission_suggestions": [["rules": [["toolName": "mcp__RepoPromptCE__read_file"]]]]
@@ -1087,15 +1087,15 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 "tool_use_id": toolUseID,
                 "input": ["op": operation]
             ]
-            XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+            XCTAssertNil(ClaudeNativeSessionAppHost().repoPromptPermissionMatch(
                 toolName: tool,
                 requestPayload: ["tool_name": tool, "input": ["op": operation]]
             ), "bare top-level name without provenance: \(tool)")
-            let match = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+            let match = ClaudeNativeSessionAppHost().repoPromptPermissionMatch(
                 toolName: qualifiedTool,
                 requestPayload: payload
             )
-            XCTAssertEqual(match?.source, .topLevelToolName, tool)
+            XCTAssertEqual(match?.source, MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch.Source.topLevelToolName.rawValue, tool)
             XCTAssertEqual(match?.normalizedToolName, tool, tool)
 
             let response = ClaudeNativeProcessSessionController.allowPermissionResponsePayload(
@@ -1108,15 +1108,15 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             XCTAssertNil(response["updatedPermissions"], tool)
         }
 
-        let metadataMatch = ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+        let metadataMatch = ClaudeNativeSessionAppHost().repoPromptPermissionMatch(
             toolName: "",
             requestPayload: ["server_name": "RepoPromptCE"]
         )
-        XCTAssertEqual(metadataMatch?.source, .serverIdentifier)
+        XCTAssertEqual(metadataMatch?.source, MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch.Source.serverIdentifier.rawValue)
         XCTAssertEqual(metadataMatch?.serverIdentifier, "RepoPromptCE")
         XCTAssertNil(metadataMatch?.normalizedToolName)
 
-        XCTAssertNil(ClaudeNativeProcessSessionController.repoPromptPermissionAutoApprovalMatch(
+        XCTAssertNil(ClaudeNativeSessionAppHost().repoPromptPermissionMatch(
             toolName: "Bash",
             requestPayload: ["input": ["command": "rm -rf /tmp/example"]]
         ))

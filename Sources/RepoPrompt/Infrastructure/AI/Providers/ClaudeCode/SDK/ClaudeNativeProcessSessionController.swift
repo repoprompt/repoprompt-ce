@@ -221,7 +221,7 @@ final actor ClaudeNativeProcessSessionController {
     private func scheduleExpectedAgentPIDDeinitClearIfNeeded() {
         guard config.toolContext == .agentRun,
               let registeredExpectedAgentPID,
-              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
         else {
             return
         }
@@ -670,7 +670,7 @@ final actor ClaudeNativeProcessSessionController {
         let resolvedCommand = CommandPathResolver.resolve(
             config.commandName,
             environment: environment,
-            additionalPaths: CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints),
+            additionalPaths: host.supplementedPathHints(config.additionalPathHints),
             logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : nil,
             preferredBasenames: [config.commandName]
         )
@@ -684,7 +684,7 @@ final actor ClaudeNativeProcessSessionController {
             model: nil
         )
         #if DEBUG
-            arguments += ClaudeStatusLineCompatibilityProbe.claimSettingsArguments(
+            arguments += host.debugStatusLineArguments(
                 launchArguments: ProcessInfo.processInfo.arguments,
                 isFirstParty: launchEnvironment.backend == .defaultClaude,
                 providerArguments: arguments
@@ -2085,7 +2085,7 @@ final actor ClaudeNativeProcessSessionController {
             let payload = request.request
             let toolName = (payload["tool_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let input = payload["input"] as? [String: Any] ?? [:]
-            if let repoPromptMatch = Self.repoPromptPermissionAutoApprovalMatch(toolName: toolName, requestPayload: payload) {
+            if let repoPromptMatch = host.repoPromptPermissionMatch(toolName: toolName, requestPayload: payload) {
                 do {
                     let allowResponse = Self.allowPermissionResponsePayload(
                         pendingRequest: payload,
@@ -2094,7 +2094,7 @@ final actor ClaudeNativeProcessSessionController {
                     writeRawEventLogRecord(kind: "approval.autoApprove.repoPrompt", payload: [
                         "requestID": request.requestID,
                         "toolName": toolName,
-                        "matchSource": repoPromptMatch.source.rawValue,
+                        "matchSource": repoPromptMatch.source,
                         "normalizedToolName": repoPromptMatch.normalizedToolName ?? NSNull(),
                         "serverIdentifier": repoPromptMatch.serverIdentifier ?? NSNull(),
                         "response": allowResponse
@@ -2441,23 +2441,6 @@ final actor ClaudeNativeProcessSessionController {
         return payload
     }
 
-    nonisolated static func shouldAutoApproveRepoPromptPermissionRequest(
-        toolName: String,
-        input: [String: Any]
-    ) -> Bool {
-        repoPromptPermissionAutoApprovalMatch(toolName: toolName, requestPayload: input) != nil
-    }
-
-    nonisolated static func repoPromptPermissionAutoApprovalMatch(
-        toolName: String,
-        requestPayload: [String: Any]
-    ) -> MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch? {
-        MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-            requestToolName: toolName,
-            requestPayload: requestPayload
-        )
-    }
-
     private func resolvedWorkingDirectory() -> String {
         let trimmedWorkspace = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmedWorkspace, !trimmedWorkspace.isEmpty {
@@ -2468,7 +2451,7 @@ final actor ClaudeNativeProcessSessionController {
 
     private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {
         guard config.toolContext == .agentRun,
-              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
         else {
             return
         }
@@ -2488,7 +2471,7 @@ final actor ClaudeNativeProcessSessionController {
 
     private func clearExpectedAgentPIDIfNeeded() async {
         guard let registeredExpectedAgentPID,
-              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
         else {
             return
         }
@@ -2528,10 +2511,7 @@ final actor ClaudeNativeProcessSessionController {
                 enableDebugLogging: config.enableDebugLogging
             )
         )
-        let filtered = await ProviderEnvironmentFiltering.filter(
-            result.environment,
-            for: config.runtimeVariant.agentKind
-        )
+        let filtered = await host.filterEnvironment(result.environment, variant: config.runtimeVariant)
         return effectiveLaunchEnvironment(
             base: filtered,
             resolverOverrides: resolverOverrides,
@@ -2564,7 +2544,7 @@ final actor ClaudeNativeProcessSessionController {
             env,
             additionalRemovedKeys: Set(["NODE_OPTIONS"]).union(resolverRemovedKeys)
         )
-        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: sanitized)
+        return host.mergeCurrentCarrier(into: sanitized)
     }
 
     private func recordObservedSessionID(_ candidate: String?) {
