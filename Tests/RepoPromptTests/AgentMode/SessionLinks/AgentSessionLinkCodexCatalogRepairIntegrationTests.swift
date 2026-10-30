@@ -5,6 +5,7 @@ import MCP
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore

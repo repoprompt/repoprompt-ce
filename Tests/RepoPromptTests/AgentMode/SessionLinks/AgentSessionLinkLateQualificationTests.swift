@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptShared
 import XCTest

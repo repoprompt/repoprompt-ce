@@ -61,7 +61,7 @@
     },
     "RepoPromptClaudeProvider": {
       "source_root": "Sources/RepoPromptClaudeProvider",
-      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"]
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess", "RepoPromptProviderQuota"]
     },
     "RepoPromptAgentProviderContracts": {
       "source_root": "Sources/RepoPromptAgentProviderContracts",
@@ -369,6 +369,16 @@
     }
   },
   "moved_families": {
+    "ClaudeNativeSessionExecution": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeProcessSessionController.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeSessionHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeTurnCorrelation.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeSDKNDJSONTranslator.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeSDKProtocolCodec.swift"
+      ]
+    },
     "ClaudeNativeLaunchEnvironmentResolving": {
       "owner": "RepoPromptClaudeProvider",
       "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeLaunchEnvironmentResolving.swift"]

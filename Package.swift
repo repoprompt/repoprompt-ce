@@ -154,6 +154,7 @@ let package = Package(
                 "RepoPromptAgentProviderContracts",
                 "RepoPromptAIContracts",
                 "RepoPromptDomainRuntime",
+                "RepoPromptProcess",
                 "RepoPromptProviderQuota",
                 .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
             ],

@@ -4,6 +4,7 @@ import JSONSchema
 import MCP
 import RepoPromptAgentProviderContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation

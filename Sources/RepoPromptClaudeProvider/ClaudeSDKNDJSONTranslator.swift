@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 
 /// Core compatibility facade for Claude SDK NDJSON translation.

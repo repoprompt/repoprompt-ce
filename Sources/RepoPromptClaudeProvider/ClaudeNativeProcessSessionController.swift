@@ -2,7 +2,6 @@ import Darwin
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
-import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
