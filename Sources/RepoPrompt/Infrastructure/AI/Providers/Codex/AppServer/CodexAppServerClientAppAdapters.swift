@@ -3,6 +3,12 @@ import RepoPromptCodexProvider
 import RepoPromptProcess
 
 extension CodexAppServerClient {
+    #if DEBUG
+        static func testProcessEnvironmentForCurrentLaunch(baseEnvironment: [String: String]) -> [String: String] {
+            DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: baseEnvironment)
+        }
+    #endif
+
     init(
         writeFrameHandler: @escaping @Sendable (Int32, Data) throws -> Void = { descriptor, frame in
             try FDWriteSupport.writeAll(frame, to: descriptor)
@@ -80,24 +86,29 @@ struct CodexAppServerAppLaunchHost: CodexAppServerLaunchHost {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
     }
 
-    func resolveRuntime(commandName: String, additionalPathHints: [String], enableDebugLogging: Bool) async -> CodexAppServerRuntimeResolution {
+    func buildEnvironment(enableDebugLogging: Bool) async -> [String: String] {
         let environmentResult = await processEnvironmentBuilder(
             ProcessEnvironmentRequest(purpose: .codexAppServer, enableDebugLogging: enableDebugLogging)
         )
-        let environment = environmentResult.environment
-        let probeEnvironment = await ProviderEnvironmentFiltering.filter(environment, for: .codexExec)
-        let resolution = CodexProviderHelpers.resolveCodexExecutable(
+        return environmentResult.environment
+    }
+
+    func resolveRuntime(commandName: String, environment: [String: String], additionalPathHints: [String], enableDebugLogging: Bool) -> CodexProviderExecutableResolution {
+        CodexProviderHelpers.resolveCodexExecutable(
             commandName: commandName,
-            environment: probeEnvironment,
+            environment: environment,
             additionalPathHints: additionalPathHints,
             launchSnapshot: launchSnapshot,
             logger: enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
         )
-        return CodexAppServerRuntimeResolution(environment: environment, resolution: resolution)
     }
 
     func prepareState(for runtime: CodexProviderRuntime.Runtime) throws {
         try runtimeStatePreparer(runtime)
+    }
+
+    func processEnvironmentForCurrentLaunch(_ baseEnvironment: [String: String]) -> [String: String] {
+        DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: baseEnvironment)
     }
 
     func filterEnvironment(_ environment: [String: String], explicitOverrides: [String: String]) async -> [String: String] {

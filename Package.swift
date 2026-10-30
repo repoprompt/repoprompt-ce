@@ -146,7 +146,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptCodexProvider",
-            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared"],
+            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared"],
             path: "Sources/RepoPromptCodexProvider",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),

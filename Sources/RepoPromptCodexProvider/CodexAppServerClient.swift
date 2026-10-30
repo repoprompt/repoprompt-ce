@@ -3,6 +3,7 @@ import Darwin.POSIX.fcntl
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptMCPCore
 import RepoPromptProcess
 import RepoPromptProviderQuota
 import RepoPromptShared
@@ -515,13 +516,14 @@ package actor CodexAppServerClient {
             return runtime
         }
 
-        let resolved = await launchHost.resolveRuntime(
+        var environment = await launchHost.buildEnvironment(enableDebugLogging: config.enableDebugLogging)
+        let probeEnvironment = await launchHost.filterEnvironment(environment, explicitOverrides: [:])
+        let resolution = launchHost.resolveRuntime(
             commandName: config.commandName,
+            environment: probeEnvironment,
             additionalPathHints: config.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging
         )
-        var environment = resolved.environment
-        let resolution = resolved.resolution
         guard resolution.status == .available else {
             throw ClientError.executableUnavailable(resolution.userMessage)
         }
@@ -546,20 +548,6 @@ package actor CodexAppServerClient {
             )
         }
     }
-
-    private static func processEnvironmentForCurrentLaunch(
-        _ baseEnvironment: [String: String]
-    ) -> [String: String] {
-        DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: baseEnvironment)
-    }
-
-    #if DEBUG
-        package static func testProcessEnvironmentForCurrentLaunch(
-            baseEnvironment: [String: String]
-        ) -> [String: String] {
-            processEnvironmentForCurrentLaunch(baseEnvironment)
-        }
-    #endif
 
     package func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
         expectedAgentPIDRegistration = registration
@@ -1583,7 +1571,7 @@ package actor CodexAppServerClient {
             launchContext.environment,
             explicitOverrides: resolution.environmentOverrides
         )
-        let environment = Self.processEnvironmentForCurrentLaunch(filtered)
+        let environment = launchHost.processEnvironmentForCurrentLaunch(filtered)
         var processOverrides = try launchHost.baseProcessArguments(
             runtime: runtime,
             provisionsRepoPromptMCP: provisionsRepoPromptMCPOnStart,

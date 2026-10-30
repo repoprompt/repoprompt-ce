@@ -89,7 +89,7 @@ final class CodexAppServerTransportOwnerTests: XCTestCase {
             msg = json.loads(line)
             if msg.get('method') == 'initialize':
                 with open(os.environ['OBSERVATIONS'], 'w') as f:
-                    json.dump({'args':sys.argv[1:], 'home':os.environ.get('CODEX_HOME'), 'request':msg}, f)
+                    json.dump({'args':sys.argv[1:], 'home':os.environ.get('CODEX_HOME'), 'carrier':os.environ.get('FIXTURE_CARRIER'), 'request':msg}, f)
             if 'id' in msg:
                 print(json.dumps({'id':msg['id'], 'result':{}}), flush=True)
         """
@@ -124,8 +124,12 @@ final class CodexAppServerTransportOwnerTests: XCTestCase {
         _ = try await client.prepareRuntimeForLaunch()
         let prepareCount = try String(contentsOf: root.appendingPathComponent("prepares"), encoding: .utf8)
         XCTAssertEqual(prepareCount, "xx")
-        try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
-            let start = Task { try await client.startIfNeeded() }
+        try await FixtureCodexLaunchContext.$carrier.withValue("launch-carrier") {
+            let start = Task {
+                try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) {
+                    try await client.startIfNeeded()
+                }
+            }
             var entry = entered.stream.makeAsyncIterator()
             _ = await entry.next()
             try "after".write(to: fresh, atomically: true, encoding: .utf8)
@@ -142,6 +146,7 @@ final class CodexAppServerTransportOwnerTests: XCTestCase {
         let object = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: observations)) as? [String: Any])
         XCTAssertEqual(object["args"] as? [String], ["base-computer-use=false", "fresh=after", "app-server"])
         XCTAssertEqual(object["home"] as? String, root.appendingPathComponent("owned").path)
+        XCTAssertEqual(object["carrier"] as? String, "launch-carrier")
         let request = try XCTUnwrap(object["request"] as? [String: Any])
         let params = try XCTUnwrap(request["params"] as? [String: Any])
         let info = try XCTUnwrap(params["clientInfo"] as? [String: Any])
@@ -155,9 +160,44 @@ final class CodexAppServerTransportOwnerTests: XCTestCase {
         released.continuation.finish()
     }
 
+    func testRuntimeResolutionReadsCurrentConfigurationAfterEnvironmentAwaits() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entered = AsyncStream<Void>.makeStream()
+        let released = AsyncStream<Void>.makeStream()
+        let client = CodexAppServerClient(
+            launchHost: FixtureCodexLaunchHost(root: root, executable: root.appendingPathComponent("unused"), environmentPreparation: {
+                entered.continuation.yield(())
+                for await _ in released.stream {
+                    break
+                }
+            }),
+            expectedAgentPIDRegistrar: .init(register: { _, _, _ in XCTFail("unexpected registration") }, clear: { _, _, _ in XCTFail("unexpected clearance") })
+        )
+        await client.updateConfig(.init(commandName: "before", additionalPathHints: ["before-hint"]))
+        let preparation = Task { try await client.prepareRuntimeForLaunch() }
+        var entry = entered.stream.makeAsyncIterator()
+        _ = await entry.next()
+        await client.updateConfig(.init(commandName: "after", additionalPathHints: ["after-hint"], enableDebugLogging: true))
+        released.continuation.yield(())
+        _ = try await preparation.value
+        let request = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(contentsOf: root.appendingPathComponent("resolution.json"))) as? [String: Any])
+        XCTAssertEqual(request["command"] as? String, "after")
+        XCTAssertEqual(request["hints"] as? [String], ["after-hint"])
+        XCTAssertEqual(request["debug"] as? Bool, true)
+        entered.continuation.finish()
+        released.continuation.finish()
+        await client.stop()
+    }
+
     private func beginRequest(_ client: CodexAppServerClient, method: String) -> Task<[String: Any], Error> {
         Task { try await client.request(method: method, params: nil, timeout: 120, useDefaultTimeout: false) }
     }
+}
+
+private enum FixtureCodexLaunchContext {
+    @TaskLocal static var carrier: String?
 }
 
 private struct FixtureCodexLaunchHost: CodexAppServerLaunchHost {
@@ -167,7 +207,24 @@ private struct FixtureCodexLaunchHost: CodexAppServerLaunchHost {
         "fixture-app-version"
     }
 
-    func resolveRuntime(commandName: String, additionalPathHints: [String], enableDebugLogging: Bool) async -> CodexAppServerRuntimeResolution {
+    let environmentPreparation: (@Sendable () async -> Void)?
+
+    init(root: URL, executable: URL, environmentPreparation: (@Sendable () async -> Void)? = nil) {
+        self.root = root
+        self.executable = executable
+        self.environmentPreparation = environmentPreparation
+    }
+
+    func buildEnvironment(enableDebugLogging: Bool) async -> [String: String] {
+        await environmentPreparation?()
+        return ["PATH": "/usr/bin:/bin", "OBSERVATIONS": root.appendingPathComponent("observed.json").path, "CODEX_HOME": "untrusted-home"]
+    }
+
+    func resolveRuntime(commandName: String, environment: [String: String], additionalPathHints: [String], enableDebugLogging: Bool) -> CodexProviderExecutableResolution {
+        let request: [String: Any] = ["command": commandName, "hints": additionalPathHints, "debug": enableDebugLogging]
+        if let data = try? JSONSerialization.data(withJSONObject: request) {
+            try? data.write(to: root.appendingPathComponent("resolution.json"))
+        }
         let resolutionLog = root.appendingPathComponent("resolutions")
         let old = (try? String(contentsOf: resolutionLog, encoding: .utf8)) ?? ""
         try? (old + "x").write(to: resolutionLog, atomically: true, encoding: .utf8)
@@ -177,10 +234,7 @@ private struct FixtureCodexLaunchHost: CodexAppServerLaunchHost {
             source: .externalOverride,
             statePaths: .init(codexHome: root.appendingPathComponent("owned"), sqliteHome: root.appendingPathComponent("sqlite"))
         )
-        return .init(
-            environment: ["PATH": "/usr/bin:/bin", "OBSERVATIONS": root.appendingPathComponent("observed.json").path, "CODEX_HOME": "untrusted-home"],
-            resolution: .init(commandName: commandName, resolvedCommand: executable.path, status: .available, runtime: runtime, userMessage: "", debugMessage: "")
-        )
+        return .init(commandName: commandName, resolvedCommand: executable.path, status: .available, runtime: runtime, userMessage: "", debugMessage: "")
     }
 
     func prepareState(for runtime: CodexProviderRuntime.Runtime) throws {
@@ -190,8 +244,14 @@ private struct FixtureCodexLaunchHost: CodexAppServerLaunchHost {
         try (old + "x").write(to: path, atomically: true, encoding: .utf8)
     }
 
+    func processEnvironmentForCurrentLaunch(_ baseEnvironment: [String: String]) -> [String: String] {
+        baseEnvironment.merging(["FIXTURE_CARRIER": FixtureCodexLaunchContext.carrier ?? "missing"]) { _, current in current }
+    }
+
     func filterEnvironment(_ environment: [String: String], explicitOverrides: [String: String]) async -> [String: String] {
-        XCTAssertEqual(environment["CODEX_HOME"], explicitOverrides["CODEX_HOME"])
+        if !explicitOverrides.isEmpty {
+            XCTAssertEqual(environment["CODEX_HOME"], explicitOverrides["CODEX_HOME"])
+        }
         return environment
     }
 

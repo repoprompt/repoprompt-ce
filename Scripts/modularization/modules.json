@@ -59,7 +59,7 @@
     },
     "RepoPromptCodexProvider": {
       "source_root": "Sources/RepoPromptCodexProvider",
-      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared"],
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared"],
       "test_target": "RepoPromptCodexProviderTests",
       "app_free_tests": true
     },
