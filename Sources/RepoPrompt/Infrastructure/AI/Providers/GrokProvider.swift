@@ -1,3 +1,5 @@
+import RepoPromptAIContracts
+
 //
 //  GrokProvider.swift
 //  RepoPrompt

@@ -1,3 +1,5 @@
+import RepoPromptAIContracts
+
 //
 //  FireworksProvider.swift
 //  RepoPrompt

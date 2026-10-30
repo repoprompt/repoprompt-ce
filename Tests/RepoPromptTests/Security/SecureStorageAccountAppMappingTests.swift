@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 @testable import RepoPromptApp
 @testable import RepoPromptSecureStorage
 import XCTest

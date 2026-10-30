@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 
 final class ZAIProvider: OpenAIProvider {
     enum Endpoint: Equatable {

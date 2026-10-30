@@ -148,8 +148,13 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptAgentProviderContracts",
-            dependencies: ["RepoPromptDomainRuntime", "RepoPromptProviderQuota"],
+            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"],
             path: "Sources/RepoPromptAgentProviderContracts"
+        ),
+        .testTarget(
+            name: "RepoPromptAgentProviderContractsTests",
+            dependencies: ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
+            path: "Tests/RepoPromptAgentProviderContractsTests"
         ),
         .target(
             name: "RepoPromptCodexProvider",

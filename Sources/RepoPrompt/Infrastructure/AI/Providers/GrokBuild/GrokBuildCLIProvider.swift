@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
 /// Grok Build CLI provider for non-agent use (chat, Oracle, AI queries).

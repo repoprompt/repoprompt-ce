@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
 /// OpenCode CLI provider for non-agent use (chat, Oracle, AI queries) backed by ACP.

@@ -1,3 +1,6 @@
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
+
 //
 //  DisposableProviderPool.swift
 //  RepoPrompt

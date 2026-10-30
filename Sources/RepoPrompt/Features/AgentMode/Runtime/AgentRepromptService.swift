@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// A stateless, tool-less side call. Inputs are text, a cheap manifest and optional bounded excerpts.

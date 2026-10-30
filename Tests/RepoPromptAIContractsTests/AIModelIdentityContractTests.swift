@@ -1,5 +1,5 @@
 import Foundation
-import RepoPromptApp
+import RepoPromptAIContracts
 import XCTest
 
 final class AIModelIdentityContractTests: XCTestCase {

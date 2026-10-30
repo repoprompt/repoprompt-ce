@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptAIContracts
 
 public enum AIModel: Equatable, Hashable {
     /// OpenAI Models

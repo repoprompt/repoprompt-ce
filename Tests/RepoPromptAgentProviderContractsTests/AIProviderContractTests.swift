@@ -1,5 +1,6 @@
 import Foundation
-import RepoPromptApp
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import XCTest
 

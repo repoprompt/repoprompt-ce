@@ -1,3 +1,5 @@
+import RepoPromptAIContracts
+
 //
 //  DeepseekProvider.swift
 //  RepoPrompt
