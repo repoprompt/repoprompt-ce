@@ -689,6 +689,7 @@
         "sortDirection": ["desc"],
         "itemsView": ["notLoaded", "full"]
       },
+      "maySend": ["cursor"],
       "responseSchema": "v2/ThreadTurnsListResponse.json",
       "consumedResponse": [
         {

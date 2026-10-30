@@ -2480,7 +2480,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private weak var oracleViewModel: OracleViewModel?
     var repromptService: AgentRepromptService?
     let repromptUIStore = AgentRepromptUIStore()
-    var repromptEnabled = false
+    /// Unsaved tabs without a workspace keep activation only for this window.
+    var unscopedRepromptEnabled = false
     var repromptDispatchTexts: [UUID: String] = [:]
     var repromptDispatchOriginals: [UUID: String] = [:]
     var repromptOperation: AgentRepromptOperation?

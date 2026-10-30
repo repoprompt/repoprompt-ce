@@ -302,6 +302,15 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings()
     }
 
+    package func setWorkspaceAgentRepromptEnabled(workspaceID: UUID, enabled: Bool) {
+        var settings = workspaceAgentModelsSettings(for: workspaceID)
+        guard (settings.agentRepromptEnabled ?? false) != enabled else { return }
+        settings.agentRepromptEnabled = enabled ? true : nil
+        agentModelsSettingsByWorkspaceID[workspaceID] = settings
+        save()
+        postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
+    }
+
     package func setWorkspaceAgentModelsInheritanceMode(
         workspaceID: UUID,
         mode: AgentModelsInheritanceMode
@@ -338,7 +347,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         let normalized = normalizedAgentModelsProfile(profile)
         let settings = WorkspaceAgentModelsSettings(
             inheritanceMode: existing?.inheritanceMode ?? .useWorkspaceOverrides,
-            profile: normalized
+            profile: normalized,
+            agentRepromptEnabled: existing?.agentRepromptEnabled
         )
         agentModelsSettingsByWorkspaceID[workspaceID] = settings
         recordAgentModelsProfileWriteDiagnostic(
@@ -522,7 +532,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             let normalized = normalizedAgentModelsProfile(profile)
             agentModelsSettingsByWorkspaceID[workspaceID] = WorkspaceAgentModelsSettings(
                 inheritanceMode: .useWorkspaceOverrides,
-                profile: normalized
+                profile: normalized,
+                agentRepromptEnabled: agentModelsSettingsByWorkspaceID[workspaceID]?.agentRepromptEnabled
             )
             recordAgentModelsProfileWriteDiagnostic(
                 scope: .workspace,

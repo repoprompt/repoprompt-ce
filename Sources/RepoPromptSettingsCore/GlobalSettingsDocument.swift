@@ -97,7 +97,9 @@ package struct GlobalSettingsDocument: Codable {
     package static let autoEffortServiceSchemaVersion = 12
     package static let routingProfileUpdatePreferenceSchemaVersion = 12
     package static let agentRepromptGuidanceSchemaVersion = 13
-    package static let currentSchemaVersion = 13
+    /// Workspace activation must survive writes by older Re-prompt-aware codecs.
+    package static let workspaceRepromptActivationSchemaVersion = 14
+    package static let currentSchemaVersion = 14
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -195,6 +197,9 @@ package struct GlobalSettingsDocument: Codable {
         }
         if hasGlobalReprompt || hasWorkspaceReprompt {
             requiredVersion = max(requiredVersion, Self.agentRepromptGuidanceSchemaVersion)
+        }
+        if agentModelsSettings.values.contains(where: { $0.agentRepromptEnabled != nil }) {
+            requiredVersion = max(requiredVersion, Self.workspaceRepromptActivationSchemaVersion)
         }
         let hasGlobalParameterPins = globalDefaults.mcpAgentRoleModelParameters?.isEmpty == false
             || globalDefaults.contextBuilderModelParametersByAgent?.isEmpty == false
@@ -672,17 +677,21 @@ package struct AgentModelsSettingsProfile: Codable, Equatable {
 package struct WorkspaceAgentModelsSettings: Codable, Equatable {
     package var inheritanceMode: AgentModelsInheritanceMode
     package var profile: AgentModelsSettingsProfile?
+    /// Local workspace activation, independent of model-profile inheritance.
+    package var agentRepromptEnabled: Bool?
 
     package init(
         inheritanceMode: AgentModelsInheritanceMode = .useGlobalSettings,
-        profile: AgentModelsSettingsProfile? = nil
+        profile: AgentModelsSettingsProfile? = nil,
+        agentRepromptEnabled: Bool? = nil
     ) {
         self.inheritanceMode = inheritanceMode
         self.profile = profile
+        self.agentRepromptEnabled = agentRepromptEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
-        case inheritanceMode, profile
+        case inheritanceMode, profile, agentRepromptEnabled
     }
 
     package init(from decoder: Decoder) throws {
@@ -690,6 +699,7 @@ package struct WorkspaceAgentModelsSettings: Codable, Equatable {
         inheritanceMode = try container.decodeIfPresent(AgentModelsInheritanceMode.self, forKey: .inheritanceMode)
             ?? .useGlobalSettings
         profile = try container.decodeIfPresent(AgentModelsSettingsProfile.self, forKey: .profile)
+        agentRepromptEnabled = try container.decodeIfPresent(Bool.self, forKey: .agentRepromptEnabled)
     }
 }
 

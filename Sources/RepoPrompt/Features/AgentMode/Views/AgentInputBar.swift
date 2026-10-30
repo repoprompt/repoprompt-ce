@@ -621,10 +621,18 @@ struct AgentComposerView: View, Equatable {
             // @Published delivers before the stored property changes; acknowledge the incoming revision.
             acknowledgedRepromptPublicationsByTab[update.tabID] = update.identity
         }
-        .onReceive(repromptStore.$autoSendRequest) { request in
-            guard let request, request.tabID == currentTabID,
-                  let operation = repromptViewModel?.repromptOperation, operation.id == request.operationID,
-                  operation.consumeAutoSend(request), localInputText == request.text else { return }
+        .task(id: repromptStore.autoSendRequest?.operationID) { @MainActor in
+            // Submit after publication commits, never reentrantly inside @Published.willSet.
+            // Automatic mode sends the operation-owned draft, not a possibly older native
+            // streaming chunk. Native edits already revoke the operation before mutation.
+            await Task.yield()
+            guard !Task.isCancelled, let request = repromptStore.autoSendRequest,
+                  request.tabID == currentTabID,
+                  let viewModel = repromptViewModel,
+                  viewModel.consumeRepromptAutoSend(
+                      request, tabID: currentTabID, visibleDraft: localInputText,
+                      hasMarkedText: nativeComposerEditor.snapshot(matching: AnyHashable(request.tabID))?.hasMarkedText == true
+                  ) else { return }
             submitMessage(rawDraftSnapshot: request.text, restoreFocus: false)
         }
         .onChange(of: props.draftRestorationEvent) { _, event in

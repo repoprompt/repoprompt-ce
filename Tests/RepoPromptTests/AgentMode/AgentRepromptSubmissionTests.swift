@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
@@ -346,6 +347,67 @@ final class AgentRepromptSubmissionTests: XCTestCase {
                 XCTAssertTrue(fixture.viewModel.repromptDispatchTexts.isEmpty)
             }
         }
+    }
+
+    func testAutoSendWaitsForCommittedPublicationAndClaimsTheFinalDraftOnce() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        let generated = "# Ready\n\n" + String(repeating: "Final rewrite. ", count: 80) + "Done."
+        vm.repromptService = .init(transport: { _, _, publish in try await publish(generated) })
+        var sawPublication = false
+        let observation = vm.repromptUIStore.$autoSendRequest.sink { request in
+            guard let request else { return }
+            sawPublication = true
+            XCTAssertFalse(
+                vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: false),
+                "Combine delivers in willSet; dispatch must wait for committed state"
+            )
+        }
+        defer { observation.cancel() }
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await ready(fixture)
+        let request = try XCTUnwrap(vm.repromptUIStore.autoSendRequest)
+        XCTAssertTrue(sawPublication)
+        XCTAssertEqual(request.text, generated)
+        // A lagging native streaming chunk is not the autosend authority. The canonical
+        // final draft is installed already, and native edits/marked text fence consumption.
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: "Previous chunk", hasMarkedText: false))
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: true))
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: UUID(), visibleDraft: generated, hasMarkedText: false))
+        XCTAssertTrue(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: false))
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: false))
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: generated)
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Completed automatic rewrite must claim without another Return")
+        }
+        defer { vm.finishPresentedComposerSubmitAttempt(claim, result: .blocked(message: "test cleanup")) }
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, generated)
+        XCTAssertNil(vm.repromptUIStore.autoSendRequest, "A committed request must clear, not be resurrected by willSet")
+        XCTAssertNil(vm.repromptOperation)
+        XCTAssertEqual(fixture.session.draftText, "")
+    }
+
+    func testDisablingRepromptFencesAPendingAutomaticSend() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await ready(fixture)
+        let vm = fixture.viewModel
+        let request = try XCTUnwrap(vm.repromptUIStore.autoSendRequest)
+        // Simulates a shared setting changing outside the local pill action.
+        vm.repromptEnabled = false
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: fixture.session.tabID, visibleDraft: request.text, hasMarkedText: false))
+        vm.invalidateRepromptIfNeeded()
+        XCTAssertNil(vm.repromptOperation)
+        XCTAssertNil(vm.repromptUIStore.autoSendRequest)
+        XCTAssertTrue(fixture.session.items.isEmpty)
     }
 
     func testAutoSendPublishesOnlyAtSuccessAndUsesFreshDispatchClaimOnce() async throws {
