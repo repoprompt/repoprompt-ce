@@ -34,36 +34,7 @@ enum CodexProviderHelpers {
         )
     }
 
-    struct CodexExecutableResolution: Equatable {
-        enum Status: Equatable {
-            case available
-            case bundledRuntimeUnavailable
-            case externalOverrideInvalid
-            case externalOverrideIncompatible
-            case unsupportedArchitecture
-        }
-
-        let commandName: String
-        let resolvedCommand: String
-        let status: Status
-        let runtime: CodexRuntimeAuthority.Runtime?
-        let userMessage: String
-        let debugMessage: String
-
-        var environmentOverrides: [String: String] {
-            runtime?.statePaths.environment ?? [:]
-        }
-
-        var displayDescription: String? {
-            guard let runtime else { return nil }
-            return switch runtime.source {
-            case let .bundled(target):
-                "Bundled Codex \(runtime.version) (\(target))"
-            case .externalOverride:
-                "Local Codex \(runtime.version) (\(runtime.executableURL.lastPathComponent))"
-            }
-        }
-    }
+    typealias CodexExecutableResolution = CodexProviderExecutableResolution
 
     struct CodexRuntimeSettingsPreflight: Equatable {
         let bundledResolution: CodexExecutableResolution

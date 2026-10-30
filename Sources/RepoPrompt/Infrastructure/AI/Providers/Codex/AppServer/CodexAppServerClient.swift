@@ -8,15 +8,15 @@ import RepoPromptProviderQuota
 
 /// Preserve the app's transport vocabulary while sharing the same typed boundary value
 /// with the app-free quota runtime. Encoding/decoding behavior is unchanged.
-typealias CodexJSONValue = RepoPromptProviderQuota.CodexJSONValue
+package typealias CodexJSONValue = RepoPromptProviderQuota.CodexJSONValue
 
-actor CodexAppServerClient {
-    struct FaultInjection {
-        let transportTerminationCleanup: @Sendable () async -> Void
-        let requestTimeoutDelivery: @Sendable (_ method: String, _ generation: UInt64) async -> Void
-        let subscriptionPreparation: @Sendable () async -> Void
+package actor CodexAppServerClient {
+    package struct FaultInjection {
+        package let transportTerminationCleanup: @Sendable () async -> Void
+        package let requestTimeoutDelivery: @Sendable (_ method: String, _ generation: UInt64) async -> Void
+        package let subscriptionPreparation: @Sendable () async -> Void
 
-        init(
+        package init(
             transportTerminationCleanup: @escaping @Sendable () async -> Void = {},
             requestTimeoutDelivery: @escaping @Sendable (_ method: String, _ generation: UInt64) async -> Void = { _, _ in },
             subscriptionPreparation: @escaping @Sendable () async -> Void = {}
@@ -27,13 +27,20 @@ actor CodexAppServerClient {
         }
     }
 
-    struct RequestFailure: Equatable {
-        let method: String
-        let code: Int?
-        let message: String
-        let data: CodexJSONValue?
+    package struct RequestFailure: Equatable {
+        package init(method: String, code: Int?, message: String, data: CodexJSONValue?) {
+            self.method = method
+            self.code = code
+            self.message = message
+            self.data = data
+        }
 
-        var userFacingMessage: String {
+        package let method: String
+        package let code: Int?
+        package let message: String
+        package let data: CodexJSONValue?
+
+        package var userFacingMessage: String {
             guard ["initialize", "thread/resume"].contains(method),
                   code == -32601 || code == -32602
             else {
@@ -43,51 +50,73 @@ actor CodexAppServerClient {
         }
     }
 
-    struct RemoteReasoningEffort: Hashable {
-        let reasoningEffort: String
-        let description: String
+    package struct RemoteReasoningEffort: Hashable {
+        package init(reasoningEffort: String, description: String) {
+            self.reasoningEffort = reasoningEffort
+            self.description = description
+        }
+
+        package let reasoningEffort: String
+        package let description: String
     }
 
-    struct RemoteModel: Hashable {
-        let id: String
-        let model: String
-        let displayName: String
-        let description: String
-        let isDefault: Bool
-        let supportedReasoningEfforts: [RemoteReasoningEffort]
-        let defaultReasoningEffort: String?
-        var serviceTiers: [CodexModelServiceTier] = []
+    package struct RemoteModel: Hashable {
+        package init(id: String, model: String, displayName: String, description: String, isDefault: Bool, supportedReasoningEfforts: [RemoteReasoningEffort], defaultReasoningEffort: String?, serviceTiers: [CodexModelServiceTier] = []) {
+            self.id = id
+            self.model = model
+            self.displayName = displayName
+            self.description = description
+            self.isDefault = isDefault
+            self.supportedReasoningEfforts = supportedReasoningEfforts
+            self.defaultReasoningEffort = defaultReasoningEffort
+            self.serviceTiers = serviceTiers
+        }
+
+        package let id: String
+        package let model: String
+        package let displayName: String
+        package let description: String
+        package let isDefault: Bool
+        package let supportedReasoningEfforts: [RemoteReasoningEffort]
+        package let defaultReasoningEffort: String?
+        package var serviceTiers: [CodexModelServiceTier] = []
     }
 
-    struct ServerRequest {
-        let id: CodexAppServerRequestID
-        let method: String
-        let params: [String: CodexJSONValue]
+    package struct ServerRequest {
+        package init(id: CodexAppServerRequestID, method: String, params: [String: CodexJSONValue]) {
+            self.id = id
+            self.method = method
+            self.params = params
+        }
+
+        package let id: CodexAppServerRequestID
+        package let method: String
+        package let params: [String: CodexJSONValue]
     }
 
-    struct Config {
-        let commandName: String
-        let additionalPathHints: [String]
-        let enableDebugLogging: Bool
-        private(set) var requestTimeout: TimeInterval?
+    package struct Config {
+        package let commandName: String
+        package let additionalPathHints: [String]
+        package let enableDebugLogging: Bool
+        package private(set) var requestTimeout: TimeInterval?
         /// Launch directory for the Codex app-server process. Distinct from the thread/turn
         /// execution cwd, which the controller sends per request.
         /// When nil, falls back to temp directory via CLIProcessConfiguration default.
-        private(set) var processLaunchDirectory: String?
-        private(set) var processFeaturePolicy: CodexOverrides.FeaturePolicy
+        package private(set) var processLaunchDirectory: String?
+        package private(set) var processFeaturePolicy: CodexProcessConfiguration.FeaturePolicy
         /// Process-level `model_reasoning_summary` override for app-server launch.
         /// Nil preserves Codex CLI process defaults; pass a value only for an intentional process override.
         /// Agent Mode should prefer per-thread config instead of process launch config.
-        private(set) var processModelReasoningSummary: CodexOverrides.ReasoningSummary?
+        package private(set) var processModelReasoningSummary: CodexProcessConfiguration.ReasoningSummary?
 
-        init(
+        package init(
             commandName: String = CLILaunchProfiles.codex.commandName,
             additionalPathHints: [String] = CLILaunchProfiles.codex.supplementalSearchPaths,
             enableDebugLogging: Bool = false,
             requestTimeout: TimeInterval? = nil,
             processLaunchDirectory: String? = nil,
-            processFeaturePolicy: CodexOverrides.FeaturePolicy = .defaultDisabled,
-            processModelReasoningSummary: CodexOverrides.ReasoningSummary? = nil
+            processFeaturePolicy: CodexProcessConfiguration.FeaturePolicy = .defaultDisabled,
+            processModelReasoningSummary: CodexProcessConfiguration.ReasoningSummary? = nil
         ) {
             self.commandName = commandName
             self.additionalPathHints = additionalPathHints
@@ -98,49 +127,54 @@ actor CodexAppServerClient {
             self.processModelReasoningSummary = processModelReasoningSummary
         }
 
-        mutating func replaceRequestTimeout(_ timeout: TimeInterval?) {
+        package mutating func replaceRequestTimeout(_ timeout: TimeInterval?) {
             requestTimeout = timeout
         }
 
-        mutating func replaceProcessLaunchDirectory(_ path: String?) {
+        package mutating func replaceProcessLaunchDirectory(_ path: String?) {
             processLaunchDirectory = path
         }
 
-        mutating func replaceProcessLaunchPolicy(
-            featurePolicy: CodexOverrides.FeaturePolicy,
-            modelReasoningSummary: CodexOverrides.ReasoningSummary?
+        package mutating func replaceProcessLaunchPolicy(
+            featurePolicy: CodexProcessConfiguration.FeaturePolicy,
+            modelReasoningSummary: CodexProcessConfiguration.ReasoningSummary?
         ) {
             processFeaturePolicy = featurePolicy
             processModelReasoningSummary = modelReasoningSummary
         }
     }
 
-    struct Notification {
-        let method: String
-        let params: [String: CodexJSONValue]
+    package struct Notification {
+        package init(method: String, params: [String: CodexJSONValue]) {
+            self.method = method
+            self.params = params
+        }
+
+        package let method: String
+        package let params: [String: CodexJSONValue]
     }
 
-    struct NotificationSubscription {
-        let stream: AsyncStream<Notification>
-        let transportGeneration: UInt64
+    package struct NotificationSubscription {
+        package let stream: AsyncStream<Notification>
+        package let transportGeneration: UInt64
     }
 
-    struct ServerRequestSubscription {
-        let stream: AsyncStream<ServerRequest>
-        let transportGeneration: UInt64
+    package struct ServerRequestSubscription {
+        package let stream: AsyncStream<ServerRequest>
+        package let transportGeneration: UInt64
     }
 
-    struct ProcessExitEvidence: Equatable {
-        let executablePath: String
-        let launchDirectory: String
-        let pid: pid_t
-        let status: ProcessExitStatus
-        let stderrTail: Data
-        let stderrWasTruncated: Bool
-        let stderrWasSettled: Bool
+    package struct ProcessExitEvidence: Equatable {
+        package let executablePath: String
+        package let launchDirectory: String
+        package let pid: pid_t
+        package let status: ProcessExitStatus
+        package let stderrTail: Data
+        package let stderrWasTruncated: Bool
+        package let stderrWasSettled: Bool
     }
 
-    enum ClientError: Error, LocalizedError {
+    package enum ClientError: Error, LocalizedError {
         case processNotRunning
         case processExited(ProcessExitEvidence)
         case invalidResponse
@@ -151,7 +185,7 @@ actor CodexAppServerClient {
         case transportWriteFailed(message: String, errno: Int32?)
         case transportReadSetupFailed(message: String, errno: Int32?)
 
-        var errorDescription: String? {
+        package var errorDescription: String? {
             switch self {
             case .processNotRunning:
                 "Codex app-server process is not running."
@@ -194,9 +228,9 @@ actor CodexAppServerClient {
         }
     }
 
-    struct AmbiguousMutationError: Error {}
+    package struct AmbiguousMutationError: Error {}
 
-    enum TransportTerminationReason: Equatable {
+    package enum TransportTerminationReason: Equatable {
         case stdinWrite(method: String?, errno: Int32?)
         case stdoutEOF
         case timeout(method: String, requestID: String)
@@ -210,23 +244,24 @@ actor CodexAppServerClient {
         case observedProcessExit(status: ProcessExitStatus)
     }
 
-    struct ExpectedAgentPIDRegistration: Equatable {
-        let clientName: String
-        let runID: UUID
+    package struct ExpectedAgentPIDRegistration: Equatable {
+        package init(clientName: String, runID: UUID) {
+            self.clientName = clientName
+            self.runID = runID
+        }
+
+        package let clientName: String
+        package let runID: UUID
     }
 
-    struct ExpectedAgentPIDRegistrar {
-        let register: @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void
-        let clear: @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void
+    package struct ExpectedAgentPIDRegistrar {
+        package init(register: @escaping @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void, clear: @escaping @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void) {
+            self.register = register
+            self.clear = clear
+        }
 
-        static let serverNetworkManager = ExpectedAgentPIDRegistrar(
-            register: { pid, clientName, runID in
-                await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: runID)
-            },
-            clear: { pid, clientName, runID in
-                await ServerNetworkManager.shared.clearExpectedAgentPID(pid, for: clientName, runID: runID)
-            }
-        )
+        package let register: @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void
+        package let clear: @Sendable (_ pid: pid_t, _ clientName: String, _ runID: UUID) async -> Void
     }
 
     private struct RegisteredExpectedAgentPID: Equatable {
@@ -261,7 +296,7 @@ actor CodexAppServerClient {
 
     private struct PreparedRuntimeLaunchContext {
         let environment: [String: String]
-        let resolution: CodexProviderHelpers.CodexExecutableResolution
+        let resolution: CodexProviderExecutableResolution
     }
 
     private struct TerminatingTransport {
@@ -272,7 +307,7 @@ actor CodexAppServerClient {
 
     /// Only the Codex rollout-path lookup diagnostic is eligible for a fresh fallback.
     /// Generic missing-file errors can describe unrelated configuration or workspace files.
-    static func isMissingRolloutPathResolutionMessage(
+    package static func isMissingRolloutPathResolutionMessage(
         _ message: String,
         expectedRolloutPath: String? = nil
     ) -> Bool {
@@ -304,7 +339,7 @@ actor CodexAppServerClient {
         return reportedPath
     }
 
-    static func isTimeoutError(_ error: Error) -> Bool {
+    package static func isTimeoutError(_ error: Error) -> Bool {
         if let clientError = error as? ClientError,
            case let .requestFailed(failure) = clientError
         {
@@ -320,14 +355,14 @@ actor CodexAppServerClient {
         return candidates.contains(where: isTimeoutErrorMessage)
     }
 
-    static func isAmbiguousMutationError(_ error: Error) -> Bool {
+    package static func isAmbiguousMutationError(_ error: Error) -> Bool {
         error is AmbiguousMutationError
     }
 
     /// True when the transport was closed because a single stdout frame exceeded the
     /// frame budget. Matching is typed: the overflowing response is never decoded, so
     /// there is no server message to inspect.
-    static func isStdoutFrameBudgetExceededError(_ error: Error) -> Bool {
+    package static func isStdoutFrameBudgetExceededError(_ error: Error) -> Bool {
         guard let clientError = error as? ClientError,
               case .stdoutFrameBudgetExceeded = clientError
         else {
@@ -345,7 +380,7 @@ actor CodexAppServerClient {
             || normalized.contains("timed out after")
     }
 
-    static func requestFailure(
+    package static func requestFailure(
         method: String,
         errorObject: [String: Any]
     ) -> RequestFailure? {
@@ -420,10 +455,7 @@ actor CodexAppServerClient {
     private let writeFrameHandler: @Sendable (Int32, Data) throws -> Void
     private let livenessProbe: @Sendable (SpawnedProcess) -> Bool
     private let processSpawnPreparation: @Sendable () async throws -> Void
-    private let computerUseRuntimeUnavailableMessage: @Sendable (URL) -> String?
-    private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
-    private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
-    private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
+    private let launchHost: any CodexAppServerLaunchHost
     private let provisionsRepoPromptMCPOnStart: Bool
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
@@ -436,7 +468,8 @@ actor CodexAppServerClient {
         emergencyTerminateTransportForDeinit()
     }
 
-    init(
+    package init(
+        launchHost: any CodexAppServerLaunchHost,
         writeFrameHandler: @escaping @Sendable (Int32, Data) throws -> Void = { descriptor, frame in
             try FDWriteSupport.writeAll(frame, to: descriptor)
         },
@@ -444,69 +477,50 @@ actor CodexAppServerClient {
             CodexAppServerClient.defaultProcessAppearsAlive(process)
         },
         processSpawnPreparation: @escaping @Sendable () async throws -> Void = {},
-        computerUseRuntimeUnavailableMessage: @escaping @Sendable (URL) -> String? = { CodexComputerUseWorkflow.runtimeUnavailableMessage(executableURL: $0) },
-        processEnvironmentBuilder: @escaping @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult = {
-            await ProcessEnvironmentBuilder.build($0)
-        },
-        runtimeStatePreparer: @escaping @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void = {
-            try $0.prepareState()
-        },
-        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver.observe(pid: $0)
         },
-        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar = .serverNetworkManager,
+        expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar,
         faultInjection: FaultInjection = .init()
     ) {
         self.writeFrameHandler = writeFrameHandler
         self.livenessProbe = livenessProbe
         self.processSpawnPreparation = processSpawnPreparation
-        self.computerUseRuntimeUnavailableMessage = computerUseRuntimeUnavailableMessage
-        self.processEnvironmentBuilder = processEnvironmentBuilder
-        self.runtimeStatePreparer = runtimeStatePreparer
-        self.launchSnapshot = launchSnapshot
+        self.launchHost = launchHost
         self.provisionsRepoPromptMCPOnStart = provisionsRepoPromptMCPOnStart
         self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
         self.faultInjection = faultInjection
     }
 
-    func updateConfig(_ config: Config) {
+    package func updateConfig(_ config: Config) {
         self.config = config
         preparedRuntimeLaunchContext = nil
     }
 
     /// Updates only the default JSON-RPC request deadline. Unlike whole-config replacement,
     /// this does not invalidate the already prepared runtime launch context.
-    func updateDefaultRequestTimeout(_ timeout: TimeInterval?) {
+    package func updateDefaultRequestTimeout(_ timeout: TimeInterval?) {
         config.replaceRequestTimeout(timeout)
     }
 
     /// Resolves the process environment and Codex runtime once for this client lifetime.
     /// Native Agent Mode calls this before MCP provisioning, then `startIfNeeded()` reuses
     /// the same captured launch context instead of consulting a second environment snapshot.
-    func prepareRuntimeForLaunch() async throws -> CodexRuntimeAuthority.Runtime {
+    package func prepareRuntimeForLaunch() async throws -> CodexProviderRuntime.Runtime {
         if let runtime = preparedRuntimeLaunchContext?.resolution.runtime {
             try prepareState(for: runtime)
             return runtime
         }
 
-        let environmentResult = await processEnvironmentBuilder(
-            ProcessEnvironmentRequest(
-                purpose: .codexAppServer,
-                enableDebugLogging: config.enableDebugLogging
-            )
-        )
-        var environment = environmentResult.environment
-        let probeEnvironment = await ProviderEnvironmentFiltering.filter(environment, for: .codexExec)
-        let resolution = CodexProviderHelpers.resolveCodexExecutable(
+        let resolved = await launchHost.resolveRuntime(
             commandName: config.commandName,
-            environment: probeEnvironment,
             additionalPathHints: config.additionalPathHints,
-            launchSnapshot: launchSnapshot,
-            logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
+            enableDebugLogging: config.enableDebugLogging
         )
+        var environment = resolved.environment
+        let resolution = resolved.resolution
         guard resolution.status == .available else {
             throw ClientError.executableUnavailable(resolution.userMessage)
         }
@@ -522,9 +536,9 @@ actor CodexAppServerClient {
         return runtime
     }
 
-    private func prepareState(for runtime: CodexRuntimeAuthority.Runtime) throws {
+    private func prepareState(for runtime: CodexProviderRuntime.Runtime) throws {
         do {
-            try runtimeStatePreparer(runtime)
+            try launchHost.prepareState(for: runtime)
         } catch {
             throw ClientError.executableUnavailable(
                 "RepoPrompt could not start Codex: unable to prepare its isolated Codex state (\(error.localizedDescription))."
@@ -539,14 +553,14 @@ actor CodexAppServerClient {
     }
 
     #if DEBUG
-        static func testProcessEnvironmentForCurrentLaunch(
+        package static func testProcessEnvironmentForCurrentLaunch(
             baseEnvironment: [String: String]
         ) -> [String: String] {
             processEnvironmentForCurrentLaunch(baseEnvironment)
         }
     #endif
 
-    func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
+    package func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
         expectedAgentPIDRegistration = registration
         guard registration != nil else {
             await clearRegisteredExpectedAgentPIDIfNeeded()
@@ -559,13 +573,13 @@ actor CodexAppServerClient {
         await registerExpectedAgentPIDIfNeeded(for: activeTransport.process.pid)
     }
 
-    func clearExpectedAgentPIDRegistration() async {
+    package func clearExpectedAgentPIDRegistration() async {
         expectedAgentPIDRegistration = nil
         await clearRegisteredExpectedAgentPIDIfNeeded()
     }
 
     /// Returns only the PID currently registered for this run and live transport.
-    func activeExpectedAgentPID(for runID: UUID) -> pid_t? {
+    package func activeExpectedAgentPID(for runID: UUID) -> pid_t? {
         guard let registeredExpectedAgentPID,
               registeredExpectedAgentPID.runID == runID,
               activeTransport?.process.pid == registeredExpectedAgentPID.pid
@@ -611,22 +625,22 @@ actor CodexAppServerClient {
 
     /// Updates the process launch directory for the next process start.
     /// Must be called before `startIfNeeded()` to take effect.
-    func updateProcessLaunchDirectory(_ path: String?) {
+    package func updateProcessLaunchDirectory(_ path: String?) {
         let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = (trimmed?.isEmpty == false) ? trimmed : nil
         config.replaceProcessLaunchDirectory(normalized)
     }
 
-    func updateProcessFeaturePolicy(_ featurePolicy: CodexOverrides.FeaturePolicy) async {
+    package func updateProcessFeaturePolicy(_ featurePolicy: CodexProcessConfiguration.FeaturePolicy) async {
         await updateProcessLaunchPolicy(
             featurePolicy: featurePolicy,
             modelReasoningSummary: config.processModelReasoningSummary
         )
     }
 
-    func updateProcessLaunchPolicy(
-        featurePolicy: CodexOverrides.FeaturePolicy,
-        modelReasoningSummary: CodexOverrides.ReasoningSummary?
+    package func updateProcessLaunchPolicy(
+        featurePolicy: CodexProcessConfiguration.FeaturePolicy,
+        modelReasoningSummary: CodexProcessConfiguration.ReasoningSummary?
     ) async {
         guard featurePolicy != config.processFeaturePolicy
             || modelReasoningSummary != config.processModelReasoningSummary
@@ -640,7 +654,7 @@ actor CodexAppServerClient {
         }
     }
 
-    func subscribeNotifications() -> AsyncStream<Notification> {
+    package func subscribeNotifications() -> AsyncStream<Notification> {
         AsyncStream { continuation in
             let id = UUID()
             notificationContinuations[id] = continuation
@@ -650,7 +664,7 @@ actor CodexAppServerClient {
         }
     }
 
-    func healthyTransportGeneration() -> UInt64? {
+    package func healthyTransportGeneration() -> UInt64? {
         guard let activeTransport,
               isInitialized,
               !didTerminateTransport,
@@ -661,7 +675,7 @@ actor CodexAppServerClient {
         return activeTransport.generation
     }
 
-    func subscribeNotificationsWithTransportGeneration() async throws -> NotificationSubscription {
+    package func subscribeNotificationsWithTransportGeneration() async throws -> NotificationSubscription {
         await faultInjection.subscriptionPreparation()
         guard let generation = healthyTransportGeneration() else {
             throw lastTransportFailure ?? ClientError.processNotRunning
@@ -672,7 +686,7 @@ actor CodexAppServerClient {
         )
     }
 
-    func subscribeServerRequests() -> AsyncStream<ServerRequest> {
+    package func subscribeServerRequests() -> AsyncStream<ServerRequest> {
         AsyncStream { continuation in
             let id = UUID()
             serverRequestContinuations[id] = continuation
@@ -682,7 +696,7 @@ actor CodexAppServerClient {
         }
     }
 
-    func subscribeServerRequestsWithTransportGeneration() async throws -> ServerRequestSubscription {
+    package func subscribeServerRequestsWithTransportGeneration() async throws -> ServerRequestSubscription {
         await faultInjection.subscriptionPreparation()
         guard let generation = healthyTransportGeneration() else {
             throw lastTransportFailure ?? ClientError.processNotRunning
@@ -693,11 +707,11 @@ actor CodexAppServerClient {
         )
     }
 
-    func startIfNeeded() async throws {
+    package func startIfNeeded() async throws {
         try await startIfNeeded(initializationTimeout: nil)
     }
 
-    func startIfNeeded(initializationTimeout: TimeInterval?) async throws {
+    package func startIfNeeded(initializationTimeout: TimeInterval?) async throws {
         let authority = startupAuthorityEpoch
         if let termination = transportTerminationTask,
            termination.generation == transportGeneration
@@ -744,7 +758,7 @@ actor CodexAppServerClient {
         }
     }
 
-    func stop() async {
+    package func stop() async {
         startupAuthorityEpoch &+= 1
         startupTask?.task.cancel()
         startupTask = nil
@@ -1200,7 +1214,7 @@ actor CodexAppServerClient {
         }
     }
 
-    private static func defaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
+    package static func defaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
         // Use a non-destructive child-state check so exited/zombie children do not
         // look healthy, while leaving final reap/cleanup to the normal teardown path.
         // `waitid` can report a stopped child on Darwin even with WEXITED; accepting
@@ -1222,7 +1236,7 @@ actor CodexAppServerClient {
         return true
     }
 
-    func request(method: String, params: [String: Any]?, timeout: TimeInterval? = nil) async throws -> [String: Any] {
+    package func request(method: String, params: [String: Any]?, timeout: TimeInterval? = nil) async throws -> [String: Any] {
         try await request(
             method: method,
             params: params,
@@ -1238,7 +1252,7 @@ actor CodexAppServerClient {
     /// transport generation, terminates that exact process on deadline, and awaits
     /// process-family cleanup before returning the timeout. A stale completion from the
     /// fenced generation therefore cannot mutate state after serialization is released.
-    func requestWithSettlementDeadline(
+    package func requestWithSettlementDeadline(
         method: String,
         params: [String: Any]?,
         deadline: TimeInterval,
@@ -1309,7 +1323,7 @@ actor CodexAppServerClient {
         return returnedError
     }
 
-    func request(
+    package func request(
         method: String,
         params: [String: Any]?,
         timeout: TimeInterval?,
@@ -1356,7 +1370,7 @@ actor CodexAppServerClient {
         }
     }
 
-    func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) throws {
+    package func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) throws {
         guard activeTransport != nil, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
         }
@@ -1367,7 +1381,7 @@ actor CodexAppServerClient {
         try sendJSONLine(payload, method: nil)
     }
 
-    func respondToServerRequestError(
+    package func respondToServerRequestError(
         id: CodexAppServerRequestID,
         code: Int = -32601,
         message: String,
@@ -1390,7 +1404,7 @@ actor CodexAppServerClient {
         try sendJSONLine(payload, method: nil)
     }
 
-    func notify(method: String, params: [String: Any]?) throws {
+    package func notify(method: String, params: [String: Any]?) throws {
         guard activeTransport != nil, !didTerminateTransport else {
             throw lastTransportFailure ?? ClientError.processNotRunning
         }
@@ -1404,7 +1418,7 @@ actor CodexAppServerClient {
     }
 
     /// Returns all models exposed by Codex app-server `model/list`, following pagination.
-    func listModels(limit: Int = 100) async throws -> [RemoteModel] {
+    package func listModels(limit: Int = 100) async throws -> [RemoteModel] {
         do {
             return try await fetchModelPages(limit: limit)
         } catch let error as ClientError {
@@ -1492,7 +1506,7 @@ actor CodexAppServerClient {
         let clientInfo: [String: Any] = [
             "name": "repoprompt",
             "title": "RepoPrompt",
-            "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+            "version": launchHost.applicationVersion
         ]
         let capabilities: [String: Any] = [
             "experimentalApi": true
@@ -1557,21 +1571,6 @@ actor CodexAppServerClient {
         }
     }
 
-    static func computerUseProcessConfigArgs(
-        computerUseEnabled: Bool,
-        serverEntries: [MCPIntegrationHelper.CodexServerEntry]
-    ) throws -> [String] {
-        let reserved = serverEntries.filter { $0.normalizedName.caseInsensitiveCompare("computer-use") == .orderedSame }
-        guard !computerUseEnabled || reserved.isEmpty else {
-            throw ClientError.executableUnavailable(CodexComputerUseWorkflow.collisionMessage)
-        }
-        var args = reserved.flatMap { ["-c", "mcp_servers.\($0.cliPathComponent).enabled=false"] }
-        if computerUseEnabled {
-            args += ["-c", "approval_policy=\"on-request\"", "-c", "approvals_reviewer=\"user\""]
-        }
-        return args
-    }
-
     private func startProcess(startupAuthority: UInt64) async throws {
         try ProviderProcessLaunchPolicy.check()
         let runtime = try await prepareRuntimeForLaunch()
@@ -1579,50 +1578,23 @@ actor CodexAppServerClient {
             throw ClientError.executableUnavailable("RepoPrompt could not start Codex: prepared runtime launch context was unavailable.")
         }
         let resolution = launchContext.resolution
-        let filtered = await ProviderEnvironmentFiltering.filter(
+        let filtered = await launchHost.filterEnvironment(
             launchContext.environment,
-            for: .codexExec,
             explicitOverrides: resolution.environmentOverrides
         )
         let environment = Self.processEnvironmentForCurrentLaunch(filtered)
-        if provisionsRepoPromptMCPOnStart {
-            let provisioning = CodexIntegrationConfiguration.ensureServerForDiscovery(runtime: runtime)
-            guard provisioning.success else {
-                throw ClientError.executableUnavailable(
-                    provisioning.errorMessage ?? "RepoPrompt could not prepare its owned Codex configuration."
-                )
-            }
-        }
-        var processOverrides = CodexOverrides.cliConfigArgs(
-            toolPolicy: .init(
-                toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
-                modelReasoningSummary: config.processModelReasoningSummary
-            ),
-            featurePolicy: config.processFeaturePolicy
+        var processOverrides = try launchHost.baseProcessArguments(
+            runtime: runtime,
+            provisionsRepoPromptMCP: provisionsRepoPromptMCPOnStart,
+            featurePolicy: config.processFeaturePolicy,
+            reasoningSummary: config.processModelReasoningSummary
         )
         try await processSpawnPreparation()
         try Task.checkCancellation()
         try ensureStartupAuthority(startupAuthority)
         if config.processFeaturePolicy.computerUseEnabled {
-            // Probe the actual executable afresh, including external selections. Do not
-            // infer its signer from DEBUG, bundle provenance, or cached UI admission.
-            if let message = computerUseRuntimeUnavailableMessage(runtime.executableURL) {
-                throw ClientError.executableUnavailable(message)
-            }
-            // No suspension between presence-dependent overrides and spawn. This does not
-            // claim atomicity against independent writers of the owned configuration.
-            // Read the actual armed launch runtime, not a personal/default home. A reserved
-            // saved definition cannot be safely cleared through recursively merged overrides.
-            let runtimeConfigURL = runtime.statePaths.codexHome.appendingPathComponent("config.toml")
-            let runtimeConfig = if FileManager.default.fileExists(atPath: runtimeConfigURL.path) {
-                try String(contentsOf: runtimeConfigURL, encoding: .utf8)
-            } else {
-                ""
-            }
-            processOverrides += try Self.computerUseProcessConfigArgs(
-                computerUseEnabled: true,
-                serverEntries: CodexIntegrationConfiguration.mcpServerEntries(from: runtimeConfig)
-            )
+            // No suspension between the fresh physical read/overrides and spawn.
+            processOverrides += try launchHost.computerUseProcessArguments(runtime: runtime)
         }
         let args = processOverrides + ["app-server"]
         let launchDirectory = CLIProcessConfiguration.resolvedWorkingDirectory(
@@ -2046,7 +2018,7 @@ actor CodexAppServerClient {
 
     /// Splits concatenated JSON objects from raw data using brace-depth scanning.
     /// Reused from Claude's `splitConcatenatedJSONObjectPayloads` algorithm.
-    static func splitConcatenatedJSONObjects(_ data: Data) -> [Data] {
+    package static func splitConcatenatedJSONObjects(_ data: Data) -> [Data] {
         guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return [] }
         var results: [Data] = []
         var start: String.Index?
@@ -2315,31 +2287,31 @@ actor CodexAppServerClient {
     }
 
     #if DEBUG
-        func debugProcessID() -> pid_t? {
+        package func debugProcessID() -> pid_t? {
             activeTransport?.process.pid
         }
 
-        func debugIsProcessRunning() -> Bool {
+        package func debugIsProcessRunning() -> Bool {
             activeTransport != nil && !didTerminateTransport
         }
 
-        func debugNextRequestID() -> Int {
+        package func debugNextRequestID() -> Int {
             nextRequestID
         }
 
-        func debugTransportGeneration() -> UInt64 {
+        package func debugTransportGeneration() -> UInt64 {
             transportGeneration
         }
 
-        func debugLastTransportTerminationReason() -> TransportTerminationReason? {
+        package func debugLastTransportTerminationReason() -> TransportTerminationReason? {
             lastTransportTerminationReason
         }
 
-        func debugProcessExitObserver() -> ChildProcessExitObserver? {
+        package func debugProcessExitObserver() -> ChildProcessExitObserver? {
             activeTransport?.exitObservation?.observer
         }
 
-        func debugDeliverObservedProcessExit(
+        package func debugDeliverObservedProcessExit(
             _ outcome: ChildProcessExitObserver.Outcome,
             observer: ChildProcessExitObserver,
             generation: UInt64
@@ -2351,44 +2323,44 @@ actor CodexAppServerClient {
             )
         }
 
-        static func debugDefaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
+        package static func debugDefaultProcessAppearsAlive(_ process: SpawnedProcess) -> Bool {
             defaultProcessAppearsAlive(process)
         }
 
-        func debugTerminalObserverJoinCount() -> Int {
+        package func debugTerminalObserverJoinCount() -> Int {
             terminalObserverJoinCount
         }
 
-        func debugDecodeRecoveryAttempts(generation: UInt64? = nil) -> Int {
+        package func debugDecodeRecoveryAttempts(generation: UInt64? = nil) -> Int {
             let key = generation ?? transportGeneration
             return decodeRecoveryAttemptsByGeneration[key, default: 0]
         }
 
-        func debugIngestStdoutChunk(_ chunk: Data, generation: UInt64) async {
+        package func debugIngestStdoutChunk(_ chunk: Data, generation: UInt64) async {
             await handleStdoutChunk(chunk, generation: generation)
         }
 
-        func debugIngestRawStdoutLine(_ line: Data) {
+        package func debugIngestRawStdoutLine(_ line: Data) {
             handleJSONLine(line)
         }
 
-        static func debugMaxDecodeRecoveryAttemptsPerGeneration() -> Int {
+        package static func debugMaxDecodeRecoveryAttemptsPerGeneration() -> Int {
             maxDecodeRecoveryAttemptsPerGeneration
         }
 
-        func debugPendingRequestCount() -> Int {
+        package func debugPendingRequestCount() -> Int {
             pendingRequests.count
         }
 
-        func debugNotificationSubscriberCount() -> Int {
+        package func debugNotificationSubscriberCount() -> Int {
             notificationContinuations.count
         }
 
-        func debugServerRequestSubscriberCount() -> Int {
+        package func debugServerRequestSubscriberCount() -> Int {
             serverRequestContinuations.count
         }
 
-        func debugBeginTransportFailure() {
+        package func debugBeginTransportFailure() {
             let generation = transportGeneration
             beginTransportTermination(
                 flushStdout: false,
@@ -2398,11 +2370,11 @@ actor CodexAppServerClient {
             )
         }
 
-        func debugTimeoutTaskCount() -> Int {
+        package func debugTimeoutTaskCount() -> Int {
             timeoutTasks.count
         }
 
-        func debugInstallTestTransport() {
+        package func debugInstallTestTransport() {
             let stdinPipe = Pipe()
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()

@@ -1,18 +1,25 @@
-struct CodexCapabilitySettings: Equatable {
-    let appsEnabled: Bool
-    let pluginsEnabled: Bool
-    let mcpElicitationEnabled: Bool
-    let toolSuggestionsEnabled: Bool
+package struct CodexCapabilitySettings: Equatable {
+    package let appsEnabled: Bool
+    package let pluginsEnabled: Bool
+    package let mcpElicitationEnabled: Bool
+    package let toolSuggestionsEnabled: Bool
+
+    package init(appsEnabled: Bool, pluginsEnabled: Bool, mcpElicitationEnabled: Bool, toolSuggestionsEnabled: Bool) {
+        self.appsEnabled = appsEnabled
+        self.pluginsEnabled = pluginsEnabled
+        self.mcpElicitationEnabled = mcpElicitationEnabled
+        self.toolSuggestionsEnabled = toolSuggestionsEnabled
+    }
 
     /// Armed sessions keep structured MCP provenance without enabling unrelated capabilities.
-    static let computerUse = CodexCapabilitySettings(
+    package static let computerUse = CodexCapabilitySettings(
         appsEnabled: false,
         pluginsEnabled: false,
         mcpElicitationEnabled: true,
         toolSuggestionsEnabled: false
     )
 
-    static let disabled = CodexCapabilitySettings(
+    package static let disabled = CodexCapabilitySettings(
         appsEnabled: false,
         pluginsEnabled: false,
         mcpElicitationEnabled: false,

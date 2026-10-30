@@ -1,6 +1,33 @@
 import Foundation
 import RepoPromptProcess
 
+extension CodexProviderRuntime.Runtime {
+    func prepareState(
+        fileManager: FileManager = .default,
+        ordinaryCodexHomeURL: URL? = nil
+    ) throws {
+        try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
+        let ordinaryCodexHome = ordinaryCodexHomeURL
+            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
+        try CodexGlobalInstructionsProjection.prepare(
+            ordinaryCodexHome: ordinaryCodexHome,
+            managedCodexHome: statePaths.codexHome,
+            fileManager: fileManager
+        )
+    }
+
+    var redactedDiagnosticSummary: String {
+        let provenance = switch source {
+        case let .bundled(target):
+            "bundled:\(target)"
+        case .externalOverride:
+            "external-override:\(executableURL.lastPathComponent)"
+        }
+        return "Codex runtime authority: provenance=\(provenance), version=\(version), state=\(CodexRuntimeAuthority.redactedStateDescription(statePaths))"
+    }
+}
+
 /// The single source of truth for RepoPrompt-managed Codex runtime selection and state.
 ///
 /// Production defaults to the verified bundled package for the running architecture. Advanced
@@ -62,54 +89,9 @@ enum CodexRuntimeAuthority {
         return snapshot
     }
 
-    enum Source: Equatable {
-        case bundled(target: String)
-        case externalOverride
-    }
-
-    struct StatePaths: Equatable {
-        let codexHome: URL
-        let sqliteHome: URL
-
-        var environment: [String: String] {
-            [
-                "CODEX_HOME": codexHome.path,
-                "CODEX_SQLITE_HOME": sqliteHome.path
-            ]
-        }
-    }
-
-    struct Runtime: Equatable {
-        let executableURL: URL
-        let version: Version
-        let source: Source
-        let statePaths: StatePaths
-
-        func prepareState(
-            fileManager: FileManager = .default,
-            ordinaryCodexHomeURL: URL? = nil
-        ) throws {
-            try fileManager.createDirectory(at: statePaths.codexHome, withIntermediateDirectories: true)
-            try fileManager.createDirectory(at: statePaths.sqliteHome, withIntermediateDirectories: true)
-            let ordinaryCodexHome = ordinaryCodexHomeURL
-                ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".codex", isDirectory: true)
-            try CodexGlobalInstructionsProjection.prepare(
-                ordinaryCodexHome: ordinaryCodexHome,
-                managedCodexHome: statePaths.codexHome,
-                fileManager: fileManager
-            )
-        }
-
-        var redactedDiagnosticSummary: String {
-            let provenance = switch source {
-            case let .bundled(target):
-                "bundled:\(target)"
-            case .externalOverride:
-                "external-override:\(executableURL.lastPathComponent)"
-            }
-            return "Codex runtime authority: provenance=\(provenance), version=\(version), state=\(CodexRuntimeAuthority.redactedStateDescription(statePaths))"
-        }
-    }
+    typealias Source = CodexProviderRuntime.Source
+    typealias StatePaths = CodexProviderRuntime.StatePaths
+    typealias Runtime = CodexProviderRuntime.Runtime
 
     enum Failure: Error, Equatable, LocalizedError {
         case unsupportedArchitecture(String)
@@ -155,86 +137,7 @@ enum CodexRuntimeAuthority {
         }
     }
 
-    struct Version: Comparable, CustomStringConvertible, Equatable {
-        let major: Int
-        let minor: Int
-        let patch: Int
-        let prerelease: String?
-
-        init(major: Int, minor: Int, patch: Int, prerelease: String? = nil) {
-            self.major = major
-            self.minor = minor
-            self.patch = patch
-            self.prerelease = prerelease
-        }
-
-        var description: String {
-            let core = "\(major).\(minor).\(patch)"
-            return prerelease.map { "\(core)-\($0)" } ?? core
-        }
-
-        static func < (lhs: Version, rhs: Version) -> Bool {
-            let lhsCore = (lhs.major, lhs.minor, lhs.patch)
-            let rhsCore = (rhs.major, rhs.minor, rhs.patch)
-            if lhsCore != rhsCore {
-                return lhsCore < rhsCore
-            }
-
-            switch (lhs.prerelease, rhs.prerelease) {
-            case (nil, nil):
-                return false
-            case (nil, .some):
-                return false
-            case (.some, nil):
-                return true
-            case let (.some(lhsPrerelease), .some(rhsPrerelease)):
-                return comparePrerelease(lhsPrerelease, rhsPrerelease)
-            }
-        }
-
-        static func parse(_ text: String) -> Version? {
-            let pattern = #"(?<![0-9A-Za-z.+-])([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?![0-9A-Za-z.+-])"#
-            guard let regex = try? NSRegularExpression(pattern: pattern),
-                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-                  match.numberOfRanges == 5,
-                  let majorRange = Range(match.range(at: 1), in: text),
-                  let minorRange = Range(match.range(at: 2), in: text),
-                  let patchRange = Range(match.range(at: 3), in: text),
-                  let major = Int(text[majorRange]),
-                  let minor = Int(text[minorRange]),
-                  let patch = Int(text[patchRange])
-            else {
-                return nil
-            }
-            let prerelease = Range(match.range(at: 4), in: text).map { String(text[$0]) }
-            if let prerelease {
-                let hasInvalidNumericIdentifier = prerelease.split(separator: ".").contains { identifier in
-                    identifier.count > 1 && identifier.first == "0" && identifier.allSatisfy(\.isNumber)
-                }
-                guard !hasInvalidNumericIdentifier else { return nil }
-            }
-            return Version(major: major, minor: minor, patch: patch, prerelease: prerelease)
-        }
-
-        private static func comparePrerelease(_ lhs: String, _ rhs: String) -> Bool {
-            let lhsIdentifiers = lhs.split(separator: ".", omittingEmptySubsequences: false)
-            let rhsIdentifiers = rhs.split(separator: ".", omittingEmptySubsequences: false)
-            for (lhsIdentifier, rhsIdentifier) in zip(lhsIdentifiers, rhsIdentifiers) {
-                guard lhsIdentifier != rhsIdentifier else { continue }
-                switch (Int(lhsIdentifier), Int(rhsIdentifier)) {
-                case let (.some(lhsNumber), .some(rhsNumber)):
-                    return lhsNumber < rhsNumber
-                case (.some, nil):
-                    return true
-                case (nil, .some):
-                    return false
-                case (nil, nil):
-                    return lhsIdentifier < rhsIdentifier
-                }
-            }
-            return lhsIdentifiers.count < rhsIdentifiers.count
-        }
-    }
+    typealias Version = CodexProviderRuntime.Version
 
     private struct PackageMetadata: Decodable {
         let layoutVersion: Int
@@ -574,7 +477,7 @@ enum CodexRuntimeAuthority {
         return hasher.finalize()
     }
 
-    private static func redactedStateDescription(_ paths: StatePaths) -> String {
+    fileprivate static func redactedStateDescription(_ paths: StatePaths) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         func redact(_ path: String) -> String {
             path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : "<application-support>/" + URL(fileURLWithPath: path).lastPathComponent
