@@ -69,7 +69,7 @@
     },
     "RepoPromptACPProviders": {
       "source_root": "Sources/RepoPromptACPProviders",
-      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptProcess"],
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
       "test_target": "RepoPromptACPProvidersTests",
       "app_free_tests": true
     },
@@ -349,6 +349,15 @@
     }
   },
   "moved_families": {
+    "ACPSessionControllerAndHeadlessBridge": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPAgentSessionController.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ACP/ACPAgentSessionHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ACPHeadlessAgentProviderBridge.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ACPHeadlessProviderLifecycle.swift"
+      ]
+    },
     "CodexAppServerTransport": {
       "owner": "RepoPromptCodexProvider",
       "former_app_files": [

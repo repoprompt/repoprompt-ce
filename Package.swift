@@ -157,7 +157,7 @@ let package = Package(
         ),
         .target(
             name: "RepoPromptACPProviders",
-            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptProcess"],
+            dependencies: ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
             path: "Sources/RepoPromptACPProviders",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug)), .enableUpcomingFeature("BareSlashRegexLiterals")]
         ),

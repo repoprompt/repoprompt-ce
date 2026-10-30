@@ -1,10 +1,10 @@
 import Darwin
 import Foundation
 import os
-import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptMCPCore
 import RepoPromptProcess
 
 package actor ACPAgentSessionController {

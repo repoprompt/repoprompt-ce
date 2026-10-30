@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import MCP
+import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
