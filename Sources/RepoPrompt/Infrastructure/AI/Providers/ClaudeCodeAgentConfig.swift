@@ -12,23 +12,8 @@ import RepoPromptAIContracts
     private func claudeCodeAgentConfigDebugLog(_ message: @autoclosure () -> String) {}
 #endif
 
-/// Configuration for Claude Code agent provider.
-struct ClaudeCodeAgentConfig {
-    let commandName: String
-    let additionalPathHints: [String]
-    let modelString: String?
-    let runtimeVariant: ClaudeCodeRuntimeVariant
-    let enableDebugLogging: Bool
-    let sdkConnectTimeoutSeconds: TimeInterval
-    let sdkRelaunchMaxAttempts: Int
-    let permissionMode: String
-    let allowNativeBashTool: Bool
-    let toolContext: MCPIntegrationHelper.CLIToolContext
-    let disallowedBuiltInTools: [String]
-    let mcpStrictMode: Bool
-    let toolSearchEnabled: Bool
-    let effortLevel: ClaudeCodeEffortLevel?
-
+/// App-owned construction and policy for Claude Code agent configuration.
+extension ClaudeCodeAgentConfig {
     var processEnvironmentOverrides: [String: String] {
         Self.processEnvironmentOverrides(for: toolContext)
     }
@@ -40,11 +25,6 @@ struct ClaudeCodeAgentConfig {
         case .discoverRun, .promptOnly:
             [:]
         }
-    }
-
-    var effortEnvironmentOverrides: [String: String] {
-        guard let effortLevel else { return [:] }
-        return ["CLAUDE_CODE_EFFORT_LEVEL": effortLevel.envValue]
     }
 
     // MARK: - Agent Mode (interactive, user-controlled permissions)
@@ -160,27 +140,35 @@ struct ClaudeCodeAgentConfig {
         let resolvedCommand = commandName ?? "claude"
         let modelSpecifier = ClaudeModelSpecifier(raw: modelString)
         claudeCodeAgentConfigDebugLog("Using command '\(resolvedCommand)' (DEBUG build)")
-        self.commandName = resolvedCommand
-        additionalPathHints = CLIPathHints.claudeCode
-        self.modelString = modelSpecifier.runtimeModelParam
-        self.runtimeVariant = runtimeVariant
-        self.enableDebugLogging = enableDebugLogging
-        self.sdkConnectTimeoutSeconds = max(1, sdkConnectTimeoutSeconds)
-        self.sdkRelaunchMaxAttempts = max(0, sdkRelaunchMaxAttempts)
-        self.permissionMode = permissionMode
-        self.allowNativeBashTool = allowNativeBashTool
-        self.toolContext = toolContext
-        self.mcpStrictMode = mcpStrictMode
-        self.toolSearchEnabled = toolSearchEnabled
-        self.effortLevel = Self.isNoModelCompatibleBackend(runtimeVariant)
+        let additionalPathHints = CLIPathHints.claudeCode
+        let resolvedModel = modelSpecifier.runtimeModelParam
+        let connectTimeout = max(1, sdkConnectTimeoutSeconds)
+        let relaunchAttempts = max(0, sdkRelaunchMaxAttempts)
+        let resolvedEffort = Self.isNoModelCompatibleBackend(runtimeVariant)
             ? nil
             : (modelSpecifier.explicitEffortLevel ?? effortLevel)
-        self.disallowedBuiltInTools = Self.normalizedToolList(
+        let resolvedDisallowedTools = Self.normalizedToolList(
             disallowedBuiltInTools
                 ?? MCPIntegrationHelper.claudeDisallowedTools(
                     for: toolContext,
                     allowNativeBashTool: allowNativeBashTool
                 )
+        )
+        self.init(
+            commandName: resolvedCommand,
+            additionalPathHints: additionalPathHints,
+            modelString: resolvedModel,
+            runtimeVariant: runtimeVariant,
+            enableDebugLogging: enableDebugLogging,
+            sdkConnectTimeoutSeconds: connectTimeout,
+            sdkRelaunchMaxAttempts: relaunchAttempts,
+            permissionMode: permissionMode,
+            allowNativeBashTool: allowNativeBashTool,
+            toolContext: toolContext,
+            disallowedBuiltInTools: resolvedDisallowedTools,
+            mcpStrictMode: mcpStrictMode,
+            toolSearchEnabled: toolSearchEnabled,
+            effortLevel: resolvedEffort
         )
     }
 
