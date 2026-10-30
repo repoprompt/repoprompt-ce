@@ -3,69 +3,97 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
-import RepoPromptSettingsCore
 
-struct DevinACPAgentProvider: ACPAgentProvider {
+package struct DevinACPAgentProvider: ACPAgentProvider {
+    package enum MCPServersPolicy {
+        case mergeRepoPrompt(RepoPromptMCPServerConfiguration)
+        case disableAll
+    }
+
+    package struct PreparedIntegration {
+        package let environment: [String: String]
+        package let cleanupArtifact: ACPLaunchCleanupArtifact
+
+        package init(environment: [String: String], cleanupArtifact: ACPLaunchCleanupArtifact) {
+            self.environment = environment
+            self.cleanupArtifact = cleanupArtifact
+        }
+    }
+
+    package typealias PermissionArguments = @Sendable (_ launchPermissionMode: String?) throws -> [String]
+    package typealias IntegrationPreparer = @Sendable (
+        _ workingDirectory: String,
+        _ mcpServers: MCPServersPolicy,
+        _ sourceEnvironment: [String: String],
+        _ isolateForeignMCPImports: Bool
+    ) throws -> PreparedIntegration
+    package typealias IntegrationCleanup = @Sendable (_ artifact: ACPLaunchCleanupArtifact) -> Void
+
     private let config: DevinAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
     private let launchResolver: DevinACPLaunchResolver
     private let isolateForeignMCPImports: Bool
+    private let toolNames: ACPToolNameResolution
+    private let permissionArguments: PermissionArguments
+    private let prepareIntegration: IntegrationPreparer
+    private let cleanupIntegration: IntegrationCleanup
 
-    init(
+    package init(
         config: DevinAgentConfig,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: DevinACPLaunchResolver = DevinACPLaunchResolver(),
-        isolateForeignMCPImports: Bool = false
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration,
+        launchResolver: DevinACPLaunchResolver,
+        isolateForeignMCPImports: Bool,
+        toolNames: ACPToolNameResolution,
+        permissionArguments: @escaping PermissionArguments,
+        prepareIntegration: @escaping IntegrationPreparer,
+        cleanupIntegration: @escaping IntegrationCleanup
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
         self.launchResolver = launchResolver
         self.isolateForeignMCPImports = isolateForeignMCPImports
+        self.toolNames = toolNames
+        self.permissionArguments = permissionArguments
+        self.prepareIntegration = prepareIntegration
+        self.cleanupIntegration = cleanupIntegration
     }
 
-    var providerID: ACPProviderID {
+    package var providerID: ACPProviderID {
         .devin
     }
 
-    var supportsParameterizedModelPicker: Bool {
+    package var supportsParameterizedModelPicker: Bool {
         true
     }
 
-    func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
+    package func modelParameterKind(for input: ACPModelParameterClassificationInput) -> ACPModelParameterKind? {
         input.category?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "thought_level"
             ? .thinking : nil
     }
 
-    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+    package func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
 
     /// `--permission-mode` is a TOP-LEVEL `devin` option (3000.10.21); `devin acp --help`
     /// does not advertise it, so the flag must precede the `acp` subcommand. Unknown
     /// non-empty carrier values are rejected rather than silently degrading to no flag.
-    func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
+    package func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = try standardizedWorkingDirectory(from: request.workspacePath)
         let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
-        guard DevinAgentToolPreferences.PermissionLevel.isRecognizedCLIPermissionMode(request.launchPermissionMode) else {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Unsupported Devin permission mode `\(request.launchPermissionMode ?? "")`."
-            )
-        }
-        let permissionLevel = DevinAgentToolPreferences.PermissionLevel.from(
-            cliPermissionMode: request.launchPermissionMode
-        )
-        let integration = try DevinIntegrationConfiguration.prepare(
-            workingDirectory: workingDirectory,
-            mcpServers: config.includeRepoPromptMCPServer
+        let permissionArguments = try permissionArguments(request.launchPermissionMode)
+        let integration = try prepareIntegration(
+            workingDirectory,
+            config.includeRepoPromptMCPServer
                 ? .mergeRepoPrompt(repoPromptMCPConfiguration)
                 : .disableAll,
-            sourceEnvironment: resolvedLaunch.environment,
-            isolateForeignMCPImports: isolateForeignMCPImports
+            resolvedLaunch.environment,
+            isolateForeignMCPImports
         )
         return ACPLaunchConfiguration(
             providerID: providerID,
             command: resolvedLaunch.command,
-            arguments: permissionLevel.launchArguments + resolvedLaunch.arguments,
+            arguments: permissionArguments + resolvedLaunch.arguments,
             environment: resolvedLaunch.environment.merging(integration.environment) { _, overlay in overlay },
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,
@@ -76,7 +104,7 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func makeSessionConfiguration(
+    package func makeSessionConfiguration(
         for request: ACPRunRequest,
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
@@ -96,7 +124,7 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func buildPromptBlocks(
+    package func buildPromptBlocks(
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
@@ -119,7 +147,7 @@ struct DevinACPAgentProvider: ACPAgentProvider {
         )
     }
 
-    func normalizeSessionUpdate(
+    package func normalizeSessionUpdate(
         _ payload: [String: Any],
         sessionID _: String
     ) -> [NormalizedAgentRuntimeEvent] {
@@ -137,20 +165,20 @@ struct DevinACPAgentProvider: ACPAgentProvider {
             // toolName when present, and leave generic-only partial records unresolved.
             projected["toolName"] = toolName
         }
-        return ACPDefaultSessionUpdateNormalizer.normalize(projected, providerID: .devin)
+        return ACPDefaultSessionUpdateNormalizer.normalize(projected, providerID: .devin, toolNames: toolNames)
     }
 
-    func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
+    package func cleanupLaunchArtifacts(for configuration: ACPLaunchConfiguration) async {
         guard let artifact = configuration.cleanupArtifact else { return }
-        DevinIntegrationConfiguration.cleanupReportingFailures(artifact: artifact)
+        cleanupIntegration(artifact)
     }
 
-    func shouldEmitStderrLine(_ line: String) -> Bool {
+    package func shouldEmitStderrLine(_ line: String) -> Bool {
         let suppressedPattern = #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s+(?:INFO\s+|WARN\s+(?:message_forest:\s+MessageChain tree duplication:|windsurf_api_client::remote_config:\s+remote config revalidation failed,\s+keeping last-good value:))"#
         return line.range(of: suppressedPattern, options: .regularExpression) == nil
     }
 
-    func normalizeError(_ error: Error) -> Error {
+    package func normalizeError(_ error: Error) -> Error {
         if error is AIProviderError { return error }
         if let runnerError = error as? CLIProcessRunnerError,
            case .commandNotFound = runnerError
