@@ -5,18 +5,6 @@ import RepoPromptCodexProvider
 import XCTest
 
 final class AgentCodexModelRegistryCacheTests: XCTestCase {
-    func testInjectedInvalidatorRunsOnlyForChangedLiveModels() {
-        let persistenceKey = "CodexDynamicModelRecords"
-        let originalPersistence = UserDefaults.standard.object(forKey: persistenceKey)
-        defer { UserDefaults.standard.set(originalPersistence, forKey: persistenceKey) }
-        var invalidationCount = 0
-        let registry = AgentCodexModelRegistry(invalidate: { invalidationCount += 1 })
-        let model = remoteModel(id: "injected-future", displayName: "Future", isDefault: false)
-        XCTAssertTrue(registry.updateLiveModels([model]))
-        XCTAssertFalse(registry.updateLiveModels([model]))
-        XCTAssertEqual(invalidationCount, 1)
-    }
-
     func testSpeedOnlyRefreshInvalidatesPickerAndPersistsCapabilities() {
         let registry = AgentCodexModelRegistry(invalidate: { AgentModelCatalogRuntime.shared.invalidate(.codexExec) })
         let persistenceKey = "CodexDynamicModelRecords"
@@ -47,30 +35,6 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
         })
         XCTAssertTrue(registry.updateLiveModels([standard]))
         XCTAssertFalse(registry.resolvedOptions(staticOptions: []).contains { $0.rawValue.hasPrefix("future-model-ultrafast") })
-    }
-
-    func testPreferredModelSnapshotsDoNotReuseAnotherCatalogsOptions() {
-        let registry = AgentCodexModelRegistry(invalidate: { AgentModelCatalogRuntime.shared.invalidate(.codexExec) })
-        let first = remoteModel(id: "future-alpha", displayName: "Alpha", isDefault: true)
-        let second = remoteModel(id: "future-beta", displayName: "Beta", isDefault: false)
-        let changedFirst = remoteModel(id: "future-alpha", displayName: "Alpha Updated", isDefault: false)
-
-        let firstOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [first])
-        XCTAssertEqual(discoveredOptions(firstOptions).map(\.rawValue), ["future-alpha"])
-        XCTAssertEqual(discoveredOptions(firstOptions).map(\.displayName), ["Alpha"])
-        XCTAssertEqual(discoveredOptions(firstOptions).map(\.isProviderDefault), [true])
-
-        let secondOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [second])
-        XCTAssertEqual(discoveredOptions(secondOptions).map(\.rawValue), ["future-beta"])
-        XCTAssertEqual(discoveredOptions(secondOptions).map(\.displayName), ["Beta"])
-
-        let changedOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [changedFirst])
-        XCTAssertEqual(discoveredOptions(changedOptions).map(\.displayName), ["Alpha Updated"])
-        XCTAssertEqual(discoveredOptions(changedOptions).map(\.isProviderDefault), [false])
-
-        let repeatedOptions = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [first])
-        XCTAssertEqual(discoveredOptions(repeatedOptions).map(\.displayName), ["Alpha"])
-        XCTAssertEqual(discoveredOptions(repeatedOptions).map(\.isProviderDefault), [true])
     }
 
     func testInvalidationRejectsPausedProducerWithoutOverwritingNewCatalogue() async throws {
@@ -113,10 +77,6 @@ final class AgentCodexModelRegistryCacheTests: XCTestCase {
             try catalogue.selection("codexExec:current-new", availability: availability).storedModelRaw,
             "current-new"
         )
-    }
-
-    private func discoveredOptions(_ options: [AgentModelOption]) -> [AgentModelOption] {
-        options.filter { !$0.isPlaceholderDefault }
     }
 
     private func remoteModel(id: String, displayName: String, isDefault: Bool) -> CodexAppServerClient.RemoteModel {

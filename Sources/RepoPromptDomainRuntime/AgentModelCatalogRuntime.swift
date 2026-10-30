@@ -1,16 +1,34 @@
 import Dispatch
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAIContracts
-import RepoPromptSettingsCore
 
 /// Admission over the already-advertised catalogue, never a discovery or persistence entrypoint.
 /// Producers refresh this index while building ordinary picker/list_agents options. A cold or
 /// invalidated index fails closed; an oversight request must not warm it on the caller's behalf.
-final class AgentModelCatalogRuntime: @unchecked Sendable {
-    static let shared = AgentModelCatalogRuntime(registerBackendChanges: { handler in
-        ClaudeCodeCompatibleBackendStore.setConfigurationChangeHandler(handler)
-    })
+package final class ModelCatalogRuntime<ACPRegistry: AnyObject, CodexRegistry: AnyObject, Availability>: @unchecked Sendable {
+    /// Construction must be pure: factories run under their respective slot locks and must not
+    /// invoke storage, invalidation, the backend registrar, or other runtime operations.
+    package struct Dependencies {
+        package let makeACPRegistry: (@escaping (AgentProviderKind) -> Void) -> ACPRegistry
+        package let makeCodexRegistry: (@escaping () -> Void) -> CodexRegistry
+        package let isAgentAvailable: (AgentProviderKind, Availability) -> Bool
+        /// Producer-time decomposition only; admission never invokes this policy or reads storage.
+        package let reasoningEffortRaw: (AgentProviderKind, AgentModelOption) -> String?
+
+        package init(
+            makeACPRegistry: @escaping (@escaping (AgentProviderKind) -> Void) -> ACPRegistry,
+            makeCodexRegistry: @escaping (@escaping () -> Void) -> CodexRegistry,
+            isAgentAvailable: @escaping (AgentProviderKind, Availability) -> Bool,
+            reasoningEffortRaw: @escaping (AgentProviderKind, AgentModelOption) -> String?
+        ) {
+            self.makeACPRegistry = makeACPRegistry
+            self.makeCodexRegistry = makeCodexRegistry
+            self.isAgentAvailable = isAgentAvailable
+            self.reasoningEffortRaw = reasoningEffortRaw
+        }
+    }
+
+    private let dependencies: Dependencies
 
     private let registerBackendChanges: (@escaping @Sendable () -> Void) -> Void
     private let activation = NSCondition()
@@ -19,33 +37,37 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
         private let activationWaiterArrived = DispatchSemaphore(value: 0)
     #endif
     private let acpSlotLock = NSLock()
-    private var acpSlot: AgentACPModelRegistry?
+    private var acpSlot: ACPRegistry?
     private let codexSlotLock = NSLock()
-    private var codexSlot: AgentCodexModelRegistry?
+    private var codexSlot: CodexRegistry?
 
-    init(registerBackendChanges: @escaping (@escaping @Sendable () -> Void) -> Void) {
+    package init(
+        dependencies: Dependencies,
+        registerBackendChanges: @escaping (@escaping @Sendable () -> Void) -> Void
+    ) {
+        self.dependencies = dependencies
         self.registerBackendChanges = registerBackendChanges
     }
 
     /// Only pure construction occurs under these slot locks. Neither registry constructor nor
     /// dependency assembly invokes storage, invalidation, or other runtime operations.
-    var acpRegistry: AgentACPModelRegistry {
+    package var acpRegistry: ACPRegistry {
         acpSlotLock.withLock {
             if let acpSlot { return acpSlot }
-            let registry = AgentACPModelRegistry(dependencies: .app(invalidate: { [weak self] agent in
+            let registry = dependencies.makeACPRegistry { [weak self] agent in
                 self?.invalidate(agent)
-            }))
+            }
             acpSlot = registry
             return registry
         }
     }
 
-    var codexRegistry: AgentCodexModelRegistry {
+    package var codexRegistry: CodexRegistry {
         codexSlotLock.withLock {
             if let codexSlot { return codexSlot }
-            let registry = AgentCodexModelRegistry(invalidate: { [weak self] in
+            let registry = dependencies.makeCodexRegistry { [weak self] in
                 self?.invalidate(.codexExec)
-            })
+            }
             codexSlot = registry
             return registry
         }
@@ -88,11 +110,11 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
     }
 
     #if DEBUG
-        func test_waitForActivationWaiter() -> Bool {
+        package func test_waitForActivationWaiter() -> Bool {
             activationWaiterArrived.wait(timeout: .now() + 5) == .success
         }
 
-        var test_initializedSlots: (acp: Bool, codex: Bool) {
+        package var test_initializedSlots: (acp: Bool, codex: Bool) {
             let acp = acpSlotLock.withLock { acpSlot != nil }
             let codex = codexSlotLock.withLock { codexSlot != nil }
             return (acp, codex)
@@ -109,22 +131,18 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
     private var generationsByAgent: [AgentProviderKind: UInt64] = [:]
 
     /// Capture before reading any source snapshot, not after options have been built.
-    func productionGeneration(for agent: AgentProviderKind) -> UInt64 {
+    package func productionGeneration(for agent: AgentProviderKind) -> UInt64 {
         ensureAdvertisedActive()
         return lock.withLock { generationsByAgent[agent, default: 0] }
     }
 
     @discardableResult
-    func record(_ options: [AgentModelOption], for agent: AgentProviderKind, generation: UInt64) -> Bool {
+    package func record(_ options: [AgentModelOption], for agent: AgentProviderKind, generation: UInt64) -> Bool {
         ensureAdvertisedActive()
         // Decomposition belongs to the producer too: Codex's legacy parser can consult persisted
         // discovery for extended effort suffixes. Never invoke that default parser during admission.
         let index = options.reduce(into: [String: Entry]()) { index, option in
-            let effort: String? = if agent == .codexExec {
-                CodexModelSpecifier(raw: option.rawValue).reasoningEffort?.rawValue
-            } else if agent.usesClaudeTooling {
-                ClaudeModelSpecifier(raw: option.rawValue).explicitEffortLevel?.rawValue
-            } else { nil }
+            let effort = dependencies.reasoningEffortRaw(agent, option)
             index[option.rawValue] = Entry(option: option, reasoningEffortRaw: effort)
         }
         return lock.withLock {
@@ -134,7 +152,7 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
         }
     }
 
-    func invalidate(_ agent: AgentProviderKind) {
+    package func invalidate(_ agent: AgentProviderKind) {
         ensureAdvertisedActive()
         lock.withLock {
             generationsByAgent[agent, default: 0] &+= 1
@@ -142,16 +160,16 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
         }
     }
 
-    func selection(
+    package func selection(
         _ modelID: String,
-        availability: AgentModelCatalog.AvailabilityContext
+        availability: Availability
     ) throws -> Selection {
         ensureAdvertisedActive()
         guard let id = AgentModelSelectionID.parse(modelID),
               let agent = AgentProviderKind(rawValue: id.agentRaw),
               id.rawValue == modelID
         else { throw AdmissionError.invalidID }
-        guard AgentModelCatalog.isAgentAvailable(agent, availability: availability) else {
+        guard dependencies.isAgentAvailable(agent, availability) else {
             throw AdmissionError.unavailable
         }
         let entry: Entry = try lock.withLock {
@@ -163,9 +181,9 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
     }
 
     /// Bounded memory-only recovery hints; never discover or warm a provider catalogue on refusal.
-    func modelIDs(for agent: AgentProviderKind, availability: AgentModelCatalog.AvailabilityContext) -> [String] {
+    package func modelIDs(for agent: AgentProviderKind, availability: Availability) -> [String] {
         ensureAdvertisedActive()
-        guard AgentModelCatalog.isAgentAvailable(agent, availability: availability) else { return [] }
+        guard dependencies.isAgentAvailable(agent, availability) else { return [] }
         return lock.withLock {
             (optionsByAgent[agent]?.keys.sorted() ?? []).prefix(8).map {
                 AgentModelSelectionID(agentRaw: agent.rawValue, modelRaw: $0).rawValue
@@ -173,24 +191,24 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
         }
     }
 
-    struct Selection {
-        let id: AgentModelSelectionID
-        let agent: AgentProviderKind
-        let option: AgentModelOption
+    package struct Selection {
+        package let id: AgentModelSelectionID
+        package let agent: AgentProviderKind
+        package let option: AgentModelOption
 
         /// Validate the complete encoded ID before decomposing it. Keep native effort encoded so
         /// manually created sessions use the same next-turn baseline as MCP-created sessions.
-        var storedModelRaw: String {
+        package var storedModelRaw: String {
             id.modelRaw
         }
 
-        let reasoningEffortRaw: String?
+        package let reasoningEffortRaw: String?
     }
 
-    enum AdmissionError: Error, Equatable {
+    package enum AdmissionError: Error, Equatable {
         case invalidID, unavailable, catalogueUnavailable, unadvertised
 
-        var diagnosticCode: String {
+        package var diagnosticCode: String {
             switch self {
             case .invalidID: "model_id_invalid"
             case .unavailable: "model_agent_unavailable"
@@ -199,7 +217,7 @@ final class AgentModelCatalogRuntime: @unchecked Sendable {
             }
         }
 
-        var message: String {
+        package var message: String {
             switch self {
             case .invalidID:
                 "model_id must be an exact compound ID from agent_manage.list_agents, not a role."

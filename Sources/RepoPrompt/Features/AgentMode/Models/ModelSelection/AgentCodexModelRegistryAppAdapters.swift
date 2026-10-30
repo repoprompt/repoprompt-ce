@@ -2,95 +2,26 @@ import Foundation
 import RepoPromptAIContracts
 import RepoPromptCodexProvider
 
-final class AgentCodexModelRegistry {
-    private let invalidate: () -> Void
-    private let lock = NSLock()
-    private var liveModels: [CodexAppServerClient.RemoteModel] = []
-    private var liveModelSignature: [CodexDynamicModelRecord] = []
-    private enum DynamicOptionsInput: Equatable {
-        case remote([CodexAppServerClient.RemoteModel])
-        case stored([CodexDynamicModelRecord])
+extension AgentCodexModelRegistry {
+    convenience init(invalidate: @escaping () -> Void) {
+        self.init(
+            dependencies: Dependencies(
+                canonicalRecords: { CodexDynamicModelStore.canonicalRecords(from: $0) },
+                save: { CodexDynamicModelStore.save($0) },
+                load: { CodexDynamicModelStore.load() },
+                remoteOptions: { AgentCodexModelPolicy.codexDynamicOptions(from: CodexDynamicModelMapper.options(from: $0)) },
+                storedOptions: { AgentCodexModelPolicy.codexDynamicOptions(from: CodexDynamicModelMapper.options(from: $0)) },
+                resolveOptions: { AgentCodexModelPolicy.resolvedOptions(dynamicOptions: $0, staticOptions: $1) },
+                addingFastVariants: { AgentCodexModelPolicy.codexOptionsByAddingFastVariants($0) }
+            ),
+            invalidate: invalidate
+        )
     }
+}
 
-    private struct DynamicOptionsCacheEntry {
-        let input: DynamicOptionsInput
-        let options: [AgentModelOption]
-    }
-
-    /// Preferred, live, and persisted model lists can differ. Keep a few exact
-    /// input snapshots rather than treating the most recent sort as universal.
-    private var cachedDynamicOptions: [DynamicOptionsCacheEntry] = []
-
-    init(invalidate: @escaping () -> Void) {
-        self.invalidate = invalidate
-    }
-
-    @discardableResult
-    func updateLiveModels(_ models: [CodexAppServerClient.RemoteModel]) -> Bool {
-        let signature = CodexDynamicModelStore.canonicalRecords(from: models)
-        let normalized = remoteModels(from: signature)
-
-        lock.lock()
-        let didChange = signature != liveModelSignature
-        if didChange {
-            liveModels = normalized
-            liveModelSignature = signature
-        }
-        lock.unlock()
-
-        guard didChange else { return false }
-        invalidate()
-        CodexDynamicModelStore.save(normalized)
-        return true
-    }
-
-    func currentLiveModels() -> [CodexAppServerClient.RemoteModel] {
-        lock.lock()
-        defer { lock.unlock() }
-        return liveModels
-    }
-
-    func resolvedOptions(
-        staticOptions: [AgentModelOption],
-        preferredLiveModels: [CodexAppServerClient.RemoteModel]? = nil
-    ) -> [AgentModelOption] {
-        if let preferredLiveModels {
-            if !preferredLiveModels.isEmpty {
-                return resolvedOptions(
-                    dynamicOptions: codexDynamicOptions(from: preferredLiveModels),
-                    staticOptions: staticOptions
-                )
-            }
-            let cachedRecords = CodexDynamicModelStore.load()
-            if !cachedRecords.isEmpty {
-                return resolvedOptions(
-                    dynamicOptions: codexDynamicOptions(from: cachedRecords),
-                    staticOptions: staticOptions
-                )
-            }
-            return codexOptionsByAddingFastVariants(staticOptions)
-        }
-
-        let knownLiveModels = currentLiveModels()
-        if !knownLiveModels.isEmpty {
-            return resolvedOptions(
-                dynamicOptions: codexDynamicOptions(from: knownLiveModels),
-                staticOptions: staticOptions
-            )
-        }
-
-        let cachedRecords = CodexDynamicModelStore.load()
-        if !cachedRecords.isEmpty {
-            return resolvedOptions(
-                dynamicOptions: codexDynamicOptions(from: cachedRecords),
-                staticOptions: staticOptions
-            )
-        }
-
-        return codexOptionsByAddingFastVariants(staticOptions)
-    }
-
-    private func resolvedOptions(
+/// The existing App picker/recommendation policy, without registry state or a second catalog.
+private enum AgentCodexModelPolicy {
+    static func resolvedOptions(
         dynamicOptions: [AgentModelOption],
         staticOptions: [AgentModelOption]
     ) -> [AgentModelOption] {
@@ -102,11 +33,11 @@ final class AgentCodexModelRegistry {
         return dynamicOptionsWithFastVariants
     }
 
-    private func codexOptionsByAddingFastVariants(_ options: [AgentModelOption]) -> [AgentModelOption] {
+    static func codexOptionsByAddingFastVariants(_ options: [AgentModelOption]) -> [AgentModelOption] {
         options + synthesizedFastAgentOptions(from: options)
     }
 
-    private func synthesizedFastAgentOptions(from options: [AgentModelOption]) -> [AgentModelOption] {
+    private static func synthesizedFastAgentOptions(from options: [AgentModelOption]) -> [AgentModelOption] {
         var synthesized: [AgentModelOption] = []
         var seen = Set(options.map { $0.rawValue.lowercased() })
 
@@ -142,7 +73,7 @@ final class AgentCodexModelRegistry {
         return synthesized
     }
 
-    private func fastDisplayName(for option: AgentModelOption, reasoningEffort: CodexReasoningEffort?) -> String {
+    private static func fastDisplayName(for option: AgentModelOption, reasoningEffort: CodexReasoningEffort?) -> String {
         let baseLabel = AIModel.stripCodexReasoningSuffix(from: option.displayName)
         let fastLabel = baseLabel.range(of: " fast", options: [.caseInsensitive, .backwards]) == nil
             ? "\(baseLabel) Fast"
@@ -153,57 +84,13 @@ final class AgentCodexModelRegistry {
         return fastLabel
     }
 
-    private func fastDescription(for description: String?) -> String {
+    private static func fastDescription(for description: String?) -> String {
         let trimmed = description?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return CodexServiceTierVariantCatalog.fastCostWarningText }
         return "\(trimmed) \(CodexServiceTierVariantCatalog.fastCostWarningText)"
     }
 
-    private func codexDynamicOptions(
-        from models: [CodexAppServerClient.RemoteModel]
-    ) -> [AgentModelOption] {
-        cachedOptions(for: .remote(models)) {
-            CodexDynamicModelMapper.options(from: models)
-        }
-    }
-
-    private func codexDynamicOptions(
-        from records: [CodexDynamicModelRecord]
-    ) -> [AgentModelOption] {
-        cachedOptions(for: .stored(records)) {
-            CodexDynamicModelMapper.options(from: records)
-        }
-    }
-
-    private func cachedOptions(
-        for input: DynamicOptionsInput,
-        makeDynamicOptions: () -> [CodexDynamicModelOption]
-    ) -> [AgentModelOption] {
-        lock.lock()
-        if let cached = cachedDynamicOptions.first(where: { $0.input == input }) {
-            lock.unlock()
-            return cached.options
-        }
-        lock.unlock()
-
-        // Sorting may be expensive; do it outside the registry lock. A concurrent
-        // miss can duplicate work, but an older result cannot overwrite a newer
-        // catalog because each entry retains the input that produced it.
-        let result = codexDynamicOptions(from: makeDynamicOptions())
-
-        lock.lock()
-        if !cachedDynamicOptions.contains(where: { $0.input == input }) {
-            cachedDynamicOptions.insert(DynamicOptionsCacheEntry(input: input, options: result), at: 0)
-            if cachedDynamicOptions.count > 3 {
-                cachedDynamicOptions.removeLast()
-            }
-        }
-        lock.unlock()
-
-        return result
-    }
-
-    private func codexDynamicOptions(
+    static func codexDynamicOptions(
         from dynamicOptions: [CodexDynamicModelOption]
     ) -> [AgentModelOption] {
         var options: [AgentModelOption] = [
@@ -235,7 +122,7 @@ final class AgentCodexModelRegistry {
         return options
     }
 
-    private func mergeCodexOptions(
+    private static func mergeCodexOptions(
         primary: [AgentModelOption],
         fallback: [AgentModelOption]
     ) -> [AgentModelOption] {
@@ -250,7 +137,7 @@ final class AgentCodexModelRegistry {
         return merged
     }
 
-    private func shouldBackfillRecommendedDefaults(_ options: [AgentModelOption]) -> Bool {
+    private static func shouldBackfillRecommendedDefaults(_ options: [AgentModelOption]) -> Bool {
         let keys = Set(options.flatMap { codexEquivalenceKeys(for: $0.rawValue) })
         // Mirrors CodexAIModelCatalog: GPT-6.1 Sol and GPT-6 Luna back the role defaults.
         let requiredKeyGroups: [[String]] = [
@@ -265,7 +152,7 @@ final class AgentCodexModelRegistry {
         }
     }
 
-    private func codexEquivalenceKeys(for rawValue: String) -> Set<String> {
+    private static func codexEquivalenceKeys(for rawValue: String) -> Set<String> {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return [] }
         var keys: Set<String> = [normalized]
@@ -293,36 +180,4 @@ final class AgentCodexModelRegistry {
         }
         return keys
     }
-
-    private func remoteModels(
-        from records: [CodexDynamicModelRecord]
-    ) -> [CodexAppServerClient.RemoteModel] {
-        records.map { record in
-            CodexAppServerClient.RemoteModel(
-                id: record.id,
-                model: record.model,
-                displayName: record.displayName,
-                description: record.description,
-                isDefault: record.isDefault,
-                supportedReasoningEfforts: record.supportedReasoningEfforts.map {
-                    CodexAppServerClient.RemoteReasoningEffort(
-                        reasoningEffort: $0.reasoningEffort,
-                        description: $0.description
-                    )
-                },
-                defaultReasoningEffort: record.defaultReasoningEffort,
-                serviceTiers: record.serviceTiers
-            )
-        }
-    }
-
-    #if DEBUG
-        @_spi(TestSupport)
-        public func test_mergeCodexOptions(
-            primary: [AgentModelOption],
-            fallback: [AgentModelOption]
-        ) -> [AgentModelOption] {
-            mergeCodexOptions(primary: primary, fallback: fallback)
-        }
-    #endif
 }

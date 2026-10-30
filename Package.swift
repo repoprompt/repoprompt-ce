@@ -159,7 +159,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RepoPromptCodexProviderTests",
-            dependencies: ["RepoPromptCodexProvider", "RepoPromptShared"],
+            dependencies: ["RepoPromptCodexProvider", "RepoPromptAIContracts", "RepoPromptShared"],
             path: "Tests/RepoPromptCodexProviderTests"
         ),
         .target(
@@ -198,6 +198,7 @@ let package = Package(
         .target(
             name: "RepoPromptDomainRuntime",
             dependencies: [
+                "RepoPromptAIContracts",
                 "RepoPromptShared",
                 "RepoPromptWorkspaceCore",
                 "RepoPromptC",
@@ -361,6 +362,7 @@ let package = Package(
         .testTarget(
             name: "RepoPromptDomainRuntimeTests",
             dependencies: [
+                "RepoPromptAIContracts",
                 "RepoPromptDomainRuntime",
                 .product(name: "MCP", package: "swift-sdk")
             ],
