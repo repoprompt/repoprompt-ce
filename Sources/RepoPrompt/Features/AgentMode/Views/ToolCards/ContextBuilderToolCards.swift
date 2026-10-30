@@ -1,3 +1,4 @@
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptShared
 import SwiftUI

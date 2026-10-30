@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import RepoPromptAIContracts
 
 /// Base provider configuration
 struct ProviderConfiguration: Codable {

@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptAIContracts
 import SwiftOpenAI
 
 class OpenRouterProvider: AIProvider {

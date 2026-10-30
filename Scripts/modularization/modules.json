@@ -65,7 +65,13 @@
     },
     "RepoPromptAgentProviderContracts": {
       "source_root": "Sources/RepoPromptAgentProviderContracts",
-      "allowed_dependencies": ["RepoPromptDomainRuntime", "RepoPromptProviderQuota"]
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"],
+      "test_target": "RepoPromptAgentProviderContractsTests",
+      "app_free_tests": true
+    },
+    "RepoPromptAgentProviderContractsTests": {
+      "source_root": "Tests/RepoPromptAgentProviderContractsTests",
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
     },
     "RepoPromptCodexProvider": {
       "source_root": "Sources/RepoPromptCodexProvider",
@@ -367,13 +373,18 @@
       "owner": "RepoPromptClaudeProvider",
       "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridgeCore.swift"]
     },
-    "NativeAgentRuntimeContracts": {
+    "AIModelIdentityAndProviderVocabulary": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/AIModelIdentity.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ClaudeModelIdentityNormalization.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderType.swift"
+      ]
+    },
+    "AIProviderProtocol": {
       "owner": "RepoPromptAgentProviderContracts",
       "former_app_files": [
-        "Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift",
-        "Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeValues.swift",
-        "Sources/RepoPrompt/Infrastructure/AI/Models/NativeAgentRuntimeConfiguration.swift",
-        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeEffortLevel.swift"
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProvider.swift"
       ]
     },
     "CodexControllerContentValues": {
@@ -387,6 +398,15 @@
       "owner": "RepoPromptAIContracts",
       "former_app_files": [
         "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexControllerPermissionValues.swift"
+      ]
+    },
+    "NativeAgentRuntimeContracts": {
+      "owner": "RepoPromptAgentProviderContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift",
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeValues.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Models/NativeAgentRuntimeConfiguration.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeEffortLevel.swift"
       ]
     },
     "ACPSessionControllerAndHeadlessBridge": {

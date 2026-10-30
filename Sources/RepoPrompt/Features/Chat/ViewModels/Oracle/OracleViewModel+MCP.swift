@@ -1,5 +1,6 @@
 import Foundation
 import MCP // <- required for `Value`
+import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 

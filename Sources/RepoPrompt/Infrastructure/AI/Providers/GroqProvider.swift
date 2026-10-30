@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import RepoPromptAIContracts
 import SwiftOpenAI
 
 final class GroqProvider: OpenAIProvider {

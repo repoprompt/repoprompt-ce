@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAIContracts
 import RepoPromptSettingsCore
 
 /// V3 acknowledges one rewrite billing route plus the optional recent-chat exposure.
