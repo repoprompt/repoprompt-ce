@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 
 /// Per-stream identifier for cancellation.
 public typealias ChatStreamID = UUID

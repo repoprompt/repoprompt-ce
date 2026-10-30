@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptFoundation
+import RepoPromptHTTPProviders
 import XCTest
 
 final class ZAIProviderEndpointTests: XCTestCase {

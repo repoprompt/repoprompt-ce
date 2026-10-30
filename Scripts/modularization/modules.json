@@ -16,6 +16,7 @@
       "source_root": "Sources/RepoPrompt",
       "allowed_dependencies": [
         "RepoPromptAgentProviderContracts",
+        "RepoPromptHTTPProviders",
         "RepoPromptACPProviders",
         "RepoPromptCodexProvider",
         "RepoPromptAIContracts",
@@ -67,6 +68,16 @@
     "RepoPromptAgentProviderContractsTests": {
       "source_root": "Tests/RepoPromptAgentProviderContractsTests",
       "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
+    },
+    "RepoPromptHTTPProviders": {
+      "source_root": "Sources/RepoPromptHTTPProviders",
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
+      "test_target": "RepoPromptHTTPProvidersTests",
+      "app_free_tests": true
+    },
+    "RepoPromptHTTPProvidersTests": {
+      "source_root": "Tests/RepoPromptHTTPProvidersTests",
+      "allowed_dependencies": ["RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
     },
     "RepoPromptCodexProvider": {
       "source_root": "Sources/RepoPromptCodexProvider",
@@ -122,7 +133,8 @@
     "RepoPromptDomainRuntimeTests": {
       "source_root": "Tests/RepoPromptDomainRuntimeTests",
       "allowed_dependencies": [
-        "RepoPromptDomainRuntime"
+        "RepoPromptDomainRuntime",
+        "RepoPromptAIContracts"
       ]
     },
     "RepoPromptFoundation": {
@@ -299,6 +311,7 @@
       "source_root": "Tests/RepoPromptTests",
       "allowed_dependencies": [
         "RepoPromptAgentProviderContracts",
+        "RepoPromptHTTPProviders",
         "RepoPromptACPProviders",
         "RepoPromptCodexProvider",
         "RepoPromptAIContracts",
@@ -361,6 +374,28 @@
     }
   },
   "moved_families": {
+    "OpenAIHTTPExecutionFamily": {
+      "owner": "RepoPromptHTTPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/DeepseekProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/FireworksProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GeminiProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GroqProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ZAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OllamaProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIProviderHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/AIMessage+OpenAIEncoding.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/ResponsesJobProvider.swift"
+      ]
+    },
+    "ProviderTransportActivity": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ProviderTransportActivity.swift"
+      ]
+    },
     "AIModelIdentityAndProviderVocabulary": {
       "owner": "RepoPromptAIContracts",
       "former_app_files": [

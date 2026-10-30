@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 import SwiftOpenAI
 
 /// Composition adapter only. Keep these live reads at the provider's original request boundaries.

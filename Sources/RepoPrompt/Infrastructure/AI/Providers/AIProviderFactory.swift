@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 import RepoPromptInstrumentation
 
 class AIProviderFactory {

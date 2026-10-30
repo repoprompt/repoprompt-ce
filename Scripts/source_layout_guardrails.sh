@@ -299,8 +299,8 @@ else:
     }
     if domain_runtime_tests.get("type") != "test": errors.append("RepoPromptDomainRuntimeTests must remain a test target")
     if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests": errors.append("RepoPromptDomainRuntimeTests target path drifted")
-    if owner_by_name != ["RepoPromptDomainRuntime"] or owner_products != {("MCP", "swift-sdk")} or len(domain_runtime_tests.get("dependencies", [])) != 2:
-        errors.append("RepoPromptDomainRuntimeTests must depend only on RepoPromptDomainRuntime and MCP")
+    if owner_by_name != ["RepoPromptAIContracts", "RepoPromptDomainRuntime"] or owner_products != {("MCP", "swift-sdk")} or len(domain_runtime_tests.get("dependencies", [])) != 3:
+        errors.append("RepoPromptDomainRuntimeTests must depend only on RepoPromptAIContracts, RepoPromptDomainRuntime, and MCP")
 
 def swift_language_modes(target):
     return [

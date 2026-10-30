@@ -4,6 +4,7 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 import RepoPromptSecureStorage
 import RepoPromptShared
 import SwiftAnthropic

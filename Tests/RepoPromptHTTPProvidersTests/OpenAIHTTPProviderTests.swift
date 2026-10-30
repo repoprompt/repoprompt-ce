@@ -1,7 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
-@testable import RepoPromptApp
+@testable import RepoPromptHTTPProviders
 import SwiftOpenAI
 import XCTest
 
