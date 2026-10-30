@@ -61,7 +61,7 @@
     },
     "RepoPromptClaudeProvider": {
       "source_root": "Sources/RepoPromptClaudeProvider",
-      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"]
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"]
     },
     "RepoPromptAgentProviderContracts": {
       "source_root": "Sources/RepoPromptAgentProviderContracts",
@@ -369,6 +369,10 @@
     }
   },
   "moved_families": {
+    "ClaudeCodeAgentConfigValue": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeAgentConfigValue.swift"]
+    },
     "AgentCLIToolContext": {
       "owner": "RepoPromptAIContracts",
       "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/AgentCLIToolContext.swift"]

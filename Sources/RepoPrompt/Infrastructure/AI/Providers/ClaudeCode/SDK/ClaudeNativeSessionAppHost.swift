@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 
 extension MCPConfigLease: ClaudeNativeConfigLease {}
 

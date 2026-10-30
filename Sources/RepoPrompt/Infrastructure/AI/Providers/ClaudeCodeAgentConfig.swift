@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 
 #if DEBUG
     private var claudeCodeAgentConfigDebugLoggingEnabled = false

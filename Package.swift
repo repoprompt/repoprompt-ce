@@ -151,6 +151,7 @@ let package = Package(
         .target(
             name: "RepoPromptClaudeProvider",
             dependencies: [
+                "RepoPromptAgentProviderContracts",
                 "RepoPromptAIContracts",
                 "RepoPromptDomainRuntime",
                 "RepoPromptProviderQuota",
