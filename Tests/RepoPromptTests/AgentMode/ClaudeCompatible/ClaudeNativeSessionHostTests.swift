@@ -21,6 +21,10 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
             environment
         }
 
+        nonisolated func processEnvironmentOverrides(for _: AgentCLIToolContext) -> [String: String] {
+            ["HOST_ROUTING_WITNESS": "host"]
+        }
+
         nonisolated func supplementedPathHints(_ hints: [String]) -> [String] {
             hints
         }
@@ -96,6 +100,16 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
             }
             XCTAssertEqual(approvals, expectApproval ? 1 : 0)
         }
+    }
+
+    func testLaunchEnvironmentUsesRequiredHostOverrides() async {
+        let controller = ClaudeNativeProcessSessionController(
+            host: RefusingHost(), runID: UUID(), tabID: UUID(), windowID: 1,
+            workspacePath: nil, config: .discovery(commandName: "/usr/bin/false")
+        )
+        let environment = await controller.test_effectiveLaunchEnvironment(base: [:])
+        XCTAssertEqual(environment["HOST_ROUTING_WITNESS"], "host")
+        await controller.shutdown()
     }
 
     func testRequiredHostReadinessRefusalPrecedesLeaseAndLaunch() async {

@@ -30,6 +30,10 @@ struct ClaudeCodeAgentConfig {
     let effortLevel: ClaudeCodeEffortLevel?
 
     var processEnvironmentOverrides: [String: String] {
+        Self.processEnvironmentOverrides(for: toolContext)
+    }
+
+    static func processEnvironmentOverrides(for toolContext: AgentCLIToolContext) -> [String: String] {
         switch toolContext {
         case .agentRun, .terminal:
             MCPIntegrationHelper.claudeProcessEnvironmentOverrides

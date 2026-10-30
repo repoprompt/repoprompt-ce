@@ -2531,7 +2531,7 @@ final actor ClaudeNativeProcessSessionController {
         if !config.toolSearchEnabled {
             env["ENABLE_TOOL_SEARCH"] = "false"
         }
-        for (key, value) in config.processEnvironmentOverrides {
+        for (key, value) in host.processEnvironmentOverrides(for: config.toolContext) {
             env[key] = value
         }
         for (key, value) in resolverOverrides {

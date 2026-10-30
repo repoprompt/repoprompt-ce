@@ -25,6 +25,10 @@ struct ClaudeNativeSessionAppHost: ClaudeNativeSessionHosting {
         DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: environment)
     }
 
+    func processEnvironmentOverrides(for context: AgentCLIToolContext) -> [String: String] {
+        ClaudeCodeAgentConfig.processEnvironmentOverrides(for: context)
+    }
+
     func supplementedPathHints(_ hints: [String]) -> [String] {
         CLIPathHints.nativeDefaultsSupplemented(with: hints)
     }

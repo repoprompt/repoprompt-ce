@@ -17,6 +17,7 @@ protocol ClaudeNativeSessionHosting: Sendable {
     func repoPromptPermissionMatch(toolName: String, requestPayload: [String: Any]) -> ClaudeNativePermissionMatch?
     func filterEnvironment(_ environment: [String: String], variant: ClaudeCodeRuntimeVariant) async -> [String: String]
     func mergeCurrentCarrier(into environment: [String: String]) -> [String: String]
+    func processEnvironmentOverrides(for context: AgentCLIToolContext) -> [String: String]
     func supplementedPathHints(_ hints: [String]) -> [String]
     func expectedAgentClientName(for variant: ClaudeCodeRuntimeVariant) -> String?
     func isRawEventFileLoggingEnabled() -> Bool
