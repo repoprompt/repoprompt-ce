@@ -4,14 +4,16 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import SwiftAnthropic
 
-class AnthropicProvider: AIProvider {
+package class AnthropicProvider: AIProvider {
     private let service: AnthropicService
+    private let host: any AnthropicHTTPHost
 
-    init(apiKey: String, betaHeaders: [String] = ["messages-2023-12-15", "prompt-caching-2024-07-31", "output-128k-2025-02-19"]) {
-        service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: betaHeaders)
+    package init(apiKey: String, host: any AnthropicHTTPHost, httpClient: SwiftAnthropic.HTTPClient? = nil, betaHeaders: [String] = ["messages-2023-12-15", "prompt-caching-2024-07-31", "output-128k-2025-02-19"]) {
+        self.host = host
+        service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: betaHeaders, httpClient: httpClient)
     }
 
-    static func isSuccessfulCompletionStopReason(_ stopReason: String) -> Bool {
+    package static func isSuccessfulCompletionStopReason(_ stopReason: String) -> Bool {
         switch stopReason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "end_turn", "stop_sequence":
             true
@@ -20,7 +22,7 @@ class AnthropicProvider: AIProvider {
         }
     }
 
-    static func makeMessages(for aiMessage: AIMessage) throws -> [MessageParameter.Message] {
+    package static func makeMessages(for aiMessage: RepoPromptDomainRuntime.AIMessage) throws -> [MessageParameter.Message] {
         let planned = try AttachmentEncoding.plan(aiMessage.attachments, route: .anthropicMessages)
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
@@ -111,17 +113,17 @@ class AnthropicProvider: AIProvider {
         ])
     }
 
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         // Check if streaming is enabled for the model
-        if !model.canStream {
+        if !host.canStream(for: model) {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
-                continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
                 switch result.completionOutcome {
                 case .completed:
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
                 case let .incomplete(reason):
-                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
                 }
                 continuation.finish()
             }
@@ -131,7 +133,7 @@ class AnthropicProvider: AIProvider {
         }
 
         // Get the model name and strip thinking suffix if present
-        let modelName = model.modelName
+        let modelName = host.modelName(for: model)
         let baseModelName: String
         let isThinkingMode: Bool
         let thinkingBudget: Int
@@ -178,7 +180,7 @@ class AnthropicProvider: AIProvider {
             temperature = nil
         }
         // Apply user-defined temperature if override is enabled (for non-thinking models)
-        else if let messageTemperature = aiMessage.effectiveTemperature(for: model) {
+        else if let messageTemperature = host.effectiveTemperature(for: aiMessage, model: model) {
             temperature = messageTemperature
         }
 
@@ -263,8 +265,8 @@ class AnthropicProvider: AIProvider {
                             break
                         }
 
-                        // Create AIStreamResult with text and reasoning
-                        let aiResult = AIStreamResult(
+                        // Create RepoPromptDomainRuntime.AIStreamResult with text and reasoning
+                        let aiResult = RepoPromptDomainRuntime.AIStreamResult(
                             type: result.type,
                             text: result.contentBlock?.text ?? result.delta?.text,
                             reasoning: reasoning,
@@ -281,8 +283,8 @@ class AnthropicProvider: AIProvider {
                         let stopReason = observedStopReason ?? "missing_stop_reason"
                         let type = Self.isSuccessfulCompletionStopReason(stopReason)
                             ? "message_stop"
-                            : AIStreamResult.incompleteType
-                        continuation.yield(AIStreamResult(
+                            : RepoPromptDomainRuntime.AIStreamResult.incompleteType
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(
                             type: type,
                             text: nil,
                             reasoning: nil,
@@ -300,9 +302,9 @@ class AnthropicProvider: AIProvider {
         }
     }
 
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AICompletionResult {
+    package func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         // Get the model name and strip thinking suffix if present
-        let modelName = model.modelName
+        let modelName = host.modelName(for: model)
         let baseModelName: String
         let isThinkingMode: Bool
         let thinkingBudget: Int
@@ -352,13 +354,13 @@ class AnthropicProvider: AIProvider {
     /// Claude 5.x-generation models (Sonnet 5/5.5, Opus 5/5.5, Fable, Mythos) accept only adaptive
     /// thinking: `thinking.budget_tokens` and sampling parameters such as `temperature` return 400.
     /// Omitting `thinking` runs adaptive thinking at the model's default effort.
-    static func usesAdaptiveThinkingOnly(_ modelName: String) -> Bool {
+    package static func usesAdaptiveThinkingOnly(_ modelName: String) -> Bool {
         let normalized = modelName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let prefixes = ["claude-fable-", "claude-mythos-", "claude-opus-5", "claude-sonnet-5"]
         return prefixes.contains { normalized.hasPrefix($0) }
     }
 
-    private func completeMessage(_ aiMessage: AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0) async throws -> AICompletionResult {
+    private func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         guard !aiMessage.systemPrompt.isEmpty else {
             throw AIProviderError.invalidSystemPrompt
         }
@@ -408,7 +410,7 @@ class AnthropicProvider: AIProvider {
             ? .completed
             : .incomplete(reason: stopReason)
 
-        return AICompletionResult(
+        return RepoPromptDomainRuntime.AICompletionResult(
             text: text,
             promptTokens: promptTokens,
             completionTokens: completionTokens,
@@ -416,8 +418,8 @@ class AnthropicProvider: AIProvider {
         )
     }
 
-    func testAPIKey() async throws -> Bool {
-        let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
+    package func testAPIKey() async throws -> Bool {
+        let testMessage = RepoPromptDomainRuntime.AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         let result = try await completeMessage(testMessage, model: .claude3Haiku)
         return result.text.lowercased().contains("hello")
     }

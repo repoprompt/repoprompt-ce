@@ -65,7 +65,7 @@ class AIProviderFactory {
     ) async throws -> AIProvider {
         switch providerType {
         case .anthropic:
-            return AnthropicProvider(apiKey: key)
+            return AnthropicProvider(apiKey: key, host: AnthropicAppHost())
         case .openAI:
             let raw = UserDefaults.standard.string(forKey: "customBaseURLOpenAI")
             let split = OpenAIURLHelper.splitBaseURLAndVersion(raw)
@@ -84,9 +84,9 @@ class AIProviderFactory {
             guard let config = azureConfiguration else {
                 return BlankProvider()
             }
-            return AzureOpenAIProvider(configuration: config)
+            return AzureOpenAIProvider(configuration: config, host: AzureOpenAIAppHost())
         case .openRouter:
-            return OpenRouterProvider(apiKey: key)
+            return OpenRouterProvider(apiKey: key, host: OpenRouterAppHost())
         case .gemini:
             return GeminiProvider(host: OpenAIProviderAppHost(), apiKey: key)
         case .deepseek:
@@ -163,7 +163,7 @@ class AIProviderFactory {
 
             // Fallback: manual HTTP provider for exotic/custom formats
             return CustomOpenAIProvider(
-                baseURL: baseStr,
+                host: CustomOpenAIAppHost(), baseURL: baseStr,
                 apiKey: key,
                 defaultModel: config.defaultModel,
                 defaultTemperature: 0, // Keep deterministic by default; configurable later if needed

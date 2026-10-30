@@ -4,10 +4,8 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 
-typealias CompletionParams = RepoPromptDomainRuntime.CompletionParams
-
 /// Provider-specific errors with detailed status codes and messages
-enum CustomOpenAIProviderError: Error {
+package enum CustomOpenAIProviderError: Error {
     case invalidToken(statusCode: Int = 401, message: String = "Invalid or missing authentication token")
     case invalidModel(statusCode: Int = 400, message: String = "The specified model is not available or invalid")
     case requestFailed(statusCode: Int, message: String)
@@ -18,7 +16,7 @@ enum CustomOpenAIProviderError: Error {
     case serviceUnavailable(statusCode: Int = 503, message: String = "Service temporarily unavailable")
     case requestTooLarge(statusCode: Int = 413, message: String = "This model has very strict token limits, and the provided request is too large.")
 
-    var statusCode: Int {
+    package var statusCode: Int {
         switch self {
         case let .invalidToken(code, _): code
         case let .invalidModel(code, _): code
@@ -32,7 +30,7 @@ enum CustomOpenAIProviderError: Error {
         }
     }
 
-    var errorMessage: String {
+    package var errorMessage: String {
         switch self {
         case let .invalidToken(_, message): message
         case let .invalidModel(_, message): message
@@ -47,9 +45,11 @@ enum CustomOpenAIProviderError: Error {
     }
 }
 
-class CustomOpenAIProvider: AIProvider, AIModelGetter {
+package class CustomOpenAIProvider: AIProvider, AIModelGetter {
     // Configuration
     private let baseURL: String
+    private let host: any CustomOpenAIHTTPHost
+    private let retrySleep: (@Sendable (TimeInterval) async throws -> Void)?
     private let apiKey: String
     private let httpCredentialConsentEndpoint: String?
     private let defaultModel: String
@@ -110,7 +110,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
 
     struct ChatMessage: Encodable {
         let role: String
-        let content: CompletionParams.Message.Content
+        let content: RepoPromptDomainRuntime.CompletionParams.Message.Content
     }
 
     /// Added support for max_tokens and temperature in the request payload
@@ -156,7 +156,9 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         let choices: [Choice]
     }
 
-    init(
+    package init(
+        host: any CustomOpenAIHTTPHost,
+        retrySleep: (@Sendable (TimeInterval) async throws -> Void)? = nil,
         baseURL: String,
         apiKey: String,
         defaultModel: String,
@@ -169,6 +171,8 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         httpClient: HTTPClient = DefaultHTTPClient.aiClient,
         streamingHttpClient: HTTPClient = DefaultHTTPClient.aiStreamingClient
     ) {
+        self.host = host
+        self.retrySleep = retrySleep
         self.baseURL = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
         self.apiKey = apiKey
         self.httpCredentialConsentEndpoint = httpCredentialConsentEndpoint
@@ -183,7 +187,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     }
 
     private func urlFor(path: String) throws -> URL? {
-        try ProviderEndpointConsent.validate(baseURL, credentialBearing: ProviderEndpointConsent.hasCredentials(apiKey: apiKey, customHeaders: customHeaders), consentEndpoint: httpCredentialConsentEndpoint)
+        try host.validateEndpoint(baseURL, apiKey: apiKey, customHeaders: customHeaders, consentEndpoint: httpCredentialConsentEndpoint)
         if let v = apiVersion, !v.isEmpty {
             return URL(string: "\(baseURL)/\(v)/\(path)")
         } else {
@@ -338,7 +342,11 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                 #endif
 
                 // Wait before retrying with exponential backoff
-                try await Task.sleep(nanoseconds: UInt64(currentDelay * 1_000_000_000))
+                if let retrySleep {
+                    try await retrySleep(currentDelay)
+                } else {
+                    try await Task.sleep(nanoseconds: UInt64(currentDelay * 1_000_000_000))
+                }
                 currentDelay = min(currentDelay * 2, maxDelay)
             }
         }
@@ -346,7 +354,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         throw lastError ?? CustomOpenAIProviderError.serverError(message: "Retry failed after \(maxAttempts) attempts")
     }
 
-    func getAvailableModels() async throws -> [String] {
+    package func getAvailableModels() async throws -> [String] {
         guard let url = try urlFor(path: "models") else {
             throw CustomOpenAIProviderError.invalidResponse(message: "Invalid base URL: \(baseURL)")
         }
@@ -377,20 +385,20 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     // ---------------------------------------
     // NEW: createMessages(for:)
     // ---------------------------------------
-    private func createMessages(for aiMessage: AIMessage) throws -> [CompletionParams.Message] {
+    private func createMessages(for aiMessage: RepoPromptDomainRuntime.AIMessage) throws -> [RepoPromptDomainRuntime.CompletionParams.Message] {
         try CustomOpenAIMessageBuilder.messages(for: aiMessage)
     }
 
     #if DEBUG
-        func serializedMessagesForTesting(
-            _ aiMessage: AIMessage
-        ) throws -> [CompletionParams.Message] {
+        package func serializedMessagesForTesting(
+            _ aiMessage: RepoPromptDomainRuntime.AIMessage
+        ) throws -> [RepoPromptDomainRuntime.CompletionParams.Message] {
             try createMessages(for: aiMessage)
         }
     #endif
 
     /// completeMessage now accepts temperature as a param
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult {
+    package func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int?) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         // Build message array using new approach
         let messages = try createMessages(for: aiMessage)
 
@@ -403,9 +411,9 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         return try await withRetry(maxAttempts: 3) {
             let request = try self.createCompletionRequest(
                 messages: messages,
-                modelName: model.modelName,
+                modelName: host.modelName(for: model),
                 maxTokens: maxTokens,
-                temperature: aiMessage.effectiveTemperature(for: model)
+                temperature: host.effectiveTemperature(for: aiMessage, model: model)
             )
 
             let response = try await httpClient.data(for: request)
@@ -419,7 +427,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                 guard let content = chatResponse.choices.first?.message.content else {
                     throw CustomOpenAIProviderError.invalidResponse(message: "No content in response")
                 }
-                return AICompletionResult(text: content, promptTokens: nil, completionTokens: nil)
+                return RepoPromptDomainRuntime.AICompletionResult(text: content, promptTokens: nil, completionTokens: nil)
             } catch let decodeError as DecodingError {
                 // Try to extract error message from response if decoding fails
                 let errorDetail = self.parseErrorBody(response.data)
@@ -429,13 +437,13 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     }
 
     /// streamMessage now accepts temperature as a param
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         // Check if stream is supported by the model
-        if !model.canStream {
+        if !host.canStream(for: model) {
             let completeText = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
-                continuation.yield(AIStreamResult(type: "content", text: completeText.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
-                continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: completeText.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: nil, completionTokens: nil))
                 continuation.finish()
             }
         }
@@ -463,10 +471,10 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                     do {
                         let request = try self.createCompletionRequest(
                             messages: messages,
-                            modelName: model.modelName,
+                            modelName: host.modelName(for: model),
                             stream: true,
                             maxTokens: maxTokens,
-                            temperature: aiMessage.effectiveTemperature(for: model)
+                            temperature: host.effectiveTemperature(for: aiMessage, model: model)
                         )
                         let (bytes, httpResponse) = try await self.streamingHttpClient.bytes(for: request)
 
@@ -509,7 +517,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
 
                             // Handle [DONE] signal
                             if payload == "[DONE]" {
-                                continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: nil, completionTokens: nil))
                                 break
                             }
 
@@ -531,11 +539,11 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                             }
 
                             if let content = choice.delta.content {
-                                continuation.yield(AIStreamResult(type: "content", text: content, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: content, reasoning: nil, promptTokens: nil, completionTokens: nil))
                             }
 
                             if choice.finish_reason != nil {
-                                continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: nil, completionTokens: nil))
                                 break
                             }
                         }
@@ -562,7 +570,11 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
                         #endif
 
                         // Wait before retrying
-                        try? await Task.sleep(nanoseconds: UInt64(currentDelay * 1_000_000_000))
+                        if let retrySleep {
+                            try? await retrySleep(currentDelay)
+                        } else {
+                            try? await Task.sleep(nanoseconds: UInt64(currentDelay * 1_000_000_000))
+                        }
                         currentDelay = min(currentDelay * 2, maxDelay)
                     }
                 }
@@ -577,8 +589,8 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         }
     }
 
-    func testAPIKey() async throws -> Bool {
-        let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
+    package func testAPIKey() async throws -> Bool {
+        let testMessage = RepoPromptDomainRuntime.AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         do {
             let response = try await completeMessage(testMessage, model: .openrouterCustom(name: defaultModel), maxTokens: 10)
             return response.text.lowercased().contains("hello")
@@ -594,7 +606,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
     }
 
     private func createCompletionRequest(
-        messages: [CompletionParams.Message],
+        messages: [RepoPromptDomainRuntime.CompletionParams.Message],
         modelName: String,
         stream: Bool = false,
         maxTokens: Int? = nil,

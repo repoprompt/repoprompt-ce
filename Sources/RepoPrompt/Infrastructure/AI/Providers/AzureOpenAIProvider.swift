@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptHTTPProviders
 import SwiftOpenAI
@@ -105,10 +106,6 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
         try container.encodeIfPresent(httpCredentialConsentEndpoint, forKey: .httpCredentialConsentEndpoint)
     }
 
-    func revokingHTTPConsent() -> AzureOpenAIConfiguration {
-        AzureOpenAIConfiguration(baseURL: baseURL, apiKey: apiKey, apiVersion: apiVersion, extraHeaders: extraHeaders, models: models, defaultModelID: defaultModelID, httpCredentialConsentEndpoint: nil)
-    }
-
     var authorization: Authorization {
         .apiKey(apiKey)
     }
@@ -140,35 +137,11 @@ public struct AzureOpenAIConfiguration: Codable, Equatable {
             extraHeaders: extraHeaders
         )
     }
-
-    static func inferredEndpoint(for modelID: String, baseModelID: String? = nil) -> ModelDescriptor.EndpointKind {
-        let candidates = [baseModelID, modelID].compactMap(\.self)
-        for name in candidates {
-            if let equivalent = AIModel.fromModelName(name), equivalent.usesResponsesAPI {
-                return .responses
-            }
-            let lowered = name.lowercased()
-            if lowered.hasPrefix("gpt-5") || lowered == "o3" || lowered.hasPrefix("o3-") {
-                return .responses
-            }
-        }
-        return .chatCompletions
-    }
-
-    static func inferredSupportsStreaming(for modelID: String, baseModelID: String? = nil) -> Bool {
-        if let baseModelID, let equivalent = AIModel.fromModelName(baseModelID) {
-            return equivalent.canStream
-        }
-        if let equivalent = AIModel.fromModelName(modelID) {
-            return equivalent.canStream
-        }
-        return !modelID.lowercased().contains("no-stream")
-    }
 }
 
 extension AzureOpenAIProvider: ResponsesJobProvider {
-    func createBackgroundResponse(
-        _ message: AIMessage,
+    package func createBackgroundResponse(
+        _ message: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int?
     ) async throws -> ResponseModel {
@@ -192,11 +165,11 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
         return response
     }
 
-    func fetchResponse(id: String) async throws -> ResponseModel {
+    package func fetchResponse(id: String) async throws -> ResponseModel {
         try await checkedAzureService().responseModel(id: id, parameters: nil)
     }
 
-    func streamResponse(id: String) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamResponse(id: String) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let service = try checkedAzureService()
 
         // Use polling instead of SSE for more reliable background job monitoring
@@ -212,7 +185,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
                     }
 
                     continuation.yield(
-                        AIStreamResult(
+                        RepoPromptDomainRuntime.AIStreamResult(
                             type: "content",
                             text: nil,
                             reasoning: "Background job started, polling for updates...\n",
@@ -239,7 +212,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
                             }
                             if !statusMessage.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: nil,
                                         reasoning: statusMessage,
@@ -276,7 +249,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
 
                             if !reasoningText.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: nil,
                                         reasoning: reasoningText,
@@ -289,7 +262,7 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
 
                             if !outputText.isEmpty {
                                 continuation.yield(
-                                    AIStreamResult(
+                                    RepoPromptDomainRuntime.AIStreamResult(
                                         type: "content",
                                         text: outputText,
                                         reasoning: nil,
@@ -302,8 +275,8 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
 
                             let didComplete = response.status == .completed
                             continuation.yield(
-                                AIStreamResult(
-                                    type: didComplete ? "message_stop" : AIStreamResult.incompleteType,
+                                RepoPromptDomainRuntime.AIStreamResult(
+                                    type: didComplete ? "message_stop" : RepoPromptDomainRuntime.AIStreamResult.incompleteType,
                                     text: nil,
                                     reasoning: nil,
                                     promptTokens: response.usage?.inputTokens,
@@ -324,7 +297,11 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
 
                         case .queued, .inProgress, .none:
                             // Continue polling with exponential backoff
-                            try await Task.sleep(for: pollInterval())
+                            if let pollSleep {
+                                try await pollSleep(pollInterval())
+                            } else {
+                                try await Task.sleep(for: pollInterval())
+                            }
                         }
                     }
 
@@ -347,23 +324,27 @@ extension AzureOpenAIProvider: ResponsesJobProvider {
         }
     }
 
-    func cancelResponse(id: String) async throws -> ResponseModel {
+    package func cancelResponse(id: String) async throws -> ResponseModel {
         try await checkedAzureService().responseCancel(id: id)
     }
 }
 
-final class AzureOpenAIProvider: AIProvider {
-    static var enableDebugLogging: Bool = false
-    static let discoveryAPIVersions: [String] = ["2023-03-15-preview"]
+package final class AzureOpenAIProvider: AIProvider {
+    package static var enableDebugLogging: Bool = false
+    package static let discoveryAPIVersions: [String] = ["2023-03-15-preview"]
 
-    static func debug(_ message: @autoclosure () -> String) {
+    package static func debug(_ message: @autoclosure () -> String) {
         if enableDebugLogging {
             print("[Azure] \(message())")
         }
     }
 
     private let configuration: AzureOpenAIConfiguration
+    private let host: any AzureOpenAIHTTPHost
+    private let sessionConfigurationFactory: (() -> URLSessionConfiguration)?
+    private let pollSleep: (@Sendable (Duration) async throws -> Void)?
     private lazy var urlSessionConfiguration: URLSessionConfiguration = {
+        if let sessionConfigurationFactory { return sessionConfigurationFactory() }
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 21600 // 6 hours
         config.timeoutIntervalForResource = 21600 // 6 hours
@@ -376,12 +357,15 @@ final class AzureOpenAIProvider: AIProvider {
         debugEnabled: Self.enableDebugLogging
     )
 
-    init(configuration: AzureOpenAIConfiguration) {
+    package init(configuration: AzureOpenAIConfiguration, host: any AzureOpenAIHTTPHost, sessionConfigurationFactory: (() -> URLSessionConfiguration)? = nil, pollSleep: (@Sendable (Duration) async throws -> Void)? = nil) {
         self.configuration = configuration
+        self.host = host
+        self.sessionConfigurationFactory = sessionConfigurationFactory
+        self.pollSleep = pollSleep
     }
 
     private func checkedAzureService() throws -> OpenAIService {
-        try ProviderEndpointConsent.validate(configuration.baseURL, apiKey: configuration.apiKey, customHeaders: configuration.extraHeaders ?? [:], consentEndpoint: configuration.httpCredentialConsentEndpoint)
+        try host.validateEndpoint(configuration.baseURL, apiKey: configuration.apiKey, customHeaders: configuration.extraHeaders ?? [:], consentEndpoint: configuration.httpCredentialConsentEndpoint)
         return azureService
     }
 
@@ -393,7 +377,7 @@ final class AzureOpenAIProvider: AIProvider {
             let normalizedName = Self.normalizedModelName(from: name)
             var descriptor = configuration.descriptor(for: name)
                 ?? configuration.descriptor(for: normalizedName)
-                ?? Self.defaultDescriptor(for: name)
+                ?? host.defaultDescriptor(for: name)
             var deploymentID = descriptor?.id ?? name
 
             let descriptorMatchesRequested = descriptor.map {
@@ -401,15 +385,15 @@ final class AzureOpenAIProvider: AIProvider {
             } ?? false
 
             if descriptor == nil || descriptorMatchesRequested {
-                if let aiModel = AIModel.fromModelName(normalizedName) {
+                if let aiModel = host.modelFromName(normalizedName) {
                     let (baseModel, _) = resolveBaseModelAndEffort(for: aiModel)
                     if baseModel != aiModel {
-                        let baseName = Self.normalizedModelName(from: baseModel.modelName)
+                        let baseName = Self.normalizedModelName(from: host.modelName(for: baseModel))
                         let baseDescriptor = configuration.descriptor(for: baseName)
-                            ?? Self.defaultDescriptor(for: baseName)
+                            ?? host.defaultDescriptor(for: baseName)
 
                         if let baseDescriptor {
-                            let variantDisplay = AIModel.azureCustom(name: normalizedName).displayName
+                            let variantDisplay = host.displayName(for: .azureCustom(name: normalizedName))
                             let resolvedDisplay = variantDisplay.isEmpty ? baseDescriptor.displayName : variantDisplay
                             descriptor = AzureOpenAIConfiguration.ModelDescriptor(
                                 id: baseDescriptor.id,
@@ -445,12 +429,12 @@ final class AzureOpenAIProvider: AIProvider {
             return true
         }
         if let baseModel {
-            return baseModel.usesResponsesAPI
+            return host.usesResponsesAPI(for: baseModel)
         }
         return false
     }
 
-    static func normalizedModelName(from deploymentID: String) -> String {
+    package static func normalizedModelName(from deploymentID: String) -> String {
         let trimmed = deploymentID.trimmingCharacters(in: .whitespacesAndNewlines)
         let lowercased = trimmed.lowercased()
         if lowercased.hasPrefix("azure/") {
@@ -471,7 +455,7 @@ final class AzureOpenAIProvider: AIProvider {
         }
 
         if let baseModel {
-            return baseModel.canStream
+            return host.canStream(for: baseModel)
         }
 
         return true
@@ -486,7 +470,7 @@ final class AzureOpenAIProvider: AIProvider {
 
         for identifier in candidates {
             let normalized = Self.normalizedModelName(from: identifier)
-            if let model = AIModel.fromModelName(normalized) {
+            if let model = host.modelFromName(normalized) {
                 return resolveBaseModelAndEffort(for: model)
             }
         }
@@ -535,13 +519,13 @@ final class AzureOpenAIProvider: AIProvider {
         case .gpt5CodexLow:
             (.gpt5CodexMed, "low")
         case .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax:
-            (.gpt61Terra, model.defaultReasoningEffort)
+            (.gpt61Terra, host.defaultReasoningEffort(for: model))
         case .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax:
-            (.gpt61Sol, model.defaultReasoningEffort)
+            (.gpt61Sol, host.defaultReasoningEffort(for: model))
         case .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax:
-            (.gpt6Astra, model.defaultReasoningEffort)
+            (.gpt6Astra, host.defaultReasoningEffort(for: model))
         case .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh:
-            (.gpt6Luna, model.defaultReasoningEffort)
+            (.gpt6Luna, host.defaultReasoningEffort(for: model))
         case .gpt6Sol:
             (.gpt6Sol, "medium")
         default:
@@ -592,7 +576,7 @@ final class AzureOpenAIProvider: AIProvider {
     }
 
     private func buildChatParameters(
-        for message: AIMessage,
+        for message: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         deploymentID: String,
         baseModel: AIModel?,
@@ -605,7 +589,7 @@ final class AzureOpenAIProvider: AIProvider {
             model: .custom(deploymentID)
         )
 
-        if let temperature = message.effectiveTemperature(for: baseModel ?? model) {
+        if let temperature = host.effectiveTemperature(for: message, model: baseModel ?? model) {
             params.temperature = temperature
         }
 
@@ -636,7 +620,7 @@ final class AzureOpenAIProvider: AIProvider {
     }
 
     private func buildResponseParameters(
-        for message: AIMessage,
+        for message: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         deploymentID: String,
         baseModel: AIModel?,
@@ -645,7 +629,7 @@ final class AzureOpenAIProvider: AIProvider {
         stream: Bool
     ) throws -> ModelResponseParameter {
         Self.debug("Building response parameters for model: \(model), deploymentID: \(deploymentID)")
-        Self.debug("Base model: \(baseModel?.rawValue ?? "nil")")
+        Self.debug("Base model: \(baseModel.map { host.rawValue(for: $0) } ?? "nil")")
         Self.debug("Reasoning effort: \(reasoningEffort ?? "nil")")
         var parameters = try ModelResponseParameter(
             input: message.openAIResponsesInput(),
@@ -656,7 +640,7 @@ final class AzureOpenAIProvider: AIProvider {
             parameters.instructions = message.systemPrompt
         }
 
-        if let temperature = message.effectiveTemperature(for: baseModel ?? model) {
+        if let temperature = host.effectiveTemperature(for: message, model: baseModel ?? model) {
             parameters.temperature = temperature
         }
 
@@ -673,7 +657,7 @@ final class AzureOpenAIProvider: AIProvider {
     }
 
     private func buildBackgroundResponseParameters(
-        for message: AIMessage,
+        for message: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         deploymentID: String,
         baseModel: AIModel?,
@@ -693,7 +677,7 @@ final class AzureOpenAIProvider: AIProvider {
         return parameters
     }
 
-    private func bridgeResponseStream(_ stream: AsyncThrowingStream<ResponseStreamEvent, Error>) -> AsyncThrowingStream<AIStreamResult, Error> {
+    private func bridgeResponseStream(_ stream: AsyncThrowingStream<ResponseStreamEvent, Error>) -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -706,11 +690,11 @@ final class AzureOpenAIProvider: AIProvider {
                         switch event {
                         case let .outputTextDelta(delta):
                             if !delta.delta.isEmpty {
-                                continuation.yield(AIStreamResult(type: "content", text: delta.delta, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: delta.delta, reasoning: nil, promptTokens: nil, completionTokens: nil))
                             }
                         case let .reasoningSummaryTextDelta(delta):
                             if !delta.delta.isEmpty {
-                                continuation.yield(AIStreamResult(type: "content", text: nil, reasoning: delta.delta, promptTokens: nil, completionTokens: nil))
+                                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: nil, reasoning: delta.delta, promptTokens: nil, completionTokens: nil))
                             }
                         case let .responseCompleted(completed):
                             observedCompletionOutcome = .completed
@@ -733,9 +717,9 @@ final class AzureOpenAIProvider: AIProvider {
 
                     switch observedCompletionOutcome {
                     case .completed:
-                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
                     case let .incomplete(reason):
-                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
                     case nil:
                         break
                     }
@@ -761,7 +745,7 @@ final class AzureOpenAIProvider: AIProvider {
 
     // MARK: - AIProvider
 
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let (deploymentID, descriptor) = try deploymentInfo(for: model)
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: deploymentID, descriptor: descriptor)
         let finalMaxTokens = resolvedMaxTokens(for: baseModel, override: maxTokens)
@@ -799,12 +783,12 @@ final class AzureOpenAIProvider: AIProvider {
         if !streamingSupported {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: finalMaxTokens)
             return AsyncThrowingStream { continuation in
-                continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
                 switch result.completionOutcome {
                 case .completed:
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens))
                 case let .incomplete(reason):
-                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, stopReason: reason))
                 }
                 continuation.finish()
             }
@@ -842,7 +826,7 @@ final class AzureOpenAIProvider: AIProvider {
 
                         if !content.isEmpty || !reasoning.isEmpty {
                             continuation.yield(
-                                AIStreamResult(
+                                RepoPromptDomainRuntime.AIStreamResult(
                                     type: "content",
                                     text: content.isEmpty ? nil : content,
                                     reasoning: reasoning.isEmpty ? nil : reasoning,
@@ -858,9 +842,9 @@ final class AzureOpenAIProvider: AIProvider {
 
                     switch observedCompletionOutcome {
                     case .completed:
-                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens))
                     case let .incomplete(reason):
-                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, stopReason: reason))
                     case nil:
                         break
                     }
@@ -874,7 +858,7 @@ final class AzureOpenAIProvider: AIProvider {
         }
     }
 
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult {
+    package func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int?) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let (deploymentID, descriptor) = try deploymentInfo(for: model)
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: deploymentID, descriptor: descriptor)
         let finalMaxTokens = resolvedMaxTokens(for: baseModel, override: maxTokens)
@@ -905,7 +889,7 @@ final class AzureOpenAIProvider: AIProvider {
                     .incomplete(reason: response.incompleteDetails?.reason ?? "unknown")
                 }
 
-                return AICompletionResult(
+                return RepoPromptDomainRuntime.AICompletionResult(
                     text: text,
                     promptTokens: promptTokens,
                     completionTokens: completionTokens,
@@ -934,7 +918,7 @@ final class AzureOpenAIProvider: AIProvider {
         let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
             ?? .incomplete(reason: "missing_finish_reason")
 
-        return AICompletionResult(
+        return RepoPromptDomainRuntime.AICompletionResult(
             text: text,
             promptTokens: response.usage?.promptTokens,
             completionTokens: response.usage?.completionTokens,
@@ -942,17 +926,17 @@ final class AzureOpenAIProvider: AIProvider {
         )
     }
 
-    func dispose() async {
+    package func dispose() async {
         // nothing to clean up
     }
 
-    func testAPIKey() async throws -> Bool {
+    package func testAPIKey() async throws -> Bool {
         let targetModelID = configuration.defaultModelID ?? configuration.models.first?.id
         guard let modelID = targetModelID else {
             throw AIProviderError.invalidConfiguration(detail: "No Azure models discovered for validation.")
         }
 
-        let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
+        let testMessage = RepoPromptDomainRuntime.AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         // Pass nil for maxTokens - Azure Responses API may reject max_output_tokens
         let result = try await completeMessage(testMessage, model: .azureCustom(name: modelID), maxTokens: nil)
         return result.text.lowercased().contains("hello")
@@ -962,88 +946,6 @@ final class AzureOpenAIProvider: AIProvider {
 // MARK: - Deployment discovery helpers ------------------------------------------------------------
 
 extension AzureOpenAIProvider {
-    static let defaultModelDescriptors: [AzureOpenAIConfiguration.ModelDescriptor] = {
-        let openAIModels = AIModel.modelsForProvider(.openAI)
-            .sorted { lhs, rhs in lhs.displayName.lowercased() < rhs.displayName.lowercased() }
-
-        let descriptors = openAIModels.map { model in
-            let rawID = model.rawValue
-            let display = AIModel.azureCustom(name: rawID).displayName
-            let usesResponses = model.usesResponsesAPI
-            let streams = model.canStream
-
-            return AzureOpenAIConfiguration.ModelDescriptor(
-                id: rawID,
-                displayName: display,
-                endpoint: usesResponses ? .responses : .chatCompletions,
-                supportsStreaming: streams,
-                baseModelID: rawID,
-                supportsChatCompletions: usesResponses ? false : true,
-                supportsResponses: usesResponses ? true : false
-            )
-        }
-
-        return descriptors
-            .map { normalizedDescriptor($0) }
-    }()
-
-    static func mergedWithDefaultDescriptors(_ descriptors: [AzureOpenAIConfiguration.ModelDescriptor]) -> [AzureOpenAIConfiguration.ModelDescriptor] {
-        var merged: [String: AzureOpenAIConfiguration.ModelDescriptor] = [:]
-
-        for descriptor in descriptors {
-            let key = normalizedModelName(from: descriptor.id).lowercased()
-            merged[key] = descriptor
-        }
-
-        for descriptor in defaultModelDescriptors {
-            let key = normalizedModelName(from: descriptor.id).lowercased()
-            if merged[key] == nil {
-                merged[key] = descriptor
-            }
-        }
-
-        return merged.values
-            .map { normalizedDescriptor($0) }
-            .sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }
-    }
-
-    private static func normalizedDescriptor(_ descriptor: AzureOpenAIConfiguration.ModelDescriptor) -> AzureOpenAIConfiguration.ModelDescriptor {
-        let normalizedID = Self.normalizedModelName(from: descriptor.id)
-        let openAIModel = AIModel.fromModelName(normalizedID)
-        let inferredEndpoint = descriptor.endpoint ?? AzureOpenAIConfiguration.inferredEndpoint(for: descriptor.id, baseModelID: descriptor.baseModelID)
-        let usesResponses = descriptor.supportsResponses ?? openAIModel?.usesResponsesAPI ?? (inferredEndpoint == .responses)
-        let endpoint: AzureOpenAIConfiguration.ModelDescriptor.EndpointKind = usesResponses ? .responses : .chatCompletions
-        let supportsStreaming = descriptor.supportsStreaming ?? openAIModel?.canStream
-        let resolvedBaseModelID: String = if let explicitBase = descriptor.baseModelID, !explicitBase.isEmpty {
-            explicitBase
-        } else if let openAIModel {
-            openAIModel.rawValue
-        } else {
-            normalizedID
-        }
-        let azureDisplay = AIModel.azureCustom(name: normalizedID).displayName
-        let resolvedDisplay = azureDisplay.isEmpty
-            ? "azure/\(descriptor.displayName.isEmpty ? descriptor.id : descriptor.displayName)"
-            : azureDisplay
-
-        return AzureOpenAIConfiguration.ModelDescriptor(
-            id: descriptor.id,
-            displayName: resolvedDisplay,
-            endpoint: endpoint,
-            supportsStreaming: supportsStreaming,
-            baseModelID: resolvedBaseModelID,
-            supportsChatCompletions: descriptor.supportsChatCompletions ?? !usesResponses,
-            supportsResponses: usesResponses
-        )
-    }
-
-    private static func defaultDescriptor(for identifier: String) -> AzureOpenAIConfiguration.ModelDescriptor? {
-        let normalized = normalizedModelName(from: identifier).lowercased()
-        return defaultModelDescriptors.first {
-            normalizedModelName(from: $0.id).lowercased() == normalized
-        }
-    }
-
     struct AzureDeploymentListResponse: Decodable {
         struct Deployment: Decodable {
             let id: String
@@ -1054,13 +956,15 @@ extension AzureOpenAIProvider {
         let data: [Deployment]
     }
 
-    static func discoverDeployments(
+    package static func discoverDeployments(
         baseURL: URL,
         apiKey: String,
         apiVersions: [String],
-        httpCredentialConsentEndpoint: String? = nil
+        httpCredentialConsentEndpoint: String? = nil,
+        host: any AzureOpenAIHTTPHost,
+        httpClient: (any RepoPromptFoundation.HTTPClient)? = nil
     ) async throws -> [AzureOpenAIConfiguration.ModelDescriptor] {
-        try ProviderEndpointConsent.validate(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
+        try host.validateEndpoint(baseURL, apiKey: apiKey, customHeaders: [:], consentEndpoint: httpCredentialConsentEndpoint)
         let orderedVersions = apiVersions.reduce(into: [String]()) { acc, version in
             let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty, !acc.contains(trimmed) else { return }
@@ -1091,7 +995,7 @@ extension AzureOpenAIProvider {
             request.addValue("application/json", forHTTPHeaderField: "Accept")
 
             do {
-                let response = try await DefaultHTTPClient.discoveryClient.data(for: request)
+                let response = try await (httpClient ?? DefaultHTTPClient.discoveryClient).data(for: request)
                 let http = response.http
 
                 if (200 ... 299).contains(http.statusCode) {
@@ -1107,24 +1011,7 @@ extension AzureOpenAIProvider {
                     Self.debug("Deployments: \(deployments)")
 
                     let descriptors = deployments.map { deployment -> AzureOpenAIConfiguration.ModelDescriptor in
-                        let normalizedID = Self.normalizedModelName(from: deployment.id)
-                        let openAIModel = AIModel.fromModelName(normalizedID)
-                        let inferredEndpoint = AzureOpenAIConfiguration.inferredEndpoint(for: deployment.id, baseModelID: deployment.model)
-                        let usesResponses = openAIModel?.usesResponsesAPI ?? (inferredEndpoint == .responses)
-                        let endpoint: AzureOpenAIConfiguration.ModelDescriptor.EndpointKind = usesResponses ? .responses : .chatCompletions
-                        let supportsStreaming = openAIModel?.canStream
-                        let resolvedBaseModelID = openAIModel?.rawValue ?? deployment.model ?? normalizedID
-                        let displayName = AIModel.azureCustom(name: normalizedID).displayName
-
-                        return AzureOpenAIConfiguration.ModelDescriptor(
-                            id: deployment.id,
-                            displayName: displayName,
-                            endpoint: endpoint,
-                            supportsStreaming: supportsStreaming,
-                            baseModelID: resolvedBaseModelID,
-                            supportsChatCompletions: usesResponses ? false : true,
-                            supportsResponses: usesResponses ? true : false
-                        )
+                        host.discoveryDescriptor(id: deployment.id, baseModelID: deployment.model)
                     }.sorted { $0.id < $1.id }
 
                     if !descriptors.isEmpty || version == orderedVersions.last {
@@ -1153,41 +1040,5 @@ extension AzureOpenAIProvider {
         throw lastError ?? NSError(domain: "AzureDiscovery", code: -1, userInfo: [
             NSLocalizedDescriptionKey: "Unable to fetch Azure deployments."
         ])
-    }
-
-    static func matchedModel(for descriptor: AzureOpenAIConfiguration.ModelDescriptor) -> AIModel? {
-        if let baseModelID = descriptor.baseModelID,
-           let model = AIModel.fromModelName(baseModelID)
-        {
-            return model
-        }
-        return AIModel.fromModelName(Self.normalizedModelName(from: descriptor.id))
-    }
-
-    static func prioritizedDeployments(from descriptors: [AzureOpenAIConfiguration.ModelDescriptor]) -> [AzureOpenAIConfiguration.ModelDescriptor] {
-        let openAIModels = Set(AIModel.modelsForProvider(.openAI))
-        return descriptors.filter { descriptor in
-            guard let model = matchedModel(for: descriptor) else { return false }
-            return openAIModels.contains(model)
-        }
-    }
-
-    static func defaultDeploymentID(for descriptors: [AzureOpenAIConfiguration.ModelDescriptor]) -> String? {
-        descriptors.sorted { $0.displayName.lowercased() < $1.displayName.lowercased() }.first?.id
-    }
-
-    static func preferredDeploymentID(from descriptors: [AzureOpenAIConfiguration.ModelDescriptor]) -> String? {
-        let priorityOrder = AIModel.wholePriorityModels
-        for priority in priorityOrder {
-            if let descriptor = descriptors.first(where: { matchedModel(for: $0) == priority }) {
-                return descriptor.id
-            }
-        }
-        for descriptor in descriptors {
-            if let model = matchedModel(for: descriptor), model.providerType == .openAI {
-                return descriptor.id
-            }
-        }
-        return descriptors.first?.id
     }
 }

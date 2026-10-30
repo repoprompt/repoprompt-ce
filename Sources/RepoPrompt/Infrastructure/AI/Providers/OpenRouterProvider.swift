@@ -1,18 +1,23 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptHTTPProviders
 import SwiftOpenAI
 
-class OpenRouterProvider: AIProvider {
+package class OpenRouterProvider: AIProvider {
     private let cachedApiKey: String
+    private let host: any OpenRouterHTTPHost
+    private let sessionConfigurationFactory: (() -> URLSessionConfiguration)?
 
-    init(apiKey: String) {
+    package init(apiKey: String, host: any OpenRouterHTTPHost, sessionConfigurationFactory: (() -> URLSessionConfiguration)? = nil) {
         cachedApiKey = apiKey
+        self.host = host
+        self.sessionConfigurationFactory = sessionConfigurationFactory
     }
 
     private func getConfiguration() -> OpenRouterConfiguration {
-        ProviderConfigurationManager.shared.getOpenRouterConfiguration()
+        host.configuration()
     }
 
     private func getService() -> OpenAIService {
@@ -31,7 +36,7 @@ class OpenRouterProvider: AIProvider {
             }
         }
 
-        let configuration = URLSessionConfiguration.default
+        let configuration = sessionConfigurationFactory?() ?? URLSessionConfiguration.default
         configuration.timeoutIntervalForRequest = 21600 // 6 hours
         configuration.timeoutIntervalForResource = 21600 // 6 hours
 
@@ -45,17 +50,17 @@ class OpenRouterProvider: AIProvider {
         )
     }
 
-    func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         // If model streaming is disabled, use completeMessage instead
-        if !model.canStream {
+        if !host.canStream(for: model) {
             let result = try await completeMessage(aiMessage, model: model, maxTokens: maxTokens)
             return AsyncThrowingStream { continuation in
-                continuation.yield(AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
+                continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: result.text, reasoning: nil, promptTokens: nil, completionTokens: nil))
                 switch result.completionOutcome {
                 case .completed:
-                    continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, cost: result.cost))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, cost: result.cost))
                 case let .incomplete(reason):
-                    continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, cost: result.cost, stopReason: reason))
+                    continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: result.promptTokens, completionTokens: result.completionTokens, cost: result.cost, stopReason: reason))
                 }
                 continuation.finish()
             }
@@ -68,11 +73,11 @@ class OpenRouterProvider: AIProvider {
         let effectiveMaxTokens = config.useCustomSettings ? (maxTokens ?? config.baseConfig.maxTokens) : 8192
 
         // Honour global & per-model overrides
-        let effectiveTemperature = aiMessage.effectiveTemperature(for: model)
+        let effectiveTemperature = host.effectiveTemperature(for: aiMessage, model: model)
 
         let parameters = ChatCompletionParameters(
             messages: messages,
-            model: .custom(model.modelName),
+            model: .custom(host.modelName(for: model)),
             maxTokens: effectiveMaxTokens,
             temperature: effectiveTemperature
         )
@@ -80,7 +85,7 @@ class OpenRouterProvider: AIProvider {
         let service = getService()
         let stream = try await service.startStreamedChat(parameters: parameters)
 
-        print("Model: \(model.modelName)")
+        print("Model: \(host.modelName(for: model))")
 
         return AsyncThrowingStream { continuation in
             Task {
@@ -106,9 +111,9 @@ class OpenRouterProvider: AIProvider {
 
                         // Only yield if there's something
                         if let c = content, !c.isEmpty {
-                            continuation.yield(AIStreamResult(type: "content", text: c, reasoning: reasoning, promptTokens: promptTokens, completionTokens: completionTokens, cost: cost))
+                            continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: c, reasoning: reasoning, promptTokens: promptTokens, completionTokens: completionTokens, cost: cost))
                         } else if let r = reasoning, !r.isEmpty {
-                            continuation.yield(AIStreamResult(type: "content", text: nil, reasoning: r))
+                            continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: nil, reasoning: r))
                         }
                         if let completionOutcome = openAIChatCompletionOutcome(finishReason) {
                             observedCompletionOutcome = completionOutcome
@@ -117,9 +122,9 @@ class OpenRouterProvider: AIProvider {
 
                     switch observedCompletionOutcome {
                     case .completed:
-                        continuation.yield(AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens, cost: cost))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil, reasoning: nil, promptTokens: promptTokens, completionTokens: completionTokens, cost: cost))
                     case let .incomplete(reason):
-                        continuation.yield(AIStreamResult(type: AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, cost: cost, stopReason: reason))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: RepoPromptDomainRuntime.AIStreamResult.incompleteType, text: nil, promptTokens: promptTokens, completionTokens: completionTokens, cost: cost, stopReason: reason))
                     case nil:
                         break
                     }
@@ -131,7 +136,7 @@ class OpenRouterProvider: AIProvider {
         }
     }
 
-    func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult {
+    package func completeMessage(_ aiMessage: RepoPromptDomainRuntime.AIMessage, model: AIModel, maxTokens: Int?) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: false)
         let config = getConfiguration()
 
@@ -139,11 +144,11 @@ class OpenRouterProvider: AIProvider {
         let effectiveMaxTokens = config.useCustomSettings ? (maxTokens ?? config.baseConfig.maxTokens) : maxTokens
 
         // Honour global & per-model overrides
-        let effectiveTemperature = aiMessage.effectiveTemperature(for: model)
+        let effectiveTemperature = host.effectiveTemperature(for: aiMessage, model: model)
 
         let parameters = ChatCompletionParameters(
             messages: messages,
-            model: .custom(model.modelName),
+            model: .custom(host.modelName(for: model)),
             maxTokens: effectiveMaxTokens,
             temperature: effectiveTemperature
         )
@@ -161,7 +166,7 @@ class OpenRouterProvider: AIProvider {
         let completionOutcome = openAIChatCompletionOutcome(choice?.finishReason)
             ?? .incomplete(reason: "missing_finish_reason")
 
-        return AICompletionResult(
+        return RepoPromptDomainRuntime.AICompletionResult(
             text: content,
             promptTokens: promptTokens,
             completionTokens: completionTokens,
@@ -171,8 +176,8 @@ class OpenRouterProvider: AIProvider {
     }
 
     /// Tests if the given API key is valid by issuing a short query
-    func testAPIKey(model: AIModel? = nil) async throws -> Bool {
-        let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
+    package func testAPIKey(model: AIModel? = nil) async throws -> Bool {
+        let testMessage = RepoPromptDomainRuntime.AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         let testModel = model ?? .openrouterGpt5
 
         do {
@@ -196,7 +201,7 @@ class OpenRouterProvider: AIProvider {
         }
     }
 
-    func dispose() async {
+    package func dispose() async {
         // No special cleanup needed
     }
 }
