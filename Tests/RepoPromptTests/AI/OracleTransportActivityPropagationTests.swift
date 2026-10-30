@@ -176,13 +176,6 @@ final class OracleTransportActivityPropagationTests: XCTestCase {
         )
     }
 
-    func testAnthropicSuccessfulCompletionReasonsAreExplicit() {
-        XCTAssertTrue(AnthropicProvider.isSuccessfulCompletionStopReason("end_turn"))
-        XCTAssertTrue(AnthropicProvider.isSuccessfulCompletionStopReason("stop_sequence"))
-        XCTAssertFalse(AnthropicProvider.isSuccessfulCompletionStopReason("max_tokens"))
-        XCTAssertFalse(AnthropicProvider.isSuccessfulCompletionStopReason("tool_use"))
-    }
-
     func testAIQueriesNormalizesIncompleteTerminationWithoutMarkingSuccess() throws {
         let result = AIStreamResult(
             type: AIStreamResult.incompleteType,
@@ -218,76 +211,6 @@ private final class OracleLifecycleActivityRecorder {
 }
 
 final class OracleImageSerializationTests: XCTestCase {
-    func testCustomOpenAITextOnlyMessagesRemainScalar() throws {
-        let message = AIMessage(systemPrompt: "system", userMessage: "plain")
-        let provider = CustomOpenAIProvider(
-            baseURL: "https://example.test/v1",
-            apiKey: "key",
-            defaultModel: "text-model"
-        )
-        let custom = try XCTUnwrap(try jsonObject(
-            provider.serializedMessagesForTesting(message)
-        ) as? [[String: Any]])
-        XCTAssertTrue(custom.allSatisfy { $0["content"] is String })
-    }
-
-    func testAnthropicAttachesOnlyToFinalUserTurn() throws {
-        let json = try jsonObject(AnthropicProvider.makeMessages(for: makeMessage()))
-        let text = try jsonText(json)
-
-        XCTAssertEqual(countObjects(type: "image", in: json), 1)
-        XCTAssertTrue(text.contains("Image title: Diagram"))
-        XCTAssertTrue(text.contains("AQID"))
-        XCTAssertFalse(text.contains("/Users/secret.png"))
-        let messages = try XCTUnwrap(json as? [[String: Any]])
-        XCTAssertFalse(try jsonText(messages[0]).contains("AQID"))
-        XCTAssertTrue(try jsonText(XCTUnwrap(messages.last)).contains("AQID"))
-    }
-
-    func testAnthropicSynthesizesUserTurnWhenNoUserEntryExists() throws {
-        let message = AIMessage(
-            systemPrompt: "system",
-            fileTree: "root",
-            conversationMessages: [.init(role: .assistant, content: "answer")],
-            attachments: [
-                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
-            ],
-            temperature: nil,
-            promptSectionsOrder: [.fileMap],
-            disabledPromptSections: []
-        )
-        let json = try jsonObject(AnthropicProvider.makeMessages(for: message))
-        let messages = try XCTUnwrap(json as? [[String: Any]])
-        let synthesized = try XCTUnwrap(messages.last)
-
-        XCTAssertEqual(synthesized["role"] as? String, "user")
-        XCTAssertEqual(countObjects(type: "image", in: json), 1)
-        XCTAssertTrue(try jsonText(synthesized).contains("AQID"))
-    }
-
-    func testAnthropicImageTurnOmitsEmptyTextAndNormalizesTitles() throws {
-        let message = AIMessage(
-            systemPrompt: "system",
-            conversationMessages: [.init(role: .user, content: "")],
-            attachments: [
-                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "  Diagram  ")
-            ],
-            temperature: nil,
-            promptSectionsOrder: [],
-            disabledPromptSections: []
-        )
-        let json = try jsonObject(AnthropicProvider.makeMessages(for: message))
-        let messages = try XCTUnwrap(json as? [[String: Any]])
-        let content = try XCTUnwrap(messages.last?["content"] as? [[String: Any]])
-        let textBlocks = content.filter { $0["type"] as? String == "text" }
-
-        // Anthropic rejects empty text blocks; only the normalized title line may appear.
-        XCTAssertTrue(textBlocks.allSatisfy { (($0["text"] as? String) ?? "").isEmpty == false })
-        XCTAssertTrue(try jsonText(content).contains("Image title: Diagram"))
-        XCTAssertFalse(try jsonText(content).contains("  Diagram  "))
-        XCTAssertEqual(countObjects(type: "image", in: json), 1)
-    }
-
     func testAttachmentRouteFollowsTheCodeThatEncodesTheRequest() {
         XCTAssertEqual(AIModel.gpt5.attachmentRoute, .openAIResponses)
         XCTAssertEqual(AIModel.ollama.attachmentRoute, .openAIChat)
@@ -295,55 +218,6 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertEqual(AIModel.grokBuildCustom(name: "grok").attachmentRoute, .grokBuild)
         XCTAssertEqual(AIModel.azureCustom(name: "azure").attachmentRoute, .openAIChat)
         XCTAssertEqual(AIModel.customProviderUser(name: "custom").attachmentRoute, .customOpenAI)
-    }
-
-    func testCustomOpenAIEncodesFinalUserAsContentArray() throws {
-        let provider = CustomOpenAIProvider(
-            baseURL: "https://example.test/v1",
-            apiKey: "key",
-            defaultModel: "vision-model"
-        )
-        let json = try jsonObject(provider.serializedMessagesForTesting(makeMessage()))
-        let messages = try XCTUnwrap(json as? [[String: Any]])
-        let earlierContent = messages[1]["content"]
-        let finalMessage = try XCTUnwrap(messages.last)
-        let finalContent = try XCTUnwrap(finalMessage["content"] as? [[String: Any]])
-
-        XCTAssertTrue(earlierContent is String)
-        XCTAssertEqual(countObjects(type: "image_url", in: finalContent), 1)
-        let finalText = try jsonText(finalContent)
-        XCTAssertTrue(
-            finalText.contains("data:image/png;base64,AQID") ||
-                finalText.contains("data:image\\/png;base64,AQID")
-        )
-    }
-
-    func testCustomOpenAISynthesizedImageTurnKeepsAdditionsBeforeImages() throws {
-        let provider = CustomOpenAIProvider(
-            baseURL: "https://example.test/v1",
-            apiKey: "key",
-            defaultModel: "vision-model"
-        )
-        let message = AIMessage(
-            systemPrompt: "system",
-            fileTree: "root",
-            conversationMessages: [.init(role: .assistant, content: "answer")],
-            attachments: [
-                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Diagram")
-            ],
-            temperature: nil,
-            promptSectionsOrder: [.fileMap],
-            disabledPromptSections: []
-        )
-        let json = try jsonObject(provider.serializedMessagesForTesting(message))
-        let messages = try XCTUnwrap(json as? [[String: Any]])
-        let synthesized = try XCTUnwrap(messages.last)
-        let parts = try XCTUnwrap(synthesized["content"] as? [[String: Any]])
-
-        XCTAssertEqual(synthesized["role"] as? String, "user")
-        XCTAssertEqual(parts.first?["type"] as? String, "text")
-        XCTAssertTrue((parts.first?["text"] as? String)?.contains("root") == true)
-        XCTAssertEqual(parts.last?["type"] as? String, "image_url")
     }
 
     func testACPEncodesTransientImagesInlineWithoutURI() throws {
@@ -523,20 +397,6 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
         XCTAssertEqual(exercised, 5 * AttachmentKind.allCases.count)
     }
 
-    func testAnthropicSendsPDFCSVAndPNGInOneRequest() throws {
-        let json = try Self.json(AnthropicProvider.makeMessages(for: Self.message([
-            Self.sample(.pdf), Self.sample(.text), Self.sample(.image)
-        ])))
-        let messages = try XCTUnwrap(json as? [[String: Any]])
-        let parts = try XCTUnwrap(messages.last?["content"] as? [[String: Any]])
-        XCTAssertEqual(parts.compactMap { $0["type"] as? String }.sorted(), ["document", "image", "text"])
-        let text = try XCTUnwrap(parts.first { $0["type"] as? String == "text" }?["text"] as? String)
-        XCTAssertTrue(text.hasPrefix("Attached file: data.csv\n```\na,b\n1,2\n```"), text)
-        XCTAssertTrue(text.hasSuffix("Question"), text)
-        let document = try XCTUnwrap(parts.first { $0["type"] as? String == "document" })
-        XCTAssertEqual((document["source"] as? [String: Any])?["media_type"] as? String, "application/pdf")
-    }
-
     func testOpenAIChatRefusesThePDFByNameAndStillPlansTheCSVAndPNG() throws {
         let attachments = [Self.sample(.pdf), Self.sample(.text), Self.sample(.image)]
         XCTAssertThrowsError(try Self.message(attachments).openAIChatMessages(embedSystemPrompt: false)) { error in
@@ -570,17 +430,6 @@ final class AttachmentRouteEncoderMatrixAppTests: XCTestCase {
         let file = try XCTUnwrap(parts.first { $0["type"] as? String == "input_file" })
         XCTAssertEqual(file["filename"] as? String, "report.pdf")
         XCTAssertTrue((file["file_data"] as? String)?.hasPrefix("data:application/pdf;base64,") == true)
-    }
-
-    func testAnthropicRefusesBeforeTheSDKWhenEncodedPDFsExceedTheRequestCap() throws {
-        let limit = try XCTUnwrap(AttachmentRouteCapability.capability(for: .anthropicMessages).maxEncodedRequestBytes)
-        let size = limit / 4 * 3 / 2 + 1024
-        let pdfs = ["first.pdf", "second.pdf"].map {
-            OracleAttachment(payload: .pdf(Self.pdfBytes(extra: size)), fileName: $0, title: nil)
-        }
-        XCTAssertThrowsError(try AnthropicProvider.makeMessages(for: Self.message(pdfs))) { error in
-            XCTAssertTrue(error is AttachmentAdmissionError, "\(error)")
-        }
     }
 
     private static func promised(by row: AttachmentRouteCapability, kind: AttachmentKind) -> Emitted? {

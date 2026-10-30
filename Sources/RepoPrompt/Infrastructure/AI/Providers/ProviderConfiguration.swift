@@ -7,30 +7,7 @@
 
 import Foundation
 import RepoPromptAIContracts
-
-/// Base provider configuration
-struct ProviderConfiguration: Codable {
-    var temperature: Double?
-    var maxTokens: Int?
-
-    init(temperature: Double? = nil, maxTokens: Int? = nil) {
-        self.temperature = temperature
-        self.maxTokens = maxTokens
-    }
-}
-
-/// OpenRouter-specific configuration
-struct OpenRouterConfiguration: Codable {
-    var baseConfig: ProviderConfiguration
-    var customHeaders: [String: String]
-    var useCustomSettings: Bool
-
-    init(temperature: Double? = nil, maxTokens: Int? = nil, customHeaders: [String: String] = [:], useCustomSettings: Bool = true) {
-        baseConfig = ProviderConfiguration(temperature: temperature, maxTokens: maxTokens)
-        self.customHeaders = customHeaders
-        self.useCustomSettings = useCustomSettings
-    }
-}
+import RepoPromptHTTPProviders
 
 /// Singleton to manage provider configurations
 class ProviderConfigurationManager {
