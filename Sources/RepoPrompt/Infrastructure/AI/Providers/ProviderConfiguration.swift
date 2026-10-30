@@ -1,5 +1,3 @@
-import RepoPromptAIContracts
-
 //
 //  ProviderConfiguration.swift
 //  RepoPrompt
@@ -8,6 +6,7 @@ import RepoPromptAIContracts
 //
 
 import Foundation
+import RepoPromptAIContracts
 
 /// Base provider configuration
 struct ProviderConfiguration: Codable {

@@ -1,5 +1,3 @@
-import RepoPromptAIContracts
-
 //
 //  FireworksProvider.swift
 //  RepoPrompt
@@ -8,6 +6,7 @@ import RepoPromptAIContracts
 //
 
 import Foundation
+import RepoPromptAIContracts
 import SwiftOpenAI
 
 final class FireworksProvider: OpenAIProvider {
