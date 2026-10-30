@@ -369,6 +369,10 @@
     }
   },
   "moved_families": {
+    "ClaudeNativeLaunchEnvironmentResolving": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeLaunchEnvironmentResolving.swift"]
+    },
     "ClaudeCodeAgentConfigValue": {
       "owner": "RepoPromptClaudeProvider",
       "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeAgentConfigValue.swift"]

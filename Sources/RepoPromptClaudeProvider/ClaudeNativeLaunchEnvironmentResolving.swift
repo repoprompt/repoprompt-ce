@@ -1,5 +1,4 @@
 import RepoPromptAIContracts
-import RepoPromptClaudeProvider
 
 package protocol ClaudeCodeLaunchEnvironmentResolving: Sendable {
     func resolve(
