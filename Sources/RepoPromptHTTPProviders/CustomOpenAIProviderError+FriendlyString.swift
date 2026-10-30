@@ -1,8 +1,35 @@
+import Foundation
 import RepoPromptAIContracts
 import RepoPromptFoundation
 
+/// Preserve the measured pre-extraction NSError bridge. These are Swift case ordinals,
+/// not the independent HTTP status carried by each case; userInfo remains empty.
+extension CustomOpenAIProviderError: CustomNSError {
+    package static var errorDomain: String {
+        "RepoPromptApp.CustomOpenAIProviderError"
+    }
+
+    package var errorCode: Int {
+        switch self {
+        case .invalidToken: 0
+        case .invalidModel: 1
+        case .requestFailed: 2
+        case .invalidResponse: 3
+        case .streamingNotSupported: 4
+        case .rateLimitExceeded: 5
+        case .serverError: 6
+        case .serviceUnavailable: 7
+        case .requestTooLarge: 8
+        }
+    }
+
+    package var errorUserInfo: [String: Any] {
+        [:]
+    }
+}
+
 extension CustomOpenAIProviderError: FriendlyErrorRepresentable {
-    var friendlyErrorString: String {
+    package var friendlyErrorString: String {
         switch self {
         case let .invalidToken(code, message):
             "Request failed with code \(code): \(message)"

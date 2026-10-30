@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import XCTest
@@ -23,6 +24,20 @@ final class ClaudeCodeDisallowedToolsTests: XCTestCase {
 
 @MainActor
 final class ClaudeCodeProviderCancellationTests: XCTestCase {
+    func testClaudeCLILeaseAdapterRemovesItsRealConfigOnRelease() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("claude-cli-lease-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let service = MCPConfigExportService(configDirectoryURL: directory)
+        let lease = try await service.prepareClaudeEmptyLaunchConfig()
+        let data = try Data(contentsOf: lease.url)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual((json["mcpServers"] as? [String: Any])?.count, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: lease.url.path))
+        lease.release()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lease.url.path))
+    }
+
     func testCancellationStopsOwnedChildAndCompletesProviderTask() async throws {
         let fixture = try OracleCancellationFixture()
         addTeardownBlock { await fixture.cleanup() }

@@ -8,6 +8,7 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptHTTPProviders
 
 actor DisposableProviderPool {
     private let keyManager: KeyManager

@@ -164,7 +164,7 @@ let package = Package(
         ),
         .testTarget(
             name: "RepoPromptClaudeProviderTests",
-            dependencies: ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
+            dependencies: ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess"],
             path: "Tests/RepoPromptClaudeProviderTests"
         ),
         .target(
@@ -180,16 +180,18 @@ let package = Package(
         .target(
             name: "RepoPromptHTTPProviders",
             dependencies: [
-                "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime",
-                .product(name: "SwiftOpenAI", package: "SwiftOpenAI")
+                "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+                .product(name: "SwiftAnthropic", package: "SwiftAnthropic")
             ],
             path: "Sources/RepoPromptHTTPProviders"
         ),
         .testTarget(
             name: "RepoPromptHTTPProvidersTests",
             dependencies: [
-                "RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime",
-                .product(name: "SwiftOpenAI", package: "SwiftOpenAI")
+                "RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+                .product(name: "SwiftAnthropic", package: "SwiftAnthropic")
             ],
             path: "Tests/RepoPromptHTTPProvidersTests"
         ),

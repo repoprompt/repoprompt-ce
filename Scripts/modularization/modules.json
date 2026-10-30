@@ -68,7 +68,7 @@
     },
     "RepoPromptClaudeProviderTests": {
       "source_root": "Tests/RepoPromptClaudeProviderTests",
-      "allowed_dependencies": ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
+      "allowed_dependencies": ["RepoPromptClaudeProvider", "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProcess"]
     },
     "RepoPromptAgentProviderContracts": {
       "source_root": "Sources/RepoPromptAgentProviderContracts",
@@ -82,13 +82,13 @@
     },
     "RepoPromptHTTPProviders": {
       "source_root": "Sources/RepoPromptHTTPProviders",
-      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation"],
       "test_target": "RepoPromptHTTPProvidersTests",
       "app_free_tests": true
     },
     "RepoPromptHTTPProvidersTests": {
       "source_root": "Tests/RepoPromptHTTPProvidersTests",
-      "allowed_dependencies": ["RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime"]
+      "allowed_dependencies": ["RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation"]
     },
     "RepoPromptCodexProvider": {
       "source_root": "Sources/RepoPromptCodexProvider",
@@ -412,6 +412,18 @@
     "ClaudeCompatibleInfrastructureBridge": {
       "owner": "RepoPromptClaudeProvider",
       "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridgeCore.swift"]
+    },
+    "RemainingHTTPExecutionFamily": {
+      "owner": "RepoPromptHTTPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AzureOpenAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AnthropicProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenRouterProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/CustomOpenai/CustomOpenAIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/CustomOpenai/CustomOpenAIProviderError+FriendlyString.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenRouterHTTPConfiguration.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/RemainingHTTPProviderHosts.swift"
+      ]
     },
     "OpenAIHTTPExecutionFamily": {
       "owner": "RepoPromptHTTPProviders",

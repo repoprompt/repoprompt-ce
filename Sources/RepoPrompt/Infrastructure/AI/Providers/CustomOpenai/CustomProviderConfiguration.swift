@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptHTTPProviders
 
 struct CustomProviderConfiguration: Codable {
     let url: String
@@ -103,7 +104,7 @@ struct CustomProviderConfiguration: Codable {
         // Note: The factory currently doesn't use this method directly for instantiation.
         // If it did, we would need to pass self.maxTokens and includeContentTypeHeader here.
         CustomOpenAIProvider(
-            baseURL: url,
+            host: CustomOpenAIAppHost(), baseURL: url,
             apiKey: apiKey,
             defaultModel: defaultModel,
             defaultTemperature: Self.defaultTemperature,

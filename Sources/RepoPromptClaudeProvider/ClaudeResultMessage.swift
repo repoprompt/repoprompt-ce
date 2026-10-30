@@ -1,6 +1,6 @@
 import Foundation
 
-struct ClaudeResultMessage: Codable {
+package struct ClaudeResultMessage: Codable {
     let type: String
     let subtype: String
     let totalCostUsd: Double
@@ -8,7 +8,7 @@ struct ClaudeResultMessage: Codable {
     let durationApiMs: Int
     let isError: Bool
     let numTurns: Int
-    let result: String?
+    package let result: String?
     let sessionId: String
     let usage: Usage?
 
