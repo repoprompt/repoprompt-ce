@@ -4,34 +4,34 @@ import RepoPromptClaudeCompatibleProvider
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 
-typealias ClaudeCompatiblePluginID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderPluginID
-typealias ClaudeCompatiblePluginBackendID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendID
-typealias ClaudeCompatiblePluginRuntimeMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeMode
-typealias ClaudeCompatiblePluginToolContext = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleToolContext
-typealias ClaudeCompatibleBackendLimits = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendLimits
-typealias ClaudeCompatiblePluginBackendConfig = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendConfig
-typealias ClaudeCompatiblePluginBackendAuth = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendAuth
-typealias ClaudeCompatiblePluginBackendModelBehavior = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendModelBehavior
-typealias ClaudeCompatiblePluginSlotMapping = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleSlotMapping
-typealias ClaudeCompatiblePluginRuntimeConfig = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeConfig
-typealias ClaudeCompatiblePluginLaunchEnvironment = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleLaunchEnvironment
-typealias ClaudeCompatiblePluginAvailability = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderAvailability
-typealias ClaudeCompatiblePluginModelOption = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelOption
-typealias ClaudeCompatiblePluginModelCatalogSnapshot = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelCatalogSnapshot
-typealias ClaudeCompatiblePluginRateLimitInfo = RepoPromptClaudeCompatibleProvider.ClaudeProviderRateLimitInfo
-typealias ClaudeCompatiblePluginStreamResult = RepoPromptClaudeCompatibleProvider.ClaudeProviderStreamResult
-typealias ClaudeCompatiblePluginRuntimeVariant = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeVariant
-typealias ClaudeCompatiblePluginProviderError = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderError
-typealias ClaudeCompatiblePluginPromptDeliveryMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatiblePromptDeliveryMode
-typealias ClaudeCompatiblePluginProtocolCodec = RepoPromptClaudeCompatibleProvider.ClaudeSDKProtocolCodec
-typealias ClaudeCompatiblePluginNDJSONTranslator = RepoPromptClaudeCompatibleProvider.ClaudeSDKNDJSONTranslator
-typealias ClaudeCompatiblePluginJSONValue = RepoPromptClaudeCompatibleProvider.ClaudeProviderJSONValue
+package typealias ClaudeCompatiblePluginID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderPluginID
+package typealias ClaudeCompatiblePluginBackendID = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendID
+package typealias ClaudeCompatiblePluginRuntimeMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeMode
+package typealias ClaudeCompatiblePluginToolContext = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleToolContext
+package typealias ClaudeCompatibleBackendLimits = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendLimits
+package typealias ClaudeCompatiblePluginBackendConfig = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendConfig
+package typealias ClaudeCompatiblePluginBackendAuth = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendAuth
+package typealias ClaudeCompatiblePluginBackendModelBehavior = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendModelBehavior
+package typealias ClaudeCompatiblePluginSlotMapping = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleSlotMapping
+package typealias ClaudeCompatiblePluginRuntimeConfig = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeConfig
+package typealias ClaudeCompatiblePluginLaunchEnvironment = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleLaunchEnvironment
+package typealias ClaudeCompatiblePluginAvailability = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderAvailability
+package typealias ClaudeCompatiblePluginModelOption = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelOption
+package typealias ClaudeCompatiblePluginModelCatalogSnapshot = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelCatalogSnapshot
+package typealias ClaudeCompatiblePluginRateLimitInfo = RepoPromptClaudeCompatibleProvider.ClaudeProviderRateLimitInfo
+package typealias ClaudeCompatiblePluginStreamResult = RepoPromptClaudeCompatibleProvider.ClaudeProviderStreamResult
+package typealias ClaudeCompatiblePluginRuntimeVariant = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeVariant
+package typealias ClaudeCompatiblePluginProviderError = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderError
+package typealias ClaudeCompatiblePluginPromptDeliveryMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatiblePromptDeliveryMode
+package typealias ClaudeCompatiblePluginProtocolCodec = RepoPromptClaudeCompatibleProvider.ClaudeSDKProtocolCodec
+package typealias ClaudeCompatiblePluginNDJSONTranslator = RepoPromptClaudeCompatibleProvider.ClaudeSDKNDJSONTranslator
+package typealias ClaudeCompatiblePluginJSONValue = RepoPromptClaudeCompatibleProvider.ClaudeProviderJSONValue
 
 /// Infrastructure-level facade for pure Claude-compatible provider package
 /// helpers. This keeps lower-level Claude provider code from depending upward on
 /// Agent Mode's feature bridge while preserving a single package import point.
-enum ClaudeCompatibleProviderRuntimeBridge {
-    static func quotaObservation(from info: ClaudeCompatiblePluginRateLimitInfo) -> ClaudeProviderQuotaObservation {
+package enum ClaudeCompatibleProviderRuntimeBridge {
+    package static func quotaObservation(from info: ClaudeCompatiblePluginRateLimitInfo) -> ClaudeProviderQuotaObservation {
         let status: ClaudeProviderQuotaObservation.Status = switch info.status {
         case .allowed: .allowed
         case .allowedWarning: .allowedWarning
@@ -40,7 +40,7 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         return ClaudeProviderQuotaObservation(status: status, resetsAt: info.resetsAt, rateLimitType: info.rateLimitType, utilization: info.utilization)
     }
 
-    static func pluginRuntimeVariant(for runtimeVariant: ClaudeCodeRuntimeVariant) -> ClaudeCompatiblePluginRuntimeVariant {
+    package static func pluginRuntimeVariant(for runtimeVariant: ClaudeCodeRuntimeVariant) -> ClaudeCompatiblePluginRuntimeVariant {
         switch runtimeVariant {
         case .standard:
             .standard
@@ -53,7 +53,7 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         }
     }
 
-    static func runtimeVariant(for pluginVariant: ClaudeCompatiblePluginRuntimeVariant) -> ClaudeCodeRuntimeVariant {
+    package static func runtimeVariant(for pluginVariant: ClaudeCompatiblePluginRuntimeVariant) -> ClaudeCodeRuntimeVariant {
         switch pluginVariant {
         case .standard:
             .standard
@@ -66,14 +66,14 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         }
     }
 
-    static func decoratedUserMessage(_ userMessage: String, instructions: String) -> String {
+    package static func decoratedUserMessage(_ userMessage: String, instructions: String) -> String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatiblePromptDelivery.decoratedUserMessage(
             userMessage,
             instructions: instructions
         )
     }
 
-    static func streamResult(from providerResult: ClaudeCompatiblePluginStreamResult) -> RepoPromptDomainRuntime.AIStreamResult {
+    package static func streamResult(from providerResult: ClaudeCompatiblePluginStreamResult) -> RepoPromptDomainRuntime.AIStreamResult {
         RepoPromptDomainRuntime.AIStreamResult(
             type: providerResult.type,
             text: providerResult.text,
@@ -97,7 +97,7 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         )
     }
 
-    static func providerStreamResult(from streamResult: RepoPromptDomainRuntime.AIStreamResult) -> ClaudeCompatiblePluginStreamResult {
+    package static func providerStreamResult(from streamResult: RepoPromptDomainRuntime.AIStreamResult) -> ClaudeCompatiblePluginStreamResult {
         ClaudeCompatiblePluginStreamResult(
             type: streamResult.type,
             text: streamResult.text,
@@ -121,58 +121,57 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         )
     }
 
-    static func normalizedRequestedModel(_ rawModel: String?) -> String? {
+    package static func normalizedRequestedModel(_ rawModel: String?) -> String? {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.normalizedRequestedModel(rawModel)
     }
 
-    static func supportsGLMXHighEffort(backendModelID: String?) -> Bool {
+    package static func supportsGLMXHighEffort(backendModelID: String?) -> Bool {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.supportsXHighEffort(backendModelID)
     }
 
-    static func contextWindowTokens(forGLMBackendModelID backendModelID: String?) -> Int? {
+    package static func contextWindowTokens(forGLMBackendModelID backendModelID: String?) -> Int? {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.contextWindowTokens(
             forBackendModelID: backendModelID
         )
     }
 
-    static var glmDefaultModelRawValue: String {
+    package static var glmDefaultModelRawValue: String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.defaultModelRawValue
     }
 
-    static var glmHaikuEquivalentModelRawValue: String {
+    package static var glmHaikuEquivalentModelRawValue: String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.haikuEquivalentModelRawValue
     }
 
-    static var glmOpusEquivalentModelRawValue: String {
+    package static var glmOpusEquivalentModelRawValue: String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.opusEquivalentModelRawValue
     }
 
-    static var glmDefaultRequestedModelRawValue: String {
+    package static var glmDefaultRequestedModelRawValue: String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.defaultRequestedModelRawValue
     }
 
-    static var glmHaikuRequestedModelRawValue: String {
+    package static var glmHaikuRequestedModelRawValue: String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.haikuRequestedModelRawValue
     }
 
-    static var glmOpusRequestedModelRawValue: String {
+    package static var glmOpusRequestedModelRawValue: String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.opusRequestedModelRawValue
     }
 
-    static var glmSupportedModelRawValues: [String] {
+    package static var glmSupportedModelRawValues: [String] {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.supportedModelRawValues
     }
 
-    static var directSelectableGLMModelRawValues: [String] {
+    package static var directSelectableGLMModelRawValues: [String] {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.directSelectableGLMModelRawValues
     }
 
-    static func isDirectSelectableGLMModel(_ rawModel: String?) -> Bool {
+    package static func isDirectSelectableGLMModel(_ rawModel: String?) -> Bool {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.isDirectSelectableGLMModel(rawModel)
     }
 
-    static func directSelectableGLMSlotRawValue(for rawModel: String?) -> String? {
+    package static func directSelectableGLMSlotRawValue(for rawModel: String?) -> String? {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.directSelectableGLMSlotRawValue(for: rawModel)
     }
-
 }
