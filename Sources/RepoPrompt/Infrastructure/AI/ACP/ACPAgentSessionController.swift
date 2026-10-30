@@ -73,6 +73,11 @@ package actor ACPAgentSessionController {
     package struct AdvertisedCommands: Equatable {
         package let sessionID: String
         package let names: Set<String>
+
+        package init(sessionID: String, names: Set<String>) {
+            self.sessionID = sessionID
+            self.names = names
+        }
     }
 
     /// Why an advertised provider command was refused before anything was written to the provider.
