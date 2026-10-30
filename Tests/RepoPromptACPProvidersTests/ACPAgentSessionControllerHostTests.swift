@@ -17,7 +17,11 @@ final class ACPAgentSessionControllerHostTests: XCTestCase {
             try "import os\nopen(os.environ['OBS_FILE'], 'w').write('launched')\n".write(to: script, atomically: true, encoding: .utf8)
             let provider = FixtureProvider(providerID: .devin, script: script.path, observations: recordURL.path)
             let request = ACPRunRequest(agentKind: .devin, modelString: nil, workspacePath: workspace.path, resumeSessionID: resumeID, attachments: [], taskLabelKind: nil)
-            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, host: RecordingHost())
+            let host = RecordingHost()
+            let controller = try ACPAgentSessionController(provider: provider, runRequest: request, host: host)
+            let expectedMode: ACPSessionConfiguration.Mode = resumeID.map { .load(existingSessionID: $0) } ?? .new
+            XCTAssertEqual(host.initialSessionConfiguration()?.mode, expectedMode)
+            XCTAssertEqual(host.initialSessionConfiguration()?.workingDirectory, workspace.path)
             do {
                 _ = try await controller.bootstrap()
                 XCTFail("Discovery and cold resume must fail closed without an explicit fixture permit")
@@ -97,9 +101,15 @@ private struct FixtureProvider: ACPAgentProvider, ACPDirectSessionModelProvider 
         ACPLaunchConfiguration(providerID: providerID, command: "/usr/bin/python3", arguments: ["-u", script], environment: ["OBS_FILE": observations], workingDirectory: nil, additionalPathHints: [], enableDebugLogging: false)
     }
 
-    func makeSessionConfiguration(for _: ACPRunRequest, mcpServer: RepoPromptMCPServerConfiguration) throws -> ACPSessionConfiguration {
+    func makeSessionConfiguration(for request: ACPRunRequest, mcpServer: RepoPromptMCPServerConfiguration) throws -> ACPSessionConfiguration {
         XCTAssertEqual(mcpServer.name, "fixture-host")
-        return ACPSessionConfiguration(mode: .new, workingDirectory: FileManager.default.temporaryDirectory.path, mcpServers: [])
+        let workingDirectory = request.workspacePath ?? FileManager.default.temporaryDirectory.path
+        let mode: ACPSessionConfiguration.Mode = if let resume = request.resumeSessionID?.trimmingCharacters(in: .whitespacesAndNewlines), !resume.isEmpty {
+            .load(existingSessionID: resume)
+        } else {
+            .new
+        }
+        return ACPSessionConfiguration(mode: mode, workingDirectory: workingDirectory, mcpServers: [])
     }
 
     func buildPromptBlocks(for _: AgentMessage, request _: ACPRunRequest) throws -> [[String: Any]] {
@@ -131,12 +141,17 @@ private final class RecordingHost: ACPAgentSessionHost, @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [String] = []
     private var snapshot: ACPDiscoveredSessionModels?
+    private var initialConfiguration: ACPSessionConfiguration?
     private func record(_ event: String) {
         lock.withLock { recorded.append(event) }
     }
 
     func events() -> [String] {
         lock.withLock { recorded }
+    }
+
+    func initialSessionConfiguration() -> ACPSessionConfiguration? {
+        lock.withLock { initialConfiguration }
     }
 
     func setSnapshot(_ raw: String) {
@@ -157,8 +172,11 @@ private final class RecordingHost: ACPAgentSessionHost, @unchecked Sendable {
         "auto"
     }
 
-    func preflightInjectedMCPServers(in _: ACPSessionConfiguration) throws {
-        record("preflight-init")
+    func preflightInjectedMCPServers(in configuration: ACPSessionConfiguration) throws {
+        lock.withLock {
+            initialConfiguration = configuration
+            recorded.append("preflight-init")
+        }
     }
 
     func preflightInjectedMCPServers(in _: ACPSessionConfiguration, environment: [String: String]) throws {
