@@ -14,12 +14,19 @@ included:
   - Sources/RepoPromptPersistence
   - Sources/RepoPromptSettingsCore
   - Sources/RepoPromptProviderQuota
+  - Sources/RepoPromptAIContracts
+  - Sources/RepoPromptACPProviders
+  - Sources/RepoPromptAgentProviderContracts
+  - Sources/RepoPromptClaudeProvider
   - Sources/RepoPromptCodexProvider
   - Tests/RepoPromptFileSystemTests
   - Tests/RepoPromptVCSTests
   - Tests/RepoPromptPersistenceTests
   - Tests/RepoPromptSettingsCoreTests
   - Tests/RepoPromptProviderQuotaTests
+  - Tests/RepoPromptAIContractsTests
+  - Tests/RepoPromptACPProvidersTests
+  - Tests/RepoPromptAgentProviderContractsTests
   - Tests/RepoPromptCodexProviderTests
   - Tests/RepoPromptTests
   - Tests/RepoPromptMCPCoreTests
