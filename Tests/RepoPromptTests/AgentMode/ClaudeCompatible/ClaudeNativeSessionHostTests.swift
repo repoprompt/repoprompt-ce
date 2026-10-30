@@ -34,6 +34,14 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
             model == "host-effort-witness" ? .high : nil
         }
 
+        nonisolated func isDefaultModel(_ model: String) -> Bool {
+            model == "host-default-witness"
+        }
+
+        nonisolated func shouldSuppressAbortArtifact(_ message: String) -> Bool {
+            message == "host-abort-witness"
+        }
+
         nonisolated func supplementedPathHints(_ hints: [String]) -> [String] {
             hints
         }
@@ -120,6 +128,20 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
         XCTAssertEqual((request?["settings"] as? [String: Any])?["effortLevel"] as? String, "high")
         let override = try await controller.test_resolveApplyFlagSettingsRequest(model: "host-effort-witness", effortLevel: .low)
         XCTAssertEqual((override?["settings"] as? [String: Any])?["effortLevel"] as? String, "low")
+        await controller.shutdown()
+    }
+
+    func testDefaultModelAndAbortFilteringUseRequiredHost() async {
+        let controller = ClaudeNativeProcessSessionController(
+            host: RefusingHost(), runID: UUID(), tabID: UUID(), windowID: 1,
+            workspacePath: nil, config: .discovery(commandName: "/usr/bin/false")
+        )
+        let defaultRequest = await controller.test_buildApplyFlagSettingsRequest(model: "host-default-witness")
+        XCTAssertNil(defaultRequest)
+        let suppressed = await controller.shouldSuppressUserFacingStreamResult(
+            AIStreamResult(type: "error", text: "host-abort-witness")
+        )
+        XCTAssertTrue(suppressed)
         await controller.shutdown()
     }
 

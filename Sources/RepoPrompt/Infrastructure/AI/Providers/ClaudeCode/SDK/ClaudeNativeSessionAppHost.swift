@@ -39,6 +39,14 @@ struct ClaudeNativeSessionAppHost: ClaudeNativeSessionHosting {
         ClaudeModelSpecifier(raw: model).explicitEffortLevel
     }
 
+    func isDefaultModel(_ model: String) -> Bool {
+        model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
+    }
+
+    func shouldSuppressAbortArtifact(_ message: String) -> Bool {
+        ClaudeAbortArtifactFilter.shouldSuppressUserFacingError(message)
+    }
+
     func supplementedPathHints(_ hints: [String]) -> [String] {
         CLIPathHints.nativeDefaultsSupplemented(with: hints)
     }

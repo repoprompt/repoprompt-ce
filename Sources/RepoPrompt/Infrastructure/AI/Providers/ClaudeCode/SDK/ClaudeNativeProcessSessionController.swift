@@ -789,7 +789,7 @@ final actor ClaudeNativeProcessSessionController {
         let requestEffortLevel = Self.shouldSuppressEffortSettings(for: launchEnvironment)
             ? nil
             : effectiveEffortLevel
-        let request = Self.buildApplyFlagSettingsRequest(
+        let request = buildApplyFlagSettingsRequest(
             model: launchEnvironment.effectiveModel,
             effortLevel: requestEffortLevel
         )
@@ -873,7 +873,7 @@ final actor ClaudeNativeProcessSessionController {
         launchEnvironment.suppressesEffortSettings
     }
 
-    private static func buildApplyFlagSettingsRequest(model: String?, effortLevel: ClaudeCodeEffortLevel?) -> [String: Any]? {
+    private func buildApplyFlagSettingsRequest(model: String?, effortLevel: ClaudeCodeEffortLevel?) -> [String: Any]? {
         var settings: [String: Any] = [:]
         if let model = normalizedFlagSettingsModel(model) {
             settings["model"] = model
@@ -888,10 +888,10 @@ final actor ClaudeNativeProcessSessionController {
         ]
     }
 
-    private static func normalizedFlagSettingsModel(_ raw: String?) -> String? {
+    private func normalizedFlagSettingsModel(_ raw: String?) -> String? {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return nil }
-        guard trimmed.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame else { return nil }
+        guard !host.isDefaultModel(trimmed) else { return nil }
         return trimmed
     }
 
@@ -1554,7 +1554,7 @@ final actor ClaudeNativeProcessSessionController {
                 writeRawEventLogRecord(kind: "translator.unownedStreamResult", payload: logPayload)
                 continue
             }
-            if Self.shouldSuppressUserFacingStreamResult(result) {
+            if shouldSuppressUserFacingStreamResult(result) {
                 emitSemanticUncertainty("Suppressed provider activity")
                 writeRawEventLogRecord(kind: "translator.streamResultSuppressed", payload: logPayload)
                 continue
@@ -1710,7 +1710,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    static func shouldSuppressUserFacingStreamResult(_ result: AIStreamResult) -> Bool {
+    func shouldSuppressUserFacingStreamResult(_ result: AIStreamResult) -> Bool {
         // Reasoning is forwarded to Agent Mode as runtime-only status preview data.
         // Transcript suppression belongs in the view-model layer, not at this transport boundary.
         // Suppress Claude background task lifecycle notifications (task_started /
@@ -1730,7 +1730,7 @@ final actor ClaudeNativeProcessSessionController {
         else {
             return false
         }
-        return ClaudeAbortArtifactFilter.shouldSuppressUserFacingError(text)
+        return host.shouldSuppressAbortArtifact(text)
     }
 
     /// Extracts tools and MCP server statuses from a `system/init` stream payload.
@@ -1990,7 +1990,7 @@ final actor ClaudeNativeProcessSessionController {
             model: String? = nil,
             effortLevel: ClaudeCodeEffortLevel? = nil
         ) -> [String: Any]? {
-            Self.buildApplyFlagSettingsRequest(model: model, effortLevel: effortLevel)
+            buildApplyFlagSettingsRequest(model: model, effortLevel: effortLevel)
         }
 
         func test_resolveApplyFlagSettingsRequest(
