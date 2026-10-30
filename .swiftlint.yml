@@ -18,6 +18,7 @@ included:
   - Sources/RepoPromptACPProviders
   - Sources/RepoPromptAgentProviderContracts
   - Sources/RepoPromptClaudeProvider
+  - Sources/RepoPromptHTTPProviders
   - Sources/RepoPromptCodexProvider
   - Tests/RepoPromptFileSystemTests
   - Tests/RepoPromptVCSTests
@@ -28,6 +29,7 @@ included:
   - Tests/RepoPromptACPProvidersTests
   - Tests/RepoPromptAgentProviderContractsTests
   - Tests/RepoPromptClaudeProviderTests
+  - Tests/RepoPromptHTTPProvidersTests
   - Tests/RepoPromptCodexProviderTests
   - Tests/RepoPromptTests
   - Tests/RepoPromptMCPCoreTests
