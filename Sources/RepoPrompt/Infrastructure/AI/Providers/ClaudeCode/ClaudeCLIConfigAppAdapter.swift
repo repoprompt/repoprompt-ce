@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
@@ -126,21 +127,8 @@ extension ClaudeCodeProvider {
     }
 }
 
-/// Keeps the canonical launch lease alive without introducing cleanup state.
-private struct ClaudeCLIConfigLeaseAdapter: ClaudeCLIConfigLease {
-    let lease: MCPConfigLease
-
-    var url: URL {
-        lease.url
-    }
-
-    func release() {
-        lease.release()
-    }
-}
-
 extension MCPConfigExportService: ClaudeCLIConfigPreparing {
     package func prepareClaudeEmptyLaunchConfig() throws -> any ClaudeCLIConfigLease {
-        try ClaudeCLIConfigLeaseAdapter(lease: prepareEmptyLaunchConfig())
+        try prepareEmptyLaunchConfig()
     }
 }

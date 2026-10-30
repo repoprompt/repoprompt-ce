@@ -146,14 +146,12 @@ extension ClaudeCompatibleProviderRuntimeBridge {
         resumeSessionID: String? = nil,
         systemPromptOverride: String? = nil
     ) -> [String] {
-        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleHeadlessRuntime.buildArguments(
-            RepoPromptClaudeCompatibleProvider.ClaudeCompatibleHeadlessArgumentsRequest(
-                runtimeConfig: runtimeConfig(from: config, mode: .discovery),
-                mcpConfigPath: context.configURL?.path,
-                launchEnvironment: context.launchEnvironment,
-                resumeSessionID: resumeSessionID,
-                systemPromptOverride: systemPromptOverride
-            )
+        buildHeadlessArguments(
+            runtimeConfig: runtimeConfig(from: config, mode: .discovery),
+            mcpConfigPath: context.configURL?.path,
+            launchEnvironment: context.launchEnvironment,
+            resumeSessionID: resumeSessionID,
+            systemPromptOverride: systemPromptOverride
         )
     }
 
