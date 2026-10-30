@@ -387,6 +387,17 @@
     }
   },
   "moved_families": {
+    "GrokBuildAndDevinConsumerExecution": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildOneShotHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuildDevinProviderHosts.swift"
+      ]
+    },
     "ClaudeNativeSessionExecution": {
       "owner": "RepoPromptClaudeProvider",
       "former_app_files": [

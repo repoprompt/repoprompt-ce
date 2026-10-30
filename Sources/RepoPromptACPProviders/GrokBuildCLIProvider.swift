@@ -1,27 +1,33 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// Grok Build CLI provider for non-agent use (chat, Oracle, AI queries).
 /// Runs a fresh prompt-only one-shot process per request without injecting RepoPrompt MCP/tools.
-final class GrokBuildCLIProvider: AIProvider {
+package final class GrokBuildCLIProvider: AIProvider {
+    private let host: any GrokBuildCLIHost
+
+    package init(host: any GrokBuildCLIHost) {
+        self.host = host
+    }
+
     private let activeProviders = ActiveGrokBuildCLIProviderStore()
 
     #if DEBUG
-        static func test_makeHeadlessConfig(modelName: String?) -> GrokBuildAgentConfig {
-            makeHeadlessConfig(modelName: modelName)
+        package static func test_makeHeadlessConfig(modelName: String?, host: any GrokBuildCLIHost) -> GrokBuildAgentConfig {
+            makeHeadlessConfig(modelName: modelName, host: host)
         }
 
-        static func test_makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
-            GrokBuildCLIProvider().makeAgentMessage(from: aiMessage)
+        package static func test_makeAgentMessage(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> AgentMessage {
+            makeAgentMessage(from: aiMessage)
         }
 
-        static func test_normalizedTerminalResult(_ result: AIStreamResult) -> AIStreamResult {
+        package static func test_normalizedTerminalResult(_ result: RepoPromptDomainRuntime.AIStreamResult) -> RepoPromptDomainRuntime.AIStreamResult {
             normalizedTerminalResult(result)
         }
 
-        static func test_resolvedCompletionText(
+        package static func test_resolvedCompletionText(
             streamedParts: [String],
             finalContent: String?
         ) -> String {
@@ -29,19 +35,19 @@ final class GrokBuildCLIProvider: AIProvider {
         }
     #endif
 
-    func streamMessage(
-        _ aiMessage: AIMessage,
+    package func streamMessage(
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens _: Int? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
-        let provider = GrokBuildOneShotHeadlessAgentProvider(
-            config: Self.makeHeadlessConfig(modelName: grokBuildModelName(for: model))
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
+        let provider = host.makeOneShotProvider(
+            config: Self.makeHeadlessConfig(modelName: host.modelName(for: model), host: host)
         )
         activeProviders.insert(provider)
 
-        let upstream: AsyncThrowingStream<AIStreamResult, Error>
+        let upstream: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>
         do {
-            upstream = try await provider.streamAgentMessage(makeAgentMessage(from: aiMessage), runID: nil)
+            upstream = try await provider.streamAgentMessage(Self.makeAgentMessage(from: aiMessage), runID: nil)
         } catch {
             activeProviders.remove(provider)
             await provider.dispose()
@@ -76,18 +82,18 @@ final class GrokBuildCLIProvider: AIProvider {
         }
     }
 
-    func completeMessage(
-        _ aiMessage: AIMessage,
+    package func completeMessage(
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int? = nil
-    ) async throws -> AICompletionResult {
+    ) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let stream = try await streamMessage(aiMessage, model: model, maxTokens: maxTokens)
         var textParts: [String] = []
         var finalContent: String?
         var promptTokens: Int?
         var completionTokens: Int?
         var cost: Double?
-        var completionOutcome: AIProviderCompletionOutcome?
+        var completionOutcome: RepoPromptDomainRuntime.AIProviderCompletionOutcome?
 
         for try await result in stream {
             switch result.type {
@@ -104,7 +110,7 @@ final class GrokBuildCLIProvider: AIProvider {
                 if let value = result.promptTokens { promptTokens = value }
                 if let value = result.completionTokens { completionTokens = value }
                 if let value = result.cost { cost = value }
-            case AIStreamResult.incompleteType:
+            case RepoPromptDomainRuntime.AIStreamResult.incompleteType:
                 guard let reason = result.stopReason?.trimmingCharacters(in: .whitespacesAndNewlines),
                       !reason.isEmpty
                 else {
@@ -129,7 +135,7 @@ final class GrokBuildCLIProvider: AIProvider {
             streamedParts: textParts,
             finalContent: finalContent
         )
-        let resolvedOutcome: AIProviderCompletionOutcome
+        let resolvedOutcome: RepoPromptDomainRuntime.AIProviderCompletionOutcome
         if let completionOutcome {
             resolvedOutcome = completionOutcome
         } else {
@@ -139,7 +145,7 @@ final class GrokBuildCLIProvider: AIProvider {
             resolvedOutcome = .incomplete(reason: "stream_ended_without_terminal")
         }
 
-        return AICompletionResult(
+        return RepoPromptDomainRuntime.AICompletionResult(
             text: text,
             promptTokens: promptTokens,
             completionTokens: completionTokens,
@@ -148,7 +154,7 @@ final class GrokBuildCLIProvider: AIProvider {
         )
     }
 
-    func dispose() async {
+    package func dispose() async {
         let providers = activeProviders.removeAll()
         for provider in providers {
             await provider.dispose()
@@ -163,7 +169,7 @@ final class GrokBuildCLIProvider: AIProvider {
         "complete"
     ]
 
-    private static func normalizedTerminalResult(_ result: AIStreamResult) -> AIStreamResult {
+    private static func normalizedTerminalResult(_ result: RepoPromptDomainRuntime.AIStreamResult) -> RepoPromptDomainRuntime.AIStreamResult {
         guard result.type == "message_stop",
               let stopReason = result.stopReason?
               .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -174,7 +180,7 @@ final class GrokBuildCLIProvider: AIProvider {
             return result
         }
 
-        return result.replacingType(AIStreamResult.incompleteType)
+        return result.replacingType(RepoPromptDomainRuntime.AIStreamResult.incompleteType)
     }
 
     private static func resolvedCompletionText(
@@ -184,18 +190,13 @@ final class GrokBuildCLIProvider: AIProvider {
         finalContent ?? streamedParts.joined()
     }
 
-    private static func makeHeadlessConfig(modelName: String?) -> GrokBuildAgentConfig {
-        GrokBuildAgentConfig(
-            enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-            modelString: modelName,
-            includeRepoPromptMCPServer: false,
-            alwaysApproveTools: false
-        )
+    private static func makeHeadlessConfig(modelName: String?, host: any GrokBuildCLIHost) -> GrokBuildAgentConfig {
+        host.makeHeadlessConfig(modelName: modelName)
     }
 
     private static let noToolsInstruction = "IMPORTANT: Do not use any tools, function calls, or external commands. Respond with text only. Any tool invocation will cause task failure."
 
-    private func makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
+    private static func makeAgentMessage(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> AgentMessage {
         let systemPrompt = aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let nonAgentSystemPrompt = systemPrompt.isEmpty
             ? Self.noToolsInstruction
@@ -208,7 +209,7 @@ final class GrokBuildCLIProvider: AIProvider {
         )
     }
 
-    private func buildPrompt(from aiMessage: AIMessage) -> String {
+    private static func buildPrompt(from aiMessage: RepoPromptDomainRuntime.AIMessage) -> String {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         var conversation = ""
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
@@ -231,17 +232,11 @@ final class GrokBuildCLIProvider: AIProvider {
         }
         return conversation
     }
-
-    private func grokBuildModelName(for model: AIModel) -> String? {
-        guard model.providerType == .grokBuild else { return nil }
-        let trimmed = model.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
 }
 
-private extension AIStreamResult {
-    func replacingType(_ type: String) -> AIStreamResult {
-        AIStreamResult(
+private extension RepoPromptDomainRuntime.AIStreamResult {
+    func replacingType(_ type: String) -> RepoPromptDomainRuntime.AIStreamResult {
+        RepoPromptDomainRuntime.AIStreamResult(
             type: type,
             text: text,
             reasoning: reasoning,

@@ -1,7 +1,7 @@
 import Foundation
-import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 
 /// Devin provider for non-agent use (chat, Oracle, AI queries).
@@ -9,26 +9,24 @@ import RepoPromptProcess
 /// Text-only requests use the sandboxed one-shot `devin -p` CLI. Requests that carry
 /// transient images are routed through `devin acp`, the only Devin transport with an
 /// image channel (`promptCapabilities.image`); the one-shot CLI has no attachment input.
-final class DevinCLIProvider: AIProvider {
-    typealias HeadlessProviderFactory = @Sendable (_ config: DevinAgentConfig, _ workspacePath: String?) -> DevinACPHeadlessAgentProvider
+package final class DevinCLIProvider: AIProvider {
+    package typealias HeadlessProviderFactory = @Sendable (_ config: DevinAgentConfig, _ workspacePath: String?) -> DevinACPHeadlessAgentProvider
 
+    private let host: any DevinCLIHost
     private let config: DevinAgentConfig
     private let launchResolver: DevinACPLaunchResolver
     private let requestTimeout: TimeInterval
     private let headlessProviderFactory: HeadlessProviderFactory
     private let activeRuns = ActiveDevinOneShotRunStore()
 
-    init(
-        config: DevinAgentConfig = DevinAgentConfig(
-            enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
-            includeRepoPromptMCPServer: false
-        ),
-        launchResolver: DevinACPLaunchResolver = DevinACPLaunchResolver(),
+    package init(
+        host: any DevinCLIHost,
+        config: DevinAgentConfig,
+        launchResolver: DevinACPLaunchResolver,
         requestTimeout: TimeInterval = 6000,
-        headlessProviderFactory: @escaping HeadlessProviderFactory = { config, workspacePath in
-            DevinACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
-        }
+        headlessProviderFactory: @escaping HeadlessProviderFactory
     ) {
+        self.host = host
         self.config = config
         self.launchResolver = launchResolver
         self.requestTimeout = requestTimeout
@@ -36,38 +34,38 @@ final class DevinCLIProvider: AIProvider {
     }
 
     #if DEBUG
-        static func test_arguments(modelName: String?, promptFilePath: String) -> [String] {
-            DevinOneShotCLIOptions(modelName: modelName, promptFilePath: promptFilePath).toTokens()
+        package static func test_arguments(modelName: String?, promptFilePath: String, isDefaultModel: (String) -> Bool) -> [String] {
+            DevinOneShotCLIOptions(modelName: modelName, promptFilePath: promptFilePath).toTokens(isDefaultModel: isDefaultModel)
         }
 
-        static func test_promptText(from message: AIMessage) -> String {
+        package static func test_promptText(from message: RepoPromptDomainRuntime.AIMessage) -> String {
             promptText(from: message)
         }
 
-        static func test_makeImageAgentMessage(from message: AIMessage) -> AgentMessage {
+        package static func test_makeImageAgentMessage(from message: RepoPromptDomainRuntime.AIMessage) -> AgentMessage {
             makeImageAgentMessage(from: message)
         }
 
-        func test_makeImageHeadlessConfig(modelName: String?) -> DevinAgentConfig {
+        package func test_makeImageHeadlessConfig(modelName: String?) -> DevinAgentConfig {
             makeImageHeadlessConfig(modelName: modelName)
         }
     #endif
 
-    func streamMessage(
-        _ aiMessage: AIMessage,
+    package func streamMessage(
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens _: Int? = nil
-    ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    ) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         let runID = UUID()
         return AsyncThrowingStream { continuation in
             let task = Task { [self] in
                 defer { activeRuns.remove(runID) }
                 do {
-                    let modelName = devinModelName(for: model)
+                    let modelName = host.modelName(for: model)
                     if aiMessage.attachments.isEmpty {
                         let text = try await runOneShot(aiMessage, modelName: modelName)
-                        continuation.yield(AIStreamResult(type: "content", text: text))
-                        continuation.yield(AIStreamResult(type: "message_stop", text: nil))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "content", text: text))
+                        continuation.yield(RepoPromptDomainRuntime.AIStreamResult(type: "message_stop", text: nil))
                     } else {
                         try await runImageRequestThroughACP(
                             aiMessage,
@@ -87,11 +85,11 @@ final class DevinCLIProvider: AIProvider {
         }
     }
 
-    func completeMessage(
-        _ aiMessage: AIMessage,
+    package func completeMessage(
+        _ aiMessage: RepoPromptDomainRuntime.AIMessage,
         model: AIModel,
         maxTokens: Int? = nil
-    ) async throws -> AICompletionResult {
+    ) async throws -> RepoPromptDomainRuntime.AICompletionResult {
         let stream = try await streamMessage(aiMessage, model: model, maxTokens: maxTokens)
         var text = ""
         var finalContent: String?
@@ -111,10 +109,10 @@ final class DevinCLIProvider: AIProvider {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AIProviderError.invalidResponse(detail: "Devin returned no completion")
         }
-        return AICompletionResult(text: text)
+        return RepoPromptDomainRuntime.AICompletionResult(text: text)
     }
 
-    func dispose() async {
+    package func dispose() async {
         let tasks = activeRuns.removeAll()
         tasks.forEach { $0.cancel() }
         for task in tasks {
@@ -126,9 +124,9 @@ final class DevinCLIProvider: AIProvider {
     /// rooted in a private temporary directory. Tool approvals are declined by the headless
     /// bridge, and the per-request timeout matches the one-shot path.
     private func runImageRequestThroughACP(
-        _ message: AIMessage,
+        _ message: RepoPromptDomainRuntime.AIMessage,
         modelName: String?,
-        continuation: AsyncThrowingStream<AIStreamResult, Error>.Continuation
+        continuation: AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>.Continuation
     ) async throws {
         try Task.checkCancellation()
         let directory = FileManager.default.temporaryDirectory
@@ -187,7 +185,7 @@ final class DevinCLIProvider: AIProvider {
         )
     }
 
-    private static func makeImageAgentMessage(from message: AIMessage) -> AgentMessage {
+    private static func makeImageAgentMessage(from message: RepoPromptDomainRuntime.AIMessage) -> AgentMessage {
         let systemPrompt = message.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         return AgentMessage(
             systemPrompt: systemPrompt.isEmpty
@@ -199,7 +197,7 @@ final class DevinCLIProvider: AIProvider {
         )
     }
 
-    private func runOneShot(_ message: AIMessage, modelName: String?) async throws -> String {
+    private func runOneShot(_ message: RepoPromptDomainRuntime.AIMessage, modelName: String?) async throws -> String {
         try Task.checkCancellation()
         let support = try await launchResolver.probeSupport(for: config)
         guard case .supported = support else {
@@ -228,12 +226,11 @@ final class DevinCLIProvider: AIProvider {
         )
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let integration = try DevinIntegrationConfiguration.prepare(
+        let integration = try host.prepareIsolatedIntegration(
             workingDirectory: directory.path,
-            mcpServers: .disableAll,
             sourceEnvironment: launch.environment
         )
-        defer { DevinIntegrationConfiguration.cleanupReportingFailures(artifact: integration.cleanupArtifact) }
+        defer { host.cleanupIntegration(artifact: integration.cleanupArtifact) }
 
         let promptURL = directory.appendingPathComponent("prompt.md")
         try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
@@ -243,7 +240,7 @@ final class DevinCLIProvider: AIProvider {
             command: launch.command,
             workingDirectory: directory.path,
             environment: launch.environment.merging(integration.environment) { _, overlay in overlay },
-            environmentFilter: ProviderEnvironmentFiltering.cliFilter(for: .devin, explicitOverrides: integration.environment),
+            environmentFilter: host.environmentFilter(explicitOverrides: integration.environment),
             additionalPaths: [],
             enableDebugLogging: config.enableDebugLogging,
             resolveCandidates: [(launch.command as NSString).lastPathComponent],
@@ -257,7 +254,7 @@ final class DevinCLIProvider: AIProvider {
                 args: DevinOneShotCLIOptions(
                     modelName: modelName,
                     promptFilePath: promptURL.path
-                ).toTokens(),
+                ).toTokens(isDefaultModel: host.isDefaultModel),
                 stdin: nil,
                 outputMode: .none,
                 timeout: requestTimeout,
@@ -293,14 +290,14 @@ final class DevinCLIProvider: AIProvider {
 
     private static let noToolsInstruction = "Do not use any tools, function calls, MCP servers, external commands, or workspace files. Return one final text answer only; preserve Markdown when useful."
 
-    private static func promptText(from message: AIMessage) -> String {
+    private static func promptText(from message: RepoPromptDomainRuntime.AIMessage) -> String {
         let systemPrompt = message.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         return [systemPrompt, noToolsInstruction, conversationText(from: message)]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
     }
 
-    private static func conversationText(from message: AIMessage) -> String {
+    private static func conversationText(from message: RepoPromptDomainRuntime.AIMessage) -> String {
         let tail = message.buildTail(embedSystemPrompt: false)
         var conversation = ""
         let lastUserIndex = message.conversationMessages.lastIndex { $0.role == .user }
@@ -316,15 +313,6 @@ final class DevinCLIProvider: AIProvider {
             conversation = "User: \(tail)"
         }
         return conversation
-    }
-
-    private func devinModelName(for model: AIModel) -> String? {
-        guard model.providerType == .devin else { return nil }
-        let value = model.modelName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty,
-              value.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
-        else { return nil }
-        return value
     }
 
     private func mapProcessError(_ error: Error) -> Error {
@@ -357,11 +345,11 @@ private struct DevinOneShotCLIOptions {
     let modelName: String?
     let promptFilePath: String
 
-    func toTokens() -> [String] {
+    func toTokens(isDefaultModel: (String) -> Bool) -> [String] {
         var tokens: [String] = []
         if let modelName = modelName?.trimmingCharacters(in: .whitespacesAndNewlines),
            !modelName.isEmpty,
-           modelName.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+           !isDefaultModel(modelName)
         {
             tokens += ["--model", modelName]
         }
