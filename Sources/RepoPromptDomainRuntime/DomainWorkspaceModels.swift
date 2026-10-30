@@ -1,5 +1,9 @@
 import CoreFoundation
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
 package enum DomainWorkspaceStoragePath {
@@ -62,12 +66,12 @@ package enum DomainAuthorityHealth: Codable, Equatable {
     }
 }
 
-package enum DomainWorkspaceTabLocation: String, Codable, Equatable, Hashable, Sendable {
+package enum DomainWorkspaceTabLocation: String, Codable, Equatable, Hashable {
     case composed
     case stashed
 }
 
-package struct DomainProtectedAgentIdentity: Codable, Equatable, Hashable, Sendable {
+package struct DomainProtectedAgentIdentity: Codable, Equatable, Hashable {
     package let tabID: UUID
     package let location: DomainWorkspaceTabLocation
     package let activeAgentSessionID: UUID?
@@ -219,12 +223,12 @@ package enum DomainExactRootSelection: Equatable {
 }
 
 /// Exact registered-workspace routing facts, independent of session/delegation authority.
-package enum DomainWorkspaceReadSelector: Equatable, Sendable {
+package enum DomainWorkspaceReadSelector: Equatable {
     case id(UUID)
     case exactName(String)
 }
 
-package struct DomainWorkspaceReadLocation: Equatable, Sendable {
+package struct DomainWorkspaceReadLocation: Equatable {
     package let runtimeID: UUID
     package let lifecycleGeneration: UInt64
     package let locationGeneration: UInt64
@@ -233,7 +237,7 @@ package struct DomainWorkspaceReadLocation: Equatable, Sendable {
     package let directory: URL
 }
 
-package enum DomainWorkspaceLocationSelection: Equatable, Sendable {
+package enum DomainWorkspaceLocationSelection: Equatable {
     case matched(DomainWorkspaceReadLocation)
     case ambiguous
     case unavailable

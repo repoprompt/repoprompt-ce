@@ -1,5 +1,13 @@
-import CryptoKit
-import Darwin
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 import Logging
 import MCP
@@ -71,7 +79,7 @@ package actor DirectHeadlessMCPService {
         self.allowsProviderProcessLaunchForTesting = allowsProviderProcessLaunchForTesting
     }
 
-    package func run() async throws {
+    package func run(stdinFD: Int32 = STDIN_FILENO, stdoutFD: Int32 = STDOUT_FILENO) async throws {
         let prepared = try await prepareRuntime()
         let server = Server(
             name: "RepoPrompt CE",
@@ -95,6 +103,8 @@ package actor DirectHeadlessMCPService {
             )
         )
         let transport = MCPStdioServerTransport(
+            stdinFD: stdinFD,
+            stdoutFD: stdoutFD,
             writeStallTimeout: .seconds(5),
             logger: logger
         )
@@ -136,7 +146,7 @@ package actor DirectHeadlessMCPService {
             environment: environment,
             currentDirectory: currentDirectory
         )
-        let profile = AppProfileLocations(identity: .current, profileName: locations.profileIdentifier)
+        let profile = AppProfileLocations(identity: .current, profileName: locations.profileIdentifier, environment: environment)
         let pathPolicy = profile.identity.buildFlavor == .debug
             ? AppMetadataPathPolicy(locations: profile, roots: [locations.storageDirectory, locations.workspaceStorageDirectory]) : nil
         try pathPolicy?.acquireProfileAccess()
@@ -444,7 +454,7 @@ package actor DirectHeadlessMCPService {
               handshake.oracleGroupClaimID == accepted.oracleGroupClaimID
         else {
             logger.warning("Rejected private child launch token", metadata: ["result": "\(redemption)"])
-            Darwin.shutdown(fd, SHUT_RDWR)
+            POSIXSystem.shutdown(fd, POSIXSystem.shutdownReadWrite)
             return
         }
 
@@ -543,11 +553,34 @@ package actor DirectHeadlessMCPService {
     /// Binds the kernel-observed parent PID to the executable identity currently on disk.
     /// Display names and initialize metadata never participate in mutation authority.
     nonisolated static func verifiedExecutableFingerprint(processID: Int32) -> String? {
+        guard processID > 0 else { return nil }
         var buffer = [CChar](repeating: 0, count: 4096)
-        guard proc_pidpath(processID, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        #if os(Linux)
+            let processPath = "/proc/\(processID)/exe"
+            let descriptor = open(processPath, O_RDONLY | O_CLOEXEC)
+            guard descriptor >= 0 else { return nil }
+            defer { close(descriptor) }
+            var executableInfo = stat()
+            guard fstat(descriptor, &executableInfo) == 0,
+                  executableInfo.st_mode & S_IFMT == S_IFREG else { return nil }
+            let count = readlink(processPath, &buffer, buffer.count - 1)
+            guard count > 0, count < buffer.count - 1 else { return nil }
+            buffer[count] = 0
+            guard !String(cString: buffer).hasSuffix(" (deleted)") else { return nil }
+        #else
+            guard proc_pidpath(processID, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        #endif
         let path = URL(fileURLWithPath: String(cString: buffer)).standardizedFileURL.path
         var info = stat()
-        guard lstat(path, &info) == 0 else { return nil }
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        #if os(Linux)
+            var currentProcessInfo = stat()
+            guard stat(processPath, &currentProcessInfo) == 0,
+                  currentProcessInfo.st_dev == executableInfo.st_dev,
+                  currentProcessInfo.st_ino == executableInfo.st_ino,
+                  info.st_dev == executableInfo.st_dev,
+                  info.st_ino == executableInfo.st_ino else { return nil }
+        #endif
         let material = "\(path)|\(info.st_dev)|\(info.st_ino)"
         return SHA256.hash(data: Data(material.utf8))
             .map { String(format: "%02x", $0) }

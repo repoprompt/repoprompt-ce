@@ -1,6 +1,12 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
+import RepoPromptC
 import RepoPromptDomainRuntime
+import RepoPromptShared
 
 /// Carries the immutable path-fence guard into detached materialization work. The guard is a
 /// value of admitted path identities whose `revalidate()` only reads the filesystem.
@@ -168,7 +174,8 @@ package enum GitWorktreeTrackedCheckoutClone {
 
     package static func directoryIdentity(_ url: URL) -> DirectoryIdentity? {
         var status = stat()
-        guard lstat(url.path, &status) == 0, status.st_mode & S_IFMT == S_IFDIR else { return nil }
+        guard lstat(url.path, &status) == 0,
+              status.st_mode & POSIXSystem.fileTypeMask == POSIXSystem.directoryFileType else { return nil }
         return DirectoryIdentity(device: status.st_dev, inode: status.st_ino)
     }
 
@@ -189,32 +196,55 @@ package enum GitWorktreeTrackedCheckoutClone {
         sourceRoot: URL,
         destination: URL
     ) -> Result<VolumeProbe, GitWorktreeTrackedCloneIneligibility> {
-        var sourceStatus = statfs()
-        guard statfs(sourceRoot.path, &sourceStatus) == 0,
-              let anchor = nearestExistingAncestor(of: destination)
-        else { return .failure(.volumeUnavailable) }
-        var destinationStatus = statfs()
-        guard statfs(anchor.path, &destinationStatus) == 0 else { return .failure(.volumeUnavailable) }
-        guard fileSystemTypeName(sourceStatus) == "apfs",
-              fileSystemTypeName(destinationStatus) == "apfs"
-        else { return .failure(.volumeNotAPFS) }
-        guard sourceStatus.f_fsid.val.0 == destinationStatus.f_fsid.val.0,
-              sourceStatus.f_fsid.val.1 == destinationStatus.f_fsid.val.1
-        else { return .failure(.differentVolume) }
-        let values = try? sourceRoot.resourceValues(forKeys: [
-            .volumeSupportsFileCloningKey,
-            .volumeSupportsCaseSensitiveNamesKey
-        ])
-        guard values?.volumeSupportsFileCloning == true else { return .failure(.volumeCloningUnsupported) }
-        return .success(VolumeProbe(caseSensitive: values?.volumeSupportsCaseSensitiveNames == true))
+        #if os(Linux)
+            guard let anchor = nearestExistingAncestor(of: destination) else {
+                return .failure(.volumeUnavailable)
+            }
+            var sourceStatus = stat()
+            var destinationStatus = stat()
+            guard stat(sourceRoot.path, &sourceStatus) == 0,
+                  stat(anchor.path, &destinationStatus) == 0
+            else {
+                return .failure(.volumeUnavailable)
+            }
+            guard sourceStatus.st_dev == destinationStatus.st_dev else { return .failure(.differentVolume) }
+            let candidate = repo_filesystem_reflink_candidate(sourceRoot.path)
+            guard candidate >= 0 else { return .failure(.volumeUnavailable) }
+            guard candidate == 1 else { return .failure(.volumeCloningUnsupported) }
+            // Conservatively reject case-folding collisions even when the volume is
+            // case-sensitive. Per-directory casefold options cannot be inferred from
+            // the filesystem type alone. Every clone still checks the actual FICLONE result.
+            return .success(VolumeProbe(caseSensitive: false))
+        #else
+            var sourceStatus = statfs()
+            guard statfs(sourceRoot.path, &sourceStatus) == 0,
+                  let anchor = nearestExistingAncestor(of: destination)
+            else { return .failure(.volumeUnavailable) }
+            var destinationStatus = statfs()
+            guard statfs(anchor.path, &destinationStatus) == 0 else { return .failure(.volumeUnavailable) }
+            guard fileSystemTypeName(sourceStatus) == "apfs",
+                  fileSystemTypeName(destinationStatus) == "apfs"
+            else { return .failure(.volumeNotAPFS) }
+            guard sourceStatus.f_fsid.val.0 == destinationStatus.f_fsid.val.0,
+                  sourceStatus.f_fsid.val.1 == destinationStatus.f_fsid.val.1
+            else { return .failure(.differentVolume) }
+            let values = try? sourceRoot.resourceValues(forKeys: [
+                .volumeSupportsFileCloningKey,
+                .volumeSupportsCaseSensitiveNamesKey
+            ])
+            guard values?.volumeSupportsFileCloning == true else { return .failure(.volumeCloningUnsupported) }
+            return .success(VolumeProbe(caseSensitive: values?.volumeSupportsCaseSensitiveNames == true))
+        #endif
     }
 
-    private static func fileSystemTypeName(_ status: statfs) -> String {
-        var name = status.f_fstypename
-        return withUnsafeBytes(of: &name) { buffer in
-            String(decoding: buffer.prefix { $0 != 0 }, as: UTF8.self)
+    #if canImport(Darwin)
+        private static func fileSystemTypeName(_ status: statfs) -> String {
+            var name = status.f_fstypename
+            return withUnsafeBytes(of: &name) { buffer in
+                String(decoding: buffer.prefix { $0 != 0 }, as: UTF8.self)
+            }
         }
-    }
+    #endif
 
     private static func nearestExistingAncestor(of url: URL) -> URL? {
         var candidate = url.standardizedFileURL

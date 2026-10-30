@@ -15,6 +15,8 @@
 #include "path_search.h"
 #include "repo_gitignore.h"
 #include "repo_process_security.h"
+#include "repo_process_portability.h"
+#include "repo_posix.h"
 #include "search_scoring.h"
 #include "session_catalog_sqlite.h"
 #include "startup_termination_signal.h"

@@ -1,6 +1,8 @@
 import Foundation
 import RepoPromptWorkspaceCore
-import UniformTypeIdentifiers
+#if canImport(UniformTypeIdentifiers)
+    import UniformTypeIdentifiers
+#endif
 
 package enum ACPPromptContentBuilder {
     package enum Error: LocalizedError, Equatable {
@@ -105,11 +107,21 @@ package enum ACPPromptContentBuilder {
         for candidate in candidates {
             let ext = candidate?.trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)) ?? ""
             guard !ext.isEmpty else { continue }
-            if let mimeType = UTType(filenameExtension: ext)?.preferredMIMEType,
-               mimeType.lowercased().hasPrefix("image/")
-            {
-                return mimeType
-            }
+            #if canImport(UniformTypeIdentifiers)
+                if let mimeType = UTType(filenameExtension: ext)?.preferredMIMEType,
+                   mimeType.lowercased().hasPrefix("image/")
+                {
+                    return mimeType
+                }
+            #else
+                let imageTypes = [
+                    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                    "gif": "image/gif", "webp": "image/webp", "avif": "image/avif",
+                    "heic": "image/heic", "heif": "image/heif", "bmp": "image/bmp",
+                    "tif": "image/tiff", "tiff": "image/tiff", "svg": "image/svg+xml"
+                ]
+                if let mimeType = imageTypes[ext.lowercased()] { return mimeType }
+            #endif
         }
         return "image/png"
     }

@@ -1,7 +1,16 @@
-import CryptoKit
-import Darwin
+import RepoPromptC
+import RepoPromptShared
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
-import RepoPromptFileSystem
 
 package enum GitRawOutputSpoolError: Error, Equatable {
     case invalidConfiguration
@@ -87,7 +96,7 @@ package final class GitRawOutputSpool: @unchecked Sendable {
         do {
             try Self.createSecureDirectory(chosenDirectory)
             try Self.admitDisk(at: chosenDirectory, policy: resourcePolicy)
-            let opened = Darwin.open(
+            let opened = POSIXSystem.open(
                 fileURL.path,
                 O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
                 S_IRUSR | S_IWUSR
@@ -99,7 +108,7 @@ package final class GitRawOutputSpool: @unchecked Sendable {
             try Self.validateSecureRegularFile(opened)
         } catch {
             if descriptor >= 0 {
-                _ = Darwin.close(descriptor)
+                _ = POSIXSystem.close(descriptor)
                 descriptor = -1
             }
             try? FileManager.default.removeItem(at: chosenDirectory)
@@ -179,7 +188,7 @@ package final class GitRawOutputSpool: @unchecked Sendable {
             return
         }
         if descriptor >= 0 {
-            _ = Darwin.close(descriptor)
+            _ = POSIXSystem.close(descriptor)
             descriptor = -1
         }
         isClosed = true
@@ -190,7 +199,7 @@ package final class GitRawOutputSpool: @unchecked Sendable {
     private func failLocked(_ error: GitRawOutputSpoolError) throws -> Never {
         terminalError = error
         if descriptor >= 0 {
-            _ = Darwin.close(descriptor)
+            _ = POSIXSystem.close(descriptor)
             descriptor = -1
         }
         isClosed = true
@@ -203,7 +212,7 @@ package final class GitRawOutputSpool: @unchecked Sendable {
         guard fstat(descriptor, &value) == 0 else {
             throw GitRawOutputSpoolError.io(operation: "spool-fstat", code: errno)
         }
-        guard value.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+        guard value.st_mode & POSIXSystem.fileTypeMask == POSIXSystem.regularFileType,
               value.st_uid == getuid(),
               value.st_mode & 0o077 == 0
         else {
@@ -222,14 +231,21 @@ package final class GitRawOutputSpool: @unchecked Sendable {
         guard value.st_size >= 0 else {
             throw GitRawOutputSpoolError.corrupt("negative spool size")
         }
+        #if os(Linux)
+            let modificationTime = value.st_mtim
+            let changeTime = value.st_ctim
+        #else
+            let modificationTime = value.st_mtimespec
+            let changeTime = value.st_ctimespec
+        #endif
         return GitRawOutputSpoolDescriptorIdentity(
-            device: safeDeviceID(value.st_dev),
+            device: UInt64(truncatingIfNeeded: value.st_dev),
             inode: UInt64(value.st_ino),
             byteCount: UInt64(value.st_size),
-            modificationSeconds: Int64(value.st_mtimespec.tv_sec),
-            modificationNanoseconds: Int64(value.st_mtimespec.tv_nsec),
-            statusChangeSeconds: Int64(value.st_ctimespec.tv_sec),
-            statusChangeNanoseconds: Int64(value.st_ctimespec.tv_nsec)
+            modificationSeconds: Int64(modificationTime.tv_sec),
+            modificationNanoseconds: Int64(modificationTime.tv_nsec),
+            statusChangeSeconds: Int64(changeTime.tv_sec),
+            statusChangeNanoseconds: Int64(changeTime.tv_nsec)
         )
     }
 
@@ -238,7 +254,7 @@ package final class GitRawOutputSpool: @unchecked Sendable {
         while offset < data.count {
             let written = data.withUnsafeBytes { bytes -> Int in
                 guard let baseAddress = bytes.baseAddress else { return -1 }
-                return Darwin.write(descriptor, baseAddress.advanced(by: offset), data.count - offset)
+                return POSIXSystem.write(descriptor, baseAddress.advanced(by: offset), data.count - offset)
             }
             if written > 0 {
                 offset += written
@@ -256,7 +272,7 @@ package final class GitRawOutputSpool: @unchecked Sendable {
         }
         var value = stat()
         guard lstat(url.path, &value) == 0,
-              value.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR),
+              value.st_mode & POSIXSystem.fileTypeMask == POSIXSystem.directoryFileType,
               value.st_uid == getuid(),
               value.st_mode & 0o077 == 0
         else {
@@ -268,17 +284,11 @@ package final class GitRawOutputSpool: @unchecked Sendable {
         at directoryURL: URL,
         policy: GitRawOutputSpoolResourcePolicy
     ) throws {
-        var value = statfs()
-        guard statfs(directoryURL.path, &value) == 0 else {
+        var availableBytes: UInt64 = 0
+        guard repo_filesystem_available_bytes(directoryURL.path, &availableBytes) == 0 else {
             throw GitRawOutputSpoolError.io(operation: "spool-statfs", code: errno)
         }
-        guard value.f_bsize > 0, value.f_bavail >= 0 else {
-            throw GitRawOutputSpoolError.resourceAdmission
-        }
-        let blockSize = UInt64(value.f_bsize)
-        let availableBlocks = UInt64(value.f_bavail)
-        let (availableBytes, overflowed) = blockSize.multipliedReportingOverflow(by: availableBlocks)
-        guard !overflowed, availableBytes >= policy.minimumFreeDiskBytes else {
+        guard availableBytes >= policy.minimumFreeDiskBytes else {
             throw GitRawOutputSpoolError.resourceAdmission
         }
     }
@@ -310,13 +320,13 @@ package final class GitRawOutputSpoolLease: @unchecked Sendable {
     }
 
     deinit {
-        _ = Darwin.close(descriptor)
+        _ = POSIXSystem.close(descriptor)
         try? FileManager.default.removeItem(at: directoryURL)
     }
 
     package func makeReader() throws -> GitRawOutputSpoolReader {
         try validateIdentity()
-        let readerDescriptor = Darwin.open(fileURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        let readerDescriptor = POSIXSystem.open(fileURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
         guard readerDescriptor >= 0 else {
             throw GitRawOutputSpoolError.io(operation: "spool-reader-open", code: errno)
         }
@@ -325,7 +335,7 @@ package final class GitRawOutputSpoolLease: @unchecked Sendable {
                 throw GitRawOutputSpoolError.corrupt("spool reader identity mismatch")
             }
         } catch {
-            _ = Darwin.close(readerDescriptor)
+            _ = POSIXSystem.close(readerDescriptor)
             throw error
         }
         return GitRawOutputSpoolReader(
@@ -354,7 +364,7 @@ package final class GitRawOutputSpoolLease: @unchecked Sendable {
         }
         var pathValue = stat()
         guard lstat(fileURL.path, &pathValue) == 0,
-              safeDeviceID(pathValue.st_dev) == identity.device,
+              UInt64(truncatingIfNeeded: pathValue.st_dev) == identity.device,
               UInt64(pathValue.st_ino) == identity.inode,
               pathValue.st_size >= 0,
               UInt64(pathValue.st_size) == identity.byteCount
@@ -385,7 +395,7 @@ package final class GitRawOutputSpoolReader: @unchecked Sendable {
     }
 
     deinit {
-        _ = Darwin.close(descriptor)
+        _ = POSIXSystem.close(descriptor)
     }
 
     package func nextChunk() throws -> Data? {
@@ -394,7 +404,7 @@ package final class GitRawOutputSpoolReader: @unchecked Sendable {
         try lease.validateIdentity()
         var buffer = Data(count: readChunkByteCount)
         let amount = buffer.withUnsafeMutableBytes { bytes in
-            Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            POSIXSystem.read(descriptor, bytes.baseAddress, bytes.count)
         }
         if amount > 0 {
             buffer.removeSubrange(amount ..< buffer.count)
@@ -450,7 +460,7 @@ package final class GitProcessPipeSpoolDrain: @unchecked Sendable {
 
     deinit {
         if let ownedDescriptor {
-            _ = Darwin.close(ownedDescriptor)
+            _ = POSIXSystem.close(ownedDescriptor)
         }
     }
 
@@ -466,7 +476,7 @@ package final class GitProcessPipeSpoolDrain: @unchecked Sendable {
         let flags = fcntl(descriptor, F_GETFL)
         guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else {
             let failure = errno
-            _ = Darwin.close(descriptor)
+            _ = POSIXSystem.close(descriptor)
             throw GitRawOutputSpoolError.io(operation: "spool-pipe-nonblock", code: failure)
         }
         return GitProcessPipeSpoolDrain(
@@ -558,7 +568,7 @@ package final class GitProcessPipeSpoolDrain: @unchecked Sendable {
         var bytes = [UInt8](repeating: 0, count: spool.resourcePolicy.maximumWriteChunkByteCount)
         while true {
             let amount = bytes.withUnsafeMutableBytes { buffer in
-                Darwin.read(descriptor, buffer.baseAddress, buffer.count)
+                POSIXSystem.read(descriptor, buffer.baseAddress, buffer.count)
             }
             if amount > 0 {
                 return .data(Data(bytes.prefix(amount)))
@@ -588,7 +598,7 @@ package final class GitProcessPipeSpoolDrain: @unchecked Sendable {
         isFinished = true
         if let ownedDescriptor {
             self.ownedDescriptor = nil
-            _ = Darwin.close(ownedDescriptor)
+            _ = POSIXSystem.close(ownedDescriptor)
         }
     }
 }

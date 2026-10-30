@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptFileSystem
 
 #if DEBUG
     private var gitDiffDataMaintenanceDebugLoggingEnabled = false

@@ -40,6 +40,10 @@ package actor InteractiveMCPService: Service {
         )
         self.session = session
 
+        #if os(Linux)
+            await session.setLocalHeadlessSingleCommandMode(options.callTool != nil)
+        #endif
+
         // Enable raw JSON mode if requested
         await session.setRawJSONEnabled(options.rawJSON)
         await session.setDefaultToolCallTimeout(Self.timeoutPolicy(from: options.toolCallTimeoutSeconds))
@@ -57,17 +61,17 @@ package actor InteractiveMCPService: Service {
             throw error
         }
 
-        defer {
-            Task {
-                await session.disconnect()
-            }
-        }
-
         // Create and run REPL
         let repl = InteractiveREPL(session: session, options: options)
         self.repl = repl
 
-        try await repl.run()
+        do {
+            try await repl.run()
+        } catch {
+            await session.disconnect()
+            throw error
+        }
+        await session.disconnect()
     }
 
     func shutdown() async throws {

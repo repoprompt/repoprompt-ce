@@ -4,7 +4,11 @@ import RepoPromptShared
     import Synchronization
 #endif
 #if DEBUG || EDIT_FLOW_PERF
-    import os
+    #if canImport(os)
+        import os
+    #else
+        import Logging
+    #endif
 #endif
 
 /// Lightweight, gated instrumentation for hot-path diagnostics.
@@ -34,7 +38,7 @@ package enum EditFlowPerf {
 
     #if DEBUG || EDIT_FLOW_PERF
         package struct IntervalState {
-            let signpostState: OSSignpostIntervalState?
+            let signpostState: EditFlowSignpostIntervalState?
             #if DEBUG
                 let debugCaptureEpoch: UInt64?
                 let debugCaptureStartNanoseconds: UInt64?
@@ -1253,8 +1257,12 @@ package enum EditFlowPerf {
     #endif
 
     #if DEBUG || EDIT_FLOW_PERF
-        private static let signposter = OSSignposter(subsystem: "com.repoprompt.edit-flow", category: "perf")
-        private static let logger = Logger(subsystem: "com.repoprompt.edit-flow", category: "perf")
+        private static let signposter = EditFlowSignposter(subsystem: "com.repoprompt.edit-flow", category: "perf")
+        #if canImport(os)
+            private static let logger = Logger(subsystem: "com.repoprompt.edit-flow", category: "perf")
+        #else
+            private static let logger = Logger(label: "com.repoprompt.edit-flow.perf")
+        #endif
         private static let environmentEnabled: Bool = {
             guard let raw = ProcessInfo.processInfo.environment["REPOPROMPT_EDIT_FLOW_PERF"] else {
                 return false
@@ -1451,7 +1459,11 @@ package enum EditFlowPerf {
 
         private static func logDimensions(_ dimensions: Dimensions) {
             guard !dimensions.isEmpty else { return }
-            logger.debug("dimensions \(dimensions.logDescription, privacy: .public)")
+            #if canImport(os)
+                logger.debug("dimensions \(dimensions.logDescription, privacy: .public)")
+            #else
+                logger.debug("dimensions \(dimensions.logDescription)")
+            #endif
         }
     #else
         package static var isEnabled: Bool {
@@ -1525,7 +1537,7 @@ package enum EditFlowPerf {
             try await operation()
         }
 
-        // Keep the dimensions overload behind the same issue #301 optimizer barrier.
+        /// Keep the dimensions overload behind the same issue #301 optimizer barrier.
         @inline(never)
         package static func measure<T>(
             _ name: StaticString,

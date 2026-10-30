@@ -1,17 +1,26 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 
-package struct SpawnedPTYProcess: Sendable {
+package struct SpawnedPTYProcess {
     package let pid: pid_t
     package let processGroupID: pid_t?
     package let master: Int32
 }
 
-extension ProcessLauncher {
+package extension ProcessLauncher {
     /// Uses the same provider launch policy, signal defaults and private process group as pipes.
     /// Callers own the master and must close it before terminating/reaping the child.
-    package static func spawnPTY(command: String, arguments: [String], environment: [String: String], workingDirectory: String,
-                                 allowsProviderProcessLaunchForTesting: Bool = false) throws -> SpawnedPTYProcess {
+    static func spawnPTY(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        workingDirectory: String,
+        allowsProviderProcessLaunchForTesting: Bool = false
+    ) throws -> SpawnedPTYProcess {
         try ProviderProcessLaunchPolicy.check(allowsLaunchInTests: allowsProviderProcessLaunchForTesting)
         var master: Int32 = -1
         var slave: Int32 = -1
@@ -22,8 +31,14 @@ extension ProcessLauncher {
             guard fcntl(master, F_SETFD, FD_CLOEXEC) == 0, fcntl(slave, F_SETFD, FD_CLOEXEC) == 0,
                   fcntl(master, F_SETFL, O_NONBLOCK) == 0 else { throw ProcessLauncherError.spawnFailed(errno: errno) }
             _ = FDWriteSupport.configureNoSigPipe(fd: master)
-            let child = try spawn(command: command, arguments: arguments, environment: environment, workingDirectory: workingDirectory,
-                allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting, terminalDescriptor: slave)
+            let child = try spawn(
+                command: command,
+                arguments: arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                allowsProviderProcessLaunchForTesting: allowsProviderProcessLaunchForTesting,
+                terminalDescriptor: slave
+            )
             try? child.stdin?.close()
             try? child.stdout.close()
             try? child.stderr.close()

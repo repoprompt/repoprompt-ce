@@ -1,0 +1,243 @@
+name: Linux
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  headless:
+    name: Headless (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: swift:6.2.3-noble
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install native build and smoke dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y binutils git imagemagick procps python3 libsqlite3-dev util-linux
+          # Trust this mounted checkout across conductor's isolated HOME directories.
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
+          swift --version
+
+      - name: Check production dependency boundaries
+        run: |
+          Scripts/source_layout_guardrails.sh
+          python3 Scripts/modularization_modules.py
+
+      - name: Build the real Linux product
+        run: Scripts/build_linux.sh release --jobs 4 --static-swift-stdlib
+
+      - name: Run focused Linux runtime and security tests
+        run: |
+          # The Swift container runs as root. Drop DAC bypass capabilities so
+          # chmod-based denial tests exercise ordinary-user behavior, without skips.
+          # Both paths must be fresh: reusing a socket reconnects to the build daemon.
+          test_state="$(mktemp -d "$RUNNER_TEMP/repoprompt-linux-tests-XXXXXXXX")"
+          test_socket_dir="$(mktemp -d /tmp/rpce-linux-ci-dac-XXXXXXXX)"
+          REPOPROMPT_DEV_DAEMON_STATE_DIR="$test_state" \
+          REPOPROMPT_DEV_DAEMON_SOCKET="$test_socket_dir/conductor.sock" \
+          REPOPROMPT_DEV_BUILD_CACHE_DISABLE=1 \
+          setpriv --bounding-set=-dac_override,-dac_read_search \
+            --inh-caps=-dac_override,-dac_read_search \
+            --ambient-caps=-dac_override,-dac_read_search --no-new-privs \
+            ./conductor test --filter 'Linux|RepoPromptProcessTests|RepoPromptMCPCoreTests|RepoPromptVCSTests|DomainMutationPhysicalCapabilityTests|MCPDomainHeadlessFileReaderTests|OracleGroupPersistenceTests|CodeMapSyntaxArtifactTests|DomainProtectedMutationSecurityTests|OracleGroupRuntimeTests'
+
+      - name: Exercise MCP against real temporary repositories
+        run: |
+          binary="$(swift build -c release --show-bin-path)/repoprompt-mcp"
+          python3 Scripts/linux_headless_smoke.py --binary "$binary"
+
+      - name: Verify Linux build tooling and installation behavior
+        run: python3 -m unittest discover -s Scripts/tests -p 'test_*linux*.py'
+
+      - name: Stage and verify installed executable
+        run: |
+          binary="$(swift build -c release --show-bin-path)/repoprompt-mcp"
+          prefix="$RUNNER_TEMP/repoprompt-ce-linux-${{ matrix.arch }}"
+          Scripts/install_linux.sh --binary "$binary" --prefix "$prefix"
+          strip --strip-debug "$prefix/bin/repoprompt-mcp"
+          "$prefix/bin/repoprompt-mcp" --version
+          (
+            cd "$RUNNER_TEMP"
+            python3 "$GITHUB_WORKSPACE/Scripts/linux_headless_smoke.py" --binary "$prefix/bin/repoprompt-mcp"
+          )
+          install -Dm644 LICENSE "$prefix/share/licenses/repoprompt-ce/LICENSE"
+          install -Dm644 THIRD_PARTY_NOTICES.md "$prefix/share/licenses/repoprompt-ce/THIRD_PARTY_NOTICES.md"
+          cp -R ThirdPartyLicenses "$prefix/share/licenses/repoprompt-ce/"
+          install -Dm644 docs/linux.md "$prefix/share/doc/repoprompt-ce/linux.md"
+          install -Dm644 Scripts/linux_headless_smoke.py "$prefix/share/doc/repoprompt-ce/linux_headless_smoke.py"
+          mkdir -p dist
+          tar -C "$prefix" -czf "dist/repoprompt-ce-linux-${{ matrix.arch }}.tar.gz" .
+
+      - name: Upload native Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repoprompt-ce-linux-${{ matrix.arch }}
+          path: dist/repoprompt-ce-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  gui:
+    name: Native GUI (${{ matrix.arch }})
+    needs: headless
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install Qt system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 xvfb xauth
+      - uses: actions/download-artifact@v4
+        with:
+          name: repoprompt-ce-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/engine-download
+      - name: Install native desktop package
+        run: |
+          mkdir -p "$RUNNER_TEMP/engine"
+          tar --no-same-owner -C "$RUNNER_TEMP/engine" -xzf "$RUNNER_TEMP/engine-download/repoprompt-ce-linux-${{ matrix.arch }}.tar.gz"
+          python -m pip install ./Apps/RepoPromptLinux
+      - name: Test desktop workflows against the release engine without a display
+        env:
+          QT_QPA_PLATFORM: offscreen
+          REPOPROMPT_GUI_TEST_ENGINE: ${{ runner.temp }}/engine/bin/repoprompt-mcp
+          REPOPROMPT_GUI_SCREENSHOT: ${{ runner.temp }}/linux-desktop.png
+        run: python -m unittest discover -s Apps/RepoPromptLinux/tests -v
+      - name: Verify the native X11 window and clipboard
+        env:
+          QT_QPA_PLATFORM: xcb
+          REPOPROMPT_GUI_TEST_ENGINE: ${{ runner.temp }}/engine/bin/repoprompt-mcp
+        run: xvfb-run -a python -m unittest discover -s Apps/RepoPromptLinux/tests -p test_window.py -v
+      - name: Verify desktop installation and launcher
+        run: |
+          python Scripts/install_linux_gui.py --prefix "$RUNNER_TEMP/desktop installation" \
+            --engine "$RUNNER_TEMP/engine/bin/repoprompt-mcp" --no-deps
+          "$RUNNER_TEMP/desktop installation/bin/repoprompt-gui" --version
+          python -m unittest discover -s Scripts/tests -p test_linux_gui_installer.py
+          QT_QPA_PLATFORM=offscreen \
+          PYTHONPATH="$RUNNER_TEMP/desktop installation/share/repoprompt-ce/linux-gui" \
+          REPOPROMPT_GUI_TEST_ENGINE="$RUNNER_TEMP/engine/bin/repoprompt-mcp" \
+            python -m unittest discover -s Apps/RepoPromptLinux/tests -p test_window.py -v
+      - name: Build portable desktop Python wheel
+        run: python -m pip wheel --no-deps ./Apps/RepoPromptLinux --wheel-dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repoprompt-ce-linux-gui-${{ matrix.arch }}
+          path: |
+            dist/repoprompt_ce_gui-*.whl
+            ${{ runner.temp }}/linux-desktop.png
+          if-no-files-found: error
+
+  archive-runtime:
+    name: Archive runtime (${{ matrix.arch }})
+    needs: headless
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install system runtime and smoke dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y \
+            libc6 libstdc++6 libgcc-s1 libcurl4t64 libsqlite3-0 \
+            ca-certificates git python3 binutils
+          if command -v swift >/dev/null 2>&1; then
+            printf '%s\n' 'Runtime verification requires an environment without Swift.' >&2
+            exit 1
+          fi
+
+      - name: Download the native Linux archive
+        uses: actions/download-artifact@v4
+        with:
+          name: repoprompt-ce-linux-${{ matrix.arch }}
+          path: ${{ runner.temp }}/download
+
+      - name: Verify archive without Swift or a source checkout
+        run: |
+          prefix="$RUNNER_TEMP/repoprompt-ce-runtime-${{ matrix.arch }}"
+          mkdir -p "$prefix"
+          tar --no-same-owner -C "$prefix" -xzf "$RUNNER_TEMP/download/repoprompt-ce-linux-${{ matrix.arch }}.tar.gz"
+          (
+            cd "$prefix/share/licenses/repoprompt-ce/ThirdPartyLicenses/swift-runtime"
+            sha256sum -c SHA256SUMS
+          )
+          binary="$prefix/bin/repoprompt-mcp"
+          unset LD_LIBRARY_PATH
+          python3 - "$binary" <<'PY'
+          import re
+          import subprocess
+          import sys
+
+          binary = sys.argv[1]
+          dynamic = subprocess.check_output(["readelf", "-d", binary], text=True)
+          libraries = re.findall(r"\(NEEDED\).*Shared library: \[([^]]+)\]", dynamic)
+          forbidden = [name for name in libraries if name.startswith((
+              "libswift", "libFoundation", "libCoreFoundation", "lib_Foundation", "libdispatch", "libBlocksRuntime"
+          ))]
+          if forbidden:
+              raise SystemExit(f"Archive still depends on Swift runtime libraries: {forbidden}")
+          linkage = subprocess.check_output(["ldd", binary], text=True)
+          print(linkage)
+          if "not found" in linkage:
+              raise SystemExit("Archive has missing system libraries")
+          versions = subprocess.check_output(["readelf", "--version-info", binary], text=True)
+          glibc = {tuple(map(int, version.split("."))) for version in re.findall(r"\bGLIBC_([0-9.]+)\b", versions)}
+          if not glibc:
+              raise SystemExit("Archive has no inspectable glibc version requirements")
+          print("Required glibc version:", ".".join(map(str, max(glibc))))
+          print("Direct system libraries:", ", ".join(libraries))
+          PY
+          cd "$RUNNER_TEMP"
+          python3 "$prefix/share/doc/repoprompt-ce/linux_headless_smoke.py" --binary "$binary"

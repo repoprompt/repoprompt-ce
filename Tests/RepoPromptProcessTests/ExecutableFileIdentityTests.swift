@@ -1,4 +1,8 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 @testable import RepoPromptProcess
 import XCTest
@@ -16,7 +20,12 @@ final class ExecutableFileIdentityTests: XCTestCase {
         ]
 
         for testCase in cases {
-            XCTAssertTrue(
+            #if os(Linux)
+                let expected = false
+            #else
+                let expected = true
+            #endif
+            XCTAssertEqual(
                 ExecutableFileIdentity.permitsHomebrewAdminGroupWritableDirectory(
                     canonicalPath: testCase.canonicalPath,
                     directoryPath: testCase.directoryPath,
@@ -25,7 +34,8 @@ final class ExecutableFileIdentityTests: XCTestCase {
                     groupGID: 80,
                     effectiveUID: effectiveUID
                 ),
-                "Expected Homebrew directory to be permitted: \(testCase.directoryPath)"
+                expected,
+                "Expected platform Homebrew directory policy: \(testCase.directoryPath)"
             )
         }
     }
@@ -69,7 +79,7 @@ final class ExecutableFileIdentityTests: XCTestCase {
         try "#!/bin/sh\nexit 0\n".write(to: escapedExecutable, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: escapedExecutable.path)
         try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: escapedDirectory.path)
-        let canonicalEscapedDirectory = try XCTUnwrap(self.realpathString(escapedDirectory.path))
+        let canonicalEscapedDirectory = try XCTUnwrap(realpathString(escapedDirectory.path))
 
         let alias = trustedDirectory.appendingPathComponent("opencode")
         try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: escapedExecutable)
@@ -90,24 +100,27 @@ final class ExecutableFileIdentityTests: XCTestCase {
         XCTAssertEqual(try posixPermissions(of: directory), 0o775)
     }
 
-    func testDirectoryHasNoExtendedACLRejectsExtendedEntriesWhilePreservingPOSIXMode() throws {
-        let entries = [
-            "user:nobody allow add_file,delete_child",
-            "user:nobody allow read"
-        ]
+    #if canImport(Darwin)
+        func testDirectoryHasNoExtendedACLRejectsExtendedEntriesWhilePreservingPOSIXMode() throws {
+            let entries = [
+                "user:nobody allow add_file,delete_child",
+                "user:nobody allow read"
+            ]
 
-        for entry in entries {
-            let directory = try makeTestDirectory(name: "ExecutableFileIdentityExtendedACL")
-            try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: directory.path)
-            try addExtendedACL(entry, to: directory)
+            for entry in entries {
+                let directory = try makeTestDirectory(name: "ExecutableFileIdentityExtendedACL")
+                try FileManager.default.setAttributes([.posixPermissions: 0o775], ofItemAtPath: directory.path)
+                try addExtendedACL(entry, to: directory)
 
-            XCTAssertEqual(try posixPermissions(of: directory), 0o775)
-            XCTAssertFalse(
-                ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: directory.path),
-                "Expected extended ACL to be rejected: \(entry)"
-            )
+                XCTAssertEqual(try posixPermissions(of: directory), 0o775)
+                XCTAssertFalse(
+                    ExecutableFileIdentity.directoryHasNoExtendedACL(atPath: directory.path),
+                    "Expected extended ACL to be rejected: \(entry)"
+                )
+            }
         }
-    }
+
+    #endif
 
     func testDirectoryHasNoExtendedACLFailsClosedForMissingNonDirectoryAndSymlinkPaths() throws {
         let root = try makeTestDirectory(name: "ExecutableFileIdentityInvalidACLPaths")

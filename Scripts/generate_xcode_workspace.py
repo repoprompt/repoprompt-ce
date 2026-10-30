@@ -194,8 +194,8 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         raise GeneratorError("RepoPromptDomainRuntimeTests must remain a test target")
     if domain_runtime_tests.get("path") != "Tests/RepoPromptDomainRuntimeTests":
         raise GeneratorError("RepoPromptDomainRuntimeTests target path drifted")
-    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptDomainRuntime"]:
-        raise GeneratorError("RepoPromptDomainRuntimeTests must directly own RepoPromptDomainRuntime")
+    if _by_name_dependencies(domain_runtime_tests) != ["RepoPromptDomainRuntime", "RepoPromptC", "RepoPromptShared"]:
+        raise GeneratorError("RepoPromptDomainRuntimeTests must directly depend on RepoPromptDomainRuntime, RepoPromptC, and RepoPromptShared")
     if _by_name_dependencies(repo_prompt_app).count("RepoPromptDomainRuntime") != 1:
         raise GeneratorError("RepoPromptApp must depend exactly once on RepoPromptDomainRuntime")
 

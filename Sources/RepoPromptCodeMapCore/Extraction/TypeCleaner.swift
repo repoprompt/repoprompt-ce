@@ -8,6 +8,7 @@
 //  container types (Promise, Record, etc.) within extractBaseTypes() itself.
 //
 
+import CoreFoundation
 import Foundation
 
 enum TypeCleaner {

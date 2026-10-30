@@ -518,6 +518,14 @@ actor InteractiveMCPClientSession {
 
     private var client: MCP.Client?
     private var transport: (any Transport)?
+    #if os(Linux)
+        private var localHeadlessTask: Task<Void, Never>?
+        private var localHeadlessSingleCommandMode = false
+
+        func setLocalHeadlessSingleCommandMode(_ enabled: Bool) {
+            localHeadlessSingleCommandMode = enabled
+        }
+    #endif
     private var requestSendBarrier: MCPRequestSendBarrier?
     private var pendingToolCallResponseTasks: [UUID: Task<Void, Never>] = [:]
     private var cachedTools: [MCP.Tool] = []
@@ -636,7 +644,11 @@ actor InteractiveMCPClientSession {
         resetToolCatalogForConnectionBoundary()
 
         // Perform bootstrap handshake and get connected FD
-        let connectedFD = try await performBootstrapHandshake()
+        #if os(Linux)
+            let connectedFD = try connectLocalHeadlessService()
+        #else
+            let connectedFD = try await performBootstrapHandshake()
+        #endif
         logger.debug("Bootstrap handshake complete, FD=\(connectedFD)")
 
         // Create transport with the connected FD and observe completed request writes.
@@ -644,6 +656,11 @@ actor InteractiveMCPClientSession {
         do {
             socketTransport = try BootstrapSocketMCPTransport(connectedFD: connectedFD, logger: logger)
         } catch let error as POSIXDescriptorConfigurationError {
+            #if os(Linux)
+                POSIXSystem.close(connectedFD)
+                await localHeadlessTask?.value
+                localHeadlessTask = nil
+            #endif
             throw InteractiveSessionError.descriptorConfigurationFailed(errno: error.errnoValue)
         }
         let requestSendBarrier = MCPRequestSendBarrier()
@@ -711,6 +728,10 @@ actor InteractiveMCPClientSession {
         } catch {
             await client.disconnect()
             await transport.disconnect()
+            #if os(Linux)
+                await localHeadlessTask?.value
+                localHeadlessTask = nil
+            #endif
             self.client = nil
             self.transport = nil
             self.requestSendBarrier = nil
@@ -720,6 +741,34 @@ actor InteractiveMCPClientSession {
             throw error
         }
     }
+
+    #if os(Linux)
+        private func connectLocalHeadlessService() throws -> Int32 {
+            var descriptors: [Int32] = [-1, -1]
+            guard socketpair(AF_UNIX, POSIXSystem.streamSocketType, 0, &descriptors) == 0 else {
+                throw InteractiveSessionError.socketCreationFailed(errno: errno)
+            }
+            do {
+                try POSIXDescriptorSupport.setCloseOnExec(descriptors[0])
+                try POSIXDescriptorSupport.setCloseOnExec(descriptors[1])
+            } catch {
+                POSIXSystem.close(descriptors[0])
+                POSIXSystem.close(descriptors[1])
+                throw error
+            }
+            let serverFD = descriptors[1]
+            let logger = logger
+            localHeadlessTask = Task {
+                defer { POSIXSystem.close(serverFD) }
+                do {
+                    try await DirectHeadlessMCPService(logger: logger).run(stdinFD: serverFD, stdoutFD: serverFD)
+                } catch {
+                    logger.error("Local headless service stopped", metadata: ["error": "\(error)"])
+                }
+            }
+            return descriptors[0]
+        }
+    #endif
 
     private static func awaitInitialization(
         timeoutNanoseconds: UInt64,
@@ -789,6 +838,10 @@ actor InteractiveMCPClientSession {
     func disconnect() async {
         await client?.disconnect()
         await transport?.disconnect()
+        #if os(Linux)
+            await localHeadlessTask?.value
+            localHeadlessTask = nil
+        #endif
         let responseTasks = Array(pendingToolCallResponseTasks.values)
         pendingToolCallResponseTasks.removeAll()
         for task in responseTasks {
@@ -955,6 +1008,11 @@ actor InteractiveMCPClientSession {
         }
 
         var args = arguments ?? [:]
+        #if os(Linux)
+            if localHeadlessSingleCommandMode {
+                try LinuxHeadlessCommandLifetime.validate(toolName: name, arguments: args)
+            }
+        #endif
         args.removeValue(forKey: MCPTimeoutPolicy.promptExportReservedEnvelopeArgumentKey)
         // Resolve routing and timeout policy before the settings preflight can suspend, so a
         // concurrent selection change cannot retarget a call that was already under way.
@@ -1051,6 +1109,11 @@ actor InteractiveMCPClientSession {
             logger.debug("Cleared window selection after open-in-new-window switch")
         }
 
+        #if os(Linux)
+            if localHeadlessSingleCommandMode {
+                return LinuxHeadlessCommandLifetime.reportPendingAgent(toolName: name, result: result)
+            }
+        #endif
         return result
     }
 
@@ -2247,7 +2310,7 @@ actor InteractiveMCPClientSession {
         }
 
         // Create socket
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        let fd = socket(AF_UNIX, POSIXSystem.streamSocketType, 0)
         guard fd >= 0 else {
             throw InteractiveSessionError.socketCreationFailed(errno: errno)
         }
@@ -2255,7 +2318,7 @@ actor InteractiveMCPClientSession {
         defer {
             if shouldCloseFD {
                 POSIXDescriptorSupport.shutdownSocketReadWrite(fd)
-                Darwin.close(fd)
+                POSIXSystem.close(fd)
             }
         }
 
@@ -2266,8 +2329,10 @@ actor InteractiveMCPClientSession {
         }
 
         // Disable SIGPIPE
-        var noSigPipe: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        #if canImport(Darwin)
+            var noSigPipe: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        #endif
 
         // Set up socket address
         var addr = sockaddr_un()
@@ -2288,7 +2353,7 @@ actor InteractiveMCPClientSession {
         let addrLen = socklen_t(MemoryLayout<sockaddr_un>.size)
         let connectResult = withUnsafePointer(to: &addr) { addrPtr in
             addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-                Darwin.connect(fd, sockaddrPtr, addrLen)
+                POSIXSystem.connect(fd, sockaddrPtr, addrLen)
             }
         }
 
@@ -2398,7 +2463,7 @@ actor InteractiveMCPClientSession {
                 throw InteractiveSessionError.connectionReset
             }
 
-            let bytesRead = Darwin.read(fd, readBuffer, 4096)
+            let bytesRead = POSIXSystem.read(fd, readBuffer, 4096)
             if bytesRead <= 0 {
                 if bytesRead < 0, errno == EAGAIN || errno == EINTR { continue }
                 throw InteractiveSessionError.serverClosed

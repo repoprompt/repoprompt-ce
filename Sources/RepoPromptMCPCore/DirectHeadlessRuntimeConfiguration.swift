@@ -39,7 +39,7 @@ enum DirectHeadlessRuntimeLocationResolver {
             throw DirectHeadlessRuntimeLocationError.profileDirectoryRequired(profile)
         }
 
-        let locations = AppProfileLocations(identity: identity, homeDirectory: homeDirectory, profileName: profile)
+        let locations = AppProfileLocations(identity: identity, homeDirectory: homeDirectory, profileName: profile, environment: environment)
         let storageDirectory: URL
         let workspaceStorageDirectory: URL
         let eventDirectory: URL
