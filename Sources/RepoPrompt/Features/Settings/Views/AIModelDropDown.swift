@@ -1,5 +1,6 @@
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import SwiftUI
 
 struct AIModelDropdown: View {

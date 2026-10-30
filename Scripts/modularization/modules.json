@@ -15,6 +15,7 @@
     "RepoPromptApp": {
       "source_root": "Sources/RepoPrompt",
       "allowed_dependencies": [
+        "RepoPromptClaudeProvider",
         "RepoPromptAgentProviderContracts",
         "RepoPromptACPProviders",
         "RepoPromptCodexProvider",
@@ -57,6 +58,10 @@
       "allowed_dependencies": [
         "RepoPromptCodeMapCore"
       ]
+    },
+    "RepoPromptClaudeProvider": {
+      "source_root": "Sources/RepoPromptClaudeProvider",
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptProviderQuota"]
     },
     "RepoPromptAgentProviderContracts": {
       "source_root": "Sources/RepoPromptAgentProviderContracts",
@@ -294,6 +299,7 @@
     "RepoPromptTests": {
       "source_root": "Tests/RepoPromptTests",
       "allowed_dependencies": [
+        "RepoPromptClaudeProvider",
         "RepoPromptAgentProviderContracts",
         "RepoPromptACPProviders",
         "RepoPromptCodexProvider",
@@ -357,6 +363,10 @@
     }
   },
   "moved_families": {
+    "ClaudeCompatibleInfrastructureBridge": {
+      "owner": "RepoPromptClaudeProvider",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridgeCore.swift"]
+    },
     "NativeAgentRuntimeContracts": {
       "owner": "RepoPromptAgentProviderContracts",
       "former_app_files": [

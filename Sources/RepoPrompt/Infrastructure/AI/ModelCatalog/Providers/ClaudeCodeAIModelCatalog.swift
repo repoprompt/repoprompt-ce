@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentProviderContracts
+import RepoPromptClaudeProvider
 
 enum ClaudeCodeAIModelCatalog {
     static let rawPrefix = "claude_code__"

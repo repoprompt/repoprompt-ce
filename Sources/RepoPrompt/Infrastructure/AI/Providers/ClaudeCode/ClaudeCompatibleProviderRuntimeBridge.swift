@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptClaudeCompatibleProvider
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 

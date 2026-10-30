@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest

@@ -3,6 +3,7 @@ import MCP
 import OSLog
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptFoundation
 import RepoPromptProcess
 

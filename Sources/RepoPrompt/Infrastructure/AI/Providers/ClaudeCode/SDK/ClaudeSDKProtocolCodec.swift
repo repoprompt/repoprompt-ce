@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptClaudeProvider
 
 /// Core compatibility facade for the Claude SDK protocol codec.
 ///

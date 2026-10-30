@@ -2,6 +2,7 @@ import Foundation
 import Logging
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
