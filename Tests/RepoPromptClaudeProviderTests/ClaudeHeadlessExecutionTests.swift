@@ -1,7 +1,6 @@
 import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
-@testable import RepoPromptApp
 import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProcess
