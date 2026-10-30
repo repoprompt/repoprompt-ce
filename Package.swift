@@ -46,6 +46,7 @@ var packageDependencies: [Package.Dependency] = [
 var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptClaudeProvider",
     "RepoPromptAgentProviderContracts",
+    "RepoPromptHTTPProviders",
     "RepoPromptACPProviders",
     "RepoPromptCodexProvider",
     "RepoPromptAIContracts",
@@ -91,6 +92,7 @@ var repoPromptSettingsCoreSwiftSettings: [SwiftSetting] = [
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptClaudeProvider",
     "RepoPromptAgentProviderContracts",
+    "RepoPromptHTTPProviders",
     "RepoPromptACPProviders",
     "RepoPromptCodexProvider",
     "RepoPromptAIContracts",
@@ -174,6 +176,22 @@ let package = Package(
             name: "RepoPromptAgentProviderContractsTests",
             dependencies: ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime"],
             path: "Tests/RepoPromptAgentProviderContractsTests"
+        ),
+        .target(
+            name: "RepoPromptHTTPProviders",
+            dependencies: [
+                "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI")
+            ],
+            path: "Sources/RepoPromptHTTPProviders"
+        ),
+        .testTarget(
+            name: "RepoPromptHTTPProvidersTests",
+            dependencies: [
+                "RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI")
+            ],
+            path: "Tests/RepoPromptHTTPProvidersTests"
         ),
         .target(
             name: "RepoPromptCodexProvider",

@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptFoundation
+import RepoPromptHTTPProviders
 import SwiftOpenAI
 
 public struct AzureOpenAIConfiguration: Codable, Equatable {

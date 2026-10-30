@@ -1,10 +1,12 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
-final class GeminiProvider: OpenAIProvider {
-    init(apiKey: String) {
+package final class GeminiProvider: OpenAIProvider {
+    package init(host: any OpenAIProviderHost, apiKey: String) {
         let baseURL = URL(string: "https://generativelanguage.googleapis.com")!
         super.init(
+            host: host,
             apiKey: apiKey,
             baseURL: baseURL,
             configuredMaxTokens: nil,
@@ -13,7 +15,7 @@ final class GeminiProvider: OpenAIProvider {
     }
 
     /// NEW – per-model overrides
-    override func providerSpecificMaxTokens(for model: AIModel) -> Int? {
+    override package func providerSpecificMaxTokens(for model: AIModel) -> Int? {
         switch model {
         case .geminiPro25, .geminiFlash25, .gemini3p1ProPreview, .gemini3FlashPreview:
             65536
@@ -23,7 +25,7 @@ final class GeminiProvider: OpenAIProvider {
         }
     }
 
-    override func testAPIKey(model: AIModel = .gemini2flashlite) async throws -> Bool {
+    override package func testAPIKey(model: AIModel = .gemini2flashlite) async throws -> Bool {
         let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
         do {
             let stream = try await streamMessage(testMessage, model: model)

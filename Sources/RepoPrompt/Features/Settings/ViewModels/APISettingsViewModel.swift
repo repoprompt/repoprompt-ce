@@ -2,6 +2,7 @@ import Combine
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptCodexProvider
+import RepoPromptHTTPProviders
 import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
@@ -2780,6 +2781,7 @@ public class APISettingsViewModel: ObservableObject {
         if !userModel.isEmpty {
             // User specified a model → validate it with a test completion (skip model list fetch)
             let testProvider = OpenAIProvider(
+                host: OpenAIProviderAppHost(),
                 apiKey: apiKey,
                 baseURL: URL(string: baseURL),
                 configuredMaxTokens: 16,

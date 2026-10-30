@@ -7,9 +7,9 @@
 
 import Foundation
 
-final class OllamaProvider: OpenAIProvider {
-    init(baseURL: URL) {
+package final class OllamaProvider: OpenAIProvider {
+    package init(host: any OpenAIProviderHost, baseURL: URL) {
         // Ollama runs locally. No API key is required, just the base URL.
-        super.init(baseURL: baseURL)
+        super.init(host: host, baseURL: baseURL)
     }
 }

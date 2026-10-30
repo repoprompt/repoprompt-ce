@@ -2,18 +2,6 @@ import Foundation
 import RepoPromptAIContracts
 import SwiftOpenAI
 
-protocol ResponsesJobProvider {
-    func createBackgroundResponse(
-        _ message: AIMessage,
-        model: AIModel,
-        maxTokens: Int?
-    ) async throws -> ResponseModel
-
-    func fetchResponse(id: String) async throws -> ResponseModel
-    func streamResponse(id: String) async throws -> AsyncThrowingStream<AIStreamResult, Error>
-    func cancelResponse(id: String) async throws -> ResponseModel
-}
-
 struct BackgroundResponseJob: Identifiable, Codable, Equatable {
     enum Status: String, Codable {
         case queued

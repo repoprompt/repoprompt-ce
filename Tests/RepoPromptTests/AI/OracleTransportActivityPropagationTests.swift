@@ -4,6 +4,7 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 import RepoPromptSecureStorage
 import RepoPromptShared
 import SwiftAnthropic
@@ -11,92 +12,6 @@ import SwiftOpenAI
 import XCTest
 
 final class OracleTransportActivityPropagationTests: XCTestCase {
-    func testOpenAIDecodedChunkAdapterPreservesChoiceAndDeltaSemantics() throws {
-        func chunk(_ object: [String: Any]) throws -> ChatCompletionChunkObject {
-            let data = try JSONSerialization.data(withJSONObject: object)
-            return try JSONDecoder().decode(ChatCompletionChunkObject.self, from: data)
-        }
-
-        let heartbeatChoice: [String: Any] = ["delta": [String: Any](), "index": 0]
-        let semanticChoice: [String: Any] = ["delta": ["content": "content"], "index": 1]
-
-        XCTAssertTrue(try OpenAIProvider.isTransportActivityChunk(chunk(["choices": [heartbeatChoice]])))
-        XCTAssertTrue(try OpenAIProvider.isTransportActivityChunk(chunk([
-            "choices": [heartbeatChoice, semanticChoice]
-        ])))
-        XCTAssertFalse(try OpenAIProvider.isTransportActivityChunk(chunk(["choices": []])))
-        XCTAssertFalse(try OpenAIProvider.isTransportActivityChunk(chunk([
-            "choices": [["index": 0]]
-        ])))
-
-        let semanticDeltas: [[String: Any]] = [
-            ["content": "content"],
-            ["reasoning_content": "reasoning"],
-            ["role": "assistant"],
-            ["tool_calls": [[
-                "index": 0,
-                "id": "call-1",
-                "type": "function",
-                "function": ["arguments": "{}", "name": "tool"]
-            ]]],
-            ["function_call": ["arguments": "{}", "name": "tool"]],
-            ["refusal": "refusal"]
-        ]
-        for delta in semanticDeltas {
-            XCTAssertFalse(try OpenAIProvider.isTransportActivityChunk(chunk([
-                "choices": [["delta": delta, "index": 0]]
-            ])))
-        }
-
-        XCTAssertFalse(try OpenAIProvider.isTransportActivityChunk(chunk([
-            "choices": [["delta": [String: Any](), "finish_reason": "stop", "index": 0]]
-        ])))
-        XCTAssertFalse(try OpenAIProvider.isTransportActivityChunk(chunk([
-            "choices": [heartbeatChoice],
-            "usage": ["prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3]
-        ])))
-    }
-
-    func testOpenAITransportPredicateRejectsEachSemanticFact() {
-        func classifies(
-            hasChoice: Bool = true,
-            hasDelta: Bool = true,
-            content: String? = nil,
-            reasoning: String? = nil,
-            role: String? = nil,
-            hasToolCalls: Bool = false,
-            hasFunctionCall: Bool = false,
-            refusal: String? = nil,
-            hasFinishReason: Bool = false,
-            hasUsage: Bool = false
-        ) -> Bool {
-            OpenAIProvider.isTransportActivityChunk(
-                hasChoice: hasChoice,
-                hasDelta: hasDelta,
-                content: content,
-                reasoning: reasoning,
-                role: role,
-                hasToolCalls: hasToolCalls,
-                hasFunctionCall: hasFunctionCall,
-                refusal: refusal,
-                hasFinishReason: hasFinishReason,
-                hasUsage: hasUsage
-            )
-        }
-
-        XCTAssertTrue(classifies())
-        XCTAssertFalse(classifies(hasChoice: false))
-        XCTAssertFalse(classifies(hasDelta: false))
-        XCTAssertFalse(classifies(content: "content"))
-        XCTAssertFalse(classifies(reasoning: "reasoning"))
-        XCTAssertFalse(classifies(role: "assistant"))
-        XCTAssertFalse(classifies(hasToolCalls: true))
-        XCTAssertFalse(classifies(hasFunctionCall: true))
-        XCTAssertFalse(classifies(refusal: "refusal"))
-        XCTAssertFalse(classifies(hasFinishReason: true))
-        XCTAssertFalse(classifies(hasUsage: true))
-    }
-
     func testAIQueriesServiceSanitizesTransportActivityOutput() {
         let activity = AIStreamResult(
             type: AIStreamResult.transportActivityType,
@@ -260,6 +175,37 @@ final class OracleTransportActivityPropagationTests: XCTestCase {
             chatData: ChatDataService()
         )
     }
+
+    func testAnthropicSuccessfulCompletionReasonsAreExplicit() {
+        XCTAssertTrue(AnthropicProvider.isSuccessfulCompletionStopReason("end_turn"))
+        XCTAssertTrue(AnthropicProvider.isSuccessfulCompletionStopReason("stop_sequence"))
+        XCTAssertFalse(AnthropicProvider.isSuccessfulCompletionStopReason("max_tokens"))
+        XCTAssertFalse(AnthropicProvider.isSuccessfulCompletionStopReason("tool_use"))
+    }
+
+    func testAIQueriesNormalizesIncompleteTerminationWithoutMarkingSuccess() throws {
+        let result = AIStreamResult(
+            type: AIStreamResult.incompleteType,
+            text: nil,
+            stopReason: "max_tokens"
+        )
+
+        let outcome = try AIQueriesService.terminalOutcome(for: result)
+
+        XCTAssertEqual(outcome, .incomplete(reason: "max_tokens"))
+        XCTAssertNotEqual(outcome, .completed)
+    }
+
+    func testAIQueriesRejectsIncompleteTerminationWithoutReason() {
+        let result = AIStreamResult(type: AIStreamResult.incompleteType, text: nil)
+
+        XCTAssertThrowsError(try AIQueriesService.terminalOutcome(for: result)) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The provider reported incomplete termination without a reason."
+            )
+        }
+    }
 }
 
 @MainActor
@@ -272,6 +218,19 @@ private final class OracleLifecycleActivityRecorder {
 }
 
 final class OracleImageSerializationTests: XCTestCase {
+    func testCustomOpenAITextOnlyMessagesRemainScalar() throws {
+        let message = AIMessage(systemPrompt: "system", userMessage: "plain")
+        let provider = CustomOpenAIProvider(
+            baseURL: "https://example.test/v1",
+            apiKey: "key",
+            defaultModel: "text-model"
+        )
+        let custom = try XCTUnwrap(try jsonObject(
+            provider.serializedMessagesForTesting(message)
+        ) as? [[String: Any]])
+        XCTAssertTrue(custom.allSatisfy { $0["content"] is String })
+    }
+
     func testAnthropicAttachesOnlyToFinalUserTurn() throws {
         let json = try jsonObject(AnthropicProvider.makeMessages(for: makeMessage()))
         let text = try jsonText(json)
@@ -336,65 +295,6 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertEqual(AIModel.grokBuildCustom(name: "grok").attachmentRoute, .grokBuild)
         XCTAssertEqual(AIModel.azureCustom(name: "azure").attachmentRoute, .openAIChat)
         XCTAssertEqual(AIModel.customProviderUser(name: "custom").attachmentRoute, .customOpenAI)
-    }
-
-    func testOpenAITextOnlyMessagesRemainScalar() throws {
-        let message = AIMessage(systemPrompt: "system", userMessage: "plain")
-        let chat = try XCTUnwrap(try jsonObject(
-            message.openAIChatMessages(embedSystemPrompt: false)
-        ) as? [[String: Any]])
-        XCTAssertTrue(chat.allSatisfy { $0["content"] is String })
-
-        let provider = CustomOpenAIProvider(
-            baseURL: "https://example.test/v1",
-            apiKey: "key",
-            defaultModel: "text-model"
-        )
-        let custom = try XCTUnwrap(try jsonObject(
-            provider.serializedMessagesForTesting(message)
-        ) as? [[String: Any]])
-        XCTAssertTrue(custom.allSatisfy { $0["content"] is String })
-
-        let assistantOnly = AIMessage(
-            systemPrompt: "",
-            fileTree: "root",
-            conversationMessages: [.init(role: .assistant, content: "answer")],
-            temperature: nil,
-            promptSectionsOrder: [.fileMap],
-            disabledPromptSections: []
-        )
-        let responses = try XCTUnwrap(try jsonObject(
-            assistantOnly.openAIResponsesInput()
-        ) as? [[String: Any]])
-        XCTAssertEqual(responses.count, 1)
-        XCTAssertEqual(responses.first?["role"] as? String, "assistant")
-    }
-
-    func testOpenAIChatAttachesOnlyToFinalUserTurn() throws {
-        let json = try jsonObject(makeMessage().openAIChatMessages(embedSystemPrompt: false))
-        let text = try jsonText(json)
-        let messages = try XCTUnwrap(json as? [[String: Any]])
-
-        XCTAssertEqual(countObjects(type: "image_url", in: json), 1)
-        XCTAssertTrue(
-            text.contains("data:image/png;base64,AQID") ||
-                text.contains("data:image\\/png;base64,AQID")
-        )
-        XCTAssertTrue(text.contains("Image title: Diagram"))
-        XCTAssertFalse(try jsonText(messages[1]).contains("AQID"))
-        XCTAssertTrue(try jsonText(XCTUnwrap(messages.last)).contains("AQID"))
-    }
-
-    func testOpenAIResponsesAttachesOnlyToFinalUserTurn() throws {
-        let json = try jsonObject(makeMessage().openAIResponsesInput())
-        let text = try jsonText(json)
-
-        XCTAssertEqual(countObjects(type: "input_image", in: json), 1)
-        XCTAssertTrue(
-            text.contains("data:image/png;base64,AQID") ||
-                text.contains("data:image\\/png;base64,AQID")
-        )
-        XCTAssertTrue(text.contains("Image title: Diagram"))
     }
 
     func testCustomOpenAIEncodesFinalUserAsContentArray() throws {
