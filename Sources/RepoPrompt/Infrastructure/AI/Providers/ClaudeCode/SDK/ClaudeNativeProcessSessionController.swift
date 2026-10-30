@@ -29,12 +29,12 @@ final actor ClaudeNativeProcessSessionController {
     private struct LaunchEnvironmentSignature: Equatable {
         let environmentOverrides: [String: String]
         let removedEnvironmentKeys: Set<String>
-        let backend: ClaudeCodeLaunchEnvironment.Backend
+        let backend: ClaudeCompatiblePluginBackendID?
 
-        init(_ launchEnvironment: ClaudeCodeLaunchEnvironment) {
+        init(_ launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment) {
             environmentOverrides = launchEnvironment.environmentOverrides
             removedEnvironmentKeys = launchEnvironment.removedEnvironmentKeys
-            backend = launchEnvironment.backend
+            backend = launchEnvironment.backendID
         }
     }
 
@@ -263,7 +263,7 @@ final actor ClaudeNativeProcessSessionController {
         windowID: Int,
         workspacePath: String?,
         config: ClaudeCodeAgentConfig,
-        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
+        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving,
         authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
     ) {
         self.host = host
@@ -687,7 +687,7 @@ final actor ClaudeNativeProcessSessionController {
         #if DEBUG
             arguments += host.debugStatusLineArguments(
                 launchArguments: ProcessInfo.processInfo.arguments,
-                isFirstParty: launchEnvironment.backend == .defaultClaude,
+                isFirstParty: launchEnvironment.backendID == nil,
                 providerArguments: arguments
             )
         #endif
@@ -772,7 +772,7 @@ final actor ClaudeNativeProcessSessionController {
     private func resolveLaunchFlagSettings(
         model: String?,
         effortLevel suppliedEffortLevel: ClaudeCodeEffortLevel?
-    ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?) {
+    ) async throws -> (launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment, request: [String: Any]?) {
         let hasModelSpecifier = host.hasModelSpecifier(model)
         let requestedModel = hasModelSpecifier
             ? model
@@ -808,7 +808,7 @@ final actor ClaudeNativeProcessSessionController {
             ?? fallbackEffortLevel
     }
 
-    private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
+    private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment) -> Bool {
         guard let activeLaunchEnvironmentSignature else {
             return false
         }
@@ -869,7 +869,7 @@ final actor ClaudeNativeProcessSessionController {
         return request
     }
 
-    private static func shouldSuppressEffortSettings(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
+    private static func shouldSuppressEffortSettings(for launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment) -> Bool {
         launchEnvironment.suppressesEffortSettings
     }
 
@@ -1973,8 +1973,8 @@ final actor ClaudeNativeProcessSessionController {
         }
 
         func test_liveFlagSettingsRequiresProcessRestart(
-            activeLaunchEnvironment: ClaudeCodeLaunchEnvironment,
-            nextLaunchEnvironment: ClaudeCodeLaunchEnvironment
+            activeLaunchEnvironment: ClaudeCompatiblePluginLaunchEnvironment,
+            nextLaunchEnvironment: ClaudeCompatiblePluginLaunchEnvironment
         ) -> Bool {
             activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(activeLaunchEnvironment)
             return liveFlagSettingsRequiresProcessRestart(for: nextLaunchEnvironment)

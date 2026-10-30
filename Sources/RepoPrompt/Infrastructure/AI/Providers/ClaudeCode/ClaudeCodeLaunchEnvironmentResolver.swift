@@ -90,40 +90,6 @@ enum ClaudeCodeGLMIntegration {
     }
 }
 
-struct ClaudeCodeLaunchEnvironment {
-    enum Backend: Equatable {
-        case defaultClaude
-        case compatible(ClaudeCodeCompatibleBackendID)
-    }
-
-    let effectiveModel: String?
-    let environmentOverrides: [String: String]
-    let removedEnvironmentKeys: Set<String>
-    let backend: Backend
-    let suppressesEffortSettings: Bool
-
-    init(
-        effectiveModel: String?,
-        environmentOverrides: [String: String],
-        removedEnvironmentKeys: Set<String> = [],
-        backend: Backend,
-        suppressesEffortSettings: Bool = false
-    ) {
-        self.effectiveModel = effectiveModel
-        self.environmentOverrides = environmentOverrides
-        self.removedEnvironmentKeys = removedEnvironmentKeys
-        self.backend = backend
-        self.suppressesEffortSettings = suppressesEffortSettings
-    }
-}
-
-protocol ClaudeCodeLaunchEnvironmentResolving: Sendable {
-    func resolve(
-        variant: ClaudeCodeRuntimeVariant,
-        requestedModel: String?
-    ) async throws -> ClaudeCodeLaunchEnvironment
-}
-
 struct ClaudeCodeLaunchEnvironmentResolver: ClaudeCodeLaunchEnvironmentResolving {
     typealias ZAIKeyProvider = @Sendable () async throws -> String?
     typealias BackendSecretProvider = @Sendable (_ backendID: ClaudeCodeCompatibleBackendID) async throws -> String?
@@ -162,7 +128,7 @@ struct ClaudeCodeLaunchEnvironmentResolver: ClaudeCodeLaunchEnvironmentResolving
     func resolve(
         variant: ClaudeCodeRuntimeVariant,
         requestedModel: String?
-    ) async throws -> ClaudeCodeLaunchEnvironment {
+    ) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
         try await ClaudeCompatibleProviderRuntimeBridge.resolveLaunchEnvironment(
             variant: variant,
             requestedModel: requestedModel,

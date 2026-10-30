@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 import RepoPromptSettingsCore
@@ -268,15 +269,15 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         func resolve(
             variant _: ClaudeCodeRuntimeVariant,
             requestedModel: String?
-        ) async throws -> ClaudeCodeLaunchEnvironment {
+        ) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
             requestedModels.append(requestedModel)
             guard requestedModel != "glm-5-turbo:xhigh" else {
                 throw ResolverError.unsupportedModel
             }
-            return ClaudeCodeLaunchEnvironment(
+            return ClaudeCompatiblePluginLaunchEnvironment(
                 effectiveModel: "sonnet",
                 environmentOverrides: [:],
-                backend: .compatible(.glmZAI)
+                backendID: .glmZAI
             )
         }
     }
@@ -319,28 +320,28 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
                 runtimeVariant: .glm
             )
         )
-        let directGLM = ClaudeCodeLaunchEnvironment(
+        let directGLM = ClaudeCompatiblePluginLaunchEnvironment(
             effectiveModel: "sonnet",
             environmentOverrides: [
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5-turbo",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5-turbo"
             ],
-            backend: .compatible(.glmZAI),
+            backendID: .glmZAI,
             suppressesEffortSettings: true
         )
-        let slotGLM = ClaudeCodeLaunchEnvironment(
+        let slotGLM = ClaudeCompatiblePluginLaunchEnvironment(
             effectiveModel: "sonnet",
             environmentOverrides: [
                 "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7",
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7"
             ],
-            backend: .compatible(.glmZAI),
+            backendID: .glmZAI,
             suppressesEffortSettings: true
         )
-        let sameEnvironmentDifferentFlagModel = ClaudeCodeLaunchEnvironment(
+        let sameEnvironmentDifferentFlagModel = ClaudeCompatiblePluginLaunchEnvironment(
             effectiveModel: "opus",
             environmentOverrides: directGLM.environmentOverrides,
-            backend: .compatible(.glmZAI),
+            backendID: .glmZAI,
             suppressesEffortSettings: true
         )
 
@@ -355,6 +356,20 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
         XCTAssertTrue(directToSlotRequiresRestart)
         XCTAssertFalse(sameEnvironmentRequiresRestart)
+
+        for backendID: ClaudeCompatiblePluginBackendID? in [nil, .kimi, .custom] {
+            let otherBackend = ClaudeCompatiblePluginLaunchEnvironment(
+                effectiveModel: directGLM.effectiveModel,
+                environmentOverrides: directGLM.environmentOverrides,
+                backendID: backendID,
+                suppressesEffortSettings: directGLM.suppressesEffortSettings
+            )
+            let requiresRestart = await controller.test_liveFlagSettingsRequiresProcessRestart(
+                activeLaunchEnvironment: directGLM,
+                nextLaunchEnvironment: otherBackend
+            )
+            XCTAssertTrue(requiresRestart, "Backend identity changes must require a restart")
+        }
     }
 
     private actor ApplicationGate {
@@ -404,8 +419,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
     }
 
     private actor PassthroughResolver: ClaudeCodeLaunchEnvironmentResolving {
-        func resolve(variant _: ClaudeCodeRuntimeVariant, requestedModel: String?) async throws -> ClaudeCodeLaunchEnvironment {
-            ClaudeCodeLaunchEnvironment(effectiveModel: requestedModel, environmentOverrides: [:], backend: .defaultClaude)
+        func resolve(variant _: ClaudeCodeRuntimeVariant, requestedModel: String?) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
+            ClaudeCompatiblePluginLaunchEnvironment(effectiveModel: requestedModel, environmentOverrides: [:], backendID: nil)
         }
     }
 
@@ -545,12 +560,12 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
             self.rejectFirst = rejectFirst
         }
 
-        func resolve(variant _: ClaudeCodeRuntimeVariant, requestedModel: String?) async throws -> ClaudeCodeLaunchEnvironment {
+        func resolve(variant _: ClaudeCodeRuntimeVariant, requestedModel: String?) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
             calls += 1
             let reject = rejectFirst && calls == 1
             _ = await gate.respond()
             if reject { throw ResolverError.unsupportedModel }
-            return ClaudeCodeLaunchEnvironment(effectiveModel: requestedModel, environmentOverrides: [:], backend: .defaultClaude)
+            return ClaudeCompatiblePluginLaunchEnvironment(effectiveModel: requestedModel, environmentOverrides: [:], backendID: nil)
         }
     }
 

@@ -71,44 +71,13 @@ extension ClaudeCompatibleProviderRuntimeBridge {
         )
     }
 
-    static func launchEnvironment(from environment: ClaudeCodeLaunchEnvironment) -> ClaudeCompatiblePluginLaunchEnvironment {
-        let backendID: ClaudeCompatiblePluginBackendID? = switch environment.backend {
-        case .defaultClaude:
-            nil
-        case let .compatible(id):
-            pluginBackendID(for: id)
-        }
-        return ClaudeCompatiblePluginLaunchEnvironment(
-            effectiveModel: environment.effectiveModel,
-            environmentOverrides: environment.environmentOverrides,
-            removedEnvironmentKeys: environment.removedEnvironmentKeys,
-            backendID: backendID,
-            suppressesEffortSettings: environment.suppressesEffortSettings
-        )
-    }
-
-    static func coreLaunchEnvironment(from environment: ClaudeCompatiblePluginLaunchEnvironment) -> ClaudeCodeLaunchEnvironment {
-        let backend: ClaudeCodeLaunchEnvironment.Backend = if let backendID = environment.backendID {
-            .compatible(coreBackendID(for: backendID))
-        } else {
-            .defaultClaude
-        }
-        return ClaudeCodeLaunchEnvironment(
-            effectiveModel: environment.effectiveModel,
-            environmentOverrides: environment.environmentOverrides,
-            removedEnvironmentKeys: environment.removedEnvironmentKeys,
-            backend: backend,
-            suppressesEffortSettings: environment.suppressesEffortSettings
-        )
-    }
-
     static func resolveLaunchEnvironment(
         variant: ClaudeCodeRuntimeVariant,
         requestedModel: String?,
         backendConfigProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig,
         zaiKeyProvider: @escaping @Sendable () async throws -> String?,
         backendSecretProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) async throws -> String?
-    ) async throws -> ClaudeCodeLaunchEnvironment {
+    ) async throws -> ClaudeCompatiblePluginLaunchEnvironment {
         let resolver = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleLaunchEnvironmentResolver(
             backendConfigProvider: { backendID in
                 pluginBackendConfig(from: backendConfigProvider(coreBackendID(for: backendID)))
@@ -119,11 +88,10 @@ extension ClaudeCompatibleProviderRuntimeBridge {
             }
         )
         do {
-            let resolved = try await resolver.resolve(
+            return try await resolver.resolve(
                 variant: pluginRuntimeVariant(for: variant),
                 requestedModel: requestedModel
             )
-            return coreLaunchEnvironment(from: resolved)
         } catch let ClaudeCompatiblePluginProviderError.invalidConfiguration(detail) {
             throw AIProviderError.invalidConfiguration(detail: detail)
         }
@@ -182,7 +150,7 @@ extension ClaudeCompatibleProviderRuntimeBridge {
             RepoPromptClaudeCompatibleProvider.ClaudeCompatibleHeadlessArgumentsRequest(
                 runtimeConfig: runtimeConfig(from: config, mode: .discovery),
                 mcpConfigPath: context.configURL?.path,
-                launchEnvironment: context.launchEnvironment.map(launchEnvironment(from:)),
+                launchEnvironment: context.launchEnvironment,
                 resumeSessionID: resumeSessionID,
                 systemPromptOverride: systemPromptOverride
             )

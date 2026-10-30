@@ -105,14 +105,6 @@ enum ClaudeCompatiblePluginBridge {
         return runtimeConfig(from: config, mode: .discovery)
     }
 
-    static func launchEnvironment(from environment: ClaudeCodeLaunchEnvironment) -> ClaudeCompatiblePluginLaunchEnvironment {
-        ClaudeCompatibleProviderRuntimeBridge.launchEnvironment(from: environment)
-    }
-
-    static func coreLaunchEnvironment(from environment: ClaudeCompatiblePluginLaunchEnvironment) -> ClaudeCodeLaunchEnvironment {
-        ClaudeCompatibleProviderRuntimeBridge.coreLaunchEnvironment(from: environment)
-    }
-
     static func backendEnvironment(
         config: ClaudeCodeCompatibleBackendConfig,
         apiKey: String
@@ -122,22 +114,6 @@ enum ClaudeCompatiblePluginBridge {
 
     static func removedBackendEnvironmentKeys(config: ClaudeCodeCompatibleBackendConfig) -> Set<String> {
         ClaudeCompatibleProviderRuntimeBridge.removedBackendEnvironmentKeys(config: config)
-    }
-
-    static func resolveLaunchEnvironment(
-        variant: ClaudeCodeRuntimeVariant,
-        requestedModel: String?,
-        backendConfigProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig,
-        zaiKeyProvider: @escaping @Sendable () async throws -> String?,
-        backendSecretProvider: @escaping @Sendable (ClaudeCodeCompatibleBackendID) async throws -> String?
-    ) async throws -> ClaudeCodeLaunchEnvironment {
-        try await ClaudeCompatibleProviderRuntimeBridge.resolveLaunchEnvironment(
-            variant: variant,
-            requestedModel: requestedModel,
-            backendConfigProvider: backendConfigProvider,
-            zaiKeyProvider: zaiKeyProvider,
-            backendSecretProvider: backendSecretProvider
-        )
     }
 
     static func decoratedUserMessage(_ userMessage: String, instructions: String) -> String {
