@@ -1,7 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
-@testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptApp
 import SwiftOpenAI
 import XCTest
 
@@ -114,16 +114,6 @@ final class OpenAIMessageEncodingTests: XCTestCase {
             message.openAIChatMessages(embedSystemPrompt: false)
         ) as? [[String: Any]])
         XCTAssertTrue(chat.allSatisfy { $0["content"] is String })
-
-        let provider = CustomOpenAIProvider(
-            baseURL: "https://example.test/v1",
-            apiKey: "key",
-            defaultModel: "text-model"
-        )
-        let custom = try XCTUnwrap(try jsonObject(
-            provider.serializedMessagesForTesting(message)
-        ) as? [[String: Any]])
-        XCTAssertTrue(custom.allSatisfy { $0["content"] is String })
 
         let assistantOnly = AIMessage(
             systemPrompt: "",

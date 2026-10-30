@@ -217,6 +217,19 @@ private final class OracleLifecycleActivityRecorder {
 }
 
 final class OracleImageSerializationTests: XCTestCase {
+    func testCustomOpenAITextOnlyMessagesRemainScalar() throws {
+        let message = AIMessage(systemPrompt: "system", userMessage: "plain")
+        let provider = CustomOpenAIProvider(
+            baseURL: "https://example.test/v1",
+            apiKey: "key",
+            defaultModel: "text-model"
+        )
+        let custom = try XCTUnwrap(try jsonObject(
+            provider.serializedMessagesForTesting(message)
+        ) as? [[String: Any]])
+        XCTAssertTrue(custom.allSatisfy { $0["content"] is String })
+    }
+
     func testAnthropicAttachesOnlyToFinalUserTurn() throws {
         let json = try jsonObject(AnthropicProvider.makeMessages(for: makeMessage()))
         let text = try jsonText(json)
