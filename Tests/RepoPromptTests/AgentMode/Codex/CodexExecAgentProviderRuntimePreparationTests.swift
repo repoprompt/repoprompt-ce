@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
-import RepoPromptCodexProvider
+@testable import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import XCTest

@@ -92,7 +92,7 @@
     },
     "RepoPromptCodexProvider": {
       "source_root": "Sources/RepoPromptCodexProvider",
-      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared"],
+      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptMCPCore", "RepoPromptProcess", "RepoPromptProviderQuota", "RepoPromptShared", "RepoPromptAgentProviderContracts", "RepoPromptFoundation"],
       "test_target": "RepoPromptCodexProviderTests",
       "app_free_tests": true
     },
@@ -512,6 +512,16 @@
         "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProviderRuntime.swift",
         "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexProcessConfiguration.swift",
         "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexCapabilitySettings.swift"
+      ]
+    },
+    "CodexExecExecution": {
+      "owner": "RepoPromptCodexProvider",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecAgentConfig.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecAgentHost.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexExecServerEntry.swift",
+        "Sources/RepoPrompt/Features/AgentMode/Runtime/Codex/CodexExecDiagnosticNoiseFilter.swift"
       ]
     },
     "DomainXMLDiffParser": {
