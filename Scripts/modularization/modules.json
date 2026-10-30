@@ -65,7 +65,7 @@
     },
     "RepoPromptCodexProviderTests": {
       "source_root": "Tests/RepoPromptCodexProviderTests",
-      "allowed_dependencies": ["RepoPromptCodexProvider", "RepoPromptShared"]
+      "allowed_dependencies": ["RepoPromptCodexProvider", "RepoPromptAIContracts", "RepoPromptShared"]
     },
     "RepoPromptACPProviders": {
       "source_root": "Sources/RepoPromptACPProviders",
@@ -100,6 +100,7 @@
     "RepoPromptDomainRuntime": {
       "source_root": "Sources/RepoPromptDomainRuntime",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "RepoPromptC",
         "RepoPromptCodeMapCore",
         "RepoPromptShared",
@@ -111,6 +112,7 @@
     "RepoPromptDomainRuntimeTests": {
       "source_root": "Tests/RepoPromptDomainRuntimeTests",
       "allowed_dependencies": [
+        "RepoPromptAIContracts",
         "RepoPromptDomainRuntime"
       ]
     },
