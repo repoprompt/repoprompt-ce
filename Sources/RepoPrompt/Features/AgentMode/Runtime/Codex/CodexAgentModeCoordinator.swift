@@ -5461,10 +5461,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return .unrecoverable(recoveryFailureMessage(for: trigger))
             }
             do {
-                let snapshot = try await probeController.readThreadSnapshot(
-                    includeTurns: true,
-                    timeout: codexRecoveryProbeTimeout
-                )
+                let snapshot: CodexNativeSessionController.ThreadSnapshot = if hasSoftLocalToolLiveness(for: session),
+                                                                               let toolTurnID = currentAuthoritativeNativeToolTurnID(for: session)
+                {
+                    try await probeController.readNativeToolProbeSnapshot(
+                        expectedTurnID: toolTurnID,
+                        timeout: codexRecoveryProbeTimeout
+                    )
+                } else {
+                    try await probeController.readThreadSnapshot(
+                        includeTurns: true,
+                        timeout: codexRecoveryProbeTimeout
+                    )
+                }
                 guard codexWatchdogAttemptRemainsCurrent(
                     session: session,
                     controller: probeController,

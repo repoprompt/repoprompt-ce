@@ -359,3 +359,266 @@ final class CodexAppServerFramingTests: XCTestCase {
         return frame
     }
 }
+
+final class CodexBoundedThreadSnapshotTests: XCTestCase {
+    func testResumeRequestGatesPaginationWithoutChangingIdentityOrPath() async throws {
+        for bounded in [false, true] {
+            let controller = makeController { method, params, _ in
+                XCTAssertEqual(method, "thread/resume")
+                XCTAssertEqual(params?["threadId"] as? String, "thread-fixture")
+                XCTAssertEqual(params?["path"] as? String, "/fixture/rollout.jsonl")
+                XCTAssertNil(params?["baseInstructions"])
+                if bounded {
+                    XCTAssertEqual(params?["excludeTurns"] as? Bool, true)
+                    let page = try XCTUnwrap(params?["initialTurnsPage"] as? [String: Any])
+                    XCTAssertEqual(page["itemsView"] as? String, "notLoaded")
+                    XCTAssertEqual(page["sortDirection"] as? String, "desc")
+                    XCTAssertEqual(page["limit"] as? Int, 32)
+                    return Self.response(page: Self.page())
+                }
+                XCTAssertNil(params?["excludeTurns"])
+                XCTAssertNil(params?["initialTurnsPage"])
+                return Self.response()
+            }
+            controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: bounded ? 164 : 149, patch: 0))
+            let result = try await controller.test_resumeThreadBinding(existing: .init(
+                conversationID: "thread-fixture", rolloutPath: "/fixture/rollout.jsonl", model: nil, reasoningEffort: nil
+            ))
+            XCTAssertEqual((result["thread"] as? [String: Any])?["id"] as? String, "thread-fixture")
+        }
+    }
+
+    func testRichReadUsesOneBoundedMetadataPageAndLegacyKeepsExistingRead() async throws {
+        for bounded in [false, true] {
+            let controller = makeController { method, params, timeout in
+                XCTAssertEqual(params?["threadId"] as? String, "thread-fixture")
+                switch method {
+                case "thread/read":
+                    XCTAssertEqual(params?["includeTurns"] as? Bool, !bounded)
+                    return Self.response(active: true, turns: bounded ? [] : [["id": "active-from-read", "status": "inProgress", "items": []]])
+                case "thread/turns/list":
+                    XCTAssertTrue(bounded)
+                    XCTAssertEqual(params?["itemsView"] as? String, "notLoaded")
+                    XCTAssertEqual(params?["limit"] as? Int, 32)
+                    XCTAssertNil(params?["cursor"])
+                    XCTAssertLessThanOrEqual(try XCTUnwrap(timeout), 2)
+                    return Self.page(turns: [["id": "active-from-read", "status": "inProgress", "itemsView": "notLoaded"]])
+                default:
+                    XCTFail("Unexpected history hydration: \(method)")
+                    throw CodexAppServerClient.ClientError.invalidResponse
+                }
+            }
+            controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: bounded ? 164 : 149, patch: 0))
+            controller.test_installThreadState(threadID: "thread-fixture", routingTurnID: "cached-old-turn")
+            let snapshot = try await controller.readThreadSnapshot(includeTurns: true, timeout: 2)
+            XCTAssertEqual(snapshot.conversationID, "thread-fixture")
+            XCTAssertEqual(snapshot.currentTurnID, "active-from-read")
+            XCTAssertEqual(snapshot.activeTurnIDs, ["active-from-read"])
+            XCTAssertTrue(snapshot.hasActiveTurn)
+            XCTAssertTrue(snapshot.hasCompleteTurnMetadata)
+        }
+    }
+
+    func testMetadataOnlyReadDoesNotFetchTurns() async throws {
+        let controller = makeController { method, params, _ in
+            XCTAssertEqual(method, "thread/read")
+            XCTAssertEqual(params?["includeTurns"] as? Bool, false)
+            return Self.response()
+        }
+        controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: 164, patch: 0))
+        controller.test_installThreadState(threadID: "thread-fixture")
+        _ = try await controller.readThreadSnapshot(includeTurns: false, timeout: 2)
+    }
+
+    func testDescendingPagePreservesNewestFailureAndActiveRoutingWithoutItemAuthority() {
+        let result = Self.response(page: Self.page(turns: [
+            ["id": "active-new", "status": "inProgress", "itemsView": "notLoaded", "items": []],
+            ["id": "active-old", "status": "inProgress", "itemsView": "notLoaded"],
+            ["id": "failed-new", "status": "failed", "error": ["message": "new failure"]],
+            ["id": "completed-old", "status": "completed"]
+        ], nextCursor: "older"))
+        let snapshot = CodexNativeSessionController.test_parseThreadSnapshot(result, fallbackEffort: "high")
+        XCTAssertEqual(snapshot.activeTurnIDs, ["active-old", "active-new"])
+        XCTAssertEqual(snapshot.currentTurnID, "active-new")
+        XCTAssertEqual(snapshot.latestTerminalTurnID, "failed-new")
+        XCTAssertEqual(snapshot.latestTurnStatus, .failed)
+        XCTAssertEqual(snapshot.latestTurnFailure?.message, "new failure")
+        XCTAssertEqual(snapshot.reasoningEffort, "high")
+        XCTAssertTrue(snapshot.hasActiveTurn)
+        XCTAssertFalse(snapshot.hasCompleteTurnMetadata)
+        XCTAssertFalse(snapshot.hasAuthoritativeActiveTurnItems)
+        XCTAssertTrue(snapshot.activeToolItems.isEmpty)
+    }
+
+    func testTruncatedActivePageCannotAuthorizeUniqueTurnInterrupt() async throws {
+        let controller = makeController { method, _, _ in
+            switch method {
+            case "thread/read":
+                return Self.response()
+            case "thread/turns/list":
+                return Self.page(turns: [["id": "active", "status": "inProgress", "itemsView": "notLoaded"]], nextCursor: "older")
+            default:
+                XCTFail("Partial history must not authorize \(method)")
+                throw CodexAppServerClient.ClientError.invalidResponse
+            }
+        }
+        controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: 164, patch: 0))
+        controller.test_installThreadState(threadID: "thread-fixture")
+        do {
+            _ = try await controller.reconcileAndInterruptCurrentTurn()
+            XCTFail("Expected fail-closed reconciliation")
+        } catch is CodexTurnInterruptError {
+            // An older active turn may have been omitted by the bounded page.
+        }
+    }
+
+    func testResumeRejectsWrongIdentityAndMissingBoundedPage() async throws {
+        for wrongIdentity in [false, true] {
+            let controller = makeController { _, _, _ in
+                if wrongIdentity {
+                    return ["thread": ["id": "different-thread"], "initialTurnsPage": Self.page()]
+                }
+                return Self.response()
+            }
+            controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: 164, patch: 0))
+            do {
+                _ = try await controller.test_resumeThreadBinding(existing: .init(
+                    conversationID: "thread-fixture", rolloutPath: nil, model: nil, reasoningEffort: nil
+                ))
+                XCTFail("Invalid binding must not commit")
+            } catch CodexAppServerClient.ClientError.invalidResponse {
+                // Never retry without excludeTurns or start a replacement thread.
+            }
+        }
+    }
+
+    func testNativeToolProbeRestoresExactFullCurrentTurnEvidenceIncludingTerminalItems() async throws {
+        for itemStatus in ["inProgress", "completed"] {
+            let controller = makeController { method, params, timeout in
+                XCTAssertEqual(params?["threadId"] as? String, "thread-fixture")
+                switch method {
+                case "thread/read":
+                    XCTAssertEqual(params?["includeTurns"] as? Bool, false)
+                    return Self.response(active: true)
+                case "thread/turns/list":
+                    XCTAssertEqual(params?["limit"] as? Int, 1)
+                    XCTAssertEqual(params?["itemsView"] as? String, "full")
+                    XCTAssertEqual(params?["sortDirection"] as? String, "desc")
+                    XCTAssertNil(params?["cursor"])
+                    XCTAssertLessThanOrEqual(try XCTUnwrap(timeout), 2)
+                    return Self.page(turns: [[
+                        "id": "active-probe", "status": "inProgress", "itemsView": "full",
+                        "items": [
+                            ["id": "call_probe", "type": "dynamicToolCall", "tool": "offline_probe_wait", "status": itemStatus],
+                            ["id": "command-a", "type": "commandExecution", "processId": "123", "status": "inProgress"],
+                            ["id": "command-b", "type": "commandExecution", "processId": "123", "status": "completed"]
+                        ]
+                    ]], nextCursor: "older-turns")
+                default:
+                    XCTFail("Tool probe must not add history/item RPCs: \(method)")
+                    throw CodexAppServerClient.ClientError.invalidResponse
+                }
+            }
+            controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: 164, patch: 0))
+            controller.test_installThreadState(threadID: "thread-fixture")
+            let snapshot = try await controller.readNativeToolProbeSnapshot(expectedTurnID: "active-probe", timeout: 2)
+            XCTAssertEqual(snapshot.currentTurnID, "active-probe")
+            XCTAssertTrue(snapshot.hasAuthoritativeActiveTurnItems)
+            XCTAssertFalse(snapshot.hasCompleteTurnMetadata, "Older turns are omitted, but the exact active turn's item set is full")
+            let item = try XCTUnwrap(snapshot.activeToolItems.first)
+            XCTAssertEqual(item.turnID, "active-probe")
+            XCTAssertEqual(item.itemID, "call_probe")
+            XCTAssertNotNil(item.invocationID)
+            XCTAssertEqual(snapshot.activeToolItems.filter { $0.kind == .commandExecution }.map(\.itemID), ["command-a", "command-b"], "Keep all commands for the coordinator's process-ID ambiguity check")
+            XCTAssertEqual(item.kind, .dynamicToolCall)
+            XCTAssertEqual(item.status, itemStatus == "inProgress" ? .inProgress : .terminal)
+        }
+    }
+
+    func testNativeToolProbeRejectsWrongTurnPartialOrMalformedItemAuthority() async throws {
+        for variant in ["wrong-turn", "summary", "notLoaded", "missing-view", "missing-items", "malformed-item", "terminal-turn", "multiple-turns"] {
+            let controller = makeController { method, _, _ in
+                if method == "thread/read" {
+                    return Self.response(active: true)
+                }
+                XCTAssertEqual(method, "thread/turns/list")
+                var turn: [String: Any] = [
+                    "id": variant == "wrong-turn" ? "other-active" : "active-probe",
+                    "status": variant == "terminal-turn" ? "completed" : "inProgress",
+                    "itemsView": "full",
+                    "items": [["id": "call_probe", "type": "commandExecution", "status": "inProgress", "processId": "123"]]
+                ]
+                switch variant {
+                case "summary", "notLoaded": turn["itemsView"] = variant
+                case "missing-view": turn["itemsView"] = nil
+                case "missing-items": turn["items"] = nil
+                case "malformed-item": turn["items"] = [["type": "commandExecution", "processId": "123"]]
+                default: break
+                }
+                let turns = variant == "multiple-turns" ? [turn, ["id": "other-active", "status": "inProgress", "itemsView": "full", "items": []]] : [turn]
+                return Self.page(turns: turns)
+            }
+            controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: 164, patch: 0))
+            controller.test_installThreadState(threadID: "thread-fixture")
+            let snapshot = try await controller.readNativeToolProbeSnapshot(expectedTurnID: "active-probe", timeout: 2)
+            XCTAssertFalse(snapshot.hasAuthoritativeActiveTurnItems, variant)
+        }
+    }
+
+    func testNativeToolProbeKeepsIdleThreadsMetadataOnlyAndOlderRuntimeRichRead() async throws {
+        for bounded in [false, true] {
+            let controller = makeController { method, params, _ in
+                switch method {
+                case "thread/read":
+                    XCTAssertEqual(params?["includeTurns"] as? Bool, !bounded)
+                    return Self.response()
+                case "thread/turns/list":
+                    XCTAssertTrue(bounded)
+                    XCTAssertEqual(params?["itemsView"] as? String, "notLoaded")
+                    XCTAssertEqual(params?["limit"] as? Int, 32)
+                    return Self.page(turns: [["id": "latest-completed", "status": "completed", "itemsView": "notLoaded"]])
+                default:
+                    XCTFail("Unexpected history hydration: \(method)")
+                    throw CodexAppServerClient.ClientError.invalidResponse
+                }
+            }
+            controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: bounded ? 164 : 149, patch: 0))
+            controller.test_installThreadState(threadID: "thread-fixture")
+            let snapshot = try await controller.readNativeToolProbeSnapshot(expectedTurnID: "prior-active", timeout: 2)
+            XCTAssertFalse(snapshot.hasAuthoritativeActiveTurnItems)
+            XCTAssertFalse(snapshot.hasActiveTurn)
+        }
+    }
+
+    func testLifecycleAuthoritativeInterruptDoesNotNeedHistoryUniquenessProbe() async throws {
+        let controller = makeController { method, params, _ in
+            XCTAssertEqual(method, "turn/interrupt", "Lifecycle authority bypasses bounded snapshot ambiguity")
+            XCTAssertEqual(params?["threadId"] as? String, "thread-fixture")
+            XCTAssertEqual(params?["turnId"] as? String, "lifecycle-active")
+            return [:]
+        }
+        controller.test_configureSnapshotRuntime(version: .init(major: 0, minor: 164, patch: 0))
+        controller.test_installThreadState(threadID: "thread-fixture", authoritativeTurnID: "lifecycle-active")
+        let receipt = try await controller.reconcileAndInterruptCurrentTurn()
+        XCTAssertEqual(receipt.interruptedTurnID, "lifecycle-active")
+    }
+
+    private func makeController(
+        request: @escaping @Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any]
+    ) -> CodexNativeSessionController {
+        CodexNativeSessionController(
+            client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1,
+            workspacePaths: .uniform(NSTemporaryDirectory()), requestExecutor: request
+        )
+    }
+
+    private static func response(page: [String: Any]? = nil, active: Bool = false, turns: [[String: Any]] = []) -> [String: Any] {
+        var result: [String: Any] = ["thread": ["id": "thread-fixture", "status": ["type": active ? "active" : "idle"], "turns": turns]]
+        result["initialTurnsPage"] = page
+        return result
+    }
+
+    private static func page(turns: [[String: Any]] = [], nextCursor: String? = nil) -> [String: Any] {
+        ["data": turns, "nextCursor": nextCursor.map { $0 as Any } ?? NSNull()]
+    }
+}
