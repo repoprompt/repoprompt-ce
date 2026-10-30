@@ -1,8 +1,8 @@
 import Foundation
 import RepoPromptAIContracts
-@testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+@testable import RepoPromptHTTPProviders
 import SwiftAnthropic
 import XCTest
 

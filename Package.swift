@@ -161,16 +161,18 @@ let package = Package(
         .target(
             name: "RepoPromptHTTPProviders",
             dependencies: [
-                "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime",
-                .product(name: "SwiftOpenAI", package: "SwiftOpenAI")
+                "RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+                .product(name: "SwiftAnthropic", package: "SwiftAnthropic")
             ],
             path: "Sources/RepoPromptHTTPProviders"
         ),
         .testTarget(
             name: "RepoPromptHTTPProvidersTests",
             dependencies: [
-                "RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime",
-                .product(name: "SwiftOpenAI", package: "SwiftOpenAI")
+                "RepoPromptHTTPProviders", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation",
+                .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
+                .product(name: "SwiftAnthropic", package: "SwiftAnthropic")
             ],
             path: "Tests/RepoPromptHTTPProvidersTests"
         ),

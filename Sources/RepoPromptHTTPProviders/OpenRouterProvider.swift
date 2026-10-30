@@ -2,7 +2,6 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
-import RepoPromptHTTPProviders
 import SwiftOpenAI
 
 package class OpenRouterProvider: AIProvider {

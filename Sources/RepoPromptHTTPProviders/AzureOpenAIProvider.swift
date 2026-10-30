@@ -3,7 +3,6 @@ import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
-import RepoPromptHTTPProviders
 import SwiftOpenAI
 
 public struct AzureOpenAIConfiguration: Codable, Equatable {

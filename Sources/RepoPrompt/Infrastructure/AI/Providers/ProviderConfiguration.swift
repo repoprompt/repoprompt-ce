@@ -7,6 +7,7 @@
 
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptHTTPProviders
 
 /// Singleton to manage provider configurations
 class ProviderConfigurationManager {

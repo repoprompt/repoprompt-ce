@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 
 extension AzureOpenAIConfiguration {
     func revokingHTTPConsent() -> AzureOpenAIConfiguration {

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptHTTPProviders
 
 struct CustomProviderConfiguration: Codable {
     let url: String

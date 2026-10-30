@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
+import RepoPromptHTTPProviders
 
 struct AnthropicAppHost: AnthropicHTTPHost {
     func canStream(for model: AIModel) -> Bool {
