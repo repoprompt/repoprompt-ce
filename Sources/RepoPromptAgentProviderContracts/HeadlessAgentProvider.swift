@@ -1,36 +1,37 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 /// Protocol for headless CLI-based agents that operate via MCP tools only.
-protocol HeadlessAgentProvider {
+package protocol HeadlessAgentProvider {
     /// Stream agent execution results.
     /// - Parameters:
     ///   - message: The agent message to process (system prompt + user message)
     ///   - runID: Optional runID for this execution (if nil, provider generates one)
-    func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error>
+    func streamAgentMessage(_ message: RepoPromptDomainRuntime.AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error>
 
     /// Best-effort provider-side cleanup for a persisted/resumable conversation.
-    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
+    func cleanupConversation(_ handle: RepoPromptDomainRuntime.ProviderConversationCleanupHandle, action: RepoPromptDomainRuntime.ProviderConversationCleanupAction) async -> RepoPromptDomainRuntime.ProviderConversationCleanupOutcome
 
     /// Dispose of the provider and cancel any running operations.
     func dispose() async
 }
 
-extension HeadlessAgentProvider {
-    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+package extension HeadlessAgentProvider {
+    func cleanupConversation(_ handle: RepoPromptDomainRuntime.ProviderConversationCleanupHandle, action: RepoPromptDomainRuntime.ProviderConversationCleanupAction) async -> RepoPromptDomainRuntime.ProviderConversationCleanupOutcome {
         .unsupported(message: "Provider has no local API for \(action.rawValue) cleanup of conversations.")
     }
 }
 
 /// Lifecycle events for agent session state (not user-facing chat content).
-enum AgentLifecycleEvent: Equatable {
+package enum AgentLifecycleEvent: Equatable {
     case initialized
     case completed
     case cancelled
 }
 
 /// Standardized events emitted from a headless agent.
-enum AgentStreamEvent {
+package enum AgentStreamEvent {
     case message(content: String, reasoning: String?)
     /// Final authoritative message content (replaces streaming content when present)
     case finalMessage(content: String)
@@ -44,28 +45,28 @@ enum AgentStreamEvent {
 }
 
 /// Token usage reported by the agent.
-struct TokenUsage {
-    let inputTokens: Int
-    let outputTokens: Int
-    let contextUsedTokens: Int?
+package struct TokenUsage {
+    package let inputTokens: Int
+    package let outputTokens: Int
+    package let contextUsedTokens: Int?
 
-    init(inputTokens: Int, outputTokens: Int, contextUsedTokens: Int? = nil) {
+    package init(inputTokens: Int, outputTokens: Int, contextUsedTokens: Int? = nil) {
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
         self.contextUsedTokens = contextUsedTokens
     }
 }
 
-final class UnsupportedHeadlessAgentProvider: HeadlessAgentProvider {
+package final class UnsupportedHeadlessAgentProvider: HeadlessAgentProvider {
     private let reason: String
 
-    init(reason: String) {
+    package init(reason: String) {
         self.reason = reason
     }
 
-    func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+    package func streamAgentMessage(_ message: RepoPromptDomainRuntime.AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<RepoPromptDomainRuntime.AIStreamResult, Error> {
         throw AIProviderError.invalidConfiguration(detail: reason)
     }
 
-    func dispose() async {}
+    package func dispose() async {}
 }

@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 
 /// Headless/discovery adapter for OpenCode's ACP runtime.
 ///

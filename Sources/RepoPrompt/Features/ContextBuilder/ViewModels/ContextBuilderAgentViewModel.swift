@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import MCP
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime

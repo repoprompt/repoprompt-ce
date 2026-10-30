@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Foundation
 import MCP
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
 import RepoPromptCodexProvider
