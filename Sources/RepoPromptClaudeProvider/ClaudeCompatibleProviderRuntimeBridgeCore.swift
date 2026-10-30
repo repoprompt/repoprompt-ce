@@ -31,6 +31,24 @@ package typealias ClaudeCompatiblePluginJSONValue = RepoPromptClaudeCompatiblePr
 /// helpers. This keeps lower-level Claude provider code from depending upward on
 /// Agent Mode's feature bridge while preserving a single package import point.
 package enum ClaudeCompatibleProviderRuntimeBridge {
+    package static func buildHeadlessArguments(
+        runtimeConfig: ClaudeCompatiblePluginRuntimeConfig,
+        mcpConfigPath: String?,
+        launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment?,
+        resumeSessionID: String?,
+        systemPromptOverride: String?
+    ) -> [String] {
+        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleHeadlessRuntime.buildArguments(
+            RepoPromptClaudeCompatibleProvider.ClaudeCompatibleHeadlessArgumentsRequest(
+                runtimeConfig: runtimeConfig,
+                mcpConfigPath: mcpConfigPath,
+                launchEnvironment: launchEnvironment,
+                resumeSessionID: resumeSessionID,
+                systemPromptOverride: systemPromptOverride
+            )
+        )
+    }
+
     package static func quotaObservation(from info: ClaudeCompatiblePluginRateLimitInfo) -> ClaudeProviderQuotaObservation {
         let status: ClaudeProviderQuotaObservation.Status = switch info.status {
         case .allowed: .allowed
