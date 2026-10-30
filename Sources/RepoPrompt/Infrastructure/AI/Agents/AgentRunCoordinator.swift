@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptInstrumentation
 

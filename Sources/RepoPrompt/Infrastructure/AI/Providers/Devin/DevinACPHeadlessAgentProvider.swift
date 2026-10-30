@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 
 final class DevinACPHeadlessAgentProvider: HeadlessAgentProvider {
     typealias ProviderFactory = @Sendable (_ config: DevinAgentConfig) -> any ACPAgentProvider

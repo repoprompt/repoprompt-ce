@@ -1,3 +1,4 @@
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 
 extension ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {}
