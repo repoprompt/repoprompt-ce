@@ -3,6 +3,7 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptShared
 import XCTest
 
@@ -40,6 +41,10 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
 
         nonisolated func shouldSuppressAbortArtifact(_ message: String) -> Bool {
             message == "host-abort-witness"
+        }
+
+        nonisolated func validateReadSourceFD(_ fd: Int32, label: String) throws {
+            try ReadSourceFDPreflight.validateOpenFD(fd, label: label)
         }
 
         nonisolated func supplementedPathHints(_ hints: [String]) -> [String] {
@@ -129,6 +134,12 @@ final class ClaudeNativeSessionHostTests: XCTestCase {
         let override = try await controller.test_resolveApplyFlagSettingsRequest(model: "host-effort-witness", effortLevel: .low)
         XCTAssertEqual((override?["settings"] as? [String: Any])?["effortLevel"] as? String, "low")
         await controller.shutdown()
+    }
+
+    func testAppFDPreflightPreservesCanonicalErrorIdentity() {
+        XCTAssertThrowsError(try ClaudeNativeSessionAppHost().validateReadSourceFD(-1, label: "Claude stdout")) { error in
+            XCTAssertEqual(error as? ReadSourceFDPreflightError, .invalidFileDescriptor(label: "Claude stdout", fd: -1))
+        }
     }
 
     func testDefaultModelAndAbortFilteringUseRequiredHost() async {

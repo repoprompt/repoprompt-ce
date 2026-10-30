@@ -1003,7 +1003,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     }
 
     private func startStdoutReader(handle: FileHandle) throws {
-        try ReadSourceFDPreflight.validateOpenFD(handle.fileDescriptor, label: "Claude stdout")
+        try host.validateReadSourceFD(handle.fileDescriptor, label: "Claude stdout")
         let channel = FileHandleChunkChannel()
         stdoutChunkChannel = channel
         handle.readabilityHandler = { readable in
@@ -1027,7 +1027,7 @@ package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeCont
     }
 
     private func startStderrReader(handle: FileHandle) throws {
-        try ReadSourceFDPreflight.validateOpenFD(handle.fileDescriptor, label: "Claude stderr")
+        try host.validateReadSourceFD(handle.fileDescriptor, label: "Claude stderr")
         let channel = FileHandleChunkChannel()
         stderrChunkChannel = channel
         handle.readabilityHandler = { readable in

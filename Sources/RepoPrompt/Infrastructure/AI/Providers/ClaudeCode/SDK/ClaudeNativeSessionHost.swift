@@ -29,6 +29,7 @@ package protocol ClaudeNativeSessionHosting: Sendable {
     func explicitEffortLevel(for model: String?) -> ClaudeCodeEffortLevel?
     func isDefaultModel(_ model: String) -> Bool
     func shouldSuppressAbortArtifact(_ message: String) -> Bool
+    func validateReadSourceFD(_ fd: Int32, label: String) throws
     func supplementedPathHints(_ hints: [String]) -> [String]
     func expectedAgentClientName(for variant: ClaudeCodeRuntimeVariant) -> String?
     func isRawEventFileLoggingEnabled() -> Bool

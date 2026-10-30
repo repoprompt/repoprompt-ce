@@ -47,6 +47,10 @@ struct ClaudeNativeSessionAppHost: ClaudeNativeSessionHosting {
         ClaudeAbortArtifactFilter.shouldSuppressUserFacingError(message)
     }
 
+    func validateReadSourceFD(_ fd: Int32, label: String) throws {
+        try ReadSourceFDPreflight.validateOpenFD(fd, label: label)
+    }
+
     func supplementedPathHints(_ hints: [String]) -> [String] {
         CLIPathHints.nativeDefaultsSupplemented(with: hints)
     }
