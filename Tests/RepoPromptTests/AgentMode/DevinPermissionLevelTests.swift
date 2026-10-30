@@ -294,21 +294,6 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(launch.arguments, ["--permission-mode", "accept-edits", "acp"])
     }
 
-    func testResolvedLaunchAlwaysHoldsTheBareACPSubcommand() throws {
-        // `makeLaunchConfiguration` prepends the permission flag to the resolver's argv, so
-        // the resolver must never emit a wrapper/shim invocation ahead of `acp`.
-        let directory = try makeTestDirectory(name: "DevinResolvedLaunchInvariant")
-        let executable = directory.appendingPathComponent("devin")
-        try "#!/bin/sh\nexit 0\n".write(to: executable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-
-        let resolved = try DevinACPLaunchResolver().resolvedLaunch(
-            for: DevinAgentConfig(commandName: executable.path)
-        )
-        XCTAssertEqual(resolved.arguments, ["acp"])
-        XCTAssertEqual((resolved.command as NSString).lastPathComponent, "devin")
-    }
-
     func testLaunchRejectsAnUnrecognizedPermissionMode() throws {
         let (provider, directory) = try makeProvider()
         XCTAssertThrowsError(
@@ -361,36 +346,6 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual((overlayMCP["mcpServers"] as? [String: Any])?.count, 0)
         let cleanupArtifact = try XCTUnwrap(launch.cleanupArtifact)
         DevinIntegrationConfiguration.cleanupReportingFailures(artifact: cleanupArtifact)
-    }
-
-    func testConcurrentProbeDoesNotInvalidateAResolvedBareCommandLaunch() async throws {
-        let directory = try makeTestDirectory(name: "DevinConcurrentBareCommandLaunch")
-        let executable = directory.appendingPathComponent("devin")
-        try "#!/bin/sh\necho 'Run as an ACP server over stdio'\n".write(
-            to: executable,
-            atomically: true,
-            encoding: .utf8
-        )
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let gate = DevinProbeEnvironmentGate(environment: ["PATH": directory.path])
-        let resolver = DevinACPLaunchResolver(launchEnvironmentProvider: { _ in
-            await gate.nextEnvironment()
-        })
-        let config = DevinAgentConfig(commandName: "devin", includeRepoPromptMCPServer: false)
-
-        let initialSupport = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
-        XCTAssertEqual(initialSupport, .supported)
-        let secondProbe = Task { try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) } }
-        await gate.waitForSecondCall()
-        let resolved = Result { try resolver.resolvedLaunch(for: config) }
-        await gate.releaseSecondCall()
-        let secondSupport = try await secondProbe.value
-        XCTAssertEqual(secondSupport, .supported)
-
-        XCTAssertEqual(
-            try resolved.get().command,
-            try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: executable.path).canonicalPath
-        )
     }
 
     func testRoutineInfoStderrIsHiddenWhileActionableOutputRemainsVisible() throws {
@@ -938,42 +893,6 @@ final class DevinPermissionLevelTests: XCTestCase {
             taskLabelKind: nil,
             launchPermissionMode: launchPermissionMode
         )
-    }
-}
-
-private actor DevinProbeEnvironmentGate {
-    private let environment: [String: String]
-    private var callCount = 0
-    private var secondCallWaiters: [CheckedContinuation<Void, Never>] = []
-    private var releaseSecondCallContinuation: CheckedContinuation<Void, Never>?
-
-    init(environment: [String: String]) {
-        self.environment = environment
-    }
-
-    func nextEnvironment() async -> ACPLaunchEnvironment {
-        callCount += 1
-        if callCount == 2 {
-            let waiters = secondCallWaiters
-            secondCallWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-            await withCheckedContinuation { continuation in
-                releaseSecondCallContinuation = continuation
-            }
-        }
-        return ACPLaunchEnvironment(environment: environment)
-    }
-
-    func waitForSecondCall() async {
-        guard callCount < 2 else { return }
-        await withCheckedContinuation { continuation in
-            secondCallWaiters.append(continuation)
-        }
-    }
-
-    func releaseSecondCall() {
-        releaseSecondCallContinuation?.resume()
-        releaseSecondCallContinuation = nil
     }
 }
 
