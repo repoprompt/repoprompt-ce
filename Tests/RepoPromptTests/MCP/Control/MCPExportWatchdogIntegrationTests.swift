@@ -1,4 +1,5 @@
 import Darwin
+import RepoPromptAgentProviderContracts
 import Foundation
 import JSONSchema
 import MCP

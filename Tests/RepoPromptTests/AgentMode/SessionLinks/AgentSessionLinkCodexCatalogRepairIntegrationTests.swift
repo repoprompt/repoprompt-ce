@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptAgentProviderContracts
 import Darwin
 import Foundation
 import MCP

@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptAgentProviderContracts
 import CryptoKit
 import Foundation
 import MCP

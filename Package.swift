@@ -44,6 +44,7 @@ var packageDependencies: [Package.Dependency] = [
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
+    "RepoPromptAgentProviderContracts",
     "RepoPromptACPProviders",
     "RepoPromptCodexProvider",
     "RepoPromptAIContracts",
@@ -87,6 +88,7 @@ var repoPromptSettingsCoreSwiftSettings: [SwiftSetting] = [
 ]
 
 var repoPromptTestDependencies: [Target.Dependency] = [
+    "RepoPromptAgentProviderContracts",
     "RepoPromptACPProviders",
     "RepoPromptCodexProvider",
     "RepoPromptAIContracts",
@@ -143,6 +145,11 @@ let package = Package(
             name: "RepoPrompt",
             dependencies: ["RepoPromptApp"],
             path: "Sources/RepoPromptExecutable"
+        ),
+        .target(
+            name: "RepoPromptAgentProviderContracts",
+            dependencies: ["RepoPromptDomainRuntime", "RepoPromptProviderQuota"],
+            path: "Sources/RepoPromptAgentProviderContracts"
         ),
         .target(
             name: "RepoPromptCodexProvider",

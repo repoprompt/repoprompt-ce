@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 @_spi(TestSupport) @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest

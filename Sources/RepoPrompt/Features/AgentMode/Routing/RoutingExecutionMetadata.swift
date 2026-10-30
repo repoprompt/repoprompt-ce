@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
 /// An opaque provider value. An advertised value is not necessarily executable by this app.

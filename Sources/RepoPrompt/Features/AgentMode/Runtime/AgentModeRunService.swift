@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
