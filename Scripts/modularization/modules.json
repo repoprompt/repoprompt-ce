@@ -369,6 +369,10 @@
     }
   },
   "moved_families": {
+    "AgentCLIToolContext": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/AgentCLIToolContext.swift"]
+    },
     "ClaudeCompatibleInfrastructureBridge": {
       "owner": "RepoPromptClaudeProvider",
       "former_app_files": ["Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridgeCore.swift"]
