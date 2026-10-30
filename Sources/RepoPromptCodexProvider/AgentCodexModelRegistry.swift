@@ -1,6 +1,5 @@
 import Foundation
 import RepoPromptAIContracts
-import RepoPromptCodexProvider
 
 package final class AgentCodexModelRegistry {
     /// App storage and option policy stay authoritative; assembling these operations is pure.
