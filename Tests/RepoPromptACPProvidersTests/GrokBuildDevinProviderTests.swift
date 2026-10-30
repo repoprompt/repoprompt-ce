@@ -1,10 +1,8 @@
 import Darwin
 import Foundation
 import os
-import RepoPromptACPProviders
-import RepoPromptAgentProviderContracts
+@testable import RepoPromptACPProviders
 import RepoPromptAIContracts
-@testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import XCTest

@@ -102,7 +102,7 @@
     },
     "RepoPromptACPProviders": {
       "source_root": "Sources/RepoPromptACPProviders",
-      "allowed_dependencies": ["RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
+      "allowed_dependencies": ["RepoPromptAgentProviderContracts", "RepoPromptAIContracts", "RepoPromptDomainRuntime", "RepoPromptFoundation", "RepoPromptMCPCore", "RepoPromptProcess"],
       "test_target": "RepoPromptACPProvidersTests",
       "app_free_tests": true
     },
@@ -387,6 +387,17 @@
     }
   },
   "moved_families": {
+    "GrokBuildAndDevinConsumerExecution": {
+      "owner": "RepoPromptACPProviders",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuild/GrokBuildOneShotHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinCLIProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Devin/DevinACPHeadlessAgentProvider.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/GrokBuildDevinProviderHosts.swift"
+      ]
+    },
     "RemainingHTTPExecutionFamily": {
       "owner": "RepoPromptHTTPProviders",
       "former_app_files": [
