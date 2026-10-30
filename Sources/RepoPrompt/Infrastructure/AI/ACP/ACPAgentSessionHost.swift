@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptDomainRuntime
 
 package struct ACPDevinThinkingSelection {
     package let advertisedModelRaw: String
@@ -26,9 +27,15 @@ package struct ACPGrokModelDecomposition {
 
 package protocol ACPAgentSessionHost: Sendable {
     var applicationVersion: String { get }
+    var repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration { get }
+    func preflightInjectedMCPServers(in configuration: ACPSessionConfiguration) throws
+    func preflightInjectedMCPServers(in configuration: ACPSessionConfiguration, environment: [String: String]) throws
     var cursorAutoModelRaw: String { get }
     func mcpClientNameHint(for kind: AgentProviderKind) -> String?
     func displayName(for kind: AgentProviderKind) -> String
+    func normalizedModelParameterSelections(_ selections: [ACPModelParameterSelection]) -> [ACPModelParameterSelection]
+    func canonicalParameterModelRaw(_ raw: String, providerID: ACPProviderID) -> String
+    func parameterIdentityMatches(_ selection: ACPModelParameterSelection, providerID: ACPProviderID, baseModelRaw: String, kind: ACPModelParameterKind) -> Bool
     func recognizedDevinPermissionMode(_ mode: String?) -> Bool
     func normalizedDevinPermissionMode(_ mode: String?) -> String?
     func devinThinkingSelection(for model: String) -> ACPDevinThinkingSelection?

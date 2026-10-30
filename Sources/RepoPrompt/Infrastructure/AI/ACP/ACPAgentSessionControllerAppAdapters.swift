@@ -4,10 +4,54 @@ import RepoPromptACPProviders
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
+import RepoPromptSettingsCore
 
 struct ACPAgentSessionAppHost: ACPAgentSessionHost {
     var applicationVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+    }
+
+    var repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration {
+        .repoPrompt
+    }
+
+    func preflightInjectedMCPServers(in sessionConfiguration: ACPSessionConfiguration) throws {
+        for server in sessionConfiguration.mcpServers {
+            try server.validateACPLaunchCommand(workingDirectory: sessionConfiguration.workingDirectory)
+        }
+    }
+
+    func preflightInjectedMCPServers(in sessionConfiguration: ACPSessionConfiguration, environment: [String: String]) throws {
+        for server in sessionConfiguration.mcpServers {
+            let resolvedBareCommandPath = try Self.resolvedBareACPCommandPath(
+                for: server.command,
+                serverName: server.name,
+                environment: environment
+            )
+            try server.validateACPLaunchCommand(
+                workingDirectory: sessionConfiguration.workingDirectory,
+                resolvedBareCommandPath: resolvedBareCommandPath
+            )
+        }
+    }
+
+    private static func resolvedBareACPCommandPath(
+        for command: String,
+        serverName: String,
+        environment: [String: String]
+    ) throws -> String? {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.range(of: #"[/~]"#, options: .regularExpression) == nil else { return nil }
+        let resolved = CommandPathResolver.resolve(
+            trimmed,
+            environment: environment,
+            additionalPaths: [],
+            preferredBasenames: [trimmed]
+        )
+        guard resolved != trimmed else {
+            throw RepoPromptMCPServerConfiguration.ACPCommandValidationError.unresolvedCommand(serverName: serverName, command: trimmed)
+        }
+        return resolved
     }
 
     var cursorAutoModelRaw: String {
@@ -20,6 +64,18 @@ struct ACPAgentSessionAppHost: ACPAgentSessionHost {
 
     func displayName(for kind: AgentProviderKind) -> String {
         kind.displayName
+    }
+
+    func normalizedModelParameterSelections(_ selections: [ACPModelParameterSelection]) -> [ACPModelParameterSelection] {
+        ACPModelParameterSelection.normalized(selections)
+    }
+
+    func canonicalParameterModelRaw(_ raw: String, providerID: ACPProviderID) -> String {
+        ACPModelParameterIdentity.canonicalBaseModelRaw(raw, providerID: providerID)
+    }
+
+    func parameterIdentityMatches(_ selection: ACPModelParameterSelection, providerID: ACPProviderID, baseModelRaw: String, kind: ACPModelParameterKind) -> Bool {
+        selection.identity == ACPModelParameterIdentity(providerID: providerID, baseModelRaw: baseModelRaw, kind: kind)
     }
 
     func recognizedDevinPermissionMode(_ mode: String?) -> Bool {

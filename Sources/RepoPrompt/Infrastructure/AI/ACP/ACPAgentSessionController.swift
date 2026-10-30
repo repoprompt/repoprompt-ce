@@ -6,7 +6,6 @@ import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
 import RepoPromptProcess
-import RepoPromptSettingsCore
 
 package actor ACPAgentSessionController {
     /// A successful pipe write is not provider acceptance or turn completion. It only proves
@@ -439,9 +438,9 @@ package actor ACPAgentSessionController {
         self.runRequest = runRequest
         let sessionConfiguration = try provider.makeSessionConfiguration(
             for: runRequest,
-            mcpServer: .repoPrompt
+            mcpServer: host.repoPromptMCPConfiguration
         )
-        try Self.preflightInjectedMCPServers(in: sessionConfiguration)
+        try host.preflightInjectedMCPServers(in: sessionConfiguration)
         self.sessionConfiguration = sessionConfiguration
         launchConfiguration = try provider.makeLaunchConfiguration(for: runRequest)
         launchedPermissionMode = provider.providerID == .devin
@@ -611,7 +610,7 @@ package actor ACPAgentSessionController {
         log("Launching ACP transport")
         diagnose(.phaseStarted("launch"))
         let environment = await resolvedEnvironment()
-        try Self.preflightInjectedMCPServers(in: sessionConfiguration, environment: environment)
+        try host.preflightInjectedMCPServers(in: sessionConfiguration, environment: environment)
         let workingDirectory = CommandPathResolver.expandPath(
             launchConfiguration.workingDirectory ?? FileManager.default.temporaryDirectory.path,
             environment: environment
@@ -1274,8 +1273,8 @@ package actor ACPAgentSessionController {
             throw ControllerError.protocolViolation("Session model parameter discovery produced no session snapshot.")
         }
         // Never return metadata belonging to a different model than the one requested.
-        guard ACPModelParameterIdentity.canonicalBaseModelRaw(currentModelRaw, providerID: provider.providerID)
-            == ACPModelParameterIdentity.canonicalBaseModelRaw(model, providerID: provider.providerID)
+        guard host.canonicalParameterModelRaw(currentModelRaw, providerID: provider.providerID)
+            == host.canonicalParameterModelRaw(model, providerID: provider.providerID)
         else {
             throw ControllerError.protocolViolation(
                 "Session model parameter discovery confirmed a different model than requested '\(model)'."
@@ -1354,7 +1353,7 @@ package actor ACPAgentSessionController {
             return .init(applied: [], skipped: selections)
         }
 
-        let normalized = ACPModelParameterSelection.normalized(selections).sorted {
+        let normalized = host.normalizedModelParameterSelections(selections).sorted {
             if $0.kind.sortOrder != $1.kind.sortOrder {
                 return $0.kind.sortOrder < $1.kind.sortOrder
             }
@@ -1378,16 +1377,17 @@ package actor ACPAgentSessionController {
                   let models = discoveredSessionModels,
                   let currentModel = models.currentModelRaw,
                   let parameterSet = models.modelParameterSets.first(where: {
-                      ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      host.canonicalParameterModelRaw(
                           $0.baseModelRaw,
                           providerID: provider.providerID
-                      ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                      ) == host.canonicalParameterModelRaw(
                           currentModel,
                           providerID: provider.providerID
                       )
                   }),
                   let definition = parameterSet.definition(kind: selection.kind),
-                  selection.identity == ACPModelParameterIdentity(
+                  host.parameterIdentityMatches(
+                      selection,
                       providerID: provider.providerID,
                       baseModelRaw: parameterSet.baseModelRaw,
                       kind: definition.kind
@@ -2684,10 +2684,10 @@ package actor ACPAgentSessionController {
               let models = discoveredSessionModels,
               let currentModel = models.currentModelRaw,
               let parameterSet = models.modelParameterSets.first(where: {
-                  ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  host.canonicalParameterModelRaw(
                       $0.baseModelRaw,
                       providerID: provider.providerID
-                  ) == ACPModelParameterIdentity.canonicalBaseModelRaw(
+                  ) == host.canonicalParameterModelRaw(
                       currentModel,
                       providerID: provider.providerID
                   )
@@ -2696,18 +2696,19 @@ package actor ACPAgentSessionController {
             throw ControllerError.requestFailed("Model parameters are unavailable before prompt submission.")
         }
         if let requestedModel = normalizedModelString(request.modelString),
-           ACPModelParameterIdentity.canonicalBaseModelRaw(
+           host.canonicalParameterModelRaw(
                requestedModel,
                providerID: provider.providerID
-           ) != ACPModelParameterIdentity.canonicalBaseModelRaw(
+           ) != host.canonicalParameterModelRaw(
                currentModel,
                providerID: provider.providerID
            )
         {
             throw ControllerError.requestFailed("Model changed before prompt submission. Retry the requested configuration.")
         }
-        for selection in ACPModelParameterSelection.normalized(request.modelParameterSelections) {
-            guard selection.identity == ACPModelParameterIdentity(
+        for selection in host.normalizedModelParameterSelections(request.modelParameterSelections) {
+            guard host.parameterIdentityMatches(
+                selection,
                 providerID: provider.providerID,
                 baseModelRaw: currentModel,
                 kind: selection.kind
@@ -2758,48 +2759,6 @@ package actor ACPAgentSessionController {
         }
 
         return false
-    }
-
-    private static func preflightInjectedMCPServers(in sessionConfiguration: ACPSessionConfiguration) throws {
-        for server in sessionConfiguration.mcpServers {
-            try server.validateACPLaunchCommand(workingDirectory: sessionConfiguration.workingDirectory)
-        }
-    }
-
-    private static func preflightInjectedMCPServers(
-        in sessionConfiguration: ACPSessionConfiguration,
-        environment: [String: String]
-    ) throws {
-        for server in sessionConfiguration.mcpServers {
-            let resolvedBareCommandPath = try resolvedBareACPCommandPath(
-                for: server.command,
-                serverName: server.name,
-                environment: environment
-            )
-            try server.validateACPLaunchCommand(
-                workingDirectory: sessionConfiguration.workingDirectory,
-                resolvedBareCommandPath: resolvedBareCommandPath
-            )
-        }
-    }
-
-    private static func resolvedBareACPCommandPath(
-        for command: String,
-        serverName: String,
-        environment: [String: String]
-    ) throws -> String? {
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.range(of: #"[/~]"#, options: .regularExpression) == nil else { return nil }
-        let resolved = CommandPathResolver.resolve(
-            trimmed,
-            environment: environment,
-            additionalPaths: [],
-            preferredBasenames: [trimmed]
-        )
-        guard resolved != trimmed else {
-            throw RepoPromptMCPServerConfiguration.ACPCommandValidationError.unresolvedCommand(serverName: serverName, command: trimmed)
-        }
-        return resolved
     }
 
     private func logLaunchContract(command resolvedCommand: String, workingDirectory: String) {
