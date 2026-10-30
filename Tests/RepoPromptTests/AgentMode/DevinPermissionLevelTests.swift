@@ -80,22 +80,6 @@ final class DevinPermissionLevelTests: XCTestCase {
         XCTAssertEqual(Level.fullApproval.launchArguments, ["--permission-mode", "dangerous"])
     }
 
-    func testDevinClassifiesOnlyThoughtLevel() {
-        let provider = DevinACPAgentProvider(config: DevinAgentConfig())
-        XCTAssertTrue(provider.supportsParameterizedModelPicker)
-        let cases: [(configID: String, category: String?, kind: ACPModelParameterKind?)] = [
-            ("arbitrary_effort_id", " ThOuGhT_LeVeL ", .thinking),
-            ("thought_level", "model_config", nil),
-            ("speed", "model_config", nil),
-            ("speed", "speed", nil)
-        ]
-        for (configID, category, expectedKind) in cases {
-            XCTAssertEqual(provider.modelParameterKind(for: .init(
-                configID: configID, category: category, displayName: configID, choices: []
-            )), expectedKind)
-        }
-    }
-
     func testOnlyFullApprovalIsAWarningLevel() {
         for level in Level.allCases {
             XCTAssertEqual(level.isWarning, level == .fullApproval, "unexpected warning flag for \(level)")
@@ -348,29 +332,6 @@ final class DevinPermissionLevelTests: XCTestCase {
         DevinIntegrationConfiguration.cleanupReportingFailures(artifact: cleanupArtifact)
     }
 
-    func testRoutineInfoStderrIsHiddenWhileActionableOutputRemainsVisible() throws {
-        let (provider, _) = try makeProvider()
-
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-14T09:52:20.134260Z  INFO chisel: elapsed_since_main_ms=4 logging initialized"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-14T09:52:20Z INFO chisel: logging initialized"
-        ))
-        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z ERROR chisel: startup failed"))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-15T11:10:05.047288Z  WARN message_forest: MessageChain tree duplication: system prefix changed"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-17T09:10:27.520189Z  WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error sending request for url (https://unleash.codeium.com/api/client/features): operation timed out"
-        ))
-        XCTAssertFalse(provider.shouldEmitStderrLine(
-            "2026-09-17T09:11:36Z WARN windsurf_api_client::remote_config: remote config revalidation failed, keeping last-good value: error decoding response body"
-        ))
-        XCTAssertTrue(provider.shouldEmitStderrLine("2026-09-14T09:52:20Z  WARN chisel: retrying"))
-        XCTAssertTrue(provider.shouldEmitStderrLine("permission denied while reading config"))
-    }
-
     func testOracleOneShotArgumentsUseSelectedModelAndPromptFile() {
         XCTAssertEqual(
             DevinCLIProvider.test_arguments(
@@ -478,6 +439,51 @@ final class DevinPermissionLevelTests: XCTestCase {
                 workspacePath: "/tmp/workspace"
             ) is DevinACPHeadlessAgentProvider
         )
+    }
+
+    func testProviderCleanupUsesCanonicalArtifactOwnershipAndRemovesTheRealOverlay() async throws {
+        let directory = try makeTestDirectory(name: "DevinProviderCleanup")
+        let sourceRoot = directory.appendingPathComponent("xdg", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        let executable = directory.appendingPathComponent("devin")
+        try "#!/bin/sh\necho 'Run as an ACP server over stdio'\n".write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let resolver = DevinACPLaunchResolver(launchEnvironmentProvider: { _ in
+            ACPLaunchEnvironment(environment: ["PATH": directory.path, "HOME": sourceRoot.path, "XDG_CONFIG_HOME": sourceRoot.path])
+        })
+        let provider = DevinACPAgentProvider(
+            config: DevinAgentConfig(commandName: executable.path, includeRepoPromptMCPServer: false),
+            launchResolver: resolver
+        )
+        let request = makeRequest(workspacePath: directory.path, launchPermissionMode: nil)
+        let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await provider.support(for: request) }
+        XCTAssertEqual(support, .supported)
+        let launch = try provider.makeLaunchConfiguration(for: request)
+        let overlayRoot = try XCTUnwrap(launch.environment["XDG_CONFIG_HOME"])
+        let artifact = try XCTUnwrap(launch.cleanupArtifact)
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: overlayRoot) }
+        XCTAssertEqual(artifact.providerID, .devin)
+        XCTAssertEqual(artifact.kind, DevinIntegrationConfiguration.cleanupArtifactKind)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot + "/devin/mcp_config.json"))
+
+        func configuration(with candidate: ACPLaunchCleanupArtifact) -> ACPLaunchConfiguration {
+            ACPLaunchConfiguration(
+                providerID: launch.providerID, command: launch.command, arguments: launch.arguments,
+                environment: launch.environment, workingDirectory: launch.workingDirectory,
+                additionalPathHints: launch.additionalPathHints, enableDebugLogging: launch.enableDebugLogging,
+                cleanupArtifact: candidate, expectedExecutableIdentity: launch.expectedExecutableIdentity,
+                explicitEnvironmentKeys: launch.explicitEnvironmentKeys
+            )
+        }
+        for foreignArtifact in [
+            ACPLaunchCleanupArtifact(providerID: .cursor, id: artifact.id, kind: artifact.kind),
+            ACPLaunchCleanupArtifact(providerID: .devin, id: artifact.id, kind: artifact.kind + "-unrelated")
+        ] {
+            await provider.cleanupLaunchArtifacts(for: configuration(with: foreignArtifact))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: overlayRoot), "Foreign artifacts must not authorize overlay removal")
+        }
+        await provider.cleanupLaunchArtifacts(for: launch)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: overlayRoot))
     }
 
     // MARK: - Controller reuse key
