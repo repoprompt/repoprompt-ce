@@ -1,26 +1,24 @@
 import Darwin
-import RepoPromptAgentProviderContracts
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptProviderQuota
 
-final actor ClaudeNativeProcessSessionController {
-    private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
-    private static let lastRawEventLogFilePathKey = "claudeLastRawEventLogFilePath"
+package final actor ClaudeNativeProcessSessionController: NativeAgentRuntimeControlling {
     private static let rawEventTimestampFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
     }()
 
-    typealias TurnStatus = NativeAgentRuntimeTurnStatus
-    typealias RuntimeInitStatus = NativeAgentRuntimeRuntimeInitStatus
-    typealias Event = NativeAgentRuntimeEvent
-    typealias SessionRef = NativeAgentRuntimeSessionRef
-    typealias InterruptOutcome = NativeAgentRuntimeInterruptOutcome
-    typealias ControllerError = NativeAgentRuntimeControllerError
+    package typealias TurnStatus = NativeAgentRuntimeTurnStatus
+    package typealias RuntimeInitStatus = NativeAgentRuntimeRuntimeInitStatus
+    package typealias Event = NativeAgentRuntimeEvent
+    package typealias SessionRef = NativeAgentRuntimeSessionRef
+    package typealias InterruptOutcome = NativeAgentRuntimeInterruptOutcome
+    package typealias ControllerError = NativeAgentRuntimeControllerError
 
     private struct PendingPermissionRequest {
         let requestID: String
@@ -30,12 +28,12 @@ final actor ClaudeNativeProcessSessionController {
     private struct LaunchEnvironmentSignature: Equatable {
         let environmentOverrides: [String: String]
         let removedEnvironmentKeys: Set<String>
-        let backend: ClaudeCodeLaunchEnvironment.Backend
+        let backend: ClaudeCompatiblePluginBackendID?
 
-        init(_ launchEnvironment: ClaudeCodeLaunchEnvironment) {
+        init(_ launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment) {
             environmentOverrides = launchEnvironment.environmentOverrides
             removedEnvironmentKeys = launchEnvironment.removedEnvironmentKeys
-            backend = launchEnvironment.backend
+            backend = launchEnvironment.backendID
         }
     }
 
@@ -147,11 +145,11 @@ final actor ClaudeNativeProcessSessionController {
 
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     private var eventsStream: AsyncStream<Event>
-    var events: AsyncStream<Event> {
+    package var events: AsyncStream<Event> {
         eventsStream
     }
 
-    var hasActiveSession: Bool {
+    package var hasActiveSession: Bool {
         #if DEBUG
             if configurationTestWrite != nil { return true }
         #endif
@@ -221,7 +219,7 @@ final actor ClaudeNativeProcessSessionController {
     private func scheduleExpectedAgentPIDDeinitClearIfNeeded() {
         guard config.toolContext == .agentRun,
               let registeredExpectedAgentPID,
-              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
         else {
             return
         }
@@ -233,16 +231,16 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    var hasTurnInFlight: Bool {
+    package var hasTurnInFlight: Bool {
         turnInFlight
     }
 
     #if DEBUG
         private func reasoningDebug(_ message: @autoclosure () -> String) {
-            guard ClaudeReasoningExtractionFeature.isEnabled else { return }
+            guard host.isReasoningExtractionEnabled() else { return }
             let line = "[ClaudeReasoningDebug][Controller] run=\(runID.uuidString) tab=\(tabID.uuidString) \(message())"
             print(line)
-            ClaudeReasoningDebugLog.append(line)
+            host.appendReasoningDebug(line)
         }
     #else
         private func reasoningDebug(_ message: @autoclosure () -> String) {}
@@ -257,14 +255,14 @@ final actor ClaudeNativeProcessSessionController {
             .description
     }
 
-    init(
+    package init(
         host: any ClaudeNativeSessionHosting,
         runID: UUID,
         tabID: UUID,
         windowID: Int,
         workspacePath: String?,
         config: ClaudeCodeAgentConfig,
-        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
+        environmentResolver: any ClaudeCodeLaunchEnvironmentResolving,
         authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
     ) {
         self.host = host
@@ -275,16 +273,18 @@ final actor ClaudeNativeProcessSessionController {
         self.config = config
         self.environmentResolver = environmentResolver
         self.authoritativeTurnIdleFallbackSeconds = authoritativeTurnIdleFallbackSeconds
-        rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
+        rawEventFileLoggingEnabled = host.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
         rawEventLogFileSessionID = nil
-        translator = ClaudeSDKNDJSONTranslator(enableDebugLogging: config.enableDebugLogging)
+        translator = ClaudeSDKNDJSONTranslator(enableDebugLogging: config.enableDebugLogging) { name in
+            host.isRepoPromptToolName(name)
+        }
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
         eventsContinuation = stream.continuation
     }
 
-    func ensureEventsStreamReady() {
+    package func ensureEventsStreamReady() {
         guard eventsContinuation == nil else { return }
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
@@ -294,7 +294,7 @@ final actor ClaudeNativeProcessSessionController {
     /// Finish the old events stream and create a fresh one.  Call this when starting a new
     /// run after a previous run was cancelled, to discard any buffered stale events and to
     /// avoid reusing an AsyncStream whose iterator may have been poisoned by task cancellation.
-    func resetEventsStreamForNewRun() {
+    package func resetEventsStreamForNewRun() {
         eventsContinuation?.finish()
         eventsContinuation = nil
         let stream = Self.makeEventsStream()
@@ -302,7 +302,7 @@ final actor ClaudeNativeProcessSessionController {
         eventsContinuation = stream.continuation
     }
 
-    func startOrResume(
+    package func startOrResume(
         existingSessionID: String?,
         model: String?,
         effortLevel: ClaudeCodeEffortLevel? = nil,
@@ -318,7 +318,7 @@ final actor ClaudeNativeProcessSessionController {
                 let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
                 storeFlagSettingsRequest(resolved.request, selection: .init(
                     model: model,
-                    effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+                    effortLevel: resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
                 ))
                 try await initializeIfNeeded(systemPromptOverride: systemPromptOverride)
                 return SessionRef(sessionID: sessionID)
@@ -353,16 +353,16 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func currentSessionRef() async -> SessionRef {
+    package func currentSessionRef() async -> SessionRef {
         SessionRef(sessionID: sessionID)
     }
 
-    func availableSlashCommands() async -> [RuntimeInitStatus.InitializeResponseSnapshot.Command] {
+    package func availableSlashCommands() async -> [RuntimeInitStatus.InitializeResponseSnapshot.Command] {
         guard hasActiveSession, !isShuttingDown else { return [] }
         return initializeResponseSnapshot?.commands ?? []
     }
 
-    func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
+    package func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
         do {
             guard try await applyModelAndEffortForTurn(model: model, effortLevel: effortLevel, replacingFailure: nil) == .applied else {
                 throw ControllerError.invalidControlResponse("Flag settings application was superseded")
@@ -373,7 +373,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func applyModelAndEffortForTurn(
+    package func applyModelAndEffortForTurn(
         model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure?
     ) async throws -> NativeAgentRuntimeTurnConfigurationOutcome {
         switch try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure) {
@@ -384,14 +384,14 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func applyModelAndEffortWithProof(
+    package func applyModelAndEffortWithProof(
         model: String?,
         effortLevel: ClaudeCodeEffortLevel?
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
         try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: nil)
     }
 
-    func applyModelAndEffortWithProof(
+    package func applyModelAndEffortWithProof(
         model: String?, effortLevel: ClaudeCodeEffortLevel?, replacingFailure: NativeAgentRuntimeConfigurationFailure
     ) async throws -> NativeAgentRuntimeConfigurationApplication {
         try await applyConfiguration(model: model, effortLevel: effortLevel, replacingFailure: replacingFailure)
@@ -409,7 +409,7 @@ final actor ClaudeNativeProcessSessionController {
         // No suspension between failure-token validation and consuming its intent.
         let selection = ConfigurationSelection(
             model: model,
-            effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+            effortLevel: resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         )
         if hasActiveSession, isInitialized, !isShuttingDown,
            requestedConfiguration == selection, let proof = appliedConfigurationProof,
@@ -486,7 +486,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
+    package func sendUserMessage(_ text: String, configuration: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         #if DEBUG
             await configurationTestBeforeProofSend?()
         #endif
@@ -502,7 +502,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     @discardableResult
-    func sendUserMessage(_ text: String) async throws -> UUID {
+    package func sendUserMessage(_ text: String) async throws -> UUID {
         try writeUserMessage(text)
     }
 
@@ -518,7 +518,7 @@ final actor ClaudeNativeProcessSessionController {
         return id
     }
 
-    func interruptTurn(reason: String) async -> InterruptOutcome {
+    package func interruptTurn(reason: String) async -> InterruptOutcome {
         guard process != nil else { return .failed }
         return await interruptRunningTurn(reason: reason)
     }
@@ -573,7 +573,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
+    package func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
         guard let pending = pendingPermissionRequests.removeValue(forKey: id) else {
             return
         }
@@ -596,7 +596,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    func shutdown() async {
+    package func shutdown() async {
         guard !isShuttingDown else { return }
         isShuttingDown = true
         configurationLifetime = UUID()
@@ -670,13 +670,13 @@ final actor ClaudeNativeProcessSessionController {
         let resolvedCommand = CommandPathResolver.resolve(
             config.commandName,
             environment: environment,
-            additionalPaths: CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints),
+            additionalPaths: host.supplementedPathHints(config.additionalPathHints),
             logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : nil,
             preferredBasenames: [config.commandName]
         )
         storeFlagSettingsRequest(resolvedFlags.request, selection: .init(
             model: model,
-            effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
+            effortLevel: resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         var arguments = buildArguments(
@@ -684,9 +684,9 @@ final actor ClaudeNativeProcessSessionController {
             model: nil
         )
         #if DEBUG
-            arguments += ClaudeStatusLineCompatibilityProbe.claimSettingsArguments(
+            arguments += host.debugStatusLineArguments(
                 launchArguments: ProcessInfo.processInfo.arguments,
-                isFirstParty: launchEnvironment.backend == .defaultClaude,
+                isFirstParty: launchEnvironment.backendID == nil,
                 providerArguments: arguments
             )
         #endif
@@ -771,12 +771,12 @@ final actor ClaudeNativeProcessSessionController {
     private func resolveLaunchFlagSettings(
         model: String?,
         effortLevel suppliedEffortLevel: ClaudeCodeEffortLevel?
-    ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?) {
-        let modelSpecifier = model.map { ClaudeModelSpecifier(raw: $0) }
-        let requestedModel = modelSpecifier != nil
+    ) async throws -> (launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment, request: [String: Any]?) {
+        let hasModelSpecifier = host.hasModelSpecifier(model)
+        let requestedModel = hasModelSpecifier
             ? model
             : config.modelString
-        let effectiveEffortLevel = Self.resolvedEffortLevel(
+        let effectiveEffortLevel = resolvedEffortLevel(
             model: model,
             suppliedEffortLevel: suppliedEffortLevel,
             fallbackEffortLevel: config.effortLevel
@@ -788,7 +788,7 @@ final actor ClaudeNativeProcessSessionController {
         let requestEffortLevel = Self.shouldSuppressEffortSettings(for: launchEnvironment)
             ? nil
             : effectiveEffortLevel
-        let request = Self.buildApplyFlagSettingsRequest(
+        let request = buildApplyFlagSettingsRequest(
             model: launchEnvironment.effectiveModel,
             effortLevel: requestEffortLevel
         )
@@ -797,17 +797,17 @@ final actor ClaudeNativeProcessSessionController {
 
     /// A turn-scoped effort override must win over the picker's encoded baseline. Otherwise
     /// `claude-opus-5-5:high` silently defeats an Auto effort choice of low or medium.
-    private nonisolated static func resolvedEffortLevel(
+    private func resolvedEffortLevel(
         model: String?,
         suppliedEffortLevel: ClaudeCodeEffortLevel?,
         fallbackEffortLevel: ClaudeCodeEffortLevel?
     ) -> ClaudeCodeEffortLevel? {
         suppliedEffortLevel
-            ?? ClaudeModelSpecifier(raw: model).explicitEffortLevel
+            ?? host.explicitEffortLevel(for: model)
             ?? fallbackEffortLevel
     }
 
-    private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
+    private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment) -> Bool {
         guard let activeLaunchEnvironmentSignature else {
             return false
         }
@@ -868,11 +868,11 @@ final actor ClaudeNativeProcessSessionController {
         return request
     }
 
-    private static func shouldSuppressEffortSettings(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
+    private static func shouldSuppressEffortSettings(for launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment) -> Bool {
         launchEnvironment.suppressesEffortSettings
     }
 
-    private static func buildApplyFlagSettingsRequest(model: String?, effortLevel: ClaudeCodeEffortLevel?) -> [String: Any]? {
+    private func buildApplyFlagSettingsRequest(model: String?, effortLevel: ClaudeCodeEffortLevel?) -> [String: Any]? {
         var settings: [String: Any] = [:]
         if let model = normalizedFlagSettingsModel(model) {
             settings["model"] = model
@@ -887,10 +887,10 @@ final actor ClaudeNativeProcessSessionController {
         ]
     }
 
-    private static func normalizedFlagSettingsModel(_ raw: String?) -> String? {
+    private func normalizedFlagSettingsModel(_ raw: String?) -> String? {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return nil }
-        guard trimmed.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame else { return nil }
+        guard !host.isDefaultModel(trimmed) else { return nil }
         return trimmed
     }
 
@@ -1002,7 +1002,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private func startStdoutReader(handle: FileHandle) throws {
-        try ReadSourceFDPreflight.validateOpenFD(handle.fileDescriptor, label: "Claude stdout")
+        try host.validateReadSourceFD(handle.fileDescriptor, label: "Claude stdout")
         let channel = FileHandleChunkChannel()
         stdoutChunkChannel = channel
         handle.readabilityHandler = { readable in
@@ -1026,7 +1026,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private func startStderrReader(handle: FileHandle) throws {
-        try ReadSourceFDPreflight.validateOpenFD(handle.fileDescriptor, label: "Claude stderr")
+        try host.validateReadSourceFD(handle.fileDescriptor, label: "Claude stderr")
         let channel = FileHandleChunkChannel()
         stderrChunkChannel = channel
         handle.readabilityHandler = { readable in
@@ -1315,7 +1315,7 @@ final actor ClaudeNativeProcessSessionController {
         #endif
     }
 
-    static func recoverablePlaintextAssistantFragment(from lineData: Data) -> String? {
+    package static func recoverablePlaintextAssistantFragment(from lineData: Data) -> String? {
         guard let rawText = String(data: lineData, encoding: .utf8) else {
             return nil
         }
@@ -1412,7 +1412,7 @@ final actor ClaudeNativeProcessSessionController {
         guard !isShuttingDown else { return }
         recordObservedSessionID(Self.firstSessionIdentifier(in: payload))
         #if DEBUG
-            if ClaudeReasoningExtractionFeature.isEnabled {
+            if host.isReasoningExtractionEnabled() {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
                 if debugPayloadType == "stream_event" || debugPayloadType == "assistant" || debugPayloadType == "message" || debugPayloadType == "result" {
                     let event = payload["event"] as? [String: Any]
@@ -1487,7 +1487,7 @@ final actor ClaudeNativeProcessSessionController {
             emitSemanticUncertainty("Unclassified provider activity")
         }
         #if DEBUG
-            if ClaudeReasoningExtractionFeature.isEnabled {
+            if host.isReasoningExtractionEnabled() {
                 let debugPayloadType = (payload["type"] as? String) ?? "<missing>"
                 if streamResults.isEmpty {
                     let event = payload["event"] as? [String: Any]
@@ -1519,7 +1519,7 @@ final actor ClaudeNativeProcessSessionController {
         // arrive per turn.
         for result in streamResults {
             #if DEBUG
-                if ClaudeReasoningExtractionFeature.isEnabled, result.type == "reasoning" {
+                if host.isReasoningExtractionEnabled(), result.type == "reasoning" {
                     let text = result.reasoning ?? result.text ?? ""
                     reasoningDebug("emitting reasoning stream result len=\(text.count) snippet=\(reasoningDebugSnippet(text))")
                 }
@@ -1553,7 +1553,7 @@ final actor ClaudeNativeProcessSessionController {
                 writeRawEventLogRecord(kind: "translator.unownedStreamResult", payload: logPayload)
                 continue
             }
-            if Self.shouldSuppressUserFacingStreamResult(result) {
+            if shouldSuppressUserFacingStreamResult(result) {
                 emitSemanticUncertainty("Suppressed provider activity")
                 writeRawEventLogRecord(kind: "translator.streamResultSuppressed", payload: logPayload)
                 continue
@@ -1709,7 +1709,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    static func shouldSuppressUserFacingStreamResult(_ result: AIStreamResult) -> Bool {
+    package func shouldSuppressUserFacingStreamResult(_ result: RepoPromptDomainRuntime.AIStreamResult) -> Bool {
         // Reasoning is forwarded to Agent Mode as runtime-only status preview data.
         // Transcript suppression belongs in the view-model layer, not at this transport boundary.
         // Suppress Claude background task lifecycle notifications (task_started /
@@ -1729,7 +1729,7 @@ final actor ClaudeNativeProcessSessionController {
         else {
             return false
         }
-        return ClaudeAbortArtifactFilter.shouldSuppressUserFacingError(text)
+        return host.shouldSuppressAbortArtifact(text)
     }
 
     /// Extracts tools and MCP server statuses from a `system/init` stream payload.
@@ -1775,7 +1775,7 @@ final actor ClaudeNativeProcessSessionController {
 
     /// Best-effort parser for the initialize control response.
     /// Malformed entries are skipped; missing fields become nil/empty.
-    static func parseInitializeResponseSnapshot(
+    package static func parseInitializeResponseSnapshot(
         from response: [String: Any]
     ) -> RuntimeInitStatus.InitializeResponseSnapshot {
         let commands: [RuntimeInitStatus.InitializeResponseSnapshot.Command] = if let rawCommands = response["commands"] as? [[String: Any]] {
@@ -1896,21 +1896,21 @@ final actor ClaudeNativeProcessSessionController {
 
     #if DEBUG
         /// In-memory transport for deterministic control-ACK/write races; never starts a provider.
-        func test_handleConfigurationStdoutChunk(_ data: Data) async {
+        package func test_handleConfigurationStdoutChunk(_ data: Data) async {
             await handleStdoutChunk(data)
         }
 
-        func test_handleStdoutEOF() async {
+        package func test_handleStdoutEOF() async {
             await handleStdoutEOF()
         }
 
         /// Exercises the real interrupt body without claiming the fake owns an OS process.
-        func test_interruptRunningTurn(reason: String) async -> InterruptOutcome {
+        package func test_interruptRunningTurn(reason: String) async -> InterruptOutcome {
             guard hasActiveSession else { return .failed }
             return await interruptRunningTurn(reason: reason)
         }
 
-        func test_installConfigurationTransport(
+        package func test_installConfigurationTransport(
             initialized: Bool = true,
             controlRequest: (@Sendable ([String: Any]) async throws -> [String: Any])? = { _ in [:] },
             write: @escaping @Sendable (Data) throws -> Void
@@ -1931,39 +1931,35 @@ final actor ClaudeNativeProcessSessionController {
             configurationTestWrite = write
         }
 
-        func test_setBeforeApplicationErrorReturn(_ action: @escaping @Sendable () async -> Void) {
+        package func test_setBeforeApplicationErrorReturn(_ action: @escaping @Sendable () async -> Void) {
             configurationTestBeforeApplicationErrorReturn = action
         }
 
         /// Pauses at controller entry, before the non-suspending proof-check/write segment.
-        func test_setBeforeConfigurationSend(_ beforeSend: @escaping @Sendable () async -> Void) {
+        package func test_setBeforeConfigurationSend(_ beforeSend: @escaping @Sendable () async -> Void) {
             configurationTestBeforeProofSend = beforeSend
         }
 
         /// Exercises the real codec, request correlation, and success/error continuation path.
-        func test_receiveConfigurationResponseLine(_ line: Data) async {
+        package func test_receiveConfigurationResponseLine(_ line: Data) async {
             await handleLine(line)
         }
 
-        func test_setConfigurationControlRequest(
+        package func test_setConfigurationControlRequest(
             _ controlRequest: @escaping @Sendable ([String: Any]) async throws -> [String: Any]
         ) {
             configurationTestControlRequest = controlRequest
         }
 
-        static func test_isRawEventFileLoggingEnabled() -> Bool {
-            isRawEventFileLoggingEnabled()
-        }
-
-        func test_determineTurnStatus(payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
+        package func test_determineTurnStatus(payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
             determineTurnStatus(from: payload, stopReasonHint: stopReasonHint)
         }
 
-        func test_setTurnWasInterrupted(_ value: Bool) {
+        package func test_setTurnWasInterrupted(_ value: Bool) {
             turnWasInterrupted = value
         }
 
-        func test_effectiveLaunchEnvironment(
+        package func test_effectiveLaunchEnvironment(
             base: [String: String],
             resolverOverrides: [String: String] = [:],
             resolverRemovedKeys: Set<String> = []
@@ -1975,28 +1971,28 @@ final actor ClaudeNativeProcessSessionController {
             )
         }
 
-        func test_liveFlagSettingsRequiresProcessRestart(
-            activeLaunchEnvironment: ClaudeCodeLaunchEnvironment,
-            nextLaunchEnvironment: ClaudeCodeLaunchEnvironment
+        package func test_liveFlagSettingsRequiresProcessRestart(
+            activeLaunchEnvironment: ClaudeCompatiblePluginLaunchEnvironment,
+            nextLaunchEnvironment: ClaudeCompatiblePluginLaunchEnvironment
         ) -> Bool {
             activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(activeLaunchEnvironment)
             return liveFlagSettingsRequiresProcessRestart(for: nextLaunchEnvironment)
         }
 
         /// Build the initialize control request payload for testing.
-        func test_buildInitializeRequest(systemPromptOverride: String? = nil) -> [String: Any] {
+        package func test_buildInitializeRequest(systemPromptOverride: String? = nil) -> [String: Any] {
             Self.buildInitializeRequest(systemPromptOverride: systemPromptOverride)
         }
 
         /// Build the initial flag-settings control request payload for testing.
-        func test_buildApplyFlagSettingsRequest(
+        package func test_buildApplyFlagSettingsRequest(
             model: String? = nil,
             effortLevel: ClaudeCodeEffortLevel? = nil
         ) -> [String: Any]? {
-            Self.buildApplyFlagSettingsRequest(model: model, effortLevel: effortLevel)
+            buildApplyFlagSettingsRequest(model: model, effortLevel: effortLevel)
         }
 
-        func test_resolveApplyFlagSettingsRequest(
+        package func test_resolveApplyFlagSettingsRequest(
             model: String? = nil,
             effortLevel: ClaudeCodeEffortLevel? = nil
         ) async throws -> [String: Any]? {
@@ -2004,12 +2000,12 @@ final actor ClaudeNativeProcessSessionController {
         }
 
         /// Build the initial permission-mode control request payload for testing.
-        func test_buildSetPermissionModeRequest(permissionMode: String? = nil) -> [String: Any]? {
+        package func test_buildSetPermissionModeRequest(permissionMode: String? = nil) -> [String: Any]? {
             Self.buildSetPermissionModeRequest(permissionMode: permissionMode ?? config.permissionMode)
         }
 
         /// Build CLI arguments for testing (verifies prompt flags are absent).
-        func test_buildArguments(
+        package func test_buildArguments(
             existingSessionID: String?,
             model: String?
         ) -> [String] {
@@ -2017,15 +2013,15 @@ final actor ClaudeNativeProcessSessionController {
         }
 
         @discardableResult
-        func test_beginTurnTracking() -> UUID {
+        package func test_beginTurnTracking() -> UUID {
             beginTurnTracking()
         }
 
-        func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
+        package func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
             pendingPermissionRequests[id] = PendingPermissionRequest(requestID: id, request: request)
         }
 
-        func test_handleControlRequest(
+        package func test_handleControlRequest(
             requestID: String,
             subtype: String,
             request: [String: Any]
@@ -2085,7 +2081,7 @@ final actor ClaudeNativeProcessSessionController {
             let payload = request.request
             let toolName = (payload["tool_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let input = payload["input"] as? [String: Any] ?? [:]
-            if let repoPromptMatch = Self.repoPromptPermissionAutoApprovalMatch(toolName: toolName, requestPayload: payload) {
+            if let repoPromptMatch = host.repoPromptPermissionMatch(toolName: toolName, requestPayload: payload) {
                 do {
                     let allowResponse = Self.allowPermissionResponsePayload(
                         pendingRequest: payload,
@@ -2094,7 +2090,7 @@ final actor ClaudeNativeProcessSessionController {
                     writeRawEventLogRecord(kind: "approval.autoApprove.repoPrompt", payload: [
                         "requestID": request.requestID,
                         "toolName": toolName,
-                        "matchSource": repoPromptMatch.source.rawValue,
+                        "matchSource": repoPromptMatch.source,
                         "normalizedToolName": repoPromptMatch.normalizedToolName ?? NSNull(),
                         "serverIdentifier": repoPromptMatch.serverIdentifier ?? NSNull(),
                         "response": allowResponse
@@ -2421,7 +2417,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    nonisolated static func allowPermissionResponsePayload(
+    package nonisolated static func allowPermissionResponsePayload(
         pendingRequest: [String: Any],
         includeUpdatedPermissions: Bool
     ) -> [String: Any] {
@@ -2441,23 +2437,6 @@ final actor ClaudeNativeProcessSessionController {
         return payload
     }
 
-    nonisolated static func shouldAutoApproveRepoPromptPermissionRequest(
-        toolName: String,
-        input: [String: Any]
-    ) -> Bool {
-        repoPromptPermissionAutoApprovalMatch(toolName: toolName, requestPayload: input) != nil
-    }
-
-    nonisolated static func repoPromptPermissionAutoApprovalMatch(
-        toolName: String,
-        requestPayload: [String: Any]
-    ) -> MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch? {
-        MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-            requestToolName: toolName,
-            requestPayload: requestPayload
-        )
-    }
-
     private func resolvedWorkingDirectory() -> String {
         let trimmedWorkspace = workspacePath?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmedWorkspace, !trimmedWorkspace.isEmpty {
@@ -2468,7 +2447,7 @@ final actor ClaudeNativeProcessSessionController {
 
     private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {
         guard config.toolContext == .agentRun,
-              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
         else {
             return
         }
@@ -2488,7 +2467,7 @@ final actor ClaudeNativeProcessSessionController {
 
     private func clearExpectedAgentPIDIfNeeded() async {
         guard let registeredExpectedAgentPID,
-              let clientName = config.runtimeVariant.agentKind.mcpClientNameHint
+              let clientName = host.expectedAgentClientName(for: config.runtimeVariant)
         else {
             return
         }
@@ -2528,10 +2507,7 @@ final actor ClaudeNativeProcessSessionController {
                 enableDebugLogging: config.enableDebugLogging
             )
         )
-        let filtered = await ProviderEnvironmentFiltering.filter(
-            result.environment,
-            for: config.runtimeVariant.agentKind
-        )
+        let filtered = await host.filterEnvironment(result.environment, variant: config.runtimeVariant)
         return effectiveLaunchEnvironment(
             base: filtered,
             resolverOverrides: resolverOverrides,
@@ -2554,7 +2530,7 @@ final actor ClaudeNativeProcessSessionController {
         if !config.toolSearchEnabled {
             env["ENABLE_TOOL_SEARCH"] = "false"
         }
-        for (key, value) in config.processEnvironmentOverrides {
+        for (key, value) in host.processEnvironmentOverrides(for: config.toolContext) {
             env[key] = value
         }
         for (key, value) in resolverOverrides {
@@ -2564,7 +2540,7 @@ final actor ClaudeNativeProcessSessionController {
             env,
             additionalRemovedKeys: Set(["NODE_OPTIONS"]).union(resolverRemovedKeys)
         )
-        return DomainChildLaunchEnvironmentBridge.mergingCurrentCarrier(into: sanitized)
+        return host.mergeCurrentCarrier(into: sanitized)
     }
 
     private func recordObservedSessionID(_ candidate: String?) {
@@ -2581,22 +2557,6 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    private static let rawEventLoggingEnabledKey = "claudeRawEventLoggingEnabled"
-
-    private static func isRawEventFileLoggingEnabled(defaults: UserDefaults = .standard) -> Bool {
-        #if DEBUG
-            defaults.bool(forKey: rawEventLoggingEnabledKey)
-        #else
-            false
-        #endif
-    }
-
-    #if DEBUG
-        static func test_isRawEventFileLoggingEnabled(defaults: UserDefaults) -> Bool {
-            isRawEventFileLoggingEnabled(defaults: defaults)
-        }
-    #endif
-
     private static func normalizedSessionIdentifier(_ raw: String?) -> String {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !trimmed.isEmpty else { return "unknown-session" }
@@ -2608,58 +2568,19 @@ final actor ClaudeNativeProcessSessionController {
         return normalized.isEmpty ? "unknown-session" : normalized
     }
 
-    private static func makeRawEventLogFileURL(
-        workspacePath: String?,
-        sessionID: String,
-        defaults: UserDefaults = .standard
-    ) -> URL? {
-        let overridePath = defaults.string(forKey: rawEventLogFilePathKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseDirectory: URL = {
-            if let overridePath, !overridePath.isEmpty {
-                let expanded = NSString(string: overridePath).expandingTildeInPath
-                return URL(fileURLWithPath: expanded, isDirectory: true)
-            }
-            return MCPFilesystemConstants.identity.temporaryRootURL()
-                .appendingPathComponent("ClaudeRawEvents", isDirectory: true)
-        }()
-        do {
-            try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
-        } catch {
-            return nil
-        }
-        let timestampFormatter = DateFormatter()
-        timestampFormatter.locale = Locale(identifier: "en_US_POSIX")
-        timestampFormatter.timeZone = TimeZone(secondsFromGMT: 0)
-        timestampFormatter.dateFormat = "yyyyMMdd-HHmmss"
-        let timestamp = timestampFormatter.string(from: Date())
-        let fileName = "claude-session-\(sessionID)-\(timestamp).jsonl"
-        return baseDirectory.appendingPathComponent(fileName)
-    }
-
-    #if DEBUG
-        static func test_makeRawEventLogFileURL(
-            workspacePath: String?,
-            sessionID: String,
-            defaults: UserDefaults
-        ) -> URL? {
-            makeRawEventLogFileURL(workspacePath: workspacePath, sessionID: sessionID, defaults: defaults)
-        }
-    #endif
-
     private func ensureRawEventLogFileReadyIfNeeded(sessionIDHint: String?) {
         guard rawEventFileLoggingEnabled else { return }
         let effectiveSessionID = Self.normalizedSessionIdentifier(sessionIDHint ?? sessionID ?? tabID.uuidString)
         if rawEventLogFileURL != nil, rawEventLogFileSessionID == effectiveSessionID {
             return
         }
-        guard let fileURL = Self.makeRawEventLogFileURL(workspacePath: workspacePath, sessionID: effectiveSessionID) else {
+        guard let fileURL = host.makeRawEventLogFileURL(workspacePath: workspacePath, sessionID: effectiveSessionID) else {
             return
         }
         rawEventLogFileURL = fileURL
         rawEventLogFileSessionID = effectiveSessionID
         hasWrittenRawEventLogHeader = false
-        UserDefaults.standard.set(fileURL.path, forKey: Self.lastRawEventLogFilePathKey)
+        host.recordLastRawEventLogFileURL(fileURL)
     }
 
     private func appendRawEventLogRecord(_ record: [String: Any]) {
@@ -2813,7 +2734,7 @@ final actor ClaudeNativeProcessSessionController {
 
     private func emit(_ event: Event) {
         #if DEBUG
-            if ClaudeReasoningExtractionFeature.isEnabled,
+            if host.isReasoningExtractionEnabled(),
                case let .stream(result) = event,
                result.type == "reasoning"
             {

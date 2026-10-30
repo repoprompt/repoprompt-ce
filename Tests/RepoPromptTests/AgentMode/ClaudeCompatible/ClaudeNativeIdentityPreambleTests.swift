@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import XCTest
 
 /// Regression coverage for the GLM/z.ai identity-preamble fix (issue #295).

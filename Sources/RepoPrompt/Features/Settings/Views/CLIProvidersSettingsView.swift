@@ -1,6 +1,7 @@
 import AppKit
 import RepoPromptACPProviders
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptProcess
 import SwiftUI
 

@@ -1,5 +1,7 @@
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptFoundation
 import RepoPromptProcess
 
@@ -10,7 +12,7 @@ struct HeadlessAgentContext {
     /// Working directory for the agent. Defaults to temp directory to avoid macOS security popups.
     let workingDirectory: String
     let environment: [String: String]
-    let launchEnvironment: ClaudeCodeLaunchEnvironment?
+    let launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment?
 
     init(
         runID: UUID,
@@ -18,7 +20,7 @@ struct HeadlessAgentContext {
         configLease: MCPConfigLease? = nil,
         workingDirectory: String? = nil,
         environment: [String: String],
-        launchEnvironment: ClaudeCodeLaunchEnvironment? = nil
+        launchEnvironment: ClaudeCompatiblePluginLaunchEnvironment? = nil
     ) {
         self.runID = runID
         self.configLease = configLease

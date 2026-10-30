@@ -15,5 +15,3 @@ extension NativeAgentRuntimeRuntimeInitStatus {
         return status == "failed"
     }
 }
-
-extension ClaudeNativeProcessSessionController: NativeAgentRuntimeControlling {}

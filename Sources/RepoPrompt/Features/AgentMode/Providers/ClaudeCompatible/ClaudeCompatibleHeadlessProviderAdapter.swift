@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptAgentProviderContracts
+import RepoPromptClaudeProvider
 
 /// Headless seam for the Claude-compatible plugin path.
 ///

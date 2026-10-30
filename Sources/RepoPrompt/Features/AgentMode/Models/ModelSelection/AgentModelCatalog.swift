@@ -1,7 +1,8 @@
 import Foundation
-import RepoPromptAgentProviderContracts
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptCodexProvider
 import RepoPromptSettingsCore
 
@@ -2302,14 +2303,4 @@ enum AgentModelCatalog {
         }
         return grantedCaps.map(\.externalName).sorted()
     }
-
-    #if DEBUG
-        @_spi(TestSupport)
-        public static func test_mergeCodexOptions(
-            primary: [AgentModelOption],
-            fallback: [AgentModelOption]
-        ) -> [AgentModelOption] {
-            AgentModelCatalogRuntime.shared.codexRegistry.test_mergeCodexOptions(primary: primary, fallback: fallback)
-        }
-    #endif
 }

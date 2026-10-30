@@ -2,6 +2,7 @@ import Foundation
 import MCP
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import XCTest
@@ -535,7 +536,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
                 let attemptID = UUID()
                 session.installRunID(runID)
                 session.beginRunAttempt(source: "compaction-replay", attemptID: attemptID)
-                var translator = ClaudeSDKNDJSONTranslator()
+                var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
                 let sidebar = AgentRuntimeSidebarViewModel()
                 func consume(_ line: String) async throws {
                     var envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])

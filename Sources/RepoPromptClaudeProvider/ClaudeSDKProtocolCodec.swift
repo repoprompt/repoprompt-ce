@@ -5,8 +5,8 @@ import Foundation
 /// The parsing/encoding implementation lives in the Claude-compatible provider
 /// package. This facade preserves the core controller's existing `[String: Any]`
 /// shape while routing protocol rules through the package-owned DTO codec.
-enum ClaudeSDKProtocolCodec {
-    enum InboundMessage {
+package enum ClaudeSDKProtocolCodec {
+    package enum InboundMessage {
         case streamPayload([String: Any])
         case controlRequest(ControlRequest)
         case controlResponse(ControlResponse)
@@ -14,26 +14,26 @@ enum ClaudeSDKProtocolCodec {
         case keepAlive
     }
 
-    struct ControlRequest {
-        let requestID: String
-        let request: [String: Any]
-        let subtype: String
+    package struct ControlRequest {
+        package let requestID: String
+        package let request: [String: Any]
+        package let subtype: String
     }
 
-    struct ControlResponse {
-        let requestID: String
-        let subtype: String
-        let response: [String: Any]?
-        let error: String?
-        let pendingPermissionRequests: [[String: Any]]
+    package struct ControlResponse {
+        package let requestID: String
+        package let subtype: String
+        package let response: [String: Any]?
+        package let error: String?
+        package let pendingPermissionRequests: [[String: Any]]
     }
 
-    enum CodecError: Error {
+    package enum CodecError: Error {
         case invalidJSON
         case unsupportedPayload
     }
 
-    static func decodeLine(_ lineData: Data) throws -> InboundMessage? {
+    package static func decodeLine(_ lineData: Data) throws -> InboundMessage? {
         do {
             guard let inbound = try ClaudeCompatiblePluginProtocolCodec.decodeLine(lineData) else {
                 return nil
@@ -44,25 +44,25 @@ enum ClaudeSDKProtocolCodec {
         }
     }
 
-    static func encodeControlRequest(requestID: String, request: [String: Any]) throws -> Data {
+    package static func encodeControlRequest(requestID: String, request: [String: Any]) throws -> Data {
         try ClaudeCompatiblePluginProtocolCodec.encodeControlRequest(
             requestID: requestID,
             request: pluginJSONObject(from: request)
         )
     }
 
-    static func encodeControlResponseSuccess(requestID: String, response: [String: Any]? = nil) throws -> Data {
+    package static func encodeControlResponseSuccess(requestID: String, response: [String: Any]? = nil) throws -> Data {
         try ClaudeCompatiblePluginProtocolCodec.encodeControlResponseSuccess(
             requestID: requestID,
             response: response.map(pluginJSONObject(from:))
         )
     }
 
-    static func encodeControlResponseError(requestID: String, error: String) throws -> Data {
+    package static func encodeControlResponseError(requestID: String, error: String) throws -> Data {
         try ClaudeCompatiblePluginProtocolCodec.encodeControlResponseError(requestID: requestID, error: error)
     }
 
-    static func encodeUserMessage(text: String, sessionID: String?, uuid: UUID? = nil) throws -> Data {
+    package static func encodeUserMessage(text: String, sessionID: String?, uuid: UUID? = nil) throws -> Data {
         try ClaudeCompatiblePluginProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID, uuid: uuid)
     }
 

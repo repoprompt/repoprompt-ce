@@ -180,12 +180,12 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     }
     if (
         _by_name_dependencies(domain_runtime)
-        != ["RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"]
+        != ["RepoPromptAIContracts", "RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"]
         or domain_runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")}
-        or len(domain_runtime.get("dependencies", [])) != 6
+        or len(domain_runtime.get("dependencies", [])) != 7
     ):
         raise GeneratorError(
-            "RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, "
+            "RepoPromptDomainRuntime dependencies must remain RepoPromptAIContracts, RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, "
             "RepoPromptCodeMapCore, Logging, and pinned MCP"
         )
 

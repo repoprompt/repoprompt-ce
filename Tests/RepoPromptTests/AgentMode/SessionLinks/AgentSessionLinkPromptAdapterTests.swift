@@ -1,6 +1,6 @@
 import Foundation
-import RepoPromptAgentProviderContracts
 import MCP
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptCodexProvider
 import RepoPromptSecureStorage

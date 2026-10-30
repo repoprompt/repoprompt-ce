@@ -1,8 +1,9 @@
 import Combine
-import RepoPromptAgentProviderContracts
 import Foundation
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 import RepoPromptSecureStorage

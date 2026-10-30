@@ -1,9 +1,10 @@
 import Darwin
-import RepoPromptAgentProviderContracts
 import Foundation
 import JSONSchema
 import MCP
+import RepoPromptAgentProviderContracts
 @testable import RepoPromptApp
+import RepoPromptClaudeProvider
 import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
@@ -112,7 +113,7 @@ import XCTest
                 var terminalTask: Task<Void, Never>?
                 var requestTask: Task<PersistentMCPTestRPCResponse, Error>?
                 var siblingTask: Task<PersistentMCPTestRPCResponse, Error>?
-                var translator = ClaudeSDKNDJSONTranslator()
+                var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
                 var nativeObserverTask: Task<Void, Never>?
                 var nativeDelivery: XCTestExpectation?
                 var nativeLocalIDs: [UUID] = []
@@ -459,7 +460,7 @@ import XCTest
                 var owner = session.beginRunAttempt(source: "W0-candidate-native-metadata")
                 session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
                 let handler = harness.host.test_claudeCoordinator.testToolTrackingHandler(for: session)
-                var translator = ClaudeSDKNDJSONTranslator()
+                var translator = ClaudeSDKNDJSONTranslator(isRepoPromptToolName: { MCPIntegrationHelper.isRepoPromptToolName($0) })
                 var contexts: [ToolInvocationContext] = []
                 let name = "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file"
                 let path = fixture.contextA.fileURL.path

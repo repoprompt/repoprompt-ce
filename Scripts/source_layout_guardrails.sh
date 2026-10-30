@@ -27,6 +27,13 @@ print_matches() {
   fi
 }
 
+# Match tokens rather than filtering whole lines: a neutral contract type must not hide a
+# forbidden implementation beside it. Keep AgentProviderKind's prefix/suffix lookalikes banned.
+domain_runtime_implementation_matches() {
+  grep -R -n -o -E 'WindowState|ViewModel|[[:alnum:]_]*AgentProvider[[:alnum:]_]*|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$1" |
+    grep -v -E ':AgentProviderKind$'
+}
+
 # 0. Required layout roots/files should exist before negative scans run.
 required_dirs=(
   "Sources/RepoPromptExecutable"
@@ -286,8 +293,8 @@ else:
         for dependency in domain_runtime.get("dependencies", [])
         if "product" in dependency
     }
-    if runtime_by_name != ["RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 6:
-        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
+    if runtime_by_name != ["RepoPromptAIContracts", "RepoPromptShared", "RepoPromptWorkspaceCore", "RepoPromptC", "RepoPromptCodeMapCore"] or runtime_products != {("Logging", "swift-log"), ("MCP", "swift-sdk")} or len(domain_runtime.get("dependencies", [])) != 7:
+        errors.append("RepoPromptDomainRuntime dependencies must remain RepoPromptAIContracts, RepoPromptShared, RepoPromptWorkspaceCore, RepoPromptC, RepoPromptCodeMapCore, Logging, and pinned MCP")
 if domain_runtime_tests is None:
     errors.append("RepoPromptDomainRuntimeTests target missing")
 else:
@@ -511,7 +518,7 @@ PY
   fi
   print_matches \
     "RepoPromptDomainRuntime contains app/UI/provider implementation" \
-    grep -R -n -E 'WindowState|ViewModel|AgentProvider|Claude[^[:space:]]*Provider|Codex[^[:space:]]*Provider|OpenCode[^[:space:]]*Provider|Cursor[^[:space:]]*Provider' "$domain_runtime_source_dir"
+    domain_runtime_implementation_matches "$domain_runtime_source_dir"
   print_matches \
     "RepoPromptDomainRuntime reintroduced random window incarnations" \
     grep -R -n -E 'windowGeneration.*random|UInt64\.random' "$domain_runtime_source_dir"

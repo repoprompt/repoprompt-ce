@@ -1,7 +1,9 @@
 import Foundation
 import Logging
 import RepoPromptACPProviders
+import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
+import RepoPromptClaudeProvider
 import RepoPromptProcess
 import RepoPromptSettingsCore
 

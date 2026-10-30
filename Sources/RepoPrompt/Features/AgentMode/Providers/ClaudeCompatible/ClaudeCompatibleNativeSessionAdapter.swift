@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAgentProviderContracts
+import RepoPromptClaudeProvider
 import RepoPromptDomainRuntime
 
 /// Interactive native-runtime seam for the Claude-compatible plugin path.

@@ -1,7 +1,8 @@
 import Foundation
 
 /// Transport-local input ownership. Resolved inputs leave this owner before idle deferral.
-struct ClaudeNativeTurnCorrelation {
+package struct ClaudeNativeTurnCorrelation {
+    package init() {}
     private struct Execution {
         let id: UUID
         var inputIDs: Set<UUID>
@@ -9,7 +10,7 @@ struct ClaudeNativeTurnCorrelation {
         var observedForeignInputIDs: Set<UUID> = []
     }
 
-    enum CorrelationError: Error {
+    package enum CorrelationError: Error {
         case invalidInputIdentity
         case missingAnswerIdentity
     }
@@ -29,16 +30,16 @@ struct ClaudeNativeTurnCorrelation {
 
     private var interrupt: Interrupt?
 
-    var hasOutstanding: Bool {
+    package var hasOutstanding: Bool {
         !outstanding.isEmpty
     }
 
-    var ownsOutput: Bool {
+    package var ownsOutput: Bool {
         guard messageHasHostOwner, let execution else { return false }
         return !execution.inputIDs.isDisjoint(with: outstanding)
     }
 
-    mutating func observeInit(_ payload: [String: Any]) {
+    package mutating func observeInit(_ payload: [String: Any]) {
         guard !enabled,
               let version = payload["claude_code_version"] as? String,
               let capabilities = payload["capabilities"] as? [String],
@@ -50,14 +51,14 @@ struct ClaudeNativeTurnCorrelation {
         enabled = !parts.lexicographicallyPrecedes([2, 1, 292])
     }
 
-    mutating func register(_ id: UUID) {
+    package mutating func register(_ id: UUID) {
         outstanding.insert(id)
         order.append(id)
     }
 
     /// Preserve context across unstamped later blocks; a pickup adds inputs to the same execution.
     @discardableResult
-    mutating func observeActivity(_ payload: [String: Any]) throws -> Bool {
+    package mutating func observeActivity(_ payload: [String: Any]) throws -> Bool {
         guard enabled else { return true }
         let ids = try Self.inputIDs(payload)
         if let ids {
@@ -86,17 +87,17 @@ struct ClaudeNativeTurnCorrelation {
 
     /// Accepted inputs are not execution evidence. A pre-reply interrupt stays unresolved
     /// until activity or an answering result identifies what the CLI was executing.
-    mutating func beginInterrupt() -> UUID {
+    package mutating func beginInterrupt() -> UUID {
         let token = UUID()
         interrupt = Interrupt(token: token, executionID: execution?.id)
         return token
     }
 
-    func isInterruptPending(_ token: UUID) -> Bool {
+    package func isInterruptPending(_ token: UUID) -> Bool {
         interrupt?.token == token
     }
 
-    mutating func acknowledgeInterrupt(_ token: UUID) {
+    package mutating func acknowledgeInterrupt(_ token: UUID) {
         // Retain evidence that an unobserved execution may still report its abort,
         // but do not bind this ACK to work that starts later.
         if interrupt?.token == token, interrupt?.executionID == nil {
@@ -104,7 +105,7 @@ struct ClaudeNativeTurnCorrelation {
         }
     }
 
-    mutating func abandonInterrupt(_ token: UUID) {
+    package mutating func abandonInterrupt(_ token: UUID) {
         guard interrupt?.token == token else { return }
         // A missing ACK does not prove the CLI ignored the request. Retain only
         // possible abort evidence, never a cancellation binding for a later input.
@@ -118,7 +119,7 @@ struct ClaudeNativeTurnCorrelation {
         }
     }
 
-    mutating func resolve(_ payload: [String: Any]) throws -> (executionID: UUID, inputIDs: [UUID], interrupted: Bool) {
+    package mutating func resolve(_ payload: [String: Any]) throws -> (executionID: UUID, inputIDs: [UUID], interrupted: Bool) {
         let ids = try Self.inputIDs(payload) ?? []
         // A session-scoped error before any execution evidence cannot answer a particular
         // input. Retire the failed transport rather than leave accepted inputs hanging.
@@ -156,7 +157,7 @@ struct ClaudeNativeTurnCorrelation {
         return (executionID, matched, interrupted)
     }
 
-    mutating func takeFirst() -> UUID? {
+    package mutating func takeFirst() -> UUID? {
         guard let id = firstOutstanding else { return nil }
         outstanding.remove(id)
         compact()
@@ -164,7 +165,7 @@ struct ClaudeNativeTurnCorrelation {
     }
 
     /// Only transport retirement calls this: eligibility and interrupt bindings retire too.
-    mutating func drain() -> [UUID] {
+    package mutating func drain() -> [UUID] {
         let ids = order[head...].filter { outstanding.contains($0) }
         self = Self()
         return ids
@@ -185,7 +186,7 @@ struct ClaudeNativeTurnCorrelation {
     }
 
     /// Singular is the last input, not a substitute for a malformed plural group.
-    static func inputIDs(_ payload: [String: Any]) throws -> [UUID]? {
+    package static func inputIDs(_ payload: [String: Any]) throws -> [UUID]? {
         let singular: UUID?
         if let raw = payload["user_message_uuid"], !(raw is NSNull) {
             guard let text = raw as? String, let id = UUID(uuidString: text) else {
