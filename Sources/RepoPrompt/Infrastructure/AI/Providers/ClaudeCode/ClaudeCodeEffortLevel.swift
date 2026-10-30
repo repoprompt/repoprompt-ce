@@ -1,8 +1,10 @@
 import Foundation
 
+package typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel
+
 // MARK: - Claude Code Effort Level
 
-enum ClaudeCodeEffortLevel: String, CaseIterable {
+package enum ClaudeCodeEffortLevel: String, CaseIterable {
     // Ordered highest → lowest so UI pickers and variant menus list the
     // strongest effort first. `allCases` drives both `AgentInputBar`'s Claude
     // effort picker and `claudeEffortSortRank` in `AgentModelCatalog`.
@@ -12,7 +14,7 @@ enum ClaudeCodeEffortLevel: String, CaseIterable {
     case medium
     case low
 
-    static func parse(_ raw: String?) -> ClaudeCodeEffortLevel? {
+    package static func parse(_ raw: String?) -> ClaudeCodeEffortLevel? {
         let normalized = raw?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -33,7 +35,7 @@ enum ClaudeCodeEffortLevel: String, CaseIterable {
         }
     }
 
-    var displayName: String {
+    package var displayName: String {
         switch self {
         case .low: "Low"
         case .medium: "Medium"
@@ -44,7 +46,7 @@ enum ClaudeCodeEffortLevel: String, CaseIterable {
     }
 
     /// Value passed to the `CLAUDE_CODE_EFFORT_LEVEL` environment variable.
-    var envValue: String {
+    package var envValue: String {
         rawValue
     }
 }

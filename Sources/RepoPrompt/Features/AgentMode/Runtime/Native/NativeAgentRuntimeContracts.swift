@@ -8,7 +8,7 @@ import RepoPromptDomainRuntime
 /// use core app models (`AIStreamResult`, `AgentApprovalRequest`, and
 /// `AgentApprovalDecision`) because adapters/bridges are expected to translate
 /// plugin-owned DTOs before events reach Agent Mode.
-protocol NativeAgentRuntimeControlling: Actor {
+package protocol NativeAgentRuntimeControlling: Actor {
     var hasActiveSession: Bool { get async }
     var hasTurnInFlight: Bool { get async }
     var events: AsyncStream<NativeAgentRuntimeEvent> { get async }
@@ -37,12 +37,12 @@ protocol NativeAgentRuntimeControlling: Actor {
     /// Sends a reasoned interrupt request to the provider runtime.
     /// - Parameter reason: "interrupt" for steering (graceful), "cancel" for forceful stop.
     func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome
-    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> RepoPromptDomainRuntime.ProviderConversationCleanupOutcome
     func shutdown() async
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
 }
 
-extension NativeAgentRuntimeControlling {
+package extension NativeAgentRuntimeControlling {
     func availableSlashCommands() async -> [NativeAgentRuntimeSlashCommand] {
         []
     }
@@ -70,27 +70,7 @@ extension NativeAgentRuntimeControlling {
         throw NativeAgentRuntimeControllerError.configurationNotCurrent
     }
 
-    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> ProviderConversationCleanupOutcome {
+    func cleanupConversation(_ handle: ProviderConversationCleanupHandle, action: ProviderConversationCleanupAction) async -> RepoPromptDomainRuntime.ProviderConversationCleanupOutcome {
         .unsupported(message: "Native runtime has no local API for \(action.rawValue) cleanup of conversations.")
     }
 }
-
-extension NativeAgentRuntimeRuntimeInitStatus {
-    var repoPromptServerStatus: String? {
-        mcpServerStatuses.first {
-            $0.key.compare(MCPIntegrationHelper.repoPromptMCPServerName, options: .caseInsensitive) == .orderedSame
-        }?.value
-    }
-
-    var isRepoPromptServerFailed: Bool {
-        guard let status = repoPromptServerStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
-            return false
-        }
-        return status == "failed"
-    }
-}
-
-// The value vocabulary is provider-neutral; the concrete controller conforms here.
-typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel
-
-extension ClaudeNativeProcessSessionController: NativeAgentRuntimeControlling {}

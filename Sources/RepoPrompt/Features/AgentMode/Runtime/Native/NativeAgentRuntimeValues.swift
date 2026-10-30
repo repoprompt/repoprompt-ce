@@ -2,21 +2,21 @@ import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptProviderQuota
 
-enum NativeAgentRuntimeTurnStatus {
+package enum NativeAgentRuntimeTurnStatus {
     case completed
     case cancelled
     case failed
 }
 
-struct NativeAgentRuntimeRuntimeInitStatus: Equatable {
-    struct InitializeResponseSnapshot: Equatable {
-        struct Command: Equatable {
-            let name: String
-            let description: String
-            let argumentHint: String
-            let builtin: Bool
+package struct NativeAgentRuntimeRuntimeInitStatus: Equatable {
+    package struct InitializeResponseSnapshot: Equatable {
+        package struct Command: Equatable {
+            package let name: String
+            package let description: String
+            package let argumentHint: String
+            package let builtin: Bool
 
-            init(name: String, description: String, argumentHint: String, builtin: Bool = false) {
+            package init(name: String, description: String, argumentHint: String, builtin: Bool = false) {
                 self.name = name
                 self.description = description
                 self.argumentHint = argumentHint
@@ -24,39 +24,72 @@ struct NativeAgentRuntimeRuntimeInitStatus: Equatable {
             }
         }
 
-        struct Agent: Equatable {
-            let name: String
-            let description: String
-            let model: String?
+        package struct Agent: Equatable {
+            package let name: String
+            package let description: String
+            package let model: String?
+
+            package init(name: String, description: String, model: String?) {
+                self.name = name
+                self.description = description
+                self.model = model
+            }
         }
 
-        struct Account: Equatable {
-            let email: String?
-            let organization: String?
-            let subscriptionType: String?
-            let tokenSource: String?
-            let apiKeySource: String?
-            let apiProvider: String?
+        package struct Account: Equatable {
+            package let email: String?
+            package let organization: String?
+            package let subscriptionType: String?
+            package let tokenSource: String?
+            package let apiKeySource: String?
+            package let apiProvider: String?
+
+            package init(email: String?, organization: String?, subscriptionType: String?, tokenSource: String?, apiKeySource: String?, apiProvider: String?) {
+                self.email = email
+                self.organization = organization
+                self.subscriptionType = subscriptionType
+                self.tokenSource = tokenSource
+                self.apiKeySource = apiKeySource
+                self.apiProvider = apiProvider
+            }
         }
 
-        let commands: [Command]
-        let agents: [Agent]
-        let outputStyle: String?
-        let availableOutputStyles: [String]
-        let account: Account?
-        let pid: Int?
-        let modelsJSON: String?
-        let fastModeStateJSON: String?
+        package let commands: [Command]
+        package let agents: [Agent]
+        package let outputStyle: String?
+        package let availableOutputStyles: [String]
+        package let account: Account?
+        package let pid: Int?
+        package let modelsJSON: String?
+        package let fastModeStateJSON: String?
+
+        package init(commands: [Command], agents: [Agent], outputStyle: String?, availableOutputStyles: [String], account: Account?, pid: Int?, modelsJSON: String?, fastModeStateJSON: String?) {
+            self.commands = commands
+            self.agents = agents
+            self.outputStyle = outputStyle
+            self.availableOutputStyles = availableOutputStyles
+            self.account = account
+            self.pid = pid
+            self.modelsJSON = modelsJSON
+            self.fastModeStateJSON = fastModeStateJSON
+        }
     }
 
-    let sessionID: String?
-    let tools: [String]
-    let mcpServerStatuses: [String: String]
-    let initializeResponse: InitializeResponseSnapshot?
+    package let sessionID: String?
+    package let tools: [String]
+    package let mcpServerStatuses: [String: String]
+    package let initializeResponse: InitializeResponseSnapshot?
+
+    package init(sessionID: String?, tools: [String], mcpServerStatuses: [String: String], initializeResponse: InitializeResponseSnapshot?) {
+        self.sessionID = sessionID
+        self.tools = tools
+        self.mcpServerStatuses = mcpServerStatuses
+        self.initializeResponse = initializeResponse
+    }
 }
 
-enum NativeAgentRuntimeEvent {
-    case stream(AIStreamResult)
+package enum NativeAgentRuntimeEvent {
+    case stream(RepoPromptDomainRuntime.AIStreamResult)
     case rateLimit(ClaudeProviderQuotaObservation)
     case runtimeInit(NativeAgentRuntimeRuntimeInitStatus)
     case approvalRequest(AgentApprovalRequest)
@@ -67,13 +100,17 @@ enum NativeAgentRuntimeEvent {
     case error(String)
 }
 
-struct NativeAgentRuntimeSessionRef {
-    var sessionID: String?
+package struct NativeAgentRuntimeSessionRef {
+    package var sessionID: String?
+
+    package init(sessionID: String?) {
+        self.sessionID = sessionID
+    }
 }
 
 /// Outcome of an interrupt control request, used by the coordinator to decide
 /// whether it is safe to proceed with a superseding user turn.
-enum NativeAgentRuntimeInterruptOutcome: Equatable {
+package enum NativeAgentRuntimeInterruptOutcome: Equatable {
     /// Claude acknowledged the interrupt via control_response success.
     case acknowledged
     /// No turn was in flight; the turn likely completed naturally before the interrupt.
@@ -84,7 +121,7 @@ enum NativeAgentRuntimeInterruptOutcome: Equatable {
     case failed
 }
 
-enum NativeAgentRuntimeControllerError: Error, LocalizedError {
+package enum NativeAgentRuntimeControllerError: Error, LocalizedError {
     case processNotRunning
     case initializationFailed(String)
     case invalidControlResponse(String)
@@ -95,7 +132,7 @@ enum NativeAgentRuntimeControllerError: Error, LocalizedError {
     /// Cancellation observed at the proof-bearing send entry, before any user-message write.
     case cancelledBeforeWrite
 
-    var errorDescription: String? {
+    package var errorDescription: String? {
         switch self {
         case .processNotRunning:
             "Claude process is not running."
@@ -117,4 +154,4 @@ enum NativeAgentRuntimeControllerError: Error, LocalizedError {
     }
 }
 
-typealias NativeAgentRuntimeSlashCommand = NativeAgentRuntimeRuntimeInitStatus.InitializeResponseSnapshot.Command
+package typealias NativeAgentRuntimeSlashCommand = NativeAgentRuntimeRuntimeInitStatus.InitializeResponseSnapshot.Command
