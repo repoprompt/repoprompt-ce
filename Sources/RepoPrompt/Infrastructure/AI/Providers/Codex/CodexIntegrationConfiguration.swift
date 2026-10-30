@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptAIContracts
+import RepoPromptCodexProvider
 import RepoPromptDomainRuntime
 import RepoPromptShared
 
@@ -39,11 +40,7 @@ enum CodexIntegrationConfiguration {
         return "[\(values.joined(separator: ", "))]"
     }
 
-    struct ServerEntry {
-        let rawName: String
-        let normalizedName: String
-        let cliPathComponent: String
-    }
+    typealias ServerEntry = CodexExecServerEntry
 
     struct PersistentMCPConfigMutationResult {
         let content: String

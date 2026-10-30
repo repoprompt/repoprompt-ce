@@ -4,6 +4,7 @@ import RepoPromptACPProviders
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 import RepoPromptClaudeProvider
+import RepoPromptCodexProvider
 import RepoPromptProcess
 import RepoPromptSettingsCore
 

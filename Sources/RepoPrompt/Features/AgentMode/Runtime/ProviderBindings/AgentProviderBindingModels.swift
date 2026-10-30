@@ -2,19 +2,6 @@ import Foundation
 import RepoPromptAgentProviderContracts
 import RepoPromptAIContracts
 
-extension CodexIntegrationConfiguration.ServerEntry: Equatable {
-    static func == (
-        lhs: CodexIntegrationConfiguration.ServerEntry,
-        rhs: CodexIntegrationConfiguration.ServerEntry
-    ) -> Bool {
-        lhs.rawName == rhs.rawName
-            && lhs.normalizedName == rhs.normalizedName
-            && lhs.cliPathComponent == rhs.cliPathComponent
-    }
-}
-
-extension CodexIntegrationConfiguration.ServerEntry: @unchecked Sendable {}
-
 enum AgentProviderPermissionLevelID: Hashable {
     case codex(CodexAgentToolPreferences.PermissionLevel)
     case claude(ClaudeAgentToolPreferences.PermissionLevel)
