@@ -349,6 +349,19 @@
     }
   },
   "moved_families": {
+    "CodexControllerContentValues": {
+      "owner": "RepoPromptDomainRuntime",
+      "former_app_files": [
+        "Sources/RepoPrompt/Features/AgentMode/Models/AgentContextUsage.swift",
+        "Sources/RepoPrompt/Features/AgentMode/Models/CodexInteractionValues.swift"
+      ]
+    },
+    "CodexControllerPermissionValues": {
+      "owner": "RepoPromptAIContracts",
+      "former_app_files": [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/Shared/CodexControllerPermissionValues.swift"
+      ]
+    },
     "ACPSessionControllerAndHeadlessBridge": {
       "owner": "RepoPromptACPProviders",
       "former_app_files": [

@@ -1,4 +1,4 @@
-import RepoPromptApp
+import RepoPromptAIContracts
 import XCTest
 
 final class CodexPermissionValueCompatibilityTests: XCTestCase {

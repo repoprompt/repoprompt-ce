@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptApp
 import RepoPromptDomainRuntime
 import XCTest
 
