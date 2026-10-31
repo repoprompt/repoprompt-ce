@@ -8427,7 +8427,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 session.selectedAgent = .claudeCode
                 fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
                 try await AsyncTestWait.waitUntil("notification provider available") { fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
-                _ = try await fixture.window.workspaceManager.saveWorkspaceToFileAsync(XCTUnwrap(fixture.window.workspaceManager.activeWorkspace))
+                _ = try await fixture.persistActiveCarriers()
                 var writes = 0
                 vm.test_setAgentSessionSaver { _, _, _ in
                     writes += 1
