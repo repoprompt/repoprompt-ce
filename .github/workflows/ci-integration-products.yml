@@ -1,0 +1,96 @@
+name: Secret-free Integration Products
+
+# Shared implementation for admission; credentialed publication stays independent.
+on:
+  workflow_call:
+    inputs:
+      admission:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  sentry:
+    name: Sentry Build and Privacy
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      ADMISSION_CONTEXT: ${{ inputs.admission }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact candidate and full-profile attempt
+        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
+      # Never restore compiled products/gate metadata here: this lane must build
+      # the declared checkout with Sentry enabled, not consume a cached success.
+      - name: Restore checksum-verified dependency binaries only
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            .build/artifacts
+            .build/swiftbuild/artifacts
+            Packages/RepoPromptAgentProviders/.build/artifacts
+            ~/Library/Caches/org.swift.swiftpm/artifacts
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
+
+      - name: Resolve Sentry dependencies
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: python3 Scripts/ci_resolve_packages.py
+
+      - name: Build app with Sentry linked
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./conductor swift-build --product RepoPrompt --full-log
+
+      - name: Test serialized Sentry privacy boundary
+        env:
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./conductor test --filter SentryTelemetryPrivacyTests --full-log
+
+  package:
+    name: Release-mode Package and MCP Smoke
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      ADMISSION_CONTEXT: ${{ inputs.admission }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify exact candidate and full-profile attempt
+        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Run release preflight
+        run: ./conductor release preflight --full-log
+
+      - name: Package secret-free universal ad-hoc release candidate
+        run: ./conductor release artifact --full-log
+
+      - name: Smoke exact release-mode packaged MCP helper
+        env:
+          REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/packaged-smoke
+        run: |
+          ./Scripts/smoke_packaged_mcp_roundtrip.sh \
+            ".build/release/RepoPrompt.app" \
+            "Admission release-mode package" \
+            ".build/release/RepoPrompt-artifact-manifest.json"
+
+      - name: Retain package manifest and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: admission-package-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .build/release/RepoPrompt-artifact-manifest.json
+            ${{ runner.temp }}/packaged-smoke
+          if-no-files-found: warn
+          retention-days: 7

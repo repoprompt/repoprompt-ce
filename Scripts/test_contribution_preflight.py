@@ -93,6 +93,13 @@ class PathSelectionTests(unittest.TestCase):
             ("Scripts/ci_resolve_packages.py", 0),
             ("Scripts/test_ci_resolve_packages.py", 0),
             (".github/workflows/ci.yml", 0),
+            (".github/workflows/ci-integration-products.yml", 0),
+            ("Scripts/ci_admission.py", 0),
+            ("Scripts/test_ci_admission.py", 0),
+            ("Scripts/ci_test_coverage.py", 0),
+            ("Scripts/test_ci_test_coverage.py", 0),
+            ("Scripts/modularization_ci_artifact.py", 0),
+            ("Scripts/modularization_ci_build.py", 0),
             ("Scripts/test_conductor_future_probe.py", 1),
             ("Scripts/ci_process_session.py.bak", 1),
         ))

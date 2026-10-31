@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from modularization_ci_artifact import test_source_hashes
+from ci_admission import invalidate_build_identity
 from swift_imports import sources_import_module
 from ci_test_coverage import listed_tests, validate_targets
 import hashlib
@@ -54,7 +55,20 @@ def timing_counts(durations: dict[tuple[str, str, str, str], int]) -> dict[str, 
     return counts
 
 
+def write_timing_report(root: Path, durations: dict, baseline: dict, enforce: bool, exit_code: int) -> None:
+    """Keep per-location maximums on success AND failure; never change the timing budget."""
+    destination = root / '.build/modularization/typecheck-timing.json'
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({
+        'schema': 1, 'policy': 'clean-enforcing' if enforce else 'incremental-report-only',
+        'build_exit_code': exit_code, 'budget': baseline, 'counts': timing_counts(durations),
+        'locations': [dict(path=path, line=int(line), column=int(column), kind=kind, duration_ms=duration)
+                      for (path, line, column, kind), duration in sorted(durations.items())],
+    }, sort_keys=True) + '\n', encoding='utf-8')
+
+
 def main() -> int:
+    invalidate_build_identity(ROOT)
     baseline = json.loads(BASELINE.read_text(encoding='utf-8'))['typecheck']
     enforce_timing = os.environ.get('TYPECHECK_RATCHET_ENFORCE', '1') == '1'
     if enforce_timing:
@@ -75,6 +89,7 @@ def main() -> int:
         print(line, end='', flush=True)
         record_warning(line, durations)
     code = process.wait()
+    write_timing_report(ROOT, durations, baseline, enforce_timing, code)
     if code:
         return code
     counts = timing_counts(durations)

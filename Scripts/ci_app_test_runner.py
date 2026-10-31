@@ -24,6 +24,7 @@ from typing import Callable, Iterable, Mapping, Optional, Sequence, TextIO
 from modularization_ci_artifact import validate as validate_ci_artifact
 from swift_imports import sources_import_module
 from ci_test_coverage import listed_tests, listing_digest, verify_execution
+from ci_admission import build_identity
 import ci_process_session as process_session
 
 XCTEST_BUNDLE_GLOB = "*.xctest"
@@ -947,6 +948,10 @@ def run_selected_suites(
         receipt = {'schema': 1, 'shard_index': shard_index, 'shard_count': shard_count,
                    'listing_sha256': listing_digest(full_listing), 'assigned': assigned,
                    'executed': sorted(executed), 'skipped': sorted(skipped)}
+        identity = build_identity(cwd or Path.cwd())
+        if identity is not None:
+            receipt['admission'] = identity['context']
+            receipt['producer'] = f'build-and-test-{shard_index}'
         receipt_path.write_text(json.dumps(receipt, sort_keys=True) + '\n')
         print(f'Coverage: assigned={len(assigned)}, executed={len(executed)}, skipped={len(skipped)}',
               file=output, flush=True)
