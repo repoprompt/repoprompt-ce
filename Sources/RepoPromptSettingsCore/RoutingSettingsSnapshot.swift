@@ -9,6 +9,8 @@ package struct RoutingSettingsSnapshot: Equatable {
     package let autoEffortBackendRawValue: String?
     package let routerRevision: UInt64
     package let autoEffortRevision: UInt64
+    package let autoWorkflowEnabled: Bool
+    package let autoWorkflowRevision: UInt64
 
     package init(
         routerEnabled: Bool,
@@ -16,7 +18,9 @@ package struct RoutingSettingsSnapshot: Equatable {
         autoEffortEnabled: Bool,
         routerRevision: UInt64,
         autoEffortBackendRawValue: String? = nil,
-        autoEffortRevision: UInt64 = 0
+        autoEffortRevision: UInt64 = 0,
+        autoWorkflowEnabled: Bool = false,
+        autoWorkflowRevision: UInt64 = 0
     ) {
         self.routerEnabled = routerEnabled
         self.selectedBackendRawValue = selectedBackendRawValue
@@ -24,9 +28,12 @@ package struct RoutingSettingsSnapshot: Equatable {
         self.autoEffortBackendRawValue = autoEffortBackendRawValue
         self.routerRevision = routerRevision
         self.autoEffortRevision = autoEffortRevision
+        self.autoWorkflowEnabled = autoWorkflowEnabled
+        self.autoWorkflowRevision = autoWorkflowRevision
     }
 
     package struct Key: Equatable {
+        package let autoWorkflowEnabled: Bool
         package let routerEnabled: Bool
         package let selectedBackendRawValue: String?
         package let autoEffortEnabled: Bool
@@ -35,6 +42,7 @@ package struct RoutingSettingsSnapshot: Equatable {
 
     package var key: Key {
         .init(
+            autoWorkflowEnabled: autoWorkflowEnabled,
             routerEnabled: routerEnabled,
             selectedBackendRawValue: selectedBackendRawValue,
             autoEffortEnabled: autoEffortEnabled,

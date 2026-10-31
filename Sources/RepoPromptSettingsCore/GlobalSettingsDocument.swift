@@ -1138,6 +1138,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
         package var codexGoalSupportEnabled: Bool?
         package var codexComputerUseEnabled: Bool?
         package var codexReasoningSummariesEnabled: Bool?
+        package var autoWorkflowEnabled: Bool?
         package var autoEffortEnabled: Bool?
         package var autoEffortBackendRawValue: String?
         package var codexMemoriesEnabled: Bool?
@@ -1182,6 +1183,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             codexGoalSupportEnabled: Bool? = nil,
             codexComputerUseEnabled: Bool? = nil,
             codexReasoningSummariesEnabled: Bool? = nil,
+            autoWorkflowEnabled: Bool? = nil,
             autoEffortEnabled: Bool? = nil,
             autoEffortBackendRawValue: String? = nil,
             codexMemoriesEnabled: Bool? = nil,
@@ -1214,6 +1216,7 @@ package struct GlobalScalarPreferences: Codable, Equatable {
             self.codexGoalSupportEnabled = codexGoalSupportEnabled
             self.codexComputerUseEnabled = codexComputerUseEnabled
             self.codexReasoningSummariesEnabled = codexReasoningSummariesEnabled
+            self.autoWorkflowEnabled = autoWorkflowEnabled
             self.autoEffortEnabled = autoEffortEnabled
             self.autoEffortBackendRawValue = autoEffortBackendRawValue
             self.codexMemoriesEnabled = codexMemoriesEnabled

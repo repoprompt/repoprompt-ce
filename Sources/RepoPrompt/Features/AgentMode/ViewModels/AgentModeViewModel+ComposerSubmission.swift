@@ -42,6 +42,8 @@ extension AgentModeViewModel {
               let attempt = session.activeComposerSubmitAttempt, attempt.id == id else { return }
         let claim = AgentComposerSubmitClaim(attempt: attempt, sourceSession: session, draftMutationGeneration: session.draftMutationGeneration)
         // Fence dispatch and restore immediately; backend cancellation may itself suspend.
+        let workflowTask = autoWorkflowJudgments.removeValue(forKey: id)
+        workflowTask?.cancel()
         finishPresentedComposerSubmitAttempt(claim, result: .blocked(message: "Send cancelled. Your draft was restored."))
         await cancelFreshTaskRouting(tabID: pending.sourceTabID)
     }
@@ -56,6 +58,7 @@ extension AgentModeViewModel {
 
     /// Idempotent cleanup also covers cancellation before the asynchronous executor starts.
     func clearRepromptSubmissionState(claimID: UUID) {
+        autoWorkflowJudgments.removeValue(forKey: claimID)?.cancel()
         cancelRepromptSpeculation(claimID: claimID)
         repromptAudits[claimID] = nil
         repromptDispatchTexts[claimID] = nil
