@@ -590,7 +590,7 @@ extension AgentModeViewModel {
         if let sessionAttachmentsRootOverride {
             return sessionAttachmentsRootOverride()?.standardizedFileURL
         }
-        guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence,
+        guard !attachmentPersistenceIsSuppressed(),
               let workspace = workspace ?? workspaceManager?.activeWorkspace
         else { return nil }
         let agentSessionsFolder = WorkspaceSessionSidecarMigration
@@ -768,7 +768,9 @@ extension AgentModeViewModel {
 
     /// Live sessions and every attachment still pending, reserved, or in flight across windows.
     func liveAttachmentSweepProtection() -> (sessionIDs: Set<UUID>, temporaryPaths: Set<String>) {
-        var viewModels = WindowStatesManager.shared.allWindows.map(\.agentModeViewModel)
+        // Resolve the app-owned registry now, after the sweep delay, rather than retaining a stale
+        // window snapshot. The current runtime also participates when it is not registered.
+        var viewModels = attachmentSweepViewModels()
         if !viewModels.contains(where: { $0 === self }) {
             viewModels.append(self)
         }

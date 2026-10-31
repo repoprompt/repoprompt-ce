@@ -1582,6 +1582,68 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         XCTAssertEqual(viewModel.oracleAuthorizedAttachmentPaths(tabID: tabID, agentSessionID: UUID()), [])
     }
 
+    func testAttachmentRootConsultsTheInjectedPersistencePolicyOnEachResolution() {
+        var suppressed = true
+        let viewModel = makeViewModel(attachmentPersistenceIsSuppressed: { suppressed })
+        let workspace = WorkspaceModel(name: "Attachment policy", repoPaths: [])
+        XCTAssertNil(viewModel.sessionAttachmentsRootURL(for: workspace))
+        suppressed = false
+        XCTAssertNotNil(viewModel.sessionAttachmentsRootURL(for: workspace))
+        suppressed = true
+        XCTAssertNil(viewModel.sessionAttachmentsRootURL(for: workspace))
+    }
+
+    func testSweepQueriesLiveOwnersAndProtectsItsOwnUnregisteredRuntime() throws {
+        let other = makeViewModel()
+        var liveOwners: [AgentModeViewModel] = []
+        let viewModel = makeViewModel(attachmentSweepViewModels: { liveOwners })
+        let localSession = viewModel.session(for: UUID())
+        let localID = UUID()
+        localSession.testInstallPersistentSessionBinding(sessionID: localID)
+        let local = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        localSession.pendingFileAttachments = [local]
+        let otherSession = other.session(for: UUID())
+        let otherID = UUID()
+        otherSession.testInstallPersistentSessionBinding(sessionID: otherID)
+        let pending = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        let reserved = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        let consumed = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        otherSession.pendingFileAttachments = [pending]
+        _ = other.reserveAttachmentsForTurn([reserved], session: otherSession)
+        otherSession.attachmentsPendingProviderConsumptionCleanup = [consumed]
+
+        XCTAssertEqual(viewModel.liveAttachmentSweepProtection().sessionIDs, [localID])
+        liveOwners = [other]
+        let protection = viewModel.liveAttachmentSweepProtection()
+        XCTAssertEqual(protection.sessionIDs, [localID, otherID])
+        XCTAssertEqual(protection.temporaryPaths, Set([local, pending, reserved, consumed].compactMap(AgentImageAttachmentAvailabilityResolver.path(for:))))
+        liveOwners = []
+        XCTAssertEqual(viewModel.liveAttachmentSweepProtection().sessionIDs, [localID])
+    }
+
+    func testWindowCompositionSuppliesCurrentWindowOwnersAndLaunchPolicy() async {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let settings = GlobalSettingsStore.shared
+        let previousAutoStart = settings.mcpAutoStart()
+        settings.setMCPAutoStart(false, commit: false)
+        defer { settings.setMCPAutoStart(previousAutoStart, commit: false) }
+        let first = WindowState()
+        WindowStatesManager.shared.registerWindowState(first)
+        await first.workspaceManager.awaitInitialized()
+        XCTAssertEqual(first.agentModeViewModel.attachmentPersistenceIsSuppressed(), AppLaunchConfiguration.current.suppressesAgentSessionPersistence)
+        let second = WindowState()
+        WindowStatesManager.shared.registerWindowState(second)
+        await second.workspaceManager.awaitInitialized()
+        XCTAssertTrue(first.agentModeViewModel.attachmentSweepViewModels().contains { $0 === second.agentModeViewModel })
+        second.beginClose()
+        await second.tearDown()
+        WindowStatesManager.shared.unregisterWindowState(second)
+        XCTAssertFalse(first.agentModeViewModel.attachmentSweepViewModels().contains { $0 === second.agentModeViewModel })
+        first.beginClose()
+        await first.tearDown()
+        WindowStatesManager.shared.unregisterWindowState(first)
+    }
+
     func testWorkspaceSwitchSchedulesTheStartupSweepThroughTheLivePath() async throws {
         let viewModel = makeViewModel()
         let agentSessionsFolder = workspaceDirectory.appendingPathComponent("AgentSessions", isDirectory: true)
@@ -2073,9 +2135,14 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         return fileURL
     }
 
-    private func makeViewModel() -> AgentModeViewModel {
+    private func makeViewModel(
+        attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false },
+        attachmentSweepViewModels: @escaping () -> [AgentModeViewModel] = { [] }
+    ) -> AgentModeViewModel {
         AgentModeViewModel(
             testWorkspaceDirectory: workspaceDirectory,
+            attachmentPersistenceIsSuppressed: attachmentPersistenceIsSuppressed,
+            attachmentSweepViewModels: attachmentSweepViewModels,
             codexControllerFactory: { _, _, _, _, _, _ in
                 preconditionFailure("Image attachment retention tests must not start Codex")
             },

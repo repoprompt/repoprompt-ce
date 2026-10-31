@@ -768,6 +768,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
+    /// App composition owns launch policy and the live window registry; standalone tests inject both.
+    let attachmentPersistenceIsSuppressed: () -> Bool
+    let attachmentSweepViewModels: () -> [AgentModeViewModel]
     /// Overrides `<workspace>/AgentSessions/attachments` (tests); `nil` uses the active workspace.
     var sessionAttachmentsRootOverride: (() -> URL?)?
     var sessionAttachmentLimits: AgentSessionAttachmentStore.Limits = .standard
@@ -2575,6 +2578,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         promptManager: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
+        attachmentPersistenceIsSuppressed: @escaping () -> Bool,
+        attachmentSweepViewModels: @escaping () -> [AgentModeViewModel],
         oracleViewModel: OracleViewModel? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
@@ -2591,6 +2596,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workspaceFileContextStore = promptManager.workspaceFileContextStore
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
+        self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
+        self.attachmentSweepViewModels = attachmentSweepViewModels
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.modelRouterSettingsStore = modelRouterSettingsStore
@@ -2803,6 +2810,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
             testWorkspaceDirectory: URL? = nil,
+            attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false },
+            attachmentSweepViewModels: @escaping () -> [AgentModeViewModel] = { [] },
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
             shouldManageCodexTooling: Bool = false,
@@ -2878,6 +2887,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = nil
             mcpServer = testMCPServer
+            self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
+            self.attachmentSweepViewModels = attachmentSweepViewModels
             modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
             catalogDiagnosticsSink = testCatalogDiagnosticsSink
