@@ -189,9 +189,9 @@ package final class CLIProcessRunner {
     private let registry = ProcessRegistry()
     private let gate: TaskSemaphore
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
-    private let beforeStreamingRead: (@Sendable () -> Void)?
-    private let beforeStreamingDrain: (@Sendable () -> Void)?
-    private let streamingDrainTimeout: TimeInterval
+    private let beforeOutputRead: (@Sendable () -> Void)?
+    private let beforeOutputDrain: (@Sendable () -> Void)?
+    private let outputDrainTimeout: TimeInterval
 
     package init(
         config: CLIProcessConfiguration,
@@ -199,16 +199,16 @@ package final class CLIProcessRunner {
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = { pid in
             ChildProcessExitObserver(pid: pid)
         },
-        beforeStreamingRead: (@Sendable () -> Void)? = nil,
-        beforeStreamingDrain: (@Sendable () -> Void)? = nil,
-        streamingDrainTimeout: TimeInterval = 5
+        beforeOutputRead: (@Sendable () -> Void)? = nil,
+        beforeOutputDrain: (@Sendable () -> Void)? = nil,
+        outputDrainTimeout: TimeInterval = 5
     ) {
         self.config = config
         gate = TaskSemaphore(max(concurrencyLimit, 1))
         self.processExitObserverFactory = processExitObserverFactory
-        self.beforeStreamingRead = beforeStreamingRead
-        self.beforeStreamingDrain = beforeStreamingDrain
-        self.streamingDrainTimeout = streamingDrainTimeout
+        self.beforeOutputRead = beforeOutputRead
+        self.beforeOutputDrain = beforeOutputDrain
+        self.outputDrainTimeout = outputDrainTimeout
     }
 
     @inline(__always)
@@ -349,9 +349,11 @@ package final class CLIProcessRunner {
                 let group = DispatchGroup()
                 var stdoutData = Data()
                 var stderrData = Data()
+                let beforeRead = beforeOutputRead
 
                 group.enter()
                 DispatchQueue.global(qos: .userInitiated).async {
+                    beforeRead?()
                     defer { group.leave() }
                     let chunkSize = 64 * 1024
                     while true {
@@ -362,6 +364,7 @@ package final class CLIProcessRunner {
 
                 group.enter()
                 DispatchQueue.global(qos: .utility).async {
+                    beforeRead?()
                     defer { group.leave() }
                     let chunkSize = 64 * 1024
                     while true {
@@ -438,10 +441,21 @@ package final class CLIProcessRunner {
                     throw error
                 }
 
-                // Proactively close FDs and wait for readers to finish
+                // Reaping the child does not mean queued readers consumed its pipe buffers.
+                // Keep descriptors open through the same bounded drain used by streaming.
+                beforeOutputDrain?()
+                let groupFinished = await Self.waitForGroup(group, timeout: outputDrainTimeout)
                 spawned.stdout.closeFile()
                 spawned.stderr.closeFile()
                 await Self.waitForGroup(group)
+                guard groupFinished else {
+                    throw CLIProcessRunnerError.waitFailed(
+                        "Output readers for owned process \(spawned.pid) did not drain before deadline"
+                    )
+                }
+                if cancelChildOnTaskCancellation {
+                    try Task.checkCancellation()
+                }
                 if !stdoutData.isEmpty {
                     config.logCollector?.appendDataSection(title: "STDOUT", data: stdoutData)
                 }
@@ -612,7 +626,7 @@ package final class CLIProcessRunner {
 
             let gateCoordinator = GateReleaseCoordinator()
             let descriptorCleanup = ProcessDescriptorCleanup(process: spawned)
-            let beforeRead = beforeStreamingRead
+            let beforeRead = beforeOutputRead
 
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async {
@@ -724,8 +738,8 @@ package final class CLIProcessRunner {
                 // Reaping the child does not mean its queued readers have consumed
                 // the pipe buffers. Keep output open until they reach EOF.
                 descriptorCleanup.closeInput()
-                beforeStreamingDrain?()
-                let groupFinished = await Self.waitForGroup(group, timeout: streamingDrainTimeout)
+                beforeOutputDrain?()
+                let groupFinished = await Self.waitForGroup(group, timeout: outputDrainTimeout)
                 if !groupFinished {
                     // Publish a bounded failure, but retain physical ownership until
                     // readers settle. Do not inspect their tails or release the gate early.
