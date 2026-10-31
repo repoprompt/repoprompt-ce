@@ -98,21 +98,29 @@ final class AppTerminationCoordinatorTests: XCTestCase {
         await fulfillment(of: [resumed], timeout: 2)
     }
 
-    func testRunLoopDeadlineProgressesWithoutMainActorTaskProgress() {
-        var replied = false
-        var cleaned = false
-        let coordinator = AppTerminationCoordinator(
-            timeout: 0.02, freeze: {}, cleanup: { cleaned = true },
-            requestTermination: { XCTFail("AppKit reply is pending") }
-        )
-        XCTAssertEqual(coordinator.shouldTerminate(reply: { replied = true }), .terminateLater)
-        // Deliberately do not yield this main-actor callout. Only the run loop may progress.
-        let deadline = Date().addingTimeInterval(1)
-        while !replied, Date() < deadline {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+    func testRunLoopDeadlineProgressesWithoutMainActorTaskProgress() async {
+        let finished = expectation(description: "main-dispatch termination callout completed")
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                var replied = false
+                var cleaned = false
+                let coordinator = AppTerminationCoordinator(
+                    timeout: 0.02, freeze: {}, cleanup: { cleaned = true },
+                    requestTermination: { XCTFail("AppKit reply is pending") }
+                )
+                XCTAssertEqual(coordinator.shouldTerminate(reply: { replied = true }), .terminateLater)
+                // Hold an actual main-dispatch callout, as an updater can do. A nested
+                // run loop must deliver the deadline without re-entering the main queue.
+                let deadline = Date().addingTimeInterval(1)
+                while !replied, Date() < deadline {
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+                }
+                XCTAssertTrue(replied)
+                XCTAssertFalse(cleaned)
+                finished.fulfill()
+            }
         }
-        XCTAssertTrue(replied)
-        XCTAssertFalse(cleaned)
+        await fulfillment(of: [finished], timeout: 2)
     }
 
     func testDeadlineDoesNotWaitForUncooperativeCleanupOrReplyTwice() async {
