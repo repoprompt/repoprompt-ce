@@ -692,8 +692,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
         let models = try [
-            OracleModelReference(providerID: "codex", modelID: "codex_custom_requested"),
-            OracleModelReference(providerID: "grokBuild", modelID: "grokbuild_custom_requested")
+            OracleModelReference(modelID: "codex_custom_requested"),
+            OracleModelReference(modelID: "grokbuild_custom_requested")
         ]
         let group = try makeCanonicalOracleGroup(fixture: fixture, models: models).group
         let member = group.members[0]
@@ -703,11 +703,13 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let turnID = try XCTUnwrap(group.turns.last?.id)
         let invocationID = UUID()
         var presentation = OracleGroupPresentation(document: group, invocationID: invocationID)
-        XCTAssertEqual(presentation.member(session).providerID, "codex")
+        XCTAssertNil(presentation.member(session).providerID)
         XCTAssertNil(presentation.member(session).capturedModelName, "No current placeholder; request IDs and prior messages are not display authority")
-        presentation.captureModelName("SIBLING_MODEL", member: group.members[1], turnID: turnID, invocationID: invocationID)
+        presentation.captureModelName("SIBLING_MODEL", providerID: "grokBuild", member: group.members[1], turnID: turnID, invocationID: invocationID)
         XCTAssertNil(presentation.member(session).capturedModelName)
+        XCTAssertNil(presentation.member(session).providerID)
         XCTAssertEqual(presentation.member(sibling).capturedModelName, "SIBLING_MODEL")
+        XCTAssertEqual(presentation.member(sibling).providerID, "grokBuild")
 
         let mismatchedMember = try OracleGroupMember(
             laneID: member.laneID, memberID: member.memberID,
@@ -719,12 +721,13 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             (mismatchedMember, turnID, invocationID)
         ]
         for (callbackMember, callbackTurn, callbackInvocation) in staleCallbacks {
-            presentation.captureModelName("STALE_MODEL", member: callbackMember, turnID: callbackTurn, invocationID: callbackInvocation)
+            presentation.captureModelName("STALE_MODEL", providerID: "bogus-provider", member: callbackMember, turnID: callbackTurn, invocationID: callbackInvocation)
             XCTAssertNil(presentation.member(session).capturedModelName)
+            XCTAssertNil(presentation.member(session).providerID)
         }
 
         let exactName = "CLI·Captured display name (High)"
-        presentation.captureModelName(exactName, member: member, turnID: turnID, invocationID: invocationID)
+        presentation.captureModelName(exactName, providerID: "codex", member: member, turnID: turnID, invocationID: invocationID)
         var mismatchedSession = session
         mismatchedSession.shortID = "replacement-projection"
         XCTAssertNil(presentation.member(mismatchedSession).capturedModelName)
@@ -739,20 +742,26 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 laneID: member.laneID, sequence: UInt64(sequence)
             ))
             XCTAssertEqual(presentation.member(session).capturedModelName, exactName)
+            XCTAssertEqual(presentation.member(session).providerID, "codex")
         }
         XCTAssertEqual(presentation.member(session).status, .settled)
         XCTAssertEqual(presentation.member(sibling).capturedModelName, "SIBLING_MODEL")
+        XCTAssertEqual(presentation.member(sibling).providerID, "grokBuild")
         for (callbackMember, callbackTurn, callbackInvocation) in staleCallbacks {
-            presentation.captureModelName("STALE_MODEL", member: callbackMember, turnID: callbackTurn, invocationID: callbackInvocation)
+            presentation.captureModelName("STALE_MODEL", providerID: "bogus-provider", member: callbackMember, turnID: callbackTurn, invocationID: callbackInvocation)
             XCTAssertEqual(presentation.member(session).capturedModelName, exactName)
+            XCTAssertEqual(presentation.member(session).providerID, "codex")
         }
         presentation.captureModelName(nil, member: member, turnID: turnID, invocationID: invocationID)
         XCTAssertNil(presentation.member(session).capturedModelName, "No surviving exact-query message must not preserve an older name")
-        presentation.captureModelName(exactName, member: member, turnID: turnID, invocationID: invocationID)
+        XCTAssertEqual(presentation.member(session).providerID, "codex")
+        presentation.captureModelName(exactName, providerID: "codex", member: member, turnID: turnID, invocationID: invocationID)
         presentation.endExecution()
         XCTAssertNil(presentation.member(session).capturedModelName)
-        presentation.captureModelName("LATE_MODEL", member: member, turnID: turnID, invocationID: invocationID)
+        XCTAssertNil(presentation.member(session).providerID)
+        presentation.captureModelName("LATE_MODEL", providerID: "bogus-provider", member: member, turnID: turnID, invocationID: invocationID)
         XCTAssertNil(presentation.member(session).capturedModelName, "Ended invocations cannot republish identity")
+        XCTAssertNil(presentation.member(session).providerID)
     }
 
     func testGroupedTerminalModelNameIsAuthoritativeAcrossColdReloadAndLegacyRemainsUnavailable() async throws {
@@ -769,9 +778,10 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let invocationID = UUID()
         let turnID = try XCTUnwrap(prepared.turns.last?.id)
         var live = OracleGroupPresentation(document: prepared, invocationID: invocationID)
-        live.captureModelName("LIVE_MODEL", member: prepared.members[0], turnID: turnID, invocationID: invocationID)
+        live.captureModelName("LIVE_MODEL", providerID: "codex", member: prepared.members[0], turnID: turnID, invocationID: invocationID)
         vm.oracleGroupPresentations[live.key] = live
         XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, "LIVE_MODEL")
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).providerID, "codex")
 
         let terminalName = "  Claude Code exact terminal footer  "
         let terminal = try terminalGroup(prepared, secondaryStatus: .failed, capturedModelNames: [0: terminalName])
@@ -780,10 +790,12 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
         vm.recordOracleGroupPresentation(terminal)
         XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, terminalName)
+        XCTAssertNil(vm.oracleMemberPresentation(for: projections[0]).providerID, "Canonical legacy result replaces transient provider identity")
         XCTAssertNil(vm.oracleMemberPresentation(for: projections[1]).capturedModelName, "Legacy result must not borrow a stored footer")
         var terminalPresentation = try XCTUnwrap(vm.oracleGroupPresentations[live.key])
-        terminalPresentation.captureModelName("LATE_MODEL", member: prepared.members[0], turnID: turnID, invocationID: invocationID)
+        terminalPresentation.captureModelName("LATE_MODEL", providerID: "bogus-provider", member: prepared.members[0], turnID: turnID, invocationID: invocationID)
         XCTAssertEqual(terminalPresentation.member(projections[0]).capturedModelName, terminalName)
+        XCTAssertNil(terminalPresentation.member(projections[0]).providerID)
         vm.recordOracleGroupPresentation(prepared, invocationID: invocationID)
         XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, terminalName, "Older prepared publication cannot replace terminal identity")
 
@@ -792,6 +804,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         vm.sessions = projections
         await vm.loadOracleGroupPresentation(containing: projections[0])
         XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).capturedModelName, terminalName)
+        XCTAssertNil(vm.oracleMemberPresentation(for: projections[0]).providerID)
         XCTAssertNil(vm.oracleMemberPresentation(for: projections[1]).capturedModelName)
         XCTAssertEqual(vm.oracleMemberPresentation(for: projections[1]).status, .failed)
     }
@@ -799,45 +812,115 @@ final class AgentOraclePillRoutingTests: XCTestCase {
     func testGroupedContinuationPreservesLegacyNilProviderRoster() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
-        let prepared = try makeCanonicalOracleGroup(fixture: fixture).group
+        let vm = fixture.oracleViewModel
+        // Configure only the fixture's availability flags; all transport remains stubbed.
+        fixture.composition.apiSettingsViewModel.isOpenAIKeyValid = true
+        fixture.composition.apiSettingsViewModel.isAnthropicKeyValid = true
+        let models = try [AIModel.gpt54, .claude4Sonnet].map {
+            try OracleModelReference(modelID: $0.rawValue)
+        }
+        let prepared = try makeCanonicalOracleGroup(fixture: fixture, models: models).group
         let store = AppDomainRuntimeComposition.shared.oracleConversationStore
         try await store.create(prepared)
         addTeardownBlock { try? await self.deleteCanonicalOracleGroup(prepared) }
         let terminal = try terminalGroup(prepared, secondaryStatus: .completed)
+        let previousTurnID = try XCTUnwrap(terminal.turns.last?.id)
         _ = try await OracleGroupTerminalPublisher.publish(
             terminal: terminal, expectedRevision: prepared.revision, store: store
         )
-        let vm = fixture.oracleViewModel
-        vm.sessions = terminal.members.map { makeProjection(member: $0, group: terminal, fixture: fixture) }
+        let projections = terminal.members.map { makeProjection(member: $0, group: terminal, fixture: fixture) }
+        vm.sessions = projections
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Mini.rawValue,
+            additionalOracleModelRaws: [AIModel.gpt54Mini.rawValue]
+        )
+        let snapshot = OracleSelectionSnapshot(
+            origin: .mcp, agentModelsProfile: profile, modelPresets: [],
+            modelPresetsExposed: false, modelPresetsTemporarilyDisabled: false,
+            chatPresets: ChatPreset.BuiltIn.all(),
+            defaultChatPresets: [.chat: ChatPreset.BuiltIn.chat]
+        )
+        let transportsReady = expectation(description: "Both continuation lanes reached stub transport")
+        transportsReady.expectedFulfillmentCount = 2
+        let firstLaneSettled = expectation(description: "Primary settled while sibling transport remains gated")
+        var streams: [Int: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation] = [:]
+        vm.setOraclePostPackagingTransportOverrideForTesting { _, model in
+            let laneIndex = try XCTUnwrap(models.firstIndex { $0.modelID == model.rawValue })
+            let (stream, continuation) = AsyncThrowingStream<ChatStreamOutput, Error>.makeStream()
+            streams[laneIndex] = continuation
+            transportsReady.fulfill()
+            return (UUID(), stream)
+        }
+        defer {
+            vm.setOraclePostPackagingTransportOverrideForTesting(nil)
+            for stream in streams.values {
+                stream.finish()
+            }
+        }
         var capturedMembers: [OracleGroupMember]?
-        do {
-            _ = try await vm.tool_chatSendWithConfiguredRosterCompletion(
+        let invocation = Task { @MainActor in
+            try await vm.tool_chatSendWithConfiguredRosterCompletion(
                 args: ["message": .string("continue"), "chat_id": .string(terminal.members[0].publicChatID)],
                 promptVM: fixture.composition.promptManager,
                 tabContext: oracleTabContext(fixture),
                 callbacks: AppOracleGroupExecutionCallbacks(
-                    prepared: { _, _, members in
-                        capturedMembers = members
-                        throw OracleProjectionRoutingTestStop.afterPrepared
+                    prepared: { _, _, members in capturedMembers = members },
+                    progress: { event in
+                        if event.kind == .laneSettled, event.laneID == terminal.members[0].laneID {
+                            firstLaneSettled.fulfill()
+                        }
                     },
-                    progress: { _ in }, laneProgress: { _, _, _ in }
+                    laneProgress: { _, _, _ in }
                 ),
-                capturedProfile: AgentModelsSettingsProfile(
-                    planningModelRaw: AIModel.gpt54.rawValue,
-                    additionalOracleModelRaws: [AIModel.claude4Sonnet.rawValue]
-                )
+                capturedProfile: profile,
+                selectionSnapshotOverride: snapshot
             )
-            XCTFail("Expected stop before provider execution")
-        } catch OracleProjectionRoutingTestStop.afterPrepared {}
+        }
+        defer { invocation.cancel() }
+        await fulfillment(of: [transportsReady], timeout: 5)
+        XCTAssertEqual(streams.count, 2)
+        XCTAssertEqual(projections.map { vm.oracleMemberPresentation(for: $0).status }, [.streaming, .streaming])
+        XCTAssertEqual(projections.map { vm.oracleMemberPresentation(for: $0).providerID }, ["openAI", "anthropic"])
+
+        streams[0]?.yield(ChatStreamOutput(
+            text: "primary continuation", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed
+        ))
+        streams[0]?.finish()
+        await fulfillment(of: [firstLaneSettled], timeout: 5)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[0]).status, .settled)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: projections[1]).status, .streaming)
+        XCTAssertEqual(projections.map { vm.oracleMemberPresentation(for: $0).providerID }, ["openAI", "anthropic"])
+
+        if let key = OracleGroupPresentation.Key(session: projections[0]),
+           let current = vm.oracleGroupPresentations[key],
+           let turnID = current.turnID, let invocationID = current.invocationID
+        {
+            var challenged = current
+            challenged.captureModelName("stale turn", providerID: "bogus-prior-turn-provider", member: terminal.members[0], turnID: previousTurnID, invocationID: invocationID)
+            XCTAssertEqual(challenged, current, "Prior-turn callbacks cannot replace current identity")
+            challenged.captureModelName("stale invocation", providerID: "bogus-other-invocation-provider", member: terminal.members[0], turnID: turnID, invocationID: UUID())
+            XCTAssertEqual(challenged, current, "Other invocations cannot replace current identity")
+        } else {
+            XCTFail("A current invocation must remain observable while its sibling is gated")
+        }
+
+        streams[1]?.yield(ChatStreamOutput(
+            text: "sibling continuation", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed
+        ))
+        streams[1]?.finish()
+        let completion = try await invocation.value
+        await vm.drainTrackedAutosaves(for: fixture.workspace.id)
         XCTAssertEqual(try XCTUnwrap(capturedMembers), terminal.members)
+        let laneErrors = completion.result.oracleResults.compactMap(\.error).map(\.message).joined(separator: "\n")
+        XCTAssertEqual(completion.result.oracleResults.map(\.status), [.completed, .completed], laneErrors)
+        XCTAssertEqual(completion.result.oracleResults.map { $0.executionProfile?.providerID }, ["openAI", "anthropic"])
         let loaded = try await store.load(groupID: terminal.group.id, owner: terminal.owner)
         let continued = try XCTUnwrap(loaded)
         XCTAssertEqual(continued.roster, terminal.roster)
+        XCTAssertEqual(continued.members, terminal.members)
         XCTAssertTrue(continued.roster.orderedModels.allSatisfy { $0.providerID == nil })
         XCTAssertEqual(continued.turns.count, terminal.turns.count + 1)
-        let continuedTurn = try XCTUnwrap(continued.turns.last)
-        XCTAssertEqual(continuedTurn.results.count, terminal.members.count)
-        XCTAssertTrue(continuedTurn.results.allSatisfy { $0.capturedModelName == nil })
+        XCTAssertEqual(continued.turns.first, terminal.turns.first, "Continuation does not backfill historical metadata")
     }
 
     func testGroupedMemberStatusUsesPersistedFailureWithoutAssistantErrorText() async throws {

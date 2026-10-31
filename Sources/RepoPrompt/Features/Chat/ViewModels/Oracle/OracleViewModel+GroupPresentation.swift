@@ -93,6 +93,7 @@ struct OracleGroupPresentation: Equatable {
 
     mutating func captureModelName(
         _ name: String?,
+        providerID: String? = nil,
         member: OracleGroupMember,
         turnID: OracleTurnID,
         invocationID: UUID
@@ -102,6 +103,7 @@ struct OracleGroupPresentation: Equatable {
         else { return }
         var presentation = lanes[member.laneID] ?? .unknown
         presentation.capturedModelName = name
+        presentation.providerID = providerID ?? presentation.providerID
         lanes[member.laneID] = presentation
     }
 
@@ -116,8 +118,10 @@ struct OracleGroupPresentation: Equatable {
         sequences[laneID] = sequence
         // Settlement is live, nonterminal evidence; only durable results establish an outcome.
         let capturedModelName = lanes[laneID]?.capturedModelName
+        let providerID = lanes[laneID]?.providerID
         lanes[laneID] = .init(
             status: event.kind == .laneStarted ? .streaming : .settled,
+            providerID: providerID,
             capturedModelName: capturedModelName
         )
     }

@@ -668,6 +668,7 @@ extension OracleViewModel {
             oracleGroupPresentations[key].flatMap { $0.invocationID == invocationID ? $0.turnID : nil }
         }
         var queryID: UUID?
+        var capturedProviderID: String?
         let capturedName = { () -> String? in
             guard let queryID,
                   let message = self.messagesSnapshot(for: sessionID).first(where: { $0.id == queryID && !$0.isUser }),
@@ -682,7 +683,7 @@ extension OracleViewModel {
                   OracleGroupPresentation.Key(session: session) == presentationKey,
                   var presentation = self.oracleGroupPresentations[presentationKey]
             else { return }
-            presentation.captureModelName(capturedName(), member: member, turnID: turnID, invocationID: invocationID)
+            presentation.captureModelName(capturedName(), providerID: capturedProviderID, member: member, turnID: turnID, invocationID: invocationID)
             self.oracleGroupPresentations[presentationKey] = presentation
         }
         defer { publishCapturedName() }
@@ -691,8 +692,9 @@ extension OracleViewModel {
                 member: member, args: args, promptVM: promptVM, tabContext: tabContext,
                 startExecution: startExecution, selectionSnapshotOverride: selectionSnapshotOverride,
                 executionContext: executionContext, callbacks: callbacks, scope: scope,
-                onQueryCreated: { id in
+                onQueryCreated: { id, providerID in
                     queryID = id
+                    capturedProviderID = providerID
                     publishCapturedName()
                 }
             )
@@ -735,7 +737,7 @@ extension OracleViewModel {
         executionContext: OracleLaneExecutionContext,
         callbacks: AppOracleGroupExecutionCallbacks?,
         scope: ContextBuilderOracleLaneScope?,
-        onQueryCreated: @escaping (UUID) -> Void
+        onQueryCreated: @escaping (UUID, String?) -> Void
     ) async throws -> OracleLaneExecutionResponse {
         var laneArgs = args
         laneArgs["chat_id"] = .string(member.publicChatID)
@@ -786,7 +788,7 @@ extension OracleViewModel {
                     resolvedExecution: laneExecution,
                     resolvedLaneIndex: resolvedLaneIndex,
                     contextBuilderScope: scope,
-                    onQueryCreated: onQueryCreated,
+                    onQueryCreated: { onQueryCreated($0, executionProfile?.providerID) },
                     onProgress: { text, reasoning in
                         partialResponse = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
                         scope?.partialResponse = partialResponse
