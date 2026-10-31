@@ -22,8 +22,13 @@ private let appDelegateLog = Logger(label: "com.repoprompt.app.delegate")
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     typealias GlobalMCPRegistrationOperation = @MainActor @Sendable () async throws -> Void
     typealias DomainRuntimeShutdownOperation = @Sendable () async -> Void
-    /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
-    private var terminationInProgress = false
+    private lazy var terminationCoordinator = AppTerminationCoordinator(
+        freeze: { [unowned self] in freezeForTermination() },
+        cleanup: { [unowned self] in await prepareForTermination() },
+        requestTermination: {
+            RunLoop.main.perform(inModes: [.common, .modalPanel]) { NSApp.terminate(nil) }
+        }
+    )
     private let dockMenuController = DockMenuController()
     /// The app delegate retains signal routing so its Dispatch sources remain active for the
     /// entire application lifetime.
@@ -95,6 +100,9 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
         // super.init
         super.init()
+        feedDelegate.postponeInstallation = { [weak self] resume in
+            self?.terminationCoordinator.postponeInstallation(resume: resume) ?? false
+        }
     }
 
     // MARK: - Global MCP startup
@@ -229,10 +237,12 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // Prevent re-entrancy (Cmd+Q twice, menu + dock quit, etc.)
-        guard !terminationInProgress else { return .terminateLater }
-        terminationInProgress = true
+        terminationCoordinator.shouldTerminate {
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+    }
 
+    private func freezeForTermination() {
         // 1) Signal termination FIRST to prevent observation crashes.
         // This stops SwiftUI from trying to update views with deallocated objects
         // during the shutdown sequence (fixes EXC_BAD_ACCESS in ObservationRegistrar).
@@ -243,39 +253,40 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         // window, and an unfrozen bridge would treat that cascade as ordinary lifecycle and delete
         // exactly the saved oversight the next launch is supposed to restore.
         AgentSessionLinkRuntimeBridge.shared.freezeForTermination()
+    }
 
-        // 2) Persist the final restorable window session before async shutdown begins.
-        // Using .terminateLater lets us do async work without deadlocking.
-        Task { @MainActor in
-            if !AppLaunchConfiguration.current.suppressesWindowPersistence {
-                await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
-            }
-
-            // 2b) Bounded settlement of durable oversight transactions the user already started.
-            // Bound settlement of admitted link decisions and their continuity outbox. Live Add/Stop
-            // results are independent of saving; unacknowledged writes are not promised to survive quit.
-            await AgentSessionLinkRuntimeBridge.shared.settleIntentTransactions()
-            // Scope authority was frozen synchronously above. Await its pending row saves, not a
-            // final snapshot or clean-shutdown seal. Only acknowledged commits restore continuity.
-            let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
-            if await !(scopes.settleForTermination(timeout: 2)) {
-                print("Overseer continuity unsettled at the two-second quit deadline: \(scopes.persistenceStatusMessage ?? "unacknowledged transactions remain")")
-            }
-
-            // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
-            // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
-            // so child processes are terminated and reaped rather than orphaned on quit.
-            await tipHistoryStore.shutdown()
-            tipHistoryCleanupTask?.cancel()
-            await tipHistoryCleanupTask?.value
-            await WindowStatesManager.shared.shutdownAllAgentSessions()
-            await WindowStatesManager.shared.stopAllServers()
-            await shutdownDomainRuntimeForTermination()
-            await NotificationService.shared.prepareForTermination()
-            sender.reply(toApplicationShouldTerminate: true)
+    private func prepareForTermination() async {
+        if !AppLaunchConfiguration.current.suppressesWindowPersistence {
+            await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
         }
 
-        return .terminateLater
+        // 2b) Bounded settlement of durable oversight transactions the user already started.
+        // Bound settlement of admitted link decisions and their continuity outbox. Live Add/Stop
+        // results are independent of saving; unacknowledged writes are not promised to survive quit.
+        guard !Task.isCancelled else { return }
+        await AgentSessionLinkRuntimeBridge.shared.settleIntentTransactions()
+        // Scope authority was frozen synchronously above. Await its pending row saves, not a
+        // final snapshot or clean-shutdown seal. Only acknowledged commits restore continuity.
+        guard !Task.isCancelled else { return }
+        let scopes = AgentSessionLinkRuntimeBridge.shared.delegationScopes
+        if await !(scopes.settleForTermination(timeout: 2)) {
+            print("Overseer continuity unsettled at the two-second quit deadline: \(scopes.persistenceStatusMessage ?? "unacknowledged transactions remain")")
+        }
+
+        // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
+        // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
+        // so child processes are terminated and reaped rather than orphaned on quit.
+        guard !Task.isCancelled else { return }
+        await tipHistoryStore.shutdown()
+        tipHistoryCleanupTask?.cancel()
+        await tipHistoryCleanupTask?.value
+        guard !Task.isCancelled else { return }
+        await WindowStatesManager.shared.shutdownAllAgentSessions()
+        guard !Task.isCancelled else { return }
+        await WindowStatesManager.shared.stopAllServers()
+        await shutdownDomainRuntimeForTermination()
+        guard !Task.isCancelled else { return }
+        await NotificationService.shared.prepareForTermination()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
