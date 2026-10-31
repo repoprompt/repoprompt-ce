@@ -57,9 +57,13 @@ jobs:
   package:
     name: Release-mode Package and MCP Smoke
     runs-on: macos-26
-    timeout-minutes: 120
+    # Conductor bounds universal artifact construction at four hours. Let that
+    # deadline report failure and leave time for smoke/diagnostic upload instead
+    # of cancelling a still-valid build at the former two-hour job limit.
+    timeout-minutes: 270
     env:
       ADMISSION_CONTEXT: ${{ inputs.admission }}
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -69,10 +73,14 @@ jobs:
       - name: Verify exact candidate and full-profile attempt
         run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
+      - name: Configure retained package diagnostics
+        run: echo "REPOPROMPT_DEV_DAEMON_STATE_DIR=$RUNNER_TEMP/admission-conductor" >> "$GITHUB_ENV"
+
       - name: Run release preflight
         run: ./conductor release preflight --full-log
 
       - name: Package secret-free universal ad-hoc release candidate
+        timeout-minutes: 245
         run: ./conductor release artifact --full-log
 
       - name: Smoke exact release-mode packaged MCP helper
@@ -92,5 +100,6 @@ jobs:
           path: |
             .build/release/RepoPrompt-artifact-manifest.json
             ${{ runner.temp }}/packaged-smoke
+            ${{ runner.temp }}/admission-conductor/jobs/*.log
           if-no-files-found: warn
           retention-days: 7
