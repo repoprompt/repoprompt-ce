@@ -359,7 +359,7 @@ struct AgentMessageBubble: View {
                         Spacer(minLength: 0)
                         // Tagged files render once, as the badge inside the bubble below.
                         AgentAttachmentsStrip(
-                            imageAttachments: item.attachments,
+                            attachments: item.attachments,
                             taggedFileAttachments: [],
                             disabled: true,
                             allowsRemoval: false
@@ -385,10 +385,13 @@ struct AgentMessageBubble: View {
                     if !item.taggedFileAttachments.isEmpty {
                         TaggedFilesBadge(attachments: item.taggedFileAttachments)
                     }
-                    CollapsibleUserMessage(
+                    MarkdownTextView(
                         text: item.text,
+                        isMarkdown: true,
+                        allowInteraction: true,
                         bareURLLinkificationPolicy: .httpHTTPSOnly
                     )
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(12)
                 .background(BubbleColors.lightBlue)

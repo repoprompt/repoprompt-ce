@@ -797,7 +797,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             fixture.viewModel.test_afterClaudeAttachmentSelfCancel = nil
             fixture.viewModel.test_claudeAttachmentRestartFinished = nil
         }
-        let attachment = AgentImageAttachment(source: .url("https://example.test/old-image.png"))
+        let attachment = AgentFileAttachment(source: .url("https://example.test/old-image.png"))
         guard case .submitted = fixture.viewModel.test_submitWaitingClaudeAttachment(
             session: fixture.session, text: "old binding text", attachment: attachment
         ) else { return XCTFail("expected scheduled attachment restart") }
@@ -830,7 +830,7 @@ final class AgentSessionLinkStopTransactionTests: XCTestCase {
             stopFence: heldFence
         )
         XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.tabID), "replacement draft")
-        XCTAssertTrue(replacement.pendingImageAttachments.isEmpty)
+        XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
         XCTAssertTrue(replacement.pendingTaggedFileAttachments.isEmpty)
     }
 

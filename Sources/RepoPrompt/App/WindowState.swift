@@ -591,6 +591,14 @@ class WindowState: ObservableObject {
     /// Accepted restore execution and the protection session capture relies on. See
     /// `WindowRestoreLifetime` for why the two lifetimes stay independent.
     private var restoreLifetime = WindowRestoreLifetime()
+    var hasUnfinishedRestoreExecution: Bool {
+        restoreLifetime.hasUnfinishedExecution
+    }
+
+    var abandonedRestoreCount: Int {
+        restoreLifetime.abandonedRestoreCount
+    }
+
     private(set) var claimedInitialRefreshDeferralID: UUID?
     private(set) var claimedInitialRefreshDeferralWaiterID: UUID?
 
@@ -864,6 +872,15 @@ class WindowState: ObservableObject {
                 await self.processCommands()
             }
         }
+
+        // Default activation can finish before the authority catalog is accepted. A later
+        // accepted publication must release queued restores without polling the legacy index.
+        workspaceManager.$workspaceChooserPresentation
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.applyPendingRestoreEntryIfPossible()
+            }
+            .store(in: &cancellables)
 
         // Once this window lands on any real workspace, a protected restore entry no longer
         // describes it. This covers a successful restore, a user switch, and a restore whose
@@ -1280,6 +1297,47 @@ class WindowState: ObservableObject {
         }
     }
 
+    /// Stops the current session's active run through the same guarded target as the composer
+    /// Stop button. Returns `false` when there is nothing to stop.
+    @discardableResult
+    func stopAgentRunFromShortcut() -> Bool {
+        let viewModel = agentModeViewModel
+        guard viewModel.isAgentModeActive,
+              let target = viewModel.composerRunCancelTarget(tabID: viewModel.currentTabID)
+        else { return false }
+        Task { _ = await viewModel.cancelAgentRun(target: target) }
+        return true
+    }
+
+    /// Moves focus to the current session's composer. Ending the current field's editing first
+    /// matches clicking into the composer; the composer still validates its tab and window.
+    func focusAgentComposerFromShortcut() {
+        let viewModel = agentModeViewModel
+        guard viewModel.isAgentModeActive, let tabID = viewModel.currentTabID, let nsWindow else { return }
+        if nsWindow.firstResponder !== nsWindow { nsWindow.makeFirstResponder(nil) }
+        viewModel.repromptUIStore.requestComposerFocus(tabID: tabID)
+    }
+
+    /// Restores the most recently stashed session, like reopening the last closed tab.
+    func reopenLastStashedAgentSessionFromShortcut() {
+        guard let workspace = workspaceManager.activeWorkspace, !workspace.isSystemWorkspace,
+              agentModeViewModel.canPerformDirectSidebarCommand(workspaceID: workspace.id),
+              let stashed = workspace.stashedTabs.max(by: { $0.stashedAt < $1.stashedAt })
+        else { return }
+        Task { await promptManager.unstashTab(stashed.id) }
+    }
+
+    /// Switches to the next session in sidebar order with an unseen attention badge.
+    func focusNextAttentionAgentSessionFromShortcut() {
+        guard workspaceManager.activeWorkspace?.isSystemWorkspace == false,
+              let tabID = agentModeViewModel.nextAttentionSidebarSessionTabID(
+                  from: promptManager.activeComposeTabID,
+                  in: promptManager.currentComposeTabs
+              )
+        else { return }
+        Task { await promptManager.switchComposeTab(tabID) }
+    }
+
     func requestClose(authorization: WindowCloseAuthorization? = nil) {
         if let authorization {
             closeCoordinator.enqueueAuthorization(authorization)
@@ -1388,6 +1446,16 @@ class WindowState: ObservableObject {
                 tabName: tab.name
             )
         )
+    }
+
+    /// Keyboard actions reuse the titlebar's captured, revalidated targets and confirmation UI.
+    func performAgentChatShortcut(_ action: AgentChatShortcutAction) {
+        guard !isClosing,
+              NSApplication.shared.modalWindow == nil,
+              nsWindow?.attachedSheet == nil,
+              let snapshot = agentChatTitleClusterMenuSnapshot()
+        else { return }
+        action.perform(snapshot: snapshot, actions: agentChatTitleClusterMenuActions())
     }
 
     func agentChatTitleClusterMenuActions(
@@ -1792,6 +1860,7 @@ class WindowState: ObservableObject {
         // before the restore (or failed startup) runs. The newer state is installed before the
         // displaced completion runs so reentrant capture or explicit intent sees it.
         let displacedCompletion = restoreLifetime.accept(entry, completion: completion)
+        windowStatesManager?.windowRestoreExecutionDidChange()
         displacedCompletion?()
         StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
         applyPendingRestoreEntryIfPossible()
@@ -1801,23 +1870,59 @@ class WindowState: ObservableObject {
     /// is untouched, so session capture keeps the requested entry if explicit intent is refused.
     private func retirePendingRestoreEntry() {
         let completion = restoreLifetime.retirePending()
+        windowStatesManager?.windowRestoreExecutionDidChange()
         completion?()
     }
 
-    private func applyPendingRestoreEntryIfPossible() {
-        guard !isClosing else { return }
-        guard workspaceManager.isInitialized else { return }
-        // The dispatch task owns this acceptance's completion from here on, even if a newer
-        // acceptance arrives before it finishes.
-        guard let dispatch = restoreLifetime.takePendingForDispatch() else { return }
+    /// At most one dispatch task is queued; it rechecks readiness when it runs.
+    private var isRestoreDispatchScheduled = false
 
+    private var canDispatchPendingRestoreEntry: Bool {
+        workspaceManager.isInitialized && workspaceManager.hasAcceptedDomainCatalogForRestoration
+    }
+
+    private func applyPendingRestoreEntryIfPossible() {
+        guard !isClosing, restoreLifetime.hasPendingEntry else { return }
+        guard canDispatchPendingRestoreEntry else {
+            releasePendingRestoreCompletionIfCatalogFailed()
+            return
+        }
+        guard !isRestoreDispatchScheduled else { return }
+        isRestoreDispatchScheduled = true
         StartupPhaseLog.mark(.restoreDispatchEnqueue, window: windowID)
         Task {
-            if !self.isClosing {
-                await restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
+            self.isRestoreDispatchScheduled = false
+            // Enqueueing is not dispatch: close, explicit intent, a newer acceptance, or a
+            // reconciliation fence can intervene before this task runs. Recheck readiness and
+            // claim the entry in the same turn; an unready entry stays pending for the next
+            // accepted chooser publication instead of resolving as unavailable.
+            guard !self.isClosing else { return }
+            guard self.canDispatchPendingRestoreEntry else {
+                self.releasePendingRestoreCompletionIfCatalogFailed()
+                return
             }
+            guard let dispatch = self.restoreLifetime.takePendingForDispatch() else { return }
+            self.windowStatesManager?.windowRestoreExecutionDidChange()
+            await self.restoreWorkspace(from: dispatch.entry, acceptanceSequence: dispatch.acceptanceSequence)
+            self.restoreLifetime.finishDispatch(acceptanceSequence: dispatch.acceptanceSequence)
+            self.windowStatesManager?.windowRestoreExecutionDidChange()
+            // The dispatch owns this acceptance's completion, even if a newer acceptance
+            // arrived while it ran.
             dispatch.completion?()
         }
+    }
+
+    /// A failed catalog may never be accepted, so it must not hold the run-wide restore
+    /// persistence gate. The entry stays pending and protected: session capture keeps the saved
+    /// identity, and a later accepted catalog still dispatches it.
+    private func releasePendingRestoreCompletionIfCatalogFailed() {
+        guard workspaceManager.workspaceChooserPresentation.failure != nil else { return }
+        let previouslyAbandoned = restoreLifetime.abandonedRestoreCount
+        let completion = restoreLifetime.releasePendingCompletion()
+        if restoreLifetime.abandonedRestoreCount != previouslyAbandoned {
+            windowStatesManager?.windowRestoreExecutionDidChange()
+        }
+        completion?()
     }
 
     private func restoreWorkspace(from entry: WindowSessionEntry, acceptanceSequence: UInt64) async {
@@ -1845,17 +1950,21 @@ class WindowState: ObservableObject {
                     "restore.window workspaceResolved windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(target.id)) workspaceName=\(target.name) entryWorkspaceID=\(WorkspaceRestorePerfLog.shortID(entry.workspaceID))"
                 )
             #endif
-            if target.isSystemWorkspace {
-                // The entry intended the system workspace, so the fallback state and the intended
-                // state coincide and there is nothing to protect. Clearing here keeps such a window
-                // capturing live state instead of re-emitting its restore-time entry for good --
-                // the selection observer only fires for non-system workspaces. Scoped to this
-                // acceptance so it never releases a newer one.
+            if target.isSystemWorkspace, workspaceManager.activeWorkspaceID == target.id,
+               !workspaceManager.isSwitchingWorkspace
+            {
+                // Startup may already have selected this exact accepted System identity.
+                // The switch API reports an already-active target as blocked, not switched.
+                restoreLifetime.releaseProtection(forDispatchedAcceptance: acceptanceSequence)
+                return
+            }
+            let result = await workspaceManager.requestWorkspaceSwitch(
+                to: target, saveState: true, reason: "restore"
+            )
+            switchOutcome = StartupPhaseLog.SwitchOutcome(result)
+            if result.didSwitch, target.isSystemWorkspace {
                 restoreLifetime.releaseProtection(forDispatchedAcceptance: acceptanceSequence)
             }
-            switchOutcome = await StartupPhaseLog.SwitchOutcome(
-                workspaceManager.requestWorkspaceSwitch(to: target, saveState: true, reason: "restore")
-            )
             #if DEBUG
                 if let restoreStartMS {
                     WorkspaceRestorePerfLog.log(
@@ -1873,9 +1982,19 @@ class WindowState: ObservableObject {
                 )
             }
         #endif
-        // No existing workspace matches; leave the window in its default state. The protection
-        // armed at acceptance stays set, so session capture re-emits it instead of persisting the
-        // Default fallback, which would discard the user's real window layout.
+        // Keep the accepted restore entry when its exact identity is unavailable, including
+        // System entries. The existing per-window notice makes the retained entry actionable.
+        let label = entry.workspaceName.flatMap { $0.isEmpty ? nil : "\"\($0)\"" } ?? "saved workspace"
+        let identity = entry.workspaceID.map { "\(label) (\($0.uuidString))" } ?? label
+        let isRecoveryCopy = entry.workspaceID.flatMap { workspaceManager.workspace(withID: $0) }?
+            .consolidatedIntoWorkspaceID != nil
+        let explanation = isRecoveryCopy
+            ? "is a consolidated recovery copy. Restore it before opening it."
+            : "is unavailable in the workspace catalog. Restore it or choose another workspace."
+        let error = NSError(domain: "WindowSessionRestore", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "The \(identity) \(explanation) This window's saved restore entry has been kept."
+        ])
+        workspaceManager.reportWindowRestoreFailure(error, workspaceID: entry.workspaceID)
     }
 
     /// Clear on an actual published departure, not a later capture/switch-flag observation. A
@@ -1967,33 +2086,37 @@ class WindowState: ObservableObject {
     }
 
     private func resolveWorkspace(for entry: WindowSessionEntry) -> WorkspaceModel? {
-        let workspaces = workspaceManager.workspaces
-
-        if let id = entry.workspaceID, let match = workspaces.first(where: { $0.id == id }) {
-            return match
+        // A saved UUID is authoritative. Paths and names are legacy hints, never substitutes
+        // for a missing identity (especially when a same-named recovery copy survives).
+        if let id = entry.workspaceID {
+            guard workspaceManager.isWorkspaceAvailableForWindowRestoration(id) else { return nil }
+            return workspaceManager.workspace(withID: id)
         }
 
+        let workspaces = workspaceManager.workspaces.filter {
+            workspaceManager.isWorkspaceAvailableForWindowRestoration($0.id)
+        }
+        if entry.isSystemWorkspace {
+            let matches = workspaces.filter(\.isSystemWorkspace)
+            return matches.count == 1 ? matches.first : nil
+        }
+
+        let candidates = workspaces.filter { !$0.isSystemWorkspace }
         if let path = entry.primaryRepoPath {
             let expanded = (path as NSString).expandingTildeInPath
-            if let match = workspaces.first(where: { workspace in
+            let matches = candidates.filter { workspace in
                 workspace.repoPaths.contains { repoPath in
                     (repoPath as NSString).expandingTildeInPath == expanded
                 }
-            }) {
-                return match
+            }
+            if !matches.isEmpty {
+                return matches.count == 1 ? matches.first : nil
             }
         }
 
-        if let name = entry.workspaceName, !name.isEmpty,
-           let match = workspaces.first(where: { $0.name == name })
-        {
-            return match
-        }
-
-        if entry.isSystemWorkspace,
-           let match = workspaces.first(where: { $0.isSystemWorkspace })
-        {
-            return match
+        if let name = entry.workspaceName, !name.isEmpty {
+            let matches = candidates.filter { $0.name == name }
+            return matches.count == 1 ? matches.first : nil
         }
 
         return nil

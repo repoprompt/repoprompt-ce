@@ -183,6 +183,39 @@ final class AgentSessionLinkHeadlessRunnerPromptAdapterTests: XCTestCase {
 
     // MARK: Composition point
 
+    func testFrozenQuietHintWithdrawalChangesActualProviderBytesWithoutBlockingOrdinaryDelivery() async throws {
+        for withdrawSupport in [false, true] {
+            let provider = AgentSessionLinkCapturingHeadlessProvider()
+            let harness = makeHarness(provider: provider)
+            harness.publishInventory(revision: 1, targetCount: 1)
+            harness.promptEpoch = .init(endpoint: harness.promptEpoch.endpoint, allowsSupplement: true, providerContext: .claudeCode)
+            let wakeID = UUID()
+            harness.forcedAutoWakeID = wakeID
+            harness.routineQuietCheckIn = true
+            harness.passiveNotices = .init(
+                observerEndpoint: harness.promptEpoch.endpoint, queueEpoch: UUID(), queueRevision: 1,
+                linkSetRevision: 1, isEnabled: true, isDeliverable: true, entries: [],
+                unacknowledgedOverflowCount: 1, overflowProduced: 1
+            )
+            let hint = "Nothing needed? Call self_noop."
+            var sawFrozenHint = false
+            harness.beforeProviderInputProof = {
+                let frozen = harness.claimStore.pendingClaim(dispatchID: .autoWake(wakeID: wakeID), observerSessionID: harness.observerSessionID)
+                sawFrozenHint = frozen?.fragment.contains(hint) == true
+                if withdrawSupport { harness.routineQuietCheckIn = false }
+            }
+            let session = harness.makeSession(agent: .openCode)
+            await startRun(harness, session: session, message: "routine overflow")
+            let messages = await provider.messages
+            let sent = try XCTUnwrap(messages.first)
+            XCTAssertTrue(sawFrozenHint, "The regression must start with already-frozen positive copy")
+            XCTAssertEqual(messages.count, 1, "No extra provider/RPCE turn or discovery retry")
+            XCTAssertEqual(sent.userMessage.contains(hint), !withdrawSupport)
+            XCTAssertTrue(sent.userMessage.contains("routine overflow"))
+            XCTAssertEqual(harness.acceptedClaims.last?.routineQuietCheckIn, !withdrawSupport)
+        }
+    }
+
     func testMembershipChangeDuringLeaseInitializationIsReflectedAtDispatch() async throws {
         let provider = AgentSessionLinkCapturingHeadlessProvider()
         let harness = makeHarness(provider: provider)

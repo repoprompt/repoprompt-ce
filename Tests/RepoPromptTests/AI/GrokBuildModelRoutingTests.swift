@@ -651,26 +651,51 @@ final class GrokBuildModelRoutingTests: XCTestCase {
     }
 
     func testOneShotRejectsImagesBeforeLaunchWithoutLeakingPayload() async {
+        let launchAttempts = LaunchAttemptCounter()
         let provider = GrokBuildOneShotHeadlessAgentProvider(
-            config: GrokBuildCLIProvider.test_makeHeadlessConfig(modelName: nil)
+            config: GrokBuildCLIProvider.test_makeHeadlessConfig(modelName: nil),
+            launchResolver: GrokBuildACPLaunchResolver(environmentProvider: { _ in
+                launchAttempts.record()
+                return [:]
+            }),
+            apiKeyProvider: {
+                launchAttempts.record()
+                return nil
+            }
         )
         let message = AgentMessage(
             systemPrompt: "system",
             userMessage: "inspect",
-            transientImages: [
-                .init(bytes: Data([1, 2, 3]), mediaType: .png, title: "Secret Diagram")
+            attachments: [
+                .init(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "Secret Diagram")
             ]
         )
 
         do {
             _ = try await provider.streamAgentMessage(message)
             XCTFail("Expected Grok Build image rejection")
-        } catch let AIProviderError.invalidConfiguration(detail) {
-            XCTAssertTrue(detail.contains("image attachments"))
-            XCTAssertFalse(detail.contains("AQID"))
-            XCTAssertFalse(detail.contains("Secret Diagram"))
+        } catch let error as AttachmentAdmissionError {
+            let detail = error.localizedDescription
+            XCTAssertTrue(detail.contains("image.png"), detail)
+            XCTAssertTrue(detail.contains("Grok Build cannot carry an image attachment"), detail)
+            XCTAssertFalse(detail.contains("AQID"), detail)
+            XCTAssertFalse(detail.contains("Secret Diagram"), detail)
         } catch {
-            XCTFail("Expected actionable provider configuration error, got \(error)")
+            XCTFail("Expected AttachmentAdmissionError, got \(error)")
+        }
+        XCTAssertEqual(launchAttempts.count, 0, "Refusal must precede launch resolution and credential lookup")
+    }
+
+    private final class LaunchAttemptCounter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var attempts = 0
+
+        var count: Int {
+            lock.withLock { attempts }
+        }
+
+        func record() {
+            lock.withLock { attempts += 1 }
         }
     }
 

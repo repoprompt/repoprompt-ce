@@ -159,6 +159,49 @@ updating every archive and exact-tree hash in the manifest, capturing the new
 license/notice files, and rerunning the offline artifact tests plus a protected
 release candidate. Never derive a new pin from an unverified local installation.
 
+### Computer Use release validation
+
+Issue #1423 reports companion authentication failures (`-10000 Sender process is
+not authenticated`) with a RepoPrompt-re-signed bundled Codex, but not with an
+OpenAI-signed external runtime. Those runtimes differed in version (0.159.0 versus
+0.163.0), so re-signing is a plausible cause, not a proven account of the
+companion's private authentication policy.
+
+RepoPrompt conservatively requires a valid OpenAI signing identity on the selected
+Codex executable before arming Computer Use, and verifies it again before spawning
+an armed app-server. This applies to bundled and external runtimes in every build
+mode. Ordinary `package_app.sh release`, local self-signed production installs,
+and contributor artifacts preserve OpenAI's nested signatures and are not blocked
+merely because they are release builds. Official privileged release signing still
+re-signs Codex; those runtimes show instructions for selecting an OpenAI-signed
+local executable under Settings → Codex CLI → Advanced and restarting. Signature
+validation is a prerequisite, not a guarantee of companion compatibility. No
+runtime is selected automatically and signing policy is unchanged.
+
+For each release candidate, record a separately authorized manual check (including
+app build, runtime version/source/signing team, companion version, and result):
+
+1. With a re-signed runtime and Computer Use enabled, `/computer-use` must show the
+   runtime requirement before opt-in or arming, even with a companion installed.
+2. With an OpenAI-signed runtime (bundled where signatures are preserved, or an
+   explicitly selected local executable after restart), arm Computer Use in a
+   top-level chat. With the user's macOS permissions, perform one non-destructive
+   companion call such as listing apps. Record unavailable prerequisites as
+   **not run**, not a pass. Do not grant permissions or operate the desktop
+   automatically, and restore runtime preferences only if requested.
+
+A read-only, opt-in XCTest can check the production static-code validator against
+an already-cached official binary (no downloads or Codex process launches):
+
+```bash
+REPOPROMPT_CODEX_CACHE_ROOT="$PWD/.build/codex-runtime" make dev-test FILTER=CodexComputerUseWorkflowTests
+```
+
+It skips when the host-target binary at `<cache>/<pinned-version>/<target>/bin/codex`
+is absent. The ordinary suite always checks that Security accepts the exact
+requirement syntax. Neither check is proof of live companion authentication.
+Debug tests and ordinary MCP smoke are not proof of release companion authentication.
+
 ### Guarded Codex update candidates
 
 `Scripts/codex_update_candidate.py` prepares evidence for a possible rotation; it

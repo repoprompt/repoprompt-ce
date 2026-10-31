@@ -61,6 +61,7 @@ final class AgentRunTerminalCommitBarrier {
         let supportsFollowUp: Bool
         let providerSuccessor: ProviderSuccessor?
         let notifyTurnComplete: Bool
+        let classifiesQuietCheckIn: Bool
         let providerDrainGeneration: UInt64
         let providerBuffersAreDrained: () -> Bool
         let prepareProviderState: () -> (@MainActor () async -> Void)?
@@ -81,6 +82,7 @@ final class AgentRunTerminalCommitBarrier {
             supportsFollowUp: Bool,
             providerSuccessor: ProviderSuccessor? = nil,
             notifyTurnComplete: Bool,
+            classifiesQuietCheckIn: Bool = false,
             providerDrainGeneration: UInt64 = 0,
             providerBuffersAreDrained: @escaping () -> Bool = { true },
             prepareProviderState: @escaping () -> (@MainActor () async -> Void)? = { nil },
@@ -100,6 +102,7 @@ final class AgentRunTerminalCommitBarrier {
             self.supportsFollowUp = supportsFollowUp
             self.providerSuccessor = providerSuccessor
             self.notifyTurnComplete = notifyTurnComplete
+            self.classifiesQuietCheckIn = classifiesQuietCheckIn
             self.providerDrainGeneration = providerDrainGeneration
             self.providerBuffersAreDrained = providerBuffersAreDrained
             self.prepareProviderState = prepareProviderState
@@ -146,6 +149,21 @@ final class AgentRunTerminalCommitBarrier {
         else {
             assertionFailure("Terminal commit requires a terminal run state")
             return nil
+        }
+        // Await only the existing completed-declaration FIFO before acquiring terminal ownership.
+        // A reentrant Stop must be free to settle through this same lifecycle while delivery is
+        // queued. The full duplicate/owner/run/drain prologue below revalidates after the await;
+        // no pending-terminal queue or retry authority is introduced.
+        var observationCutAllowsQuiet = true
+        if request.terminalState == .completed, request.classifiesQuietCheckIn,
+           !lifecycle.terminalCommitInProgress,
+           lifecycle.lastTerminalCommitRevision?.ownership != request.ownership,
+           validatesOwnership(request),
+           binding.providerDrainGeneration == request.providerDrainGeneration,
+           request.providerBuffersAreDrained(),
+           let flush = binding.hooks.flushQuietToolObservations
+        {
+            observationCutAllowsQuiet = await flush()
         }
         guard !lifecycle.terminalCommitInProgress else {
             recordRejection("commit_in_progress", request: request)
@@ -215,6 +233,18 @@ final class AgentRunTerminalCommitBarrier {
             return nil
         }
 
+        // The pre-acquisition FIFO cut precedes generic cleanup, which could otherwise terminalize
+        // an undelivered native placeholder. Synchronous cleanup cannot confer owner/drain authority.
+        guard validatesOwnership(request),
+              binding.providerDrainGeneration == request.providerDrainGeneration,
+              request.providerBuffersAreDrained()
+        else {
+            lifecycle.abortTerminalCommit()
+            recordTerminalBarrierState(false, request: request)
+            recordRejection("ownership_or_drain_changed_before_commit", request: request)
+            return nil
+        }
+
         binding.hooks.finalizeStreamingItems()
         binding.hooks.finalizePendingToolCalls(request.terminalState)
         if request.finalizeNonCodexUsage {
@@ -257,6 +287,8 @@ final class AgentRunTerminalCommitBarrier {
             binding.appendError(errorText)
         }
 
+        // Cleanup hooks cannot confer seal authority. Repeat the exact owner/provider-drain fence
+        // immediately before the mandatory complete-association check and synchronous classification.
         guard validatesOwnership(request),
               binding.providerDrainGeneration == request.providerDrainGeneration,
               request.providerBuffersAreDrained()
@@ -267,6 +299,11 @@ final class AgentRunTerminalCommitBarrier {
             return nil
         }
 
+        binding.hooks.sealQuietCheckIn(
+            request.ownership, request.terminalState,
+            request.classifiesQuietCheckIn && observationCutAllowsQuiet && binding.hooks.quietToolObservationsAreComplete(),
+            queuedInstruction != nil || providerSuccessor != nil
+        )
         let attemptTeardown = lifecycle.claimTerminalTeardown(
             ownership: request.ownership,
             terminalState: request.terminalState

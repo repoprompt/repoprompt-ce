@@ -68,6 +68,26 @@ final class OracleLaneMarkdownFormatterTests: XCTestCase {
         XCTAssertFalse(OracleLaneMarkdownFormatter.format(payload).contains("mutable"))
     }
 
+    func testTerminalPayloadPreservesProModeWithoutOverridingDifferentRuntimeModels() throws {
+        let tieredPro = AIModel.openAIServiceTierVariant(base: .gpt6AstraProMax, tier: "flex")
+        let cases: [(selected: AIModel, execution: String, expected: String)] = [
+            (.gpt6AstraProMax, "gpt-6-astra", AIModel.gpt6AstraProMax.rawValue),
+            (tieredPro, "gpt-6-astra", tieredPro.rawValue),
+            (.gpt6AstraMax, "gpt-6-astra", "gpt-6-astra"),
+            (.gpt6AstraProMax, "different-runtime-model", "different-runtime-model")
+        ]
+        for item in cases {
+            let fixture = try makeGroup(
+                startedAt: Date(timeIntervalSince1970: 1000), terminal: true,
+                primaryModelID: item.selected.rawValue, primaryExecutionModelID: item.execution
+            )
+            let payload = OracleGroupLanePayloadLoader.payload(group: fixture.group, sessions: [], liveMessages: { _ in [] })
+            XCTAssertEqual(payload.lanes[0].modelID, item.expected)
+            XCTAssertEqual(payload.lanes[0].providerID, "runtime-provider-0")
+            XCTAssertEqual(payload.lanes[0].effectiveReasoningEffort, "high")
+        }
+    }
+
     func testCopyAllVisibilityUsesCanonicalGroupIdentity() {
         XCTAssertTrue(AgentOraclePillLogic.canCopyAll(ChatSession(oracleGroupID: UUID(), oracleGroupSize: 2)))
         XCTAssertFalse(AgentOraclePillLogic.canCopyAll(ChatSession(oracleGroupSize: 2)))
@@ -153,10 +173,12 @@ final class OracleLaneMarkdownFormatterTests: XCTestCase {
 
     private func makeGroup(
         startedAt: Date,
-        terminal: Bool
+        terminal: Bool,
+        primaryModelID: String = "configured-primary",
+        primaryExecutionModelID: String = "runtime-model-0"
     ) throws -> (group: OracleGroupDocument, members: [OracleGroupMember]) {
         let roster = try OracleRoster(
-            primary: OracleModelReference(providerID: nil, modelID: "configured-primary"),
+            primary: OracleModelReference(providerID: nil, modelID: primaryModelID),
             additional: [
                 OracleModelReference(providerID: "configured-provider-1", modelID: "configured-additional-1"),
                 OracleModelReference(providerID: nil, modelID: "configured-additional-2")
@@ -176,11 +198,11 @@ final class OracleLaneMarkdownFormatterTests: XCTestCase {
                     laneIndex: 0,
                     chatID: "chat-0",
                     providerID: nil,
-                    modelID: "configured-primary",
+                    modelID: primaryModelID,
                     status: .completed,
                     executionProfile: OracleExecutionProfile(
                         providerID: "runtime-provider-0",
-                        modelID: "runtime-model-0",
+                        modelID: primaryExecutionModelID,
                         effectiveReasoningEffort: "high"
                     ),
                     response: "durable primary answer"

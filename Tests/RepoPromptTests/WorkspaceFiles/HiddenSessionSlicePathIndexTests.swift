@@ -1,6 +1,7 @@
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptFileSystem
+import RepoPromptWorkspaceCore
 import XCTest
 
 final class HiddenSessionSlicePathIndexTests: XCTestCase {
@@ -89,5 +90,97 @@ final class HiddenSessionAppliedIndexHotPathTests: XCTestCase {
         // should be rejected before even a targeted lookup.
         XCTAssertEqual(lookups.lookupRequests, 1)
         XCTAssertEqual(lookups.requestedRecords, 0)
+    }
+}
+
+@MainActor
+final class RemovedFolderIndexRebuildTests: XCTestCase {
+    func testMatcherPreservesStandardizedPathSemantics() {
+        let paths = [
+            "/", "/file.swift", "/work", "/work/file.swift", "/workspace/file.swift",
+            "/work/a/b/c/d/e/file.swift", "/work/café/file.swift", "/work/cafe\u{301}/file.swift",
+            "/work/日本語/名前.swift", "/work/\u{301}combining/file.swift", "/work/x\u{0600}/file.swift", "relative/file.swift"
+        ].map(StandardizedPath.absolute)
+        let removedSets: [Set<String>] = [
+            [], ["/"], ["/work"], ["/workspace"], ["/work/a/b/c"], ["/work/café"],
+            ["/work/cafe\u{301}"], ["/work/日本語"], ["/work/\u{301}combining"],
+            ["/missing", "/work/a/b/c"], ["/work/x\u{0600}"], ["relative"]
+        ]
+        for removed in removedSets {
+            let matcher = RemovedFolderPathMatcher(removedFolderPaths: removed)
+            for path in paths {
+                XCTAssertEqual(
+                    matcher.containsPathEqualToOrInsideRemovedFolder(path),
+                    legacyContains(path, removed: removed),
+                    "Removed: \(removed), path: \(path)"
+                )
+            }
+        }
+    }
+
+    func testRebuildDecisionPreservesOwnedAndFallbackIndexes() {
+        let root = "/workspace"
+        let removed: Set = ["/workspace/removed"]
+        var index = FileHierarchyIndex()
+        index.filePathsByRoot[root] = ["/workspace/kept/file.swift"]
+        XCTAssertFalse(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: root))
+        index.filePathsByRoot[root]?.insert("/workspace/removed/deep/file.swift")
+        XCTAssertTrue(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: root))
+        XCTAssertFalse(index.hasIndexedPaths(inRemovedFolders: [], rootKey: root))
+
+        index.filePathsByRoot[root] = []
+        index.foldersByFullPath["/workspace/removed"] = FolderViewModel(
+            folder: Folder(name: "removed", path: "/workspace/removed", modificationDate: .distantPast),
+            rootPath: root
+        )
+        XCTAssertTrue(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: root))
+        index.foldersByFullPath = [:]
+        let file = makeFile(path: "/workspace/removed/deep/file.swift", root: root)
+        index.filesByFullPath[file.standardizedFullPath] = file
+        // A present empty owned index remains authoritative, as in the old decision.
+        XCTAssertFalse(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: root))
+        index.filePathsByRoot = [:]
+        XCTAssertTrue(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: root + "/./"))
+        XCTAssertFalse(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: "/other-root"))
+    }
+
+    func testLargeUnmaterializedRemovalBatchStaysResponsive() {
+        let removed = Set((0 ..< 2000).map { "/workspace/.worktrees/removed-\($0)" })
+        let files = Set((0 ..< 12000).map { "/workspace/source/module/component/detail/types/nested/File\($0).swift" })
+        var index = FileHierarchyIndex()
+        index.filePathsByRoot["/workspace"] = files
+        let start = ProcessInfo.processInfo.systemUptime
+        XCTAssertFalse(index.hasIndexedPaths(inRemovedFolders: removed, rootKey: "/workspace"))
+        let elapsed = ProcessInfo.processInfo.systemUptime - start
+        print("REMOVED_FOLDER_BATCH folders=2000 files=12000 new_ms=\(elapsed * 1000)")
+        // Limit this synchronous decision to 250 ms (15 frames at 60 Hz), rather than
+        // the multi-second UI starvation caused by a scan for every removed folder.
+        XCTAssertLessThan(elapsed, 0.25)
+    }
+
+    private func legacyContains(_ path: String, removed: Set<String>) -> Bool {
+        guard !removed.isEmpty else { return false }
+        if removed.contains(path) {
+            return true
+        }
+        var current = path
+        while true {
+            let parent = (current as NSString).deletingLastPathComponent
+            guard !parent.isEmpty, parent != current else { return false }
+            if removed.contains(parent) {
+                return true
+            }
+            current = parent
+        }
+    }
+
+    private func makeFile(path: String, root: String) -> FileViewModel {
+        FileViewModel(
+            file: File(name: "file.swift", path: path, modificationDate: .distantPast),
+            rootPath: root,
+            rootIdentifier: UUID(),
+            rootFolderPath: root,
+            fileSystemService: nil
+        )
     }
 }

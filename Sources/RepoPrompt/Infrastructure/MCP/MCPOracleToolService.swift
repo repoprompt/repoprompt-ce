@@ -118,18 +118,9 @@ struct MCPOracleToolService {
     // MARK: - ask_oracle (agent-mode only)
 
     func executeAskOracle(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "images", "export_response"]
-        let unsupported = args.keys
-            .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
-            .sorted()
-        if !unsupported.isEmpty {
-            throw MCPError.invalidParams(
-                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, images, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
-            )
-        }
-
+        try Self.validateOracleArguments(toolName: MCPWindowToolName.askOracle, args: args)
         try validateCommonOracleArgs(args)
-        let imageRequests = try Self.parseOracleImageRequests(args["images"])
+        let attachmentRequests = try OracleAttachmentContract.parseArguments(args)
 
         guard let connectionID = invocationContext.connectionID else {
             throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
@@ -188,18 +179,18 @@ struct MCPOracleToolService {
                 owner: owner,
                 origin: .askOracle,
                 mode: modeRaw,
-                imageRequests: imageRequests
+                attachmentRequests: attachmentRequests
             )
         } else {
             guard let tabSnapshot = targetWindow.workspaceManager.composeTabSnapshot(for: tabID) else {
                 throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
             }
             let lookupContext = try await oraclePackagingLookupContext(owner: owner)
-            let transientImages = try await loadOracleImages(
-                imageRequests,
+            let attachments = try await loadOracleImages(
+                attachmentRequests,
                 lookupContext: lookupContext,
                 sessionAttachmentPaths: sessionAttachmentPaths(
-                    for: imageRequests,
+                    for: attachmentRequests,
                     tabID: tabID,
                     owner: owner
                 )
@@ -243,7 +234,7 @@ struct MCPOracleToolService {
                 agentModeSessionID: owner.agentSessionID,
                 agentModeRunID: owner.runID,
                 packaging: packaging,
-                transientImages: transientImages
+                attachments: attachments
             )
         }
 
@@ -308,18 +299,9 @@ struct MCPOracleToolService {
     // MARK: - oracle_send
 
     func executeOracleSend(args: [String: Value], invocationContext: ToolInvocationContext) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "images", "export_response"]
-        let unsupported = args.keys
-            .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
-            .sorted()
-        if !unsupported.isEmpty {
-            throw MCPError.invalidParams(
-                "oracle_send only accepts: message, mode, chat_id, new_chat, model, images, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
-            )
-        }
-
+        try Self.validateOracleArguments(toolName: MCPWindowToolName.oracleSend, args: args)
         try validateCommonOracleArgs(args)
-        let imageRequests = try Self.parseOracleImageRequests(args["images"])
+        let attachmentRequests = try OracleAttachmentContract.parseArguments(args)
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
         let exportResponse = try parseExportResponseFlag(args)
@@ -370,14 +352,14 @@ struct MCPOracleToolService {
                 owner: owner,
                 origin: .oracleSend,
                 mode: modeRaw,
-                imageRequests: imageRequests
+                attachmentRequests: attachmentRequests
             )
         } else {
             tabContext = try await oracleSendTabContext(
                 from: context,
                 origin: .oracleSend,
                 mode: modeRaw,
-                imageRequests: imageRequests
+                attachmentRequests: attachmentRequests
             )
         }
 
@@ -401,7 +383,9 @@ struct MCPOracleToolService {
 
         var chatArgs = args
         chatArgs.removeValue(forKey: "export_response")
-        chatArgs.removeValue(forKey: "images")
+        for key in OracleAttachmentContract.redactedArgumentKeys {
+            chatArgs.removeValue(forKey: key)
+        }
 
         let capturedTabContext = tabContext
         let capturedChatArgs = chatArgs
@@ -485,49 +469,24 @@ struct MCPOracleToolService {
         return boolValue
     }
 
-    static func parseOracleImageRequests(_ value: Value?) throws -> [OracleImageRequest] {
-        guard let value else { return [] }
-        guard case let .array(items) = value else {
-            throw MCPError.invalidParams("images must be an array of objects.")
-        }
-        guard !items.isEmpty else { return [] }
-        guard items.count <= OracleImageAttachmentLimits.production.maxCount else {
+    private static let oracleArgumentNames = [
+        "message", "mode", "chat_id", "new_chat", "model", OracleAttachmentContract.argumentName, "export_response"
+    ]
+
+    /// The deprecated `images` alias is accepted but deliberately not listed, so the error steers
+    /// callers to `attachments`.
+    private static let acceptedOracleArgumentNames = Set(oracleArgumentNames + [
+        OracleAttachmentContract.legacyImagesArgumentName
+    ])
+
+    private static func validateOracleArguments(toolName: String, args: [String: Value]) throws {
+        let unsupported = args.keys
+            .filter { !$0.hasPrefix("_") && !acceptedOracleArgumentNames.contains($0) }
+            .sorted()
+        if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "images supports at most \(OracleImageAttachmentLimits.production.maxCount) items."
+                "\(toolName) only accepts: \(oracleArgumentNames.joined(separator: ", ")). Unsupported args: \(unsupported.joined(separator: ", "))"
             )
-        }
-        return try items.enumerated().map { index, item in
-            guard case let .object(object) = item else {
-                throw MCPError.invalidParams("images[\(index)] must be an object.")
-            }
-            let unsupported = object.keys
-                .filter { !["path", "title"].contains($0) }
-                .sorted()
-            guard unsupported.isEmpty else {
-                throw MCPError.invalidParams(
-                    "images[\(index)] unsupported keys: \(unsupported.joined(separator: ", "))."
-                )
-            }
-            guard let rawPath = object["path"]?.stringValue else {
-                throw MCPError.invalidParams("images[\(index)].path must be a string.")
-            }
-            guard !rawPath.isEmpty else {
-                throw MCPError.invalidParams("images[\(index)].path must be a non-empty local file path.")
-            }
-            let title: String?
-            if let titleValue = object["title"] {
-                guard let rawTitle = titleValue.stringValue else {
-                    throw MCPError.invalidParams("images[\(index)].title must be a string.")
-                }
-                let normalized = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard normalized.count <= 200 else {
-                    throw MCPError.invalidParams("images[\(index)].title exceeds 200 characters.")
-                }
-                title = normalized.isEmpty ? nil : normalized
-            } else {
-                title = nil
-            }
-            return OracleImageRequest(index: index, path: rawPath, title: title)
         }
     }
 
@@ -775,15 +734,15 @@ struct MCPOracleToolService {
         ),
         origin: OracleSendOrigin,
         mode: String,
-        imageRequests: [OracleImageRequest] = []
+        attachmentRequests: [OracleAttachmentRequest] = []
     ) async throws -> OracleViewModel.OracleSendTabContext {
         let stabilizedContext = await stabilizedVirtualContext(context)
         let lookupContext = try await oraclePackagingLookupContext(for: stabilizedContext)
-        let transientImages = try await loadOracleImages(
-            imageRequests,
+        let attachments = try await loadOracleImages(
+            attachmentRequests,
             lookupContext: lookupContext,
             sessionAttachmentPaths: sessionAttachmentPaths(
-                for: imageRequests,
+                for: attachmentRequests,
                 tabID: stabilizedContext.tabID,
                 owner: owner
             )
@@ -821,13 +780,13 @@ struct MCPOracleToolService {
             agentModeSessionID: owner.agentSessionID,
             agentModeRunID: owner.runID,
             packaging: packaging,
-            transientImages: transientImages
+            attachments: attachments
         )
     }
 
     /// Exact image files the owning Agent session attached itself; empty without an owner.
     private func sessionAttachmentPaths(
-        for requests: [OracleImageRequest],
+        for requests: [OracleAttachmentRequest],
         tabID: UUID,
         owner: AgentOracleOwner
     ) -> [String] {
@@ -839,10 +798,10 @@ struct MCPOracleToolService {
     }
 
     private func loadOracleImages(
-        _ requests: [OracleImageRequest],
+        _ requests: [OracleAttachmentRequest],
         lookupContext: WorkspaceLookupContext,
         sessionAttachmentPaths: [String]
-    ) async throws -> [AITransientImage] {
+    ) async throws -> [OracleAttachment] {
         guard !requests.isEmpty else { return [] }
         let storeRoots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let representedPhysicalPaths = Set(storeRoots.map(\.standardizedFullPath))
@@ -875,11 +834,11 @@ struct MCPOracleToolService {
             )
         }
         do {
-            let authority = try await OracleImageAttachmentLoader.deriveAuthorityDetached(
+            let authority = try await OracleAttachmentLoader.deriveAuthorityDetached(
                 rootSpecs: rootSpecs,
                 sessionAttachmentPaths: sessionAttachmentPaths
             )
-            return try await OracleImageAttachmentLoader.loadDetached(
+            return try await OracleAttachmentLoader.loadDetached(
                 requests: requests,
                 authority: authority
             )

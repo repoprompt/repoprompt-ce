@@ -143,6 +143,12 @@ protocol DelegationMembershipProjector {
     func authorityConflictInAncestry(of sessionID: UUID) -> Bool
     /// Capacity decisions consume this optional proof, never an incomplete numeric projection.
     func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage?
+    /// Without worktree accounting, only the session count and parent depth are capacity evidence.
+    func usageEvidence(
+        of scope: DomainDelegationScopeGrant,
+        spawnParentSessionID: UUID?,
+        requiresWorktreeAccounting: Bool
+    ) -> DomainDelegationScopeUsage?
 }
 
 extension DelegationMembershipProjector {
@@ -156,6 +162,14 @@ extension DelegationMembershipProjector {
 
     func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage? {
         usage(of: scope, spawnParentSessionID: spawnParentSessionID)
+    }
+
+    func usageEvidence(
+        of scope: DomainDelegationScopeGrant,
+        spawnParentSessionID: UUID?,
+        requiresWorktreeAccounting _: Bool
+    ) -> DomainDelegationScopeUsage? {
+        usageEvidence(of: scope, spawnParentSessionID: spawnParentSessionID)
     }
 
     func withSynchronousTargets<Result>(_: Set<UUID>, _ body: (any DelegationMembershipProjector) -> Result) -> Result {
@@ -190,12 +204,16 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     /// Worktrees created by any of the given sessions under a scope and not yet released
     /// (`WorktreeOwnershipStore`). Counted toward `maxWorktrees` even while unbound.
     var ownedUnreleasedWorktreeIDs: @MainActor (_ createdBy: Set<UUID>) -> Set<String> = { _ in [] }
+    /// Standalone projectors model known in-memory ownership. Production supplies the durable
+    /// store's live readiness; unavailable ownership is unknown usage, never an empty set.
+    var ownershipAccountingReady: @MainActor () -> Bool = { true }
     /// Optional operation-count witness; not retained in an authority proof.
     var onAncestryLookup: ((UUID) -> Void)?
 
     func withSynchronousCensus<Result>(_ body: (any DelegationMembershipProjector) -> Result) -> Result {
         var projector = Self(source: census(), onAncestryLookup: onAncestryLookup)
         projector.ownedUnreleasedWorktreeIDs = ownedUnreleasedWorktreeIDs
+        projector.ownershipAccountingReady = ownershipAccountingReady
         return body(projector)
     }
 
@@ -203,6 +221,7 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
         let points = TargetSource(source: source, targets: targets)
         var projector = Self(source: points, onAncestryLookup: onAncestryLookup)
         projector.ownedUnreleasedWorktreeIDs = ownedUnreleasedWorktreeIDs
+        projector.ownershipAccountingReady = ownershipAccountingReady
         return body(projector)
     }
 
@@ -319,6 +338,15 @@ struct SpawnProvenanceDelegationMembershipProjector: DelegationMembershipProject
     }
 
     func usageEvidence(of scope: DomainDelegationScopeGrant, spawnParentSessionID: UUID?) -> DomainDelegationScopeUsage? {
+        usageEvidence(of: scope, spawnParentSessionID: spawnParentSessionID, requiresWorktreeAccounting: true)
+    }
+
+    func usageEvidence(
+        of scope: DomainDelegationScopeGrant,
+        spawnParentSessionID: UUID?,
+        requiresWorktreeAccounting: Bool
+    ) -> DomainDelegationScopeUsage? {
+        guard !requiresWorktreeAccounting || ownershipAccountingReady() else { return nil }
         let census = census()
         guard census.snapshot.hasCompletePlacement(for: scope) else { return nil }
         return Self(source: census, ownedUnreleasedWorktreeIDs: ownedUnreleasedWorktreeIDs, onAncestryLookup: onAncestryLookup)

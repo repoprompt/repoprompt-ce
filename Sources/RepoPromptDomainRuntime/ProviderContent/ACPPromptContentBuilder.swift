@@ -4,52 +4,62 @@ import UniformTypeIdentifiers
 
 package enum ACPPromptContentBuilder {
     package enum Error: LocalizedError, Equatable {
-        case unreadableLocalImage(String)
+        case unreadableLocalAttachment(String)
 
         package var errorDescription: String? {
             switch self {
-            case let .unreadableLocalImage(path):
-                "Unable to read image attachment at \(path)."
+            case let .unreadableLocalAttachment(path):
+                "Unable to read attachment at \(path)."
             }
         }
     }
 
     package static func blocks(
         text: String,
-        attachments: [AgentImageAttachment],
-        transientImages: [AITransientImage] = []
+        attachments: [AgentFileAttachment],
+        oracleAttachments: [OracleAttachment] = []
     ) throws -> [[String: Any]] {
+        let imageAttachments = attachments.filter { $0.kind == .image }
+        let planned = try AttachmentEncoding.plan(oracleAttachments, route: .acp)
+        let body = AttachmentEncoding.prependingInlineText(of: planned, to: text)
         var blocks: [[String: Any]] = []
-        if !text.isEmpty || (attachments.isEmpty && transientImages.isEmpty) {
+        if !body.isEmpty || (imageAttachments.isEmpty && planned.isEmpty) {
             blocks.append([
                 "type": "text",
-                "text": text
+                "text": body
             ])
         }
 
-        for attachment in attachments {
+        for attachment in imageAttachments {
             if let block = try imageBlock(for: attachment) {
                 blocks.append(block)
             }
         }
-        for image in transientImages {
-            if let annotation = image.titleAnnotation {
+        for item in planned {
+            switch item.delivery {
+            case let .nativeImage(mediaType, data):
+                if let annotation = item.titleAnnotation {
+                    blocks.append([
+                        "type": "text",
+                        "text": annotation
+                    ])
+                }
                 blocks.append([
-                    "type": "text",
-                    "text": annotation
+                    "type": "image",
+                    "mimeType": mediaType.rawValue,
+                    "data": data.base64EncodedString()
                 ])
+            case .inlineText:
+                break
+            case .nativeDocument:
+                throw item.undeclaredRung(on: .acp)
             }
-            blocks.append([
-                "type": "image",
-                "mimeType": image.mediaType.rawValue,
-                "data": image.base64Payload
-            ])
         }
 
         return blocks
     }
 
-    private static func imageBlock(for attachment: AgentImageAttachment) throws -> [String: Any]? {
+    private static func imageBlock(for attachment: AgentFileAttachment) throws -> [String: Any]? {
         switch attachment.source {
         case let .localFile(rawPath):
             let url: URL
@@ -58,7 +68,7 @@ package enum ACPPromptContentBuilder {
                 url = try localImageFileURL(exactPath: rawPath)
                 data = try Data(contentsOf: url)
             } catch {
-                throw Error.unreadableLocalImage(rawPath)
+                throw Error.unreadableLocalAttachment(rawPath)
             }
             return [
                 "type": "image",

@@ -4892,7 +4892,7 @@ import XCTest
 
         func startUserTurn(
             text _: String,
-            images _: [AgentImageAttachment],
+            attachments _: [AgentFileAttachment],
             model _: String?,
             reasoningEffort _: String?,
             serviceTier _: String?
@@ -4902,7 +4902,7 @@ import XCTest
 
         func steerUserTurn(
             text _: String,
-            images _: [AgentImageAttachment],
+            attachments _: [AgentFileAttachment],
             expectedTurnID: String
         ) async throws -> CodexTurnSteerReceipt {
             CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)

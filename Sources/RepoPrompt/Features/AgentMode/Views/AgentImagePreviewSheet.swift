@@ -7,7 +7,7 @@ import SwiftUI
 /// The image is decoded off the main thread at a bounded preview size and fitted to the sheet.
 /// Esc, ⌘W, and the Close button dismiss it; the decode is cancelled when the sheet closes.
 struct AgentImagePreviewSheet: View {
-    let attachment: AgentImageAttachment
+    let attachment: AgentFileAttachment
     let title: String
 
     @Environment(\.dismiss) private var dismiss
@@ -52,7 +52,7 @@ struct AgentImagePreviewSheet: View {
         .background(closeShortcut)
         .onExitCommand { dismiss() }
         .onAppear(perform: loadPreview)
-        .onReceive(AgentAttachmentThumbnailCache.shared.invalidatedPaths.receive(on: DispatchQueue.main)) { paths in
+        .onReceive(AttachmentTilePreviewCache.shared.retainedImages.invalidatedPaths.receive(on: DispatchQueue.main)) { paths in
             guard let path, paths.contains(path) else { return }
             loadToken?.cancel()
             loadToken = nil
@@ -153,7 +153,7 @@ struct AgentImagePreviewSheet: View {
             return
         }
         let key = AgentAttachmentImageKey.preview(path: path, backingScale: NSScreen.main?.backingScaleFactor ?? 2)
-        let cache = AgentAttachmentThumbnailCache.shared
+        let cache = AttachmentTilePreviewCache.shared.retainedImages
         if let cached = cache.cachedImage(for: key) {
             phase = .loaded(cached.image, pixelSize: cached.pixelSize)
             return

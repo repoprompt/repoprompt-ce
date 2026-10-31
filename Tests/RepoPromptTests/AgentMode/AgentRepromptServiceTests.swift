@@ -15,7 +15,7 @@ final class AgentRepromptServiceTests: XCTestCase {
         XCTAssertTrue(message.systemPrompt.contains("do NOT carry forward the prior"))
         XCTAssertTrue(message.systemPrompt.contains("My guidance"))
         XCTAssertEqual(message.conversationMessages.count, 1)
-        XCTAssertTrue(message.transientImages.isEmpty && message.fileBlocks.isEmpty && message.metaPrompts.isEmpty && message.fileTree.isEmpty)
+        XCTAssertTrue(message.attachments.isEmpty && message.fileBlocks.isEmpty && message.metaPrompts.isEmpty && message.fileTree.isEmpty)
         XCTAssertNil(message.gitDiff)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(message.conversationMessages[0].content.utf8)) as? [String: Any])
         XCTAssertEqual(object["originalText"] as? String, request.originalText)

@@ -6,6 +6,19 @@ import XCTest
 
 @MainActor
 final class OracleExecutionResolverTests: XCTestCase {
+    func testDirectAstraProSelectionRemainsProForOracleExecution() throws {
+        let model = AIModel.gpt6AstraProMax
+        let snapshot = makeSnapshot(presets: [], profile: AgentModelsSettingsProfile(planningModelRaw: model.rawValue))
+        let resolver = makeResolver(available: [model])
+
+        let execution = try resolver.resolve(choice: .oracleSend("current_chat_model"), mode: "review", snapshot: snapshot)
+
+        XCTAssertEqual(execution.models, [model])
+        XCTAssertEqual(execution.roster.orderedModels.map(\.modelID), [model.rawValue])
+        XCTAssertEqual(execution.models.first?.openAIReasoningMode, "pro")
+        XCTAssertEqual(execution.models.first?.modelName, "gpt-6-astra")
+    }
+
     func testExplicitPresetOwnsOrderedRosterAndMappingIncludingDuplicates() throws {
         let customReview = ChatPreset(name: "Custom Review", mode: .review)
         let preset = try ModelPreset(

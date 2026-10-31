@@ -15,7 +15,7 @@ extension AgentSessionDataService {
     /// Registration precedes any suspension; once deletion installs its tombstone, no new move can
     /// join. The worker stays off this actor so image decoding does not stall session operations.
     func retainConsumedAttachments(
-        _ attachments: [AgentImageAttachment],
+        _ attachments: [AgentFileAttachment],
         sessionID: UUID,
         store: AgentSessionAttachmentStore,
         workspaceDirectory: URL
@@ -58,12 +58,12 @@ extension AgentSessionDataService {
     /// Copy under both session lifetimes. A parent delete waits for the independent bytes; a child
     /// delete waits before removing them and permanently fences any later copy admission.
     func copyHandoffAttachments(
-        _ attachments: [AgentImageAttachment],
+        _ attachments: [AgentFileAttachment],
         sourceSessionID: UUID?,
         destinationSessionID: UUID,
         store: AgentSessionAttachmentStore,
         temporaryRoot: URL?
-    ) async throws -> [UUID: AgentImageAttachment] {
+    ) async throws -> [UUID: AgentFileAttachment] {
         let folder = store.rootURL.deletingLastPathComponent()
         let destinationURL = folder.appendingPathComponent(agentSessionFilename(for: destinationSessionID)).standardizedFileURL
         var sessionURLs = [destinationURL]

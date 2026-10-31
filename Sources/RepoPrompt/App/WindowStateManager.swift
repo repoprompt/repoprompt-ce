@@ -76,6 +76,14 @@ struct WindowSessionRestorePersistenceGate {
         isRestoreSessionLoadPending || pendingRestoreEntryCount > 0 || !restoringWindowIDs.isEmpty
     }
 
+    /// A failed catalog can release persistence before its accepted restore entry executes.
+    /// Absence requires both the persistence gate and every accepted restore execution to finish.
+    func oversightTopologyState(hasPendingWindowExecution: Bool, abandonedEntryCount: Int) -> AgentSessionOversightRestoreTopologyState {
+        guard !isRestoreInProgress, !hasPendingWindowExecution else { return .pending }
+        guard abandonedEntryCount == 0 else { return .incompleteLeftoversAbandoned(count: abandonedEntryCount) }
+        return .completeAllEntriesConsumed
+    }
+
     mutating func beginRestoreSessionLoad() {
         isRestoreSessionLoadPending = true
     }
@@ -560,6 +568,17 @@ class WindowStatesManager: ObservableObject {
                 updateKeyboardShortcutsState()
             }
             .store(in: &focusCancellables)
+        for name in [
+            NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification,
+            NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+            NSWindow.willBeginSheetNotification, NSWindow.didEndSheetNotification,
+            UserDefaults.didChangeNotification
+        ] {
+            NotificationCenter.default.publisher(for: name)
+                .receive(on: RunLoop.main)
+                .sink { [weak self] _ in self?.updateKeyboardShortcutsState() }
+                .store(in: &focusCancellables)
+        }
         updateKeyboardShortcutsState()
     }
 
@@ -737,11 +756,16 @@ class WindowStatesManager: ObservableObject {
     private func computeAgentSessionOversightTopologyState() -> AgentSessionOversightRestoreTopologyState {
         if AppLaunchConfiguration.current.suppressesAgentSessionOversightPersistence { return .suppressed }
         guard autoRestoreWorkspacesEnabled else { return .dormantAutoRestoreDisabled }
-        guard hasLoadedRestoreSession, !restorePersistenceGate.isRestoreInProgress else { return .pending }
-        guard abandonedRestoreEntryCount == 0 else {
-            return .incompleteLeftoversAbandoned(count: abandonedRestoreEntryCount)
-        }
-        return .completeAllEntriesConsumed
+        guard hasLoadedRestoreSession else { return .pending }
+        let restoringWindows = allWindows.filter { !$0.isClosing }
+        return restorePersistenceGate.oversightTopologyState(
+            hasPendingWindowExecution: restoringWindows.contains { $0.hasUnfinishedRestoreExecution },
+            abandonedEntryCount: abandonedRestoreEntryCount + restoringWindows.reduce(0) { $0 + $1.abandonedRestoreCount }
+        )
+    }
+
+    func windowRestoreExecutionDidChange() {
+        updateAgentSessionOversightTopologyState()
     }
 
     func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {
@@ -1291,22 +1315,27 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - Keyboard Shortcuts Enabling/Disabling
 
-    /// Updates `KeyboardShortcuts.isEnabled` depending on whether
-    /// any of our tracked windows is currently focused and if shortcuts are enabled in settings.
+    /// Application commands remain available in Settings and after the last main window closes.
+    /// Individual workspace/session handlers additionally require a key main window.
     private func updateKeyboardShortcutsState() {
         // Skip during termination to prevent observation crashes
         guard !isTerminating else { return }
 
         let shortcutsEnabled = GlobalSettingsStore.shared.enableKeyboardShortcuts()
 
-        // If *any* window is currently focused AND shortcuts are enabled, enable shortcuts; otherwise disable them.
-        let anyFocused = allWindows.contains { $0.isCurrentlyFocused == true }
-        let shouldEnable = anyFocused && shortcutsEnabled
+        let shouldEnable = NSApplication.shared.isActive && shortcutsEnabled
         if shouldEnable {
             // Register handlers lazily to avoid installing Carbon hotkeys during background/inactive launch.
             GlobalKeyboardShortcutsCoordinator.shared.ensureHandlersRegistered()
         }
         KeyboardShortcuts.isEnabled = shouldEnable
+        // Resolve from self: this also runs during singleton initialization, before `.shared`
+        // is safe for the coordinator to look up recursively.
+        let keyWindow = NSApplication.shared.keyWindow
+        let eligible = keyWindow != nil && NSApplication.shared.modalWindow == nil
+            && keyWindow?.attachedSheet == nil
+            && allWindows.contains { $0.nsWindow === keyWindow && !$0.isClosing }
+        GlobalKeyboardShortcutsCoordinator.shared.updateRegistrationContext(hasEligibleMainWindow: eligible)
     }
 
     // MARK: - Window Lookup Helpers (for MCP routing)

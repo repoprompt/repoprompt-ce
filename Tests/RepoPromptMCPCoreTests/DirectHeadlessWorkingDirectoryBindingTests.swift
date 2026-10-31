@@ -54,6 +54,120 @@ final class DirectHeadlessWorkingDirectoryBindingTests: XCTestCase {
         }
     }
 
+    /// Published variants survive the installed SDK boundary and describe the existing parser, not new inputs.
+    func testPublishedWorkspaceContractMatchesHeadlessCalls() async throws {
+        let profile = try makeProfile()
+        try await withSession(profile, extraOperations: [
+            "manage_workspaces.create", "manage_workspaces.select_tab", "manage_workspaces.create_tab",
+            "manage_workspaces.close_tab", "manage_workspaces.delete"
+        ]) { session in
+            let tools = try await session.client.listTools().tools
+            let bind = try XCTUnwrap(tools.first { $0.name == "bind_context" })
+            let properties = try XCTUnwrap(bind.inputSchema.objectValue?["properties"]?.objectValue)
+            let forms = try XCTUnwrap(properties["working_dirs"]?.objectValue?["anyOf"]?.arrayValue)
+            XCTAssertEqual(forms.map { $0.objectValue?["type"] }, [.string("array"), .string("string")])
+            XCTAssertTrue(properties["window_id"]?.objectValue?["description"]?.stringValue?.contains("headless rejects") == true)
+            let manage = try XCTUnwrap(tools.first { $0.name == "manage_workspaces" })
+            XCTAssertEqual(manage.inputSchema.objectValue?["required"], .array([.string("action")]))
+            XCTAssertTrue(manage.description?.contains("Required for select_tab and close_tab") == true)
+            XCTAssertTrue(manage.description?.contains("headless: workspace_id, name, repo_paths, hidden, contexts, without window IDs") == true)
+            XCTAssertTrue(manage.description?.contains("UUID exactly as listed or unambiguous name for close_tab") == true)
+            // #1517 remains a separate unresolved promise; this change must not silently remove it.
+            XCTAssertTrue(manage.description?.contains("or any tab with a live bound run") == true)
+
+            let original = try await Self.status(session)
+            for roots in [Value.string(profile.root.path), .array([.string(profile.root.path)])] {
+                let bound = await Self.callTool(session.client, "bind_context", [
+                    "op": .string("bind"), "working_dirs": roots,
+                    "create_if_missing": .bool(true), "tab_name": .string("Ignored name")
+                ])
+                XCTAssertEqual(bound.binding, original.explicitly, bound.text)
+            }
+            let before = await session.prepared.runtime.workspaceStore.snapshot()
+            let missing = await Self.callTool(session.client, "bind_context", [
+                "op": .string("bind"), "working_dirs": .array([.string(profile.base.path)]),
+                "create_if_missing": .bool(true)
+            ])
+            XCTAssertTrue(missing.isError, missing.text)
+            let after = await session.prepared.runtime.workspaceStore.snapshot()
+            XCTAssertEqual(after.workspaces.count, before.workspaces.count)
+            XCTAssertEqual(after.workspaces.map(\.document.metadata.name), before.workspaces.map(\.document.metadata.name))
+
+            let commaRoot = profile.root.appendingPathComponent("comma,root", isDirectory: true)
+            try FileManager.default.createDirectory(at: commaRoot, withIntermediateDirectories: true)
+            let created = await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("create"), "name": .string("Comma roots"),
+                "folder_path": .string(commaRoot.path), "switch_to_created": .bool(true),
+                "open_in_new_window": .bool(false)
+            ])
+            XCTAssertFalse(created.isError, created.text)
+            let commaBinding = try XCTUnwrap(created.binding)
+            let commaBound = await Self.callTool(session.client, "bind_context", [
+                "op": .string("bind"), "working_dirs": .array([.string(commaRoot.path)])
+            ])
+            XCTAssertEqual(commaBound.binding, commaBinding, commaBound.text)
+
+            let windowRefused = try await Self.callTool(session.client, "bind_context", [
+                "op": .string("bind"), "context_id": .string(XCTUnwrap(commaBinding.contextID)),
+                "window_id": .int(1)
+            ])
+            XCTAssertTrue(windowRefused.isError, windowRefused.text)
+            XCTAssertTrue(windowRefused.text.contains("window_id is unavailable"), windowRefused.text)
+            for flag in ["window_id": Value.int(1), "open_in_new_window": .bool(true)] {
+                let refused = await Self.callTool(session.client, "manage_workspaces", [
+                    "action": .string("list"), flag.key: flag.value
+                ])
+                XCTAssertTrue(refused.isError, refused.text)
+                XCTAssertTrue(refused.text.contains("unavailable with --backend headless"), refused.text)
+            }
+            let named = await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("select_tab"), "tab": .string("Prompt 1")
+            ])
+            XCTAssertTrue(named.isError, named.text)
+            XCTAssertTrue(named.text.contains("canonical tab UUID"), named.text)
+            let selected = try await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("select_tab"), "tab": .string(XCTUnwrap(commaBinding.contextID)),
+                "focus": .bool(true)
+            ])
+            XCTAssertEqual(selected.binding, commaBinding, selected.text)
+            let newTab = await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("create_tab"), "name": .string("Second"), "focus": .bool(true)
+            ])
+            XCTAssertFalse(newTab.isError, newTab.text)
+            let beforeClose = try await Self.workspace(XCTUnwrap(commaBinding.workspaceUUID), in: session)
+            XCTAssertEqual(beforeClose.contexts.count, 2)
+            let active = try await Self.status(session)
+            XCTAssertEqual(beforeClose.document.metadata.activeContextID?.uuidString, active.contextID)
+            let omitted = await Self.callTool(session.client, "manage_workspaces", ["action": .string("close_tab")])
+            XCTAssertTrue(omitted.isError, omitted.text)
+            XCTAssertTrue(omitted.text.contains("requires an existing tab"), omitted.text)
+            let unchanged = try await Self.workspace(XCTUnwrap(commaBinding.workspaceUUID), in: session)
+            XCTAssertEqual(unchanged.contexts.map(\.metadata.identity), beforeClose.contexts.map(\.metadata.identity))
+            let deleted = try await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("delete"), "workspace": .string(XCTUnwrap(commaBinding.workspaceID)),
+                "close_window": .bool(true)
+            ])
+            XCTAssertFalse(deleted.isError, deleted.text)
+            let remaining = await session.prepared.runtime.workspaceStore.snapshot()
+            XCTAssertFalse(remaining.workspaces.contains { $0.document.workspaceID == commaBinding.workspaceUUID })
+        }
+    }
+
+    func testWorkspaceMetadataDoesNotGrantCloseAuthority() async throws {
+        let profile = try makeProfile()
+        try await withSession(profile) { session in
+            let before = try await Self.status(session)
+            let refused = try await Self.callTool(session.client, "manage_workspaces", [
+                "action": .string("close_tab"), "tab": .string(XCTUnwrap(before.contextID)),
+                "allow_active": .bool(true)
+            ])
+            XCTAssertTrue(refused.isError, refused.text)
+            XCTAssertTrue(refused.text.contains("Protected mutation denied because no active grant covers this operation."), refused.text)
+            let after = try await Self.status(session)
+            XCTAssertEqual(after, before)
+        }
+    }
+
     // MARK: - Scenario
 
     private func assertRestartBindsCanonical(
@@ -163,7 +277,7 @@ final class DirectHeadlessWorkingDirectoryBindingTests: XCTestCase {
     }
 
     /// One headless process lifetime: always torn down before returning, so the next call is a real restart.
-    private func withSession<T>(_ profile: Profile, _ body: (Session) async throws -> T) async throws -> T {
+    private func withSession<T>(_ profile: Profile, extraOperations: Set<String> = [], _ body: (Session) async throws -> T) async throws -> T {
         let service = DirectHeadlessMCPService(environment: profile.environment, currentDirectory: profile.base)
         let prepared = try await service.prepareRuntime()
         let transports = await InMemoryTransport.createConnectedPair()
@@ -173,7 +287,7 @@ final class DirectHeadlessWorkingDirectoryBindingTests: XCTestCase {
             principal: prepared.principal, policyProfile: .direct, restrictedToolNames: [],
             additionalToolNames: [],
             ephemeralGrantedOperations: DirectHeadlessMCPService.topLevelDefaultMutationOperations
-                .union(["bind_context.bind"])
+                .union(["bind_context.bind"]).union(extraOperations)
         ))
         let client = Client(name: "Headless working-dirs client", version: "1")
         let session = Session(service: service, prepared: prepared, server: server, client: client)

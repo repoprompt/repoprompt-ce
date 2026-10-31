@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 import RepoPromptShared
 import RepoPromptWorkspaceCore
@@ -50,6 +51,46 @@ struct ToolInvocationContext {
     let toolName: String
     let metadata: MCPRequestMetadata
     let dispatchAuthorization: MCPToolDispatchAuthorization?
+    /// Candidate native association supplied by Claude Code request metadata. Not host authority.
+    /// Live presence/equality with stream tool_use_id is an unverified external assumption.
+    let claudeToolUseID: String?
+    /// Pinned Codex request correlation only; never admission or host invocation authority.
+    let codexCallID: String?
+    let codexThreadID: String?
+
+    init(
+        origin: Origin,
+        invocationID: UUID,
+        requestID: JSONRPCBridgeID?,
+        toolName: String,
+        metadata: MCPRequestMetadata,
+        dispatchAuthorization: MCPToolDispatchAuthorization?,
+        claudeToolUseID: String? = nil,
+        codexCallID: String? = nil,
+        codexThreadID: String? = nil
+    ) {
+        self.origin = origin
+        self.invocationID = invocationID
+        self.requestID = requestID
+        self.toolName = toolName
+        self.metadata = metadata
+        self.dispatchAuthorization = dispatchAuthorization
+        self.claudeToolUseID = claudeToolUseID
+        self.codexCallID = codexCallID
+        self.codexThreadID = codexThreadID
+    }
+
+    static func candidateClaudeToolUseID(_ value: MCP.Value?) -> String? {
+        correlationString(value)
+    }
+
+    static func correlationString(_ value: MCP.Value?) -> String? {
+        guard case let .string(raw)? = value, !raw.isEmpty,
+              raw == raw.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+        else { return nil }
+        return raw
+    }
 
     var connectionID: UUID? {
         metadata.connectionID
@@ -74,7 +115,10 @@ struct ToolInvocationContext {
                 invocationID: metadata.invocationID,
                 requestID: metadata.requestID
             ),
-            dispatchAuthorization: authorization
+            dispatchAuthorization: authorization,
+            claudeToolUseID: claudeToolUseID,
+            codexCallID: codexCallID,
+            codexThreadID: codexThreadID
         )
     }
 

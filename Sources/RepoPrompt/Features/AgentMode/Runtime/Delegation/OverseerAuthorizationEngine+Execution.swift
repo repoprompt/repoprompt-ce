@@ -247,7 +247,10 @@ extension OverseerAuthorizationEngine {
             $0.formUnion(projector.knownProvenance(for: $1)?.boundWorktreeIDs ?? [])
         }.count
         for record in scopes.scopeChain(from: scope.id) {
-            guard let evidence = projector.usageEvidence(of: record.grant, spawnParentSessionID: nil) else {
+            guard let evidence = projector.usageEvidence(
+                of: record.grant, spawnParentSessionID: nil,
+                requiresWorktreeAccounting: record.grant.guardrails.maxWorktrees != nil
+            ) else {
                 return .usageProofMissing
             }
             let usage = scopes.usageIncludingReservations(evidence)

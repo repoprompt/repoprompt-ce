@@ -30,7 +30,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         let sessionID = UUID()
         let temporaryFile = temporaryRoot.appendingPathComponent("\(UUID().uuidString).png")
         try Data("small image".utf8).write(to: temporaryFile)
-        let attachment = AgentImageAttachment(source: .localFile(path: temporaryFile.path), title: "shot.png")
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path), title: "shot.png")
 
         let result = store.retain([attachment], sessionID: sessionID, temporaryRoot: temporaryRoot)
 
@@ -51,6 +51,35 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         XCTAssertEqual(result.evictedPaths, [])
     }
 
+    func testGenericFileFactsSurviveRetentionRepairAndHandoffWithoutImageConversion() throws {
+        let limits = AgentSessionAttachmentStore.Limits(
+            maxRetainedImageBytes: 1, downscaledLongEdgePixels: 1, maxSessionFolderBytes: .max
+        )
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder, limits: limits)
+        let parentID = UUID()
+        let childID = UUID()
+        let source = temporaryRoot.appendingPathComponent("document.pdf")
+        // ImageIO-readable bytes deliberately exercise the kind fence, not decoder failure.
+        try writeNoisePNG(to: source, width: 16, height: 16)
+        let bytes = try Data(contentsOf: source)
+        let attachment = AgentFileAttachment(
+            source: .localFile(path: source.path), title: "Document",
+            kind: .pdf, fileName: "document.pdf", byteCount: bytes.count
+        )
+        let retained = try XCTUnwrap(store.retain([attachment], sessionID: parentID, temporaryRoot: temporaryRoot).retained[attachment.id])
+        let repaired = try XCTUnwrap(store.repairMissingPaths([attachment], sessionID: parentID)[attachment.id])
+        let copied = try XCTUnwrap(store.copyForHandoff(
+            [attachment], sourceSessionID: parentID, destinationSessionID: childID, temporaryRoot: temporaryRoot
+        )[attachment.id])
+        for result in [retained, repaired, copied] {
+            XCTAssertEqual(result.kind, .pdf)
+            XCTAssertEqual(result.fileName, attachment.fileName)
+            XCTAssertEqual(result.byteCount, bytes.count)
+            guard case let .localFile(path) = result.source else { return XCTFail("Expected local copy") }
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
+        }
+    }
+
     func testRetainNeverMovesFilesOutsideTheTemporaryRoot() throws {
         let store = AgentSessionAttachmentStore(agentSessionsFolder: agentSessionsFolder)
         let userFile = baseURL.appendingPathComponent("user-original.png")
@@ -63,10 +92,10 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
 
         let result = store.retain(
             [
-                AgentImageAttachment(source: .localFile(path: userFile.path)),
-                AgentImageAttachment(source: .localFile(path: nestedFile.path)),
-                AgentImageAttachment(source: .localFile(path: missing.path)),
-                AgentImageAttachment(source: .url("https://example.com/remote.png"))
+                AgentFileAttachment(source: .localFile(path: userFile.path)),
+                AgentFileAttachment(source: .localFile(path: nestedFile.path)),
+                AgentFileAttachment(source: .localFile(path: missing.path)),
+                AgentFileAttachment(source: .url("https://example.com/remote.png"))
             ],
             sessionID: UUID(),
             temporaryRoot: temporaryRoot
@@ -84,7 +113,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         let original = temporaryRoot.appendingPathComponent("original.png")
         let bytes = Data("parent image".utf8)
         try bytes.write(to: original)
-        let attachment = AgentImageAttachment(source: .localFile(path: original.path), title: "Keep this image")
+        let attachment = AgentFileAttachment(source: .localFile(path: original.path), title: "Keep this image")
         let retained = try XCTUnwrap(store.retain([attachment], sessionID: parentID, temporaryRoot: temporaryRoot).retained[attachment.id])
         guard case let .localFile(parentPath) = retained.source else { return XCTFail("Expected retained image") }
 
@@ -114,7 +143,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         let source = temporaryRoot.appendingPathComponent("source.png")
         let bytes = Data("original source".utf8)
         try bytes.write(to: source)
-        let good = AgentImageAttachment(source: .localFile(path: source.path))
+        let good = AgentFileAttachment(source: .localFile(path: source.path))
         let foreign = baseURL.appendingPathComponent("foreign.png")
         try bytes.write(to: foreign)
         let symlink = temporaryRoot.appendingPathComponent("link.png")
@@ -122,7 +151,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         for badPath in [temporaryRoot.appendingPathComponent("missing.png").path, foreign.path, symlink.path] {
             let childID = UUID()
             XCTAssertThrowsError(try store.copyForHandoff(
-                [good, AgentImageAttachment(source: .localFile(path: badPath))],
+                [good, AgentFileAttachment(source: .localFile(path: badPath))],
                 sourceSessionID: UUID(), destinationSessionID: childID, temporaryRoot: temporaryRoot
             ))
             XCTAssertFalse(FileManager.default.fileExists(atPath: store.sessionFolderURL(sessionID: childID).path))
@@ -152,10 +181,10 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         let second = temporaryRoot.appendingPathComponent("second.png")
         try Data("first".utf8).write(to: first)
         try Data("second".utf8).write(to: second)
-        let attachment = AgentImageAttachment(source: .localFile(path: first.path))
+        let attachment = AgentFileAttachment(source: .localFile(path: first.path))
         for secondID in [UUID(), attachment.id] {
             XCTAssertThrowsError(try store.copyForHandoff(
-                [attachment, AgentImageAttachment(id: secondID, source: .localFile(path: second.path))],
+                [attachment, AgentFileAttachment(id: secondID, source: .localFile(path: second.path))],
                 sourceSessionID: UUID(), destinationSessionID: UUID(), temporaryRoot: temporaryRoot
             ))
             XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: store.rootURL.path), [])
@@ -185,7 +214,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         let temporary = temporaryRoot.appendingPathComponent("new.png")
         try Data("replacement".utf8).write(to: temporary)
         let result = store.retain(
-            [AgentImageAttachment(id: attachmentID, source: .localFile(path: temporary.path))],
+            [AgentFileAttachment(id: attachmentID, source: .localFile(path: temporary.path))],
             sessionID: linkedID, temporaryRoot: temporaryRoot
         )
         XCTAssertTrue(result.retained.isEmpty)
@@ -205,7 +234,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         try writeNoisePNG(to: temporaryFile, width: 256, height: 128)
         let originalSize = try XCTUnwrap(fileSize(temporaryFile))
         XCTAssertGreaterThan(originalSize, limits.maxRetainedImageBytes)
-        let attachment = AgentImageAttachment(source: .localFile(path: temporaryFile.path))
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
 
         let result = store.retain([attachment], sessionID: sessionID, temporaryRoot: temporaryRoot)
 
@@ -238,7 +267,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         try setModificationDate(now.addingTimeInterval(-100), of: middle)
         let temporaryFile = temporaryRoot.appendingPathComponent("\(UUID().uuidString).png")
         try Data(repeating: 3, count: 100).write(to: temporaryFile)
-        let attachment = AgentImageAttachment(source: .localFile(path: temporaryFile.path))
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
 
         let result = store.retain([attachment], sessionID: sessionID, temporaryRoot: temporaryRoot, now: now)
 
@@ -317,7 +346,7 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         let sessionID = UUID()
         let folder = store.sessionFolderURL(sessionID: sessionID)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let lost = AgentImageAttachment(
+        let lost = AgentFileAttachment(
             source: .localFile(path: temporaryRoot.appendingPathComponent("gone.png").path),
             title: "lost.png"
         )
@@ -325,8 +354,8 @@ final class AgentSessionAttachmentStoreTests: XCTestCase {
         try Data("kept".utf8).write(to: kept)
         let present = temporaryRoot.appendingPathComponent("present.png")
         try Data("present".utf8).write(to: present)
-        let stillThere = AgentImageAttachment(source: .localFile(path: present.path))
-        let noCopy = AgentImageAttachment(source: .localFile(path: temporaryRoot.appendingPathComponent("never.png").path))
+        let stillThere = AgentFileAttachment(source: .localFile(path: present.path))
+        let noCopy = AgentFileAttachment(source: .localFile(path: temporaryRoot.appendingPathComponent("never.png").path))
 
         let repaired = store.repairMissingPaths([lost, stillThere, noCopy], sessionID: sessionID)
 

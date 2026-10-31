@@ -16,6 +16,20 @@ struct MCPContextBuilderGitReviewAdmission {
     let publicationFence: MCPContextBuilderGitPublicationFence?
 }
 
+extension MCPContextBuilderGitReviewAdmission {
+    /// Default for an omitted or relative selector under an available frozen Context Builder target: its
+    /// primary checkout, never the ambient workspace election. A target whose primary checkout is no longer
+    /// discovered is a discovery refusal. Nil when no frozen target governs the request (no Context Builder
+    /// run, or a deferred/unavailable target admitting explicit read-only inspection), leaving the election.
+    func frozenDefaultRepository() throws -> GitRepoDescriptor? {
+        guard target != nil else { return nil }
+        guard let preferredDefaultRepository else {
+            throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(.checkoutIdentityChanged)
+        }
+        return preferredDefaultRepository
+    }
+}
+
 struct MCPContextBuilderGitPublishedOutcome {
     let repository: GitRepoDescriptor
     let manifest: GitDiffSnapshotManifest?

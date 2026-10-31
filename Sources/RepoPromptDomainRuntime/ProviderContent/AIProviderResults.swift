@@ -124,6 +124,7 @@ package struct AIStreamResult {
     package let toolArgs: String? // JSON string of tool arguments (for tool_call)
     package let toolOutput: String? // Tool execution result (for tool_result)
     package let toolInvocationID: UUID?
+    package let claudeToolUseID: String?
     package let toolResultJSON: String?
     package let toolArgsJSON: String?
     package let toolIsError: Bool?
@@ -153,6 +154,7 @@ package struct AIStreamResult {
         toolArgs: String? = nil,
         toolOutput: String? = nil,
         toolInvocationID: UUID? = nil,
+        claudeToolUseID: String? = nil,
         toolResultJSON: String? = nil,
         toolArgsJSON: String? = nil,
         toolIsError: Bool? = nil,
@@ -173,6 +175,7 @@ package struct AIStreamResult {
         self.toolArgs = toolArgs
         self.toolOutput = toolOutput
         self.toolInvocationID = toolInvocationID
+        self.claudeToolUseID = claudeToolUseID
         self.toolResultJSON = toolResultJSON
         self.toolArgsJSON = toolArgsJSON
         self.toolIsError = toolIsError

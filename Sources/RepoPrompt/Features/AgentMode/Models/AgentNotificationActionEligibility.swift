@@ -70,6 +70,7 @@ enum AgentNotificationAction: Hashable {
     static let staticActionLists: [[AgentNotificationAction]] = [
         [.review],
         [.decline, .review],
+        [.approve, .review],
         [.approve, .decline, .review],
         [.reply, .review],
         [.reply, .skip, .review],
@@ -172,10 +173,10 @@ enum AgentNotificationActionEligibility {
 
         switch descriptor.kind {
         case .approval:
-            if isApprovable(descriptor, preferences: preferences) {
-                return [.approve, .decline, .review]
-            }
-            return canDecide ? [.decline, .review] : [.review]
+            var actions: [AgentNotificationAction] = []
+            if isApprovable(descriptor, preferences: preferences) { actions.append(.approve) }
+            if canDecide, descriptor.supportsDecline { actions.append(.decline) }
+            return actions + [.review]
         case .permissions:
             return canDecide ? [.decline, .review] : [.review]
         case .askUser:

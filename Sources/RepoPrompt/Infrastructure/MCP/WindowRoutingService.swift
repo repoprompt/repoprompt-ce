@@ -458,7 +458,10 @@ final class WindowRoutingService: Service {
         }
 
         guard let rawTabParam, !rawTabParam.isEmpty else {
-            throw MCPError.invalidParams("Missing required 'tab' or 'context_id' parameter for '\(action)' action.")
+            let message = action == "close_tab"
+                ? "Missing required 'tab' parameter (UUID or name) for 'close_tab' action."
+                : "Missing required 'tab' or 'context_id' parameter for '\(action)' action."
+            throw MCPError.invalidParams(message)
         }
         return try resolveComposeTab(rawTabParam: rawTabParam, tabs: tabs)
     }

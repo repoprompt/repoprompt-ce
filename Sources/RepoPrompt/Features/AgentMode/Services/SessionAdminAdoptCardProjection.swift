@@ -65,11 +65,13 @@ enum SessionAdminAdoptCardProjection {
         guard let layout else { return [] }
         let byID = Dictionary(items.map { ($0.sessionID, $0) }, uniquingKeysWith: { first, _ in first })
         return layout.adoptees.flatMap { adoptee -> [Value] in
-            guard let item = byID[adoptee] else { return [] }
+            guard byID[adoptee] != nil else { return [] }
             let descendants = layout.descendantsByAdoptee[adoptee] ?? []
             var row: [String: Value] = [
                 "session_id": .string(adoptee.uuidString),
-                "effect": .string(item.effect),
+                // Human-card effects may embed an outside adoptee's title (especially when
+                // overlapping targets promote a descendant). Never reuse them as agent text.
+                "effect": .string("Bring into this delegation scope"),
                 "descendant_count": .int(descendants.count)
             ]
             if let approved {

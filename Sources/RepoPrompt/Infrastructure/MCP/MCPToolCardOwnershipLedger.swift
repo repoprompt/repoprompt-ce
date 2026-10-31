@@ -71,6 +71,12 @@ final class MCPToolCardOwnershipLedger: @unchecked Sendable {
         }
     }
 
+    func hasOwners(windowID: Int, runID: UUID) -> Bool {
+        lock.withLock {
+            !(ownersByKey[Key(windowID: windowID, runID: runID)]?.isEmpty ?? true)
+        }
+    }
+
     func snapshots() -> [Snapshot] {
         lock.withLock {
             ownersByKey.map { key, owners in

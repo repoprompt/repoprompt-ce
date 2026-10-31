@@ -158,18 +158,22 @@ protocol CodexSessionControlling: AnyObject {
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot
+    func readNativeToolProbeSnapshot(
+        expectedTurnID: String,
+        timeout: TimeInterval?
+    ) async throws -> CodexNativeSessionController.ThreadSnapshot
     func outstandingBlockingNativeToolCallNames() async -> [String]
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt
     func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
@@ -499,6 +503,7 @@ final class CodexNativeSessionController {
             case commandOrProcessOutput = "command-or-process-output"
             case processExited = "process-exited"
             case hookLifecycle = "hook-lifecycle"
+            case protocolMetadata = "protocol-metadata"
             case warning
             case deprecationNotice = "deprecation-notice"
             case serverRequestResolved = "server-request-resolved"
@@ -537,6 +542,13 @@ final class CodexNativeSessionController {
 
     typealias ChatgptAuthTokensRefreshHandler = @Sendable (ChatgptAuthTokensRefreshRequest) async throws -> ChatgptAuthTokensRefreshResponse
 
+    /// Original MCP item.id from the pinned native stream, alongside the local display UUID.
+    struct MCPToolIdentity: Equatable {
+        let callID: String
+        let threadID: String?
+        let turnID: String?
+    }
+
     enum Event {
         case assistantDelta(String)
         case canonicalAssistantDelta(text: String, scope: ItemScope)
@@ -552,8 +564,8 @@ final class CodexNativeSessionController {
         case requestUserInput(AgentRequestUserInputRequest)
         case mcpElicitationRequest(AgentMCPElicitationRequest)
         case serverRequestIssue(ServerRequestIssue)
-        case toolCall(name: String, invocationID: UUID?, argsJSON: String?)
-        case toolResult(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?)
+        case toolCall(name: String, invocationID: UUID?, argsJSON: String?, mcpIdentity: MCPToolIdentity? = nil)
+        case toolResult(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?, mcpIdentity: MCPToolIdentity? = nil)
         case commandExecutionRunning(CommandExecutionRunningUpdate)
         case livenessActivity(LivenessActivity)
         case errorNotification(ErrorNotification)
@@ -633,6 +645,9 @@ final class CodexNativeSessionController {
         let runtimeStatus: RuntimeStatus
         let currentTurnID: String?
         let activeTurnIDs: [String]
+        /// False when bounded metadata omits older turns; absence cannot prove uniqueness.
+        /// Describes pagination coverage, not whether turn metadata or items were requested.
+        let hasCompleteTurnMetadata: Bool
         /// Identifier paired with `latestTurnStatus`; this is the last terminal turn, not an active turn.
         let latestTerminalTurnID: String?
         let latestTurnStatus: TurnStatus?
@@ -648,6 +663,7 @@ final class CodexNativeSessionController {
             runtimeStatus: RuntimeStatus,
             currentTurnID: String?,
             activeTurnIDs: [String],
+            hasCompleteTurnMetadata: Bool = true,
             latestTerminalTurnID: String? = nil,
             latestTurnStatus: TurnStatus?,
             latestTurnFailure: TurnFailure? = nil,
@@ -661,6 +677,7 @@ final class CodexNativeSessionController {
             self.runtimeStatus = runtimeStatus
             self.currentTurnID = currentTurnID
             self.activeTurnIDs = activeTurnIDs
+            self.hasCompleteTurnMetadata = hasCompleteTurnMetadata
             self.latestTerminalTurnID = latestTerminalTurnID
             self.latestTurnStatus = latestTurnStatus
             self.latestTurnFailure = latestTurnFailure
@@ -873,6 +890,7 @@ final class CodexNativeSessionController {
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
     private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
+    private let serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)?
     private let hookTrustFaultInjection: HookTrustFaultInjection
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
@@ -883,6 +901,18 @@ final class CodexNativeSessionController {
     private var threadPath: String?
     private var activeSessionReference: SessionRef?
     private var threadBindingContext: ThreadBindingContext?
+    // Captured from the client's authoritative launch resolution, never independently resolved.
+    private var usesBoundedThreadSnapshots = false
+    private static let snapshotTurnLimit = 32
+
+    private static func supportsBoundedThreadSnapshots(_ version: CodexRuntimeAuthority.Version) -> Bool {
+        version >= CodexRuntimeAuthority.Version(major: 0, minor: 164, patch: 0)
+    }
+
+    private static var snapshotTurnPageParams: [String: Any] {
+        ["limit": snapshotTurnLimit, "sortDirection": "desc", "itemsView": "notLoaded"]
+    }
+
     private var routingCurrentTurnID: String?
     private var authoritativeLifecycleTurnID: String?
     private var activeTurnIDs: Set<String> = []
@@ -1492,6 +1522,7 @@ final class CodexNativeSessionController {
         clientShutdownBehavior: ClientShutdownBehavior = .none,
         expectedMCPClientName: String? = nil,
         requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil,
+        serverRequestResponseExecutor: (@Sendable (CodexAppServerRequestID, [String: Any]) async throws -> Void)? = nil,
         hookTrustFaultInjection: HookTrustFaultInjection = .init(),
         perfRecorder: any AgentModePerfRecording = NoopAgentModePerfRecorder()
     ) {
@@ -1504,6 +1535,7 @@ final class CodexNativeSessionController {
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
         self.requestExecutor = requestExecutor
+        self.serverRequestResponseExecutor = serverRequestResponseExecutor
         self.hookTrustFaultInjection = hookTrustFaultInjection
         self.perfRecorder = perfRecorder
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
@@ -1785,6 +1817,10 @@ final class CodexNativeSessionController {
     ) async throws -> [String: Any] {
         if let resumeThreadID {
             var params: [String: Any] = ["threadId": resumeThreadID]
+            if usesBoundedThreadSnapshots {
+                params["excludeTurns"] = true
+                params["initialTurnsPage"] = Self.snapshotTurnPageParams
+            }
             if let rolloutPath = existing?.rolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines),
                !rolloutPath.isEmpty
             {
@@ -1804,7 +1840,8 @@ final class CodexNativeSessionController {
             // preserves original instructions across resume (confirmed by Codex protocol
             // tests: resume_switches_models_preserves_base_instructions). Resending them
             // wastes ~5-6k tokens on every reconnect for no benefit.
-            return try await requestWithCompatibleAppServerRequestValueStyle(
+            let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? options.requestTimeout ?? 5)
+            var result = try await requestWithCompatibleAppServerRequestValueStyle(
                 method: "thread/resume",
                 timeout: timeout
             ) { requestValueStyle in
@@ -1814,6 +1851,26 @@ final class CodexNativeSessionController {
                 requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
                 return requestParams
             }
+            try Task.checkCancellation()
+            try Self.validateThreadSnapshotResponse(result, expectedThreadID: resumeThreadID, requiresPage: false)
+            // The protocol permits an absent/null initial page even when one was requested.
+            // Fetch one bounded metadata page, never retry resume with full history.
+            if usesBoundedThreadSnapshots,
+               result["initialTurnsPage"] == nil || result["initialTurnsPage"] is NSNull
+            {
+                var pageParams = Self.snapshotTurnPageParams
+                pageParams["threadId"] = resumeThreadID
+                result["initialTurnsPage"] = try await performRequest(
+                    method: "thread/turns/list", params: pageParams,
+                    timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/turns/list")
+                )
+            }
+            try Task.checkCancellation()
+            if usesBoundedThreadSnapshots {
+                _ = try Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/resume")
+            }
+            try Self.validateThreadSnapshotResponse(result, expectedThreadID: resumeThreadID, requiresPage: usesBoundedThreadSnapshots)
+            return result
         }
 
         var params: [String: Any] = [:]
@@ -1897,6 +1954,7 @@ final class CodexNativeSessionController {
             let runtime: CodexRuntimeAuthority.Runtime
             do {
                 runtime = try await client.prepareRuntimeForLaunch()
+                usesBoundedThreadSnapshots = Self.supportsBoundedThreadSnapshots(runtime.version)
                 #if DEBUG
                     await recordLifecyclePhase(
                         .runtimeResolution,
@@ -2095,20 +2153,72 @@ final class CodexNativeSessionController {
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> ThreadSnapshot {
+        try await readThreadSnapshot(includeTurns: includeTurns, nativeToolTurnID: nil, timeout: timeout)
+    }
+
+    /// Only the watchdog with an existing local tool span requests current-turn item evidence.
+    /// Older runtimes retain their existing rich read; modern runtimes never load prior items.
+    func readNativeToolProbeSnapshot(
+        expectedTurnID: String,
+        timeout: TimeInterval?
+    ) async throws -> ThreadSnapshot {
+        guard let turnID = Self.nonEmptyString(expectedTurnID) else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        return try await readThreadSnapshot(includeTurns: true, nativeToolTurnID: turnID, timeout: timeout)
+    }
+
+    private func readThreadSnapshot(
+        includeTurns: Bool,
+        nativeToolTurnID: String?,
+        timeout: TimeInterval?
+    ) async throws -> ThreadSnapshot {
         guard let threadID,
               !threadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let result = try await performRequest(
+        let bounded = usesBoundedThreadSnapshots && includeTurns
+        let deadline = (timeout ?? options.requestTimeout).map { ProcessInfo.processInfo.systemUptime + $0 }
+        var result = try await performRequest(
             method: "thread/read",
             params: [
                 "threadId": threadID,
-                "includeTurns": includeTurns
+                "includeTurns": includeTurns && !bounded
             ],
             timeout: timeout
         )
-        return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
+        try Self.validateThreadSnapshotResponse(result, expectedThreadID: threadID, requiresPage: false)
+        let thread = result["thread"] as? [String: Any] ?? [:]
+        let hydrateCurrentTurn = bounded && nativeToolTurnID != nil
+            && Self.parseThreadRuntimeStatus(from: thread["status"]).isActive
+        if bounded {
+            try Task.checkCancellation()
+            let remaining = deadline.map { $0 - ProcessInfo.processInfo.systemUptime }
+            if let remaining, remaining <= 0 {
+                throw CodexAppServerClient.ClientError.requestFailed(.init(
+                    method: "thread/turns/list", code: nil,
+                    message: "Request timed out while reading thread snapshot", data: nil
+                ))
+            }
+            // Replace the metadata page, rather than adding another legacy rollout scan.
+            // Idle threads stay metadata-only: their latest completed turn may itself be huge.
+            var params = Self.snapshotTurnPageParams
+            if hydrateCurrentTurn {
+                params["limit"] = 1
+                params["itemsView"] = "full"
+            }
+            params["threadId"] = threadID
+            result["initialTurnsPage"] = try await performRequest(
+                method: "thread/turns/list", params: params, timeout: remaining
+            )
+            try Self.validateThreadSnapshotResponse(result, expectedThreadID: threadID, requiresPage: true)
+        }
+        try Task.checkCancellation()
+        return Self.parseThreadSnapshot(
+            from: result, fallbackEffort: nil,
+            authoritativeToolTurnID: hydrateCurrentTurn ? nativeToolTurnID : nil
+        )
     }
 
     func outstandingBlockingNativeToolCallNames() async -> [String] {
@@ -2216,13 +2326,13 @@ final class CodexNativeSessionController {
 
     func startUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
 
         var params: [String: Any] = [
             "threadId": threadID,
@@ -2292,14 +2402,14 @@ final class CodexNativeSessionController {
 
     func steerUserTurn(
         text: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         expectedTurnID: String
     ) async throws -> CodexTurnSteerReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
         guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let input = try Self.turnInput(text: text, images: images)
+        let input = try Self.turnInput(text: text, attachments: attachments)
         do {
             let result = try await performRequest(
                 method: "turn/steer",
@@ -2389,30 +2499,91 @@ final class CodexNativeSessionController {
         if let authoritativeLifecycleTurnID {
             return try await interruptUserTurn(expectedTurnID: authoritativeLifecycleTurnID)
         }
-        let snapshot = try await readThreadSnapshot(
-            includeTurns: true,
-            timeout: min(options.requestTimeout ?? 5, 5)
-        )
-        let observedTurnIDs = Array(
-            Set(snapshot.activeTurnIDs + [snapshot.currentTurnID].compactMap(\.self))
-        ).sorted()
-        guard observedTurnIDs.count == 1,
-              let reconciledTurnID = observedTurnIDs.first
-        else {
+        let timeout = min(options.requestTimeout ?? 5, 5)
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        guard let expectedThreadID = Self.nonEmptyString(threadID) else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        let observedTurnIDs: [String]
+        if usesBoundedThreadSnapshots {
+            observedTurnIDs = try await readActiveTurnIDsForInterrupt(threadID: expectedThreadID, deadline: deadline)
+        } else {
+            let snapshot = try await readThreadSnapshot(includeTurns: true, timeout: timeout)
+            observedTurnIDs = Array(Set(snapshot.activeTurnIDs + [snapshot.currentTurnID].compactMap(\.self))).sorted()
+        }
+        guard observedTurnIDs.count == 1, let reconciledTurnID = observedTurnIDs.first else {
             throw CodexTurnInterruptError.noUniqueActiveTurn(
                 authoritativeTurnID: authoritativeLifecycleTurnID,
                 observedTurnIDs: observedTurnIDs
             )
         }
+        guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+        if let authoritativeLifecycleTurnID, authoritativeLifecycleTurnID != reconciledTurnID {
+            throw CodexTurnInterruptError.reconciliationFailed(
+                expectedTurnID: reconciledTurnID, authoritativeTurnID: authoritativeLifecycleTurnID
+            )
+        }
         _ = try await performRequest(
             method: "turn/interrupt",
-            params: [
-                "threadId": snapshot.conversationID,
-                "turnId": reconciledTurnID
-            ],
-            timeout: options.requestTimeout
+            params: ["threadId": expectedThreadID, "turnId": reconciledTurnID],
+            timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "turn/interrupt")
         )
         return CodexTurnInterruptReceipt(interruptedTurnID: reconciledTurnID)
+    }
+
+    /// Only Stop needs exhaustive turn uniqueness. Do not retain prior turns or load their items.
+    private func readActiveTurnIDsForInterrupt(threadID expectedThreadID: String, deadline: TimeInterval) async throws -> [String] {
+        let metadata = try await performRequest(
+            method: "thread/read", params: ["threadId": expectedThreadID, "includeTurns": false],
+            timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/read")
+        )
+        try Self.validateThreadSnapshotResponse(metadata, expectedThreadID: expectedThreadID, requiresPage: false)
+        var activeTurnIDs: Set<String> = []
+        var cursor: String?
+        var requestedCursors: Set<String> = []
+        repeat {
+            guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+            var params = Self.snapshotTurnPageParams
+            params["threadId"] = expectedThreadID
+            if let cursor {
+                guard requestedCursors.insert(cursor).inserted else { throw CodexAppServerClient.ClientError.invalidResponse }
+                params["cursor"] = cursor
+            }
+            let page = try await performRequest(
+                method: "thread/turns/list", params: params,
+                timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/turns/list")
+            )
+            try Task.checkCancellation()
+            guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+            let turns = try Self.validatedTurnMetadataPage(page)
+            for turn in turns {
+                guard let status = turn["status"] as? String, let turnID = turn["id"] as? String else {
+                    throw CodexAppServerClient.ClientError.invalidResponse
+                }
+                if Self.isThreadSnapshotTurnActive(status) {
+                    activeTurnIDs.insert(turnID)
+                } else if Self.parseTerminalTurnStatus(from: status) == nil {
+                    // An unknown status must not establish that an omitted active turn is absent.
+                    throw CodexAppServerClient.ClientError.invalidResponse
+                }
+            }
+            if activeTurnIDs.count > 1 {
+                return activeTurnIDs.sorted()
+            }
+            cursor = page["nextCursor"] as? String
+        } while cursor != nil
+        return activeTurnIDs.sorted()
+    }
+
+    private static func remainingControlPlaneTimeout(deadline: TimeInterval, method: String) throws -> TimeInterval {
+        try Task.checkCancellation()
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining.isFinite, remaining > 0 else {
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: method, code: nil, message: "Request timed out after exhausting the shared reconciliation deadline", data: nil
+            ))
+        }
+        return remaining
     }
 
     func compactThread() async throws {
@@ -2462,6 +2633,7 @@ final class CodexNativeSessionController {
         let timeout = min(options.requestTimeout ?? 5, 5)
         do {
             let snapshot = try await readThreadSnapshot(includeTurns: true, timeout: timeout)
+            guard snapshot.hasCompleteTurnMetadata else { return .refreshed(nil) }
             reconcileActiveTurnRoutingState(from: snapshot)
             return .refreshed(snapshot.currentTurnID)
         } catch {
@@ -2493,12 +2665,12 @@ final class CodexNativeSessionController {
 
     private static func turnInput(
         text: String,
-        images: [AgentImageAttachment]
+        attachments: [AgentFileAttachment]
     ) throws -> [[String: Any]] {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         var input: [[String: Any]] = []
-        for image in images {
-            switch image.source {
+        for attachment in attachments where attachment.kind == .image {
+            switch attachment.source {
             case let .localFile(path):
                 guard let path = nonEmptyString(path) else { continue }
                 input.append([
@@ -2730,9 +2902,39 @@ final class CodexNativeSessionController {
         #endif
     }
 
+    private static func validateThreadSnapshotResponse(
+        _ result: [String: Any],
+        expectedThreadID: String,
+        requiresPage: Bool
+    ) throws {
+        guard let thread = result["thread"] as? [String: Any],
+              thread["id"] as? String == expectedThreadID
+        else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        if requiresPage {
+            guard let page = result["initialTurnsPage"] as? [String: Any] else {
+                throw CodexAppServerClient.ClientError.invalidResponse
+            }
+            _ = try validatedTurnMetadataPage(page)
+        }
+    }
+
+    private static func validatedTurnMetadataPage(_ page: [String: Any]) throws -> [[String: Any]] {
+        guard let turns = page["data"] as? [[String: Any]],
+              turns.count <= snapshotTurnLimit,
+              turns.allSatisfy({ nonEmptyString($0["id"] as? String) != nil && nonEmptyString($0["status"] as? String) != nil }),
+              page["nextCursor"] == nil || page["nextCursor"] is NSNull || nonEmptyString(page["nextCursor"] as? String) != nil
+        else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        return turns
+    }
+
     private static func parseThreadSnapshot(
         from result: [String: Any],
-        fallbackEffort: String?
+        fallbackEffort: String?,
+        authoritativeToolTurnID: String? = nil
     ) -> ThreadSnapshot {
         let thread = result["thread"] as? [String: Any] ?? [:]
         let conversationID = firstString(in: thread, keys: ["id", "threadId", "thread_id", "threadID"]) ?? ""
@@ -2740,7 +2942,14 @@ final class CodexNativeSessionController {
         let model = result["model"] as? String
         let reasoningEffort = result["reasoningEffort"] as? String ?? fallbackEffort
         let runtimeStatus = parseThreadRuntimeStatus(from: thread["status"])
-        let turns = thread["turns"] as? [[String: Any]] ?? []
+        let page = result["initialTurnsPage"] as? [String: Any]
+        // Our bounded requests are newest-first; the legacy parser expects chronological order.
+        let turns: [[String: Any]] = if let data = page?["data"] as? [[String: Any]] {
+            Array(data.reversed())
+        } else {
+            thread["turns"] as? [[String: Any]] ?? []
+        }
+        let hasCompleteTurnMetadata = page?["nextCursor"] == nil || page?["nextCursor"] is NSNull
         var activeTurnIDs: [String] = []
         var latestTerminalTurnID: String?
         var latestTurnStatus: TurnStatus?
@@ -2757,7 +2966,10 @@ final class CodexNativeSessionController {
                 let itemsView = firstString(in: turn, keys: ["itemsView", "items_view"])?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased()
-                if turn["items"] is [[String: Any]], itemsView == nil || itemsView == "full" {
+                if let items = turn["items"] as? [[String: Any]],
+                   itemsView == "full" || (page == nil && itemsView == nil),
+                   page == nil || items.allSatisfy({ nonEmptyString($0["id"] as? String) != nil && nonEmptyString($0["type"] as? String) != nil })
+                {
                     authoritativeActiveTurnIDs.insert(turnID)
                 }
                 if let items = turn["items"] as? [[String: Any]] {
@@ -2772,7 +2984,15 @@ final class CodexNativeSessionController {
                 latestTurnFailure = parsedStatus == .failed ? parseTurnFailure(from: turn) : nil
             }
         }
-        let hasAuthoritativeActiveTurnItems = !activeTurnIDs.isEmpty
+        // Ordinary bounded pages request no items and carry no item authority. Only the
+        // watchdog's full latest-turn page may corroborate the exact captured active turn.
+        // Older-turn truncation does not truncate that turn's full command set, which is
+        // essential for the coordinator's process-ID ambiguity check.
+        let hasExactCurrentTurnItems = authoritativeToolTurnID.map {
+            runtimeStatus.isActive && turns.count == 1 && activeTurnIDs == [$0]
+        } ?? false
+        let hasAuthoritativeActiveTurnItems = (page == nil || hasExactCurrentTurnItems)
+            && !activeTurnIDs.isEmpty
             && activeTurnIDs.allSatisfy(authoritativeActiveTurnIDs.contains)
         return ThreadSnapshot(
             conversationID: conversationID,
@@ -2782,6 +3002,7 @@ final class CodexNativeSessionController {
             runtimeStatus: runtimeStatus,
             currentTurnID: activeTurnIDs.last,
             activeTurnIDs: activeTurnIDs,
+            hasCompleteTurnMetadata: hasCompleteTurnMetadata,
             latestTerminalTurnID: latestTerminalTurnID,
             latestTurnStatus: latestTurnStatus,
             latestTurnFailure: latestTurnFailure,
@@ -3554,6 +3775,39 @@ final class CodexNativeSessionController {
         {
             markTurnActivity(notifiedTurnID, makeCurrent: true)
         }
+        // Preserve semantic/unknown activity before item/tool deduplication or malformed-payload
+        // early returns. Reuse the existing scoped non-rendering liveness channel; no history or
+        // extra event registry. The coordinator applies its current controller/turn acceptance.
+        // A validated MCP item is represented by the typed tool event below, not an opaque
+        // warning as well. This is semantic coverage, not a quiet/neutral method exception:
+        // the ordinary coordinator still records toolActivity for that event.
+        let representedMCPToolEvent: ToolLifecycleEvent? = {
+            guard let item = Self.canonicalItem(from: params),
+                  Self.canonicalItemScope(from: params, item: item) != nil,
+                  item["id"] is String,
+                  ["mcptoolcall", "mcp_tool_call"].contains(normalizedTypeString(from: item)),
+                  item["arguments"] is [String: Any] || item["arguments"] is NSNull else { return nil }
+            let status = item["status"] as? String
+            if notification.method == "item/started" {
+                guard status == "inProgress" else { return nil }
+            } else if notification.method == "item/completed" {
+                guard (status == "completed" && (item["result"] as? [String: Any])?["content"] is [Any])
+                    || (status == "failed" && (item["result"] is [String: Any] || item["error"] is [String: Any])) else { return nil }
+            } else { return nil }
+            return parseCanonicalMCPToolLifecycleEvent(method: notification.method, item: item)
+        }()
+        // Ordinary decoding owns positively recognized metadata. Unknown/malformed packets
+        // still fall through to negative evidence; a method namespace is never sufficient.
+        let livenessActivity = Self.parseLivenessActivity(method: notification.method, params: params)
+        if let representedMCPToolEvent, case let .result(_, _, _, _, isError, _) = representedMCPToolEvent, isError != false {
+            // A failed or indeterminate mirror remains evidence even if its successful item
+            // was already rendered and the unchanged lifecycle deduplication drops this update.
+            await emitUnrepresentedActivity(method: notification.method, params: params)
+        } else if representedMCPToolEvent == nil, livenessActivity?.kind != .protocolMetadata,
+                  hasUnrepresentedActivity(method: notification.method, params: params)
+        {
+            await emitUnrepresentedActivity(method: notification.method, params: params)
+        }
         switch notification.method {
         case "turn/started", "codex/event/turn_started":
             emittedToolEventDedupKeys.removeAll(keepingCapacity: true)
@@ -3666,20 +3920,23 @@ final class CodexNativeSessionController {
                 await emit(.contextCompacted(turnID: compactionTurnID))
             }
         case "item/agentMessage/delta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                var state = assistantEmittedTextByTurnID[scope.turnID]
-                    ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
-                if state.itemID != scope.itemID {
-                    state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
-                } else {
-                    state.text.append(delta)
-                }
-                assistantEmittedTextByTurnID[scope.turnID] = state
-                await emit(.canonicalAssistantDelta(text: delta, scope: scope))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            var state = assistantEmittedTextByTurnID[scope.turnID]
+                ?? AssistantEmittedTextState(itemID: scope.itemID, text: "")
+            if state.itemID != scope.itemID {
+                state = AssistantEmittedTextState(itemID: scope.itemID, text: delta)
+            } else {
+                state.text.append(delta)
+            }
+            assistantEmittedTextByTurnID[scope.turnID] = state
+            await emit(.canonicalAssistantDelta(text: delta, scope: scope))
         case "codex/event/agent_message":
             let legacyTurnID = Self.notificationTurnID(from: params)
             let legacyItemID = Self.notificationItemID(
@@ -3756,37 +4013,43 @@ final class CodexNativeSessionController {
                 }
             }
         case "item/reasoning/summaryTextDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
-                let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .summary,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: summaryIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let summaryIndex = intValue(params["summaryIndex"]) ?? intValue(params["summary_index"])
+            let groupID = makeReasoningGroupID(kind: "summary", itemID: scope.itemID, index: summaryIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .summary,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: summaryIndex,
+                scope: scope
+            )))
         case "item/reasoning/textDelta":
-            if let delta = params["delta"] as? String,
-               let scope = Self.canonicalItemScope(from: params),
-               !completedCanonicalItemScopes.contains(scope)
-            {
-                let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
-                let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
-                await emit(.reasoningDelta(.init(
-                    text: delta,
-                    kind: .text,
-                    itemID: scope.itemID,
-                    groupID: groupID,
-                    index: contentIndex,
-                    scope: scope
-                )))
+            guard let delta = params["delta"] as? String,
+                  params["itemId"] == nil || params["itemId"] is String,
+                  let scope = Self.canonicalItemScope(from: params)
+            else {
+                await emitUnrepresentedActivity(method: notification.method, params: params)
+                break
             }
+            guard !completedCanonicalItemScopes.contains(scope) else { break }
+            let contentIndex = intValue(params["contentIndex"]) ?? intValue(params["content_index"])
+            let groupID = makeReasoningGroupID(kind: "text", itemID: scope.itemID, index: contentIndex)
+            await emit(.reasoningDelta(.init(
+                text: delta,
+                kind: .text,
+                itemID: scope.itemID,
+                groupID: groupID,
+                index: contentIndex,
+                scope: scope
+            )))
         case let method where Self.isItemLifecycleNotificationMethod(method):
             let item = Self.canonicalItem(from: params)
             let typeRaw = item.map { normalizedTypeString(from: $0) } ?? ""
@@ -3832,11 +4095,14 @@ final class CodexNativeSessionController {
                 } else if completedCanonicalItemScopes.contains(scope) {
                     return
                 }
-                if let toolEvent = parseCanonicalMCPToolLifecycleEvent(
+                if let toolEvent = representedMCPToolEvent ?? parseCanonicalMCPToolLifecycleEvent(
                     method: method,
                     item: item ?? [:]
                 ) {
-                    await emitToolLifecycleEvent(toolEvent, method: method)
+                    let mcpIdentity = (item?["id"] as? String).map {
+                        MCPToolIdentity(callID: $0, threadID: Self.notificationThreadID(from: params), turnID: scope.turnID)
+                    }
+                    await emitToolLifecycleEvent(toolEvent, method: method, mcpIdentity: mcpIdentity)
                 }
                 return
             }
@@ -3850,7 +4116,10 @@ final class CodexNativeSessionController {
             {
                 let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
                 Self.logCodexDebug("[CodexNativeController] fileChangeOutputDelta invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) result=\(Self.debugPreview(resultJSON))")
-                guard emitted else { break }
+                guard emitted else {
+                    await emitUnrepresentedActivity(method: notification.method, params: params)
+                    break
+                }
                 await emit(.toolResult(
                     name: name,
                     invocationID: invocationID,
@@ -3858,6 +4127,8 @@ final class CodexNativeSessionController {
                     resultJSON: resultJSON,
                     isError: isError
                 ))
+            } else {
+                await emitUnrepresentedActivity(method: notification.method, params: params)
             }
         case "codex/event/exec_command_begin":
             if let beginEvent = parseExecCommandBeginEvent(params: params) {
@@ -3911,6 +4182,7 @@ final class CodexNativeSessionController {
         case "item/commandExecution/outputDelta":
             let itemID = commandExecutionItemID(from: params)
             guard shouldAcceptCommandExecutionEvent(itemID: itemID, family: .normalized) else {
+                await emitUnrepresentedActivity(method: notification.method, params: params)
                 break
             }
             if let update = parseCommandExecutionRunningUpdateFromNotification(
@@ -3919,6 +4191,8 @@ final class CodexNativeSessionController {
             ) {
                 Self.logCodexDebug("[CodexNativeController] runningUpdate method=\(notification.method) invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)")
                 await emit(.commandExecutionRunning(update))
+            } else {
+                await emitUnrepresentedActivity(method: notification.method, params: params)
             }
         case "item/commandExecution/terminalInteraction":
             let itemID = commandExecutionItemID(from: params)
@@ -3959,12 +4233,13 @@ final class CodexNativeSessionController {
             {
                 break
             }
+            let mcpIdentity = legacyMCPItemID.map { MCPToolIdentity(callID: $0, threadID: Self.notificationThreadID(from: params), turnID: notifiedTurnID) }
             if let toolEvent = parseRawMCPToolLifecycleEvent(method: notification.method, params: params) {
                 switch toolEvent {
                 case let .call(name, invocationID, argsJSON, dedupKey):
                     let emitted = markToolEventEmitted(key: "call:\(dedupKey)")
                     guard emitted else { break }
-                    await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON))
+                    await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON, mcpIdentity: mcpIdentity))
                 case let .result(name, invocationID, argsJSON, resultJSON, isError, dedupKey):
                     let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
                     guard emitted else { break }
@@ -3973,7 +4248,8 @@ final class CodexNativeSessionController {
                         invocationID: invocationID,
                         argsJSON: argsJSON,
                         resultJSON: resultJSON,
-                        isError: isError
+                        isError: isError,
+                        mcpIdentity: mcpIdentity
                     ))
                     if Self.normalizedExternalToolName(name) != "bash",
                        let runningUpdate = Self.commandExecutionRunningUpdate(
@@ -4014,9 +4290,144 @@ final class CodexNativeSessionController {
                 await emit(.errorNotification(errorNotification))
             }
         default:
-            if let activity = Self.parseLivenessActivity(method: notification.method, params: params) {
-                await emit(.livenessActivity(activity))
+            if let livenessActivity {
+                await emit(.livenessActivity(livenessActivity))
             }
+        }
+    }
+
+    private func emitUnrepresentedActivity(method: String, params: [String: Any]) async {
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
+    private func hasUnrepresentedActivity(method: String, params: [String: Any]) -> Bool {
+        if Self.isItemLifecycleNotificationMethod(method) {
+            guard let item = Self.canonicalItem(from: params),
+                  Self.canonicalItemScope(from: params, item: item) != nil
+            else { return true }
+            let type = normalizedTypeString(from: item)
+            if type == "usermessage" || type == "user_message" {
+                // Canonical prompt echo; accepted task input is latched by the host before send.
+                return !(item["content"] is [Any])
+            }
+            switch type {
+            case "agentmessage", "agent_message":
+                // Required on both lifecycle phases. Rendering fallbacks cannot prove silence.
+                return !(item["text"] is String)
+            case "reasoning":
+                // Absent arrays default to empty; present arrays must contain only strings.
+                return ["summary", "content"].contains { key in
+                    item[key] != nil && !(item[key] is [String])
+                }
+            default: break
+            }
+            return !["agentmessage", "agent_message", "reasoning"].contains(type)
+        }
+        switch method {
+        case "turn/completed", "codex/event/turn_completed":
+            let turn = params["turn"] as? [String: Any]
+            return turn?["status"] as? String != "completed"
+        case "codex/event/agent_message":
+            let message = (params["msg"] as? [String: Any])?["message"]
+            return Self.notificationItemID(from: params, includeTopLevelIDFallback: false) == nil
+                || !(message is String || params["message"] is String)
+        case "rawResponseItem/completed":
+            return hasUnrepresentedRawResponseItem(params)
+        case "rawResponse/completed":
+            guard Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) != nil,
+                  Self.firstString(in: params, keys: ["responseId"]) != nil,
+                  params["usageMetadata"] == nil || params["usageMetadata"] is NSNull || params["usageMetadata"] is [String: Any]
+            else { return true }
+            if params["usage"] is NSNull { return false }
+            guard let usage = params["usage"] as? [String: Any] else { return true }
+            return Self.parseTokenUsagePayload(from: ["tokenUsage": ["last": usage]]) == nil
+        case "item/reasoning/summaryPartAdded":
+            return Self.canonicalItemScope(from: params) == nil || (intValue(params["summaryIndex"]) ?? -1) < 0
+        case "thread/tokenUsage/updated":
+            return Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params)) == nil
+                || Self.parseTokenUsagePayload(from: params) == nil
+        case "account/rateLimits/updated":
+            return !(params["rateLimits"] is [String: Any])
+        case "account/updated":
+            return !(params["authMode"] is NSNull || params["authMode"] is String)
+                || !(params["planType"] is NSNull || params["planType"] is String)
+        case "item/commandExecution/outputDelta", "item/fileChange/outputDelta":
+            // Their handlers preserve uncertainty on parse/dedup failure using the actual result.
+            // In particular, never invoke the stateful file-change parser a second time here.
+            return false
+        case "item/mcpToolCall/progress", "item/plan/delta", "turn/diff/updated":
+            return Self.parseLivenessActivity(method: method, params: params) == nil
+        case "codex/event/mcp_tool_call_begin", "codex/event/mcp_tool_call_end":
+            // Valid successful events reach typed activity. Preserve malformed or failed evidence
+            // here as well, before completed-scope and tool-result deduplication can discard it.
+            guard let event = parseRawMCPToolLifecycleEvent(method: method, params: params) else { return true }
+            if case let .result(_, _, _, _, isError, _) = event { return isError != false }
+            return false
+        case "turn/started", "codex/event/turn_started",
+             "codex/event/task_complete", "item/agentMessage/delta",
+             "item/reasoning/summaryTextDelta", "item/reasoning/textDelta",
+             "thread/status/changed", "deprecationNotice":
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func hasUnrepresentedRawResponseItem(_ params: [String: Any]) -> Bool {
+        guard let item = Self.canonicalItem(from: params),
+              let scope = Self.canonicalItemScope(from: params, item: item),
+              Self.turnScope(threadID: Self.notificationThreadID(from: params), turnID: scope.turnID) != nil
+        else { return true }
+        switch item["type"] as? String {
+        case "message":
+            guard let content = item["content"] as? [[String: Any]] else { return true }
+            switch item["role"] as? String {
+            case "user":
+                // Harness-owned v0.160.1 wire annotation (outside exported schema), not text or
+                // version inference. Missing/new/mixed/misaligned kinds stay ordinary and visible.
+                guard let metadata = item["internal_chat_message_metadata_passthrough"] as? [String: Any],
+                      let kinds = metadata["content_item_kinds"] as? [String],
+                      let kind = kinds.first, kinds.count == content.count,
+                      ["user.text", "user.image", "user.audio"].contains(kind),
+                      kinds.allSatisfy({ $0 == kind })
+                else { return true }
+                return !content.allSatisfy { part in
+                    switch (kind, part["type"] as? String) {
+                    case ("user.text", "input_text"), ("user.text", "output_text"):
+                        part["text"] is String
+                    case ("user.image", "input_image"):
+                        Self.nonEmptyString(part["image_url"] as? String) != nil
+                            || Self.nonEmptyString(part["file_id"] as? String) != nil
+                    case ("user.audio", "input_audio"):
+                        Self.nonEmptyString(part["audio_url"] as? String) != nil
+                    default: false
+                    }
+                }
+            case "assistant":
+                // Core emits canonical completion before recording this raw model-output mirror.
+                // Its exact existing scope, not its text, proves the final replacement is represented.
+                return !completedCanonicalItemScopes.contains(scope) || !content.allSatisfy {
+                    ["input_text", "output_text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }
+            default: return true
+            }
+        case "reasoning":
+            guard completedCanonicalItemScopes.contains(scope),
+                  let summary = item["summary"] as? [[String: Any]],
+                  summary.allSatisfy({ $0["type"] as? String == "summary_text" && $0["text"] is String })
+            else { return true }
+            if let content = item["content"], !(content is NSNull) {
+                guard let parts = content as? [[String: Any]], parts.allSatisfy({
+                    ["reasoning_text", "text"].contains($0["type"] as? String ?? "") && $0["text"] is String
+                }) else { return true }
+            }
+            if let encrypted = item["encrypted_content"], !(encrypted is NSNull), !(encrypted is String) { return true }
+            return false
+        default: return true
         }
     }
 
@@ -4102,9 +4513,9 @@ final class CodexNativeSessionController {
             method: method,
             threadID: notificationThreadID(from: params),
             turnID: notificationTurnID(from: params),
-            itemID: notificationItemID(from: params),
-            activeFlags: notificationActiveFlags(from: params),
-            message: firstString(
+            itemID: kind == .protocolMetadata ? nil : notificationItemID(from: params),
+            activeFlags: kind == .protocolMetadata ? [] : notificationActiveFlags(from: params),
+            message: kind == .protocolMetadata ? nil : firstString(
                 in: params,
                 keys: ["message", "warning", "text", "reason", "description", "detail"]
             )
@@ -4113,6 +4524,14 @@ final class CodexNativeSessionController {
 
     private static func livenessActivityKind(for method: String, params: [String: Any]) -> LivenessActivity.Kind? {
         switch method {
+        case "turn/moderationMetadata":
+            // Pinned v0.159.0: this variant carries arbitrary JSON, not a ResponseItem.
+            // Null is valid; missing metadata or scope is not a decoded notification.
+            turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) != nil
+                && params["metadata"] != nil ? .protocolMetadata : nil
+        case "thread/settings/updated":
+            nonEmptyString(params["threadId"] as? String) != nil
+                && isThreadSettingsMetadata(params["threadSettings"]) ? .protocolMetadata : nil
         case "thread/status/changed":
             .threadStatusChanged
         case "turn/plan/updated":
@@ -4138,6 +4557,26 @@ final class CodexNativeSessionController {
         default:
             nil
         }
+    }
+
+    /// Decode the required snapshot structure, not settings policy or model-output content.
+    /// Optional/future settings are not applied here. Incomplete envelopes retain uncertainty.
+    private static func isThreadSettingsMetadata(_ value: Any?) -> Bool {
+        guard let settings = value as? [String: Any],
+              ["cwd", "model", "modelProvider", "approvalsReviewer"].allSatisfy({ nonEmptyString(settings[$0] as? String) != nil }),
+              let approvalPolicy = settings["approvalPolicy"],
+              nonEmptyString(approvalPolicy as? String) != nil || (approvalPolicy as? [String: Any])?.isEmpty == false,
+              let sandbox = settings["sandboxPolicy"] as? [String: Any], nonEmptyString(sandbox["type"] as? String) != nil,
+              let collaboration = settings["collaborationMode"] as? [String: Any], nonEmptyString(collaboration["mode"] as? String) != nil,
+              let collaborationSettings = collaboration["settings"] as? [String: Any], nonEmptyString(collaborationSettings["model"] as? String) != nil
+        else { return false }
+        let optionalStrings = ["serviceTier", "effort", "summary", "personality"]
+        guard optionalStrings.allSatisfy({ settings[$0] == nil || settings[$0] is NSNull || settings[$0] is String }),
+              settings["multiAgentMode"] == nil || settings["multiAgentMode"] is String,
+              settings["disabledPluginIds"] == nil || settings["disabledPluginIds"] is [String],
+              settings["activePermissionProfile"] == nil || settings["activePermissionProfile"] is NSNull || settings["activePermissionProfile"] is [String: Any]
+        else { return false }
+        return true
     }
 
     private static func notificationActiveFlags(from params: [String: Any]) -> [String] {
@@ -4630,6 +5069,17 @@ final class CodexNativeSessionController {
             parseLivenessActivity(method: method, params: params)
         }
 
+        func test_configureSnapshotRuntime(version: CodexRuntimeAuthority.Version) {
+            usesBoundedThreadSnapshots = Self.supportsBoundedThreadSnapshots(version)
+        }
+
+        func test_resumeThreadBinding(existing: SessionRef, timeout: TimeInterval = 5) async throws -> [String: Any] {
+            try await requestThreadBinding(
+                resumeThreadID: existing.conversationID, existing: existing, baseInstructions: "",
+                model: nil, serviceTier: nil, configOverrides: [:], timeout: timeout
+            )
+        }
+
         static func test_parseThreadSnapshot(
             _ result: [String: Any],
             fallbackEffort: String?
@@ -4825,6 +5275,7 @@ final class CodexNativeSessionController {
             let autoApproveHost = Self.isRepoPromptMCPElicitationRequest(params: params)
             if autoApproveHost || autoApproveCompanion {
                 logComputerUseApprovalDecision(path: .mcpElicitation, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(
                     id: request.id,
                     result: [
@@ -4866,6 +5317,7 @@ final class CodexNativeSessionController {
                )
             {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: [
                     "permissions": permission.permissionsObject, "scope": "turn", "strictAutoReview": false
                 ])
@@ -4873,6 +5325,7 @@ final class CodexNativeSessionController {
             }
             if let approvalResult = hostApprovalResult {
                 logComputerUseApprovalDecision(path: .permissions, params: params, outcome: "accept")
+                await emitAutoApprovedServerRequestActivity(method: method, params: params)
                 await respondToServerRequest(id: request.id, result: approvalResult)
                 return
             }
@@ -4914,6 +5367,16 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func emitAutoApprovedServerRequestActivity(method: String, params: [String: Any]) async {
+        // Automatic consent is still interaction, even with no surfaced request or later tool.
+        // Reuse raw scope parsing; the coordinator owns current-controller/turn acceptance.
+        await emit(.livenessActivity(.init(
+            kind: .warning, method: method,
+            threadID: Self.notificationThreadID(from: params), turnID: Self.notificationTurnID(from: params),
+            itemID: Self.notificationItemID(from: params), activeFlags: [], message: nil
+        )))
+    }
+
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
         #if DEBUG
             writeRawEventLogRecord(
@@ -4925,7 +5388,11 @@ final class CodexNativeSessionController {
             )
         #endif
         do {
-            try await client.respondToServerRequest(id: id, result: result)
+            if let serverRequestResponseExecutor {
+                try await serverRequestResponseExecutor(id, result)
+            } else {
+                try await client.respondToServerRequest(id: id, result: result)
+            }
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
         }
@@ -4986,6 +5453,7 @@ final class CodexNativeSessionController {
             )
             return
         }
+        await emitAutoApprovedServerRequestActivity(method: method, params: params)
         do {
             try await client.respondToServerRequest(id: requestID, result: response.payload)
         } catch {
@@ -5426,6 +5894,29 @@ final class CodexNativeSessionController {
             return .fileChange
         }()
 
+        // This authority is top-level only: nested fields must never resurrect legacy choices.
+        let availableDecisions: [AgentApprovalDecision]? = {
+            guard let value = params["availableDecisions"], !(value is NSNull) else { return nil }
+            guard let entries = value as? [Any] else { return [] }
+            return entries.compactMap { entry in
+                if let name = entry as? String {
+                    switch name {
+                    case "accept": return .accept
+                    case "acceptForSession": return .acceptForSession
+                    case "decline": return .decline
+                    case "cancel": return .cancel
+                    default: return nil
+                    }
+                }
+                guard let object = entry as? [String: Any], object.count == 1,
+                      let amendment = object["acceptWithExecpolicyAmendment"] as? [String: Any],
+                      let values = amendment["execpolicy_amendment"] as? [String], !values.isEmpty,
+                      let data = try? JSONSerialization.data(withJSONObject: values)
+                else { return nil }
+                return .acceptWithExecpolicyAmendment(String(decoding: data, as: UTF8.self))
+            }
+        }()
+
         let approvalID = AgentApprovalRequest.stableID(
             requestID: .codex(requestID),
             method: method,
@@ -5434,6 +5925,25 @@ final class CodexNativeSessionController {
             turnID: stableTurnID,
             itemID: itemID
         )
+        func makeRequest(details: [AgentApprovalDetail]) -> AgentApprovalRequest {
+            AgentApprovalRequest(
+                id: approvalID,
+                requestID: .codex(requestID),
+                method: method,
+                kind: kind,
+                threadID: threadID,
+                turnID: turnID,
+                itemID: itemID,
+                reason: reason,
+                command: command,
+                cwd: cwd,
+                grantRoot: grantRoot,
+                proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
+                availableDecisions: availableDecisions,
+                details: details
+            )
+        }
+        let presentedAmendment = makeRequest(details: []).presentedExecpolicyAmendmentJSON
         let detailSeed = approvalID.uuidString
         var details: [AgentApprovalDetail] = []
         var detailIndex = 0
@@ -5469,28 +5979,14 @@ final class CodexNativeSessionController {
         if let commandActionsJSON, !commandActionsJSON.isEmpty {
             appendDetail(label: "Command Actions", value: commandActionsJSON, isCode: true)
         }
-        if let proposedExecpolicyAmendmentJSON, !proposedExecpolicyAmendmentJSON.isEmpty {
-            appendDetail(label: "Execpolicy Amendment", value: proposedExecpolicyAmendmentJSON, isCode: true)
+        if let presentedAmendment, !presentedAmendment.isEmpty {
+            appendDetail(label: "Execpolicy Amendment", value: presentedAmendment, isCode: true)
         }
         if details.isEmpty {
             appendDetail(label: "Method", value: method, isCode: true)
         }
 
-        return AgentApprovalRequest(
-            id: approvalID,
-            requestID: .codex(requestID),
-            method: method,
-            kind: kind,
-            threadID: threadID,
-            turnID: turnID,
-            itemID: itemID,
-            reason: reason,
-            command: command,
-            cwd: cwd,
-            grantRoot: grantRoot,
-            proposedExecpolicyAmendmentJSON: proposedExecpolicyAmendmentJSON,
-            details: details
-        )
+        return makeRequest(details: details)
     }
 
     private static func firstString(in value: Any, keys: [String]) -> String? {
@@ -5879,9 +6375,9 @@ final class CodexNativeSessionController {
             "reasoningDelta kind=\(payload.kind) chars=\(payload.text.count) itemID=\(payload.itemID ?? "nil") groupID=\(payload.groupID ?? "nil")"
         case let .reasoningCompleted(payload):
             "reasoningCompleted summary=\(payload.summary.count) content=\(payload.content.count) turnID=\(payload.scope.turnID) itemID=\(payload.scope.itemID)"
-        case let .toolCall(name, invocationID, _):
+        case let .toolCall(name, invocationID, _, _):
             "toolCall tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil")"
-        case let .toolResult(name, invocationID, _, resultJSON, isError):
+        case let .toolResult(name, invocationID, _, resultJSON, isError, _):
             "toolResult tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count)"
         case let .commandExecutionRunning(update):
             "commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)"
@@ -5919,13 +6415,13 @@ final class CodexNativeSessionController {
         case result(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?, dedupKey: String)
     }
 
-    private func emitToolLifecycleEvent(_ toolEvent: ToolLifecycleEvent, method: String) async {
+    private func emitToolLifecycleEvent(_ toolEvent: ToolLifecycleEvent, method: String, mcpIdentity: MCPToolIdentity? = nil) async {
         switch toolEvent {
         case let .call(name, invocationID, argsJSON, dedupKey):
             let emitted = markToolEventEmitted(key: "call:\(dedupKey)")
             Self.logCodexDebug("[CodexNativeController] toolCall method=\(method) tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) args=\(Self.debugPreview(argsJSON))")
             guard emitted else { return }
-            await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON))
+            await emit(.toolCall(name: name, invocationID: invocationID, argsJSON: argsJSON, mcpIdentity: mcpIdentity))
         case let .result(name, invocationID, argsJSON, resultJSON, isError, dedupKey):
             let emitted = markToolEventEmitted(key: "result:\(dedupKey)")
             Self.logCodexDebug("[CodexNativeController] toolResult method=\(method) tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") emitted=\(emitted) isError=\(isError.map(String.init(describing:)) ?? "nil") result=\(Self.debugPreview(resultJSON))")
@@ -5935,7 +6431,8 @@ final class CodexNativeSessionController {
                 invocationID: invocationID,
                 argsJSON: argsJSON,
                 resultJSON: resultJSON,
-                isError: isError
+                isError: isError,
+                mcpIdentity: mcpIdentity
             ))
             if Self.normalizedExternalToolName(name) != "bash",
                let runningUpdate = Self.commandExecutionRunningUpdate(
@@ -9543,14 +10040,14 @@ enum CommandExecutionOutputSanitizer {
 }
 
 enum CodexSessionControllerError: LocalizedError {
-    case imageAttachmentsUnsupported
+    case attachmentsUnsupported
     case emptyUserTurn
     case invalidResumeReferenceMissingThreadID
     case invalidLifecycleState(String)
 
     var errorDescription: String? {
         switch self {
-        case .imageAttachmentsUnsupported:
+        case .attachmentsUnsupported:
             "This Codex session controller does not support image attachments."
         case .emptyUserTurn:
             "Cannot send an empty user turn."
@@ -9587,6 +10084,13 @@ extension CodexSessionControlling {
     ) async throws -> CodexNativeSessionController.ThreadSnapshot {
         assertionFailure("\(type(of: self)) must implement readThreadSnapshot(includeTurns:timeout:)")
         throw CodexAppServerClient.ClientError.invalidResponse
+    }
+
+    func readNativeToolProbeSnapshot(
+        expectedTurnID _: String,
+        timeout: TimeInterval?
+    ) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        try await readThreadSnapshot(includeTurns: true, timeout: timeout)
     }
 
     func setThreadName(_: String, threadID _: String?) async throws {}

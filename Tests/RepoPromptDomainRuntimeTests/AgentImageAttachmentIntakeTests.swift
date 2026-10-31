@@ -140,11 +140,11 @@ final class AgentImageAttachmentGuardTests: XCTestCase {
 final class AgentImageAttachmentAvailabilityResolverTests: XCTestCase {
     func testPathLookupIsNilForRemoteSources() {
         XCTAssertNil(AgentImageAttachmentAvailabilityResolver.path(
-            for: AgentImageAttachment(source: .url("https://example.com/a.png"))
+            for: AgentFileAttachment(source: .url("https://example.com/a.png"))
         ))
         XCTAssertEqual(
             AgentImageAttachmentAvailabilityResolver.path(
-                for: AgentImageAttachment(source: .localFile(path: "/tmp/a/../b.png"))
+                for: AgentFileAttachment(source: .localFile(path: "/tmp/a/../b.png"))
             ),
             "/tmp/b.png"
         )

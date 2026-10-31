@@ -812,6 +812,16 @@ final class GitWorktreeCreatePreconditionTests: XCTestCase {
                 XCTAssertTrue(message.contains("refused before creation"), "\(testCase.label): \(message)")
                 XCTAssertTrue(message.contains(testCase.detail), "\(testCase.label): \(message)")
                 XCTAssertTrue(message.contains("Nothing was created."), "\(testCase.label): \(message)")
+                // Repository and request context come from the source, and the classification is structured.
+                XCTAssertTrue(message.contains("in repository \(source.path):"), "\(testCase.label): \(message)")
+                XCTAssertTrue(message.contains("destination \(testCase.request.path.path)"), "\(testCase.label): \(message)")
+                let baseRef = testCase.request.baseRef.map { "base ref '\($0)'" } ?? "base ref (omitted; Git default)"
+                XCTAssertTrue(message.contains(baseRef), "\(testCase.label): \(message)")
+                XCTAssertEqual(
+                    (error as? GitService.GitError)?.worktreeCreateFailure,
+                    GitService.WorktreeCreateFailure(refusedBeforeCreation: true, branchExists: testCase.label == "existing branch"),
+                    testCase.label
+                )
             }
             let fenceCalls = await fence.calls
             XCTAssertEqual(fenceCalls, 0, testCase.label)

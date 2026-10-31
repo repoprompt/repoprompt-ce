@@ -163,7 +163,7 @@ package final class AgentImageAttachmentAvailabilityResolver: @unchecked Sendabl
     }
 
     /// The standardized local path a card checks, or `nil` for remote sources.
-    package static func path(for attachment: AgentImageAttachment) -> String? {
+    package static func path(for attachment: AgentFileAttachment) -> String? {
         guard case let .localFile(path) = attachment.source else { return nil }
         let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
         return standardized.isEmpty ? nil : standardized

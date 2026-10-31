@@ -479,6 +479,8 @@ import XCTest
             // Full manager close still follows the existing save/writer drains below.
             manager?.beginRootReconciliationShutdown()
             if let files {
+                files.setRootTeardownWillUnloadStoreRootHandler(nil)
+                files.setRootLoadDidAttachRootShellHandler(nil)
                 await files.workspaceFileContextStore.setRootUnloadDidDetachHandler(nil)
                 for root in await files.workspaceFileContextStore.roots() {
                     await files.workspaceFileContextStore.setPrimaryRootQueryabilityFailureForTesting(rootID: root.id, failure: nil)

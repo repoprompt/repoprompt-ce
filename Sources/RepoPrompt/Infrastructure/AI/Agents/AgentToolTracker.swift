@@ -150,6 +150,10 @@ final class AgentToolEventDeliveryMailbox: @unchecked Sendable {
     }
 
     #if DEBUG
+        func idleWaiterCountForTesting() -> Int {
+            lock.withLock { idleContinuations.count }
+        }
+
         func queuedOperationCountForTesting() -> Int {
             lock.lock()
             defer { lock.unlock() }
@@ -220,7 +224,7 @@ final class AgentToolEventDeliveryMailbox: @unchecked Sendable {
 /// (Claude, Codex, ACP) don't need to duplicate this state. Each provider owner
 /// keeps one instance per tab (via `[UUID: AgentToolTrackingController]` dictionary).
 ///
-/// Starting tracking for the same `runID` is a no-op. Starting for a different `runID`
+/// Starting tracking for the same `runID` and optional attempt scope is a no-op. Starting for a different `runID`
 /// serializes teardown of the prior registration before re-registering. Callbacks are suppressed if the `trackedRunID`
 /// has changed by delivery time (stale-delivery protection).
 ///
@@ -236,28 +240,32 @@ final class AgentToolTrackingController {
     private var registrationTask: Task<Void, Never>?
     private var registrationRunID: UUID?
     private var trackingGeneration: UInt64 = 0
+    private var trackingAttemptID: UUID?
     private(set) var trackedRunID: UUID?
 
     // MARK: - Callback-Based API (used by Claude, Codex, ACP)
 
     /// Start tracking MCP tool events for a run, delivering callbacks on the main actor.
     ///
-    /// - If `runID` matches the current tracked run, this is a no-op.
+    /// - The default is unchanged run-scoped reuse. Exact owners may refresh an attempt scope.
+    /// - If run and optional attempt scope match, this is a no-op.
     /// - If a different run is tracked, prior teardown is serialized before registration.
     /// - Stale callbacks (where `trackedRunID` has changed) are silently dropped.
     @MainActor func startTracking(
         runID: UUID,
+        attemptID: UUID? = nil,
         clientNameHint: String?,
         onCalled: @escaping @MainActor (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?) -> Void,
         onCompleted: @escaping @MainActor (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?, _ resultJSON: String, _ isError: Bool) -> Void
     ) async {
-        if trackedRunID == runID {
+        if trackedRunID == runID, trackingAttemptID == attemptID {
             if registrationRunID == runID, let registrationTask {
                 await registrationTask.value
             }
             return
         }
 
+        trackingAttemptID = attemptID
         trackingGeneration &+= 1
         let generation = trackingGeneration
         let previousRegistrationTask = registrationTask
@@ -281,6 +289,7 @@ final class AgentToolTrackingController {
             await tracker.registerEnhancedObserver(
                 runID: runID,
                 onCalled: { [weak self, eventDeliveryMailbox] invocationID, toolName, args in
+                    let invocationContext = MCPInvocationContextBridge.current
                     #if DEBUG
                         let scheduledAt = DispatchTime.now().uptimeNanoseconds
                         EditFlowPerf.lifecycleEvent(
@@ -306,7 +315,7 @@ final class AgentToolTrackingController {
                                     )
                                 )
                                 guard let self, shouldDeliverCallback(for: runID) else { return 0 }
-                                onCalled(invocationID, toolName, args)
+                                MCPInvocationContextBridge.currentTaskLocal.withValue(invocationContext) { onCalled(invocationID, toolName, args) }
                                 return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
                             }
                             EditFlowPerf.lifecycleEvent(
@@ -321,12 +330,13 @@ final class AgentToolTrackingController {
                         #else
                             await MainActor.run { [weak self] in
                                 guard let self, shouldDeliverCallback(for: runID) else { return }
-                                onCalled(invocationID, toolName, args)
+                                MCPInvocationContextBridge.currentTaskLocal.withValue(invocationContext) { onCalled(invocationID, toolName, args) }
                             }
                         #endif
                     }
                 },
                 onCompleted: { [weak self, eventDeliveryMailbox] invocationID, toolName, args, resultJSON, isError in
+                    let invocationContext = MCPInvocationContextBridge.current
                     #if DEBUG
                         let scheduledAt = DispatchTime.now().uptimeNanoseconds
                         EditFlowPerf.lifecycleEvent(
@@ -352,7 +362,7 @@ final class AgentToolTrackingController {
                                     )
                                 )
                                 guard let self, shouldDeliverCallback(for: runID) else { return 0 }
-                                onCompleted(invocationID, toolName, args, resultJSON, isError)
+                                MCPInvocationContextBridge.currentTaskLocal.withValue(invocationContext) { onCompleted(invocationID, toolName, args, resultJSON, isError) }
                                 return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
                             }
                             EditFlowPerf.lifecycleEvent(
@@ -368,7 +378,7 @@ final class AgentToolTrackingController {
                         #else
                             await MainActor.run { [weak self] in
                                 guard let self, shouldDeliverCallback(for: runID) else { return }
-                                onCompleted(invocationID, toolName, args, resultJSON, isError)
+                                MCPInvocationContextBridge.currentTaskLocal.withValue(invocationContext) { onCompleted(invocationID, toolName, args, resultJSON, isError) }
                             }
                         #endif
                     }
@@ -485,6 +495,15 @@ final class AgentToolTrackingController {
     #if DEBUG
         func waitForPendingEventDeliveriesForTesting() async {
             await waitForPendingEventDeliveries()
+        }
+
+        var pendingEventDeliveryWaiterCountForTesting: Int {
+            eventDeliveryMailbox.idleWaiterCountForTesting()
+        }
+
+        /// A deterministic suspension of this existing FIFO, not an observer-completion fence.
+        func enqueueEventDeliveryBarrierForTesting(_ operation: @escaping @Sendable () async -> Void) {
+            eventDeliveryMailbox.enqueue(operation)
         }
     #endif
 

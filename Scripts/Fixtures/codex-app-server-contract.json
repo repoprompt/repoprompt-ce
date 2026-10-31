@@ -486,10 +486,50 @@
         "config",
         "cwd",
         "model",
-        "serviceTier"
+        "serviceTier",
+        "path",
+        "excludeTurns",
+        "initialTurnsPage",
+        "initialTurnsPage.limit",
+        "initialTurnsPage.sortDirection",
+        "initialTurnsPage.itemsView"
       ],
+      "enumValues": {
+        "initialTurnsPage.sortDirection": ["desc"],
+        "initialTurnsPage.itemsView": ["notLoaded"]
+      },
       "responseSchema": "v2/ThreadResumeResponse.json",
       "consumedResponse": [
+        {
+          "path": "initialTurnsPage",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "initialTurnsPage.data",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "initialTurnsPage.nextCursor",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "initialTurnsPage.data[].id",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "initialTurnsPage.data[].status",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "initialTurnsPage.data[].error",
+          "presence": "optional",
+          "nullable": true
+        },
         {
           "path": "thread",
           "presence": "required",
@@ -634,6 +674,88 @@
           "inProgress",
           "interrupted"
         ]
+      }
+    },
+    {
+      "union": "ClientRequest.json",
+      "method": "thread/turns/list",
+      "alwaysSent": [
+        "threadId",
+        "limit",
+        "sortDirection",
+        "itemsView"
+      ],
+      "enumValues": {
+        "sortDirection": ["desc"],
+        "itemsView": ["notLoaded", "full"]
+      },
+      "maySend": ["cursor"],
+      "responseSchema": "v2/ThreadTurnsListResponse.json",
+      "consumedResponse": [
+        {
+          "path": "data",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "nextCursor",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "data[].id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].status",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].error",
+          "presence": "optional",
+          "nullable": true
+        },
+        {
+          "path": "data[].itemsView",
+          "presence": "optional",
+          "nullable": false
+        },
+        {
+          "path": "data[].items",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].items[].type",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].items[].id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "path": "data[].items[].status",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "data[].items[].tool",
+          "presence": "conditional",
+          "nullable": false
+        },
+        {
+          "path": "data[].items[].processId",
+          "presence": "optional",
+          "nullable": true
+        }
+      ],
+      "consumedEnumValues": {
+        "data[].itemsView": ["full", "notLoaded", "summary"],
+        "data[].items[].status": ["completed", "declined", "failed", "inProgress", "interrupted"]
       }
     },
     {

@@ -408,10 +408,47 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
+    func bindingQuietDeclarationObservations(
+        _ binding: AgentRunTerminalSessionBinding, session: AgentTabSession,
+        owner: AgentRunOwnership, runID: UUID
+    ) -> AgentRunTerminalSessionBinding {
+        #if DEBUG
+            if session.test_flushQuietToolObservations != nil { return binding }
+        #endif
+        var binding = binding
+        binding.hooks.flushQuietToolObservations = { [weak self, weak session] in
+            guard let self, let session, session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID),
+                  session.quietLedger.acceptedDeclarationInvocationID(owner: owner) != nil,
+                  !hasActiveMCPTools(runID),
+                  !ServerNetworkManager.shared.hasPendingToolCardObservations(windowID: windowID, runID: runID),
+                  let handler = toolHandlerByTabID[session.tabID] else { return false }
+            // Returned MCP calls may have enqueued their first host callback without delivering it.
+            // Drain that existing FIFO before requiring its exact native/host join at the second cut.
+            await handler.waitForPendingEventDeliveries()
+            return true
+        }
+        binding.hooks.quietToolObservationsAreComplete = { [weak self, weak session] in
+            guard let self, let session, session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID),
+                  let id = session.quietLedger.acceptedDeclarationInvocationID(owner: owner),
+                  !hasActiveMCPTools(runID),
+                  !ServerNetworkManager.shared.hasPendingToolCardObservations(windowID: windowID, runID: runID),
+                  let handler = toolHandlerByTabID[session.tabID] else { return false }
+            return handler.hasCompleteExactAssociation(hostInvocationID: id, owner: owner, session: session)
+                && session.quietLedger.declarationMaySeal(owner: owner, canonicalInvocations: [id])
+        }
+        return binding
+    }
+
     func ensureClaudeToolTrackingIfNeeded(for session: AgentTabSession, runID: UUID) async {
         let handler = toolHandler(for: session)
         await handler.startTracking(runID: runID, session: session, clientNameHint: session.selectedAgent.mcpClientNameHint)
     }
+
+    #if DEBUG
+        func testToolTrackingHandler(for session: AgentTabSession) -> ClaudeAgentToolTrackingHandler {
+            toolHandler(for: session)
+        }
+    #endif
 
     private func toolHandler(for session: AgentTabSession) -> ClaudeAgentToolTrackingHandler {
         if let existing = toolHandlerByTabID[session.tabID] {
@@ -815,6 +852,11 @@ final class ClaudeAgentModeCoordinator {
                 throw error
             }
 
+            if case let .runAttempt(owner, runID) = intent,
+               session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID)
+            {
+                session.recordRunProgress(ownership: owner, kind: .stageTransition, stage: .retrying, retryIntent: .applicationManaged)
+            }
             await hostCapabilities.stageClaudeResumeRecoveryHandoff(session)
             guard intentIsCurrent(intent, for: session),
                   let detached = detachClaudeController(
@@ -1039,7 +1081,7 @@ final class ClaudeAgentModeCoordinator {
     func sendClaudeNativeMessage(
         session: AgentTabSession,
         text: String,
-        attachments _: [AgentImageAttachment],
+        attachments _: [AgentFileAttachment],
         intent: NativeSessionIntent,
         allowsCatalogRouteControllerRecovery: Bool,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
@@ -1649,6 +1691,7 @@ final class ClaudeAgentModeCoordinator {
                 // A lane-update dispatch has no base user instruction. If its required batch was
                 // revoked, acknowledged, revision-fenced, or omitted by the shared budget, stop before
                 // `sendUserMessage`; `.superseded` is the quiet no-provider-call outcome.
+                defer { withExtendedLifetime(monitoring.quietMarkerProducerLifetime) {} }
                 guard !monitoring.mustAbortDispatch else {
                     hostCapabilities.recordAgentSessionLinkPhysicalDispatchNotAttempted(session, promptDispatchID)
                     return .superseded
@@ -1796,6 +1839,9 @@ final class ClaudeAgentModeCoordinator {
             removeToolTracking: true
         ) else {
             return false
+        }
+        if let owner = session.activeRunOwnership, session.isCurrentRunAttemptForCurrentBinding(owner) {
+            session.recordRunProgress(ownership: owner, kind: .stageTransition, stage: .retrying, retryIntent: .applicationManaged)
         }
         _ = await retireClaudeController(
             detached,

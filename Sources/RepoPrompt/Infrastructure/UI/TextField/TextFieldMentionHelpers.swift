@@ -33,7 +33,7 @@ final class FileTagMentionHelper {
     }
 
     func configure(
-        textView: ImageAwareTextView,
+        textView: AttachmentAwareTextView,
         enabled: Bool,
         store: WorkspaceFileContextStore?,
         searchService: WorkspaceSearchService?,
@@ -467,7 +467,7 @@ final class SlashSkillMentionHelper {
     }
 
     func configure(
-        textView: ImageAwareTextView,
+        textView: AttachmentAwareTextView,
         enabled: Bool,
         suggestionsProvider: ((String) async -> [MentionSuggestion])?
     ) {

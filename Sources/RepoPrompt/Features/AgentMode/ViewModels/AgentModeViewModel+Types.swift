@@ -668,8 +668,8 @@ extension AgentModeViewModel {
 
     enum AttachmentTurnState: Equatable {
         case idle
-        case reserved(reservationID: UUID, attachments: [AgentImageAttachment])
-        case consumed(reservationID: UUID, attachments: [AgentImageAttachment])
+        case reserved(reservationID: UUID, attachments: [AgentFileAttachment])
+        case consumed(reservationID: UUID, attachments: [AgentFileAttachment])
     }
 
     struct CodexComputerUseActivation: Equatable {
@@ -814,6 +814,7 @@ extension AgentModeViewModel {
         case remove(index: Int, itemKind: AgentChatItemKind)
         case replaceAll
         case structural
+        case metadataRange(ClosedRange<Int>)
 
         var changedIndexRange: ClosedRange<Int>? {
             switch self {
@@ -822,6 +823,8 @@ extension AgentModeViewModel {
                  let .mutate(index, _),
                  let .remove(index, _):
                 index ... index
+            case let .metadataRange(range):
+                range
             case .replaceAll, .structural:
                 nil
             }
@@ -835,6 +838,8 @@ extension AgentModeViewModel {
                 itemKind == .user
             case let .replace(_, previousKind, currentKind):
                 previousKind == .user || currentKind == .user
+            case .metadataRange:
+                false
             case .replaceAll, .structural:
                 true
             }
@@ -844,7 +849,7 @@ extension AgentModeViewModel {
             switch self {
             case .remove, .replaceAll, .structural:
                 true
-            case .append, .replace, .mutate:
+            case .append, .replace, .mutate, .metadataRange:
                 false
             }
         }
@@ -1047,6 +1052,9 @@ extension AgentModeViewModel {
         let projection: AgentTranscriptProjection
         let turnProjectionCaches: [UUID: AgentTranscriptTurnProjectionCache]
         let archivedSnapshot: AgentArchivedTranscriptSnapshot
+        /// Semantic reuse evidence from the existing validated sanitizer prefix, not a claim
+        /// that building the archive projection avoided traversal or reused its storage.
+        let reusesPreviousArchive: Bool
         let projectionProtection: AgentTranscriptProjectionProtection
         let canonicalVisibleRowCount: Int
         let projectionCounts: AgentTranscriptProjectionCounts
@@ -1146,13 +1154,13 @@ extension AgentModeViewModel {
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
     struct PendingUserTurnState: Equatable {
         let workflow: AgentWorkflowDefinition?
-        let imageAttachments: [AgentImageAttachment]
+        let attachments: [AgentFileAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
 
         var isEmpty: Bool {
             workflow == nil
-                && imageAttachments.isEmpty
+                && attachments.isEmpty
                 && taggedFileAttachments.isEmpty
                 && initialStartLocation == .local
         }
@@ -1167,12 +1175,6 @@ extension AgentModeViewModel {
         let message: String
         let strategy: AgentModeRunService.DraftRestorationStrategy
         let operation: AgentComposerDraftRestorationOperation?
-    }
-
-    /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.
-    struct ImageAttachmentFingerprint: Hashable {
-        let byteCount: Int64
-        let digestHex: String
     }
 
     struct SlashSkillToken: Equatable {

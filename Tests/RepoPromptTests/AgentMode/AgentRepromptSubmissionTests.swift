@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptSettingsCore
@@ -335,7 +336,7 @@ final class AgentRepromptSubmissionTests: XCTestCase {
                 fixture.session.recordRestorationAuthoritative(.persistedPayloadApplied)
                 fixture.viewModel.repromptEnabled = enabled
                 fixture.viewModel.repromptService = .init(transport: { _, _, _ in XCTFail("Bypassed submission must not rewrite") })
-                if text.isEmpty { fixture.session.pendingImageAttachments = [.init(source: .localFile(path: "/tmp/parity.png"))] }
+                if text.isEmpty { fixture.session.pendingFileAttachments = [.init(source: .localFile(path: "/tmp/parity.png"))] }
                 let claim = try fixture.claim(text: text, local: true)
                 let result = await fixture.viewModel.executeComposerSubmitAttempt(text: text, claim: claim, createAndActivateSessionTab: { XCTFail("Existing session must not be replaced")
                     return nil
@@ -346,6 +347,67 @@ final class AgentRepromptSubmissionTests: XCTestCase {
                 XCTAssertTrue(fixture.viewModel.repromptDispatchTexts.isEmpty)
             }
         }
+    }
+
+    func testAutoSendWaitsForCommittedPublicationAndClaimsTheFinalDraftOnce() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        let vm = fixture.viewModel
+        let tabID = fixture.session.tabID
+        let generated = "# Ready\n\n" + String(repeating: "Final rewrite. ", count: 80) + "Done."
+        vm.repromptService = .init(transport: { _, _, publish in try await publish(generated) })
+        var sawPublication = false
+        let observation = vm.repromptUIStore.$autoSendRequest.sink { request in
+            guard let request else { return }
+            sawPublication = true
+            XCTAssertFalse(
+                vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: false),
+                "Combine delivers in willSet; dispatch must wait for committed state"
+            )
+        }
+        defer { observation.cancel() }
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await ready(fixture)
+        let request = try XCTUnwrap(vm.repromptUIStore.autoSendRequest)
+        XCTAssertTrue(sawPublication)
+        XCTAssertEqual(request.text, generated)
+        // A lagging native streaming chunk is not the autosend authority. The canonical
+        // final draft is installed already, and native edits/marked text fence consumption.
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: "Previous chunk", hasMarkedText: false))
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: true))
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: UUID(), visibleDraft: generated, hasMarkedText: false))
+        XCTAssertTrue(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: false))
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: tabID, visibleDraft: generated, hasMarkedText: false))
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: fixture.session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: generated)
+        guard case let .claimed(claim) = vm.claimComposerSubmitForImmediatePresentation(attempt) else {
+            return XCTFail("Completed automatic rewrite must claim without another Return")
+        }
+        defer { vm.finishPresentedComposerSubmitAttempt(claim, result: .blocked(message: "test cleanup")) }
+        XCTAssertEqual(vm.ui.composer.pendingSubmissions[attempt.id]?.text, generated)
+        XCTAssertNil(vm.repromptUIStore.autoSendRequest, "A committed request must clear, not be resurrected by willSet")
+        XCTAssertNil(vm.repromptOperation)
+        XCTAssertEqual(fixture.session.draftText, "")
+    }
+
+    func testDisablingRepromptFencesAPendingAutomaticSend() async throws {
+        let fixture = try await AgentRepromptTestFixture()
+        defer { fixture.cleanUp() }
+        fixture.enableReprompt()
+        fixture.viewModel.setRepromptMode(.sendAutomatically)
+        XCTAssertTrue(try fixture.begin(text: "Original"))
+        try await ready(fixture)
+        let vm = fixture.viewModel
+        let request = try XCTUnwrap(vm.repromptUIStore.autoSendRequest)
+        // Simulates a shared setting changing outside the local pill action.
+        vm.repromptEnabled = false
+        XCTAssertFalse(vm.consumeRepromptAutoSend(request, tabID: fixture.session.tabID, visibleDraft: request.text, hasMarkedText: false))
+        vm.invalidateRepromptIfNeeded()
+        XCTAssertNil(vm.repromptOperation)
+        XCTAssertNil(vm.repromptUIStore.autoSendRequest)
+        XCTAssertTrue(fixture.session.items.isEmpty)
     }
 
     func testAutoSendPublishesOnlyAtSuccessAndUsesFreshDispatchClaimOnce() async throws {
@@ -437,15 +499,15 @@ final class AgentRepromptSubmissionTests: XCTestCase {
             try await publish("brief.")
         })
         defer { Task { await gate.release() } }
-        fixture.session.pendingImageAttachments = [.init(source: .localFile(path: "/tmp/kept-image.png"))]
-        let images = fixture.session.pendingImageAttachments
+        fixture.session.pendingFileAttachments = [.init(source: .localFile(path: "/tmp/kept-image.png"))]
+        let images = fixture.session.pendingFileAttachments
         let token = fixture.session.composerSubmissionToken
         XCTAssertTrue(try fixture.begin(text: "Original"))
         try await AsyncTestWait.waitUntil("incremental draft", timeout: 5) { fixture.session.draftText == "A streamed " }
         XCTAssertEqual(fixture.session.composerSubmissionToken, token)
         XCTAssertNil(fixture.session.activeComposerSubmitAttempt)
         XCTAssertTrue(fixture.session.items.isEmpty)
-        XCTAssertEqual(fixture.session.pendingImageAttachments, images)
+        XCTAssertEqual(fixture.session.pendingFileAttachments, images)
         let requests = await fixture.backend.requests
         XCTAssertTrue(requests.isEmpty, "Never route partial tokens")
         await gate.release()

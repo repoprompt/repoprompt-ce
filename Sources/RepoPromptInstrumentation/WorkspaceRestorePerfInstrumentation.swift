@@ -1,8 +1,25 @@
 import Foundation
 
-/// Synchronous, opt-in restore timing and structured event contract.
-/// Consumers provide only the same bounded diagnostic fields as the app logger;
-/// a missing app composition is intentionally silent.
+package enum WorkspaceRestoreStartupPhase: String, Sendable {
+    case oversightIntentLoad, oversightLaunchSeed, oversightRestoreAdmission
+    case oversightDiscoveryAdoption, oversightDiscoveryCompletion, oversightDiscoveryBarrier
+}
+
+package enum WorkspaceRestoreOversightOutcome: String, Sendable {
+    case restored, blocked, terminal
+    case endpointUnresolved = "endpoint_unresolved"
+}
+
+package enum WorkspaceRestoreLaneAddFailureBranch: String, Sendable {
+    case targetBindingOrProvenance = "target_binding_or_provenance"
+    case restorationProof = "restoration_proof"
+    case addFailed = "add_failed"
+    case addRejected = "add_rejected"
+}
+
+/// Synchronous restore diagnostics. Timing is opt-in; startup and Add-failure records are always on.
+/// Consumers provide bounded identifiers, counters and enum raw values.
+/// A missing app composition is silent.
 package protocol WorkspaceRestorePerfRecording: Sendable {
     var isEnabled: Bool { get }
     func timestampMSIfEnabled() -> Double?
@@ -14,6 +31,28 @@ package protocol WorkspaceRestorePerfRecording: Sendable {
     @MainActor func nextAgentActivationTrueCount() -> Int
     func log(_ message: @autoclosure () -> String)
     func event(_ name: String, fields: [String: String])
+    func recordStartupPhase(_ phase: WorkspaceRestoreStartupPhase, debug: Bool, window: Int?, fields: [String: Int])
+    func recordOversightRestoreAttempt(observer: UUID, target: UUID, outcome: WorkspaceRestoreOversightOutcome, reason: String?)
+    func recordLaneCreationAddFailure(branch: WorkspaceRestoreLaneAddFailureBranch, reason: String?)
+}
+
+package extension WorkspaceRestorePerfRecording {
+    /// Always-on startup records use closed phases, identifiers and counters. Reasons are enum raw values.
+    func recordStartupPhase(_: WorkspaceRestoreStartupPhase, debug _: Bool, window _: Int?, fields _: [String: Int]) {}
+    func recordOversightRestoreAttempt(observer _: UUID, target _: UUID, outcome _: WorkspaceRestoreOversightOutcome, reason _: String?) {}
+    func recordLaneCreationAddFailure(branch _: WorkspaceRestoreLaneAddFailureBranch, reason _: String?) {}
+
+    func startupPhase(_ phase: WorkspaceRestoreStartupPhase, debug: Bool = false, window: Int? = nil, fields: [String: Int] = [:]) {
+        recordStartupPhase(phase, debug: debug, window: window, fields: fields)
+    }
+
+    func oversightRestoreAttempt(observer: UUID, target: UUID, outcome: WorkspaceRestoreOversightOutcome, reason: String? = nil) {
+        recordOversightRestoreAttempt(observer: observer, target: target, outcome: outcome, reason: reason)
+    }
+
+    func laneCreationAddFailed(branch: WorkspaceRestoreLaneAddFailureBranch, reason: String? = nil) {
+        recordLaneCreationAddFailure(branch: branch, reason: reason)
+    }
 }
 
 package struct NoopWorkspaceRestorePerfRecorder: WorkspaceRestorePerfRecording {

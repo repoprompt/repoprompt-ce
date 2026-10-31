@@ -600,12 +600,13 @@ else
     fail "M2 workspace presentation bridge declaration missing"
   fi
   # Scope each readiness check to its owner: another guard elsewhere cannot cover its removal.
+  # Drain each scoped body: grep -q can SIGPIPE awk under pipefail.
   if ! awk '/^    private func projectInitial\(/ { scoped=1 } /^    private func consume\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
-    | grep -q 'if initial.isBootstrapped, initial.workspaces.isEmpty,'; then
+    | grep 'if initial.isBootstrapped, initial.workspaces.isEmpty,' > /dev/null; then
     fail "M2 initial Default creation must be gated by authority bootstrap readiness"
   fi
   if ! awk '/^    private func project\(/ { scoped=1 } /^    private func commitAccepted\(/ { scoped=0 } scoped { print }' "$m2_presentation_bridge" \
-    | grep -q 'guard snapshot.isBootstrapped else'; then
+    | grep 'guard snapshot.isBootstrapped else' > /dev/null; then
     fail "M2 catalog projection must reject unbootstrapped authority snapshots"
   fi
 fi
@@ -813,9 +814,11 @@ allowed_tracked_docs=(
   "docs/architecture/codex-user-mcp-import.md"
   "docs/architecture/context-composer.md"
   "docs/architecture/headless-mcp-runtime.md"
+  "docs/architecture/keyboard-shortcuts.md"
   "docs/architecture/mcp-lifecycle-diagnostics.md"
   "docs/architecture/model-routing.md"
   "docs/architecture/modules.md"
+  "docs/architecture/oracle-attachments.md"
   "docs/architecture/oracle-groups-rewrite.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/routing-profile-publication.md"

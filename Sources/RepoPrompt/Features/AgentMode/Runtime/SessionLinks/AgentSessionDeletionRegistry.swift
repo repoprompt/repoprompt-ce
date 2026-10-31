@@ -153,6 +153,7 @@ final class AgentSessionDeletionRegistry {
         let token = AttemptToken(sessionID: sessionID, attemptID: UUID(), origin: origin)
         activeAttemptIDsBySession[sessionID, default: []].insert(token.attemptID)
         guard statesBySession[sessionID] != .committed else { return token }
+        if statesBySession[sessionID] == nil { ServerNetworkManager.catalogAdvertisementDidChange() }
         statesBySession[sessionID] = .inProgress(attemptID: token.attemptID)
         #if DEBUG
             logTransition("begin", sessionID: sessionID)
@@ -175,6 +176,7 @@ final class AgentSessionDeletionRegistry {
             return
         }
         activeAttemptIDsBySession.removeValue(forKey: token.sessionID)
+        ServerNetworkManager.catalogAdvertisementDidChange()
         statesBySession.removeValue(forKey: token.sessionID)
         resumeSettlementWaiters(for: token.sessionID)
         #if DEBUG
@@ -198,6 +200,7 @@ final class AgentSessionDeletionRegistry {
             return
         }
         guard activeAttemptIDsBySession[token.sessionID]?.contains(token.attemptID) == true else { return }
+        ServerNetworkManager.catalogAdvertisementDidChange()
         statesBySession[token.sessionID] = .committed
         activeAttemptIDsBySession[token.sessionID]?.remove(token.attemptID)
         if activeAttemptIDsBySession[token.sessionID]?.isEmpty == true {
@@ -312,6 +315,7 @@ final class AgentSessionDeletionRegistry {
         func test_reset() {
             terminationFreezeAllowsRestoration = nil
             scopePersistenceAdmission = nil
+            if !statesBySession.isEmpty { ServerNetworkManager.catalogAdvertisementDidChange() }
             statesBySession.removeAll()
             activeAttemptIDsBySession.removeAll()
             commitTasksBySession.removeAll()

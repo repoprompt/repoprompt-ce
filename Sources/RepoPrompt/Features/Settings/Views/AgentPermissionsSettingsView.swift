@@ -198,7 +198,10 @@ struct AgentPermissionsSettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Overseer")
                 .font(.headline)
-            Toggle(isOn: $autoApproveDelegationRequests) {
+            Toggle(isOn: Binding(get: { autoApproveDelegationRequests }, set: { enabled in
+                if autoApproveDelegationRequests != enabled { ServerNetworkManager.catalogAdvertisementDidChange() }
+                autoApproveDelegationRequests = enabled
+            })) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Overseer full access (no approvals)")
                     Text("An Overseer can do everything to every session without asking: observe, organize, control, restructure, spawn, worktrees, retire, and delete sessions. No approval or confirmation cards appear. Its access shows in Active delegations. Turn this off to revoke it immediately.")

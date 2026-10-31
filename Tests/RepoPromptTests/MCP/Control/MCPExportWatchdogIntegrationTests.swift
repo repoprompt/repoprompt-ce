@@ -12,6 +12,678 @@ import XCTest
 #if DEBUG
     @MainActor
     final class MCPExportWatchdogIntegrationTests: XCTestCase {
+        func testW2ProductionTerminalObservationHooksPreserveTheResponseAndMailboxCut() async throws {
+            for claude in [true, false] {
+                for mutation in ["none", "premature", "outer"] {
+                    try await proveW0TerminalCut(claude: claude, mutation: mutation, productionCut: true)
+                }
+            }
+        }
+
+        func testW0ClaudeNormalTerminalRevalidatesExactResponseMailboxAndOwnershipCut() async throws {
+            for mutation in ["none", "premature", "veto", "drain", "owner", "active", "outer", "reentry"] {
+                try await proveW0TerminalCut(claude: true, mutation: mutation)
+            }
+        }
+
+        func testW0ClaudeMissingMismatchedAndOrphanNativeAssociationsRemainOrdinary() async throws {
+            for mutation in ["missing-key", "mismatch", "orphan"] {
+                try await proveW0TerminalCut(claude: true, mutation: mutation)
+            }
+        }
+
+        func testW0CodexNormalTerminalRevalidatesHostResponseMailboxAndOwnershipCut() async throws {
+            for mutation in ["none", "host-first", "duplicate-representation", "successor", "premature", "veto", "drain", "owner", "run", "active", "outer", "reentry"] {
+                try await proveW0TerminalCut(claude: false, mutation: mutation)
+            }
+        }
+
+        func testW0CodexTrailingProtocolMetadataPreservesDeclarationEligibilityButUnknownNotificationVetoes() async throws {
+            for mutation in ["trailing-metadata", "trailing-unknown"] {
+                try await proveW0TerminalCut(claude: false, mutation: mutation)
+            }
+        }
+
+        func testW0PinnedCodexMissingMismatchedDuplicateAndForeignWitnessesStayOrdinary() async throws {
+            for mutation in ["missing-key", "malformed-key", "mismatch", "wrong-thread", "native-wrong-thread", "wrong-turn", "orphan", "duplicate-dispatch", "overlap", "heuristic-veto", "unknown-status", "malformed-start", "malformed-result", "native-error", "noncandidate"] {
+                try await proveW0TerminalCut(claude: false, mutation: mutation)
+            }
+        }
+
+        /// The fake provider awaits the REAL socket response before its native result/terminal.
+        /// Negative premature completion deliberately breaks that fence. Membership is injected;
+        /// the ordinary read_file declaration is not registered/certified as self_noop.
+        private func proveW0TerminalCut(claude: Bool, mutation: String, productionCut: Bool = false) async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let server = fixture.contextA.window.mcpServer
+                let harness = AgentSessionLinkRunnerHarness(
+                    headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() },
+                    testWindowID: productionCut ? fixture.contextA.window.windowID : 1,
+                    testMCPServer: productionCut ? server : nil
+                )
+                let session = harness.makeSession(agent: claude ? .claudeCode : .codexExec)
+                session.testInstallPersistentSessionBinding(sessionID: UUID())
+                let runID = UUID()
+                var currentTurnID = "w0-terminal"
+                session.installRunID(runID)
+                session.runState = .running
+                var owner = session.beginRunAttempt(source: "W0-terminal-cut")
+                let decoder = CodexNativeSessionController(
+                    client: CodexAppServerClient(),
+                    runID: runID,
+                    tabID: session.tabID,
+                    windowID: -1,
+                    workspacePaths: .uniform(nil)
+                )
+                if !claude {
+                    session.codexController = decoder
+                    await decoder.test_installThreadState(threadID: "w0-thread", authoritativeTurnID: currentTurnID, routingTurnID: currentTurnID)
+                    session.codexConversationID = "w0-thread"
+                    session.codexPendingTurnKind = .user
+                    await harness.host.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: currentTurnID), session: session)
+                    XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, currentTurnID)
+                }
+                var wakeID = UUID()
+                session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                let originEndpoint = DomainAgentSessionLinkEndpointIdentity(
+                    windowID: fixture.contextA.window.windowID,
+                    workspaceID: fixture.contextA.workspaceID,
+                    tabID: owner.binding.tabID,
+                    sessionID: owner.binding.persistentSessionID!,
+                    persistentBindingGeneration: owner.binding.persistentBindingGeneration,
+                    bindingTransitionGeneration: owner.binding.bindingTransitionGeneration
+                )
+                var origin = AgentSelfMCPCallOrigin(endpoint: originEndpoint, runID: runID, runAttemptID: owner.attemptID)
+                let handler = harness.host.test_claudeCoordinator.testToolTrackingHandler(for: session)
+                let codex = harness.host.test_codexCoordinator
+                let mailbox = TestReleaseFence(name: "W0 terminal mailbox \(claude) \(mutation)")
+                let outer = TestReleaseFence(name: "W0 terminal outer observer")
+                let sibling = TestReleaseFence(name: "W0 terminal sibling active")
+                let lateOuter = TestReleaseFence(name: "W0 second outer observer")
+                let flushEntered: XCTestExpectation? = productionCut ? nil : expectation(description: "terminal entered observation flush")
+                var context: ToolInvocationContext?
+                var responseReturned = false
+                var sealEligibility: [Bool] = []
+                var terminalTask: Task<Void, Never>?
+                var requestTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var siblingTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var translator = ClaudeSDKNDJSONTranslator()
+                var nativeObserverTask: Task<Void, Never>?
+                var nativeDelivery: XCTestExpectation?
+                var nativeLocalIDs: [UUID] = []
+                var originalNativeEvents: [CodexNativeSessionController.Event] = []
+                let terminalDelivery = AsyncStream<Void>.makeStream()
+                let raw = claude ? "toolu_unmodified_native_string" : "call_original_non_UUID_native_string"
+                session.test_codexQuietDeclarationMembership = { $0.callID == raw && mutation != "noncandidate" }
+                session.test_quietDeclarationMembership = { stream in
+                    stream.claudeToolUseID == raw && stream.toolName == "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file"
+                }
+                @MainActor
+                func native(result: Bool, callID: String? = nil, turnOverride: String? = nil, duplicate: Bool = false) async throws {
+                    if !claude {
+                        let callID = callID ?? raw
+                        let thread = mutation == "native-wrong-thread" ? "foreign-thread" : "w0-thread"
+                        let turn = turnOverride ?? (mutation == "wrong-turn" ? "foreign-turn" : currentTurnID)
+                        if thread != "w0-thread" || turn != currentTurnID {
+                            await decoder.test_installThreadState(threadID: thread, authoritativeTurnID: turn, routingTurnID: turn)
+                        }
+                        let previousSequence = session.runLifecycle.liveness?.lastAcceptedSequence ?? 0
+                        let wasCurrent = session.isCurrentRunAttemptForCurrentBinding(owner, expectedRunID: runID)
+                        let previousEventCount = nativeLocalIDs.count
+                        let delivered = duplicate ? nil : expectation(description: "original native MCP item delivered")
+                        nativeDelivery = delivered
+                        await decoder.test_handleNotification(method: result ? "item/completed" : "item/started", params: [
+                            "threadId": .string(thread), "turnId": .string(turn),
+                            "item": .object([
+                                "type": .string("mcpToolCall"),
+                                "id": .string(callID),
+                                "server": .string(MCPIntegrationHelper.repoPromptMCPServerName),
+                                "tool": .string("read_file"),
+                                "arguments": mutation == "malformed-start" ? .array([]) : .object(["path": .string(fixture.contextA.fileURL.path)]),
+                                "status": .string(mutation == "unknown-status" ? "future-status" : (result ? (mutation == "native-error" ? "failed" : "completed") : "inProgress")),
+                                "result": result ? (mutation == "malformed-result" ? .object([:]) : .object(["content": .array([.object(["type": .string("text"), "text": .string("contents")])])])) : .null
+                            ])
+                        ])
+                        if let delivered { await fulfillment(of: [delivered], timeout: 5) }
+                        nativeDelivery = nil
+                        if thread != "w0-thread" || turn != currentTurnID {
+                            await decoder.test_installThreadState(threadID: "w0-thread", authoritativeTurnID: currentTurnID, routingTurnID: currentTurnID)
+                        } else if duplicate {
+                            XCTAssertEqual(nativeLocalIDs.count, previousEventCount, "The normal canonical decoder deduplicates own representations, not handler entries")
+                        } else if wasCurrent {
+                            XCTAssertGreaterThan(session.runLifecycle.liveness?.lastAcceptedSequence ?? 0, previousSequence, "Membership does not bypass normal accepted tool liveness")
+                        }
+                        return
+                    }
+                    let block: [String: Any] = result
+                        ? ["type": "tool_result", "tool_use_id": raw, "content": [["type": "text", "text": "contents"]]]
+                        : ["type": "tool_use", "id": raw, "name": "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file", "input": ["path": fixture.contextA.fileURL.path]]
+                    let data = try JSONSerialization.data(withJSONObject: ["type": result ? "user" : "assistant", "message": ["content": [block]]])
+                    for stream in translator.parseNDJSONLine(data) {
+                        await harness.host.test_handleStreamResult(stream, session: session, runID: runID, runAttemptID: owner.attemptID)
+                    }
+                }
+                @MainActor
+                func flush() async {
+                    if claude { await handler.waitForPendingEventDeliveries() }
+                    else { await codex.testFlushCodexToolTracking(for: session) }
+                }
+                @MainActor
+                func startTerminal() -> Task<Void, Never> {
+                    Task {
+                        if claude {
+                            let turnID = UUID()
+                            session.claudeExpectedTurnIDs.insert(turnID)
+                            let runner = ClaudeIntegratedAgentModeRunner(
+                                claudeCoordinator: harness.host.test_claudeCoordinator,
+                                hooks: harness.hooks,
+                                terminalCommitBarrier: AgentRunTerminalCommitBarrier()
+                            )
+                            let stream = AsyncStream<NativeAgentRuntimeEvent> { continuation in
+                                continuation.yield(.turnCompleted(turnID: turnID, status: .completed))
+                                continuation.finish()
+                            }
+                            _ = await runner.testConsumeAndFinalizeQuietEvents(stream, session: session, runID: runID, owner: owner)
+                        } else {
+                            await decoder.test_handleNotification(method: "turn/completed", params: [
+                                "threadId": .string("w0-thread"), "turn": .object(["id": .string(currentTurnID), "status": .string("completed")])
+                            ])
+                            for await _ in terminalDelivery.stream {
+                                break
+                            }
+                        }
+                    }
+                }
+                @MainActor
+                func cleanup() async throws {
+                    outer.release()
+                    mailbox.release()
+                    sibling.release()
+                    lateOuter.release()
+                    if let requestTask { _ = try? await requestTask.value }
+                    if let siblingTask { _ = try? await siblingTask.value }
+                    if let terminalTask { await terminalTask.value }
+                    await decoder.shutdown()
+                    if let nativeObserverTask { await nativeObserverTask.value }
+                    terminalDelivery.continuation.finish()
+                    session.test_flushQuietToolObservations = nil
+                    session.test_quietToolObservationsAreComplete = { true }
+                    session.test_observeQuietSealEligibility = nil
+                    server.setBeforeDomainReadContextResolutionForTesting(nil)
+                    await manager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                    if claude { await handler.stopTracking(for: session) } else { await codex.testStopCodexToolTracking(for: session) }
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+                do {
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpoint, context: fixture.contextA)
+                    await manager.debugSeedConnectionRunRouting(connectionID: endpoint.connectionID, runID: runID, windowID: fixture.contextA.window.windowID)
+                    if claude { await handler.startTracking(runID: runID, session: session, clientNameHint: nil) }
+                    else {
+                        await codex.testStartCodexToolTracking(for: session, runID: runID)
+                        let events = decoder.events
+                        nativeObserverTask = Task {
+                            for await event in events {
+                                await codex.test_handleCodexNativeEvent(event, session: session, sourceController: decoder)
+                                switch event {
+                                case let .toolCall(_, localID, _, identity), let .toolResult(_, localID, _, _, _, identity):
+                                    XCTAssertNotNil(identity)
+                                    XCTAssertNotNil(localID)
+                                    if let localID { nativeLocalIDs.append(localID) }
+                                    originalNativeEvents.append(event)
+                                    nativeDelivery?.fulfill()
+                                case .turnCompleted: terminalDelivery.continuation.yield(())
+                                default: break
+                                }
+                            }
+                        }
+                    }
+                    server.setBeforeDomainReadContextResolutionForTesting { packet in
+                        if context != nil {
+                            if mutation == "duplicate-dispatch" {
+                                XCTAssertFalse(session.quietLedger.enterDeclarationBody(owner: owner, hostInvocationID: packet.invocationID))
+                            } else { await sibling.enterAndWait() }
+                            return
+                        }
+                        context = packet
+                        // Injected handler entry, before domain validation/resolution. No real self_noop.
+                        XCTAssertTrue(session.quietLedger.enterDeclarationBody(owner: owner, hostInvocationID: packet.invocationID))
+                        await flush()
+                        let accepted = session.quietLedger.acceptDeclarationBody(
+                            owner: owner,
+                            hostInvocationID: packet.invocationID,
+                            wakeID: wakeID,
+                            origin: origin,
+                            currentEndpoint: originEndpoint,
+                            currentRunID: session.runID
+                        )
+                        XCTAssertEqual(accepted, !["missing-key", "malformed-key", "wrong-thread", "heuristic-veto", "unknown-status", "malformed-start", "noncandidate"].contains(mutation) && (claude || mutation != "mismatch"), "\(claude ? "Claude" : "Codex") \(mutation)")
+                        if mutation == "reentry" { XCTAssertFalse(session.quietLedger.enterDeclarationBody(owner: owner, hostInvocationID: packet.invocationID)) }
+                    }
+                    await manager.debugSetBeforeToolCompletionObserversForTesting { id, name in
+                        if id == endpoint.connectionID, name == "read_file" { await outer.enterAndWait() }
+                    }
+                    if !["orphan", "host-first"].contains(mutation) { try await native(result: false) }
+                    if mutation == "duplicate-representation" { try await native(result: false, duplicate: true) }
+                    if mutation == "heuristic-veto" {
+                        codex.testSimulateRepoPromptToolCall(invocationID: nil, toolName: "read_file", args: [:], session: session)
+                    }
+                    let requestMeta: [String: Any] = claude
+                        ? (mutation == "missing-key" ? [:] : ["claudecode/toolUseId": mutation == "mismatch" ? "different-native-string" : raw])
+                        : (mutation == "missing-key" ? [:] : [
+                            "callId": mutation == "malformed-key" ? 7 : (mutation == "mismatch" ? "different-call" : raw),
+                            "threadId": mutation == "wrong-thread" ? "foreign-thread" : "w0-thread",
+                            "itemId": "originating-item-is-NOT-the-call-id", "sessionId": "fixture-session", "windowId": "fixture-window"
+                        ])
+                    requestTask = Task {
+                        let response = try await endpoint.client.request(method: "tools/call", params: [
+                            "name": "read_file", "arguments": ["path": fixture.contextA.fileURL.path],
+                            "_meta": requestMeta
+                        ])
+                        responseReturned = true
+                        return response
+                    }
+                    guard await outer.waitUntilEntered() else { throw CancellationError() }
+                    await flush()
+                    if mutation == "host-first" { try await native(result: false) }
+                    let hostID = try XCTUnwrap(context?.invocationID)
+                    XCTAssertTrue(nativeLocalIDs.allSatisfy { $0 != hostID }, "A native UUID/hash is never set equal to the real socket-generated host UUID")
+                    if !claude { XCTAssertEqual(context?.codexCallID, mutation == "missing-key" || mutation == "malformed-key" ? nil : (mutation == "mismatch" ? "different-call" : raw)) }
+                    XCTAssertFalse(server.hasActiveToolExecutions(runID: runID))
+                    XCTAssertTrue(manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID))
+                    XCTAssertFalse(responseReturned)
+                    session.test_observeQuietSealEligibility = { sealEligibility.append($0) }
+                    if !productionCut {
+                        session.test_flushQuietToolObservations = {
+                            flushEntered?.fulfill()
+                            // Native terminal alone, no-active, or an idle FIFO is insufficient.
+                            guard !server.hasActiveToolExecutions(runID: runID),
+                                  !manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID),
+                                  claude ? handler.hasExactNativeResult(hostInvocationID: hostID, owner: owner, session: session)
+                                  : session.quietLedger.codexAssociationHasNativeResult(owner: owner, hostID: hostID, runID: session.runID, threadID: session.codexConversationID)
+                            else { return false }
+                            await flush()
+                            return true
+                        }
+                        session.test_quietToolObservationsAreComplete = {
+                            let ids = session.items.filter { $0.kind == .toolCall || $0.kind == .toolResult }.compactMap(\.toolInvocationID)
+                            let identityComplete = claude
+                                ? handler.hasCompleteExactAssociation(hostInvocationID: hostID, owner: owner, session: session)
+                                : session.quietLedger.codexAssociationIsComplete(owner: owner, hostID: hostID, runID: session.runID, threadID: session.codexConversationID)
+                            return identityComplete && !server.hasActiveToolExecutions(runID: runID)
+                                && !manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID)
+                                && session.quietLedger.declarationMaySeal(owner: owner, canonicalInvocations: ids)
+                        }
+                    }
+                    if mutation == "premature" {
+                        terminalTask = startTerminal()
+                        await terminalTask?.value
+                        if let flushEntered { await fulfillment(of: [flushEntered], timeout: 5) }
+                        XCTAssertEqual(sealEligibility, [false], "Successful native terminal cannot cover an outer observer not yet returned")
+                        let settledFacts = session.quietLedger.facts
+                        outer.release()
+                        _ = try await requestTask?.value
+                        try await native(result: true)
+                        await flush()
+                        XCTAssertEqual(session.quietLedger.facts, settledFacts, "Late exact evidence cannot mutate a completed seal")
+                    } else {
+                        if claude { handler.enqueueEventDeliveryBarrierForTesting { await mailbox.enterAndWait() } }
+                        else { codex.testEnqueueCodexToolTrackingBarrier(for: session) { await mailbox.enterAndWait() } }
+                        guard await mailbox.waitUntilEntered() else { throw CancellationError() }
+                        outer.release()
+                        let response = try await XCTUnwrap(requestTask).value
+                        XCTAssertTrue(try Self.toolResultText(response).contains(fixture.contextA.sentinel))
+                        XCTAssertTrue(responseReturned)
+                        if mutation == "overlap" { try await native(result: false, callID: "another-call-with-identical-arguments") }
+                        if mutation == "duplicate-dispatch" {
+                            _ = try await endpoint.client.request(method: "tools/call", params: ["name": "read_file", "arguments": ["path": fixture.contextA.fileURL.path], "_meta": requestMeta])
+                        }
+                        try await native(result: true)
+                        if mutation == "duplicate-representation" { try await native(result: true, duplicate: true) }
+                        if !claude, ["none", "host-first", "successor", "duplicate-representation"].contains(mutation) {
+                            XCTAssertEqual(nativeLocalIDs.count, 2)
+                            XCTAssertEqual(nativeLocalIDs.first, nativeLocalIDs.last, "Started/completed are normal representations, not two dispatches")
+                            XCTAssertEqual(session.quietLedger.declarationBodyEntryCardinality(owner: owner), 1)
+                        }
+                        if mutation == "reentry" { XCTAssertEqual(session.quietLedger.declarationBodyEntryCardinality(owner: owner), 2) }
+                        if mutation == "trailing-metadata" {
+                            // Both outside-output variants trail the exact body/result and are
+                            // consumed by the real decoder/coordinator before normal terminal.
+                            await decoder.test_handleNotification(method: "turn/moderationMetadata", params: [
+                                "threadId": .string("w0-thread"), "turnId": .string(currentTurnID), "metadata": .null
+                            ])
+                            await decoder.test_handleNotification(method: "thread/settings/updated", params: CodexProtocolMetadataTestFixtures.settings(threadID: "w0-thread"))
+                        } else if mutation == "trailing-unknown" {
+                            await decoder.test_handleNotification(method: "thread/futureMetadata/updated", params: ["threadId": .string("w0-thread"), "metadata": .object([:])])
+                        }
+                        terminalTask = startTerminal()
+                        if let flushEntered { await fulfillment(of: [flushEntered], timeout: 5) }
+                        else {
+                            try await AsyncTestWait.waitUntil("production terminal awaits its existing mailbox before phase acquisition") {
+                                (claude ? handler.pendingEventDeliveryWaiterCountForTesting : codex.testCodexToolTrackingWaiterCount(for: session)) > 0
+                            }
+                        }
+                        if !["missing-key", "malformed-key", "mismatch", "wrong-thread", "native-wrong-thread", "wrong-turn", "orphan", "overlap", "unknown-status", "native-error"].contains(mutation) {
+                            XCTAssertTrue(sealEligibility.isEmpty, "Returned response only enqueues completion; terminal must await FIFO")
+                        }
+                        if mutation == "veto" { session.quietLedger.noteOccurrence(owner: owner) }
+                        if mutation == "drain" { session.bumpProviderTerminalDrainGeneration() }
+                        if mutation == "run" { session.installRunID(UUID()) }
+                        if mutation == "owner" { _ = session.endRunAttempt(ifCurrent: owner, source: "W0 stale terminal")
+                            let successor = session.beginRunAttempt(source: "W0 successor")
+                            session.quietLedger.markRoutineWake(owner: successor, wakeID: UUID())
+                        }
+                        if mutation == "active" || mutation == "outer" {
+                            if mutation == "outer" {
+                                await manager.debugSetBeforeToolCompletionObserversForTesting { _, _ in await lateOuter.enterAndWait() }
+                            }
+                            siblingTask = Task { try await endpoint.callTool(name: "read_file", arguments: ["path": fixture.contextA.fileURL.path]) }
+                            guard await sibling.waitUntilEntered() else { throw CancellationError() }
+                            if mutation == "outer" {
+                                sibling.release()
+                                guard await lateOuter.waitUntilEntered() else { throw CancellationError() }
+                                XCTAssertFalse(server.hasActiveToolExecutions(runID: runID))
+                                XCTAssertTrue(manager.debugHasPendingToolCardObservations(windowID: fixture.contextA.window.windowID, runID: runID))
+                            }
+                        }
+                        mailbox.release()
+                        await terminalTask?.value
+                        if mutation == "owner" || mutation == "drain" || mutation == "run" {
+                            XCTAssertTrue(sealEligibility.isEmpty, "SECOND ownership/provider-drain guard must abort rather than seal")
+                            XCTAssertNil(session.lastTerminalCommitRevision)
+                            if mutation == "owner" {
+                                let successor = try XCTUnwrap(session.activeRunOwnership)
+                                XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: successor), "Queued old-attempt completion cannot poison the fresh successor")
+                            }
+                        } else {
+                            XCTAssertEqual(sealEligibility, [mutation == "none" || mutation == "host-first" || mutation == "successor" || mutation == "duplicate-representation" || mutation == "trailing-metadata"], "\(claude ? "Claude" : "Codex") \(mutation)")
+                            XCTAssertNotNil(session.lastTerminalCommitRevision, "Actual runner successful terminal used the normal barrier")
+                        }
+                        if mutation == "reentry" {
+                            XCTAssertEqual(session.items.count(where: { $0.toolInvocationID == hostID }), 1)
+                        }
+                    }
+                    if mutation == "successor" {
+                        let previousOwner = owner
+                        currentTurnID = "w0-successor"
+                        session.installRunID(runID)
+                        session.runState = .running
+                        owner = session.beginRunAttempt(source: "W0 Codex same-run successor")
+                        wakeID = UUID()
+                        origin = AgentSelfMCPCallOrigin(endpoint: originEndpoint, runID: runID, runAttemptID: owner.attemptID)
+                        session.quietLedger.markRoutineWake(owner: owner, wakeID: wakeID)
+                        session.codexPendingTurnKind = .user
+                        await decoder.test_installThreadState(threadID: "w0-thread", authoritativeTurnID: currentTurnID, routingTurnID: currentTurnID)
+                        await decoder.test_handleNotification(method: "turn/started", params: ["threadId": .string("w0-thread"), "turn": .object(["id": .string(currentTurnID)])])
+                        await codex.testStartCodexToolTracking(for: session, runID: runID)
+                        context = nil
+                        let stale = try XCTUnwrap(originalNativeEvents.first)
+                        await codex.test_handleCodexNativeEvent(stale, session: session, sourceController: decoder)
+                        XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "Stale native origin cannot poison or qualify a successor")
+                        try await native(result: false)
+                        _ = try await endpoint.client.request(method: "tools/call", params: ["name": "read_file", "arguments": ["path": fixture.contextA.fileURL.path], "_meta": requestMeta])
+                        await flush()
+                        try await native(result: true)
+                        let successorH = try XCTUnwrap(context?.invocationID)
+                        XCTAssertNotEqual(successorH, hostID)
+                        XCTAssertTrue(session.quietLedger.codexAssociationIsComplete(owner: owner, hostID: successorH, runID: runID, threadID: "w0-thread"))
+                        XCTAssertFalse(session.quietLedger.codexAssociationIsComplete(owner: previousOwner, hostID: successorH, runID: runID, threadID: "w0-thread"))
+                        XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner))
+                    }
+                    try await cleanup()
+                } catch { try? await cleanup()
+                    throw error
+                }
+            }
+        }
+
+        /// Fixture metadata follows Helm's static client evidence. This does NOT verify that a
+        /// live client emits the key or that it equals the native stream ID.
+        func testW0CandidateClaudeNativeStringJoinsRealHostContextInBothOrdersAndDuplicateDispatchVetoes() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let server = fixture.contextA.window.mcpServer
+                let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+                let session = harness.makeSession(agent: .claudeCode)
+                let runID = UUID()
+                session.installRunID(runID)
+                session.runState = .running
+                var owner = session.beginRunAttempt(source: "W0-candidate-native-metadata")
+                session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+                let handler = harness.host.test_claudeCoordinator.testToolTrackingHandler(for: session)
+                var translator = ClaudeSDKNDJSONTranslator()
+                var contexts: [ToolInvocationContext] = []
+                let name = "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file"
+                let path = fixture.contextA.fileURL.path
+                session.test_quietDeclarationMembership = { $0.claudeToolUseID == "toolu_before" || $0.claudeToolUseID == "toolu_after" }
+                @MainActor
+                func native(_ raw: String, result: Bool = false) async throws -> UUID {
+                    let block: [String: Any] = result
+                        ? ["type": "tool_result", "tool_use_id": raw, "content": [["type": "text", "text": "contents"]]]
+                        : ["type": "tool_use", "id": raw, "name": name, "input": ["path": path]]
+                    let line = try JSONSerialization.data(withJSONObject: ["type": result ? "user" : "assistant", "message": ["content": [block]]])
+                    let stream = try XCTUnwrap(translator.parseNDJSONLine(line).first { $0.type == (result ? "tool_result" : "tool_call") })
+                    XCTAssertEqual(stream.claudeToolUseID, raw)
+                    await harness.host.test_handleStreamResult(stream, session: session, runID: runID, runAttemptID: owner.attemptID)
+                    return try XCTUnwrap(stream.toolInvocationID)
+                }
+                @MainActor
+                func cleanup() async throws {
+                    server.setBeforeDomainReadContextResolutionForTesting(nil)
+                    await handler.stopTracking(for: session)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+                do {
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpoint, context: fixture.contextA)
+                    await manager.debugSeedConnectionRunRouting(connectionID: endpoint.connectionID, runID: runID, windowID: fixture.contextA.window.windowID)
+                    await handler.startTracking(runID: runID, session: session, clientNameHint: nil)
+                    // The production runner registers tracking before sendClaudeNativeMessage resets the turn.
+                    handler.resetTurnState(for: session)
+                    server.setBeforeDomainReadContextResolutionForTesting { contexts.append($0) }
+                    var hostIDs: [UUID] = []
+                    for (index, raw) in ["toolu_before", "toolu_after"].enumerated() {
+                        let providerID = index == 0 ? try await native(raw) : nil
+                        let response = try await endpoint.client.request(method: "tools/call", params: [
+                            "name": "read_file", "arguments": ["path": path], "_meta": ["claudecode/toolUseId": raw]
+                        ])
+                        XCTAssertNotEqual(try Self.responseObject(from: response)["result"].flatMap { $0 as? [String: Any] }?["isError"] as? Bool, true)
+                        await handler.waitForPendingEventDeliveries()
+                        let context = try XCTUnwrap(contexts.last)
+                        XCTAssertEqual(context.claudeToolUseID, raw)
+                        XCTAssertEqual(context.metadata.invocationID, context.invocationID)
+                        let nativeID: UUID = if let providerID { providerID } else { try await native(raw) }
+                        XCTAssertNotEqual(nativeID, context.invocationID, "No crafted equal UUID; only the raw native string joins the two paths")
+                        _ = try await native(raw, result: true)
+                        XCTAssertTrue(handler.hasCompleteExactAssociation(hostInvocationID: context.invocationID, owner: owner, session: session))
+                        hostIDs.append(context.invocationID)
+                    }
+                    XCTAssertNotEqual(hostIDs[0], hostIDs[1])
+                    XCTAssertEqual(session.items.count, 2, "Identical name/arguments do not collapse distinct exact native strings")
+                    XCTAssertEqual(Set(session.items.compactMap(\.toolInvocationID)), Set(hostIDs))
+                    XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner), "Correlation-only injected candidate; no production quiet certification")
+                    let duplicate = try await endpoint.client.request(method: "tools/call", params: [
+                        "name": "read_file", "arguments": ["path": path], "_meta": ["claudecode/toolUseId": "toolu_before"]
+                    ])
+                    XCTAssertTrue(try Self.toolResultText(duplicate).contains(fixture.contextA.sentinel))
+                    await handler.waitForPendingEventDeliveries()
+                    XCTAssertNil(session.quietLedger.candidateStartKey(owner: owner))
+                    XCTAssertFalse(handler.hasCompleteExactAssociation(hostInvocationID: hostIDs[0], owner: owner, session: session))
+                    let previousOwner = owner
+                    XCTAssertTrue(session.endRunAttempt(ifCurrent: owner, source: "W0 exact successor"))
+                    owner = session.beginRunAttempt(source: "W0 exact successor")
+                    session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+                    handler.resetTurnState(for: session)
+                    // Same process/run, same raw native string; only a fresh attempt may join.
+                    await handler.startTracking(runID: runID, session: session, clientNameHint: nil)
+                    _ = try await native("toolu_before")
+                    _ = try await endpoint.client.request(method: "tools/call", params: [
+                        "name": "read_file", "arguments": ["path": path], "_meta": ["claudecode/toolUseId": "toolu_before"]
+                    ])
+                    await handler.waitForPendingEventDeliveries()
+                    _ = try await native("toolu_before", result: true)
+                    let successorID = try XCTUnwrap(contexts.last?.invocationID)
+                    XCTAssertFalse(hostIDs.contains(successorID))
+                    XCTAssertTrue(handler.hasCompleteExactAssociation(hostInvocationID: successorID, owner: owner, session: session))
+                    XCTAssertFalse(handler.hasCompleteExactAssociation(hostInvocationID: successorID, owner: previousOwner, session: session))
+                    XCTAssertNotNil(session.quietLedger.candidateStartKey(owner: owner))
+                    try await cleanup()
+                } catch { try? await cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testW0MissingMalformedAndUnrelatedMetadataDoNotChangeOtherClientExecutionOrResults() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let server = fixture.contextA.window.mcpServer
+                var captured: [ToolInvocationContext] = []
+                do {
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpoint, context: fixture.contextA)
+                    server.setBeforeDomainReadContextResolutionForTesting { captured.append($0) }
+                    var outputs: [String] = []
+                    for meta: [String: Any] in [[:], ["claudecode/toolUseId": 7], ["claudecode/toolUseId": " "], ["unrelated": "opaque"], ["claudecode/toolUseId": "opaque-other-client"], ["callId": 7, "threadId": []], ["callId": "opaque-other-client", "threadId": "opaque-thread"]] {
+                        let response = try await endpoint.client.request(method: "tools/call", params: [
+                            "name": "read_file", "arguments": ["path": fixture.contextA.fileURL.path], "_meta": meta
+                        ])
+                        let object = try Self.responseObject(from: response)
+                        let result = try XCTUnwrap(object["result"] as? [String: Any])
+                        XCTAssertNotEqual(result["isError"] as? Bool, true)
+                        try outputs.append(Self.toolResultText(response))
+                    }
+                    XCTAssertEqual(captured.count, 7)
+                    XCTAssertTrue(captured.prefix(4).allSatisfy { $0.claudeToolUseID == nil })
+                    XCTAssertEqual(captured[4].claudeToolUseID, "opaque-other-client")
+                    XCTAssertTrue(captured.prefix(6).allSatisfy { $0.codexCallID == nil })
+                    XCTAssertEqual(captured.last?.codexCallID, "opaque-other-client")
+                    XCTAssertEqual(Set(outputs).count, 1, "Missing/malformed candidate metadata is not admission or result policy")
+                    XCTAssertTrue(outputs[0].contains(fixture.contextA.sentinel))
+                    server.setBeforeDomainReadContextResolutionForTesting(nil)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    server.setBeforeDomainReadContextResolutionForTesting(nil)
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        /// W0(a): exercises the real network handler, wrapper active set, context UUID, observer
+        /// delivery and tracker FIFO. No self_noop registration or provider process is involved.
+        func testW0WrapperCleanupAndMailboxIdleDoNotFenceFutureObserverAndResponseDoesNotDrainMailbox() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease, domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+                let endpoint = try fixture.endpointA()
+                let manager = fixture.networkManager
+                let server = fixture.contextA.window.mcpServer
+                let tracker = AgentToolTrackingController()
+                let bodyGate = TestReleaseFence(name: "W0 body entered")
+                let outerGate = TestReleaseFence(name: "W0 wrapper cleaned, outer observer suspended")
+                let mailboxGate = TestReleaseFence(name: "W0 pending callback")
+                let runID = UUID()
+                var contextID: UUID?
+                var calledIDs: [UUID] = []
+                var completedIDs: [UUID] = []
+                var bodyEntries = 0
+                var responseReturned = false
+                var responseTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var flushTask: Task<Void, Never>?
+                var flushReturned = false
+                @MainActor
+                func cleanup() async throws {
+                    bodyGate.release()
+                    outerGate.release()
+                    mailboxGate.release()
+                    responseTask?.cancel()
+                    if let responseTask { _ = try? await responseTask.value }
+                    if let flushTask { await flushTask.value }
+                    server.setBeforeDomainReadContextResolutionForTesting(nil)
+                    await manager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                    await tracker.stopTracking()
+                    await manager.debugSetDomainPeerIdentityForTesting(connectionID: endpoint.connectionID, identity: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                }
+                do {
+                    try await Self.prepareCanonicalReadFixture(fixture, endpoint: endpoint, context: fixture.contextA)
+                    await manager.debugSeedConnectionRunRouting(connectionID: endpoint.connectionID, runID: runID, windowID: fixture.contextA.window.windowID)
+                    await tracker.startTracking(runID: runID, clientNameHint: nil, onCalled: { invocation, _, _ in
+                        calledIDs.append(invocation)
+                    }, onCompleted: { invocation, _, _, _, _ in
+                        completedIDs.append(invocation)
+                    })
+                    server.setBeforeDomainReadContextResolutionForTesting { packet in
+                        bodyEntries += 1
+                        contextID = packet.invocationID
+                        XCTAssertEqual(packet.metadata.invocationID, packet.invocationID)
+                        await bodyGate.enterAndWait()
+                    }
+                    await manager.debugSetBeforeToolCompletionObserversForTesting { connectionID, toolName in
+                        guard connectionID == endpoint.connectionID, toolName == MCPWindowToolName.readFile else { return }
+                        await outerGate.enterAndWait()
+                    }
+                    let task = Task {
+                        let response = try await endpoint.callTool(name: MCPWindowToolName.readFile, arguments: ["path": fixture.contextA.fileURL.path])
+                        responseReturned = true
+                        return response
+                    }
+                    responseTask = task
+                    guard await bodyGate.waitUntilEntered() else { throw CancellationError() }
+                    XCTAssertTrue(server.hasActiveToolExecutions(runID: runID))
+                    await tracker.waitForPendingEventDeliveries()
+                    XCTAssertEqual(calledIDs, try [XCTUnwrap(contextID)], "Host context, not JSON-RPC request ID, is the observer authority")
+                    XCTAssertEqual(bodyEntries, 1)
+                    bodyGate.release()
+                    guard await outerGate.waitUntilEntered() else { throw CancellationError() }
+                    XCTAssertFalse(server.hasActiveToolExecutions(runID: runID), "Wrapper cleanup really precedes the outer observer")
+                    await tracker.waitForPendingEventDeliveries()
+                    XCTAssertTrue(completedIDs.isEmpty, "An idle FIFO cannot cover a future observer callback")
+                    XCTAssertFalse(responseReturned, "Normal network response cannot overtake its completion observer")
+
+                    tracker.enqueueEventDeliveryBarrierForTesting { await mailboxGate.enterAndWait() }
+                    guard await mailboxGate.waitUntilEntered() else { throw CancellationError() }
+                    outerGate.release()
+                    _ = try await task.value
+                    responseTask = nil
+                    XCTAssertTrue(responseReturned)
+                    XCTAssertTrue(completedIDs.isEmpty, "Returning MCP result proves enqueue, not MainActor delivery")
+                    let flushStarted = expectation(description: "W0 flush started")
+                    let waiting = Task {
+                        flushStarted.fulfill()
+                        await tracker.waitForPendingEventDeliveries()
+                        flushReturned = true
+                    }
+                    flushTask = waiting
+                    await fulfillment(of: [flushStarted], timeout: 5)
+                    XCTAssertFalse(flushReturned)
+                    mailboxGate.release()
+                    await waiting.value
+                    flushTask = nil
+                    XCTAssertTrue(flushReturned)
+                    XCTAssertEqual(completedIDs, calledIDs)
+                    XCTAssertFalse(server.hasActiveToolExecutions(runID: runID))
+                    XCTAssertEqual(bodyEntries, 1)
+                    try await cleanup()
+                } catch {
+                    try? await cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testLifecycleDiagnosticsNormalReturnIdleEOFAndImmediateReconnect() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(

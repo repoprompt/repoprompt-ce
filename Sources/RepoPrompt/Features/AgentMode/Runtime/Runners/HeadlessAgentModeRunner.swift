@@ -22,7 +22,7 @@ final class HeadlessAgentModeRunner {
         session: AgentTabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         makeLease: (_ runID: UUID) -> MCPBootstrapLease,
         stopFence: AgentRunStartStopFence? = nil,
         localComposerCandidate: UUID? = nil
@@ -181,7 +181,7 @@ final class HeadlessAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID,
         ownership: AgentRunOwnership,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         attachmentReservationID: UUID?,
         lease: MCPBootstrapLease,
         localComposerCandidate: UUID?

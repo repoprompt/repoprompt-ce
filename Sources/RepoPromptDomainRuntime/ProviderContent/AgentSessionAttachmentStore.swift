@@ -33,11 +33,11 @@ package struct AgentSessionAttachmentStore {
 
     package struct RetentionResult: Equatable {
         /// Rewritten attachments keyed by attachment ID; the source points at the kept copy.
-        package var retained: [UUID: AgentImageAttachment]
+        package var retained: [UUID: AgentFileAttachment]
         /// Kept files removed to bring the session folder back under its cap.
         package var evictedPaths: [String]
 
-        package init(retained: [UUID: AgentImageAttachment], evictedPaths: [String]) {
+        package init(retained: [UUID: AgentFileAttachment], evictedPaths: [String]) {
             self.retained = retained
             self.evictedPaths = evictedPaths
         }
@@ -115,19 +115,22 @@ package struct AgentSessionAttachmentStore {
 
     /// Rewrites local attachments whose file no longer exists to their kept copy in this session's
     /// folder, when one exists. Attachments that still resolve, or have no kept copy, are omitted.
-    package func repairMissingPaths(_ attachments: [AgentImageAttachment], sessionID: UUID) -> [UUID: AgentImageAttachment] {
-        var repaired: [UUID: AgentImageAttachment] = [:]
+    package func repairMissingPaths(_ attachments: [AgentFileAttachment], sessionID: UUID) -> [UUID: AgentFileAttachment] {
+        var repaired: [UUID: AgentFileAttachment] = [:]
         for attachment in attachments where repaired[attachment.id] == nil {
             guard case let .localFile(path) = attachment.source,
                   !FileManager.default.fileExists(atPath: path),
                   let kept = locateRetainedFile(attachmentID: attachment.id, sessionID: sessionID),
                   kept.path != URL(fileURLWithPath: path).standardizedFileURL.path
             else { continue }
-            repaired[attachment.id] = AgentImageAttachment(
+            repaired[attachment.id] = AgentFileAttachment(
                 id: attachment.id,
                 source: .localFile(path: kept.path),
                 title: attachment.title,
-                createdAt: attachment.createdAt
+                createdAt: attachment.createdAt,
+                kind: attachment.kind,
+                fileName: attachment.fileName,
+                byteCount: attachment.byteCount
             )
         }
         return repaired
@@ -138,11 +141,11 @@ package struct AgentSessionAttachmentStore {
     /// A missing image, storage limit, or cancellation fails the whole copy instead of silently
     /// publishing transcript rows that depend on the parent or on already-consumed temporary files.
     package func copyForHandoff(
-        _ attachments: [AgentImageAttachment],
+        _ attachments: [AgentFileAttachment],
         sourceSessionID: UUID?,
         destinationSessionID: UUID,
         temporaryRoot: URL?
-    ) throws -> [UUID: AgentImageAttachment] {
+    ) throws -> [UUID: AgentFileAttachment] {
         let local = attachments.filter {
             if case .localFile = $0.source { true } else { false }
         }
@@ -158,8 +161,8 @@ package struct AgentSessionAttachmentStore {
         let staging = rootURL.appendingPathComponent(".handoff-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: staging) }
-        var copied: [UUID: AgentImageAttachment] = [:]
-        var sourcesByID: [UUID: AgentImageSource] = [:]
+        var copied: [UUID: AgentFileAttachment] = [:]
+        var sourcesByID: [UUID: AgentAttachmentSource] = [:]
         var totalBytes: Int64 = 0
         for attachment in local {
             try Task.checkCancellation()
@@ -188,11 +191,14 @@ package struct AgentSessionAttachmentStore {
                 throw HandoffCopyError.sessionLimitExceeded
             }
             totalBytes += size
-            copied[attachment.id] = AgentImageAttachment(
+            copied[attachment.id] = AgentFileAttachment(
                 id: attachment.id,
                 source: .localFile(path: destinationFolder.appendingPathComponent(stagedFile.lastPathComponent).path),
                 title: attachment.title,
-                createdAt: attachment.createdAt
+                createdAt: attachment.createdAt,
+                kind: attachment.kind,
+                fileName: attachment.fileName,
+                byteCount: attachment.byteCount
             )
         }
         try Task.checkCancellation()
@@ -207,7 +213,7 @@ package struct AgentSessionAttachmentStore {
         return copied
     }
 
-    private func handoffSource(for attachment: AgentImageAttachment, sessionID: UUID?, temporaryRoot: URL?) throws -> URL {
+    private func handoffSource(for attachment: AgentFileAttachment, sessionID: UUID?, temporaryRoot: URL?) throws -> URL {
         guard case let .localFile(path) = attachment.source else {
             throw HandoffCopyError.sourceUnavailable(attachment.id)
         }
@@ -233,7 +239,7 @@ package struct AgentSessionAttachmentStore {
     /// Only files directly inside `temporaryRoot` are touched, so a user's original file is never
     /// moved. Attachments whose temporary copy is already gone are skipped and keep their path.
     package func retain(
-        _ attachments: [AgentImageAttachment],
+        _ attachments: [AgentFileAttachment],
         sessionID: UUID,
         temporaryRoot: URL,
         now: Date = Date()
@@ -241,7 +247,7 @@ package struct AgentSessionAttachmentStore {
         let fileManager = FileManager.default
         let temporaryPrefix = temporaryRoot.standardizedFileURL.path + "/"
         let folder = sessionFolderURL(sessionID: sessionID)
-        var retained: [UUID: AgentImageAttachment] = [:]
+        var retained: [UUID: AgentFileAttachment] = [:]
         var folderReady = false
         guard !isSymbolicLink(folder) else {
             return RetentionResult(retained: [:], evictedPaths: [])
@@ -262,14 +268,17 @@ package struct AgentSessionAttachmentStore {
                 }
                 folderReady = true
             }
-            guard let destination = placeFile(source, attachmentID: attachment.id, in: folder) else { continue }
+            guard let destination = placeFile(source, attachmentID: attachment.id, isImage: attachment.kind == .image, in: folder) else { continue }
             // Order eviction by retention time, not by the original file's preserved timestamp.
             try? fileManager.setAttributes([.modificationDate: now], ofItemAtPath: destination.path)
-            retained[attachment.id] = AgentImageAttachment(
+            retained[attachment.id] = AgentFileAttachment(
                 id: attachment.id,
                 source: .localFile(path: destination.path),
                 title: attachment.title,
-                createdAt: attachment.createdAt
+                createdAt: attachment.createdAt,
+                kind: attachment.kind,
+                fileName: attachment.fileName,
+                byteCount: attachment.byteCount
             )
         }
 
@@ -410,10 +419,10 @@ package struct AgentSessionAttachmentStore {
         return resolved.hasPrefix(prefix) && !resolved.dropFirst(prefix.count).contains("/")
     }
 
-    private func placeFile(_ source: URL, attachmentID: UUID, in folder: URL) -> URL? {
+    private func placeFile(_ source: URL, attachmentID: UUID, isImage: Bool, in folder: URL) -> URL? {
         let fileManager = FileManager.default
         let size = ((try? fileManager.attributesOfItem(atPath: source.path))?[.size] as? NSNumber)?.int64Value ?? 0
-        if size > limits.maxRetainedImageBytes,
+        if isImage, size > limits.maxRetainedImageBytes,
            let downscaled = writeDownscaledCopy(of: source, attachmentID: attachmentID, in: folder)
         {
             try? fileManager.removeItem(at: source)

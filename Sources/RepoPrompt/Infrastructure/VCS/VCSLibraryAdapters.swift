@@ -58,13 +58,14 @@ extension GitDiffSnapshotPublisher {
 }
 
 /// The app translates its existing workspace-root projection at the module boundary.
-/// Repository/worktree authorization remains implemented once, in RepoPromptVCS.
+/// Repository/worktree authorization remains implemented once, in RepoPromptVCS. A nil default
+/// selects the optional-default entry points, which throw `DefaultRepositoryRequired` for relative selectors.
 extension GitRepoTargetResolver {
     func resolveRepoRoots(
         explicitRootTokens: [String]?,
         allRepos: [GitRepoDescriptor],
         visibleRoots: [WorkspaceRootRef],
-        defaultRepo: GitRepoDescriptor
+        defaultRepo: GitRepoDescriptor?
     ) async throws -> [GitRepoDescriptor] {
         try await resolveRepoRoots(
             explicitRootTokens: explicitRootTokens,
@@ -78,7 +79,7 @@ extension GitRepoTargetResolver {
         _ token: String,
         allRepos: [GitRepoDescriptor],
         visibleRoots: [WorkspaceRootRef],
-        defaultRepo: GitRepoDescriptor
+        defaultRepo: GitRepoDescriptor?
     ) async throws -> GitRepoDescriptor {
         try await resolveRepoRootToken(
             token,
@@ -90,7 +91,7 @@ extension GitRepoTargetResolver {
 
     func resolveWorktree(
         selector: String?,
-        repo: GitRepoDescriptor,
+        repo: GitRepoDescriptor?,
         allRepos: [GitRepoDescriptor],
         authorizedRoots: [WorkspaceRootRef]?
     ) async throws -> GitWorktreeDescriptor {

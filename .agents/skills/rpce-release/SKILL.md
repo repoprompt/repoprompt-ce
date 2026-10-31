@@ -37,6 +37,9 @@ local self-signed packages remain host-native.
 ## Maintainer publish
 
 Read [`docs/releasing.md`](../../../docs/releasing.md) before publishing.
+Record the separately authorized [Computer Use release validation](../../../docs/releasing.md#computer-use-release-validation)
+check or explicitly mark it **not run**; debug success does not establish release
+companion compatibility.
 
 Use the environment-scoped GitHub **Publish Release** workflow for production
 draft creation. It requires an existing pushed tag and the `release`

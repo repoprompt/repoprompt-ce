@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptInstrumentation
 import XCTest
 
 final class StartupPhaseLogTests: XCTestCase {
@@ -69,6 +70,30 @@ final class StartupPhaseLogTests: XCTestCase {
             recorder.emissions.last,
             "phase=windowComposition boundary=end window=2 elapsed_ms=26000 span_ms=750 entries=42 loaded=40"
         )
+    }
+
+    func testRestoreRecorderPreservesStartupLevelsAndAttemptFields() {
+        let normal = Recorder(ticks: [125])
+        let debug = Recorder(ticks: [125])
+        StartupPhaseLog.installForTesting(.init(
+            uptime: { normal.uptime() }, processStartUptime: 100,
+            emit: { normal.emit($0) }, debugEmit: { debug.emit($0) }
+        ))
+        let adapter: any WorkspaceRestorePerfRecording = AppWorkspaceRestorePerfRecorder()
+        adapter.startupPhase(.oversightLaunchSeed, fields: ["entries": 2, "appended": 2])
+        adapter.startupPhase(.oversightDiscoveryCompletion, debug: true, window: 3, fields: ["epoch": 2, "completed": 1])
+        let observer = UUID()
+        let target = UUID()
+        adapter.oversightRestoreAttempt(observer: observer, target: target, outcome: .terminal, reason: "missing")
+        adapter.oversightRestoreAttempt(observer: observer, target: target, outcome: .restored)
+        XCTAssertEqual(normal.emissions, [
+            "phase=oversightLaunchSeed boundary=event elapsed_ms=25000 appended=2 entries=2",
+            "phase=oversightRestoreAttempt boundary=event elapsed_ms=25000 observer=\(observer.uuidString) target=\(target.uuidString) outcome=terminal reason=missing",
+            "phase=oversightRestoreAttempt boundary=event elapsed_ms=25000 observer=\(observer.uuidString) target=\(target.uuidString) outcome=restored"
+        ])
+        XCTAssertEqual(debug.emissions, [
+            "phase=oversightDiscoveryCompletion boundary=event window=3 elapsed_ms=25000 completed=1 epoch=2"
+        ])
     }
 
     /// A regressed or imprecise start anchor must never emit negative timings.

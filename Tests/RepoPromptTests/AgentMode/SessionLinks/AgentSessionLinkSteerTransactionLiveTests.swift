@@ -247,6 +247,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         let workflow = stageComposerState(fixture)
         fixture.session.runState = .waitingForUser
         fixture.session.installRunID(UUID())
+        _ = fixture.session.beginRunAttempt(source: "waiting-steer-test")
         fixture.session.instructionWaitID = UUID()
         let session = fixture.session
         let resumed = Task { @MainActor in
@@ -280,6 +281,7 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         let session = fixture.session
         session.runState = .waitingForUser
         session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "waiting-noncomposer-test")
         session.instructionWaitID = UUID()
         let resumed = Task { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
@@ -313,6 +315,60 @@ final class AgentSessionLinkSteerTransactionLiveTests: XCTestCase {
         XCTAssertNil(row.workflow, "the composer workflow remains the local user's")
         XCTAssertNil(session.mcpControlContext)
         assertComposerUntouched(fixture, workflow: workflow)
+    }
+
+    func testDelayedLocalAndManagedWaitingPreparationCannotCrossSealOrOwnerReplacement() async throws {
+        for managed in [false, true] {
+            for replaceOwner in [false, true] {
+                let fixture = try makeFixture()
+                let session = fixture.session
+                session.installRunID(UUID())
+                let owner = session.beginRunAttempt(source: "waiting-quiet-race")
+                session.quietLedger.markRoutineWake(owner: owner, wakeID: UUID())
+                session.runState = .waitingForUser
+                session.instructionWaitID = UUID()
+                let resumed = Task { @MainActor in
+                    try await withCheckedThrowingContinuation { continuation in session.instructionContinuation = continuation }
+                }
+                try await AsyncTestWait.waitUntil("waiting continuation") {
+                    await MainActor.run { session.instructionContinuation != nil }
+                }
+                let ticket = session.codexDispatchSerialGate.issueTicket()
+                let admitted = await session.codexDispatchSerialGate.awaitTurn(ticket)
+                XCTAssertTrue(admitted)
+                let sink = AgentSessionLinkManagedSteerSink()
+                if managed {
+                    XCTAssertTrue(fixture.viewModel.submitNoncomposerSteer(
+                        tabID: fixture.tabID, session: session, displayText: "accepted task",
+                        turn: AgentNoncomposerTurn(endpoint: fixture.candidate.domainEndpoint, providerText: "accepted task", sink: sink),
+                        route: .waitingInstruction
+                    ))
+                } else {
+                    XCTAssertEqual(fixture.viewModel.submitUserTurn(text: "accepted task", tabID: fixture.tabID), .submitted)
+                }
+                XCTAssertNil(session.quietLedger.candidateStartKey(owner: owner), "Acceptance precedes serial/augmentation waits")
+                XCTAssertTrue(session.items.contains { $0.kind == .user })
+                if replaceOwner {
+                    _ = session.beginRunAttempt(source: "replacement-owner")
+                } else {
+                    session.sealQuietCheckIn(owner: owner, terminalState: .completed, normal: true, hasSuccessor: false)
+                }
+                session.codexDispatchSerialGate.finish(ticket)
+                try await AsyncTestWait.waitUntil("stale prepared row rollback") {
+                    await MainActor.run { !session.items.contains { $0.kind == .user } }
+                }
+                XCTAssertNotNil(session.instructionContinuation, "Old prepared input did not resume even the same wait/controller")
+                if managed { _ = await sink.awaitOutcome(timeoutSeconds: 1) }
+                session.instructionContinuation?.resume(throwing: CancellationError())
+                session.instructionContinuation = nil
+                _ = try? await resumed.value
+                XCTAssertEqual(session.quietLedger.facts?.ordinaryThrough, 1)
+                if replaceOwner {
+                    let successor = try XCTUnwrap(session.activeRunOwnership)
+                    XCTAssertTrue(session.quietLedger.isOpen(owner: successor))
+                }
+            }
+        }
     }
 
     func testResidentCountsUseExactExistingBoardAndRefuseUnsettledMembership() throws {

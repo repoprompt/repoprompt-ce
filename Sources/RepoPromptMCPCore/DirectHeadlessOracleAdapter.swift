@@ -26,7 +26,7 @@ actor DirectHeadlessOracleAdapter {
         case singleLaneBypassRequired
         case appOnlyOraclePreset
         case unsupportedProviderOverride
-        case unsupportedImageAttachments
+        case unsupportedAttachments
         case unknownChatID
         case rosterConflict
         case missingPreparedInvocation
@@ -66,8 +66,8 @@ actor DirectHeadlessOracleAdapter {
                 "oracle_preset is available only through the app-backed Context Builder."
             case .unsupportedProviderOverride:
                 "Direct Oracle provider overrides are unsupported; select a model or start a new chat."
-            case .unsupportedImageAttachments:
-                "Oracle `images` require the app backend; the direct headless backend cannot attach images."
+            case .unsupportedAttachments:
+                OracleAttachmentContract.headlessUnsupportedMessage()
             case .unknownChatID:
                 "Unknown Oracle chat_id. Start a new chat with ask_oracle and new_chat=true."
             case .rosterConflict:
@@ -245,7 +245,10 @@ actor DirectHeadlessOracleAdapter {
             try Self.validateContextBuilderArguments(arguments)
         }
         if arguments["provider"] != nil { throw AdapterError.unsupportedProviderOverride }
-        if arguments["images"] != nil { throw AdapterError.unsupportedImageAttachments }
+        // v1.6.0's headless backend rejected `images` too, so the alias stays unsupported here.
+        if OracleAttachmentContract.redactedArgumentKeys.contains(where: { arguments[$0] != nil }) {
+            throw AdapterError.unsupportedAttachments
+        }
         let route: OracleConversationRoute
         let input: OracleInput
         let resolvedStartRoster: OracleRoster?

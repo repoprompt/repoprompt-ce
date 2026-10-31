@@ -163,9 +163,27 @@ actor GitService {
 
     struct GitError: LocalizedError {
         let message: String
+        /// Set only by worktree creation, where the evidence is: its preflight or Git's own `worktree add` stderr.
+        /// Callers classify from this, never by searching a message that also carries refs and paths.
+        var worktreeCreateFailure: WorktreeCreateFailure?
         var errorDescription: String? {
             GitService.friendlyErrorDescription(for: message)
         }
+
+        /// The same failure, also naming the workspace root that `checkout` serves.
+        func naming(workspaceRoot: String, servedBy checkout: String) -> GitError {
+            GitError(
+                message: "\(message) Workspace root \(workspaceRoot) is served by checkout \(checkout).",
+                worktreeCreateFailure: worktreeCreateFailure
+            )
+        }
+    }
+
+    struct WorktreeCreateFailure: Equatable {
+        /// Refused under the mutation lock before any creation side effect or commit fence: nothing was created.
+        let refusedBeforeCreation: Bool
+        /// The requested branch already exists, by the preflight check or by Git's own report.
+        let branchExists: Bool
     }
 
     struct ResolvedWorktreeRecord: Equatable {
@@ -1014,7 +1032,9 @@ actor GitService {
                         try await runGit(args, at: repoURL)
                     }
                     guard exitCode == 0 else {
-                        throw GitError(message: "git worktree add failed: \(stderr)")
+                        throw Self.worktreeAddFailure(
+                            stderr: stderr, exitCode: exitCode, request: mutationRequest, repoURL: repoURL
+                        )
                     }
                     let checkoutReport: GitWorktreeCheckoutReport
                     switch trackedCloneDecision {
@@ -2170,9 +2190,12 @@ actor GitService {
                 at: repoURL
             )
             if exitCode == 0 {
-                throw GitError(message: Self.worktreeCreateRefusal(
-                    "a branch named '\(branch)' already exists; choose a new branch name, or bind the worktree that has it checked out"
-                ))
+                throw Self.worktreeCreateRefusal(
+                    "a branch named '\(branch)' already exists; choose a new branch name, or bind the worktree that has it checked out",
+                    branchExists: true,
+                    request: request,
+                    repoURL: repoURL
+                )
             }
         }
         // Without `-b`/`--detach`, Git may DWIM a remote-tracking branch name; leave that to Git.
@@ -2190,7 +2213,11 @@ actor GitService {
                 resolves = exitCode == 0
             }
             guard resolves else {
-                throw GitError(message: Self.worktreeCreateRefusal("base ref '\(baseRef)' does not resolve to a commit"))
+                throw Self.worktreeCreateRefusal(
+                    "base ref '\(baseRef)' does not resolve to a commit",
+                    request: request,
+                    repoURL: repoURL
+                )
             }
         }
         // Git accepts an existing empty directory; anything else at the destination is refused.
@@ -2200,13 +2227,55 @@ actor GitService {
             let isEmptyDirectory = isDirectory
                 && ((try? FileManager.default.contentsOfDirectory(atPath: destinationPath).isEmpty) ?? false)
             guard isEmptyDirectory else {
-                throw GitError(message: Self.worktreeCreateRefusal("destination path is occupied: \(destinationPath)"))
+                throw Self.worktreeCreateRefusal(
+                    "destination path is occupied",
+                    request: request,
+                    repoURL: repoURL
+                )
             }
         }
     }
 
-    private static func worktreeCreateRefusal(_ detail: String) -> String {
-        "git worktree add refused before creation: \(detail). Nothing was created."
+    /// A refusal proven before any creation side effect, naming the repository Git would run in and the request.
+    private static func worktreeCreateRefusal(
+        _ detail: String,
+        branchExists: Bool = false,
+        request: GitWorktreeCreateRequest,
+        repoURL: URL
+    ) -> GitError {
+        GitError(
+            message: "git worktree add refused before creation in repository \(repoURL.standardizedFileURL.path): \(detail). \(worktreeCreateRequestDescription(request)). Nothing was created.",
+            worktreeCreateFailure: WorktreeCreateFailure(refusedBeforeCreation: true, branchExists: branchExists)
+        )
+    }
+
+    /// Git's own `worktree add` failure, past the commit fence: it makes no claim about what was created.
+    private static func worktreeAddFailure(
+        stderr: String,
+        exitCode: Int32,
+        request: GitWorktreeCreateRequest,
+        repoURL: URL
+    ) -> GitError {
+        let reason = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Git's own report, matched on its stderr rather than on the message below.
+        let branchExists = request.branch.map { !$0.isEmpty && stderr.contains("a branch named '\($0)' already exists") } ?? false
+        return GitError(
+            message: "git worktree add failed in repository \(repoURL.standardizedFileURL.path): \(reason.isEmpty ? "git exited with status \(exitCode)" : reason). \(worktreeCreateRequestDescription(request)).",
+            worktreeCreateFailure: WorktreeCreateFailure(refusedBeforeCreation: false, branchExists: branchExists)
+        )
+    }
+
+    /// The requested branch, base ref, and destination. An omitted base ref is Git's default rather than a claim
+    /// about HEAD; a lone "-" keeps the caller's spelling.
+    private static func worktreeCreateRequestDescription(_ request: GitWorktreeCreateRequest) -> String {
+        let branch = request.branch.flatMap { $0.isEmpty ? nil : "branch '\($0)'" }
+            ?? (request.detach ? "branch omitted (detached)" : "branch omitted")
+        let baseRef = switch request.baseRef {
+        case nil, ""?: "base ref (omitted; Git default)"
+        case "-"?: "base ref '-' (@{-1}, the previously checked-out branch)"
+        case let baseRef?: "base ref '\(baseRef)'"
+        }
+        return "Request: \(branch), \(baseRef), destination \(request.path.standardizedFileURL.path)"
     }
 
     private static func canonicalizedAppManagedRequestAtMutationBoundary(
@@ -2751,7 +2820,9 @@ actor GitService {
             at: repoURL
         )
         guard exitCode == 0 else {
-            throw GitError(message: "git rev-parse HEAD failed: \(stderr)")
+            throw GitError(
+                message: "git rev-parse failed in repository \(repoURL.standardizedFileURL.path) for requested HEAD: \(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
         }
         return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -2764,7 +2835,9 @@ actor GitService {
             at: repoURL
         )
         guard exitCode == 0 else {
-            throw GitError(message: "git rev-parse \(ref) failed: \(stderr)")
+            throw GitError(
+                message: "git rev-parse failed in repository \(repoURL.standardizedFileURL.path) for requested ref '\(ref)': \(stderr.trimmingCharacters(in: .whitespacesAndNewlines))"
+            )
         }
         return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }

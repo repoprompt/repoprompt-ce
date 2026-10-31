@@ -15,6 +15,37 @@ import SwiftUI
 enum KeyboardShortcutCatalog {
     static let sections: [KeyboardShortcutCatalogSection] = [
         KeyboardShortcutCatalogSection(
+            id: "application",
+            title: "Application",
+            blurb: "Clear or change New Workspace Window to free ⌘N for New Agent chat or New Agent session tab.",
+            bindings: [
+                .init(id: "new-window", title: "New workspace window", detail: nil, name: .newWorkspaceWindow),
+                .init(id: "settings", title: "Settings", detail: nil, name: .showAppSettings),
+                .init(id: "close-window", title: "Close window", detail: nil, name: .closeAppWindow),
+                .init(id: "updates", title: "Check for updates / install available update", detail: nil, name: .checkForUpdates)
+            ]
+        ),
+        KeyboardShortcutCatalogSection(
+            id: "current-session",
+            title: "Current Agent session",
+            blurb: "Apply to the current session, just like its titlebar menu. Delete is unassigned by default and always asks for confirmation.",
+            bindings: [
+                .init(
+                    id: "session-stop",
+                    title: "Stop current run",
+                    detail: "Same as the composer Stop button. With nothing to stop, ⌘. keeps its usual cancel behavior.",
+                    name: .stopAgentRun
+                ),
+                .init(id: "session-focus-composer", title: "Focus message composer", detail: nil, name: .focusAgentComposer),
+                .init(id: "session-pin", title: "Pin / unpin session", detail: nil, name: .pinAgentSession),
+                .init(id: "session-rename", title: "Rename session", detail: nil, name: .renameAgentSession),
+                .init(id: "session-stash", title: "Stash session", detail: nil, name: .stashAgentSession),
+                .init(id: "session-handoff", title: "Copy handoff prompt", detail: nil, name: .handoffAgentSession),
+                .init(id: "session-copy-id", title: "Copy session ID", detail: nil, name: .copyAgentSessionID),
+                .init(id: "session-delete", title: "Delete session…", detail: nil, name: .deleteAgentSession)
+            ]
+        ),
+        KeyboardShortcutCatalogSection(
             id: "agent-layout",
             title: "Agent & layout",
             blurb: "Agent shortcuts apply when a real workspace is open. New chat matches the titlebar New Session button.",
@@ -28,7 +59,33 @@ enum KeyboardShortcutCatalog {
                     name: .toggleContextComposer
                 ),
                 .init(id: "agent-nav-current", title: "Show Agent Session Switcher", detail: "Jump between Agent sessions in the focused window.", name: .showCurrentWindowAgentNavigationHUD),
-                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD)
+                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD),
+                .init(
+                    id: "agent-next-attention",
+                    title: "Next session needing attention",
+                    detail: "Cycle through sessions with an unseen completed, failed, or waiting badge in this window.",
+                    name: .nextAttentionAgentSession
+                ),
+                .init(
+                    id: "agent-reopen-stashed",
+                    title: "Reopen last stashed session",
+                    detail: "Restore the most recently stashed session, including one closed with ⌘W.",
+                    name: .reopenStashedAgentSession
+                )
+            ]
+        ),
+        KeyboardShortcutCatalogSection(
+            id: "composer",
+            title: "Composer",
+            blurb: "Not global: Re-prompt works while the message composer has focus, and Send original only while a Re-prompt is shown. A matching shortcut elsewhere in this list wins.",
+            bindings: [
+                .init(id: "composer-reprompt", title: "Re-prompt draft again", detail: nil, name: .repromptDraft),
+                .init(
+                    id: "composer-send-original",
+                    title: "Send original (during Re-prompt)",
+                    detail: "Sends your original text instead of the rewrite.",
+                    name: .repromptSendOriginal
+                )
             ]
         ),
         KeyboardShortcutCatalogSection(
@@ -49,10 +106,16 @@ enum KeyboardShortcutCatalog {
             blurb: "Adjust prompt and transcript text size globally.",
             bindings: [
                 .init(id: "font-up", title: "Increase font size", detail: nil, name: .increaseFontScale),
-                .init(id: "font-down", title: "Decrease font size", detail: nil, name: .decreaseFontScale)
+                .init(id: "font-down", title: "Decrease font size", detail: nil, name: .decreaseFontScale),
+                .init(id: "font-reset", title: "Reset font size", detail: nil, name: .resetFontScale)
             ]
         )
     ]
+
+    /// Commands that stay registered outside main windows (Settings frontmost, no window open).
+    static var applicationNames: [KeyboardShortcuts.Name] {
+        sections.first { $0.id == "application" }?.bindings.map(\.name) ?? []
+    }
 
     private static var workspaceAndPresetBindings: [KeyboardShortcutCatalogBinding] {
         var rows: [KeyboardShortcutCatalogBinding] = [
@@ -143,7 +206,7 @@ struct KeyboardShortcutsSettingsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 SettingSection(
                     title: "Keyboard Shortcuts",
-                    description: "Customize global hotkeys. Bindings are stored per-app; conflicts with the menu bar or other apps may prevent shortcuts from firing."
+                    description: "Customize shortcuts used while RepoPrompt is active. Clear a binding before assigning its keys to another action. Session and workspace actions require a focused main window; standard text editing and dialog keys remain native."
                 ) {
                     SettingToggle(
                         title: "Enable keyboard shortcuts",

@@ -23,7 +23,7 @@ final class ProviderContentTests: XCTestCase {
     }
 
     func testImagesAttachOnlyToFinalUserAndSupportImageOnlyTurns() throws {
-        let image = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: " Diagram ")
+        let image = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: " Diagram ")
         let message = AIMessage(
             systemPrompt: "System",
             conversationMessages: [
@@ -31,7 +31,7 @@ final class ProviderContentTests: XCTestCase {
                 ConversationEntry(role: .assistant, content: "Answer"),
                 ConversationEntry(role: .user, content: "Inspect")
             ],
-            transientImages: [image],
+            attachments: [image],
             temperature: nil,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: []
@@ -46,13 +46,13 @@ final class ProviderContentTests: XCTestCase {
         XCTAssertEqual(imageURL, ["url": "data:image/png;base64,AQID", "detail": "auto"])
 
         let imageOnly = AIMessage(
-            systemPrompt: "", transientImages: [image], temperature: nil,
+            systemPrompt: "", attachments: [image], temperature: nil,
             promptSectionsOrder: [], disabledPromptSections: []
         )
         let imageOnlyMessages = try encodedMessages(imageOnly)
         XCTAssertEqual(imageOnlyMessages.count, 1)
         XCTAssertEqual(imageOnlyMessages.first?["role"] as? String, "user")
-        let acp = try ACPPromptContentBuilder.blocks(text: "", attachments: [], transientImages: [image])
+        let acp = try ACPPromptContentBuilder.blocks(text: "", attachments: [], oracleAttachments: [image])
         XCTAssertEqual(acp.count, 2)
         XCTAssertEqual(acp[1]["type"] as? String, "image")
         XCTAssertEqual(acp[1]["mimeType"] as? String, "image/png")
@@ -128,8 +128,8 @@ final class ProviderContentTests: XCTestCase {
         // Walk to / from the existing CWD without mutating process-wide CWD.
         let cwdDepth = FileManager.default.currentDirectoryPath.split(separator: "/").count
         let relative = String(repeating: "../", count: cwdDepth) + String(target.path.dropFirst())
-        let attachment = AgentImageAttachment(source: .localFile(path: relative), title: "legacy.png")
-        let decoded = try JSONDecoder().decode(AgentImageAttachment.self, from: JSONEncoder().encode(attachment))
+        let attachment = AgentFileAttachment(source: .localFile(path: relative), title: "legacy.png")
+        let decoded = try JSONDecoder().decode(AgentFileAttachment.self, from: JSONEncoder().encode(attachment))
         XCTAssertEqual(decoded.source, .localFile(path: relative))
         let block = try XCTUnwrap(ACPPromptContentBuilder.blocks(text: "", attachments: [decoded]).first)
         XCTAssertEqual(block["data"] as? String, expected.base64EncodedString())
@@ -162,7 +162,7 @@ final class ProviderContentTests: XCTestCase {
         try Data([91, 92]).write(to: decoy)
         for path in ["", decoy.path + " ", decoy.path + "\0ignored"] {
             XCTAssertThrowsError(try localImageBlock(path: path)) { error in
-                XCTAssertEqual(error as? ACPPromptContentBuilder.Error, .unreadableLocalImage(path))
+                XCTAssertEqual(error as? ACPPromptContentBuilder.Error, .unreadableLocalAttachment(path))
             }
         }
     }
@@ -174,7 +174,7 @@ final class ProviderContentTests: XCTestCase {
     }
 
     private func localImageBlock(path: String, title: String? = nil) throws -> [String: Any] {
-        let attachment = AgentImageAttachment(source: .localFile(path: path), title: title)
+        let attachment = AgentFileAttachment(source: .localFile(path: path), title: title)
         let blocks = try ACPPromptContentBuilder.blocks(text: "", attachments: [attachment])
         return try XCTUnwrap(blocks.first)
     }

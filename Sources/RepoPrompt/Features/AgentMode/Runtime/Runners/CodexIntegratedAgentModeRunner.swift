@@ -20,7 +20,7 @@ final class CodexIntegratedAgentModeRunner {
         tabID: UUID,
         session: AgentTabSession,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         fallbackContext: AgentTabSession.CodexFallbackSubmissionContext?,
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         selfCompactDispatchID: AgentSelfCompactionDispatchID? = nil,

@@ -3185,8 +3185,11 @@ class WorkspaceManagerViewModel: ObservableObject {
                 #if DEBUG
                     try await gate(.beforeUnload)
                 #endif
-                await files.unloadRootFolderPath(root.standardizedFullPath)
+                // Pin the observed lifetime: a shell-less actor root still unloads, and a
+                // same-path replacement is left alone and reported as a stale invocation.
+                let unload = await files.unloadRootFolder(root, kind: .primaryWorkspace)
                 _ = try dependencies()
+                if unload == .superseded { throw failure(.staleInvocation) }
             }
             let loaded = Set(observation.requestedRoots.map(\.standardizedFullPath))
             let shells = Set(files.visibleRootShellProjections.map(\.fullPath))
@@ -8553,6 +8556,13 @@ class WorkspaceManagerViewModel: ObservableObject {
         Self.logger.error("Domain workspace authority \(operation, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
     }
 
+    func reportWindowRestoreFailure(_ error: Error, workspaceID: UUID?) {
+        guard !isPreparingForWindowClose else { return }
+        reportDomainAuthorityFailure(error, workspaceID: workspaceID, operation: "window_restore")
+        guard !isPreparingForWindowClose else { return }
+        pendingWorkspaceSwitchBlockedNotice = WorkspaceSwitchBlockedNotice(message: error.localizedDescription)
+    }
+
     func refreshDomainWorkspaceAuthority() async {
         guard let domainWorkspaceAuthorityClient else { return }
         let snapshot = await domainWorkspaceAuthorityClient.reloadExternalChanges()
@@ -9000,6 +9010,26 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// reconciliation clears it, so metadata/self-echo cannot certify unresolved retained state.
     private(set) var requiresFullCatalogReconciliation = false
 
+    /// Initialization can finish after only the System Default point read. Restoring a saved
+    /// identity needs accepted catalog membership, never the constructor's legacy disk index.
+    /// Legacy managers have no separate authority catalog to await.
+    var hasAcceptedDomainCatalogForRestoration: Bool {
+        domainWorkspaceAuthorityClient == nil
+            || (domainCatalogReconciliationGeneration > 0 && !requiresFullCatalogReconciliation)
+    }
+
+    /// Retained unavailable rows and consolidated recovery copies are not restore targets.
+    /// Authority-backed System workspaces need the same accepted membership as other saved IDs.
+    func isWorkspaceAvailableForWindowRestoration(_ workspaceID: UUID) -> Bool {
+        guard let workspace = workspace(withID: workspaceID), !workspace.isEphemeral,
+              workspace.consolidatedIntoWorkspaceID == nil,
+              !pendingConsolidatedRestoreIDs.contains(workspaceID)
+        else { return false }
+        guard domainWorkspaceAuthorityClient != nil else { return true }
+        guard hasAcceptedDomainCatalogForRestoration, let membership = acceptedCatalogMembership else { return false }
+        return membership.available.contains(workspaceID) && !membership.unavailable.contains(workspaceID)
+    }
+
     /// The only production boundary that may establish accepted catalog membership. Validates the
     /// whole catalog before reconciling decoded models and last-known unavailable members.
     @discardableResult
@@ -9235,8 +9265,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         return model
     }
 
-    /// Captured before CPU preparation suspends. Even an equal-value setter or a point adoption
-    /// can invalidate local-edit provenance without advancing the catalog publication floor.
+    /// Local provenance observed across CPU preparation. Even an equal-value setter or a point
+    /// adoption can require a new cache reuse plan without invalidating decoded canonical bytes.
     struct CatalogPreparationWitness: Equatable {
         let publicationSerial: UInt64
         let reconciliationGeneration: UInt64

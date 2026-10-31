@@ -10,9 +10,9 @@ final class CodexCLIProvider: AIProvider {
     }
 
     /// Codex's app server only accepts image file paths, so request-scoped images are staged.
-    private static func stageImages(_ images: [AITransientImage]) async throws -> OracleTransientImageStaging? {
+    private static func stageImages(_ planned: [PlannedAttachment]) async throws -> OracleTransientImageStaging? {
         do {
-            return try await OracleTransientImageStaging.stage(images)
+            return try await OracleTransientImageStaging.stage(planned, route: .codexAppServer)
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -22,8 +22,8 @@ final class CodexCLIProvider: AIProvider {
         }
     }
 
-    private static func attachments(for staging: OracleTransientImageStaging?) -> [AgentImageAttachment] {
-        staging?.files.map { AgentImageAttachment(source: .localFile(path: $0.path), title: $0.title) } ?? []
+    private static func attachments(for staging: OracleTransientImageStaging?) -> [AgentFileAttachment] {
+        staging?.files.map { AgentFileAttachment(source: .localFile(path: $0.path), title: $0.title) } ?? []
     }
 
     private struct ReconciledTerminalTurn: Equatable {
@@ -157,8 +157,8 @@ final class CodexCLIProvider: AIProvider {
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens _: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let baseInstructions = buildBaseInstructions(from: aiMessage)
-        let transientImages = aiMessage.transientImages
-        let prompt = promptAppendingImageTitles(buildPrompt(from: aiMessage), images: transientImages)
+        let planned = try AttachmentEncoding.plan(aiMessage.attachments, route: .codexAppServer)
+        let prompt = promptAppendingAttachmentTitles(buildPrompt(from: aiMessage, planned: planned), planned: planned)
         let requestedModelIdentifier = modelIdentifier(for: model)
         let fallbackReasoningEffort = model.defaultReasoningEffort
         let serviceTier = model.codexServiceTier
@@ -176,12 +176,12 @@ final class CodexCLIProvider: AIProvider {
                 }
 
                 do {
-                    let imageStaging = try await Self.stageImages(transientImages)
+                    let imageStaging = try await Self.stageImages(planned)
                     defer { imageStaging?.cleanup() }
                     try await streamViaAppServer(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
-                        images: Self.attachments(for: imageStaging),
+                        attachments: Self.attachments(for: imageStaging),
                         requestedModelIdentifier: requestedModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -334,7 +334,7 @@ final class CodexCLIProvider: AIProvider {
     private func streamViaAppServer(
         baseInstructions: String,
         prompt: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -359,7 +359,7 @@ final class CodexCLIProvider: AIProvider {
                     try await runSingleStreamAttempt(
                         baseInstructions: baseInstructions,
                         prompt: prompt,
-                        images: images,
+                        attachments: attachments,
                         requestedModelIdentifier: activeModelIdentifier,
                         fallbackReasoningEffort: fallbackReasoningEffort,
                         serviceTier: serviceTier,
@@ -455,7 +455,7 @@ final class CodexCLIProvider: AIProvider {
     private func runSingleStreamAttempt(
         baseInstructions: String,
         prompt: String,
-        images: [AgentImageAttachment],
+        attachments: [AgentFileAttachment],
         requestedModelIdentifier: String?,
         fallbackReasoningEffort: String?,
         serviceTier: String?,
@@ -497,7 +497,7 @@ final class CodexCLIProvider: AIProvider {
                 )
                 let turnReceipt = try await controller.startUserTurn(
                     text: prompt,
-                    images: images,
+                    attachments: attachments,
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
@@ -704,7 +704,7 @@ final class CodexCLIProvider: AIProvider {
                 )
                 _ = try await controller.startUserTurn(
                     text: prompt,
-                    images: [],
+                    attachments: [],
                     model: selection.model,
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
@@ -1056,18 +1056,20 @@ final class CodexCLIProvider: AIProvider {
         aiMessage.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func promptAppendingImageTitles(_ prompt: String, images: [AITransientImage]) -> String {
-        let titles = images.compactMap(\.titleAnnotation)
+    private func promptAppendingAttachmentTitles(_ prompt: String, planned: [PlannedAttachment]) -> String {
+        let titles = planned.compactMap(\.titleAnnotation)
         guard !titles.isEmpty else { return prompt }
         return ([prompt] + titles).filter { !$0.isEmpty }.joined(separator: "\n\n")
     }
 
-    private func buildPrompt(from aiMessage: AIMessage) -> String {
+    private func buildPrompt(from aiMessage: AIMessage, planned: [PlannedAttachment] = []) -> String {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         var conversation = ""
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
         for (index, message) in aiMessage.conversationMessages.enumerated() {
-            var text = message.content
+            var text = message.role == .user && index == lastUserIndex
+                ? AttachmentEncoding.prependingInlineText(of: planned, to: message.content)
+                : message.content
             if message.role == .user,
                index == lastUserIndex,
                !tail.isEmpty

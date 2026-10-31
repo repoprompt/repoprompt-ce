@@ -1,10 +1,174 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptWorkspaceCore
 import XCTest
 
 #if DEBUG
     @MainActor
     final class ContextBuilderWorkspaceReadinessTests: XCTestCase {
+        func testSiblingWorkspaceRootsInOneCheckoutElectAvailableReviewTarget() async throws {
+            for staleRootIndex in 0 ..< 2 {
+                try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["B", "C"]) { fixture in
+                    let checkout = fixture.base.resolvingSymlinksInPath().standardizedFileURL
+                    let roots = fixture.rootPaths.map {
+                        URL(fileURLWithPath: $0).resolvingSymlinksInPath().standardizedFileURL
+                    }
+                    let selectedPaths = roots.map { $0.appendingPathComponent("README.md").path }
+                    let git = try ReviewGitRepositoryFixture(parentDirectory: checkout)
+                    try git.initializeRepository(at: checkout)
+                    for root in roots {
+                        try git.stage(root.lastPathComponent + "/README.md", at: checkout)
+                        let owner = try git.runGit(["rev-parse", "--show-toplevel"], at: root)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        XCTAssertEqual(URL(fileURLWithPath: owner).resolvingSymlinksInPath().path, checkout.path)
+                    }
+                    try git.write("original unselected content", to: "B/other.md", at: checkout)
+                    try git.stage("B/other.md", at: checkout)
+                    try git.commit("Initial sibling-root fixture", at: checkout)
+                    try git.write("SELECTED_B_CHANGE", to: "B/README.md", at: checkout)
+                    try git.write("SELECTED_C_CHANGE", to: "C/README.md", at: checkout)
+                    try git.write("UNSELECTED_SIBLING_CHANGE", to: "B/other.md", at: checkout)
+                    try await fixture.selectFixtureFiles(selectedPaths)
+
+                    let selection = StoredSelection(selectedPaths: selectedPaths)
+                    let store = fixture.files.workspaceFileContextStore
+                    let rootsBeforeElection = await Set(store.rootRefs(scope: .visibleWorkspace))
+                    XCTAssertEqual(Set(rootsBeforeElection.map(\.standardizedFullPath)), Set(roots.map(\.path)))
+                    XCTAssertFalse(rootsBeforeElection.contains { $0.standardizedFullPath == checkout.path })
+                    let context = try await self.resolve(fixture, selection: selection)
+                    let rootsAfterElection = await Set(store.rootRefs(scope: .visibleWorkspace))
+                    XCTAssertEqual(rootsAfterElection, rootsBeforeElection)
+                    XCTAssertEqual(Set(context.reviewGitContext.displayContext.roots.map(\.logicalRootPath)), Set(roots.map(\.path)))
+                    // Exact checkout ownership must not require one loaded root containing both contributors.
+                    guard case let .available(target) = context.reviewTargetResolution else {
+                        return XCTFail("Expected available review target for sibling roots B+C in one checkout; observed \(context.reviewTargetResolution)")
+                    }
+                    XCTAssertEqual(target.checkouts.count, 1)
+                    XCTAssertEqual(target.primaryCheckout.checkoutRootPath, checkout.path)
+                    XCTAssertEqual(Set(target.initialOrdinarySelectionIdentities), Set(selectedPaths))
+                    XCTAssertEqual(Set(target.primaryCheckout.contributingRoots.map(\.physicalWorkspaceRoot.standardizedFullPath)), Set(roots.map(\.path)))
+                    let final = try await context.authorizeFinalReviewSelection(
+                        selection, workspaceID: fixture.workspace.id, tabID: context.tabID,
+                        selectionRevision: target.sourceSelectionRevision, store: store
+                    )
+                    XCTAssertEqual(final.electionOrigin, .initiallyAvailable)
+                    XCTAssertEqual(final.checkoutAuthorizations.count, 1)
+                    XCTAssertEqual(Set(final.checkoutAuthorizations.flatMap(\.ordinaryPhysicalPaths)), Set(selectedPaths))
+                    let diff = try await AutomaticReviewGitDiffCoordinator(dependencies: .live(store: store)).resolveStrict(
+                        AutomaticReviewGitDiffRequest(
+                            finalReviewAuthorization: final, compareIntent: context.reviewGitContext.compareIntent,
+                            displayContext: context.reviewGitContext.displayContext
+                        )
+                    )
+                    XCTAssertEqual(diff.completeness, .complete)
+                    let text = try XCTUnwrap(diff.text)
+                    XCTAssertTrue(text.contains("SELECTED_B_CHANGE"), text)
+                    XCTAssertTrue(text.contains("SELECTED_C_CHANGE"), text)
+                    XCTAssertFalse(text.contains("UNSELECTED_SIBLING_CHANGE"), text)
+                    let input = ContextBuilderReviewTargetInput(
+                        workspaceID: fixture.workspace.id, tabID: context.tabID,
+                        selectionRevision: target.sourceSelectionRevision, selection: selection,
+                        lookupContext: context.lookupContext, reviewGitContext: context.reviewGitContext
+                    )
+                    do {
+                        _ = try await ContextBuilderReviewTargetResolver().finalizeSelection(
+                            input: input, initialResolution: .unavailable(.ambiguousOwnership), store: store
+                        )
+                        XCTFail("Initial unavailability must remain terminal")
+                    } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+                        XCTAssertEqual(reason, .ambiguousOwnership)
+                    }
+                    await fixture.files.unloadRootFolderPath(roots[staleRootIndex].path)
+                    let reason = await ContextBuilderReviewTargetResolver().revalidate(target, store: store)
+                    XCTAssertEqual(reason, .staleWorkspaceRoot, "Contributor \(staleRootIndex) must remain required")
+                    do {
+                        _ = try await context.authorizeFinalReviewSelection(
+                            selection, workspaceID: fixture.workspace.id, tabID: context.tabID,
+                            selectionRevision: target.sourceSelectionRevision, store: store
+                        )
+                        XCTFail("Finalization must reject the unloaded contributor")
+                    } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+                        XCTAssertEqual(reason, .unresolvedSelection(count: 1))
+                    }
+                }
+            }
+        }
+
+        func testLogicalAliasesOfOneOwnedWorktreeElectAndFinalizeReview() async throws {
+            try await WorkspaceAuthorityRootTestFixture.withFixture(rootNames: ["A", "B", "Worktree"], configuration: { Array($0.prefix(2)) }) { fixture in
+                let firstBinding = try fixture.makeWorktreeBinding(logicalRootIndex: 0, worktreeRootIndex: 2)
+                let alias = URL(fileURLWithPath: fixture.rootPaths[1], isDirectory: true)
+                let git = try ReviewGitRepositoryFixture()
+                try FileManager.default.removeItem(at: alias.appendingPathComponent("README.md"))
+                try git.runGit(["worktree", "add", "--detach", alias.path, "HEAD"], at: URL(fileURLWithPath: fixture.rootPaths[0]))
+                let secondBinding = AgentSessionWorktreeBinding(
+                    id: "alias-binding", repositoryID: firstBinding.repositoryID, repoKey: firstBinding.repoKey,
+                    logicalRootPath: alias.path, logicalRootName: "alias",
+                    worktreeID: firstBinding.worktreeID, worktreeRootPath: firstBinding.worktreeRootPath,
+                    commonGitDir: firstBinding.commonGitDir, isMainWorktree: firstBinding.isMainWorktree, source: "test"
+                )
+                // Selecting either logical alias must resolve through the same materialized physical authority.
+                let selection = StoredSelection(selectedPaths: [alias.appendingPathComponent("README.md").path])
+                let context = try await self.resolve(fixture, selection: selection, bindingState: .hydrated([secondBinding, firstBinding]))
+                let store = fixture.files.workspaceFileContextStore
+                let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+                defer {
+                    fixture.startOwnedTask { await materializer.release(sessionID: context.parentAgentSessionID) }
+                }
+                let projection = try XCTUnwrap(context.lookupContext.bindingProjection)
+                let boundRoots = projection.boundRootsForMetadata
+                XCTAssertEqual(boundRoots.count, 2)
+                XCTAssertEqual(projection.physicalRootRefs.count, 1)
+                XCTAssertEqual(Set(projection.logicalRootRefs.map(\.standardizedFullPath)), Set(fixture.rootPaths.prefix(2)))
+                let root = try XCTUnwrap(boundRoots.first)
+                let authorization = try XCTUnwrap(root.sessionRootAuthorization)
+                XCTAssertTrue(boundRoots.allSatisfy { $0.sessionRootAuthorization == authorization })
+                guard case let .available(target) = context.reviewTargetResolution else {
+                    return XCTFail("Compatible logical aliases must not be ambiguous: \(context.reviewTargetResolution)")
+                }
+                XCTAssertEqual(target.checkouts.count, 1)
+                XCTAssertEqual(target.primaryCheckout.contributingRoots.count, 1)
+                XCTAssertEqual(target.primaryCheckout.contributingRoots.first?.sessionRootAuthorization, authorization)
+                let physicalPath = firstBinding.worktreeRootPath + "/README.md"
+                XCTAssertEqual(target.initialOrdinarySelectionIdentities, [physicalPath])
+                let final = try await context.authorizeFinalReviewSelection(
+                    selection, workspaceID: fixture.workspace.id, tabID: context.tabID,
+                    selectionRevision: target.sourceSelectionRevision, store: store
+                )
+                XCTAssertEqual(final.checkoutAuthorizations.flatMap(\.ordinaryPhysicalPaths), [physicalPath])
+
+                // A conflicting lifetime on an alias must not be hidden by choosing the first binding.
+                let other = try XCTUnwrap(boundRoots.last)
+                let conflictingProjection = WorkspaceRootBindingProjection(
+                    sessionID: projection.sessionID,
+                    boundRoots: [root, .init(
+                        logicalRoot: other.logicalRoot, physicalRoot: other.physicalRoot, binding: other.binding,
+                        sessionRootAuthorization: WorkspaceSessionRootAuthorization(
+                            sessionID: authorization.sessionID, ownershipGeneration: authorization.ownershipGeneration,
+                            root: authorization.root, lifetimeID: UUID()
+                        )
+                    )],
+                    visibleLogicalRoots: projection.visibleLogicalRootRefs
+                )
+                let conflicting = try await ContextBuilderReviewTargetResolver().resolve(
+                    input: ContextBuilderReviewTargetInput(
+                        workspaceID: fixture.workspace.id, tabID: context.tabID,
+                        selectionRevision: target.sourceSelectionRevision, selection: StoredSelection(selectedPaths: [physicalPath]),
+                        lookupContext: WorkspaceLookupContext(
+                            rootScope: conflictingProjection.lookupRootScope, bindingProjection: conflictingProjection
+                        ),
+                        reviewGitContext: context.reviewGitContext
+                    ), store: store
+                )
+                guard case .unavailable(.ambiguousOwnership) = conflicting else {
+                    return XCTFail("Conflicting alias authority must remain ambiguous: \(conflicting)")
+                }
+                await materializer.release(sessionID: context.parentAgentSessionID)
+                let reason = await ContextBuilderReviewTargetResolver().revalidate(target, store: store)
+                XCTAssertEqual(reason, .staleWorkspaceRoot)
+            }
+        }
+
         func testInvalidWholeManifestReturnsSafeNonretryableMCPTextWithoutChangingRoots() async throws {
             try await WorkspaceAuthorityRootTestFixture.withFixture { fixture in
                 try await fixture.selectFixtureFiles([fixture.rootPaths[0] + "/README.md"])
@@ -681,6 +845,7 @@ import XCTest
         private func resolve(
             _ fixture: WorkspaceAuthorityRootTestFixture,
             paths: [String]? = nil,
+            selection: StoredSelection = StoredSelection(),
             bindingState: AgentSessionWorktreeBindingState = .hydrated([]),
             workspaceID: UUID? = nil,
             directoryPath: String? = nil,
@@ -691,7 +856,7 @@ import XCTest
             let model = try XCTUnwrap(fixture.manager.workspace(withID: fixture.workspace.id))
             let snapshot = try MCPServerViewModel.TabContextSnapshot(
                 tabID: XCTUnwrap(model.activeComposeTabID), windowID: -944,
-                workspaceID: workspaceID ?? model.id, promptText: "sensitive-prompt", selection: StoredSelection(),
+                workspaceID: workspaceID ?? model.id, promptText: "sensitive-prompt", selection: selection,
                 selectedMetaPromptIDs: [], tabName: "sensitive-name", runID: UUID(), activeAgentSessionID: sessionID,
                 worktreeBindingState: bindingState, explicitlyBound: true
             )

@@ -5,6 +5,7 @@ import os
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceCore
 import XCTest
 
 @MainActor
@@ -949,8 +950,621 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
             }
         }
 
+        // MARK: - Default repository election (#1431)
+
+        // Declared [A,B,C] is installed [B,C,A] (bound checkouts install after unbound siblings), so a
+        // first-loaded default can never pass by accident.
+
+        func testElectionWithoutBindingUsesDeclaredPrimaryNotFirstInstalledRoot() async throws {
+            try await withElectionFixture { fixture in
+                try await fixture.assertGitDefault(.alpha)
+                let list = try await fixture.manage(["op": .string("list")])
+                XCTAssertEqual(Self.repositoryRootPath(list), Self.canonicalPath(fixture.alpha))
+                let created = try await fixture.manage(["op": .string("create"), "branch": .string("primary-default")])
+                let createdPath = try XCTUnwrap(created.objectValue?["created_worktree"]?.objectValue?["path"]?.stringValue)
+                XCTAssertEqual(fixture.repositoryID(URL(fileURLWithPath: createdPath)), fixture.repositoryID(fixture.alpha))
+            }
+        }
+
+        func testElectionSoleBindingOnPrimaryUsesItsCheckoutAndBareMainStaysInPrimary() async throws {
+            try await withElectionFixture { fixture in
+                try fixture.bind([(fixture.alpha, fixture.alphaPrime)])
+                try await fixture.assertGitDefault(.alphaPrime)
+                let main = try await fixture.git(["op": .string("status"), "repo_root": .string("@main")])
+                XCTAssertEqual(Self.statusBranch(main), RepoMarker.alpha.branch, Self.json(main))
+                let list = try await fixture.manage(["op": .string("list")])
+                XCTAssertEqual(Self.repositoryRootPath(list), Self.canonicalPath(fixture.alphaPrime))
+            }
+        }
+
+        func testElectionSoleSecondaryBindingUsesItsCheckoutNotUnboundSiblings() async throws {
+            try await withElectionFixture { fixture in
+                try fixture.bind([(fixture.beta, fixture.betaPrime)])
+                try await fixture.assertGitDefault(.betaPrime)
+                let list = try await fixture.manage(["op": .string("list")])
+                XCTAssertEqual(Self.repositoryRootPath(list), Self.canonicalPath(fixture.betaPrime))
+            }
+        }
+
+        func testElectionMultipleBindingsRefuseUnqualifiedAndRelativeCallsBeforeMutation() async throws {
+            try await withElectionFixture { fixture in
+                try fixture.bind([(fixture.alpha, fixture.alphaPrime), (fixture.beta, fixture.betaPrime)])
+                let original = fixture.session.worktreeBindings
+                for args: [String: Value] in [
+                    ["op": .string("status")],
+                    ["op": .string("diff"), "detail": .string("files")],
+                    ["op": .string("log"), "count": .int(1)],
+                    ["op": .string("status"), "repo_root": .string("@main")]
+                ] {
+                    await fixture.assertMultipleBindingRefusal(args, toolName: "git")
+                }
+                let registrations = try fixture.worktreeRegistrations()
+                for args: [String: Value] in [
+                    ["op": .string("list")],
+                    ["op": .string("show")],
+                    ["op": .string("create"), "branch": .string("ambiguous-default")],
+                    ["op": .string("bind"), "session_id": .string(fixture.sessionID.uuidString), "worktree": .string("@main")],
+                    ["op": .string("unbind"), "session_id": .string(fixture.sessionID.uuidString)]
+                ] {
+                    await fixture.assertMultipleBindingRefusal(args, toolName: "manage_worktree")
+                }
+                XCTAssertEqual(try fixture.worktreeRegistrations(), registrations)
+                XCTAssertEqual(fixture.session.worktreeBindings, original)
+            }
+        }
+
+        func testElectionMultipleBindingsStillHonorIdentifyingSelectors() async throws {
+            try await withElectionFixture { fixture in
+                try fixture.bind([(fixture.alpha, fixture.alphaPrime), (fixture.beta, fixture.betaPrime)])
+                let alphaPrimeID = try fixture.worktreeID(fixture.alphaPrime)
+                let betaPrimeID = try fixture.worktreeID(fixture.betaPrime)
+
+                let byPath = try await fixture.git(["op": .string("status"), "repo_root": .string(fixture.gamma.path)])
+                XCTAssertEqual(Self.statusBranch(byPath), RepoMarker.gamma.branch, Self.json(byPath))
+                let key = GitRepoDescriptor(rootURL: fixture.betaPrime.resolvingSymlinksInPath()).repoKey
+                let byKey = try await fixture.git(["op": .string("status"), "repo_key": .string(key)])
+                XCTAssertEqual(Self.statusBranch(byKey), RepoMarker.betaPrime.branch, Self.json(byKey))
+                let byID = try await fixture.git(["op": .string("status"), "repo_root": .string("@id:\(alphaPrimeID)")])
+                XCTAssertEqual(Self.statusBranch(byID), RepoMarker.alphaPrime.branch, Self.json(byID))
+                let byBranch = try await fixture.git([
+                    "op": .string("log"), "count": .int(1), "repo_root": .string("@branch:\(RepoMarker.betaPrime.branch)")
+                ])
+                XCTAssertTrue(Self.json(byBranch).contains(RepoMarker.betaPrime.subject), Self.json(byBranch))
+
+                // An identifying worktree selects its own repository for the DTO and binding identity.
+                let shown = try await fixture.manage(["op": .string("show"), "worktree": .string("@id:\(betaPrimeID)")])
+                XCTAssertEqual(shown.objectValue?["worktree"]?.objectValue?["worktree_id"]?.stringValue, betaPrimeID)
+                XCTAssertEqual(Self.repositoryRootPath(shown), Self.canonicalPath(fixture.betaPrime))
+                _ = try await fixture.manage([
+                    "op": .string("unbind"), "session_id": .string(fixture.sessionID.uuidString),
+                    "worktree_id": .string(betaPrimeID)
+                ])
+                XCTAssertEqual(fixture.session.worktreeBindings.map(\.worktreeID), [alphaPrimeID])
+            }
+        }
+
+        func testElectionRefusesNonGitPrimaryWithoutFallingBackToGitSibling() async throws {
+            try await withElectionFixture(gitRootIndices: [1, 2]) { fixture in
+                // An enclosing repository is outside the declared roots and cannot supply the default either.
+                try fixture.repos.initializeRepository(at: fixture.alpha.deletingLastPathComponent())
+                let unqualifiedCalls: [(String, [String: Value])] = [
+                    ("git", ["op": .string("status")]),
+                    ("git", ["op": .string("log"), "count": .int(1)]),
+                    ("manage_worktree", ["op": .string("list")])
+                ]
+                for (toolName, args) in unqualifiedCalls {
+                    do {
+                        let reply = try await fixture.invoke(toolName, args)
+                        XCTFail("Unqualified \(toolName) must not fall back from a non-Git PRIMARY: \(Self.json(reply))")
+                    } catch {
+                        let text = Self.errorText(error)
+                        XCTAssertTrue(text.contains(fixture.alpha.path), text)
+                        XCTAssertTrue(text.contains("not inside a Git repository"), text)
+                    }
+                }
+                let explicit = try await fixture.git(["op": .string("status"), "repo_root": .string(fixture.beta.path)])
+                XCTAssertEqual(Self.statusBranch(explicit), RepoMarker.beta.branch, Self.json(explicit))
+            }
+        }
+
+        func testElectionLoaderGateInstallsSiblingsBeforeHeldPrimary() async throws {
+            try await withElectionFixture(adversarialOrder: false) { fixture in
+                let driver = fixture.driver
+                let workspace = try XCTUnwrap(driver.manager.workspace(withID: driver.fixture.workspace.id))
+                for root in fixture.roots {
+                    await driver.files.unloadRootFolderPath(root.path)
+                }
+                for root in [fixture.beta, fixture.gamma] {
+                    try await driver.files.loadFolder(at: root, for: workspace)
+                }
+                let gate = try driver.manager.armRootPreloadGateForTesting(
+                    windowID: driver.window.windowID, workspaceID: workspace.id, rootIndex: 0, expectedPath: fixture.alpha.path
+                )
+                defer { driver.manager.clearRootPreloadGateForTesting() }
+                let held = XCTestExpectation(description: "declared PRIMARY held before its hydration")
+                gate.didHold = { held.fulfill() }
+                let ticket = try XCTUnwrap(driver.manager.requestRootReconciliation(workspaceID: workspace.id))
+                let reconciliation = driver.fixture.startOwnedTask {
+                    do { _ = try await driver.manager.awaitRootReconciliationCompletion(ticket: ticket) }
+                    catch { XCTFail("Gated reconciliation failed: \(error)") }
+                }
+                try await driver.fixture.awaitGateEvent(held)
+                let whileHeld = await fixture.actorRootPaths()
+                XCTAssertEqual(whileHeld, [fixture.beta, fixture.gamma].map(Self.standardized))
+                driver.manager.clearRootPreloadGateForTesting()
+                await reconciliation.value
+                await fixture.assertAdversarialOrder()
+                try await fixture.assertGitDefault(.alpha)
+            }
+        }
+
+        func testElectionDiffArtifactManifestRecordsElectedRepositoryAndCheckout() async throws {
+            try await withElectionFixture { fixture in
+                try await fixture.assertDiffArtifactManifest(repoRoot: fixture.alpha, worktreeRoot: nil, marker: .alpha)
+                try fixture.bind([(fixture.beta, fixture.betaPrime)])
+                try await fixture.assertDiffArtifactManifest(repoRoot: fixture.betaPrime, worktreeRoot: fixture.betaPrime, marker: .betaPrime)
+            }
+        }
+
+        func testElectionUnhydratedBindingStateFailsClosedInsteadOfCountingZero() async throws {
+            try await withElectionFixture { fixture in
+                try fixture.bind([(fixture.alpha, fixture.alphaPrime)])
+                fixture.session.hasLoadedPersistedState = false
+                defer { fixture.session.hasLoadedPersistedState = true }
+                XCTAssertEqual(
+                    fixture.driver.window.agentModeViewModel.worktreeBindingState(forAgentSessionID: fixture.sessionID),
+                    .unhydrated
+                )
+                do {
+                    let reply = try await fixture.git(["op": .string("status")])
+                    XCTFail("Unhydrated bindings must fail closed, not elect a default: \(Self.json(reply))")
+                } catch {
+                    let message = Self.errorText(error)
+                    XCTAssertTrue(message.contains("rather than falling back to the canonical checkout"), message)
+                    XCTAssertFalse(message.contains("DefaultRepositoryRequired"), message)
+                }
+            }
+        }
+
+        func testElectionCountsDistinctLogicalBindingsThatShareOneRepository() async throws {
+            try await withElectionFixture(gitRootIndices: [0, 1], gammaLinkedToAlpha: true) { fixture in
+                let alphaSecond = fixture.repos.sandbox.appendingPathComponent("alpha-wt2")
+                _ = try fixture.repos.runGit(["worktree", "add", "-b", "alpha-wt2", alphaSecond.path, "HEAD"], at: fixture.alpha)
+                try fixture.bind([(fixture.alpha, fixture.alphaPrime), (fixture.gamma, alphaSecond)])
+                let bindings = fixture.session.worktreeBindings
+                XCTAssertEqual(Set(bindings.map(\.repositoryID)).count, 1, "both bindings belong to one repository")
+                XCTAssertEqual(Set(bindings.map(\.logicalRootPath)).count, 2, "two distinct logical roots")
+                do {
+                    let reply = try await fixture.git(["op": .string("status")])
+                    XCTFail("Two logical bindings must refuse even when they share a repository: \(Self.json(reply))")
+                } catch {
+                    let message = Self.errorText(error)
+                    XCTAssertTrue(message.contains("2 worktree bindings"), message)
+                    XCTAssertTrue(message.contains(fixture.alpha.path) && message.contains(fixture.gamma.path), message)
+                }
+            }
+        }
+
+        func testElectionRelativeSelectSelectorUsesTheElectedRepository() async throws {
+            try await withElectionFixture { fixture in
+                try fixture.bind([(fixture.beta, fixture.betaPrime)])
+                let bound = try XCTUnwrap(fixture.session.worktreeBindings.first)
+                let reply = try await fixture.manage([
+                    "op": .string("select"), "session_id": .string(fixture.sessionID.uuidString), "worktree": .string("@main")
+                ])
+                // The sole binding B->B' is elected, so `@main` is B's logical checkout: selecting it removes that
+                // binding. A first-installed default (C or A) would have been a no-op leaving the binding in place.
+                XCTAssertTrue(fixture.session.worktreeBindings.isEmpty, "\(fixture.session.worktreeBindings)")
+                XCTAssertEqual(reply.objectValue?["previous_binding"]?.objectValue?["id"]?.stringValue, bound.id)
+            }
+        }
+
+        func testElectionUnqualifiedShowUsesTheSameDefaultAsStatus() async throws {
+            try await withElectionFixture { fixture in
+                try fixture.bind([(fixture.beta, fixture.betaPrime)])
+                let show = try await fixture.git(["op": .string("show"), "ref": .string("HEAD")])
+                XCTAssertTrue(Self.json(show).contains(RepoMarker.betaPrime.subject), Self.json(show))
+            }
+        }
+
+        func testElectionLeavesExplicitDuplicateRootNameOnFirstVisibleMatch() async throws {
+            // Declared [one/dup, two/dup, C] installed [two/dup, C, one/dup]. An explicit name keeps the
+            // resolver's existing first-visible-root match; only the default uses declared order. Changing
+            // explicit name matching is out of scope for #1431.
+            try await withElectionFixture(rootNames: ["one/dup", "two/dup", "C"]) { fixture in
+                let explicit = try await fixture.git(["op": .string("status"), "repo_root": .string("dup")])
+                XCTAssertEqual(Self.statusBranch(explicit), RepoMarker.beta.branch, Self.json(explicit))
+                let unqualified = try await fixture.git(["op": .string("status")])
+                XCTAssertEqual(Self.statusBranch(unqualified), RepoMarker.alpha.branch, Self.json(unqualified))
+            }
+        }
+
+        func testElectionUndeclaredBindingFailsClosedEvenForExplicitSibling() async throws {
+            try await withElectionFixture { fixture in
+                let undeclared = fixture.repos.sandbox.appendingPathComponent("undeclared-logical", isDirectory: true)
+                try FileManager.default.createDirectory(at: undeclared, withIntermediateDirectories: true)
+                fixture.session.worktreeBindings = try [fixture.binding(logical: undeclared, worktree: fixture.alphaPrime)]
+                for args: [String: Value] in [
+                    ["op": .string("status")],
+                    ["op": .string("status"), "repo_root": .string(fixture.gamma.path)]
+                ] {
+                    do {
+                        let reply = try await fixture.git(args)
+                        XCTFail("An undeclared binding must fail closed, not fall back: \(Self.json(reply))")
+                    } catch {
+                        XCTAssertFalse(Self.errorText(error).contains("DefaultRepositoryRequired"), Self.errorText(error))
+                    }
+                }
+            }
+        }
+
+        func testElectionInvalidRequestedRefNamesTheExecutionCheckoutAndSettlesNotApplied() async throws {
+            try await withElectionFixture { fixture in
+                // The sole binding B->B' elects checkout B', which differs from its logical root B.
+                try fixture.bind([(fixture.beta, fixture.betaPrime)])
+                let bindings = fixture.session.worktreeBindings
+                let registrations = try fixture.worktreeRegistrations()
+                let container = GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.beta)
+                let checkoutsBefore = Self.checkouts(in: container)
+                // A lone "-" keeps the caller's spelling; the context explains Git's @{-1} meaning.
+                for (branch, baseRef) in [("bad-base", "no-such-ref"), ("bad-previous", "-")] {
+                    let settlements = OSAllocatedUnfairLock<[DomainProtectedMutationSettlement]>(initialState: [])
+                    do {
+                        let reply = try await MCPDomainProtectedMutationSettlementContext.$observer.withValue({ settlement in
+                            settlements.withLock { $0.append(settlement) }
+                        }) {
+                            try await fixture.manage([
+                                "op": .string("create"), "branch": .string(branch), "base_ref": .string(baseRef)
+                            ])
+                        }
+                        XCTFail("An unresolvable base ref must be refused: \(Self.json(reply))")
+                    } catch {
+                        XCTAssertNil(error as? DomainProtectedMutationError, "Refusal must not be indeterminate: \(error)")
+                        let text = Self.errorText(error)
+                        XCTAssertTrue(Self.names(text, "repository ", fixture.betaPrime), "names the execution checkout: \(text)")
+                        XCTAssertTrue(Self.names(text, "Workspace root ", fixture.beta), "keeps the logical root legible: \(text)")
+                        XCTAssertTrue(text.contains("base ref '\(baseRef)' does not resolve to a commit"), text)
+                        XCTAssertTrue(text.contains("branch '\(branch)'"), text)
+                        XCTAssertTrue(text.contains("Nothing was created."), text)
+                        if baseRef == "-" {
+                            XCTAssertTrue(text.contains("@{-1}"), text)
+                        }
+                    }
+                    XCTAssertEqual(settlements.withLock { $0.last?.state }, .notApplied, baseRef)
+                    XCTAssertThrowsError(
+                        try fixture.repos.runGit(["show-ref", "--verify", "--quiet", "refs/heads/\(branch)"], at: fixture.betaPrime),
+                        "no branch is created for base ref \(baseRef)"
+                    )
+                }
+                XCTAssertEqual(try fixture.worktreeRegistrations(), registrations)
+                XCTAssertEqual(Self.checkouts(in: container), checkoutsBefore, "no checkout under the app-managed container")
+                XCTAssertEqual(fixture.session.worktreeBindings, bindings)
+            }
+        }
+
+        func testElectionDeclaredRootsCollapseIdenticalPathsButKeepAliasesInOrder() {
+            let home = ("~" as NSString).expandingTildeInPath
+            let roots = WorkspaceDefaultGitRepositoryElection.Snapshot.declaredRoots([
+                " /tmp/election/A/ \n", "/tmp/election/./A", "", "/tmp/election/B", "~/election-C", "/tmp/election/A-alias"
+            ])
+            XCTAssertEqual(roots.map(\.path), [
+                "/tmp/election/A", "/tmp/election/B", (home as NSString).appendingPathComponent("election-C"), "/tmp/election/A-alias"
+            ].map { ($0 as NSString).standardizingPath })
+            XCTAssertEqual(roots.first?.displayPath, "/tmp/election/A/")
+        }
+
         private static func canonicalPath(_ url: URL) -> String {
             url.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+
+        private static func standardized(_ url: URL) -> String {
+            (url.path as NSString).standardizingPath
+        }
+
+        private static func json(_ value: Value) -> String {
+            (try? JSONEncoder().encode(value)).map { String(decoding: $0, as: UTF8.self) } ?? "\(value)"
+        }
+
+        private static func errorText(_ error: Error) -> String {
+            "\(error) \(error.localizedDescription)"
+        }
+
+        /// Whether `text` names `url` after `label`, in its given, symlink-resolved, or realpath spelling.
+        private static func names(_ text: String, _ label: String, _ url: URL) -> Bool {
+            var spellings = [url.standardizedFileURL.path, canonicalPath(url)]
+            if let resolved = realpath(url.path, nil) {
+                spellings.append(String(cString: resolved))
+                free(resolved)
+            }
+            return spellings.contains { text.contains(label + $0) }
+        }
+
+        /// Entries of `container` that hold a Git checkout, rather than every directory a create may prepare.
+        private static func checkouts(in container: URL) -> [String] {
+            let entries = (try? FileManager.default.contentsOfDirectory(atPath: container.path)) ?? []
+            return entries.filter {
+                FileManager.default.fileExists(atPath: container.appendingPathComponent($0).appendingPathComponent(".git").path)
+            }.sorted()
+        }
+
+        private static func statusBranch(_ reply: Value) -> String? {
+            reply.objectValue?["status"]?.objectValue?["branch"]?.stringValue
+        }
+
+        private static func repositoryRootPath(_ reply: Value) -> String? {
+            reply.objectValue?["repository"]?.objectValue?["root_path"]?.stringValue
+                .map { canonicalPath(URL(fileURLWithPath: $0)) }
+        }
+
+        /// Distinct branch, tracked change, and newest commit subject per checkout.
+        private struct RepoMarker: Equatable {
+            let branch: String
+            let changedFile: String
+            let subject: String
+
+            static let alpha = RepoMarker(branch: "alpha-main", changedFile: "alpha-tracked.txt", subject: "alpha fixture commit")
+            static let alphaPrime = RepoMarker(branch: "alpha-wt", changedFile: "alphawt-tracked.txt", subject: "alphawt fixture commit")
+            static let beta = RepoMarker(branch: "beta-main", changedFile: "beta-tracked.txt", subject: "beta fixture commit")
+            static let betaPrime = RepoMarker(branch: "beta-wt", changedFile: "betawt-tracked.txt", subject: "betawt fixture commit")
+            static let gamma = RepoMarker(branch: "gamma-main", changedFile: "gamma-tracked.txt", subject: "gamma fixture commit")
+            static let all = [alpha, alphaPrime, beta, betaPrime, gamma]
+        }
+
+        @MainActor
+        private struct ElectionFixture {
+            let driver: ContextBuilderMultiRootDiscoveryDriver
+            let repos: ReviewGitRepositoryFixture
+            let alpha: URL
+            let beta: URL
+            let gamma: URL
+            let alphaPrime: URL
+            let betaPrime: URL
+            let session: AgentModeViewModel.TabSession
+            let sessionID: UUID
+            let gitBinding: MCPDomainToolBinding
+            let manageBinding: MCPDomainToolBinding
+            let security: DomainToolInvocationSecurityContext
+
+            var roots: [URL] {
+                [alpha, beta, gamma]
+            }
+
+            func git(_ args: [String: Value]) async throws -> Value {
+                try await invoke("git", args)
+            }
+
+            func manage(_ args: [String: Value]) async throws -> Value {
+                try await invoke("manage_worktree", args)
+            }
+
+            /// Routed through the fixture tab so the call captures its session and bindings.
+            func invoke(_ toolName: String, _ args: [String: Value]) async throws -> Value {
+                let binding = toolName == "git" ? gitBinding : manageBinding
+                let metadata = MCPRequestMetadata(
+                    connectionID: nil, clientName: nil, windowID: driver.window.windowID,
+                    tabContextHint: MCPTabContextHint(tabID: driver.tabID, workspaceID: nil, windowID: driver.window.windowID)
+                )
+                let invocation = ToolInvocationContext.trustedLocal(toolName: toolName, metadata: metadata)
+                let requestSecurity = DomainToolInvocationSecurityContext(
+                    principal: security.principal,
+                    connectionID: security.connectionID, connectionGeneration: security.connectionGeneration,
+                    invocationID: UUID(), runtimeID: security.runtimeID, runtimeGeneration: security.runtimeGeneration,
+                    authorizedCanonicalRoots: security.authorizedCanonicalRoots,
+                    hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: [toolName]
+                )
+                return try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(requestSecurity) {
+                    try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
+                }
+            }
+
+            func binding(logical: URL, worktree: URL) throws -> AgentSessionWorktreeBinding {
+                let identity = try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: worktree))
+                return AgentSessionWorktreeBinding(
+                    id: UUID().uuidString, repositoryID: identity.repository.repositoryID, repoKey: identity.repository.repoKey,
+                    logicalRootPath: logical.path, logicalRootName: logical.lastPathComponent,
+                    worktreeID: identity.worktreeID, worktreeRootPath: worktree.path,
+                    commonGitDir: identity.repository.commonGitDir, isMainWorktree: identity.isMain, source: "test"
+                )
+            }
+
+            func bind(_ pairs: [(logical: URL, worktree: URL)]) throws {
+                session.worktreeBindings = try pairs.map { try binding(logical: $0.logical, worktree: $0.worktree) }
+            }
+
+            func worktreeID(_ root: URL) throws -> String {
+                try XCTUnwrap(GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root)).worktreeID
+            }
+
+            func repositoryID(_ root: URL) -> String? {
+                GitWorktreeIdentityResolver.resolve(atWorkTreeRoot: root)?.repository.repositoryID
+            }
+
+            func worktreeRegistrations() throws -> [String] {
+                try [alpha, beta, gamma].map { try repos.runGit(["worktree", "list", "--porcelain"], at: $0) }
+            }
+
+            func actorRootPaths() async -> [String] {
+                await driver.files.workspaceFileContextStore.roots()
+                    .filter { $0.kind == .primaryWorkspace }
+                    .map(\.standardizedFullPath)
+            }
+
+            func assertAdversarialOrder(file: StaticString = #filePath, line: UInt = #line) async {
+                let actor = await actorRootPaths()
+                XCTAssertEqual(actor, [beta, gamma, alpha].map(standardized), "actor install order", file: file, line: line)
+                XCTAssertEqual(
+                    driver.files.visibleRootShellProjections.map(\.fullPath).map { ($0 as NSString).standardizingPath },
+                    roots.map(standardized), "shell order", file: file, line: line
+                )
+                XCTAssertEqual(
+                    driver.manager.workspace(withID: driver.fixture.workspace.id)?.repoPaths,
+                    roots.map(\.path), "declared order", file: file, line: line
+                )
+            }
+
+            func assertGitDefault(_ expected: RepoMarker, file: StaticString = #filePath, line: UInt = #line) async throws {
+                let status = try await git(["op": .string("status")])
+                XCTAssertEqual(
+                    status.objectValue?["status"]?.objectValue?["branch"]?.stringValue, expected.branch,
+                    "status: \(text(status))", file: file, line: line
+                )
+                let diff = try await text(git(["op": .string("diff"), "detail": .string("files")]))
+                XCTAssertTrue(diff.contains(expected.changedFile), "diff: \(diff)", file: file, line: line)
+                for other in RepoMarker.all where other != expected {
+                    XCTAssertFalse(diff.contains(other.changedFile), "diff leaked \(other.changedFile): \(diff)", file: file, line: line)
+                }
+                let log = try await text(git(["op": .string("log"), "count": .int(1)]))
+                XCTAssertTrue(log.contains(expected.subject), "log: \(log)", file: file, line: line)
+            }
+
+            /// Inspects the published manifest itself, not rendered headings.
+            func assertDiffArtifactManifest(
+                repoRoot: URL, worktreeRoot: URL?, marker: RepoMarker, file: StaticString = #filePath, line: UInt = #line
+            ) async throws {
+                let reply = try await git(["op": .string("diff"), "artifacts": .bool(true), "detail": .string("files")])
+                let snapshotDir = try XCTUnwrap(
+                    reply.objectValue?["snapshot_dir"]?.stringValue, "no snapshot_dir: \(text(reply))", file: file, line: line
+                )
+                // `snapshot_dir` is relative to the workspace's Git-data root.
+                let workspace = try XCTUnwrap(driver.manager.workspace(withID: driver.fixture.workspace.id), file: file, line: line)
+                let manifestURL = GitDiffSnapshotStore()
+                    .gitDataRoot(workspaceDirectory: driver.manager.workspaceDirectory(for: workspace))
+                    .appendingPathComponent(snapshotDir, isDirectory: true)
+                    .appendingPathComponent("manifest.json")
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let manifest = try decoder.decode(GitDiffSnapshotManifest.self, from: Data(contentsOf: manifestURL))
+                XCTAssertEqual(manifest.repoRoot.map(canonical), canonical(repoRoot.path), "manifest repo_root", file: file, line: line)
+                XCTAssertEqual(manifest.worktreeRoot.map(canonical), worktreeRoot.map { canonical($0.path) }, "manifest worktree_root", file: file, line: line)
+                XCTAssertEqual(manifest.files.map(\.gitPath), [marker.changedFile], "manifest files", file: file, line: line)
+            }
+
+            private func canonical(_ path: String) -> String {
+                URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+            }
+
+            func assertMultipleBindingRefusal(
+                _ args: [String: Value], toolName: String, file: StaticString = #filePath, line: UInt = #line
+            ) async {
+                do {
+                    let reply = try await invoke(toolName, args)
+                    XCTFail("\(toolName) \(args) must refuse with multiple bindings: \(text(reply))", file: file, line: line)
+                } catch {
+                    let message = "\(error) \(error.localizedDescription)"
+                    XCTAssertTrue(message.contains("worktree bindings"), message, file: file, line: line)
+                    XCTAssertTrue(message.contains(alpha.path) && message.contains(beta.path), message, file: file, line: line)
+                    XCTAssertFalse(message.contains("DefaultRepositoryRequired"), message, file: file, line: line)
+                }
+            }
+
+            private func standardized(_ url: URL) -> String {
+                (url.path as NSString).standardizingPath
+            }
+
+            private func text(_ value: Value) -> String {
+                (try? JSONEncoder().encode(value)).map { String(decoding: $0, as: UTF8.self) } ?? "\(value)"
+            }
+        }
+
+        private static func makeElectionRepository(_ git: ReviewGitRepositoryFixture, at root: URL, marker: RepoMarker) throws {
+            try git.initializeRepository(at: root)
+            try git.write("tracked\n", to: marker.changedFile, at: root)
+            _ = try git.runGit(["add", "-A"], at: root)
+            try git.commit(marker.subject, at: root)
+            _ = try git.runGit(["branch", "-m", marker.branch], at: root)
+            try git.write("tracked\nchanged\n", to: marker.changedFile, at: root)
+        }
+
+        private static func makeElectionWorktree(
+            _ git: ReviewGitRepositoryFixture, from root: URL, at path: URL, marker: RepoMarker
+        ) throws {
+            _ = try git.runGit(["worktree", "add", "-b", marker.branch, path.path, "HEAD"], at: root)
+            try git.write("tracked\n", to: marker.changedFile, at: path)
+            _ = try git.runGit(["add", "--", marker.changedFile], at: path)
+            try git.commit(marker.subject, at: path)
+            try git.write("tracked\nchanged\n", to: marker.changedFile, at: path)
+        }
+
+        /// `gammaLinkedToAlpha` makes declared root C a second checkout of A's repository instead of its own repository.
+        private func withElectionFixture(
+            rootNames: [String] = ["A", "B", "C"],
+            gitRootIndices: Set<Int> = [0, 1, 2],
+            gammaLinkedToAlpha: Bool = false,
+            adversarialOrder: Bool = true,
+            _ body: @escaping @MainActor (ElectionFixture) async throws -> Void
+        ) async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: rootNames, configuration: { $0 }) { driver in
+                let git = try ReviewGitRepositoryFixture(parentDirectory: driver.fixture.base)
+                defer { git.cleanup() }
+                let roots = driver.fixture.rootPaths.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                let primes = [git.sandbox.appendingPathComponent("alpha-wt"), git.sandbox.appendingPathComponent("beta-wt")]
+                for (index, marker) in [RepoMarker.alpha, .beta, .gamma].enumerated() where gitRootIndices.contains(index) {
+                    try Self.makeElectionRepository(git, at: roots[index], marker: marker)
+                    try FileManager.default.createDirectory(
+                        at: GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: roots[index]),
+                        withIntermediateDirectories: true
+                    )
+                }
+                for (index, marker) in [RepoMarker.alphaPrime, .betaPrime].enumerated() where gitRootIndices.contains(index) {
+                    try Self.makeElectionWorktree(git, from: roots[index], at: primes[index], marker: marker)
+                }
+                if gammaLinkedToAlpha {
+                    // Git accepts an existing empty directory, but not the fixture's placeholder file.
+                    try FileManager.default.removeItem(at: roots[2].appendingPathComponent("README.md"))
+                    _ = try git.runGit(["worktree", "add", "-b", "gamma-linked", roots[2].path, "HEAD"], at: roots[0])
+                }
+                if adversarialOrder {
+                    let workspace = try XCTUnwrap(driver.manager.workspace(withID: driver.fixture.workspace.id))
+                    for root in roots {
+                        await driver.files.unloadRootFolderPath(root.path)
+                    }
+                    for root in [roots[1], roots[2], roots[0]] {
+                        try await driver.files.loadFolder(at: root, for: workspace)
+                    }
+                }
+
+                let vm = driver.window.agentModeViewModel
+                let session = AgentModeViewModel.TabSession(tabID: driver.tabID)
+                session.hasLoadedPersistedState = true
+                let sessionID = UUID()
+                vm.test_installLiveSession(session)
+                _ = vm.test_installPersistentSessionBinding(sessionID: sessionID, on: session, updateWorkspaceMetadata: true)
+                session.recordRestorationAuthoritative(.persistedPayloadApplied)
+                vm.test_setAgentSessionSaver { _, _, _ in git.sandbox.appendingPathComponent("session.json") }
+                let tools = await driver.window.mcpServer.windowMCPTools
+                let gitTool = try XCTUnwrap(tools.first { $0.name == "git" })
+                let manageTool = try XCTUnwrap(tools.first { $0.name == "manage_worktree" })
+                let runtime = try XCTUnwrap(driver.fixture.runtime)
+                let security = DomainToolInvocationSecurityContext(
+                    principal: DomainClientPrincipal(
+                        principalID: UUID(), stableKey: "worktree-election-test", displayName: "test",
+                        kind: .runScoped, assurance: .hostLaunchToken, processID: 42, runID: UUID(), provider: "test"
+                    ),
+                    connectionID: UUID(), connectionGeneration: 1, invocationID: UUID(),
+                    runtimeID: runtime.identity.runtimeID, runtimeGeneration: runtime.identity.lifecycleGeneration,
+                    authorizedCanonicalRoots: Set((roots + primes).map { $0.resolvingSymlinksInPath().path }),
+                    hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["git", "manage_worktree"]
+                )
+                let fixture = try ElectionFixture(
+                    driver: driver, repos: git,
+                    alpha: roots[0], beta: roots[1], gamma: roots[2], alphaPrime: primes[0], betaPrime: primes[1],
+                    session: session, sessionID: sessionID,
+                    gitBinding: gitTool.domainBinding(),
+                    manageBinding: runtime.protectedMutationProvider.protectedBinding(manageTool.domainBinding()),
+                    security: security
+                )
+                if adversarialOrder {
+                    await fixture.assertAdversarialOrder()
+                }
+                let materializer = WorkspaceRootBindingProjectionMaterializer(store: driver.files.workspaceFileContextStore)
+                do {
+                    try await body(fixture)
+                } catch {
+                    await materializer.release(sessionID: sessionID)
+                    throw error
+                }
+                await materializer.release(sessionID: sessionID)
+            }
         }
 
         @MainActor
@@ -1082,6 +1696,151 @@ final class ManageWorktreeSessionAuthorityTests: XCTestCase {
                     security: security
                 ))
             }
+        }
+    }
+
+    @MainActor
+    final class GitDefaultElectionReadAuthorizationTests: XCTestCase {
+        func testChildOnlyWorkspaceRefusesEnclosingRepositoryForOmittedAndCurrentSelectors() async throws {
+            try await assertReadElection(.childOnly)
+        }
+
+        func testNestedRepositoryUsesItsOwnDataForOmittedAndCurrentSelectors() async throws {
+            try await assertReadElection(.nestedRepository)
+        }
+
+        func testLinkedWorktreeUsesItsOwnDataForOmittedAndCurrentSelectors() async throws {
+            try await assertReadElection(.linkedWorktree)
+        }
+
+        func testNestedPrimaryCanUseIndependentlyDeclaredEnclosingRepository() async throws {
+            try await assertReadElection(.declaredParent)
+        }
+
+        func testNestedPrimaryPrefersNearestAuthorizedAncestorDespiteLongerOuterAlias() async throws {
+            let git = try ReviewGitRepositoryFixture()
+            defer { git.cleanup() }
+            let outer = git.sandbox.appendingPathComponent("real")
+            let inner = outer.appendingPathComponent("project")
+            let primary = inner.appendingPathComponent("src")
+            try FileManager.default.createDirectory(at: primary, withIntermediateDirectories: true)
+            try Self.makeRepository(git, at: outer, name: "parent")
+            try Self.makeRepository(git, at: inner, name: "child")
+            let outerAlias = git.sandbox.appendingPathComponent("longer-spelling-for-the-more-distant-ancestor")
+            let innerAlias = git.sandbox.appendingPathComponent("i")
+            try FileManager.default.createSymbolicLink(at: outerAlias, withDestinationURL: outer)
+            try FileManager.default.createSymbolicLink(at: innerAlias, withDestinationURL: inner)
+            let roots = [primary, outerAlias, innerAlias].map {
+                WorkspaceRootRef(id: UUID(), name: $0.lastPathComponent, fullPath: $0.path)
+            }
+            let snapshot = WorkspaceDefaultGitRepositoryElection.Snapshot(
+                workspaceID: UUID(), declaredRepoPaths: roots.map(\.fullPath),
+                bindingSource: .init(activeAgentSessionID: nil, worktreeBindingState: .notApplicable),
+                lookupContext: .visibleWorkspace, lookupRoots: roots
+            )
+            let selection = try await WorkspaceDefaultGitRepositoryElection(vcsService: VCSService()).elect(in: snapshot)
+            XCTAssertEqual(
+                GitRepoRootAuthorization.canonicalPath(selection.repository.rootPath),
+                GitRepoRootAuthorization.canonicalPath(inner.path)
+            )
+            XCTAssertEqual(selection.logicalRoot, roots[0], "Retain PRIMARY's logical attribution")
+        }
+
+        private enum Layout {
+            case childOnly, nestedRepository, linkedWorktree, declaredParent
+        }
+
+        /// Exercise the real window Git tool binding with only declared roots in the read grant.
+        /// Parent-only branch/file/commit witnesses catch status, diff, and log disclosure independently.
+        private func assertReadElection(_ layout: Layout) async throws {
+            let rootNames = layout == .declaredParent ? ["parent/child", "parent"] : ["parent/child"]
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: rootNames) { driver in
+                let git = try ReviewGitRepositoryFixture(parentDirectory: driver.fixture.base)
+                defer { git.cleanup() }
+                let child = try URL(fileURLWithPath: XCTUnwrap(driver.fixture.rootPaths.first), isDirectory: true)
+                let parent = child.deletingLastPathComponent()
+                try Self.makeRepository(git, at: parent, name: "parent")
+                switch layout {
+                case .nestedRepository:
+                    try Self.makeRepository(git, at: child, name: "child")
+                case .linkedWorktree:
+                    try FileManager.default.removeItem(at: child.appendingPathComponent("README.md"))
+                    _ = try git.runGit(["worktree", "add", "-b", "child-main", child.path, "HEAD"], at: parent)
+                    try git.write("tracked\n", to: "child-marker.txt", at: child)
+                    _ = try git.runGit(["add", "child-marker.txt"], at: child)
+                    try git.commit("CHILD_ONLY_ELECTION_SUBJECT", at: child)
+                    try git.write("tracked\nchanged\n", to: "child-marker.txt", at: child)
+                case .childOnly, .declaredParent:
+                    break
+                }
+                let tools = await driver.window.mcpServer.windowMCPTools
+                let binding = try XCTUnwrap(tools.first { $0.name == "git" }).domainBinding()
+                let runtime = try XCTUnwrap(driver.fixture.runtime)
+                let metadata = MCPRequestMetadata(
+                    connectionID: nil, clientName: nil, windowID: driver.window.windowID,
+                    tabContextHint: MCPTabContextHint(tabID: driver.tabID, workspaceID: nil, windowID: driver.window.windowID)
+                )
+                let invocation = ToolInvocationContext.trustedLocal(toolName: "git", metadata: metadata)
+                let security = DomainToolInvocationSecurityContext(
+                    principal: DomainClientPrincipal(
+                        principalID: UUID(), stableKey: "git-election-read-test", displayName: "test",
+                        kind: .runScoped, assurance: .hostLaunchToken, processID: 42, runID: UUID(), provider: "test"
+                    ),
+                    connectionID: UUID(), connectionGeneration: 1, invocationID: UUID(),
+                    runtimeID: runtime.identity.runtimeID, runtimeGeneration: runtime.identity.lifecycleGeneration,
+                    authorizedCanonicalRoots: Set(driver.fixture.rootPaths.map {
+                        URL(fileURLWithPath: $0).resolvingSymlinksInPath().path
+                    }),
+                    hasAuthoritativeRoutingContext: true, ephemeralGrantedToolNames: ["git"]
+                )
+                let expected = layout == .declaredParent ? "parent" : "child"
+                for selector: String? in [nil, "@current"] {
+                    for op in ["status", "diff", "log"] {
+                        var args: [String: Value] = ["op": .string(op)]
+                        if let selector { args["repo_root"] = .string(selector) }
+                        if op == "diff" { args["detail"] = .string("files") }
+                        if op == "log" { args["count"] = .int(1) }
+                        do {
+                            let reply = try await MCPDomainInvocationSecurityContext.currentTaskLocal.withValue(security) {
+                                try await MCPInvocationContextBridge.withInvocation(invocation) { try await binding(args) }
+                            }
+                            let text = try String(decoding: JSONEncoder().encode(reply), as: UTF8.self)
+                            if layout == .childOnly {
+                                XCTAssertFalse(text.contains("parent-marker.txt"), text)
+                                XCTAssertFalse(text.contains("PARENT_ONLY_ELECTION_SUBJECT"), text)
+                                XCTFail("Child-only workspace must refuse parent \(op), selector \(selector ?? "omitted"): \(text)")
+                            } else {
+                                switch op {
+                                case "status":
+                                    XCTAssertEqual(reply.objectValue?["status"]?.objectValue?["branch"]?.stringValue, "\(expected)-main", text)
+                                    XCTAssertTrue(text.contains("\(expected)-marker.txt"), text)
+                                case "diff":
+                                    XCTAssertTrue(text.contains("\(expected)-marker.txt"), text)
+                                default:
+                                    XCTAssertTrue(text.contains("\(expected.uppercased())_ONLY_ELECTION_SUBJECT"), text)
+                                }
+                                if expected == "child" {
+                                    XCTAssertFalse(text.contains("parent-marker.txt"), text)
+                                    XCTAssertFalse(text.contains("PARENT_ONLY_ELECTION_SUBJECT"), text)
+                                }
+                            }
+                        } catch {
+                            guard layout == .childOnly else { throw error }
+                            XCTAssertTrue(error.localizedDescription.contains("no default Git repository"), "\(error)")
+                            XCTAssertFalse(error.localizedDescription.contains("PARENT_ONLY_ELECTION_SUBJECT"), "\(error)")
+                        }
+                    }
+                }
+            }
+        }
+
+        private static func makeRepository(_ git: ReviewGitRepositoryFixture, at root: URL, name: String) throws {
+            try git.initializeRepository(at: root)
+            try git.write("tracked\n", to: "\(name)-marker.txt", at: root)
+            _ = try git.runGit(["add", "-A"], at: root)
+            try git.commit("\(name.uppercased())_ONLY_ELECTION_SUBJECT", at: root)
+            _ = try git.runGit(["branch", "-m", "\(name)-main"], at: root)
+            try git.write("tracked\nchanged\n", to: "\(name)-marker.txt", at: root)
         }
     }
 #endif

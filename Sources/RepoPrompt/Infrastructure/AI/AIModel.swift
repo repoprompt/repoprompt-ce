@@ -79,11 +79,22 @@ public enum AIModel: Equatable, Hashable {
     case gpt61SolHigh
     case gpt61SolXHigh
     case gpt61SolMax
+    case gpt61Terra
+    case gpt61TerraNone
+    case gpt61TerraLow
+    case gpt61TerraHigh
+    case gpt61TerraXHigh
+    case gpt61TerraMax
     case gpt6Astra
     case gpt6AstraLow
     case gpt6AstraHigh
     case gpt6AstraXHigh
     case gpt6AstraMax
+    case gpt6AstraPro
+    case gpt6AstraProLow
+    case gpt6AstraProHigh
+    case gpt6AstraProXHigh
+    case gpt6AstraProMax
     case gpt6Luna
     case gpt6LunaLow
     case gpt6LunaHigh
@@ -352,11 +363,24 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .gpt61SolHigh, rawValue: "gpt-6.1-sol-high", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol High", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt61SolXHigh, rawValue: "gpt-6.1-sol-xhigh", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol XHigh", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt61SolMax, rawValue: "gpt-6.1-sol-max", actualName: "gpt-6.1-sol", displayName: "GPT-6.1 Sol Max", provider: ProviderIndex.openAI),
+        // https://developers.openai.com/api/docs/models/gpt-6.1-terra
+        ModelInfo(model: .gpt61Terra, rawValue: "gpt-6.1-terra", actualName: nil, displayName: "GPT-6.1 Terra Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraNone, rawValue: "gpt-6.1-terra-none", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra None", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraLow, rawValue: "gpt-6.1-terra-low", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraHigh, rawValue: "gpt-6.1-terra-high", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraXHigh, rawValue: "gpt-6.1-terra-xhigh", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt61TerraMax, rawValue: "gpt-6.1-terra-max", actualName: "gpt-6.1-terra", displayName: "GPT-6.1 Terra Max", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6Astra, rawValue: "gpt-6-astra", actualName: nil, displayName: "GPT-6 Astra Med", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6AstraLow, rawValue: "gpt-6-astra-low", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Low", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6AstraHigh, rawValue: "gpt-6-astra-high", actualName: "gpt-6-astra", displayName: "GPT-6 Astra High", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6AstraXHigh, rawValue: "gpt-6-astra-xhigh", actualName: "gpt-6-astra", displayName: "GPT-6 Astra XHigh", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6AstraMax, rawValue: "gpt-6-astra-max", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Max", provider: ProviderIndex.openAI),
+        // Pro is a Responses execution mode; these selection IDs are not API model IDs.
+        ModelInfo(model: .gpt6AstraPro, rawValue: "gpt-6-astra-pro", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Pro Med", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraProLow, rawValue: "gpt-6-astra-pro-low", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Pro Low", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraProHigh, rawValue: "gpt-6-astra-pro-high", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Pro High", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraProXHigh, rawValue: "gpt-6-astra-pro-xhigh", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Pro XHigh", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt6AstraProMax, rawValue: "gpt-6-astra-pro-max", actualName: "gpt-6-astra", displayName: "GPT-6 Astra Pro Max", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6Luna, rawValue: "gpt-6-luna", actualName: nil, displayName: "GPT-6 Luna Med", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6LunaLow, rawValue: "gpt-6-luna-low", actualName: "gpt-6-luna", displayName: "GPT-6 Luna Low", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt6LunaHigh, rawValue: "gpt-6-luna-high", actualName: "gpt-6-luna", displayName: "GPT-6 Luna High", provider: ProviderIndex.openAI),
@@ -523,7 +547,7 @@ public enum AIModel: Equatable, Hashable {
 
     private static let modelDefinitions: [ModelInfo] = {
         let azureVariants = baseModelDefinitions
-            .filter { $0.provider == ProviderIndex.openAI }
+            .filter { $0.provider == ProviderIndex.openAI && $0.model.openAIReasoningMode == nil }
             .map { info -> ModelInfo in
                 let displaySource = info.displayName.isEmpty ? info.rawValue : info.displayName
                 return ModelInfo(
@@ -1090,11 +1114,22 @@ public enum AIModel: Equatable, Hashable {
             .gpt61SolHigh,
             .gpt61SolXHigh,
             .gpt61SolMax,
+            .gpt61Terra,
+            .gpt61TerraNone,
+            .gpt61TerraLow,
+            .gpt61TerraHigh,
+            .gpt61TerraXHigh,
+            .gpt61TerraMax,
             .gpt6Astra,
             .gpt6AstraLow,
             .gpt6AstraHigh,
             .gpt6AstraXHigh,
             .gpt6AstraMax,
+            .gpt6AstraPro,
+            .gpt6AstraProLow,
+            .gpt6AstraProHigh,
+            .gpt6AstraProXHigh,
+            .gpt6AstraProMax,
             .gpt6Luna,
             .gpt6LunaLow,
             .gpt6LunaHigh,
@@ -1247,10 +1282,13 @@ public enum AIModel: Equatable, Hashable {
         if case let .openAIServiceTierVariant(base, _) = self {
             return base.canStream
         }
+        // Mode-based Pro responses use terminal-only background polling even if
+        // an older saved override requests incremental streaming.
+        if openAIReasoningMode != nil { return false }
         if let override = ModelOverridesSettings.shared.streamOverride(for: rawValue) {
             return override
         }
-        // Explicitly disable streaming for all Pro variants
+        // Explicitly disable streaming for legacy Pro variants
         if self == .gpt5Pro || self == .gpt5ProXHigh || self == .gpt54Pro || self == .gpt54ProXHigh {
             return false
         }
@@ -1270,11 +1308,12 @@ public enum AIModel: Equatable, Hashable {
         case .gpt5, .gpt54, .gpt5CodexMed, .o3: return "medium"
         case .gpt5Low, .gpt54Low, .gpt5CodexLow, .o3Low: return "low"
         // GPT-6 family (API)
-        case .gpt61SolMax, .gpt6AstraMax: return "max"
-        case .gpt61SolXHigh, .gpt6AstraXHigh, .gpt6LunaXHigh: return "xhigh"
-        case .gpt61SolHigh, .gpt6AstraHigh, .gpt6LunaHigh: return "high"
-        case .gpt61Sol, .gpt6Astra, .gpt6Luna, .gpt6Sol: return "medium"
-        case .gpt61SolLow, .gpt6AstraLow, .gpt6LunaLow: return "low"
+        case .gpt61TerraNone: return "none"
+        case .gpt6AstraProMax, .gpt61TerraMax, .gpt61SolMax, .gpt6AstraMax: return "max"
+        case .gpt6AstraProXHigh, .gpt61TerraXHigh, .gpt61SolXHigh, .gpt6AstraXHigh, .gpt6LunaXHigh: return "xhigh"
+        case .gpt6AstraProHigh, .gpt61TerraHigh, .gpt61SolHigh, .gpt6AstraHigh, .gpt6LunaHigh: return "high"
+        case .gpt6AstraPro, .gpt61Terra, .gpt61Sol, .gpt6Astra, .gpt6Luna, .gpt6Sol: return "medium"
+        case .gpt6AstraProLow, .gpt61TerraLow, .gpt61SolLow, .gpt6AstraLow, .gpt6LunaLow: return "low"
         // Codex CLI models
         case .codexCliGpt61SolUltra, .codexCliGpt56SolUltra, .codexCliGpt56TerraUltra: return "ultra"
         case .codexCliGpt61SolMax, .codexCliGpt6AstraMax, .codexCliGpt6LunaMax, .codexCliGpt6SolMax,
@@ -1298,6 +1337,26 @@ public enum AIModel: Equatable, Hashable {
         case let .openaiCustomReasoning(_, effort):
             return effort.rawValue
         default: return nil
+        }
+    }
+
+    /// Keep mode-bearing selections distinguishable when their execution profile
+    /// uses the shared API model ID. A different runtime model remains authoritative.
+    static func readableModelID(selectedID: String, executionID: String?) -> String {
+        guard let selected = fromModelName(selectedID),
+              selected.openAIReasoningMode != nil,
+              executionID == nil || executionID == selected.modelName
+        else { return executionID ?? selectedID }
+        return selectedID
+    }
+
+    /// Mode and effort are independent. Legacy Pro model IDs retain their own API behavior.
+    var openAIReasoningMode: String? {
+        switch openAIServiceTierBase {
+        case .gpt6AstraPro, .gpt6AstraProLow, .gpt6AstraProHigh, .gpt6AstraProXHigh, .gpt6AstraProMax:
+            "pro"
+        default:
+            nil
         }
     }
 
@@ -2195,11 +2254,22 @@ public enum AIModel: Equatable, Hashable {
         case gpt61SolHigh
         case gpt61SolXHigh
         case gpt61SolMax
+        case gpt61Terra
+        case gpt61TerraNone
+        case gpt61TerraLow
+        case gpt61TerraHigh
+        case gpt61TerraXHigh
+        case gpt61TerraMax
         case gpt6Astra
         case gpt6AstraLow
         case gpt6AstraHigh
         case gpt6AstraXHigh
         case gpt6AstraMax
+        case gpt6AstraPro
+        case gpt6AstraProLow
+        case gpt6AstraProHigh
+        case gpt6AstraProXHigh
+        case gpt6AstraProMax
         case gpt6Luna
         case gpt6LunaLow
         case gpt6LunaHigh
@@ -2419,6 +2489,18 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt61SolXHigh)
         case .gpt61SolMax:
             .staticCase(.gpt61SolMax)
+        case .gpt61Terra:
+            .staticCase(.gpt61Terra)
+        case .gpt61TerraNone:
+            .staticCase(.gpt61TerraNone)
+        case .gpt61TerraLow:
+            .staticCase(.gpt61TerraLow)
+        case .gpt61TerraHigh:
+            .staticCase(.gpt61TerraHigh)
+        case .gpt61TerraXHigh:
+            .staticCase(.gpt61TerraXHigh)
+        case .gpt61TerraMax:
+            .staticCase(.gpt61TerraMax)
         case .gpt6Astra:
             .staticCase(.gpt6Astra)
         case .gpt6AstraLow:
@@ -2429,6 +2511,16 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt6AstraXHigh)
         case .gpt6AstraMax:
             .staticCase(.gpt6AstraMax)
+        case .gpt6AstraPro:
+            .staticCase(.gpt6AstraPro)
+        case .gpt6AstraProLow:
+            .staticCase(.gpt6AstraProLow)
+        case .gpt6AstraProHigh:
+            .staticCase(.gpt6AstraProHigh)
+        case .gpt6AstraProXHigh:
+            .staticCase(.gpt6AstraProXHigh)
+        case .gpt6AstraProMax:
+            .staticCase(.gpt6AstraProMax)
         case .gpt6Luna:
             .staticCase(.gpt6Luna)
         case .gpt6LunaLow:

@@ -341,6 +341,12 @@ enum PromptContextPreAssemblyService {
             entries: allEntries,
             rootScope: prepared.ordinaryRootScope
         )
+        if request.finalReviewAuthorization != nil,
+           case let .automatic(result) = gitDiffResolution,
+           let reason = result.authorizationFailure
+        {
+            throw reason
+        }
         let packagingEntries = entriesForPackaging(request: request, entries: allEntries)
 
         return PromptContextPreAssemblyResult(

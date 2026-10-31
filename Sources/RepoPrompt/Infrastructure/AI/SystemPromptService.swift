@@ -905,8 +905,8 @@ class SystemPromptService {
         - `manage_selection` - Curate the file selection used by all tools
         - `prompt` - Get or modify the shared prompt; export context
         - `workspace_context` - Get a combined workspace snapshot (prompt + selection + tokens)
-        - `ask_oracle` - Consult a second AI for planning, review, or questions. File reads are tracked so the Oracle knows what you see. Prefer one long-running chat (`new_chat:false`).
-        - `oracle_chat_log` - Read recent Oracle conversation messages to recover context after compaction
+        - `ask_oracle` - Consult a second AI for planning, review, or questions. File reads are tracked so the Oracle knows what you see. Prefer one long-running chat (`new_chat:false`) within the current Agent run; chats are tied to the run that created them, which can change (for example after Stop, Clear chat, or an app relaunch).
+        - `oracle_chat_log` - Read recent Oracle conversation messages from the current Agent run's chats, for example to recover context after compaction
 
         \(agentDelegationSection)
 
@@ -930,7 +930,7 @@ class SystemPromptService {
         	- Use `ask_user` to clarify requirements
            - Or consult `ask_oracle` with `mode:"plan"` to think through the approach
 
-        3.5 **After compaction**: Call `oracle_chat_log` with `limit:1` to read the Oracle's most recent message, then continue with `ask_oracle` (`new_chat:false`) to pick up where you left off.
+        3.5 **After compaction**: Call `oracle_chat_log` with `limit:1` to read the Oracle's most recent message, then continue with `ask_oracle` (`new_chat:false`) to pick up where you left off. No Oracle tool continues or reads a chat from an earlier Agent run: start a new chat (`new_chat:true`) and restate the needed context, or read the export file if you exported that response.
 
         4. **After completing a task**:
         \(afterCompletingTask)
@@ -939,7 +939,7 @@ class SystemPromptService {
         **Important Notes**
         - Always explore before editing unfamiliar code
         - For multi-file changes, work methodically file by file
-        - Prefer continuing Oracle chats (`ask_oracle` with `new_chat:false`) unless a fresh thread is necessary
+        - Prefer continuing Oracle chats (`ask_oracle` with `new_chat:false`) unless a fresh thread is necessary or the chat is from an earlier Agent run
         \(agentDelegationFinalNote)
         - If something goes wrong, explain what happened and offer to fix it\(askForHelpNote)
         """

@@ -40,8 +40,8 @@ final class OracleCancellationAuthorityTests: XCTestCase {
         composition.apiSettingsViewModel.isOpenAIKeyValid = true
         await oracle.startNewChatSession(reuseBlankSession: false)
         let sessionID = try XCTUnwrap(oracle.currentSessionID)
-        let original = AITransientImage(bytes: Data([1, 2, 3]), mediaType: .png, title: "original")
-        var gates: [CheckedContinuation<[AIChatImageAttachment], Error>] = []
+        let original = OracleAttachment(payload: .image(.png, Data([1, 2, 3])), fileName: "image.png", title: "original")
+        var gates: [CheckedContinuation<[AIChatFileAttachment], Error>] = []
         var sent: [AIMessage] = []
         oracle.oracleImageThumbnailsForTesting = { _ in
             try await withCheckedThrowingContinuation { gates.append($0) }
@@ -58,7 +58,7 @@ final class OracleCancellationAuthorityTests: XCTestCase {
                 text,
                 sessionID: sessionID,
                 overrideModel: .gpt54Mini,
-                oracleTransientImages: [original],
+                oracleAttachments: [original],
                 contextBuilderScope: scope
             ) }
         }
@@ -149,7 +149,7 @@ final class OracleCancellationAuthorityTests: XCTestCase {
             oracle.messagesSnapshot(for: sessionID).filter(\.isUser).map(\.content),
             ["newer", "text successor", "background", "latest"]
         )
-        XCTAssertTrue(oracle.messagesSnapshot(for: sessionID).filter(\.isUser).allSatisfy(\.imageAttachments.isEmpty))
+        XCTAssertTrue(oracle.messagesSnapshot(for: sessionID).filter(\.isUser).allSatisfy(\.fileAttachments.isEmpty))
 
         // This scenario purges a background session. Blank-session reuse can
         // otherwise keep the original foreground before autosave updates counts.
@@ -165,8 +165,8 @@ final class OracleCancellationAuthorityTests: XCTestCase {
             sent.map { $0.conversationMessages.last?.content ?? "" },
             ["newer", "text successor", "background", "latest"].map { "<user_instructions>\n\($0)\n</user_instructions>" }
         )
-        XCTAssertEqual(sent.first?.transientImages.first?.bytes, original.bytes)
-        XCTAssertEqual(sent.last?.transientImages.first?.bytes, original.bytes)
+        XCTAssertEqual(sent.first?.attachments.first?.bytes, original.bytes)
+        XCTAssertEqual(sent.last?.attachments.first?.bytes, original.bytes)
 
         // Exercise real preview failure through sendMessage, not just the ordering override.
         oracle.oracleImageThumbnailsForTesting = nil
@@ -175,13 +175,13 @@ final class OracleCancellationAuthorityTests: XCTestCase {
             "unavailable preview",
             sessionID: visibleSessionID,
             overrideModel: .gpt54Mini,
-            oracleTransientImages: [original]
+            oracleAttachments: [original]
         )
         let placeholderID = try XCTUnwrap(placeholder)
         try await waitForCompletion(placeholderID, in: visibleSessionID)
         XCTAssertEqual(sent.count, 5)
-        XCTAssertEqual(sent.last?.transientImages.first?.bytes, original.bytes)
-        let previews = try XCTUnwrap(oracle.messagesSnapshot(for: visibleSessionID).first(where: \.isUser)?.imageAttachments)
+        XCTAssertEqual(sent.last?.attachments.first?.bytes, original.bytes)
+        let previews = try XCTUnwrap(oracle.messagesSnapshot(for: visibleSessionID).first(where: \.isUser)?.fileAttachments)
         XCTAssertEqual(previews.count, 1)
         XCTAssertTrue(previews[0].thumbnailData.isEmpty)
     }

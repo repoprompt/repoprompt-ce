@@ -17,61 +17,69 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
     }
 
     func testHandoffOwnsItsImagesBeforeFirstSaveAndKeepsThemAfterParentDeletion() async throws {
-        try await withFixture(bindSource: false) { fixture in
-            let (store, attachment, parentImage) = try await installHandoffImage(fixture)
-            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
-            let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
-            let originalBytes = try Data(contentsOf: parentImage)
-            var childSaves = 0
-            fixture.viewModel.test_setAgentSessionSaver { session, workspace, count in
-                if session.id != fixture.sourceSessionID {
-                    childSaves += 1
-                    let transcript = try XCTUnwrap(session.transcript)
-                    let image = try XCTUnwrap(AgentTranscriptIO.workingSourceItems(from: transcript).flatMap(\.attachments).first)
-                    guard case let .localFile(path) = image.source else { throw AgentSessionError.emptySession }
-                    XCTAssertNotEqual(path, parentImage.path)
-                    XCTAssertTrue(store.isRetainedPath(path, sessionID: session.id))
-                    XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), originalBytes)
-                    if childSaves == 1 {
-                        XCTAssertEqual(try Data(contentsOf: parentImage), originalBytes)
+        for isImage in [true, false] {
+            try await withFixture(bindSource: false) { fixture in
+                let (store, attachment, parentImage) = try await installHandoffImage(fixture, isImage: isImage)
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+                let originalBytes = try Data(contentsOf: parentImage)
+                var childSaves = 0
+                fixture.viewModel.test_setAgentSessionSaver { session, workspace, count in
+                    if session.id != fixture.sourceSessionID {
+                        childSaves += 1
+                        let transcript = try XCTUnwrap(session.transcript)
+                        let image = try XCTUnwrap(AgentTranscriptIO.workingSourceItems(from: transcript).flatMap(\.attachments).first)
+                        guard case let .localFile(path) = image.source else { throw AgentSessionError.emptySession }
+                        XCTAssertNotEqual(path, parentImage.path)
+                        XCTAssertTrue(store.isRetainedPath(path, sessionID: session.id))
+                        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), originalBytes)
+                        XCTAssertEqual(image.kind, attachment.kind)
+                        XCTAssertEqual(image.fileName, attachment.fileName)
+                        XCTAssertEqual(image.byteCount, attachment.byteCount)
+                        if childSaves == 1 {
+                            XCTAssertEqual(try Data(contentsOf: parentImage), originalBytes)
+                        }
                     }
+                    return try await AgentSessionDataService.shared.saveAgentSession(
+                        session, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                    )
                 }
-                return try await AgentSessionDataService.shared.saveAgentSession(
-                    session, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                let childTabID = try await fixture.viewModel.prepareHandoffToNewTab(
+                    upToItemID: cutoff,
+                    destinationAgent: fixture.sourceSession.selectedAgent,
+                    destinationModelRaw: fixture.sourceSession.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw,
+                    activateDestination: false,
+                    inheritOversightLinks: false
                 )
-            }
-            let childTabID = try await fixture.viewModel.prepareHandoffToNewTab(
-                upToItemID: cutoff,
-                destinationAgent: fixture.sourceSession.selectedAgent,
-                destinationModelRaw: fixture.sourceSession.selectedModelRaw,
-                destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw,
-                activateDestination: false,
-                inheritOversightLinks: false
-            )
-            let child = try XCTUnwrap(fixture.viewModel.sessions[childTabID])
-            let childID = try XCTUnwrap(child.activeAgentSessionID)
-            let childImage = try XCTUnwrap(child.items.flatMap(\.attachments).first)
-            guard case let .localFile(childPath) = childImage.source else { return XCTFail("Child must keep a local image") }
-            XCTAssertGreaterThan(childSaves, 0)
-            XCTAssertEqual(childImage.id, attachment.id)
-            XCTAssertEqual(childImage.title, attachment.title)
-            XCTAssertEqual(childImage.createdAt, attachment.createdAt)
-            XCTAssertEqual(fixture.sourceSession.items.flatMap(\.attachments), [attachment])
-            XCTAssertEqual(
-                fixture.viewModel.oracleAuthorizedAttachmentPaths(tabID: childTabID, agentSessionID: childID),
-                [childPath]
-            )
-            XCTAssertFalse(store.isRetainedPath(parentImage.path, sessionID: childID))
+                let child = try XCTUnwrap(fixture.viewModel.sessions[childTabID])
+                let childID = try XCTUnwrap(child.activeAgentSessionID)
+                let childImage = try XCTUnwrap(child.items.flatMap(\.attachments).first)
+                guard case let .localFile(childPath) = childImage.source else { return XCTFail("Child must keep a local image") }
+                XCTAssertGreaterThan(childSaves, 0)
+                XCTAssertEqual(childImage.id, attachment.id)
+                XCTAssertEqual(childImage.title, attachment.title)
+                XCTAssertEqual(childImage.createdAt, attachment.createdAt)
+                XCTAssertEqual(childImage.kind, attachment.kind)
+                XCTAssertEqual(childImage.fileName, attachment.fileName)
+                XCTAssertEqual(childImage.byteCount, attachment.byteCount)
+                XCTAssertEqual(fixture.sourceSession.items.flatMap(\.attachments), [attachment])
+                XCTAssertEqual(
+                    fixture.viewModel.oracleAuthorizedAttachmentPaths(tabID: childTabID, agentSessionID: childID),
+                    [childPath]
+                )
+                XCTAssertFalse(store.isRetainedPath(parentImage.path, sessionID: childID))
 
-            try await AgentSessionDataService.shared.deleteAgentSession(id: fixture.sourceSessionID, for: workspace)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: parentImage.path))
-            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: childPath)), originalBytes)
-            XCTAssertEqual(
-                fixture.viewModel.oracleAuthorizedAttachmentPaths(tabID: childTabID, agentSessionID: childID),
-                [childPath]
-            )
-            let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: childID, for: workspace)
-            XCTAssertEqual(try XCTUnwrap(loaded).items.flatMap(\.attachments), [childImage])
+                try await AgentSessionDataService.shared.deleteAgentSession(id: fixture.sourceSessionID, for: workspace)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: parentImage.path))
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: childPath)), originalBytes)
+                XCTAssertEqual(
+                    fixture.viewModel.oracleAuthorizedAttachmentPaths(tabID: childTabID, agentSessionID: childID),
+                    [childPath]
+                )
+                let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: childID, for: workspace)
+                XCTAssertEqual(try XCTUnwrap(loaded).items.flatMap(\.attachments), [childImage])
+            }
         }
     }
 
@@ -1210,7 +1218,7 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? [])
     }
 
-    private func installHandoffImage(_ fixture: Fixture) async throws -> (AgentSessionAttachmentStore, AgentImageAttachment, URL) {
+    private func installHandoffImage(_ fixture: Fixture, isImage: Bool = true) async throws -> (AgentSessionAttachmentStore, AgentFileAttachment, URL) {
         let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
         let folder = WorkspaceSessionSidecarMigration.workspaceDirectory(
             for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
@@ -1220,9 +1228,14 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         let sourceFolder = store.sessionFolderURL(sessionID: fixture.sourceSessionID)
         try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
         let attachmentID = UUID()
-        let image = sourceFolder.appendingPathComponent("\(attachmentID.uuidString).png")
-        try Data("handoff image bytes".utf8).write(to: image)
-        let attachment = AgentImageAttachment(id: attachmentID, source: .localFile(path: image.path), title: "Handoff image")
+        let fileName = isImage ? "image.png" : "document.pdf"
+        let image = sourceFolder.appendingPathComponent(attachmentID.uuidString).appendingPathExtension(isImage ? "png" : "pdf")
+        let bytes = Data("handoff attachment bytes".utf8)
+        try bytes.write(to: image)
+        let attachment = AgentFileAttachment(
+            id: attachmentID, source: .localFile(path: image.path), title: "Handoff attachment",
+            kind: isImage ? .image : .pdf, fileName: fileName, byteCount: bytes.count
+        )
         fixture.sourceSession.appendItem(.user("Look at this image", attachments: [attachment]))
         fixture.sourceSession.appendItem(.assistant("Image received"))
         // A hydrated source hands off from its structured transcript; appended live items reach it

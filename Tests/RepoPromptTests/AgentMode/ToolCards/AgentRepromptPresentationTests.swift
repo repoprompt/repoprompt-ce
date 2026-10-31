@@ -237,7 +237,7 @@ final class AgentRepromptPresentationTests: XCTestCase {
         func descendants(_ view: NSView) -> [NSView] {
             [view] + view.subviews.flatMap { descendants($0) }
         }
-        let editor = try XCTUnwrap(descendants(host).compactMap { $0 as? ImageAwareTextView }.first)
+        let editor = try XCTUnwrap(descendants(host).compactMap { $0 as? AttachmentAwareTextView }.first)
         let coordinator = try XCTUnwrap(editor.delegate as? CustomTextField.Coordinator)
         func awaitRequest(_ request: UUID) async throws {
             host.layoutSubtreeIfNeeded()
@@ -290,8 +290,8 @@ final class AgentRepromptPresentationTests: XCTestCase {
             window.close()
         }
         host.layoutSubtreeIfNeeded()
-        func editor(in view: NSView) -> ImageAwareTextView? {
-            if let text = view as? ImageAwareTextView { return text }
+        func editor(in view: NSView) -> AttachmentAwareTextView? {
+            if let text = view as? AttachmentAwareTextView { return text }
             return view.subviews.lazy.compactMap { editor(in: $0) }.first
         }
         let textView = try XCTUnwrap(editor(in: host))
@@ -310,7 +310,7 @@ final class AgentRepromptPresentationTests: XCTestCase {
     }
 
     func testReadOnlyEditorHandlesReturnDirectlyButNotHeldKeysOrModifiedReturn() throws {
-        let textView = ImageAwareTextView()
+        let textView = AttachmentAwareTextView()
         textView.isEditable = false
         var returns = 0
         textView.readOnlyReturnHandler = { returns += 1 }
@@ -346,12 +346,12 @@ final class AgentRepromptPresentationTests: XCTestCase {
         XCTAssertTrue(store.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID))
         XCTAssertFalse(store.allowsAttachmentMutation(tabID: tabID, currentTabID: nil), "Delayed intake must reject a cleared live selection, not fall back to a captured tab")
         XCTAssertFalse(store.allowsAttachmentMutation(tabID: tabID, currentTabID: UUID()))
-        let textView = ImageAwareTextView()
+        let textView = AttachmentAwareTextView()
         textView.string = "Original"
         textView.isEditable = false
-        textView.enablesImagePasteHandling = true
+        textView.enablesAttachmentPasteHandling = true
         var pastes = 0
-        textView.imagePasteHandler = { _ in pastes += 1
+        textView.attachmentPasteHandler = { _ in pastes += 1
             return true
         }
         let board = NSPasteboard.withUniqueName()
@@ -400,11 +400,11 @@ final class AgentRepromptPresentationTests: XCTestCase {
         func event(_ flags: NSEvent.ModifierFlags, code: UInt16 = 36) throws -> NSEvent {
             try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0, context: nil, characters: "\r", charactersIgnoringModifiers: "\r", isARepeat: false, keyCode: code))
         }
-        XCTAssertTrue(try ImageAwareTextView.isCommandReturn(event(.command)))
-        XCTAssertTrue(try ImageAwareTextView.isCommandReturn(event(.command, code: 76)))
+        XCTAssertTrue(try AttachmentAwareTextView.isCommandReturn(event(.command)))
+        XCTAssertTrue(try AttachmentAwareTextView.isCommandReturn(event(.command, code: 76)))
         let otherFlags: [NSEvent.ModifierFlags] = [[], .shift, [.command, .shift], [.command, .option], [.command, .control]]
         for flags in otherFlags {
-            XCTAssertFalse(try ImageAwareTextView.isCommandReturn(event(flags)))
+            XCTAssertFalse(try AttachmentAwareTextView.isCommandReturn(event(flags)))
         }
         var escapes = 0
         let field = CustomTextField(text: .constant("prepared"), placeholder: "", onReturn: {}, onEscape: { escapes += 1 }, currentHeightPresetIndex: .constant(0), onHeightChange: { _ in })

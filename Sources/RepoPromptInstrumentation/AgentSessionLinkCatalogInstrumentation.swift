@@ -18,6 +18,10 @@ package enum AgentSessionLinkCatalogOutcome: String, Equatable, Sendable {
     case spentStrandedRunRetired = "spent-stranded-run-retired"
 }
 
+package enum AgentSessionLinkReturnedDefinition: String, Sendable {
+    case unknown, absent, exact, ambiguous, different
+}
+
 /// The sink receives only identifiers, bounded generations, and closed presence/outcome values.
 /// Hashing and local logging remain the app adapter's responsibility.
 package enum AgentSessionLinkCatalogEvent: Sendable {
@@ -42,6 +46,10 @@ package enum AgentSessionLinkCatalogEvent: Sendable {
     )
     case repairTransition(runID: UUID?, tabID: UUID, outcome: AgentSessionLinkCatalogOutcome)
     case toolCallReceived(runID: UUID?, tabID: UUID?, connectionID: UUID)
+    case quietQualification(
+        tabID: UUID, reserved: Bool, candidate: Bool, routingGeneration: UInt64?,
+        definition: AgentSessionLinkReturnedDefinition, serverProof: Bool, ordinary: Bool, qualified: Bool
+    )
 }
 
 package protocol AgentSessionLinkCatalogEventSink: Sendable {

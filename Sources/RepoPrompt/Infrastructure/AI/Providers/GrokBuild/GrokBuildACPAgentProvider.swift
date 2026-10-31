@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 import RepoPromptProcess
 import RepoPromptSettingsCore
 
@@ -117,9 +118,9 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
-        // Grok Build 1.0.3 advertises promptCapabilities.image = false over ACP, so v1 is
-        // text-only: reject attachments explicitly instead of silently dropping them.
-        guard request.attachments.isEmpty, message.transientImages.isEmpty else {
+        // Grok Build 1.0.3 advertises promptCapabilities.image = false over ACP, so image
+        // attachments are rejected explicitly and Oracle attachments travel only as prompt text.
+        guard request.attachments.isEmpty else {
             throw AIProviderError.invalidConfiguration(
                 detail: "Grok Build does not advertise image support over ACP; remove attachments and retry."
             )
@@ -139,7 +140,7 @@ struct GrokBuildACPAgentProvider: ACPAgentProvider {
         }
 
         return try ACPPromptContentBuilder.blocks(
-            text: text,
+            text: AttachmentEncoding.textOnlyBody(for: message.attachments, route: .grokBuild, body: text),
             attachments: request.attachments
         )
     }

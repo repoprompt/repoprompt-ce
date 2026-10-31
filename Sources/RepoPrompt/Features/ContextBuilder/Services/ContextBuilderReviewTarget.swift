@@ -27,7 +27,7 @@ enum ContextBuilderReviewTargetUnavailableReason: Equatable, LocalizedError {
         case let .nonGitSelection(count):
             "Context Builder found \(count) selected item(s) without an exact Git checkout owner."
         case .ambiguousOwnership:
-            "Context Builder selected repository ownership is ambiguous."
+            "Context Builder cannot determine a unique authorized workspace-root mapping. Check the selected files and loaded roots, then start a new review."
         case let .unauthorizedSelectedArtifact(count):
             "Context Builder found \(count) selected Git artifact(s) without frozen checkout authority."
         case let .deferredArtifactSelection(count):
@@ -46,16 +46,20 @@ enum ContextBuilderReviewTargetUnavailableReason: Equatable, LocalizedError {
     }
 }
 
-struct ContextBuilderReviewCheckoutTarget: Equatable, Hashable {
+struct ContextBuilderReviewRootAuthority: Equatable, Hashable {
     let logicalWorkspaceRoot: WorkspaceRootRef
     let physicalWorkspaceRoot: WorkspaceRootRef
     let physicalWorkspaceRootKind: WorkspaceRootKind
+    let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
+}
+
+struct ContextBuilderReviewCheckoutTarget: Equatable, Hashable {
+    let contributingRoots: [ContextBuilderReviewRootAuthority]
     let checkoutRootPath: String
     let repoKey: String
     let repositoryID: String
     let worktreeID: String
     let kind: FrozenVisibleGitCheckoutKind
-    let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
 
     var identityKey: String {
         [repoKey, repositoryID, worktreeID, GitRepoRootAuthorization.canonicalPath(checkoutRootPath)]
@@ -549,16 +553,38 @@ struct ContextBuilderReviewTargetResolver {
         }
 
         let combined = ordinaryTargets.isEmpty ? artifactTargets : ordinaryTargets
-        let targets = Dictionary(grouping: combined, by: \.identityKey)
-            .compactMap { _, values in Set(values).count == 1 ? values.first : nil }
-            .sorted { lhs, rhs in
-                if lhs.logicalWorkspaceRoot.name != rhs.logicalWorkspaceRoot.name {
-                    return lhs.logicalWorkspaceRoot.name < rhs.logicalWorkspaceRoot.name
+        let targets: [ContextBuilderReviewCheckoutTarget]
+        do {
+            targets = try Dictionary(grouping: combined, by: \.identityKey)
+                .map { _, values in
+                    guard let first = values.first,
+                          values.allSatisfy({ $0.kind == first.kind })
+                    else {
+                        throw ContextBuilderReviewTargetUnavailableReason.ambiguousOwnership
+                    }
+                    return try ContextBuilderReviewCheckoutTarget(
+                        contributingRoots: sortedRootAuthorities(values.flatMap(\.contributingRoots)),
+                        checkoutRootPath: first.checkoutRootPath,
+                        repoKey: first.repoKey,
+                        repositoryID: first.repositoryID,
+                        worktreeID: first.worktreeID,
+                        kind: first.kind
+                    )
                 }
-                if lhs.repoKey != rhs.repoKey { return lhs.repoKey < rhs.repoKey }
-                if lhs.repositoryID != rhs.repositoryID { return lhs.repositoryID < rhs.repositoryID }
-                return lhs.worktreeID < rhs.worktreeID
-            }
+                .sorted { lhs, rhs in
+                    let lhsName = lhs.contributingRoots.first?.logicalWorkspaceRoot.name ?? ""
+                    let rhsName = rhs.contributingRoots.first?.logicalWorkspaceRoot.name ?? ""
+                    if lhsName != rhsName { return lhsName < rhsName }
+                    if lhs.repoKey != rhs.repoKey { return lhs.repoKey < rhs.repoKey }
+                    if lhs.repositoryID != rhs.repositoryID { return lhs.repositoryID < rhs.repositoryID }
+                    if lhs.worktreeID != rhs.worktreeID { return lhs.worktreeID < rhs.worktreeID }
+                    return lhs.checkoutRootPath < rhs.checkoutRootPath
+                }
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            return .unavailable(reason)
+        } catch {
+            return .unavailable(.ambiguousOwnership)
+        }
         guard !targets.isEmpty else { return .unavailable(.emptySelection) }
 
         let primary: ContextBuilderReviewCheckoutTarget = if let firstOrdinaryPath = ordinaryResolution.paths.first,
@@ -599,36 +625,40 @@ struct ContextBuilderReviewTargetResolver {
     ) async -> ContextBuilderReviewTargetUnavailableReason? {
         var sessionAuthorizations: [WorkspaceSessionRootAuthorization] = []
         for checkout in target.checkouts {
-            let sessionAuthorization: WorkspaceSessionRootAuthorization?
-            if checkout.physicalWorkspaceRootKind == .sessionWorktree {
-                guard let authorization = checkout.sessionRootAuthorization else {
-                    emitRevalidationDiagnostic(
-                        target: target,
-                        outcome: .staleAuthority,
-                        authorization: nil,
-                        mismatch: .token
-                    )
-                    return .staleWorkspaceRoot
+            guard !checkout.contributingRoots.isEmpty else { return .staleWorkspaceRoot }
+            var checkoutSessionAuthorizations: [WorkspaceSessionRootAuthorization] = []
+            for contributor in checkout.contributingRoots {
+                if contributor.physicalWorkspaceRootKind == .sessionWorktree {
+                    guard let authorization = contributor.sessionRootAuthorization,
+                          authorization.root == contributor.physicalWorkspaceRoot
+                    else {
+                        emitRevalidationDiagnostic(
+                            target: target,
+                            outcome: .staleAuthority,
+                            authorization: nil,
+                            mismatch: .token
+                        )
+                        return .staleWorkspaceRoot
+                    }
+                    if let mismatch = await store.validateSessionRootAuthorization(authorization) {
+                        emitRevalidationDiagnostic(
+                            target: target,
+                            outcome: .staleAuthority,
+                            authorization: authorization,
+                            mismatch: mismatch
+                        )
+                        return .staleWorkspaceRoot
+                    }
+                    sessionAuthorizations.append(authorization)
+                    checkoutSessionAuthorizations.append(authorization)
+                } else {
+                    guard await store.exactRootRef(
+                        path: contributor.physicalWorkspaceRoot.standardizedFullPath,
+                        kind: contributor.physicalWorkspaceRootKind
+                    ) == contributor.physicalWorkspaceRoot else {
+                        return .staleWorkspaceRoot
+                    }
                 }
-                if let mismatch = await store.validateSessionRootAuthorization(authorization) {
-                    emitRevalidationDiagnostic(
-                        target: target,
-                        outcome: .staleAuthority,
-                        authorization: authorization,
-                        mismatch: mismatch
-                    )
-                    return .staleWorkspaceRoot
-                }
-                sessionAuthorizations.append(authorization)
-                sessionAuthorization = authorization
-            } else {
-                guard await store.exactRootRef(
-                    path: checkout.physicalWorkspaceRoot.standardizedFullPath,
-                    kind: checkout.physicalWorkspaceRootKind
-                ) == checkout.physicalWorkspaceRoot else {
-                    return .staleWorkspaceRoot
-                }
-                sessionAuthorization = nil
             }
 
             guard let resolved = await vcsService.resolveRepo(
@@ -640,13 +670,15 @@ struct ContextBuilderReviewTargetResolver {
                 let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: resolved.rootURL)
             else { return .checkoutIdentityChanged }
 
-            if let authorization = sessionAuthorization,
-               let mismatch = await store.validateSessionRootAuthorization(authorization)
-            {
+            if let mismatch = await firstStaleAuthorization(
+                in: checkoutSessionAuthorizations,
+                store: store
+            ) {
                 emitRevalidationDiagnostic(
                     target: target,
                     outcome: .staleAuthority,
-                    authorization: authorization,
+                    authorization: Set(checkoutSessionAuthorizations).count == 1
+                        ? checkoutSessionAuthorizations.first : nil,
                     mismatch: mismatch
                 )
                 return .staleWorkspaceRoot
@@ -822,23 +854,56 @@ struct ContextBuilderReviewTargetResolver {
         scopedRoots: [WorkspaceRootRef],
         lookupContext: WorkspaceLookupContext
     ) throws -> ContextBuilderReviewCheckoutTarget {
-        let canonicalPaths = selectedPaths.map(GitRepoRootAuthorization.canonicalPath)
-        let matchingRoots = scopedRoots.filter { root in
-            let rootPath = GitRepoRootAuthorization.canonicalPath(root.standardizedFullPath)
-            return canonicalPaths.allSatisfy {
-                $0 == rootPath || StandardizedPath.isDescendant($0, of: rootPath)
+        let roots = Set(scopedRoots)
+        let contributingPhysicalRoots = try Set(selectedPaths.map { selectedPath in
+            let path = GitRepoRootAuthorization.canonicalPath(selectedPath)
+            let matchingRoots = roots.filter { root in
+                let rootPath = GitRepoRootAuthorization.canonicalPath(root.standardizedFullPath)
+                return path == rootPath || StandardizedPath.isDescendant(path, of: rootPath)
             }
+            let longest = matchingRoots.map {
+                GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath).count
+            }.max()
+            let mostSpecific = matchingRoots.filter {
+                GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath).count == longest
+            }
+            guard mostSpecific.count == 1, let physicalRoot = mostSpecific.first else {
+                throw ContextBuilderReviewTargetUnavailableReason.ambiguousOwnership
+            }
+            return physicalRoot
+        })
+        let authorities = try contributingPhysicalRoots.map {
+            try makeRootAuthority(physicalRoot: $0, lookupContext: lookupContext)
         }
-        let longest = matchingRoots.map { GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath).count }.max()
-        let mostSpecific = matchingRoots.filter {
-            GitRepoRootAuthorization.canonicalPath($0.standardizedFullPath).count == longest
-        }
-        guard mostSpecific.count == 1, let physicalRoot = mostSpecific.first else {
-            throw ContextBuilderReviewTargetUnavailableReason.ambiguousOwnership
-        }
-        let boundRoot = lookupContext.bindingProjection?.boundRootsForMetadata.first {
+        return try ContextBuilderReviewCheckoutTarget(
+            contributingRoots: sortedRootAuthorities(authorities),
+            checkoutRootPath: GitRepoRootAuthorization.canonicalPath(checkoutRootPath),
+            repoKey: repoKey,
+            repositoryID: repositoryID,
+            worktreeID: worktreeID,
+            kind: kind
+        )
+    }
+
+    private func makeRootAuthority(
+        physicalRoot: WorkspaceRootRef,
+        lookupContext: WorkspaceLookupContext
+    ) throws -> ContextBuilderReviewRootAuthority {
+        let boundRoots = lookupContext.bindingProjection?.boundRootsForMetadata.filter {
             $0.physicalRoot.id == physicalRoot.id
                 && $0.physicalRoot.standardizedFullPath == physicalRoot.standardizedFullPath
+        } ?? []
+        let boundRoot = boundRoots.first
+        // Logical aliases remain in the frozen projection. Review authority is physical-root scoped;
+        // retain its deterministic first logical root for display, not as an equality requirement.
+        guard boundRoots.allSatisfy({
+            $0.physicalRoot == physicalRoot
+                && $0.sessionRootAuthorization == boundRoot?.sessionRootAuthorization
+                && $0.binding.repositoryID == boundRoot?.binding.repositoryID
+                && $0.binding.repoKey == boundRoot?.binding.repoKey
+                && $0.binding.worktreeID == boundRoot?.binding.worktreeID
+        }) else {
+            throw ContextBuilderReviewTargetUnavailableReason.ambiguousOwnership
         }
         let isSessionWorktreeRoot: Bool = switch lookupContext.rootScope {
         case let .sessionBoundWorkspace(_, physicalRootPaths):
@@ -853,24 +918,47 @@ struct ContextBuilderReviewTargetResolver {
         }
         let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
         if isSessionWorktreeRoot {
-            guard let authorization = boundRoot?.sessionRootAuthorization else {
+            guard let authorization = boundRoot?.sessionRootAuthorization,
+                  authorization.root == physicalRoot
+            else {
                 throw ContextBuilderReviewTargetUnavailableReason.staleWorkspaceRoot
             }
             sessionRootAuthorization = authorization
         } else {
             sessionRootAuthorization = nil
         }
-        return ContextBuilderReviewCheckoutTarget(
+        return ContextBuilderReviewRootAuthority(
             logicalWorkspaceRoot: boundRoot?.logicalRoot ?? physicalRoot,
             physicalWorkspaceRoot: physicalRoot,
             physicalWorkspaceRootKind: isSessionWorktreeRoot ? .sessionWorktree : .primaryWorkspace,
-            checkoutRootPath: GitRepoRootAuthorization.canonicalPath(checkoutRootPath),
-            repoKey: repoKey,
-            repositoryID: repositoryID,
-            worktreeID: worktreeID,
-            kind: kind,
             sessionRootAuthorization: sessionRootAuthorization
         )
+    }
+
+    private func sortedRootAuthorities(
+        _ authorities: [ContextBuilderReviewRootAuthority]
+    ) throws -> [ContextBuilderReviewRootAuthority] {
+        guard !authorities.isEmpty else {
+            throw ContextBuilderReviewTargetUnavailableReason.ambiguousOwnership
+        }
+        var byPhysicalRoot: [WorkspaceRootRef: ContextBuilderReviewRootAuthority] = [:]
+        for authority in authorities {
+            if let existing = byPhysicalRoot[authority.physicalWorkspaceRoot], existing != authority {
+                throw ContextBuilderReviewTargetUnavailableReason.ambiguousOwnership
+            }
+            byPhysicalRoot[authority.physicalWorkspaceRoot] = authority
+        }
+        return byPhysicalRoot.values.sorted { lhs, rhs in
+            func key(_ authority: ContextBuilderReviewRootAuthority) -> [String] {
+                let logical = authority.logicalWorkspaceRoot
+                let physical = authority.physicalWorkspaceRoot
+                return [
+                    logical.name, logical.standardizedFullPath, logical.fullPath, logical.id.uuidString,
+                    physical.standardizedFullPath, physical.fullPath, physical.name, physical.id.uuidString
+                ]
+            }
+            return key(lhs).lexicographicallyPrecedes(key(rhs))
+        }
     }
 
     private func firstStaleAuthorization(

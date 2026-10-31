@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 /// Pane-wide image drop state for one Agent Mode pane.
 ///
-/// The pane's SwiftUI drop delegate and the composer's `ImageAwareTextView` both report into this
+/// The pane's SwiftUI drop delegate and the composer's `AttachmentAwareTextView` both report into this
 /// controller, so the overlay stays lit while an image drag moves between the transcript, the
 /// text field, and the composer controls. Text and non-image drags are never highlighted.
 @MainActor
@@ -59,8 +59,8 @@ final class AgentImageDropController: ObservableObject {
     @discardableResult
     func performPaneDrop(
         currentTabID: UUID?,
-        load: (_ completion: @escaping ([AgentImageInputAdapter.PreparedImage]) -> Void) -> Bool,
-        prepareAttach: (_ tabID: UUID) -> ([AgentImageInputAdapter.PreparedImage]) -> Void
+        load: (_ completion: @escaping ([AgentAttachmentIntake.Prepared]) -> Void) -> Bool,
+        prepareAttach: (_ tabID: UUID) -> ([AgentAttachmentIntake.Prepared]) -> Void
     ) -> Bool {
         let accepts = tracker.classification.map { $0 != .notImages } ?? true
         let target = tracker.takeDropTarget(fallbackTabID: currentTabID)
@@ -114,8 +114,8 @@ final class AgentImageDropController: ObservableObject {
 struct AgentImagePaneDropDelegate: DropDelegate {
     let controller: AgentImageDropController
     let currentTabID: () -> UUID?
-    let prepareAttachImages: (_ tabID: UUID) -> ([URL]) -> Void
-    var imageInputAdapter = AgentImageInputAdapter()
+    let prepareAttachImages: (_ tabID: UUID) -> ([URL]) async -> Void
+    var attachmentIntake = AgentAttachmentIntake()
 
     static let acceptedTypes: [UTType] = [.image, .fileURL]
 
@@ -142,18 +142,26 @@ struct AgentImagePaneDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         let providers = info.itemProviders(for: Self.acceptedTypes)
-        let adapter = imageInputAdapter
+        let adapter = attachmentIntake
         let prepareAttachImages = prepareAttachImages
         return controller.performPaneDrop(
             currentTabID: currentTabID(),
             load: { completion in
-                adapter.loadPreparedImages(from: providers, completion: completion)
+                adapter.loadPreparedAttachments(from: providers) { prepared, _ in
+                    let images = prepared.filter {
+                        AgentImageDropClassifier.classify(typeIdentifiers: [], fileURLs: [$0.url]) == .images
+                    }
+                    adapter.cleanupTemporaryFiles(prepared.filter { !images.contains($0) })
+                    completion(images)
+                }
             },
             prepareAttach: { tabID in
                 let attach = prepareAttachImages(tabID)
                 return { prepared in
-                    attach(prepared.map(\.url))
-                    adapter.cleanupTemporaryFiles(prepared)
+                    Task { @MainActor in
+                        defer { adapter.cleanupTemporaryFiles(prepared) }
+                        await attach(prepared.map(\.url))
+                    }
                 }
             }
         )

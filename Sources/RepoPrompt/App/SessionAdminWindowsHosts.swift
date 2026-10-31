@@ -352,14 +352,20 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
 
     // MARK: - Repository context of the TARGET session
 
+    /// The target's placement, canonical discovery, and binding authority, captured before discovery suspends.
+    /// Capture elects nothing and requires no hydrated bindings: merge apply needs only its admission roots.
     @MainActor
-    private struct TargetContext {
+    private struct TargetCapture {
         let owner: AgentSessionCarrierResolver.RuntimeOwner
         let workspaceID: UUID
         let repoPaths: [String]
+        /// Canonical (logical) roots of the target's workspace.
         let roots: [WorkspaceRootRef]
+        /// Repositories resolved from exactly those roots, deduplicated by checkout path.
         let repos: [GitRepoDescriptor]
-        let repo: GitRepoDescriptor
+        let repoByRootPath: [String: GitRepoDescriptor]
+        /// Read synchronously with placement, so a binding change during discovery is detected.
+        let bindingSource: AgentWorkspaceLookupContextSource
 
         var viewModel: AgentModeViewModel {
             owner.location.window.agentModeViewModel
@@ -369,11 +375,46 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             owner.session
         }
 
-        var isCurrent: Bool {
+        /// Runtime owner, workspace, and declared root order (PRIMARY moves on reorder).
+        var isPlacementCurrent: Bool {
             SessionAdminWindows.isCurrent(owner)
                 && viewModel.workspaceManager?.activeWorkspace?.id == workspaceID
                 && viewModel.workspaceManager?.activeWorkspace?.repoPaths == repoPaths
         }
+
+        /// The target's hydration and binding set still match the capture.
+        var isBindingCurrent: Bool {
+            Self.bindingSource(viewModel, sessionID: owner.location.sessionID).identity == bindingSource.identity
+        }
+
+        static func bindingSource(_ viewModel: AgentModeViewModel, sessionID: UUID) -> AgentWorkspaceLookupContextSource {
+            AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: sessionID,
+                worktreeBindingState: viewModel.worktreeBindingState(forAgentSessionID: sessionID)
+            )
+        }
+    }
+
+    /// Create/bind authority: the capture's hydrated target bindings and the validated lookup they project to.
+    @MainActor
+    private struct TargetAuthority {
+        let capture: TargetCapture
+        let bindings: [AgentSessionWorktreeBinding]
+        let election: WorkspaceDefaultGitRepositoryElection.Snapshot
+
+        /// Checked only before a commit fence: a transition's own publication is not supersession.
+        var isCurrent: Bool {
+            capture.isPlacementCurrent && capture.isBindingCurrent
+        }
+    }
+
+    /// A real selected repository where Git executes. `logicalRoot` is set when election chose it, so binding
+    /// attribution never rediscovers it by load order; explicit selections use the existing first-match rule.
+    private struct TargetRepository {
+        let repo: GitRepoDescriptor
+        let logicalRoot: WorkspaceRootRef?
+        /// The elected checkout itself, already validated against the target's binding identity.
+        let electedCheckout: GitRepoDescriptor?
     }
 
     /// A saved or never-visited target is prepared (no tab focus, no provider run) before an
@@ -385,8 +426,8 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         guard outcome == .ready else { throw SessionAdminWindowsStructureHost.preparationRefusal(outcome) }
     }
 
-    /// Repositories and roots come from the target's own workspace, never the caller's routing.
-    private func targetContext(_ sessionID: UUID, repoRoot: String?) async throws -> TargetContext {
+    /// Roots and repositories come from the target's own workspace, never the caller's routing.
+    private func captureTarget(_ sessionID: UUID) async throws -> TargetCapture {
         guard let owner = SessionAdminWindows.runtimeOwner(for: sessionID) else {
             throw SessionAdminHostError.sessionUnavailable
         }
@@ -394,45 +435,192 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         guard let workspace = viewModel.workspaceManager?.activeWorkspace,
               let store = viewModel.promptManager?.workspaceFileContextStore
         else { throw SessionAdminHostError.sessionUnavailable }
+        let bindingSource = TargetCapture.bindingSource(viewModel, sessionID: sessionID)
         let roots = await store.rootRefs(scope: .visibleWorkspace)
         var repos: [GitRepoDescriptor] = []
+        var repoByRootPath: [String: GitRepoDescriptor] = [:]
         var seen: Set<String> = []
         for root in roots {
             if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
                 let descriptor = GitRepoDescriptor(rootURL: resolved.rootURL)
+                repoByRootPath[root.standardizedFullPath] = descriptor
                 if seen.insert(descriptor.rootPath.lowercased()).inserted { repos.append(descriptor) }
             }
         }
-        guard let defaultRepo = repos.first else {
-            throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
-        }
-        let repo: GitRepoDescriptor
-        if let repoRoot {
-            do {
-                repo = try await resolver.resolveRepoRootToken(repoRoot, allRepos: repos, visibleRoots: roots, defaultRepo: defaultRepo)
-            } catch let error as GitRepoTargetResolverError {
-                throw SessionAdminHostError.invalid(error.message)
-            }
-        } else {
-            repo = defaultRepo
-        }
-        let context = TargetContext(
+        let capture = TargetCapture(
             owner: owner, workspaceID: workspace.id, repoPaths: workspace.repoPaths,
-            roots: roots, repos: repos, repo: repo
+            roots: roots, repos: repos, repoByRootPath: repoByRootPath, bindingSource: bindingSource
         )
-        guard context.isCurrent else { throw SessionAdminHostError.authorityEnded }
-        return context
+        guard capture.isPlacementCurrent else { throw SessionAdminHostError.authorityEnded }
+        return capture
     }
 
-    private func logicalRoot(for repo: GitRepoDescriptor, in context: TargetContext) async throws -> WorkspaceRootRef {
-        for root in context.roots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)),
-               GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path) == GitRepoRootAuthorization.canonicalPath(repo.rootPath)
+    /// Create/bind require the target's authoritative, hydrated bindings and their validated projection
+    /// (`requiredLookupContext`), even when the selector is explicit; only default election is optional.
+    private func resolveTargetAuthority(_ sessionID: UUID) async throws -> TargetAuthority {
+        let capture = try await captureTarget(sessionID)
+        guard !capture.repos.isEmpty else {
+            throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
+        }
+        guard capture.session.permitsBoundOperationAndSave else { throw SessionAdminHostError.sessionUnavailable }
+        guard case let .hydrated(bindings) = capture.bindingSource.worktreeBindingState else {
+            throw SessionAdminHostError.invalid(WorkspaceLookupContextResolutionError.unknownBindingState.localizedDescription)
+        }
+        guard let store = capture.viewModel.promptManager?.workspaceFileContextStore else {
+            throw SessionAdminHostError.sessionUnavailable
+        }
+        let lookupContext: WorkspaceLookupContext
+        do {
+            lookupContext = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
+                source: capture.bindingSource, visibleRoots: capture.roots, store: store
+            )
+        } catch let error as WorkspaceLookupContextResolutionError {
+            guard capture.isPlacementCurrent, capture.isBindingCurrent else { throw SessionAdminHostError.authorityEnded }
+            throw SessionAdminHostError.invalid(error.localizedDescription)
+        }
+        let lookupRoots = await store.rootRefs(scope: lookupContext.rootScope)
+        try Task.checkCancellation()
+        guard capture.isPlacementCurrent, capture.isBindingCurrent else { throw SessionAdminHostError.authorityEnded }
+        return TargetAuthority(
+            capture: capture,
+            bindings: bindings,
+            election: .init(
+                workspaceID: capture.workspaceID,
+                declaredRepoPaths: capture.repoPaths,
+                bindingSource: capture.bindingSource,
+                lookupContext: lookupContext,
+                lookupRoots: lookupRoots
+            )
+        )
+    }
+
+    /// The target's default repository: its sole binding's checkout, or declared PRIMARY with no bindings.
+    /// A superseded attempt fails rather than retargeting.
+    private func electDefaultRepository(_ authority: TargetAuthority) async throws -> WorkspaceDefaultGitRepositoryElection.Selection {
+        let selection: WorkspaceDefaultGitRepositoryElection.Selection
+        do {
+            selection = try await WorkspaceDefaultGitRepositoryElection(vcsService: vcsService).elect(in: authority.election)
+        } catch let failure as WorkspaceDefaultGitRepositoryElection.Failure {
+            guard authority.isCurrent else { throw SessionAdminHostError.authorityEnded }
+            throw SessionAdminHostError.invalid(failure.localizedDescription)
+        } catch let error as WorkspaceLookupContextResolutionError {
+            guard authority.isCurrent else { throw SessionAdminHostError.authorityEnded }
+            throw SessionAdminHostError.invalid(error.localizedDescription)
+        }
+        guard authority.isCurrent else { throw SessionAdminHostError.authorityEnded }
+        return selection
+    }
+
+    /// The repository `repo_root` names, else the elected default. Explicit tokens keep the host's canonical
+    /// roots and raw selector semantics (a canonical path is never replaced by its bound checkout); only an
+    /// omitted or relative token (bare `@main`, `@current`, `@wt`) elects.
+    private func resolveRepository(_ repoRoot: String?, authority: TargetAuthority) async throws -> TargetRepository {
+        let capture = authority.capture
+        guard let repoRoot else {
+            let selection = try await electDefaultRepository(authority)
+            return TargetRepository(repo: selection.repository, logicalRoot: selection.logicalRoot, electedCheckout: selection.repository)
+        }
+        do {
+            do {
+                let repo = try await resolver.resolveRepoRootToken(
+                    repoRoot, allRepos: capture.repos, visibleRoots: capture.roots, defaultRepo: nil
+                )
+                return TargetRepository(repo: repo, logicalRoot: nil, electedCheckout: nil)
+            } catch is GitRepoTargetResolver.DefaultRepositoryRequired {
+                let selection = try await electDefaultRepository(authority)
+                let repo = try await resolver.resolveRepoRootToken(
+                    repoRoot, allRepos: capture.repos, visibleRoots: capture.roots, defaultRepo: selection.repository
+                )
+                return TargetRepository(repo: repo, logicalRoot: selection.logicalRoot, electedCheckout: selection.repository)
+            }
+        } catch let error as GitRepoTargetResolverError {
+            throw SessionAdminHostError.invalid(error.message)
+        }
+    }
+
+    /// Resolves `worktree` against the `repo_root` repository when one was named. Otherwise an identifying
+    /// selector (`@id:`, `@branch:`, name, branch, or path) searches the target's repositories and is attributed
+    /// to the worktree's own repository; a relative one (`@current`, `@main[:<branch>]`, `@wt`) uses the elected
+    /// default and its logical root.
+    private func resolveWorktree(
+        _ selector: String,
+        repository: TargetRepository?,
+        authority: TargetAuthority
+    ) async throws -> (worktree: GitWorktreeDescriptor, target: TargetRepository) {
+        let capture = authority.capture
+        do {
+            if let repository {
+                let worktree = try await resolver.resolveWorktree(
+                    selector: selector, repo: repository.repo, allRepos: capture.repos, authorizedRoots: capture.roots
+                )
+                guard repository.logicalRoot == nil else { return (worktree, repository) }
+                let repo = capture.repos.first { $0.repoKey == worktree.repository.repoKey } ?? repository.repo
+                return (worktree, TargetRepository(repo: repo, logicalRoot: nil, electedCheckout: nil))
+            }
+            do {
+                let worktree = try await resolver.resolveWorktree(
+                    selector: selector, repo: nil, allRepos: capture.repos, authorizedRoots: capture.roots
+                )
+                return try (worktree, owningRepository(of: worktree, in: capture))
+            } catch is GitRepoTargetResolver.DefaultRepositoryRequired {
+                let selection = try await electDefaultRepository(authority)
+                let worktree = try await resolver.resolveWorktree(
+                    selector: selector, repo: selection.repository, allRepos: capture.repos, authorizedRoots: capture.roots
+                )
+                return (worktree, TargetRepository(
+                    repo: selection.repository, logicalRoot: selection.logicalRoot, electedCheckout: selection.repository
+                ))
+            }
+        } catch let error as GitRepoTargetResolverError {
+            throw SessionAdminHostError.invalid(error.message)
+        }
+    }
+
+    /// The workspace repository an identified worktree belongs to, by identity rather than discovery order: the
+    /// repository that is the worktree itself, else the one sharing its repository identity. Several loaded
+    /// checkouts of that repository are ambiguous; never pick one by load order.
+    private func owningRepository(of worktree: GitWorktreeDescriptor, in capture: TargetCapture) throws -> TargetRepository {
+        let worktreePath = GitRepoRootAuthorization.canonicalPath(worktree.path)
+        if let exact = capture.repos.first(where: { GitRepoRootAuthorization.canonicalPath($0.rootPath) == worktreePath }) {
+            return TargetRepository(repo: exact, logicalRoot: nil, electedCheckout: nil)
+        }
+        let owners = capture.repos.filter { $0.worktreeIdentity?.repository.repositoryID == worktree.repository.repositoryID }
+        guard let owner = owners.first else {
+            throw SessionAdminHostError.invalid("The repository is not attached to the target's workspace.")
+        }
+        guard owners.count == 1 else {
+            throw SessionAdminHostError.invalid(
+                "Worktree \(worktree.path) belongs to a repository with \(owners.count) checkouts in the target's workspace (\(owners.map(\.rootPath).joined(separator: ", "))). Pass repo_root to choose the workspace root it binds under."
+            )
+        }
+        return TargetRepository(repo: owner, logicalRoot: nil, electedCheckout: nil)
+    }
+
+    /// First workspace root, in installation order, whose repository is `repo` (the existing explicit rule).
+    private func logicalRoot(for repo: GitRepoDescriptor, in capture: TargetCapture) throws -> WorkspaceRootRef {
+        let repoPath = GitRepoRootAuthorization.canonicalPath(repo.rootPath)
+        for root in capture.roots {
+            if let resolved = capture.repoByRootPath[root.standardizedFullPath],
+               GitRepoRootAuthorization.canonicalPath(resolved.rootPath) == repoPath
             {
                 return root
             }
         }
         throw SessionAdminHostError.invalid("The repository is not attached to the target's workspace.")
+    }
+
+    /// The repository reported to callers and replayed by `next_call`: the executing repository when it is a
+    /// workspace repository, else the canonical repository of the elected logical root (never a bound checkout
+    /// that an explicit `repo_root` could not name).
+    private func reportedRepositoryRoot(_ target: TargetRepository, in capture: TargetCapture) -> String {
+        let executing = GitRepoRootAuthorization.canonicalPath(target.repo.rootPath)
+        if capture.repos.contains(where: { GitRepoRootAuthorization.canonicalPath($0.rootPath) == executing }) {
+            return target.repo.rootPath
+        }
+        if let logicalRoot = target.logicalRoot, let canonical = capture.repoByRootPath[logicalRoot.standardizedFullPath] {
+            return canonical.rootPath
+        }
+        return target.repo.rootPath
     }
 
     // MARK: - Create
@@ -445,19 +633,31 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         isStillAuthorized: @escaping @MainActor () -> Bool
     ) async throws -> SessionAdminWorktreeInfo {
         try await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized)
-        let context = try await targetContext(sessionID, repoRoot: repoRoot)
+        let authority = try await resolveTargetAuthority(sessionID)
+        let capture = authority.capture
+        let target = try await resolveRepository(repoRoot, authority: authority)
+        // Placement and the target's bindings must hold until the Git commit fence. A committed worktree is
+        // returned even if authority changes afterwards, so the handler can record its ownership.
         let authorize: @MainActor () throws -> Void = {
-            guard isStillAuthorized(), context.isCurrent
+            guard isStillAuthorized(), authority.isCurrent
             else { throw SessionAdminHostError.authorityEnded }
         }
         try authorize()
-        let existing = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
+        let existing = try await vcsService.listGitWorktrees(at: target.repo.rootURL)
         try authorize()
-        let mainRoot = existing.first(where: \.isMain)?.path ?? context.repo.rootPath
+        let mainRoot = existing.first(where: \.isMain)?.path ?? target.repo.rootPath
+        // Refusals name the checkout Git runs in, plus the workspace root it serves when that differs.
+        let executionRepository = target.repo.rootURL.standardizedFileURL.path
+        let servedWorkspaceRoot = target.logicalRoot.map(\.standardizedFullPath).flatMap { root in
+            GitRepoRootAuthorization.canonicalPath(root) == GitRepoRootAuthorization.canonicalPath(executionRepository) ? nil : root
+        }
         if let branch, let holder = existing.first(where: { $0.branch.map(Self.shortBranch) == Self.shortBranch(branch) }) {
             throw SessionAdminHostError.refused(
                 code: "branch_exists",
-                detail: Self.branchExistsDetail(branch, checkedOutAt: holder.path),
+                detail: Self.branchExistsDetail(
+                    branch, repository: executionRepository, workspaceRoot: servedWorkspaceRoot,
+                    checkedOutAt: holder.path, provenBeforeCreation: true
+                ),
                 nextCall: .object(["tool": .string("session_admin"), "arguments": .object([
                     "op": .string("worktree_bind"), "session_id": .string(sessionID.uuidString), "worktree": .string(holder.path)
                 ])])
@@ -478,12 +678,16 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
             purpose: .standaloneCreate(now: Date())
         ))
         // Authorized roots: the target workspace's roots and the repositories resolved from exactly
-        // those roots (a root may sit inside its repository), then the app-managed container. This is
-        // the on-behalf admission only; `manage_worktree` keeps its own policy unchanged.
-        let workspaceRoots = Set(context.roots.map(\.standardizedFullPath) + context.repos.map(\.rootURL.standardizedFileURL.path))
+        // those roots (a root may sit inside its repository), plus an elected checkout the target is bound
+        // to, then the app-managed container. This is the on-behalf admission only; `manage_worktree` keeps
+        // its own policy unchanged.
+        var workspaceRoots = Set(capture.roots.map(\.standardizedFullPath) + capture.repos.map(\.rootURL.standardizedFileURL.path))
+        if let electedCheckout = target.electedCheckout {
+            workspaceRoots.insert(electedCheckout.rootURL.standardizedFileURL.path)
+        }
         // Step 1: the source repository must be admitted before anything is created on disk.
         _ = try await DomainMutationPathFence.admit(
-            requestedPaths: [context.repo.rootURL.standardizedFileURL.path],
+            requestedPaths: [target.repo.rootURL.standardizedFileURL.path],
             authorizedRoots: workspaceRoots
         )
         // Step 2: the container is derived from that admitted repository (never from arguments), so it
@@ -491,13 +695,13 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         try authorize()
         try FileManager.default.createDirectory(at: plan.appManagedContainer, withIntermediateDirectories: true)
         let snapshot = try await DomainMutationPathFence.admit(
-            requestedPaths: [context.repo.rootURL.standardizedFileURL.path, plan.path.standardizedFileURL.path],
+            requestedPaths: [target.repo.rootURL.standardizedFileURL.path, plan.path.standardizedFileURL.path],
             authorizedRoots: workspaceRoots.union([plan.appManagedContainer.standardizedFileURL.path])
         )
         let physicalGuard = DomainMutationPhysicalCommitGuard(snapshot: snapshot)
         let controller = DomainMutationCommitController(physicalMutationGuard: { physicalGuard }, willCommit: {})
         let vcsService = vcsService
-        let repoURL = context.repo.rootURL
+        let repoURL = target.repo.rootURL
         let result: GitWorktreeCreateResult
         do {
             result = try await MCPDomainMutationCommitContext.controllerTaskLocal.withValue(controller) {
@@ -505,16 +709,26 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
                     request: plan.createRequest, at: repoURL, beforeCommit: { try await authorize() }
                 )
             }
-        } catch let error where branch != nil && String(describing: error).contains("already exists") {
-            throw SessionAdminHostError.refused(
-                code: "branch_exists", detail: Self.branchExistsDetail(branch ?? "", checkedOutAt: nil), nextCall: nil
-            )
+        } catch let error as GitService.GitError where error.worktreeCreateFailure != nil {
+            // The Git service classifies its creation failures where the evidence is. Only its preflight refusal
+            // proves nothing was created; Git's own failure past the commit fence does not.
+            if let branch, let failure = error.worktreeCreateFailure, failure.branchExists {
+                throw SessionAdminHostError.refused(
+                    code: "branch_exists",
+                    detail: Self.branchExistsDetail(
+                        branch, repository: executionRepository, workspaceRoot: servedWorkspaceRoot,
+                        checkedOutAt: nil, provenBeforeCreation: failure.refusedBeforeCreation
+                    ),
+                    nextCall: nil
+                )
+            }
+            throw servedWorkspaceRoot.map { error.naming(workspaceRoot: $0, servedBy: executionRepository) } ?? error
         }
         let created = result.descriptor
         return SessionAdminWorktreeInfo(
             worktreeID: created.worktreeID,
             repositoryID: created.repository.repositoryID,
-            repoRootPath: context.repo.rootPath,
+            repoRootPath: reportedRepositoryRoot(target, in: capture),
             path: created.path,
             branch: created.branch,
             isPrunable: created.isPrunable
@@ -525,11 +739,23 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         name.hasPrefix("refs/heads/") ? String(name.dropFirst("refs/heads/".count)) : name
     }
 
-    static func branchExistsDetail(_ branch: String, checkedOutAt path: String?) -> String {
+    /// `repository` is the checkout Git runs in; `workspaceRoot` is the root it serves, given only when it differs.
+    /// "Nothing was created" is claimed only for a refusal proven before creation.
+    static func branchExistsDetail(
+        _ branch: String,
+        repository: String,
+        workspaceRoot: String?,
+        checkedOutAt path: String?,
+        provenBeforeCreation: Bool
+    ) -> String {
+        let location = workspaceRoot.map { "repository \(repository) (for workspace root \($0))" } ?? "repository \(repository)"
+        let outcome = provenBeforeCreation
+            ? "Nothing was created."
+            : "Git reported this while adding the worktree, after the pre-creation checks passed; inspect that repository's worktrees before retrying."
         if let path {
-            return "Branch '\(branch)' already exists and is checked out at \(path). Bind that worktree with worktree_bind {worktree: \"\(path)\"}, or pass a new branch name. Nothing was created."
+            return "Branch '\(branch)' already exists in \(location) and is checked out at \(path). Bind that worktree with worktree_bind {worktree: \"\(path)\"}, or pass a new branch name. \(outcome)"
         }
-        return "Branch '\(branch)' already exists. Pass a new branch name, or omit branch to get a generated one. Nothing was created."
+        return "Branch '\(branch)' already exists in \(location). Pass a new branch name, or omit branch to get a generated one. \(outcome)"
     }
 
     // MARK: - Bind / unbind
@@ -543,20 +769,19 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> SessionAdminWorktreeInfo {
         try await prepareIfUnloaded(sessionID, isStillAuthorized: isStillAuthorized)
-        let context = try await targetContext(sessionID, repoRoot: repoRoot)
-        guard isIdle(context.viewModel, context.session) else { throw SessionAdminHostError.notIdle }
-        let worktree: GitWorktreeDescriptor
-        do {
-            worktree = try await resolver.resolveWorktree(
-                selector: selector, repo: context.repo, allRepos: context.repos, authorizedRoots: context.roots
-            )
-        } catch let error as GitRepoTargetResolverError {
-            throw SessionAdminHostError.invalid(error.message)
+        let authority = try await resolveTargetAuthority(sessionID)
+        let capture = authority.capture
+        guard isIdle(capture.viewModel, capture.session) else { throw SessionAdminHostError.notIdle }
+        let repository: TargetRepository? = if let repoRoot {
+            try await resolveRepository(repoRoot, authority: authority)
+        } else {
+            nil
         }
-        let repoForWorktree = context.repos.first { $0.repoKey == worktree.repository.repoKey } ?? context.repo
-        let logicalRoot = try await logicalRoot(for: repoForWorktree, in: context)
-        guard isStillAuthorized(), context.isCurrent else { throw SessionAdminHostError.authorityEnded }
-        let existing = context.viewModel.worktreeBindings(forAgentSessionID: sessionID)
+        let (worktree, target) = try await resolveWorktree(selector, repository: repository, authority: authority)
+        let logicalRoot = try target.logicalRoot ?? logicalRoot(for: target.repo, in: capture)
+        guard isStillAuthorized(), authority.isCurrent else { throw SessionAdminHostError.authorityEnded }
+        // Desired bindings come from the validated, hydrated capture, preserving unrelated rows.
+        let existing = authority.bindings
         let normalizedRoot = GitRepoRootAuthorization.canonicalPath(logicalRoot.standardizedFullPath)
         let previous = existing.first { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) == normalizedRoot }
         var desired = existing.filter { GitRepoRootAuthorization.canonicalPath($0.logicalRootPath) != normalizedRoot }
@@ -586,19 +811,21 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         // The transition's exact no-op path has no beforeCommit callback. A released ownership row
         // may still be reactivated by that bind, so even this path receives identity admission.
         if existing == desired {
-            guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
+            guard isStillAuthorized(), authority.isCurrent else { throw SessionAdminHostError.authorityEnded }
             try admit()
             committed()
         }
+        // Placement and target bindings are re-checked at entry and at `beforeCommit`; the transition's own
+        // publication afterwards never counts as supersession.
         try await transition(
-            desired, owner: context.owner,
-            isStillAuthorized: { isStillAuthorized() && context.isCurrent },
+            desired, owner: capture.owner,
+            isStillAuthorized: { isStillAuthorized() && authority.isCurrent },
             admitBindings: admit, bindingsCommitted: committed
         )
         return SessionAdminWorktreeInfo(
             worktreeID: worktree.worktreeID,
             repositoryID: worktree.repository.repositoryID,
-            repoRootPath: repoForWorktree.rootPath,
+            repoRootPath: reportedRepositoryRoot(target, in: capture),
             path: worktree.path,
             branch: worktree.branch,
             isPrunable: worktree.isPrunable
@@ -766,12 +993,16 @@ final class SessionAdminWindowsWorktreeHost: SessionAdminWorktreeHost {
         }
         // Fence the merge's source and target worktrees to the target session's workspace roots and
         // their repositories, as `createWorktree` does; the user still decides in the review prompt.
+        // Capture only: the saved operation owns its endpoints, so no default repository is elected.
         let operation = try viewModel.statusWorktreeMerge(sessionID: sessionID, operationID: operationID)
-        let context = try await targetContext(sessionID, repoRoot: nil)
-        var authorizedRoots = Set(context.roots.map(\.standardizedFullPath) + context.repos.map(\.rootURL.standardizedFileURL.path))
+        let capture = try await captureTarget(sessionID)
+        guard !capture.repos.isEmpty else {
+            throw SessionAdminHostError.invalid("The target session's workspace has no Git repository.")
+        }
+        var authorizedRoots = Set(capture.roots.map(\.standardizedFullPath) + capture.repos.map(\.rootURL.standardizedFileURL.path))
         for endpoint in [operation.source, operation.target] {
             if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: endpoint.path)),
-               context.repos.contains(where: {
+               capture.repos.contains(where: {
                    GitRepoRootAuthorization.canonicalPath($0.rootPath) == GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path)
                })
             {

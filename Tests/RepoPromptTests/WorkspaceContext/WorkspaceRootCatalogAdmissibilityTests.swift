@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import XCTest
 
@@ -543,3 +544,621 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
         }
     }
 }
+
+#if DEBUG
+    final class WorkspaceRootCatalogDeltaTests: XCTestCase {
+        func testSmallCanonicalMixedBatchMatchesAuthority() async throws {
+            var fixture = CatalogDeltaFixture(fileCount: 12)
+            let old = fixture.authoritative()
+            let recordsOnly = fixture.authoritative(requiresPathIndexes: false)
+            let snapshot = try await WorkspaceRootSeedTestSupport.snapshot(paths: old.entries.map { ($0.standardizedRelativePath, "100644") })
+            let projectedIndex = try XCTUnwrap(WorkspaceSearchRootPathIndex(
+                identity: WorkspaceSearchRootPathIndexIdentity(rootID: old.root.id, lifetimeID: old.lifetimeID, topologyGeneration: old.topologyGeneration),
+                root: old.root, projectedSnapshot: snapshot,
+                changedRelativeFilePaths: [], tombstonedBaseRelativeFilePaths: [], entries: old.entries
+            ))
+            let projected = WorkspaceFileContextStore.RootCatalogShardComparisonView(
+                lifetimeID: old.lifetimeID, topologyGeneration: old.topologyGeneration, root: old.root,
+                files: old.files, folders: old.folders, entries: old.entries,
+                projectionFiles: old.projectionFiles, projectionLanguages: old.projectionLanguages,
+                projectionFileIndexByID: old.projectionFileIndexByID,
+                pathSearchIndex: projectedIndex, appliedIndexGeneration: old.appliedIndexGeneration
+            )
+            let heldBytes = old.files.map(catalogFileBytes)
+            let first = fixture.addFile(number: 100, name: "Added.swift")
+            let second = fixture.addFile(number: 101, name: "Added.md")
+            let ancestor = try XCTUnwrap(fixture.folders[fixture.parentID])
+            let add = fixture.event(upsertedFiles: [first, second], upsertedFolders: [ancestor, ancestor])
+            let candidate = try XCTUnwrap(fixture.patch(old, event: add))
+            XCTAssertEqual(candidate.logicalMutationCount, 3, "Repeated ancestors count once, but still consume budget")
+            XCTAssertEqual(candidate.changedFileIDs, [first.id, second.id])
+            assertCatalogParity(candidate.shard, fixture.authoritative(generation: 1))
+            let projectedCandidate = try XCTUnwrap(fixture.patch(projected, event: add))
+            XCTAssertEqual(projectedCandidate.shard.pathSearchIndex?.buildKind, .projectedReuse)
+            assertCatalogParity(projectedCandidate.shard, fixture.authoritative(generation: 1))
+            let recordsOnlyCandidate = try XCTUnwrap(fixture.patch(recordsOnly, event: add))
+            XCTAssertNil(recordsOnlyCandidate.shard.pathSearchIndex)
+            assertCatalogParity(recordsOnlyCandidate.shard, fixture.authoritative(generation: 1, requiresPathIndexes: false))
+            XCTAssertEqual(old.files.map(catalogFileBytes), heldBytes)
+
+            let removed = try XCTUnwrap(fixture.files[CatalogDeltaFixture.id(1000)])
+            fixture.removeFile(removed)
+            let replacement = fixture.addFile(number: 102, name: removed.name)
+            let next = fixture.event(generation: 2, upsertedFiles: [replacement], removedFileIDs: [removed.id])
+            let replaced = try XCTUnwrap(fixture.patch(candidate.shard, event: next))
+            XCTAssertEqual(replaced.changedFileIDs, [removed.id, replacement.id])
+            assertCatalogParity(replaced.shard, fixture.authoritative(generation: 2))
+
+            let newParent = fixture.addFolder(number: 30, name: "Nested")
+            let nested = fixture.addFile(number: 300, name: "Nested.swift", parentID: newParent.id)
+            let nestedEvent = fixture.event(generation: 3, upsertedFiles: [nested], upsertedFolders: [newParent, ancestor, ancestor])
+            let nestedResult = try XCTUnwrap(fixture.patch(replaced.shard, event: nestedEvent))
+            XCTAssertEqual(nestedResult.logicalMutationCount, 3)
+            assertCatalogParity(nestedResult.shard, fixture.authoritative(generation: 3))
+
+            // Production cap remains one: a real multi-record publication must still rebuild,
+            // advance once, complete before replay returns, and leave the other root untouched.
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let a = directory.appendingPathComponent("a")
+            let b = directory.appendingPathComponent("b")
+            try FileManager.default.createDirectory(at: a.appendingPathComponent("Sources"), withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: b, withIntermediateDirectories: true)
+            try "value".write(to: a.appendingPathComponent("Sources/Old.swift"), atomically: false, encoding: .utf8)
+            try "other".write(to: b.appendingPathComponent("Other.md"), atomically: false, encoding: .utf8)
+            let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false, codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+            addTeardownBlock {
+                for root in await store.roots() {
+                    await store.unloadRoot(id: root.id)
+                }
+                try? FileManager.default.removeItem(at: directory)
+            }
+            let rootA = try await store.loadRoot(path: a.path)
+            let rootB = try await store.loadRoot(path: b.path)
+            _ = await store.rootContextSnapshot()
+            let before = await store.storeWorkDiagnosticsSnapshot()
+            let beforeA = try XCTUnwrap(before.rootCatalogShards.roots.first { $0.rootID == rootA.id })
+            let beforeB = try XCTUnwrap(before.rootCatalogShards.roots.first { $0.rootID == rootB.id })
+            let otherValue = await store.rootCatalogShardComparisonViewForTesting(rootID: rootB.id)
+            let other = try XCTUnwrap(otherValue)
+            let stream = await store.appliedIndexEvents()
+            var iterator = stream.makeAsyncIterator()
+            try FileManager.default.createDirectory(at: a.appendingPathComponent("Sources/Nested"), withIntermediateDirectories: true)
+            for name in ["Nested/One.swift", "Two.md"] {
+                try "added".write(to: a.appendingPathComponent("Sources/" + name), atomically: false, encoding: .utf8)
+            }
+            let attached = try await store.attachPublisherIngressWithoutStartingWatcherForTesting(rootID: rootA.id)
+            XCTAssertTrue(attached)
+            let ingressBefore = await store.publisherIngressDebugSnapshotForTesting(rootID: rootA.id)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: rootA.id, deltas: [.fileAdded("Sources/Nested/One.swift"), .fileAdded("Sources/Two.md")]
+            )
+            let accepted = await store.publisherIngressDebugSnapshotForTesting(rootID: rootA.id)
+            XCTAssertGreaterThan(accepted.acceptedServicePublicationSequence, ingressBefore.acceptedServicePublicationSequence)
+            await store.waitUntilPublisherIngressAppliedForTesting(
+                rootID: rootA.id, servicePublicationSequence: accepted.acceptedServicePublicationSequence
+            )
+            let completed = await store.publisherIngressDebugSnapshotForTesting(rootID: rootA.id)
+            XCTAssertEqual(completed.appliedServicePublicationSequence, completed.acceptedServicePublicationSequence)
+            XCTAssertEqual(completed.acceptedAppliedSequenceGap, 0)
+            XCTAssertEqual(completed.outstandingPublicationCount, 0)
+            let appliedValue = await iterator.next()
+            let applied = try XCTUnwrap(appliedValue)
+            XCTAssertEqual(applied.rootID, rootA.id)
+            XCTAssertEqual(applied.upsertedFiles.count, 2)
+            XCTAssertGreaterThan(
+                applied.upsertedFolders.count,
+                Set(applied.upsertedFolders.map(\.id)).count,
+                "Keep subscriber identity-reconciliation payload unchanged"
+            )
+            let after = await store.storeWorkDiagnosticsSnapshot()
+            let afterA = try XCTUnwrap(after.rootCatalogShards.roots.first { $0.rootID == rootA.id })
+            let afterB = try XCTUnwrap(after.rootCatalogShards.roots.first { $0.rootID == rootB.id })
+            XCTAssertEqual(afterA.patchCount, beforeA.patchCount)
+            XCTAssertEqual(afterA.authoritativeRebuildCount, beforeA.authoritativeRebuildCount + 1)
+            XCTAssertEqual(afterA.fallbackReasonCounts[.patchThresholdExceeded, default: 0], beforeA.fallbackReasonCounts[.patchThresholdExceeded, default: 0] + 1)
+            XCTAssertEqual(afterA.fallbackReasonCounts[.patchApplicationBackstop, default: 0], beforeA.fallbackReasonCounts[.patchApplicationBackstop, default: 0])
+            XCTAssertEqual(afterA.lastAppliedIndexGeneration, applied.generation)
+            XCTAssertEqual(applied.generation, try XCTUnwrap(beforeA.lastAppliedIndexGeneration) + 1)
+            XCTAssertEqual(afterB.patchCount, beforeB.patchCount)
+            XCTAssertEqual(afterB.authoritativeRebuildCount, beforeB.authoritativeRebuildCount)
+            let otherAfterValue = await store.rootCatalogShardComparisonViewForTesting(rootID: rootB.id)
+            try assertCatalogParity(XCTUnwrap(otherAfterValue), other)
+        }
+
+        func testUnicodeIdentityAndOrderingMatchAuthoritativeBytes() throws {
+            var fixture = CatalogDeltaFixture(fileCount: 9)
+            let old = fixture.authoritative()
+            let names = ["caf\u{00E9}.swift", "cafe\u{0301}.md", "\u{212A}.swift", "K.md", "\u{0315}\u{0300}.txt"]
+            let additions = names.enumerated().map { fixture.addFile(number: 100 + $0.offset, name: $0.element) }
+            let result = try XCTUnwrap(fixture.patch(old, event: fixture.event(upsertedFiles: additions)))
+            assertCatalogParity(result.shard, fixture.authoritative(generation: 1))
+            XCTAssertEqual(result.changedFileIDs, Set(additions.map(\.id)))
+
+            let unicodeFolders = ["\u{212A}elvin", "Latin"].enumerated().map {
+                fixture.addFolder(number: 30 + $0.offset, name: $0.element)
+            }
+            let folderResult = try XCTUnwrap(fixture.patch(result.shard, event: fixture.event(generation: 2, upsertedFolders: unicodeFolders)))
+            assertCatalogParity(folderResult.shard, fixture.authoritative(generation: 2))
+
+            let original = additions[0]
+            let contradictory = WorkspaceFileRecord(
+                id: original.id, rootID: original.rootID, name: "cafe\u{0301}.swift",
+                relativePath: original.relativePath, fullPath: original.fullPath,
+                parentFolderID: original.parentFolderID, modificationDate: original.modificationDate
+            )
+            XCTAssertNil(
+                fixture.patch(old, event: fixture.event(upsertedFiles: [original, contradictory])),
+                "Canonical String equality must not admit conflicting source bytes"
+            )
+            // A true canonical alias in another ID cannot displace a still-authoritative record.
+            let alias = fixture.addFile(number: 200, name: "cafe\u{0301}.swift")
+            XCTAssertNil(fixture.patch(result.shard, event: fixture.event(upsertedFiles: [alias])))
+        }
+
+        func testUnsafeOrOversizedBatchKeepsAuthoritativeFallback() async throws {
+            var fixture = CatalogDeltaFixture(fileCount: 3)
+            let old = fixture.authoritative()
+            let added = fixture.addFile(number: 100, name: "new.swift")
+            let missingParent = WorkspaceFileRecord(
+                id: added.id, rootID: added.rootID, name: added.name,
+                relativePath: added.relativePath, fullPath: added.fullPath,
+                parentFolderID: CatalogDeltaFixture.id(999), modificationDate: nil
+            )
+            fixture.files[added.id] = missingParent
+            XCTAssertNil(fixture.patch(old, event: fixture.event(upsertedFiles: [missingParent])))
+            fixture.files[added.id] = added
+            XCTAssertNil(fixture.patch(old, event: fixture.event(upsertedFiles: [added], removedFileIDs: [added.id])))
+            XCTAssertNil(fixture.patch(old, event: fixture.event(modifiedFileIDs: [added.id])), "A modification must have an old row")
+            XCTAssertNil(fixture.patch(old, event: fixture.event(removedFileIDs: [CatalogDeltaFixture.id(999)])))
+            let parent = try XCTUnwrap(fixture.folders.removeValue(forKey: fixture.parentID))
+            fixture.folderIDsByPath.removeValue(forKey: parent.standardizedRelativePath)
+            XCTAssertNil(
+                fixture.patch(old, event: fixture.event(removedFolderIDs: [parent.id])),
+                "Retained children of removed parents require authoritative fallback"
+            )
+
+            let rejected: [(String, (inout CatalogDeltaFixture) throws -> WorkspaceAppliedIndexBatchEvent)] = [
+                ("unreported new ancestor", { value in
+                    let folder = value.addFolder(number: 30, name: "New")
+                    let file = value.addFile(number: 100, name: "New.swift", parentID: folder.id)
+                    return value.event(upsertedFiles: [file])
+                }),
+                ("live removed file", { value in
+                    value.event(removedFileIDs: [CatalogDeltaFixture.id(1000)])
+                }),
+                ("live removed folder", { value in
+                    value.event(removedFolderIDs: [value.parentID])
+                }),
+                ("missing removed path", { value in
+                    value.event(removedFilePaths: ["Sources/missing.swift"])
+                }),
+                ("root removal by path", { value in
+                    value.event(removedFolderPaths: [""])
+                }),
+                ("root removal by ID", { value in
+                    value.event(removedFolderIDs: [value.root.id])
+                }),
+                ("managed-only upsert", { value in
+                    let file = value.addFile(number: 100, name: "Managed.swift")
+                    value.managedOnlyFileIDs.insert(file.id)
+                    return value.event(upsertedFiles: [file])
+                }),
+                ("wrong path owner", { value in
+                    let file = value.addFile(number: 100, name: "Wrong.swift")
+                    value.fileIDsByPath[file.standardizedRelativePath] = CatalogDeltaFixture.id(999)
+                    return value.event(upsertedFiles: [file])
+                }),
+                ("folder path change", { value in
+                    let folder = try XCTUnwrap(value.folders[value.parentID])
+                    let moved = WorkspaceFolderRecord(
+                        id: folder.id, rootID: folder.rootID, name: "Moved",
+                        relativePath: "Moved", fullPath: value.root.fullPath + "/Moved",
+                        parentFolderID: folder.parentFolderID
+                    )
+                    value.folders[folder.id] = moved
+                    value.folderIDsByPath.removeValue(forKey: folder.standardizedRelativePath)
+                    value.folderIDsByPath[moved.standardizedRelativePath] = folder.id
+                    return value.event(modifiedFolderIDs: [folder.id])
+                }),
+                ("self-parent cycle", { value in
+                    let folder = try XCTUnwrap(value.folders[value.parentID])
+                    let changed = WorkspaceFolderRecord(
+                        id: folder.id, rootID: folder.rootID, name: folder.name,
+                        relativePath: folder.relativePath, fullPath: folder.fullPath,
+                        parentFolderID: folder.id
+                    )
+                    value.folders[folder.id] = changed
+                    return value.event(modifiedFolderIDs: [folder.id])
+                })
+            ]
+            for (name, mutate) in rejected {
+                var value = CatalogDeltaFixture(fileCount: 3)
+                let previous = value.authoritative()
+                let event = try mutate(&value)
+                XCTAssertNil(value.patch(previous, event: event), name)
+            }
+            var byPath = CatalogDeltaFixture(fileCount: 3)
+            let beforePathRemoval = byPath.authoritative()
+            let pathRemoved = try XCTUnwrap(byPath.files[CatalogDeltaFixture.id(1000)])
+            byPath.removeFile(pathRemoved)
+            let pathResult = try XCTUnwrap(byPath.patch(beforePathRemoval, event: byPath.event(removedFilePaths: [pathRemoved.standardizedRelativePath])))
+            XCTAssertEqual(pathResult.changedFileIDs, [pathRemoved.id])
+            assertCatalogParity(pathResult.shard, byPath.authoritative(generation: 1))
+            let folder = try XCTUnwrap(byPath.folders[byPath.parentID])
+            let folderResult = try XCTUnwrap(byPath.patch(pathResult.shard, event: byPath.event(generation: 2, modifiedFolderIDs: [folder.id])))
+            assertCatalogParity(folderResult.shard, byPath.authoritative(generation: 2))
+
+            // Exercise the actual actor's pre-merge recovery fences at both capabilities.
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try "value".write(to: directory.appendingPathComponent("Old.swift"), atomically: false, encoding: .utf8)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let cases: [(name: String, offset: UInt64, resync: Bool, missingID: Bool, reason: WorkspaceFileContextStore.RootCatalogShardFallbackReason)] = [
+                ("resync", 1, true, false, .fullResync),
+                ("gap", 2, false, false, .generationGap),
+                ("zero", 0, false, false, .generationGap),
+                ("maximum", UInt64.max, false, false, .generationGap),
+                ("invalid", 1, false, true, .patchApplicationBackstop)
+            ]
+            for indexed in [false, true] {
+                for testCase in cases {
+                    let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false, codemapGraphIndexBuildLaunchPolicyForTesting: .disabled)
+                    let root = try await store.loadRoot(path: directory.path)
+                    _ = await store.searchCatalogSnapshot(requirement: indexed ? .recordsAndPathIndexes : .recordsOnly)
+                    let originalValue = await store.rootCatalogShardComparisonViewForTesting(rootID: root.id)
+                    let original = try XCTUnwrap(originalValue)
+                    XCTAssertEqual(original.pathSearchIndex != nil, indexed, testCase.name)
+                    let before = await store.storeWorkDiagnosticsSnapshot()
+                    let beforeRoot = try XCTUnwrap(before.rootCatalogShards.roots.first { $0.rootID == root.id })
+                    let generation = testCase.offset == 1 || testCase.offset == 2
+                        ? original.appliedIndexGeneration + testCase.offset : testCase.offset
+                    await store.applyAppliedIndexEventToRootCatalogShardForTesting(WorkspaceAppliedIndexBatchEvent(
+                        rootID: root.id, rootPath: root.standardizedFullPath, generation: generation,
+                        modifiedFileIDs: testCase.missingID ? [CatalogDeltaFixture.id(999)] : [],
+                        requiresFullResync: testCase.resync
+                    ))
+                    let after = await store.storeWorkDiagnosticsSnapshot()
+                    let afterRoot = try XCTUnwrap(after.rootCatalogShards.roots.first { $0.rootID == root.id })
+                    XCTAssertEqual(afterRoot.patchCount, beforeRoot.patchCount, testCase.name)
+                    XCTAssertEqual(afterRoot.authoritativeRebuildCount, beforeRoot.authoritativeRebuildCount + 1, testCase.name)
+                    XCTAssertEqual(afterRoot.fallbackReasonCounts[testCase.reason, default: 0], beforeRoot.fallbackReasonCounts[testCase.reason, default: 0] + 1, testCase.name)
+                    XCTAssertFalse(afterRoot.deltaStateDirty, testCase.name)
+                    let rebuiltValue = await store.rootCatalogShardComparisonViewForTesting(rootID: root.id)
+                    let rebuilt = try XCTUnwrap(rebuiltValue)
+                    XCTAssertEqual(rebuilt.pathSearchIndex != nil, indexed, testCase.name)
+                    XCTAssertEqual(rebuilt.appliedIndexGeneration, generation, testCase.name)
+                    XCTAssertEqual(rebuilt.files.map(catalogFileBytes), original.files.map(catalogFileBytes), testCase.name)
+                    XCTAssertEqual(rebuilt.folders.map(catalogFolderBytes), original.folders.map(catalogFolderBytes), testCase.name)
+                    XCTAssertEqual(rebuilt.entries.map(catalogEntryBytes), original.entries.map(catalogEntryBytes), testCase.name)
+                    if generation == UInt64.max {
+                        // The next event must not overflow lastApplied + 1.
+                        await store.applyAppliedIndexEventToRootCatalogShardForTesting(WorkspaceAppliedIndexBatchEvent(
+                            rootID: root.id, rootPath: root.standardizedFullPath, generation: 1
+                        ))
+                        let overflow = await store.storeWorkDiagnosticsSnapshot()
+                        let overflowRoot = try XCTUnwrap(overflow.rootCatalogShards.roots.first { $0.rootID == root.id })
+                        XCTAssertEqual(overflowRoot.fallbackReasonCounts[.generationGap, default: 0], afterRoot.fallbackReasonCounts[.generationGap, default: 0] + 1)
+                        XCTAssertEqual(overflowRoot.lastAppliedIndexGeneration, 1)
+                        XCTAssertEqual(overflowRoot.patchCount, beforeRoot.patchCount)
+                    }
+                    await store.unloadRoot(id: root.id)
+                }
+            }
+        }
+
+        func testRepeatedMultiRecordOverlaysMatchFreshIndex() throws {
+            var fixture = CatalogDeltaFixture(fileCount: 8)
+            let held = fixture.authoritative()
+            var current = held
+            for sequence in 0 ..< 36 {
+                let added = fixture.addFile(number: 100 + sequence, name: "Overlay-\(sequence).swift")
+                let oldFile = try XCTUnwrap(fixture.files[CatalogDeltaFixture.id(1000)])
+                let renamed = WorkspaceFileRecord(
+                    id: oldFile.id, rootID: oldFile.rootID, name: sequence.isMultiple(of: 2) ? "Match.swift" : "Gone.md",
+                    relativePath: "Sources/" + (sequence.isMultiple(of: 2) ? "Match.swift" : "Gone.md"),
+                    fullPath: fixture.root.fullPath + "/Sources/" + (sequence.isMultiple(of: 2) ? "Match.swift" : "Gone.md"),
+                    parentFolderID: oldFile.parentFolderID, modificationDate: oldFile.modificationDate
+                )
+                fixture.removeFile(oldFile)
+                fixture.files[renamed.id] = renamed
+                fixture.fileIDsByPath[renamed.standardizedRelativePath] = renamed.id
+                let event = fixture.event(generation: UInt64(sequence + 1), upsertedFiles: [added], modifiedFileIDs: [renamed.id])
+                let result = try XCTUnwrap(fixture.patch(current, event: event))
+                XCTAssertEqual(result.shard.pathSearchIndex?.buildKind, .overlay)
+                current = result.shard
+                if [0, 16, 33, 35].contains(sequence) {
+                    assertCatalogParity(current, fixture.authoritative(generation: UInt64(sequence + 1)))
+                }
+            }
+            let metrics = try XCTUnwrap(current.pathSearchIndex?.overlayHistoryMetricsForTesting)
+            XCTAssertEqual(metrics.compactedPageCount, 0)
+            XCTAssertEqual(metrics.compactedPayloadCount, 0)
+            XCTAssertLessThanOrEqual(metrics.totalPayloadCount, 1)
+            XCTAssertEqual(held.files.count, 8)
+            XCTAssertEqual(held.pathSearchIndex?.search("Overlay", limit: 100).count, 0)
+        }
+
+        func testMaterializedDeltaParityAt200001Files() throws {
+            var fixture = CatalogDeltaFixture(fileCount: 200_001)
+            fixture.managedOnlyFileIDs = [CatalogDeltaFixture.id(201_000)]
+            let held = fixture.authoritative()
+            XCTAssertEqual(fixture.files.count, 200_001)
+            XCTAssertEqual(held.files.count, 200_000)
+            var current = held
+            var candidateSeconds = 0.0
+            var referenceSeconds = 0.0
+            let heldFirst = try catalogFileBytes(XCTUnwrap(held.files.first))
+            // Four fixed checkpoints. Setup and byte/query assertions are outside construction timing.
+            for checkpoint in 0 ..< 4 {
+                var changed: [WorkspaceFileRecord] = []
+                var upsertedFolders: [WorkspaceFolderRecord] = []
+                var removed: [UUID] = []
+                var modified: [UUID] = []
+                if checkpoint == 0 {
+                    let newParent = fixture.addFolder(number: 30, name: "Nested")
+                    let shared = try XCTUnwrap(fixture.folders[fixture.parentID])
+                    upsertedFolders = [newParent, shared, shared]
+                    changed = [
+                        fixture.addFile(number: 300_000, name: "New.swift", parentID: newParent.id),
+                        fixture.addFile(number: 300_001, name: "New.md")
+                    ]
+                } else if checkpoint == 1 {
+                    for number in [1000, 1100] {
+                        let file = try XCTUnwrap(fixture.files[CatalogDeltaFixture.id(number)])
+                        let replacement = WorkspaceFileRecord(
+                            id: file.id, rootID: file.rootID, name: file.name,
+                            relativePath: file.relativePath, fullPath: file.fullPath,
+                            parentFolderID: file.parentFolderID,
+                            modificationDate: Date(timeIntervalSinceReferenceDate: 2)
+                        )
+                        fixture.files[file.id] = replacement
+                        modified.append(file.id)
+                    }
+                } else if checkpoint == 2 {
+                    let file = try XCTUnwrap(fixture.files[CatalogDeltaFixture.id(1200)])
+                    fixture.removeFile(file)
+                    removed = [file.id]
+                    changed = [fixture.addFile(number: 300_002, name: file.name)]
+                } else {
+                    // Actual overlay history crosses two page transitions, retaining the same base.
+                    for sequence in 0 ..< 34 {
+                        let additions = [
+                            fixture.addFile(number: 400_000 + sequence * 2, name: "Overlay-\(sequence).swift"),
+                            fixture.addFile(number: 400_001 + sequence * 2, name: "Overlay-\(sequence).md")
+                        ]
+                        let event = fixture.event(generation: UInt64(4 + sequence), upsertedFiles: additions)
+                        current = try XCTUnwrap(fixture.patch(current, event: event)).shard
+                    }
+                    changed = [
+                        fixture.addFile(number: 400_068, name: "Overlay-34.swift"),
+                        fixture.addFile(number: 400_069, name: "Overlay-34.md")
+                    ]
+                }
+                let generation = UInt64(checkpoint == 3 ? 38 : checkpoint + 1)
+                let event = fixture.event(
+                    generation: generation,
+                    upsertedFiles: changed,
+                    upsertedFolders: upsertedFolders,
+                    removedFileIDs: removed,
+                    modifiedFileIDs: modified
+                )
+                let start = DispatchTime.now().uptimeNanoseconds
+                let result = try XCTUnwrap(fixture.patch(current, event: event))
+                candidateSeconds += Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+                current = result.shard
+                let referenceStart = DispatchTime.now().uptimeNanoseconds
+                let reference = fixture.authoritative(generation: generation)
+                referenceSeconds += Double(DispatchTime.now().uptimeNanoseconds - referenceStart) / 1e9
+                assertCatalogParity(current, reference)
+                XCTAssertEqual(try catalogFileBytes(XCTUnwrap(held.files.first)), heldFirst)
+            }
+            print("CATALOG_DELTA_200001 candidate_checkpoints_seconds=\(candidateSeconds) authoritative_checkpoints_seconds=\(referenceSeconds)")
+            // Calibrated debug construction totals: 1.912–1.928 s versus 30.247–30.325 s.
+            // Fourfold local runner headroom; parity/oracle/setup work is outside this budget.
+            XCTAssertLessThan(candidateSeconds, 8)
+            XCTAssertLessThan(candidateSeconds, referenceSeconds * 0.5)
+        }
+    }
+
+    private struct CatalogDeltaFixture {
+        static func id(_ value: Int) -> UUID {
+            UUID(uuidString: String(format: "00000000-0000-0000-0000-%012x", value))!
+        }
+
+        let root = WorkspaceRootRecord(id: id(1), name: "Root", fullPath: "/catalog-delta")
+        let lifetimeID = id(2)
+        let parentID = id(10)
+        var files: [UUID: WorkspaceFileRecord] = [:]
+        var folders: [UUID: WorkspaceFolderRecord] = [:]
+        var managedOnlyFileIDs = Set<UUID>()
+        var fileIDsByPath: [String: UUID] = [:]
+        var folderIDsByPath: [String: UUID] = [:]
+
+        init(fileCount: Int) {
+            let sentinel = WorkspaceFolderRecord(
+                id: root.id,
+                rootID: root.id,
+                name: root.name,
+                relativePath: "",
+                fullPath: root.fullPath,
+                parentFolderID: nil
+            )
+            let parent = WorkspaceFolderRecord(
+                id: parentID,
+                rootID: root.id,
+                name: "Sources",
+                relativePath: "Sources",
+                fullPath: root.fullPath + "/Sources",
+                parentFolderID: root.id
+            )
+            folders = [sentinel.id: sentinel, parent.id: parent]
+            folderIDsByPath = ["": sentinel.id, "Sources": parent.id]
+            for index in 0 ..< fileCount {
+                let suffix = index.isMultiple(of: 3) ? "swift" : "md"
+                let accent = index.isMultiple(of: 5) ? "caf\u{00E9}-" : ""
+                _ = addFile(number: index, name: String(format: "File-%@%06d.%@", accent, index, suffix))
+            }
+        }
+
+        mutating func addFolder(number: Int, name: String) -> WorkspaceFolderRecord {
+            let folder = WorkspaceFolderRecord(
+                id: Self.id(number),
+                rootID: root.id,
+                name: name,
+                relativePath: "Sources/" + name,
+                fullPath: root.fullPath + "/Sources/" + name,
+                parentFolderID: parentID
+            )
+            folders[folder.id] = folder
+            folderIDsByPath[folder.standardizedRelativePath] = folder.id
+            return folder
+        }
+
+        mutating func addFile(number: Int, name: String, parentID: UUID? = nil) -> WorkspaceFileRecord {
+            let parent = folders[parentID ?? self.parentID]!
+            let file = WorkspaceFileRecord(
+                id: Self.id(1000 + number),
+                rootID: root.id,
+                name: name,
+                relativePath: parent.standardizedRelativePath + "/" + name,
+                fullPath: parent.fullPath + "/" + name,
+                parentFolderID: parent.id,
+                modificationDate: Date(timeIntervalSinceReferenceDate: 1)
+            )
+            files[file.id] = file
+            fileIDsByPath[file.standardizedRelativePath] = file.id
+            return file
+        }
+
+        mutating func removeFile(_ file: WorkspaceFileRecord) {
+            files.removeValue(forKey: file.id)
+            fileIDsByPath.removeValue(forKey: file.standardizedRelativePath)
+        }
+
+        func event(
+            generation: UInt64 = 1,
+            upsertedFiles: [WorkspaceFileRecord] = [],
+            upsertedFolders: [WorkspaceFolderRecord] = [],
+            removedFileIDs: [UUID] = [],
+            removedFolderIDs: [UUID] = [],
+            removedFilePaths: [String] = [],
+            removedFolderPaths: [String] = [],
+            modifiedFileIDs: [UUID] = [],
+            modifiedFolderIDs: [UUID] = []
+        ) -> WorkspaceAppliedIndexBatchEvent {
+            WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: generation,
+                upsertedFiles: upsertedFiles,
+                upsertedFolders: upsertedFolders,
+                removedFileIDs: removedFileIDs,
+                removedFolderIDs: removedFolderIDs,
+                removedFilePaths: removedFilePaths,
+                removedFolderPaths: removedFolderPaths,
+                modifiedFileIDs: modifiedFileIDs,
+                modifiedFolderIDs: modifiedFolderIDs
+            )
+        }
+
+        func authoritative(generation: UInt64 = 0, requiresPathIndexes: Bool = true) -> WorkspaceFileContextStore.RootCatalogShardComparisonView {
+            WorkspaceFileContextStore.authoritativeRootCatalogShardForTesting(
+                root: root, lifetimeID: lifetimeID, topologyGeneration: 1, appliedIndexGeneration: generation,
+                filesByID: files, foldersByID: folders, managedOnlyFileIDs: managedOnlyFileIDs,
+                requiresPathIndexes: requiresPathIndexes
+            )
+        }
+
+        func patch(_ old: WorkspaceFileContextStore.RootCatalogShardComparisonView, event: WorkspaceAppliedIndexBatchEvent)
+            -> (shard: WorkspaceFileContextStore.RootCatalogShardComparisonView, logicalMutationCount: Int, changedFileIDs: Set<UUID>)?
+        {
+            WorkspaceFileContextStore.patchedRootCatalogShardForTesting(
+                previous: old, root: root, event: event, filesByID: files, foldersByID: folders,
+                fileIDsByPath: fileIDsByPath, folderIDsByPath: folderIDsByPath,
+                managedOnlyFileIDs: managedOnlyFileIDs
+            )
+        }
+    }
+
+    private func catalogFileBytes(_ file: WorkspaceFileRecord) -> [[UInt8]] {
+        [
+            file.id.uuidString,
+            file.rootID.uuidString,
+            file.name,
+            file.relativePath,
+            file.standardizedRelativePath,
+            file.fullPath,
+            file.standardizedFullPath,
+            file.parentFolderID?.uuidString ?? "nil",
+            file.modificationDate.map { String($0.timeIntervalSinceReferenceDate.bitPattern) } ?? "nil"
+        ].map { Array($0.utf8) }
+    }
+
+    private func catalogFolderBytes(_ folder: WorkspaceFolderRecord) -> [[UInt8]] {
+        [
+            folder.id.uuidString,
+            folder.rootID.uuidString,
+            folder.name,
+            folder.relativePath,
+            folder.standardizedRelativePath,
+            folder.fullPath,
+            folder.standardizedFullPath,
+            folder.parentFolderID?.uuidString ?? "nil",
+            folder.modificationDate.map { String($0.timeIntervalSinceReferenceDate.bitPattern) } ?? "nil"
+        ].map { Array($0.utf8) }
+    }
+
+    private func catalogEntryBytes(_ entry: WorkspaceSearchCatalogEntry) -> [[UInt8]] {
+        [
+            entry.id.uuidString,
+            entry.rootID.uuidString,
+            entry.rootName,
+            entry.rootPath,
+            entry.name,
+            entry.relativePath,
+            entry.standardizedRelativePath,
+            entry.fullPath,
+            entry.standardizedFullPath,
+            entry.displayPath
+        ].map { Array($0.utf8) }
+    }
+
+    private func assertCatalogParity(
+        _ actual: WorkspaceFileContextStore.RootCatalogShardComparisonView,
+        _ expected: WorkspaceFileContextStore.RootCatalogShardComparisonView,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.files.count, expected.files.count, file: file, line: line)
+        for (lhs, rhs) in zip(actual.files, expected.files) {
+            XCTAssertEqual(catalogFileBytes(lhs), catalogFileBytes(rhs), file: file, line: line)
+        }
+        XCTAssertEqual(actual.folders.count, expected.folders.count, file: file, line: line)
+        for (lhs, rhs) in zip(actual.folders, expected.folders) {
+            XCTAssertEqual(catalogFolderBytes(lhs), catalogFolderBytes(rhs), file: file, line: line)
+        }
+        XCTAssertEqual(actual.entries.count, expected.entries.count, file: file, line: line)
+        for (lhs, rhs) in zip(actual.entries, expected.entries) {
+            XCTAssertEqual(catalogEntryBytes(lhs), catalogEntryBytes(rhs), file: file, line: line)
+        }
+        XCTAssertEqual(actual.projectionFiles.count, expected.projectionFiles.count, file: file, line: line)
+        for (lhs, rhs) in zip(actual.projectionFiles, expected.projectionFiles) {
+            XCTAssertEqual(catalogFileBytes(lhs), catalogFileBytes(rhs), file: file, line: line)
+        }
+        XCTAssertEqual(actual.projectionLanguages.map { Array($0.utf8) }, expected.projectionLanguages.map { Array($0.utf8) }, file: file, line: line)
+        XCTAssertEqual(actual.projectionFileIndexByID, expected.projectionFileIndexByID, file: file, line: line)
+        XCTAssertEqual(actual.appliedIndexGeneration, expected.appliedIndexGeneration, file: file, line: line)
+        for query in ["File", "Sources File", "caf\u{00E9}", "cafe\u{0301}", "*.swift", "New", "Overlay", "Match", "Gone", "/catalog-delta/Sources", "missing", ""] {
+            for limit in [0, 1, 7, actual.files.count + 1] {
+                let lhs = actual.pathSearchIndex?.search(query, limit: limit) ?? []
+                let rhs = expected.pathSearchIndex?.search(query, limit: limit) ?? []
+                XCTAssertEqual(lhs.count, rhs.count, file: file, line: line)
+                for (a, b) in zip(lhs, rhs) {
+                    XCTAssertEqual(catalogEntryBytes(a.entry), catalogEntryBytes(b.entry), file: file, line: line)
+                    XCTAssertEqual(a.score, b.score, file: file, line: line)
+                    XCTAssertEqual(Array(a.tieBreakKey.utf8), Array(b.tieBreakKey.utf8), file: file, line: line)
+                }
+            }
+        }
+    }
+#endif

@@ -92,7 +92,9 @@ class OpenAIProvider: AIProvider {
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
              .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax,
              .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6AstraPro, .gpt6AstraProLow, .gpt6AstraProHigh, .gpt6AstraProXHigh, .gpt6AstraProMax,
              .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             128_000
@@ -134,7 +136,9 @@ class OpenAIProvider: AIProvider {
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
              .gpt61Sol, .gpt61SolLow, .gpt61SolHigh, .gpt61SolXHigh, .gpt61SolMax,
+             .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax,
              .gpt6Astra, .gpt6AstraLow, .gpt6AstraHigh, .gpt6AstraXHigh, .gpt6AstraMax,
+             .gpt6AstraPro, .gpt6AstraProLow, .gpt6AstraProHigh, .gpt6AstraProXHigh, .gpt6AstraProMax,
              .gpt6Luna, .gpt6LunaLow, .gpt6LunaHigh, .gpt6LunaXHigh, .gpt6Sol,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             return true
@@ -147,9 +151,9 @@ class OpenAIProvider: AIProvider {
 
     // MARK: Helper – build the `input` array for the Responses API
 
-    private func createResponseInput(for aiMessage: AIMessage) -> SwiftOpenAI.InputType {
+    private func createResponseInput(for aiMessage: AIMessage) throws -> SwiftOpenAI.InputType {
         // Forward to the centralised builder defined on AIMessage
-        aiMessage.openAIResponsesInput()
+        try aiMessage.openAIResponsesInput()
     }
 
     // MARK: - Helper to decide whether to route via Responses-API
@@ -163,10 +167,10 @@ class OpenAIProvider: AIProvider {
         model: AIModel,
         maxTokens: Int?,
         stream: Bool
-    ) -> ModelResponseParameter {
+    ) throws -> ModelResponseParameter {
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
 
-        var parameters = ModelResponseParameter(
+        var parameters = try ModelResponseParameter(
             input: createResponseInput(for: aiMessage),
             model: baseModel.toProviderModel() as! SwiftOpenAI.Model
         )
@@ -190,6 +194,36 @@ class OpenAIProvider: AIProvider {
         parameters.tools = nil
         parameters.toolChoice = nil
         return parameters
+    }
+
+    /// The pinned SwiftOpenAI Reasoning value has no `mode` field. Keep its request
+    /// encoding and transport, adding only the documented Responses execution mode.
+    func buildProResponseRequest(_ parameters: ModelResponseParameter, model: AIModel) throws -> URLRequest {
+        guard let mode = model.openAIReasoningMode else {
+            throw AIProviderError.invalidResponse(detail: "A Pro response request requires a Pro model selection.")
+        }
+        let apiKey = cachedApiKey ?? ""
+        let baseURL = cachedBaseURL ?? URL(string: "https://api.openai.com")!
+        try ProviderEndpointConsent.validate(baseURL, apiKey: apiKey, consentEndpoint: httpCredentialConsentEndpoint)
+        let url = baseURL.appendingPathComponent(overrideVersion ?? "v1").appendingPathComponent("responses")
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONEncoder().encode(OpenAIResponseModeParameters(parameters: parameters, mode: mode))
+        return request
+    }
+
+    private func createResponse(
+        _ parameters: ModelResponseParameter,
+        model: AIModel,
+        service: OpenAIService
+    ) async throws -> ResponseModel {
+        guard model.openAIReasoningMode != nil else {
+            return try await service.responseCreate(parameters)
+        }
+        let request = try buildProResponseRequest(parameters, model: model)
+        return try await service.fetch(debugEnabled: false, type: ResponseModel.self, with: request)
     }
 
     static func isTransportActivityChunk(
@@ -243,9 +277,10 @@ class OpenAIProvider: AIProvider {
         // Route via Responses-API when required
         if shouldUseResponsesAPI(for: model) {
             let responseMaxTokens = resolvedResponseMaxTokens(for: model, override: maxTokens)
-            // Use *background job + streaming attach* when the model forbids direct streaming.
-            // This creates a queued job and then attaches via SSE for incremental output.
-            if forceCompletion {
+            // Pro can reason silently for longer than a foreground connection or the
+            // Context Builder inactivity budget. Use the existing background job path
+            // and renew liveness from actual status responses while it is processing.
+            if forceCompletion || model.openAIReasoningMode == "pro" {
                 let response = try await createBackgroundResponse(
                     aiMessage,
                     model: model,
@@ -292,7 +327,7 @@ class OpenAIProvider: AIProvider {
         print("Effective model: \(effectiveModel)")
 
         let isO1PreviewOrMini = (effectiveModel == .o1Mini || effectiveModel == .o1Preview)
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
             model: effectiveModel.toProviderModel() as! SwiftOpenAI.Model
@@ -386,7 +421,7 @@ class OpenAIProvider: AIProvider {
         maxTokens: Int? // Keep maxTokens parameter
     ) async throws -> AICompletionResult {
         let service = try getService()
-        let parameters = buildForegroundResponseParameters(
+        let parameters = try buildForegroundResponseParameters(
             aiMessage,
             model: model,
             maxTokens: maxTokens,
@@ -395,7 +430,7 @@ class OpenAIProvider: AIProvider {
 
         do {
             // Assuming responseCreate exists in the service layer as per previous code.
-            let response = try await service.responseCreate(parameters)
+            let response = try await createResponse(parameters, model: model, service: service)
 
             let completionOutcome: AIProviderCompletionOutcome
             if response.status == .completed {
@@ -452,14 +487,20 @@ class OpenAIProvider: AIProvider {
         maxTokens: Int?
     ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         let service = try getService()
-        let parameters = buildForegroundResponseParameters(
+        let parameters = try buildForegroundResponseParameters(
             aiMessage,
             model: model,
             maxTokens: maxTokens,
             stream: true
         )
 
-        let sseStream = try await service.responseCreateStream(parameters)
+        let sseStream: AsyncThrowingStream<ResponseStreamEvent, Error>
+        if model.openAIReasoningMode != nil {
+            let request = try buildProResponseRequest(parameters, model: model)
+            sseStream = try await service.fetchStream(debugEnabled: false, type: ResponseStreamEvent.self, with: request)
+        } else {
+            sseStream = try await service.responseCreateStream(parameters)
+        }
         return bridgeResponseStream(sseStream)
     }
 
@@ -479,7 +520,7 @@ class OpenAIProvider: AIProvider {
         }
 
         let isO1PreviewOrMini = (model == .o1Mini || model == .o1Preview)
-        let messages = aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
+        let messages = try aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)
         var parameters = ChatCompletionParameters(
             messages: messages,
             model: model.toProviderModel() as! SwiftOpenAI.Model
@@ -569,13 +610,14 @@ class OpenAIProvider: AIProvider {
         return false
     }
 
-    private func bridgeResponseStream(_ stream: AsyncThrowingStream<ResponseStreamEvent, Error>) -> AsyncThrowingStream<AIStreamResult, Error> {
+    func bridgeResponseStream(_ stream: AsyncThrowingStream<ResponseStreamEvent, Error>) -> AsyncThrowingStream<AIStreamResult, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     var promptTokens: Int?
                     var completionTokens: Int?
                     var observedCompletionOutcome: AIProviderCompletionOutcome?
+                    var activityThrottle = ProviderTransportActivityThrottle()
 
                     for try await event in stream {
                         if Task.isCancelled { break }
@@ -621,7 +663,11 @@ class OpenAIProvider: AIProvider {
                         case let .error(errorEvent):
                             throw APIError.requestFailed(description: errorEvent.prettyDescription)
                         default:
-                            continue
+                            // Keepalive and structural events are received transport
+                            // activity even when no answer or reasoning text is ready.
+                            if activityThrottle.shouldEmit(at: .now) {
+                                continuation.yield(ProviderTransportActivity.result())
+                            }
                         }
                     }
 
@@ -660,13 +706,13 @@ class OpenAIProvider: AIProvider {
         }
     }
 
-    private func buildBackgroundResponseParameters(
+    func buildBackgroundResponseParameters(
         _ aiMessage: AIMessage,
         model: AIModel,
         maxTokens: Int?
-    ) -> ModelResponseParameter {
+    ) throws -> ModelResponseParameter {
         let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
-        var parameters = ModelResponseParameter(
+        var parameters = try ModelResponseParameter(
             input: aiMessage.openAIResponsesInput(),
             model: baseModel.toProviderModel() as! SwiftOpenAI.Model
         )
@@ -756,11 +802,18 @@ class OpenAIProvider: AIProvider {
         case .gpt54Low: return (.gpt54, "low")
         case .gpt54: return (.gpt54, "medium")
         // ── GPT-6 family (no none/minimal on 6.1 Sol or Astra) ──
+        case .gpt61Terra, .gpt61TerraNone, .gpt61TerraLow, .gpt61TerraHigh, .gpt61TerraXHigh, .gpt61TerraMax:
+            return (.gpt61Terra, model.defaultReasoningEffort)
         case .gpt61SolMax: return (.gpt61Sol, "max")
         case .gpt61SolXHigh: return (.gpt61Sol, "xhigh")
         case .gpt61SolHigh: return (.gpt61Sol, "high")
         case .gpt61SolLow: return (.gpt61Sol, "low")
         case .gpt61Sol: return (.gpt61Sol, "medium")
+        case .gpt6AstraPro: return (.gpt6Astra, "medium")
+        case .gpt6AstraProLow: return (.gpt6Astra, "low")
+        case .gpt6AstraProHigh: return (.gpt6Astra, "high")
+        case .gpt6AstraProXHigh: return (.gpt6Astra, "xhigh")
+        case .gpt6AstraProMax: return (.gpt6Astra, "max")
         case .gpt6AstraMax: return (.gpt6Astra, "max")
         case .gpt6AstraXHigh: return (.gpt6Astra, "xhigh")
         case .gpt6AstraHigh: return (.gpt6Astra, "high")
@@ -794,8 +847,8 @@ extension OpenAIProvider: ResponsesJobProvider {
         model: AIModel,
         maxTokens: Int?
     ) async throws -> ResponseModel {
-        let parameters = buildBackgroundResponseParameters(message, model: model, maxTokens: maxTokens)
-        let response = try await getService().responseCreate(parameters)
+        let parameters = try buildBackgroundResponseParameters(message, model: model, maxTokens: maxTokens)
+        let response = try await createResponse(parameters, model: model, service: getService())
 
         if response.status == .failed {
             let detail = response.error?.message ?? response.incompleteDetails?.reason ?? "Responses API returned a failed status."
@@ -836,7 +889,14 @@ extension OpenAIProvider: ResponsesJobProvider {
 
                     while !Task.isCancelled {
                         let response = try await service.responseModel(id: id, parameters: nil)
+                        try Task.checkCancellation()
                         pollCount += 1
+
+                        // An unchanged queued/in-progress status still proves the
+                        // server is reachable. A blocked or failed poll emits nothing.
+                        if response.status == .queued || response.status == .inProgress {
+                            continuation.yield(ProviderTransportActivity.result())
+                        }
 
                         // Emit status change updates
                         if response.status != lastStatus {

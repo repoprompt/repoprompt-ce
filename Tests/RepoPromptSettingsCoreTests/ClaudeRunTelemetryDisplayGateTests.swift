@@ -193,7 +193,9 @@ final class ClaudeRunTelemetryDisplayGateTests: XCTestCase {
 
     private func cliSnapshot(fiveHour: Double, weekly: Double?, observedAt: Date) -> ProviderQuotaSnapshot {
         let id = ProviderQuotaBucketID.synthesizedDefault
-        let rows: [(String, Double, TimeInterval)] = [("five_hour", fiveHour, 5 * 3600)] + (weekly.map { [("seven_day", $0, 7 * 86400)] } ?? [])
+        let fiveHourRow: [(String, Double, TimeInterval)] = [("five_hour", fiveHour, 5 * 3600)]
+        let weeklyRows: [(String, Double, TimeInterval)] = weekly.map { [("seven_day", $0, 7 * 86400)] } ?? []
+        let rows = fiveHourRow + weeklyRows
         let windows = rows.map { role, used, duration in
             ProviderQuotaWindow(
                 key: .init(bucketID: id, nativeRole: role),

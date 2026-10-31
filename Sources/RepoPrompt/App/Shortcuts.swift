@@ -5,11 +5,65 @@
 //  Created by Eric Provencher on 2025-03-09.
 //
 
+import Foundation
 import KeyboardShortcuts
 
 /// Define your shortcut
 extension KeyboardShortcuts.Name {
     // static let cmdOptionA = Self("cmdOptionA", default: .init(.a, modifiers: [.command, .option]))
+
+    // Application commands: preserve the defaults formerly owned by native menus.
+    static let newWorkspaceWindow = Self("newWorkspaceWindow", default: .init(.n, modifiers: [.command]))
+    static let showAppSettings = Self("showAppSettings", default: .init(.comma, modifiers: [.command]))
+    static let closeAppWindow = Self("closeAppWindow", default: .init(.w, modifiers: [.command, .shift]))
+    static let checkForUpdates = Self("checkForUpdates", default: .init(.u, modifiers: [.command, .option]))
+
+    // Current-session actions. Destructive deletion intentionally requires an opt-in binding.
+    static let pinAgentSession = sessionAction("pinAgentSession", default: .init(.p, modifiers: [.command, .shift]))
+    static let renameAgentSession = sessionAction("renameAgentSession", default: .init(.r, modifiers: [.command, .shift]))
+    static let stashAgentSession = sessionAction("stashAgentSession", default: .init(.e, modifiers: [.command, .shift]))
+    static let handoffAgentSession = sessionAction("handoffAgentSession", default: .init(.h, modifiers: [.command, .shift]))
+    static let copyAgentSessionID = sessionAction("copyAgentSessionID", default: .init(.c, modifiers: [.command, .option]))
+    static let deleteAgentSession = Self("deleteAgentSession")
+
+    // MARK: - Agent workflow actions (defaults follow macOS conventions and yield to saved assignments)
+
+    /// Stop the focused session's active run (⌘. is the macOS cancel/stop convention).
+    static let stopAgentRun = sessionAction("stopAgentRun", default: .init(.period, modifiers: [.command]))
+    /// Move keyboard focus to the current session's composer (⌘L focuses the primary input field in browsers).
+    static let focusAgentComposer = sessionAction("focusAgentComposer", default: .init(.l, modifiers: [.command]))
+    /// Restore the most recently stashed session (⌘W stashes; ⇧⌘T reopens the last closed tab in browsers).
+    static let reopenStashedAgentSession = sessionAction("reopenStashedAgentSession", default: .init(.t, modifiers: [.command, .shift]))
+    /// Jump to the next session with an unseen completed, failed, or waiting state.
+    static let nextAttentionAgentSession = sessionAction("nextAttentionAgentSession", default: .init(.a, modifiers: [.command, .shift]))
+
+    // MARK: - Composer-local commands
+
+    // These were fixed keys before becoming configurable, so they keep their defaults unconditionally.
+    // They are matched by the focused view, never registered with Carbon; see `LocalKeyboardShortcut`.
+
+    /// Re-prompt the composer draft again (formerly fixed ⌘↩).
+    static let repromptDraft = Self("repromptDraft", default: .init(.return, modifiers: [.command]))
+    /// Send the original text while a Re-prompt is shown (formerly fixed ⇧⌘O).
+    static let repromptSendOriginal = Self("repromptSendOriginal", default: .init(.o, modifiers: [.command, .shift]))
+
+    /// New defaults yield to upgrade-time custom assignments; explicitly cleared new actions stay cleared.
+    /// The pinned library has no public name/existence enumeration API. Its documented-in-source
+    /// UserDefaults prefix is used only for discovery; decoding and writes stay in the library.
+    static func sessionAction(_ rawValue: String, default shortcut: KeyboardShortcuts.Shortcut) -> Self {
+        let prefix = "KeyboardShortcuts_"
+        let stored = UserDefaults.standard.dictionaryRepresentation()
+        let isNew = stored[prefix + rawValue] == nil
+        let occupied = isNew && stored.keys.contains { key in
+            guard key.hasPrefix(prefix),
+                  let name = Self(rawValue: String(key.dropFirst(prefix.count)))
+            else { return false }
+            return name.rawValue != rawValue && KeyboardShortcuts.getShortcut(for: name) == shortcut
+        }
+        let name = Self(rawValue, default: shortcut)
+        if occupied { KeyboardShortcuts.setShortcut(nil, for: name) }
+        return name
+    }
 
     // Switch to presets with Cmd+Option+1..9
     static let switchToPreset1 = Self("swPreset1", default: .init(.one, modifiers: [.command, .option]))

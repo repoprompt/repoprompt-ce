@@ -97,6 +97,17 @@ struct MCPSettingsView: View {
 
                 serverControlSection
                 Divider()
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Strict connection approval", isOn: Binding(
+                        get: { globalSettings.mcpStrictConnectionApproval() },
+                        set: { globalSettings.setMCPStrictConnectionApproval($0) }
+                    ))
+                    Text("Off (default): \"Always allow\" saves approvals by app name, and common clients are approved automatically. This trusts apps by name, so any program using an approved app's name is let in. On: saved and built-in names are ignored and each app is asked once per run; reconnects from the same running app are not re-asked, and nothing is saved across RepoPrompt restarts. Agents started inside RepoPrompt never prompt. Applies to new connections.")
+                        .font(fontPreset.captionFont)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider()
                 modelPresetsSection
                 Divider()
                 contextBuilderSection

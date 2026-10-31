@@ -70,5 +70,11 @@ final class ClaudeSDKProtocolCodecTests: XCTestCase {
         XCTAssertTrue(object["parent_tool_use_id"] is NSNull)
         let message = try XCTUnwrap(object["message"] as? [String: Any])
         XCTAssertEqual(message["role"] as? String, "user")
+        XCTAssertNil(object["uuid"], "Other codec callers retain the existing wire shape")
+        let id = UUID()
+        let stamped = try ClaudeSDKProtocolCodec.encodeUserMessage(text: "Continue", sessionID: "session-1", uuid: id)
+        var stampedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: stamped) as? [String: Any])
+        XCTAssertEqual(stampedObject.removeValue(forKey: "uuid") as? String, id.uuidString)
+        XCTAssertEqual(NSDictionary(dictionary: stampedObject), NSDictionary(dictionary: object))
     }
 }

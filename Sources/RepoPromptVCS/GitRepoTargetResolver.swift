@@ -29,30 +29,66 @@ public struct GitRepoTargetResolver: Sendable {
         ))
     }
 
+    /// Payload-free control signal from the optional-default entry points: the request is relative to a
+    /// default repository the caller did not supply (an omitted selector or `repo_root` list, an empty
+    /// `repo_root` token, or bare `@main[:<branch>]`, `@primary[:<branch>]`, `@current`, `@wt`, or
+    /// `@worktree`). Selectors that identify their target never throw it. Callers catch only this signal,
+    /// elect a default once, and retry; it is not an MCP error code and never belongs in a reply.
+    public struct DefaultRepositoryRequired: Error, Sendable {}
+
+    /// Compatibility entry point for callers that have already chosen `defaultRepo`.
     public func resolveRepoRoots(
         explicitRootTokens: [String]?,
         allRepos: [GitRepoDescriptor],
         visibleRoots: [VCSRepositoryRoot],
         defaultRepo: GitRepoDescriptor
     ) async throws -> [GitRepoDescriptor] {
+        try await resolveRepoRoots(
+            explicitRootTokens: explicitRootTokens,
+            allRepos: allRepos,
+            visibleRoots: visibleRoots,
+            defaultRepo: defaultRepo as GitRepoDescriptor?
+        )
+    }
+
+    /// Resolves `repo_root` tokens; identifying tokens never consult `defaultRepo`. Without a default, an
+    /// omitted list or a relative token throws `DefaultRepositoryRequired`, but only after every other
+    /// token resolved, so a final selector error outranks the request for a default.
+    public func resolveRepoRoots(
+        explicitRootTokens: [String]?,
+        allRepos: [GitRepoDescriptor],
+        visibleRoots: [VCSRepositoryRoot],
+        defaultRepo: GitRepoDescriptor?
+    ) async throws -> [GitRepoDescriptor] {
         guard let tokens = explicitRootTokens, !tokens.isEmpty else {
-            return [defaultRepo]
+            return try [requireDefault(defaultRepo)]
         }
 
         var repos: [GitRepoDescriptor] = []
         var seenKeys = Set<String>()
+        var requiresDefault = false
 
         for token in tokens {
-            let repo = try await resolveRepoRootToken(
-                token,
-                allRepos: allRepos,
-                visibleRoots: visibleRoots,
-                defaultRepo: defaultRepo
-            )
+            let repo: GitRepoDescriptor
+            do {
+                repo = try await resolveRepoRootToken(
+                    token,
+                    allRepos: allRepos,
+                    visibleRoots: visibleRoots,
+                    defaultRepo: defaultRepo
+                )
+            } catch is DefaultRepositoryRequired {
+                requiresDefault = true
+                continue
+            }
             let key = repo.rootPath.lowercased()
             if seenKeys.insert(key).inserted {
                 repos.append(repo)
             }
+        }
+
+        if requiresDefault {
+            throw DefaultRepositoryRequired()
         }
 
         guard !repos.isEmpty else {
@@ -62,14 +98,42 @@ public struct GitRepoTargetResolver: Sendable {
         return repos
     }
 
+    /// Compatibility entry point for callers that have already chosen `defaultRepo`.
     public func resolveRepoRootToken(
         _ token: String,
         allRepos: [GitRepoDescriptor],
         visibleRoots: [VCSRepositoryRoot],
         defaultRepo: GitRepoDescriptor
     ) async throws -> GitRepoDescriptor {
+        try await resolveRepoRootToken(
+            token,
+            allRepos: allRepos,
+            visibleRoots: visibleRoots,
+            defaultRepo: defaultRepo as GitRepoDescriptor?
+        )
+    }
+
+    /// Resolves one `repo_root` token. Repository paths and names, repository-qualified suffixes such as
+    /// `A@main`, base-less `@id:`/`@branch:`, and worktree branch/name/path selectors identify their target
+    /// without `defaultRepo`; their candidate searches include it only when supplied. Relative tokens
+    /// throw `DefaultRepositoryRequired` when it is nil.
+    public func resolveRepoRootToken(
+        _ token: String,
+        allRepos: [GitRepoDescriptor],
+        visibleRoots: [VCSRepositoryRoot],
+        defaultRepo: GitRepoDescriptor?
+    ) async throws -> GitRepoDescriptor {
         let (baseToken, specifier) = parseRepoTreeSpecifier(token)
         let trimmed = baseToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return try await resolveBaselessRepoRootToken(
+                specifier,
+                allRepos: allRepos,
+                visibleRoots: visibleRoots,
+                defaultRepo: defaultRepo
+            )
+        }
+
         let baseRepo = try await resolveBaseRepo(
             trimmed,
             allRepos: allRepos,
@@ -79,14 +143,7 @@ public struct GitRepoTargetResolver: Sendable {
         )
 
         if let baseRepo {
-            return try await applyTreeSpecifier(
-                specifier,
-                to: baseRepo,
-                allRepos: allRepos,
-                defaultRepo: defaultRepo,
-                hasExplicitBase: !trimmed.isEmpty,
-                authorizedRoots: visibleRoots
-            )
+            return try await applyTreeSpecifier(specifier, to: baseRepo, authorizedRoots: visibleRoots)
         }
 
         guard specifier == nil else {
@@ -109,11 +166,31 @@ public struct GitRepoTargetResolver: Sendable {
         throw GitRepoTargetResolverError.invalidParams("No repo found matching '\(trimmed)'. Available root names: \(availableNames)")
     }
 
+    /// Compatibility entry point for callers that have already chosen `repo`.
     public func resolveWorktree(
         selector rawSelector: String?,
         repo: GitRepoDescriptor,
         allRepos: [GitRepoDescriptor],
         authorizedRoots: [VCSRepositoryRoot]? = nil
+    ) async throws -> GitWorktreeDescriptor {
+        try await resolveWorktree(
+            selector: rawSelector,
+            repo: repo as GitRepoDescriptor?,
+            allRepos: allRepos,
+            authorizedRoots: authorizedRoots
+        )
+    }
+
+    /// Resolves a worktree selector. `@id:`, `@branch:`, and worktree branch/name/path selectors search
+    /// `repo` (when supplied) and `allRepos`. An omitted selector, `@current`, `@main[:<branch>]`, `@wt`,
+    /// and `@worktree` are relative to `repo` and throw `DefaultRepositoryRequired` without one; as before,
+    /// a repository prefix inside the selector is ignored. A supplied `repo` is the advertising repository
+    /// for authorization; without one, it is the candidate that advertises the selected repository.
+    public func resolveWorktree(
+        selector rawSelector: String?,
+        repo: GitRepoDescriptor?,
+        allRepos: [GitRepoDescriptor],
+        authorizedRoots: [VCSRepositoryRoot]?
     ) async throws -> GitWorktreeDescriptor {
         let worktree = try await resolveWorktreeDescriptor(
             selector: rawSelector,
@@ -123,7 +200,7 @@ public struct GitRepoTargetResolver: Sendable {
         if let authorizedRoots {
             _ = try await resolveAuthorizedWorktreeRepository(
                 worktree,
-                advertisingRepos: [repo],
+                advertisingRepos: repo.map { [$0] } ?? candidateRepos(allRepos: allRepos, defaultRepo: nil),
                 authorizedRoots: authorizedRoots
             )
         }
@@ -141,21 +218,23 @@ public struct GitRepoTargetResolver: Sendable {
 
     private func resolveWorktreeDescriptor(
         selector rawSelector: String?,
-        repo: GitRepoDescriptor,
+        repo selectedRepo: GitRepoDescriptor?,
         allRepos: [GitRepoDescriptor]
     ) async throws -> GitWorktreeDescriptor {
         let selector = rawSelector?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "@current"
         let (_, specifier) = parseRepoTreeSpecifier(selector)
-        let candidateRepos = candidateRepos(allRepos: allRepos, defaultRepo: repo)
+        let candidateRepos = candidateRepos(allRepos: allRepos, defaultRepo: selectedRepo)
 
         switch specifier {
         case .current:
+            let repo = try requireDefault(selectedRepo)
             let worktrees = try await worktreesForRepository(containing: repo, candidateRepos: candidateRepos)
             if let current = worktrees.first(where: { samePath($0.path, repo.rootPath) }) {
                 return current
             }
             throw GitRepoTargetResolverError.invalidParams("No current worktree found for repo: \(repo.rootPath)")
         case let .main(branch):
+            let repo = try requireDefault(selectedRepo)
             if let branch, !branch.isEmpty {
                 if let worktree = try await resolveWorktreeSelector(branch, in: [repo], selectorKind: .branch) {
                     return worktree
@@ -181,6 +260,7 @@ public struct GitRepoTargetResolver: Sendable {
             if let branch, !branch.isEmpty {
                 throw GitRepoTargetResolverError.invalidParams("worktree selector '@wt:\(branch)' is not supported. Use '@branch:\(branch)' to target a worktree by branch or omit the branch.")
             }
+            let repo = try requireDefault(selectedRepo)
             let worktrees = try await worktreesForRepository(containing: repo, candidateRepos: candidateRepos)
             if let current = worktrees.first(where: { samePath($0.path, repo.rootPath) }) {
                 return current
@@ -196,17 +276,55 @@ public struct GitRepoTargetResolver: Sendable {
 
     // MARK: - Base repo resolution
 
+    /// A token without a repository base. `@id:` and `@branch:` identify a checkout by searching the
+    /// candidates, which include `defaultRepo` only when supplied; an unsupported `@wt:<branch>` keeps its
+    /// error. Every other selector is relative to the default repository.
+    private func resolveBaselessRepoRootToken(
+        _ specifier: RepoTreeSpecifier?,
+        allRepos: [GitRepoDescriptor],
+        visibleRoots: [VCSRepositoryRoot],
+        defaultRepo: GitRepoDescriptor?
+    ) async throws -> GitRepoDescriptor {
+        let selector: String
+        let selectorKind: WorktreeSelectorKind
+        let notFoundMessage: String
+        switch specifier {
+        case let .id(id):
+            selector = id
+            selectorKind = .id
+            notFoundMessage = "No worktree found for id '\(id)'."
+        case let .branch(branch):
+            selector = branch
+            selectorKind = .branch
+            notFoundMessage = "No worktree found for branch '\(branch)'."
+        case let .worktree(branch?) where !branch.isEmpty:
+            throw Self.unsupportedRepoRootWorktreeSelector(branch)
+        case nil, .worktree, .main, .current:
+            return try await applyTreeSpecifier(
+                specifier,
+                to: requireDefault(defaultRepo),
+                authorizedRoots: visibleRoots
+            )
+        }
+
+        let candidates = candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo)
+        guard let worktree = try await resolveWorktreeSelector(selector, in: candidates, selectorKind: selectorKind) else {
+            throw GitRepoTargetResolverError.invalidParams(notFoundMessage)
+        }
+        return try await resolveAuthorizedWorktreeRepository(
+            worktree,
+            advertisingRepos: candidates,
+            authorizedRoots: visibleRoots
+        )
+    }
+
     private func resolveBaseRepo(
         _ trimmed: String,
         allRepos: [GitRepoDescriptor],
         visibleRoots: [VCSRepositoryRoot],
-        defaultRepo: GitRepoDescriptor,
+        defaultRepo: GitRepoDescriptor?,
         allowBareWorktreeSelector: Bool
     ) async throws -> GitRepoDescriptor? {
-        if trimmed.isEmpty {
-            return defaultRepo
-        }
-
         let looksLikePath = trimmed.contains("/") || trimmed.hasPrefix("~") || trimmed.hasPrefix(".")
 
         if looksLikePath {
@@ -330,12 +448,11 @@ public struct GitRepoTargetResolver: Sendable {
         }
     }
 
+    /// Applies a specifier to an explicit repository base, or to the supplied default for relative
+    /// specifiers. Base-less `@id:`/`@branch:` never reach here; they search candidates instead.
     private func applyTreeSpecifier(
         _ specifier: RepoTreeSpecifier?,
         to repo: GitRepoDescriptor,
-        allRepos: [GitRepoDescriptor],
-        defaultRepo: GitRepoDescriptor,
-        hasExplicitBase: Bool,
         authorizedRoots: [VCSRepositoryRoot]
     ) async throws -> GitRepoDescriptor {
         guard let specifier else {
@@ -344,7 +461,7 @@ public struct GitRepoTargetResolver: Sendable {
         switch specifier {
         case let .worktree(branch):
             if let branch, !branch.isEmpty {
-                throw GitRepoTargetResolverError.invalidParams("repo_root selector '@wt:\(branch)' is not supported. Use '@main:\(branch)' to target a worktree by branch or omit the branch.")
+                throw Self.unsupportedRepoRootWorktreeSelector(branch)
             }
             return repo
         case let .main(branch):
@@ -428,26 +545,28 @@ public struct GitRepoTargetResolver: Sendable {
         case .current:
             return repo
         case let .id(id):
-            let candidates = hasExplicitBase ? [repo] : candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo)
-            if let worktree = try await resolveWorktreeSelector(id, in: candidates, selectorKind: .id) {
+            if let worktree = try await resolveWorktreeSelector(id, in: [repo], selectorKind: .id) {
                 return try await resolveAuthorizedWorktreeRepository(
                     worktree,
-                    advertisingRepos: candidates,
+                    advertisingRepos: [repo],
                     authorizedRoots: authorizedRoots
                 )
             }
             throw GitRepoTargetResolverError.invalidParams("No worktree found for id '\(id)'.")
         case let .branch(branch):
-            let candidates = hasExplicitBase ? [repo] : candidateRepos(allRepos: allRepos, defaultRepo: defaultRepo)
-            if let worktree = try await resolveWorktreeSelector(branch, in: candidates, selectorKind: .branch) {
+            if let worktree = try await resolveWorktreeSelector(branch, in: [repo], selectorKind: .branch) {
                 return try await resolveAuthorizedWorktreeRepository(
                     worktree,
-                    advertisingRepos: candidates,
+                    advertisingRepos: [repo],
                     authorizedRoots: authorizedRoots
                 )
             }
             throw GitRepoTargetResolverError.invalidParams("No worktree found for branch '\(branch)'.")
         }
+    }
+
+    private static func unsupportedRepoRootWorktreeSelector(_ branch: String) -> GitRepoTargetResolverError {
+        .invalidParams("repo_root selector '@wt:\(branch)' is not supported. Use '@main:\(branch)' to target a worktree by branch or omit the branch.")
     }
 
     // MARK: - Worktree selectors
@@ -522,8 +641,17 @@ public struct GitRepoTargetResolver: Sendable {
         return result
     }
 
-    private func candidateRepos(allRepos: [GitRepoDescriptor], defaultRepo: GitRepoDescriptor) -> [GitRepoDescriptor] {
-        uniqueRepos([defaultRepo] + allRepos)
+    /// Search candidates for identifying selectors: a supplied default first, then discovered repositories.
+    /// Without a supplied default no candidate stands in for one.
+    private func candidateRepos(allRepos: [GitRepoDescriptor], defaultRepo: GitRepoDescriptor?) -> [GitRepoDescriptor] {
+        uniqueRepos((defaultRepo.map { [$0] } ?? []) + allRepos)
+    }
+
+    private func requireDefault(_ repo: GitRepoDescriptor?) throws -> GitRepoDescriptor {
+        guard let repo else {
+            throw DefaultRepositoryRequired()
+        }
+        return repo
     }
 
     private func uniqueRepos(_ repos: [GitRepoDescriptor]) -> [GitRepoDescriptor] {

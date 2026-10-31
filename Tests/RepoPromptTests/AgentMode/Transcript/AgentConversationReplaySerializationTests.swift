@@ -440,7 +440,7 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
     // MARK: - Per-turn slicing
 
     func testCompletedRequestAttachmentChangesInvalidateOnlyTheirOwnTurnCache() {
-        let attachment = AgentImageAttachment(
+        let attachment = AgentFileAttachment(
             source: .localFile(path: "/old/image.png"), title: "original", createdAt: Date(timeIntervalSince1970: 10)
         )
         var changedTurn = makeFullTurn(index: 0)
@@ -452,8 +452,8 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
         XCTAssertEqual(unchanged, initial)
 
         for repaired in [
-            AgentImageAttachment(id: attachment.id, source: .localFile(path: "/kept/image.png"), title: attachment.title, createdAt: attachment.createdAt),
-            AgentImageAttachment(id: attachment.id, source: attachment.source, title: "revised metadata", createdAt: attachment.createdAt)
+            AgentFileAttachment(id: attachment.id, source: .localFile(path: "/kept/image.png"), title: attachment.title, createdAt: attachment.createdAt),
+            AgentFileAttachment(id: attachment.id, source: attachment.source, title: "revised metadata", createdAt: attachment.createdAt)
         ] {
             var updatedTranscript = transcript
             updatedTranscript.turns[0].request?.attachments = [repaired]

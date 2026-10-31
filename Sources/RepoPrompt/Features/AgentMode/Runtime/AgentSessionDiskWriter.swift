@@ -27,7 +27,7 @@ actor AgentSessionDiskWriter {
         private var beforeWriteHook: (@Sendable (URL) async -> Void)?
     #endif
 
-    /// Only the final committed submission receives publication authority; coalesced callers get nil.
+    /// Only the last actually committed submission receives publication authority; coalesced callers get nil.
     func enqueueAndWait(data: Data, url: URL) async throws -> Receipt? {
         let url = url.standardizedFileURL
         sequence += 1
@@ -105,7 +105,9 @@ actor AgentSessionDiskWriter {
         }
 
         func test_pendingWriteCount(for url: URL) -> Int {
-            pendingByURL[url.standardizedFileURL]?.waiters.count ?? 0
+            // Preserve the admitted file URL's identity if a failure fixture replaces it with a
+            // directory: re-standardizing then appends a slash and can falsely report idle.
+            pendingByURL[url]?.waiters.count ?? pendingByURL[url.standardizedFileURL]?.waiters.count ?? 0
         }
     #endif
 
@@ -127,12 +129,13 @@ actor AgentSessionDiskWriter {
                 let waiters = pending.waiters
                 pendingByURL.removeValue(forKey: url)
                 for waiter in waiters {
-                    if let lastError {
+                    // A failed successor cannot revoke the receipt for bytes that committed.
+                    if let lastReceipt, lastReceipt.sequence == waiter.sequence {
+                        waiter.continuation.resume(returning: lastReceipt)
+                    } else if let lastError {
                         waiter.continuation.resume(throwing: lastError)
                     } else {
-                        waiter.continuation.resume(
-                            returning: lastReceipt?.sequence == waiter.sequence ? lastReceipt : nil
-                        )
+                        waiter.continuation.resume(returning: nil)
                     }
                 }
                 let idleWaiters = idleWaitersByURL.removeValue(forKey: url) ?? []

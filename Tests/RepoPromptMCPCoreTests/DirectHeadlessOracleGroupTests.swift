@@ -181,8 +181,8 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertTrue(try fixture.calls().isEmpty)
     }
 
-    func testOracleSendToolsRejectImagesBeforeProviderWork() async throws {
-        let fixture = try Fixture(name: "ask-oracle-images-rejected")
+    func testOracleSendToolsRejectAttachmentsAndRetiredImagesBeforeProviderWork() async throws {
+        let fixture = try Fixture(name: "ask-oracle-attachments-rejected")
         defer { fixture.cleanup() }
         let service = fixture.service()
         let prepared = try await service.prepareRuntime()
@@ -193,19 +193,25 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         )
 
         for toolName in ["ask_oracle", "oracle_send"] {
-            do {
-                _ = try await invoke(
-                    prepared: prepared,
-                    backend: backend,
-                    toolName: toolName,
-                    arguments: [
-                        "message": .string("inspect this screenshot"),
-                        "images": .array([.object(["path": .string("/tmp/shot.png")])])
-                    ]
-                )
-                XCTFail("Expected images rejection on the direct headless backend")
-            } catch {
-                XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, .unsupportedImageAttachments)
+            let cases: [(argument: String, expected: DirectHeadlessOracleAdapter.AdapterError)] = [
+                (OracleAttachmentContract.argumentName, .unsupportedAttachments),
+                (OracleAttachmentContract.legacyImagesArgumentName, .unsupportedAttachments)
+            ]
+            for (argument, expected) in cases {
+                do {
+                    _ = try await invoke(
+                        prepared: prepared,
+                        backend: backend,
+                        toolName: toolName,
+                        arguments: [
+                            "message": .string("inspect this screenshot"),
+                            argument: .array([.object(["path": .string("/tmp/shot.png")])])
+                        ]
+                    )
+                    XCTFail("Expected \(argument) rejection on the direct headless backend")
+                } catch {
+                    XCTAssertEqual(error as? DirectHeadlessOracleAdapter.AdapterError, expected)
+                }
             }
         }
         XCTAssertTrue(try fixture.calls().isEmpty)
