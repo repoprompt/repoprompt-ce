@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptProcess
@@ -55,6 +56,11 @@ struct ClaudeCLIOptions {
 }
 
 final class ClaudeCodeProvider: AIProvider {
+    private enum CompletionUsageMode {
+        case raw
+        case nativeClaudeTerminal
+    }
+
     private let runner: CLIProcessRunner
     private let decoder: JSONDecoder
     private let configService = MCPConfigExportService.shared
@@ -213,6 +219,7 @@ final class ClaudeCodeProvider: AIProvider {
         let emptyConfigLease = try await configService.prepareEmptyLaunchConfig()
         defer { emptyConfigLease.release() }
         var options = try await makeOptions(for: aiMessage, model: model, emptyConfigURL: emptyConfigLease.url)
+        let usageMode = try Self.completionUsageMode(for: model)
         options.systemPromptOverride = nativePromptMode.nativeSystemPromptOverride(instructions: aiMessage.systemPrompt)
         if options.timeout == nil {
             options.timeout = defaultRequestTimeout
@@ -255,7 +262,7 @@ final class ClaudeCodeProvider: AIProvider {
                     throw AIProviderError.invalidResponse(detail: "Claude CLI returned no output")
                 }
                 do {
-                    return try parseCompletionPayload(result.stdout, isStreamJSON: true)
+                    return try parseStreamJSONCompletionPayload(result.stdout, usageMode: usageMode)
                 } catch {
                     throw AIProviderError.apiError(source: error)
                 }
@@ -295,9 +302,9 @@ final class ClaudeCodeProvider: AIProvider {
     }
 
     #if DEBUG
-        static func test_parseStreamJSONCompletionPayload(_ data: Data) throws -> AICompletionResult {
+        static func test_parseStreamJSONCompletionPayload(_ data: Data, model: AIModel = .claudeCode) throws -> AICompletionResult {
             let provider = ClaudeCodeProvider()
-            return try provider.parseCompletionPayload(data, isStreamJSON: true)
+            return try provider.parseStreamJSONCompletionPayload(data, usageMode: completionUsageMode(for: model))
         }
 
         static func test_extractStreamJSONErrorDetail(from data: Data) -> String? {
@@ -347,6 +354,17 @@ final class ClaudeCodeProvider: AIProvider {
             modelArgument: runtimeModel,
             effortLevel: specifier.explicitEffortLevel
         )
+    }
+
+    private static func completionUsageMode(for model: AIModel) throws -> CompletionUsageMode {
+        guard model.providerType == .claudeCode else {
+            throw AIProviderError.invalidModel
+        }
+        if ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) != nil {
+            return .raw
+        }
+        _ = try resolveCLIModelSelection(for: model)
+        return .nativeClaudeTerminal
     }
 
     private func makeOptions(for aiMessage: AIMessage, model: AIModel, emptyConfigURL: URL) async throws -> ClaudeCLIOptions {
@@ -452,10 +470,7 @@ final class ClaudeCodeProvider: AIProvider {
         return prompt
     }
 
-    private func parseCompletionPayload(_ data: Data, isStreamJSON: Bool = false) throws -> AICompletionResult {
-        if isStreamJSON {
-            return try parseStreamJSONCompletionPayload(data)
-        }
+    private func parseCompletionPayload(_ data: Data) throws -> AICompletionResult {
         if let message = try? decoder.decode(ClaudeResultMessage.self, from: data) {
             return AICompletionResult(
                 text: message.result ?? "",
@@ -482,7 +497,7 @@ final class ClaudeCodeProvider: AIProvider {
         }
     }
 
-    private func parseStreamJSONCompletionPayload(_ data: Data) throws -> AICompletionResult {
+    private func parseStreamJSONCompletionPayload(_ data: Data, usageMode: CompletionUsageMode) throws -> AICompletionResult {
         // Decode complete events, not token deltas; counting both would duplicate text.
         // Ignore non-JSON CLI diagnostics, but fail closed on malformed/truncated JSON events.
         let events = try data.split(separator: 0x0A).compactMap { line -> [String: Any]? in
@@ -515,13 +530,54 @@ final class ClaudeCodeProvider: AIProvider {
             }.joined()
             return text.isEmpty ? nil : text
         }
-        let completion = parseCompletionDictionary(terminal)
+        let usage = terminal["usage"] as? [String: Any]
+        let rawInput = reportedTokenCount(usage?["input_tokens"]) ?? reportedTokenCount(usage?["inputTokens"])
+        let output = reportedTokenCount(usage?["output_tokens"]) ?? reportedTokenCount(usage?["outputTokens"])
+        var input = rawInput
+        // Native Claude terminal usage follows the documented producer contract of
+        // disjoint uncached, cache-read and cache-creation input categories. Compatible
+        // backends retain raw input because they may already report inclusive counts.
+        if case .nativeClaudeTerminal = usageMode,
+           let uncached = reportedTokenCount(usage?["input_tokens"]),
+           let cacheRead = reportedTokenCount(usage?["cache_read_input_tokens"]),
+           let cacheCreation = reportedTokenCount(usage?["cache_creation_input_tokens"])
+        {
+            let partial = uncached.addingReportingOverflow(cacheRead)
+            let total = partial.partialValue.addingReportingOverflow(cacheCreation)
+            if !partial.overflow, !total.overflow {
+                input = total.partialValue
+            }
+        }
+        let text = extractString(terminal["result"]) ?? extractString(terminal["content"]) ?? ""
         return AICompletionResult(
-            text: texts.isEmpty ? completion.text : texts.joined(),
-            promptTokens: completion.promptTokens,
-            completionTokens: completion.completionTokens,
-            cost: completion.cost
+            text: texts.isEmpty ? text : texts.joined(),
+            promptTokens: input,
+            completionTokens: output,
+            cost: terminal["total_cost_usd"] as? Double
         )
+    }
+
+    /// JSON numbers only: reject booleans, fractions and values outside Int without
+    /// converting through Double for integer-backed NSNumber values.
+    private func reportedTokenCount(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else { return nil }
+        let count: Int? = switch String(cString: number.objCType) {
+        case "f", "d":
+            Int(exactly: number.doubleValue)
+        default:
+            Int(number.stringValue)
+        }
+        guard let count, count >= 0 else { return nil }
+        // JSONSerialization can retain high-precision fractional numbers as Decimal;
+        // their rounded Double representation must not turn them into integer counts.
+        if let decimal = number as? NSDecimalNumber,
+           decimal.compare(NSDecimalNumber(value: count)) != .orderedSame
+        {
+            return nil
+        }
+        return count
     }
 
     private func parseCompletionDictionary(_ dict: [String: Any]) -> AICompletionResult {

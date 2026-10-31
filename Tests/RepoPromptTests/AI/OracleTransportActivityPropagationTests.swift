@@ -576,6 +576,103 @@ final class OracleImageSerializationTests: XCTestCase {
         XCTAssertEqual(completion.cost, 0.12)
     }
 
+    func testClaudeStreamJSONReportsNativeInputIncludingCacheTokens() throws {
+        let output = """
+        {"type":"result","subtype":"success","result":"Done","usage":{"input_tokens":2,"cache_read_input_tokens":1772,"cache_creation_input_tokens":1027,"output_tokens":4},"total_cost_usd":0.12}
+        """
+
+        let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+        XCTAssertEqual(completion.promptTokens, 2801)
+        XCTAssertEqual(completion.completionTokens, 4)
+        XCTAssertEqual(completion.text, "Done")
+        XCTAssertEqual(completion.cost, 0.12)
+
+        let nativeModel = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(
+            Data(output.utf8), model: .claudeCodeSonnet
+        )
+        XCTAssertEqual(nativeModel.promptTokens, 2801)
+        XCTAssertEqual(nativeModel.completionTokens, 4)
+    }
+
+    func testClaudeStreamJSONPreservesCompatibleBackendRawInputTokens() throws {
+        let output = """
+        {"type":"result","subtype":"success","result":"Done","usage":{"input_tokens":2,"cache_read_input_tokens":1772,"cache_creation_input_tokens":1027,"output_tokens":4}}
+        """
+
+        for backendID in ClaudeCodeCompatibleBackendID.allCases {
+            let models = ClaudeCodeAIModelCatalog.compatibleBackendModelsForPicker(backendID)
+            XCTAssertFalse(models.isEmpty, "\(backendID)")
+            for model in models {
+                let descriptor = try XCTUnwrap(ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model))
+                XCTAssertEqual(descriptor.backendID, backendID)
+                let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(
+                    Data(output.utf8), model: model
+                )
+                XCTAssertEqual(completion.promptTokens, 2, "\(model)")
+                XCTAssertEqual(completion.completionTokens, 4, "\(model)")
+            }
+        }
+    }
+
+    func testClaudeStreamJSONPreservesPartialUsageIndependently() throws {
+        let cases: [(name: String, usage: [String: Any], input: Int?, output: Int?)] = [
+            ("input only", ["input_tokens": 2], 2, nil),
+            ("output only", ["output_tokens": 4], nil, 4),
+            ("cache read only", ["cache_read_input_tokens": 2799], nil, nil),
+            ("cache creation only", ["cache_creation_input_tokens": 2799, "output_tokens": 4], nil, 4),
+            ("missing creation", ["input_tokens": 2, "cache_read_input_tokens": 2799, "output_tokens": 4], 2, 4),
+            ("missing read", ["input_tokens": 2, "cache_creation_input_tokens": 2799, "output_tokens": 4], 2, 4),
+            ("missing raw input", ["cache_read_input_tokens": 1000, "cache_creation_input_tokens": 1799, "output_tokens": 4], nil, 4),
+            ("both caches", ["input_tokens": 2, "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 1799], 2801, nil),
+            ("zero counts", ["input_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 0], 0, 0),
+            ("no counts", [:], nil, nil)
+        ]
+        for item in cases {
+            let output = try jsonText(["type": "result", "subtype": "success", "result": "Done", "usage": item.usage])
+            let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+            XCTAssertEqual(completion.promptTokens, item.input, item.name)
+            XCTAssertEqual(completion.completionTokens, item.output, item.name)
+        }
+    }
+
+    func testClaudeStreamJSONFallsBackOnInvalidOrOverflowingInputWithoutLosingOutput() throws {
+        let cases: [(name: String, usage: [String: Any], input: Int?, output: Int?)] = [
+            ("invalid cache", ["input_tokens": 2, "cache_read_input_tokens": "invalid", "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("negative cache", ["input_tokens": 2, "cache_read_input_tokens": 0, "cache_creation_input_tokens": -1, "output_tokens": 4], 2, 4),
+            ("null cache", ["input_tokens": 2, "cache_read_input_tokens": NSNull(), "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("boolean cache", ["input_tokens": 2, "cache_read_input_tokens": true, "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("fractional cache", ["input_tokens": 2, "cache_read_input_tokens": 1.5, "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("overflowing sum", ["input_tokens": 2, "cache_read_input_tokens": Int.max, "cache_creation_input_tokens": 0, "output_tokens": 4], 2, 4),
+            ("invalid input", ["input_tokens": "invalid", "output_tokens": 4], nil, 4),
+            ("null input", ["input_tokens": NSNull(), "output_tokens": 4], nil, 4),
+            ("boolean input", ["input_tokens": true, "output_tokens": 4], nil, 4),
+            ("negative input", ["input_tokens": -1, "output_tokens": 4], nil, 4),
+            ("fractional input", ["input_tokens": 1.5, "output_tokens": 4], nil, 4),
+            ("invalid output with partial input", ["input_tokens": 2, "cache_read_input_tokens": 2799, "output_tokens": "invalid"], 2, nil),
+            ("boolean output", ["input_tokens": 2, "cache_read_input_tokens": 1772, "cache_creation_input_tokens": 1027, "output_tokens": true], 2801, nil)
+        ]
+        for item in cases {
+            let output = try jsonText(["type": "result", "subtype": "success", "result": "Done", "usage": item.usage])
+            let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+            XCTAssertEqual(completion.promptTokens, item.input, item.name)
+            XCTAssertEqual(completion.completionTokens, item.output, item.name)
+        }
+    }
+
+    func testClaudeStreamJSONRejectsInexactOrOutOfRangeNumericCountsWithoutLosingOutput() throws {
+        let cases: [(usage: String, input: Int?)] = [
+            (#"{"input_tokens":2.00000000000000000001,"output_tokens":4}"#, nil),
+            (#"{"input_tokens":9223372036854775808,"output_tokens":4}"#, nil),
+            (#"{"input_tokens":2,"cache_read_input_tokens":9223372036854775808,"cache_creation_input_tokens":0,"output_tokens":4}"#, 2)
+        ]
+        for item in cases {
+            let output = #"{"type":"result","subtype":"success","result":"Done","usage":\#(item.usage)}"#
+            let completion = try ClaudeCodeProvider.test_parseStreamJSONCompletionPayload(Data(output.utf8))
+            XCTAssertEqual(completion.promptTokens, item.input, item.usage)
+            XCTAssertEqual(completion.completionTokens, 4, item.usage)
+        }
+    }
+
     func testClaudeStreamJSONPreservesContinuedAnswerWithoutDuplicatingResult() throws {
         let first = String(repeating: "First section. ", count: 20000) + "\n```swift\nfunc handl"
         let output = try [
