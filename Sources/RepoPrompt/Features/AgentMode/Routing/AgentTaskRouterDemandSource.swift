@@ -6,7 +6,7 @@ typealias AgentTaskRouterDemandSnapshot = RoutingSettingsSnapshot
 extension RoutingSettingsSnapshot {
     var requiredBackendIDs: Set<DecisionServiceID> {
         var ids: Set<DecisionServiceID> = []
-        if routerEnabled, let raw = selectedBackendRawValue,
+        if routerEnabled || autoWorkflowEnabled, let raw = selectedBackendRawValue,
            !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
             ids.insert(.init(rawValue: raw))

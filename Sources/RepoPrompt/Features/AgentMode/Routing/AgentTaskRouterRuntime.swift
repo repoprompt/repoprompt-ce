@@ -226,8 +226,9 @@ private actor AgentTaskRouterActivation {
         if demandChanged { epoch &+= 1 }
         let cancelRouter = lastSnapshot.map { $0.routerRevision != snapshot.routerRevision } ?? false
         let cancelAutoEffort = lastSnapshot.map { $0.autoEffortRevision != snapshot.autoEffortRevision } ?? false
+        let cancelAutoWorkflow = lastSnapshot.map { $0.autoWorkflowRevision != snapshot.autoWorkflowRevision } ?? false
         lastSnapshot = snapshot
-        if cancelRouter || cancelAutoEffort {
+        if cancelRouter || cancelAutoEffort || cancelAutoWorkflow {
             let previous = routeCancellation
             routeCancellation = Task { [coordinator] in
                 await previous?.value
@@ -236,6 +237,9 @@ private actor AgentTaskRouterActivation {
                 }
                 if cancelAutoEffort {
                     await coordinator.advanceConsumerRevision(consumerID: .autoEffort, revision: snapshot.autoEffortRevision)
+                }
+                if cancelAutoWorkflow {
+                    await coordinator.advanceConsumerRevision(consumerID: .autoWorkflow, revision: snapshot.autoWorkflowRevision)
                 }
             }
         }

@@ -40,6 +40,7 @@ struct RouterSettingsView: View {
                     pageHeader
                     modelRouterSection
                         .id(SettingsWindowCoordinator.AgentDecisionsSection.modelRouter)
+                    autoWorkflowSection
                     autoEffortSection
                         .id(SettingsWindowCoordinator.AgentDecisionsSection.autoEffort)
                     usageBalancingCard
@@ -173,7 +174,7 @@ struct RouterSettingsView: View {
                     .foregroundColor(.accentColor)
             }
             .font(fontPreset.swiftUIFont(sizeAtNormal: 22, weight: .bold))
-            Text("Configure model routing, local usage balancing, automatic effort, and decision services.")
+            Text("Configure model routing, automatic workflows, local usage balancing, automatic effort, and decision services.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -557,6 +558,37 @@ struct RouterSettingsView: View {
         }
     }
 
+    private var autoWorkflowSection: some View {
+        card {
+            sectionHeader(
+                title: "Auto Workflow",
+                systemImage: "wand.and.stars",
+                iconWeight: .regular,
+                description: "Choose a workflow, or no workflow, for the first message you send from the composer in a new session."
+            )
+            Divider()
+            Toggle("Enable Auto Workflow", isOn: Binding(
+                get: { viewModel.autoWorkflowConfiguration.enabled },
+                set: viewModel.setAutoWorkflowEnabled
+            ))
+            .toggleStyle(.switch)
+            Text(!viewModel.autoWorkflowConfiguration.enabled ? "Off" : viewModel.autoWorkflowReadiness.isReady ? "On" : "Paused — configure the selected decision service below.")
+                .foregroundStyle(.secondary)
+            responsiveServiceControls(
+                picker: { routingServicePicker },
+                configure: { configureSelectedServiceButton }
+            )
+            Text("Uses Model Router’s selected decision service, even when Model Router is off. Manual workflow selections take precedence. Follow-up messages, resumed sessions, and MCP starts are never auto-matched. If no workflow fits, the catalog exceeds the service’s limits, or matching fails, the message is sent normally.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            settingsDisclosure("What Auto Workflow shares", systemImage: "hand.raised", id: "auto-workflow:sharing", prominent: true) {
+                Text("When enabled, the selected decision service receives a best-effort-masked excerpt of the initial message and workflow names/descriptions. Workflow templates, attachments, tool results, and earlier conversation are not included. Masking can miss sensitive text; turn Auto Workflow off for private tasks.")
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     private var autoEffortSection: some View {
         card {
             sectionHeader(
@@ -861,6 +893,9 @@ struct RouterSettingsView: View {
         var labels: [String] = []
         if backendID == viewModel.selectedBackendID {
             labels.append(viewModel.configuration.enabled ? "Used by Model Router" : "Selected for Model Router")
+        }
+        if viewModel.autoWorkflowConfiguration.selectedBackendID == backendID {
+            labels.append(viewModel.autoWorkflowConfiguration.enabled ? "Used by Auto Workflow" : "Selected for Auto Workflow")
         }
         if viewModel.selectedAutoEffortBackendID == backendID {
             labels.append(viewModel.autoEffortEnabled ? "Used by Auto Effort" : "Selected for Auto Effort")

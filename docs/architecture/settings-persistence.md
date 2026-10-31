@@ -59,6 +59,12 @@ typed save can occur. Save, compatible import, recovery,
 and default creation all use this content-derived minimum. Lineage is still stamped on
 every CE write, and future-schema and unlineaged preservation guards remain unchanged.
 
+## Auto Workflow enablement
+
+`scalarPreferences.agentMode.autoWorkflowEnabled` is an optional, additive boolean: absent means off, enabling writes `true`, and disabling removes the key. Both Agent Decisions and the workflow dropdown call the same synchronous `GlobalSettingsStore` setter/save path, so intent is durable immediately and restored by a fresh store after app relaunch. No separate UserDefaults mirror or per-session matched flag is used, and no schema bump is required.
+
+Auto Workflow shares `modelRouter.selectedBackendRawValue` but has its own runtime-only revision. Loading/reloading changed enablement or shared-backend selection advances that revision and updates decision-service demand independently of Model Router enablement. Unknown settings fields retain the existing raw-preserving save behavior. Relaunch regression coverage lives in `AutoWorkflowSettingsPersistenceTests` alongside the Auto Effort settings tests.
+
 ## False-v4 normalization
 
 One development path stamped baseline-only CE documents with schema v4. On load,

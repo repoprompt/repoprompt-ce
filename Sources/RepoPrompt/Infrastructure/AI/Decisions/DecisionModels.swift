@@ -21,6 +21,7 @@ struct DecisionConsumerID: RawRepresentable, Codable, Hashable {
 
     static let modelRouter = Self(rawValue: "model-router")
     static let autoEffort = Self(rawValue: "auto-effort")
+    static let autoWorkflow = Self(rawValue: "auto-workflow")
 }
 
 struct DecisionChoice: Equatable {
