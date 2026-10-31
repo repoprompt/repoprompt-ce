@@ -5,6 +5,7 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import UniformTypeIdentifiers
 import XCTest
 
 @MainActor
@@ -1913,10 +1914,10 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
     }
 
     func testPaneEntryClearsAStuckTextViewHover() {
-        let controller = AgentImageDropController()
-        controller.setTextViewImageDragActive(true)
-        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], fileURLProviders: [], currentTabID: UUID())
-        XCTAssertFalse(controller.isTextViewImageDragActive)
+        let controller = AgentAttachmentDropController()
+        controller.setTextViewAttachmentDragActive(true)
+        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], currentTabID: UUID())
+        XCTAssertFalse(controller.isTextViewAttachmentDragActive)
         XCTAssertFalse(controller.isOverlayVisible)
     }
 
@@ -2038,14 +2039,14 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
     }
 
     func testPaneDropAttachesToTabCapturedAtDragStartAfterTabSwitch() {
-        let controller = AgentImageDropController()
+        let controller = AgentAttachmentDropController()
         let dragStartTab = UUID()
         let switchedTab = UUID()
-        var pendingCompletion: (([AgentAttachmentIntake.Prepared]) -> Void)?
+        var pendingCompletion: (([AgentAttachmentIntake.Prepared], [AgentAttachmentFailure]) -> Void)?
         var attachedTab: UUID?
         var attachedURLs: [URL] = []
 
-        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: dragStartTab)
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], currentTabID: dragStartTab)
         XCTAssertTrue(controller.isOverlayVisible)
         XCTAssertTrue(controller.acceptsPaneDrop)
 
@@ -2056,7 +2057,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                 return true
             },
             prepareAttach: { tabID in
-                { prepared in
+                { prepared, _ in
                     attachedTab = tabID
                     attachedURLs = prepared.map(\.url)
                 }
@@ -2067,7 +2068,7 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
 
         // The asynchronous load finishes after the user switched tabs.
         let image = URL(fileURLWithPath: "/tmp/dropped.png")
-        pendingCompletion?([AgentAttachmentIntake.Prepared(url: image, isTemporary: false)])
+        pendingCompletion?([AgentAttachmentIntake.Prepared(url: image, isTemporary: false)], [])
         XCTAssertEqual(attachedTab, dragStartTab)
         XCTAssertEqual(attachedURLs, [image])
     }
@@ -2077,24 +2078,24 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let tabID = UUID()
         let removedSession = viewModel.session(for: tabID)
         let source = try writeSourceImage()
-        let controller = AgentImageDropController()
-        var pendingCompletion: (([AgentAttachmentIntake.Prepared]) -> Void)?
+        let controller = AgentAttachmentDropController()
+        var pendingCompletion: (([AgentAttachmentIntake.Prepared], [AgentAttachmentFailure]) -> Void)?
         var intakeTask: Task<Void, Never>?
-        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: tabID)
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], currentTabID: tabID)
         XCTAssertTrue(controller.performPaneDrop(
             currentTabID: tabID,
             load: { pendingCompletion = $0
                 return true
             },
             prepareAttach: { tabID in
-                let attach = viewModel.prepareImageAttachmentIntake(tabID: tabID)
-                return { prepared in
-                    intakeTask = Task { await attach(prepared.map(\.url)) }
+                let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                return { prepared, failures in
+                    intakeTask = Task { await attach(prepared.map(\.url), failures) }
                 }
             }
         ))
         viewModel.test_removeSession(tabID: tabID)
-        pendingCompletion?([AgentAttachmentIntake.Prepared(url: source, isTemporary: false)])
+        pendingCompletion?([AgentAttachmentIntake.Prepared(url: source, isTemporary: false)], [])
         await intakeTask?.value
         XCTAssertNil(viewModel.session(for: tabID, createIfNeeded: false))
         XCTAssertTrue(removedSession.pendingFileAttachments.isEmpty)
@@ -2105,23 +2106,214 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
         let tabID = UUID()
         let original = viewModel.session(for: tabID)
         let source = try writeSourceImage()
-        let attachBeforeReplacement = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        let attachBeforeReplacement = viewModel.prepareAttachmentIntake(tabID: tabID)
         viewModel.test_removeSession(tabID: tabID)
         let replacement = viewModel.session(for: tabID)
-        await attachBeforeReplacement([source])
+        await attachBeforeReplacement([source], [])
         XCTAssertTrue(original.pendingFileAttachments.isEmpty)
         XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
-        let attachBeforeRebinding = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        let attachBeforeRebinding = viewModel.prepareAttachmentIntake(tabID: tabID)
         replacement.testInstallPersistentSessionBinding(sessionID: UUID())
-        await attachBeforeRebinding([source])
+        await attachBeforeRebinding([source], [])
         XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
     }
 
-    func testNonImageDropsAreNotHighlightedOrAccepted() {
-        let controller = AgentImageDropController()
+    func testPaneAndEditorDropsShareBroadFileIntakeAndReportFailuresForClaudeAndCodex() async throws {
+        var sources: [URL] = []
+        for (name, bytes) in [
+            ("report.pdf", Data("%PDF-1.7\nreport".utf8)),
+            ("table.csv", Data("name,value\na,1".utf8)),
+            ("config.json", Data("{\"enabled\":true}".utf8)),
+            ("source.custom-extension", Data("let answer = 42".utf8)),
+            ("notebook.ipynb", Data("{\"cells\":[],\"nbformat\":4}".utf8)),
+            ("document.docx", Data([0x50, 0x4B, 0x03, 0x04, 0, 0xFF])),
+            ("sheet.xlsx", Data([0x50, 0x4B, 0x03, 0x04, 0, 0xFE]))
+        ] {
+            let url = workspaceDirectory.appendingPathComponent(name)
+            try bytes.write(to: url)
+            sources.append(url)
+        }
+        try sources.append(writeSourceImage())
+        let folder = workspaceDirectory.appendingPathComponent("NotAFile", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for agent in [AgentProviderKind.claudeCode, .codexExec] {
+            for viaEditor in [false, true] {
+                let viewModel = makeViewModel()
+                let tabID = UUID()
+                let session = viewModel.session(for: tabID)
+                session.selectedAgent = agent
+                let controller = AgentAttachmentDropController()
+                controller.paneDragEntered(typeIdentifiers: [UTType.fileURL.identifier], currentTabID: tabID)
+                XCTAssertTrue(controller.isOverlayVisible, "All file URLs highlight immediately, not just images")
+                let finished = expectation(description: "\(agent) editor=\(viaEditor)")
+                let delegate = AgentAttachmentPaneDropDelegate(
+                    controller: controller,
+                    currentTabID: { tabID },
+                    prepareAttach: { tabID in
+                        let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                        return { urls, failures in
+                            await attach(urls, failures)
+                            finished.fulfill()
+                        }
+                    }
+                )
+                let dropped = sources + [folder]
+                if viaEditor {
+                    let pasteboard = NSPasteboard.withUniqueName()
+                    defer { pasteboard.releaseGlobally() }
+                    XCTAssertTrue(pasteboard.writeObjects(dropped.map { $0 as NSURL }))
+                    XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+                } else {
+                    XCTAssertTrue(delegate.performDrop(providers: dropped.map {
+                        NSItemProvider(item: $0 as NSURL, typeIdentifier: UTType.fileURL.identifier)
+                    }))
+                }
+                await fulfillment(of: [finished], timeout: 10)
+                XCTAssertFalse(controller.isOverlayVisible)
+                XCTAssertEqual(Set(session.pendingFileAttachments.map(\.fileName)), Set(sources.map(\.lastPathComponent)))
+                XCTAssertEqual(session.pendingFileAttachments.count, sources.count)
+                XCTAssertTrue(session.items.contains { $0.kind == .error && $0.text.contains("NotAFile") })
+                let message = viewModel.renderProviderMessage(text: "Inspect these files", attachments: session.pendingFileAttachments, agent: agent)
+                for attachment in session.pendingFileAttachments {
+                    guard case let .localFile(path) = attachment.source else { return XCTFail("Expected owned local file") }
+                    XCTAssertTrue(message.contains(path), "Non-images must reach the provider as file references, not be silently discarded")
+                }
+                await viewModel.prepareForWindowClose()
+            }
+        }
+    }
+
+    func testEditorRawImageDropUsesSharedOwnerAndCleansTemporaryIntake() async throws {
+        let image = try writeSourceImage()
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        XCTAssertTrue(try pasteboard.setData(Data(contentsOf: image), forType: .png))
+        let temporaryRoot = workspaceDirectory.appendingPathComponent("raw-drop", isDirectory: true)
+        let controller = AgentAttachmentDropController()
+        let finished = expectation(description: "raw image attached")
+        var copied: Data?
+        let delegate = AgentAttachmentPaneDropDelegate(
+            controller: controller,
+            currentTabID: { UUID() },
+            prepareAttach: { _ in { urls, failures in
+                XCTAssertTrue(failures.isEmpty)
+                copied = try? Data(contentsOf: urls[0])
+                finished.fulfill()
+            } },
+            attachmentIntake: AgentAttachmentIntake(temporaryRoot: temporaryRoot)
+        )
+        XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(copied, try Data(contentsOf: image))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporaryRoot.path), [])
+    }
+
+    func testDirectEditorEntryReplacesCancelledDragAndKeepsItsTabAcrossSwitch() async throws {
+        let source = try writeSourceImage()
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        XCTAssertTrue(pasteboard.writeObjects([source as NSURL]))
+        let viewModel = makeViewModel()
+        let originalTab = UUID()
+        let switchedTab = UUID()
+        let original = viewModel.session(for: originalTab)
+        let switched = viewModel.session(for: switchedTab)
+        let controller = AgentAttachmentDropController()
+        controller.paneDragEntered(typeIdentifiers: [UTType.fileURL.identifier], currentTabID: UUID(), dragID: "cancelled-old-drag")
+        controller.paneDragExited()
+        // Native entry can happen without a SwiftUI pane entry, or before a late pane exit.
+        controller.textViewDragEntered(pasteboard: pasteboard, currentTabID: originalTab)
+        controller.paneDragExited()
+        XCTAssertTrue(controller.isOverlayVisible)
+        let finished = expectation(description: "editor destination retained")
+        let delegate = AgentAttachmentPaneDropDelegate(
+            controller: controller,
+            currentTabID: { switchedTab },
+            prepareAttach: { tabID in
+                XCTAssertEqual(tabID, originalTab)
+                let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                return { urls, failures in
+                    await attach(urls, failures)
+                    finished.fulfill()
+                }
+            }
+        )
+        XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(original.pendingFileAttachments.count, 1)
+        XCTAssertTrue(switched.pendingFileAttachments.isEmpty)
+        await viewModel.prepareForWindowClose()
+    }
+
+    func testDirectEditorExitClearsOverlayWithoutASwiftUIPaneExit() {
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.setString("file:///tmp/notes.txt", forType: .fileURL)
+        let controller = AgentAttachmentDropController()
+        controller.textViewDragEntered(pasteboard: pasteboard, currentTabID: UUID())
+        XCTAssertTrue(controller.isOverlayVisible)
+        controller.setTextViewAttachmentDragActive(false)
+        XCTAssertFalse(controller.isOverlayVisible)
+    }
+
+    func testFailureOnlyAndMixedDropsWhileBusyDoNotAppendTranscriptRows() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.runState = .running
+        let before = session.items
+        let source = try writeSourceImage()
+        let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+        for urls in [[], [source]] {
+            await attach(urls, [AgentAttachmentFailure(fileName: "folder", reason: "Not a regular file")])
+            XCTAssertEqual(session.items, before)
+            XCTAssertTrue(session.pendingFileAttachments.isEmpty)
+            XCTAssertEqual(viewModel.imageAttachmentNotice?.message, AgentImageAttachmentBlockReason.agentBusy.message)
+        }
+    }
+
+    func testMixedEditorFileAndRawImageDropKeepsBothWithoutDuplicatingRepresentations() async throws {
+        let source = try writeSourceImage()
+        let file = workspaceDirectory.appendingPathComponent("notes.txt")
+        try Data("Read these notes".utf8).write(to: file)
+        let fileItem = NSPasteboardItem()
+        XCTAssertTrue(fileItem.setString(file.absoluteString, forType: .fileURL))
+        XCTAssertTrue(try fileItem.setData(Data(contentsOf: source), forType: .png))
+        let imageItem = NSPasteboardItem()
+        XCTAssertTrue(try imageItem.setData(Data(contentsOf: source), forType: .png))
+        let pasteboard = NSPasteboard.withUniqueName()
+        defer { pasteboard.releaseGlobally() }
+        XCTAssertTrue(pasteboard.writeObjects([fileItem, imageItem]))
+        let temporaryRoot = workspaceDirectory.appendingPathComponent("mixed-drop", isDirectory: true)
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        let finished = expectation(description: "file and raw image attached")
+        let delegate = AgentAttachmentPaneDropDelegate(
+            controller: AgentAttachmentDropController(), currentTabID: { tabID },
+            prepareAttach: { tabID in
+                let attach = viewModel.prepareAttachmentIntake(tabID: tabID)
+                return { urls, failures in
+                    await attach(urls, failures)
+                    finished.fulfill()
+                }
+            },
+            attachmentIntake: AgentAttachmentIntake(temporaryRoot: temporaryRoot)
+        )
+        XCTAssertTrue(delegate.performDrop(pasteboard: pasteboard))
+        await fulfillment(of: [finished], timeout: 5)
+        XCTAssertEqual(session.pendingFileAttachments.count, 2)
+        XCTAssertEqual(Set(session.pendingFileAttachments.map(\.kind)), [.text, .image])
+        XCTAssertFalse(session.items.contains { $0.kind == .error })
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: temporaryRoot.path), [])
+        await viewModel.prepareForWindowClose()
+    }
+
+    func testPlainTextDropsAreNotHighlightedOrAccepted() {
+        let controller = AgentAttachmentDropController()
         var loadCalled = false
 
-        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], fileURLProviders: [], currentTabID: UUID())
+        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], currentTabID: UUID())
         XCTAssertFalse(controller.isOverlayVisible)
         XCTAssertFalse(controller.acceptsPaneDrop)
 
@@ -2131,19 +2323,19 @@ final class AgentImageAttachmentRetentionTests: XCTestCase {
                 loadCalled = true
                 return true
             },
-            prepareAttach: { _ in { _ in XCTFail("Non-image drops must not attach") } }
+            prepareAttach: { _ in { _, _ in XCTFail("Plain-text drops must not attach") } }
         )
         XCTAssertFalse(accepted)
         XCTAssertFalse(loadCalled)
     }
 
-    func testTextViewImageDragKeepsOverlayLitAfterPaneExit() {
-        let controller = AgentImageDropController()
-        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: UUID())
+    func testTextViewFileDragKeepsOverlayLitAfterPaneExit() {
+        let controller = AgentAttachmentDropController()
+        controller.paneDragEntered(typeIdentifiers: ["public.file-url"], currentTabID: UUID())
         controller.paneDragExited()
-        controller.setTextViewImageDragActive(true)
+        controller.setTextViewAttachmentDragActive(true)
         XCTAssertTrue(controller.isOverlayVisible)
-        controller.setTextViewImageDragActive(false)
+        controller.setTextViewAttachmentDragActive(false)
         XCTAssertFalse(controller.isOverlayVisible)
     }
 

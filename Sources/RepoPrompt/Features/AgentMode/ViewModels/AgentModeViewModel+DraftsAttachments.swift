@@ -443,16 +443,24 @@ extension AgentModeViewModel {
 
     /// Capture the drop's live owner before asynchronous item providers load. Switching tabs is
     /// allowed; replacing its session, rebinding it, or switching workspaces invalidates the intake.
-    func prepareImageAttachmentIntake(tabID: UUID) -> ([URL]) async -> Void {
-        guard let session = session(for: tabID, createIfNeeded: false) else { return { _ in } }
+    func prepareAttachmentIntake(tabID: UUID) -> ([URL], [AgentAttachmentFailure]) async -> Void {
+        guard let session = session(for: tabID, createIfNeeded: false) else { return { _, _ in } }
         let workspaceID = workspaceManager?.activeWorkspaceID
         let sessionID = session.activeAgentSessionID
-        return { [weak self, weak session] urls in
+        return { [weak self, weak session] urls, failures in
             guard let self, let session,
                   sessions[tabID] === session,
                   workspaceManager?.activeWorkspaceID == workspaceID,
-                  session.activeAgentSessionID == sessionID
+                  session.activeAgentSessionID == sessionID,
+                  !session.bindingTransitionInProgress,
+                  repromptUIStore.allowsAttachmentMutation(tabID: tabID, currentTabID: tabID)
             else { return }
+            // Even a failure-only drop must respect the live turn's last-row streaming owner.
+            if let reason = imageAttachmentBlockReason(tabID: tabID) {
+                reportImageAttachmentBlocked(reason, tabID: tabID)
+                return
+            }
+            reportAttachmentFailures(tabID: tabID, failures)
             await attachImagesIfAllowed(tabID: tabID, urls: urls)
         }
     }
