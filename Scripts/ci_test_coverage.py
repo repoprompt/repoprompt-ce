@@ -91,7 +91,9 @@ def main() -> int:
         manifest = json.loads((args.metadata / 'test-targets.json').read_text())
         receipts = [json.loads(path.read_text()) for path in sorted(args.receipts.glob('shard-*.json'))]
         admission = json.loads(args.admission_context) if args.admission_context is not None else None
-        if admission is not None:
+        if args.admission_context is not None:
+            if not isinstance(admission, dict):
+                raise ValueError('hosted admission context must be an object')
             from ci_admission import verify_build_identity
             identity = json.loads((args.metadata / 'admission.json').read_text())
             verify_build_identity(identity, admission)

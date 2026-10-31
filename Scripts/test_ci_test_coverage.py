@@ -134,6 +134,21 @@ class UnionTests(unittest.TestCase):
     def test_complete_partition_passes(self):
         coverage.verify_shards(self.tests, self.targets, self.receipts, 2)
 
+    def test_hosted_cli_never_downgrades_null_context_to_local_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'ci-test-list.txt').write_text('\n'.join(self.tests) + '\n')
+            (root / 'test-targets.json').write_text(json.dumps({'targets': self.targets}))
+            for receipt in self.receipts:
+                (root / f'shard-{receipt["shard_index"]}.json').write_text(json.dumps(receipt))
+            for context in ('null', '[]', '""', ''):
+                args = ['coverage', '--metadata', str(root), '--receipts', str(root),
+                        '--shard-count', '2', '--admission-context', context]
+                with self.subTest(context=context), mock.patch('sys.argv', args), \
+                        mock.patch('sys.stderr', io.StringIO()), self.assertRaises(SystemExit) as error:
+                    coverage.main()
+                self.assertEqual(error.exception.code, 1)
+
     def test_hosted_identity_rejects_other_candidate_run_attempt_or_producer(self):
         context = {'head': 'candidate', 'tree': 'tree', 'base': 'base', 'run_id': '42', 'attempt': '2'}
         receipts = copy.deepcopy(self.receipts)

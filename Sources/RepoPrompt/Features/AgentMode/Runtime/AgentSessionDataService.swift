@@ -68,12 +68,16 @@ actor AgentSessionDataService {
 
     /// Retain ordering only while callbacks can overlap; settled session URLs leave no receipt state.
     private var metadataPublicationsByURL: [URL: MetadataPublication] = [:]
-    /// Blocks new writes during reversible admission as well as after committed deletion.
-    private var deletedSessionFileURLs: Set<URL> = []
+    /// Blocks new writes and attachment moves/copies during reversible admission as well as after
+    /// committed deletion. Internal: shared with the attachment-retention extension.
+    var deletedSessionFileURLs: Set<URL> = []
+    /// Admitted moves/copies share the save/deletion tombstone. Deletion drains their I/O before
+    /// removing images; workers wait only on handles captured before their own registration.
+    var attachmentFileTasksByFileURL: [URL: [UUID: Task<Void, Never>]] = [:]
     /// Only an irreversible deletion may withdraw an already-admitted write and its metadata.
     private var committedSessionDeletionFileURLs: Set<URL> = []
     /// Overlapping reversible deletions share the local save fence; one failure cannot clear another.
-    private var deletionAttemptCountByFileURL: [URL: Int] = [:]
+    var deletionAttemptsByFileURL: [URL: DeletionAttempts] = [:]
     #if DEBUG
         private var deletionTombstoneWaitersByURL: [URL: [CheckedContinuation<Void, Never>]] = [:]
         private var workspaceRootOverrideForTesting: URL?
@@ -81,6 +85,8 @@ actor AgentSessionDataService {
         private var testBeforeLoadRepairWriteHook: (@Sendable (URL) async -> Void)?
         private var testAfterSessionWriteHook: (@Sendable (URL) async -> Void)?
         private var testBeforeDeletionAdmissionHook: (@Sendable (URL) async -> Void)?
+        var testBeforeAttachmentRetentionHook: (@Sendable (URL) async -> Void)?
+        var testBeforeHandoffAttachmentCopyHook: (@Sendable (UUID) async -> Void)?
         /// Passive gate run inside `preparePersistedHydration` once the load result is known.
         private var testAfterHydrationPrepareHook: (@Sendable (UUID) async throws -> Void)?
     #endif
@@ -518,10 +524,6 @@ actor AgentSessionDataService {
 
     private func metadataIndexFileURL(forAgentSessionsFolder folder: URL) -> URL {
         folder.appendingPathComponent("AgentSessionIndex.json")
-    }
-
-    private func agentSessionFilename(for id: UUID) -> String {
-        "AgentSession-\(id.uuidString).json"
     }
 
     private func agentSessionFileURL(id: UUID, in folder: URL) -> URL {
@@ -1764,7 +1766,7 @@ actor AgentSessionDataService {
         try AppProfileLocations.current.validateMetadataFile(fileURL)
         let attempt = try await AgentSessionDurableDeletionReporter.beginDurableDeletion(sessionID: sessionID, origin: origin)
         deletedSessionFileURLs.insert(fileURL)
-        deletionAttemptCountByFileURL[fileURL, default: 0] += 1
+        deletionAttemptsByFileURL[fileURL, default: DeletionAttempts()].activeCount += 1
         #if DEBUG
             let tombstoneWaiters = deletionTombstoneWaitersByURL.removeValue(forKey: fileURL) ?? []
             for waiter in tombstoneWaiters {
@@ -1772,6 +1774,11 @@ actor AgentSessionDataService {
             }
         #endif
         await diskWriter.waitUntilIdle(for: fileURL)
+        // Tombstone admission is closed, so this covers all source/destination image operations.
+        let attachmentOperations = Array(attachmentFileTasksByFileURL[fileURL]?.values ?? [:].values)
+        for operation in attachmentOperations {
+            await operation.value
+        }
         var fileRemoved = false
         do {
             if let fence = Self.destructiveCommitFence.get(), await !fence() {
@@ -1783,13 +1790,7 @@ actor AgentSessionDataService {
                 fileRemoved = true
             }
         } catch {
-            let remainingAttempts = max(0, (deletionAttemptCountByFileURL[fileURL] ?? 1) - 1)
-            if remainingAttempts == 0 {
-                deletionAttemptCountByFileURL.removeValue(forKey: fileURL)
-                deletedSessionFileURLs.remove(fileURL)
-            } else {
-                deletionAttemptCountByFileURL[fileURL] = remainingAttempts
-            }
+            finishDeletionAttempt(for: fileURL, committed: false)
             await AgentSessionDurableDeletionReporter.didFailDurableDeletion(attempt)
             throw error
         }
@@ -1797,7 +1798,9 @@ actor AgentSessionDataService {
         // withdrawn even while committed cleanup is suspended. A refused attempt never sets this.
         committedSessionDeletionFileURLs.insert(fileURL)
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
-        // Keep one permanent count with the tombstone. A later overlapping failure must not reopen saves.
+        // Retained images belong to the committed session; a refused attempt never reaches here.
+        AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
+        finishDeletionAttempt(for: fileURL, committed: true)
     }
 
     private func discardSaveIfSessionWasDeleted(

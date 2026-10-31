@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import XCTest
 
@@ -410,6 +411,7 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
         AgentTranscriptTurnProjectionCache(
             token: .init(
                 turnID: turnID,
+                request: nil,
                 retentionTier: .full,
                 isCompleted: true,
                 responseSpanCount: 0,
@@ -436,6 +438,32 @@ final class AgentTranscriptTurnCacheGroupingTests: XCTestCase {
     }
 
     // MARK: - Per-turn slicing
+
+    func testCompletedRequestAttachmentChangesInvalidateOnlyTheirOwnTurnCache() {
+        let attachment = AgentFileAttachment(
+            source: .localFile(path: "/old/image.png"), title: "original", createdAt: Date(timeIntervalSince1970: 10)
+        )
+        var changedTurn = makeFullTurn(index: 0)
+        changedTurn.request?.attachments = [attachment]
+        let otherTurn = makeFullTurn(index: 1)
+        let transcript = AgentTranscript(turns: [changedTurn, otherTurn], nextSequenceIndex: 6)
+        let initial = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: [:])
+        let unchanged = AgentTranscriptProjectionBuilder.buildWithCaches(from: transcript, turnCaches: initial.updatedTurnCaches)
+        XCTAssertEqual(unchanged, initial)
+
+        for repaired in [
+            AgentFileAttachment(id: attachment.id, source: .localFile(path: "/kept/image.png"), title: attachment.title, createdAt: attachment.createdAt),
+            AgentFileAttachment(id: attachment.id, source: attachment.source, title: "revised metadata", createdAt: attachment.createdAt)
+        ] {
+            var updatedTranscript = transcript
+            updatedTranscript.turns[0].request?.attachments = [repaired]
+            let rebuilt = AgentTranscriptProjectionBuilder.buildWithCaches(from: updatedTranscript, turnCaches: initial.updatedTurnCaches)
+            XCTAssertEqual(rebuilt.projection, AgentTranscriptProjectionBuilder.build(from: updatedTranscript))
+            XCTAssertEqual(rebuilt.projection.workingRows.first?.attachments, [repaired])
+            XCTAssertNotEqual(rebuilt.updatedTurnCaches[changedTurn.id]?.token, initial.updatedTurnCaches[changedTurn.id]?.token)
+            XCTAssertEqual(rebuilt.updatedTurnCaches[otherTurn.id], initial.updatedTurnCaches[otherTurn.id])
+        }
+    }
 
     /// Same-process, interleaved benchmark: fixture construction and assertions stay
     /// outside timing. Five samples follow one warm-up of each implementation. The

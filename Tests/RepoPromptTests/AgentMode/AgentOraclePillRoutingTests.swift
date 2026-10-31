@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import MCP
@@ -1567,6 +1568,629 @@ final class AgentOracleAttachmentForwardingTests: XCTestCase {
             },
             headlessProviderFactory: { _, _ in
                 UnsupportedHeadlessAgentProvider(reason: "oracle attachment forwarding test")
+            }
+        )
+    }
+}
+
+/// Composer image intake and session-lifetime retention: the attach guard for paste/drop, pane
+/// drops routed to the tab captured at drag start, and finished turns keeping their images.
+@MainActor
+final class AgentImageAttachmentRetentionTests: XCTestCase {
+    private var workspaceDirectory: URL!
+
+    override func setUpWithError() throws {
+        workspaceDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("image-attachment-retention-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        if let workspaceDirectory {
+            try? FileManager.default.removeItem(at: workspaceDirectory)
+        }
+    }
+
+    func testFinishedTurnMovesImagesIntoSessionStorageAndRewritesUserRow() async throws {
+        let viewModel = makeViewModel()
+        let attachmentsRoot = workspaceDirectory
+            .appendingPathComponent("AgentSessions", isDirectory: true)
+            .appendingPathComponent(AgentSessionAttachmentStore.directoryName, isDirectory: true)
+        viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+        let tabID = UUID()
+        let agentSessionID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.testInstallPersistentSessionBinding(sessionID: agentSessionID)
+        let temporaryFile = try writeTemporaryImage()
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path), title: "shot.png")
+        session.appendItem(.user("look", attachments: [attachment]))
+        let reservationID = viewModel.reserveAttachmentsForTurn([attachment], session: session)
+
+        viewModel.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
+        await viewModel.waitForAttachmentRetention()
+
+        let keptPath = AgentSessionAttachmentStore(rootURL: attachmentsRoot)
+            .sessionFolderURL(sessionID: agentSessionID)
+            .appendingPathComponent("\(attachment.id.uuidString).png")
+            .path
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: keptPath))
+        let userRow = try XCTUnwrap(session.items.last { $0.kind == .user })
+        XCTAssertEqual(userRow.attachments.map(\.id), [attachment.id])
+        XCTAssertEqual(userRow.attachments.first?.source, .localFile(path: keptPath))
+        XCTAssertEqual(userRow.attachments.first?.title, "shot.png")
+        XCTAssertTrue(session.isDirty)
+        // The kept copy stays exact-file Oracle authority for its own session only.
+        XCTAssertEqual(viewModel.oracleAuthorizedAttachmentPaths(tabID: tabID, agentSessionID: agentSessionID), [keptPath])
+        XCTAssertEqual(viewModel.oracleAuthorizedAttachmentPaths(tabID: tabID, agentSessionID: UUID()), [])
+    }
+
+    func testAttachmentRootConsultsTheInjectedPersistencePolicyOnEachResolution() {
+        var suppressed = true
+        let viewModel = makeViewModel(attachmentPersistenceIsSuppressed: { suppressed })
+        let workspace = WorkspaceModel(name: "Attachment policy", repoPaths: [])
+        XCTAssertNil(viewModel.sessionAttachmentsRootURL(for: workspace))
+        suppressed = false
+        XCTAssertNotNil(viewModel.sessionAttachmentsRootURL(for: workspace))
+        suppressed = true
+        XCTAssertNil(viewModel.sessionAttachmentsRootURL(for: workspace))
+    }
+
+    func testSweepQueriesLiveOwnersAndProtectsItsOwnUnregisteredRuntime() throws {
+        let other = makeViewModel()
+        var liveOwners: [AgentModeViewModel] = []
+        let viewModel = makeViewModel(attachmentSweepViewModels: { liveOwners })
+        let localSession = viewModel.session(for: UUID())
+        let localID = UUID()
+        localSession.testInstallPersistentSessionBinding(sessionID: localID)
+        let local = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        localSession.pendingFileAttachments = [local]
+        let otherSession = other.session(for: UUID())
+        let otherID = UUID()
+        otherSession.testInstallPersistentSessionBinding(sessionID: otherID)
+        let pending = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        let reserved = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        let consumed = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        otherSession.pendingFileAttachments = [pending]
+        _ = other.reserveAttachmentsForTurn([reserved], session: otherSession)
+        otherSession.attachmentsPendingProviderConsumptionCleanup = [consumed]
+
+        XCTAssertEqual(viewModel.liveAttachmentSweepProtection().sessionIDs, [localID])
+        liveOwners = [other]
+        let protection = viewModel.liveAttachmentSweepProtection()
+        XCTAssertEqual(protection.sessionIDs, [localID, otherID])
+        XCTAssertEqual(protection.temporaryPaths, Set([local, pending, reserved, consumed].compactMap(AgentImageAttachmentAvailabilityResolver.path(for:))))
+        liveOwners = []
+        XCTAssertEqual(viewModel.liveAttachmentSweepProtection().sessionIDs, [localID])
+    }
+
+    func testWindowCompositionSuppliesCurrentWindowOwnersAndLaunchPolicy() async {
+        GlobalSettingsStore.installApplicationModelIdentityPolicy()
+        let settings = GlobalSettingsStore.shared
+        let previousAutoStart = settings.mcpAutoStart()
+        settings.setMCPAutoStart(false, commit: false)
+        defer { settings.setMCPAutoStart(previousAutoStart, commit: false) }
+        let first = WindowState()
+        WindowStatesManager.shared.registerWindowState(first)
+        await first.workspaceManager.awaitInitialized()
+        XCTAssertEqual(first.agentModeViewModel.attachmentPersistenceIsSuppressed(), AppLaunchConfiguration.current.suppressesAgentSessionPersistence)
+        let second = WindowState()
+        WindowStatesManager.shared.registerWindowState(second)
+        await second.workspaceManager.awaitInitialized()
+        XCTAssertTrue(first.agentModeViewModel.attachmentSweepViewModels().contains { $0 === second.agentModeViewModel })
+        second.beginClose()
+        await second.tearDown()
+        WindowStatesManager.shared.unregisterWindowState(second)
+        XCTAssertFalse(first.agentModeViewModel.attachmentSweepViewModels().contains { $0 === second.agentModeViewModel })
+        first.beginClose()
+        await first.tearDown()
+        WindowStatesManager.shared.unregisterWindowState(first)
+    }
+
+    func testWorkspaceSwitchSchedulesTheStartupSweepThroughTheLivePath() async throws {
+        let viewModel = makeViewModel()
+        let agentSessionsFolder = workspaceDirectory.appendingPathComponent("AgentSessions", isDirectory: true)
+        let attachmentsRoot = AgentSessionAttachmentStore.rootURL(forAgentSessionsFolder: agentSessionsFolder)
+        viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+        viewModel.sessionAttachmentSweepDelayNanoseconds = 0
+        let orphan = UUID()
+        let orphanFolder = AgentSessionAttachmentStore(rootURL: attachmentsRoot).sessionFolderURL(sessionID: orphan)
+        try FileManager.default.createDirectory(at: orphanFolder, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3600)],
+            ofItemAtPath: orphanFolder.path
+        )
+
+        // The private owner-taking path the workspace-did-switch listener calls.
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(nil)
+        await viewModel.test_handleWorkspaceSwitch(nil, owner: owner)
+
+        let sweep = try XCTUnwrap(viewModel.sessionAttachmentSweepTask, "The live switch path must schedule the sweep")
+        let result = await sweep.value
+        XCTAssertEqual(result?.removedSessionFolders, [orphan])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanFolder.path))
+    }
+
+    func testRetentionUsesTheRootCapturedWhenTheTurnReservedItsImages() async throws {
+        let viewModel = makeViewModel()
+        let reservedRoot = workspaceDirectory.appendingPathComponent("WorkspaceA/AgentSessions/attachments", isDirectory: true)
+        let switchedRoot = workspaceDirectory.appendingPathComponent("WorkspaceB/AgentSessions/attachments", isDirectory: true)
+        var currentRoot = reservedRoot
+        viewModel.sessionAttachmentsRootOverride = { currentRoot }
+        let session = viewModel.session(for: UUID())
+        let agentSessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: agentSessionID)
+        let attachment = try AgentFileAttachment(source: .localFile(path: writeTemporaryImage().path))
+        session.appendItem(.user("look", attachments: [attachment]))
+        let reservationID = viewModel.reserveAttachmentsForTurn([attachment], session: session)
+
+        currentRoot = switchedRoot // The window switched workspace mid-turn.
+        viewModel.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
+        await viewModel.waitForAttachmentRetention()
+
+        let keptPath = AgentSessionAttachmentStore(rootURL: reservedRoot)
+            .sessionFolderURL(sessionID: agentSessionID)
+            .appendingPathComponent("\(attachment.id.uuidString).png").path
+        XCTAssertTrue(FileManager.default.fileExists(atPath: keptPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: switchedRoot.path))
+        XCTAssertNil(session.attachmentRetentionRoot)
+    }
+
+    func testFinalizeForASessionThatIsNoLongerLiveDeletesTheTemporaryCopy() async throws {
+        let viewModel = makeViewModel()
+        let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+        viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let temporaryFile = try writeTemporaryImage()
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
+        let reservationID = viewModel.reserveAttachmentsForTurn([attachment], session: session)
+        viewModel.test_installLiveSession(AgentModeViewModel.TabSession(tabID: tabID))
+
+        viewModel.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
+        await viewModel.waitForAttachmentRetention()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentsRoot.path))
+    }
+
+    func testHydrationRepairsADeadTemporaryPathFromTheKeptCopy() async throws {
+        let viewModel = makeViewModel()
+        let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+        viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+        let session = viewModel.session(for: UUID())
+        let agentSessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: agentSessionID)
+        let deadPath = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory)
+            .appendingPathComponent("\(UUID().uuidString).png").path
+        let attachment = AgentFileAttachment(source: .localFile(path: deadPath), title: "lost.png")
+        session.appendItem(.user("look", attachments: [attachment]))
+        let folder = AgentSessionAttachmentStore(rootURL: attachmentsRoot).sessionFolderURL(sessionID: agentSessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let kept = folder.appendingPathComponent("\(attachment.id.uuidString).png")
+        try Data("kept".utf8).write(to: kept)
+
+        viewModel.repairRetainedAttachmentPathsAfterHydration(session, sessionID: agentSessionID)
+        await viewModel.waitForAttachmentRetention()
+
+        let row = try XCTUnwrap(session.items.last { $0.kind == .user })
+        XCTAssertEqual(row.attachments.first?.source, .localFile(path: kept.path))
+        XCTAssertEqual(row.attachments.first?.title, "lost.png")
+    }
+
+    func testHydrationRepairsCompactedCanonicalImageAndPersistsItsRenderedPath() async throws {
+        let viewModel = makeViewModel()
+        let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+        viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+        let session = viewModel.session(for: UUID())
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        let attachment = AgentFileAttachment(
+            source: .localFile(path: workspaceDirectory.appendingPathComponent("lost.png").path),
+            title: "compacted image",
+            createdAt: Date(timeIntervalSince1970: 10)
+        )
+        let request = AgentChatItem.user("earlier request", attachments: [attachment], sequenceIndex: 0)
+        let transcript = compactedTranscript(for: request)
+        session.runState = .completed
+        session.nextSequenceIndex = transcript.nextSequenceIndex
+        session.setItemsSilently(AgentTranscriptIO.workingSourceItems(from: transcript), reason: .persistedSessionHydration)
+        viewModel.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
+        session.isDirty = false
+        let mutationGeneration = session.persistenceMutationGeneration
+        XCTAssertTrue(session.items.isEmpty, "The request exists only in canonical compacted history")
+        XCTAssertNotNil(session.turnProjectionCaches[transcript.turns[0].id], "Prime the completed-turn projection cache")
+        XCTAssertEqual(session.fullTranscriptProjection.workingRows.first?.attachments, [attachment])
+        let folder = AgentSessionAttachmentStore(rootURL: attachmentsRoot).sessionFolderURL(sessionID: sessionID)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let kept = folder.appendingPathComponent("\(attachment.id.uuidString).png")
+        try Data("compacted kept image".utf8).write(to: kept)
+
+        viewModel.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
+        await viewModel.waitForAttachmentRetention()
+
+        let expected = AgentFileAttachment(
+            id: attachment.id, source: .localFile(path: kept.path), title: attachment.title, createdAt: attachment.createdAt
+        )
+        XCTAssertTrue(session.items.isEmpty, "Repair must not reintroduce compacted requests into the working suffix")
+        XCTAssertEqual(session.transcript.turns.first?.request?.attachments, [expected])
+        XCTAssertEqual(session.fullTranscriptProjection.workingRows.first?.attachments, [expected])
+        XCTAssertEqual(session.fullTranscriptProjection.workingBlocks.first?.rows.first?.attachments, [expected])
+        XCTAssertTrue(session.isDirty)
+        XCTAssertGreaterThan(session.persistenceMutationGeneration, mutationGeneration)
+
+        let workspace = WorkspaceModel(name: "Compacted attachment repair", repoPaths: [], customStoragePath: workspaceDirectory)
+        let service = AgentSessionDataService()
+        let savedURL = try await service.saveAgentSession(
+            AgentSession(
+                id: sessionID, workspaceID: workspace.id, composeTabID: session.tabID,
+                transcript: session.transcript, lastRunState: AgentSessionRunState.completed.rawValue
+            ),
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript
+        )
+        let reloaded = try await service.loadAgentSession(from: savedURL)
+        let reloadedTranscript = try XCTUnwrap(reloaded.transcript)
+        XCTAssertTrue(reloaded.items.isEmpty)
+        XCTAssertEqual(reloadedTranscript.turns.first?.request?.attachments, [expected])
+        let reloadedProjection = AgentTranscriptProjectionBuilder.build(from: reloadedTranscript)
+        XCTAssertEqual(reloadedProjection.workingRows.first?.attachments, [expected])
+        XCTAssertEqual(reloadedProjection.workingBlocks.first?.rows.first?.attachments, [expected])
+        XCTAssertEqual(try Data(contentsOf: kept), Data("compacted kept image".utf8))
+    }
+
+    func testHydrationRepairsSharedAttachmentWithoutReplacingEachRequestsMetadata() async throws {
+        for workingPathAlreadyRetained in [false, true] {
+            let viewModel = makeViewModel()
+            let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+            viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+            let session = viewModel.session(for: UUID())
+            let sessionID = UUID()
+            session.testInstallPersistentSessionBinding(sessionID: sessionID)
+            let attachmentID = UUID()
+            let folder = AgentSessionAttachmentStore(rootURL: attachmentsRoot).sessionFolderURL(sessionID: sessionID)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let kept = folder.appendingPathComponent("\(attachmentID.uuidString).png")
+            try Data("shared kept image".utf8).write(to: kept)
+            let missingPath = workspaceDirectory.appendingPathComponent("missing-\(attachmentID).png").path
+            let historicalAttachment = AgentFileAttachment(
+                id: attachmentID, source: .localFile(path: missingPath), title: "original title", createdAt: Date(timeIntervalSince1970: 10)
+            )
+            let workingAttachment = AgentFileAttachment(
+                id: attachmentID,
+                source: .localFile(path: workingPathAlreadyRetained ? kept.path : missingPath),
+                title: "reused title", createdAt: Date(timeIntervalSince1970: 20)
+            )
+            let historicalRequest = AgentChatItem.user("older", attachments: [historicalAttachment], sequenceIndex: 0)
+            let workingRequest = AgentChatItem.user("newer", attachments: [workingAttachment], sequenceIndex: 1)
+            var transcript = compactedTranscript(for: historicalRequest)
+            transcript.turns.append(AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(from: workingRequest), terminalState: .completed,
+                startedAt: workingRequest.timestamp, completedAt: workingRequest.timestamp
+            ))
+            transcript.nextSequenceIndex = 2
+            session.runState = .completed
+            session.nextSequenceIndex = transcript.nextSequenceIndex
+            session.setItemsSilently([workingRequest], reason: .persistedSessionHydration)
+            viewModel.applyTranscriptPresentation(transcript, to: session, isColdLoad: true)
+
+            viewModel.repairRetainedAttachmentPathsAfterHydration(session, sessionID: sessionID)
+            await viewModel.waitForAttachmentRetention()
+
+            let expectedHistorical = AgentFileAttachment(
+                id: attachmentID, source: .localFile(path: kept.path), title: historicalAttachment.title, createdAt: historicalAttachment.createdAt
+            )
+            let expectedWorking = AgentFileAttachment(
+                id: attachmentID, source: .localFile(path: kept.path), title: workingAttachment.title, createdAt: workingAttachment.createdAt
+            )
+            XCTAssertEqual(session.items.map(\.id), [workingRequest.id])
+            XCTAssertEqual(session.items.first?.attachments, [expectedWorking])
+            XCTAssertEqual(session.transcript.turns.first { $0.request?.id == historicalRequest.id }?.request?.attachments, [expectedHistorical])
+            XCTAssertEqual(session.transcript.turns.first { $0.request?.id == workingRequest.id }?.request?.attachments, [expectedWorking])
+            XCTAssertEqual(session.fullTranscriptProjection.workingRows.first { $0.id == historicalRequest.id }?.attachments, [expectedHistorical])
+            XCTAssertEqual(session.fullTranscriptProjection.workingRows.first { $0.id == workingRequest.id }?.attachments, [expectedWorking])
+        }
+    }
+
+    func testRetentionMarksTheMovedTemporaryPathMissing() async throws {
+        let viewModel = makeViewModel()
+        let attachmentsRoot = workspaceDirectory.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+        viewModel.sessionAttachmentsRootOverride = { attachmentsRoot }
+        let session = viewModel.session(for: UUID())
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let temporaryFile = try writeTemporaryImage()
+        let temporaryPath = temporaryFile.standardizedFileURL.path
+        AttachmentTilePreviewCache.shared.retainedImages.availability.record(.available, forPath: temporaryPath)
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
+        session.appendItem(.user("look", attachments: [attachment]))
+        let reservationID = viewModel.reserveAttachmentsForTurn([attachment], session: session)
+
+        viewModel.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
+        await viewModel.waitForAttachmentRetention()
+
+        XCTAssertEqual(AttachmentTilePreviewCache.shared.retainedImages.availability.cachedAvailability(forPath: temporaryPath), .missing)
+    }
+
+    func testPaneEntryClearsAStuckTextViewHover() {
+        let controller = AgentImageDropController()
+        controller.setTextViewImageDragActive(true)
+        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], fileURLProviders: [], currentTabID: UUID())
+        XCTAssertFalse(controller.isTextViewImageDragActive)
+        XCTAssertFalse(controller.isOverlayVisible)
+    }
+
+    func testFinishedTurnWithoutPersistedSessionDeletesTemporaryCopy() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let temporaryFile = try writeTemporaryImage()
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
+        session.appendItem(.user("look", attachments: [attachment]))
+        let reservationID = viewModel.reserveAttachmentsForTurn([attachment], session: session)
+
+        viewModel.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .deleteFiles)
+        await viewModel.waitForAttachmentRetention()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
+        XCTAssertEqual(session.items.last { $0.kind == .user }?.attachments, [attachment])
+    }
+
+    func testRestoredTurnKeepsItsTemporaryCopyPending() async throws {
+        let viewModel = makeViewModel()
+        viewModel.sessionAttachmentsRootOverride = { [workspaceDirectory] in
+            workspaceDirectory?.appendingPathComponent("AgentSessions/attachments", isDirectory: true)
+        }
+        let session = viewModel.session(for: UUID())
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let temporaryFile = try writeTemporaryImage()
+        let attachment = AgentFileAttachment(source: .localFile(path: temporaryFile.path))
+        let reservationID = viewModel.reserveAttachmentsForTurn([attachment], session: session)
+
+        viewModel.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: .restoreToPending)
+        await viewModel.waitForAttachmentRetention()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: temporaryFile.path))
+        XCTAssertEqual(session.pendingFileAttachments, [attachment])
+    }
+
+    func testEvictionPublishesInvalidationAndFencesAlreadyQueuedCachedThumbnail() async throws {
+        let source = workspaceDirectory.appendingPathComponent("\(UUID().uuidString).png")
+        let png = try XCTUnwrap(Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="))
+        try png.write(to: source)
+        let cache = AttachmentTilePreviewCache.shared.retainedImages
+        let key = AgentAttachmentImageKey.preview(path: source.path, backingScale: 1)
+        let loaded = expectation(description: "Initial image loaded")
+        let initialToken = cache.loadImage(for: key) { result in
+            guard case .image = result else { return XCTFail("Fixture must decode as an image") }
+            loaded.fulfill()
+        }
+        defer { initialToken.cancel() }
+        await fulfillment(of: [loaded], timeout: 5)
+        XCTAssertNotNil(cache.cachedImage(for: key))
+        let invalidated = expectation(description: "Mounted-card invalidation delivered")
+        let subscription = cache.invalidatedPaths.receive(on: DispatchQueue.main).sink { paths in
+            guard paths.contains(source.path) else { return }
+            XCTAssertEqual(cache.availability.cachedAvailability(forPath: source.path), .missing)
+            invalidated.fulfill()
+        }
+        defer { subscription.cancel() }
+        let refreshed = expectation(description: "Queued cached result becomes missing")
+        let queuedToken = cache.loadImage(for: key) { result in
+            guard case .missing = result else { return XCTFail("Eviction must fence the queued cached image") }
+            refreshed.fulfill()
+        }
+        defer { queuedToken.cancel() }
+        try FileManager.default.removeItem(at: source)
+        cache.invalidate(paths: [source.path])
+        await fulfillment(of: [invalidated, refreshed], timeout: 5)
+        XCTAssertNil(cache.cachedImage(for: key))
+    }
+
+    func testPasteAndDropAttachWhenAllowed() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        let source = try writeSourceImage()
+
+        XCTAssertNil(viewModel.imageAttachmentBlockReason(tabID: tabID))
+        let accepted = await viewModel.attachImagesIfAllowed(tabID: tabID, urls: [source])
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(session.pendingFileAttachments.count, 1)
+    }
+
+    func testPasteAndDropAreBlockedWhileAgentIsBusyWithoutTouchingTheTranscript() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.runState = .running
+        let itemCountBefore = session.items.count
+        let source = try writeSourceImage()
+
+        XCTAssertEqual(viewModel.imageAttachmentBlockReason(tabID: tabID), .agentBusy)
+        let accepted = await viewModel.attachImagesIfAllowed(tabID: tabID, urls: [source])
+        XCTAssertFalse(accepted)
+
+        XCTAssertTrue(session.pendingFileAttachments.isEmpty)
+        XCTAssertEqual(session.items.count, itemCountBefore, "A running turn streams into the last row")
+        XCTAssertEqual(viewModel.imageAttachmentNotice?.tabID, tabID)
+        XCTAssertEqual(viewModel.imageAttachmentNotice?.message, AgentImageAttachmentBlockReason.agentBusy.message)
+    }
+
+    func testPasteAndDropAreBlockedForProvidersWithoutImageSupport() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .grokBuild
+        let source = try writeSourceImage()
+
+        let accepted = await viewModel.attachImagesIfAllowed(tabID: tabID, urls: [source])
+        XCTAssertFalse(accepted)
+
+        XCTAssertTrue(session.pendingFileAttachments.isEmpty)
+        let errorRow = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(errorRow.kind, .error)
+        XCTAssertEqual(
+            errorRow.text,
+            AgentImageAttachmentBlockReason.providerUnsupported(providerName: AgentProviderKind.grokBuild.displayName).message
+        )
+    }
+
+    func testPaneDropAttachesToTabCapturedAtDragStartAfterTabSwitch() {
+        let controller = AgentImageDropController()
+        let dragStartTab = UUID()
+        let switchedTab = UUID()
+        var pendingCompletion: (([AgentAttachmentIntake.Prepared]) -> Void)?
+        var attachedTab: UUID?
+        var attachedURLs: [URL] = []
+
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: dragStartTab)
+        XCTAssertTrue(controller.isOverlayVisible)
+        XCTAssertTrue(controller.acceptsPaneDrop)
+
+        let accepted = controller.performPaneDrop(
+            currentTabID: switchedTab,
+            load: { completion in
+                pendingCompletion = completion
+                return true
+            },
+            prepareAttach: { tabID in
+                { prepared in
+                    attachedTab = tabID
+                    attachedURLs = prepared.map(\.url)
+                }
+            }
+        )
+        XCTAssertTrue(accepted)
+        XCTAssertFalse(controller.isOverlayVisible)
+
+        // The asynchronous load finishes after the user switched tabs.
+        let image = URL(fileURLWithPath: "/tmp/dropped.png")
+        pendingCompletion?([AgentAttachmentIntake.Prepared(url: image, isTemporary: false)])
+        XCTAssertEqual(attachedTab, dragStartTab)
+        XCTAssertEqual(attachedURLs, [image])
+    }
+
+    func testDelayedPaneDropDoesNotRecreateRemovedSession() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let removedSession = viewModel.session(for: tabID)
+        let source = try writeSourceImage()
+        let controller = AgentImageDropController()
+        var pendingCompletion: (([AgentAttachmentIntake.Prepared]) -> Void)?
+        var intakeTask: Task<Void, Never>?
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: tabID)
+        XCTAssertTrue(controller.performPaneDrop(
+            currentTabID: tabID,
+            load: { pendingCompletion = $0
+                return true
+            },
+            prepareAttach: { tabID in
+                let attach = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+                return { prepared in
+                    intakeTask = Task { await attach(prepared.map(\.url)) }
+                }
+            }
+        ))
+        viewModel.test_removeSession(tabID: tabID)
+        pendingCompletion?([AgentAttachmentIntake.Prepared(url: source, isTemporary: false)])
+        await intakeTask?.value
+        XCTAssertNil(viewModel.session(for: tabID, createIfNeeded: false))
+        XCTAssertTrue(removedSession.pendingFileAttachments.isEmpty)
+    }
+
+    func testPreparedDropDoesNotAttachToReplacementOrReboundSession() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let original = viewModel.session(for: tabID)
+        let source = try writeSourceImage()
+        let attachBeforeReplacement = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        viewModel.test_removeSession(tabID: tabID)
+        let replacement = viewModel.session(for: tabID)
+        await attachBeforeReplacement([source])
+        XCTAssertTrue(original.pendingFileAttachments.isEmpty)
+        XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
+        let attachBeforeRebinding = viewModel.prepareImageAttachmentIntake(tabID: tabID)
+        replacement.testInstallPersistentSessionBinding(sessionID: UUID())
+        await attachBeforeRebinding([source])
+        XCTAssertTrue(replacement.pendingFileAttachments.isEmpty)
+    }
+
+    func testNonImageDropsAreNotHighlightedOrAccepted() {
+        let controller = AgentImageDropController()
+        var loadCalled = false
+
+        controller.paneDragEntered(typeIdentifiers: ["public.utf8-plain-text"], fileURLProviders: [], currentTabID: UUID())
+        XCTAssertFalse(controller.isOverlayVisible)
+        XCTAssertFalse(controller.acceptsPaneDrop)
+
+        let accepted = controller.performPaneDrop(
+            currentTabID: UUID(),
+            load: { _ in
+                loadCalled = true
+                return true
+            },
+            prepareAttach: { _ in { _ in XCTFail("Non-image drops must not attach") } }
+        )
+        XCTAssertFalse(accepted)
+        XCTAssertFalse(loadCalled)
+    }
+
+    func testTextViewImageDragKeepsOverlayLitAfterPaneExit() {
+        let controller = AgentImageDropController()
+        controller.paneDragEntered(typeIdentifiers: ["public.png"], fileURLProviders: [], currentTabID: UUID())
+        controller.paneDragExited()
+        controller.setTextViewImageDragActive(true)
+        XCTAssertTrue(controller.isOverlayVisible)
+        controller.setTextViewImageDragActive(false)
+        XCTAssertFalse(controller.isOverlayVisible)
+    }
+
+    // MARK: - Helpers
+
+    private func compactedTranscript(for request: AgentChatItem) -> AgentTranscript {
+        AgentTranscript(
+            turns: [AgentTranscriptTurn(
+                request: AgentTranscriptRequestAnchor(from: request), retentionTier: .condensed, terminalState: .completed,
+                startedAt: request.timestamp, completedAt: request.timestamp
+            )],
+            nextSequenceIndex: request.sequenceIndex + 1
+        )
+    }
+
+    private func writeTemporaryImage() throws -> URL {
+        let temporaryRoot = AgentAttachmentStore.managedStorageRootURL(for: workspaceDirectory)
+        try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        let fileURL = temporaryRoot.appendingPathComponent("\(UUID().uuidString).png")
+        try Data("temporary image".utf8).write(to: fileURL)
+        return fileURL
+    }
+
+    private func writeSourceImage() throws -> URL {
+        let fileURL = workspaceDirectory.appendingPathComponent("source-\(UUID().uuidString).png")
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 4, bitsPerPixel: 32
+        ))
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: fileURL)
+        return fileURL
+    }
+
+    private func makeViewModel(
+        attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false },
+        attachmentSweepViewModels: @escaping () -> [AgentModeViewModel] = { [] }
+    ) -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWorkspaceDirectory: workspaceDirectory,
+            attachmentPersistenceIsSuppressed: attachmentPersistenceIsSuppressed,
+            attachmentSweepViewModels: attachmentSweepViewModels,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Image attachment retention tests must not start Codex")
+            },
+            headlessProviderFactory: { _, _ in
+                UnsupportedHeadlessAgentProvider(reason: "image attachment retention test")
             }
         )
     }
