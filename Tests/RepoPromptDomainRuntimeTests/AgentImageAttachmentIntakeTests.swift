@@ -3,72 +3,35 @@ import RepoPromptDomainRuntime
 import UniformTypeIdentifiers
 import XCTest
 
-final class AgentImageDropClassifierTests: XCTestCase {
-    func testImageDataTypesClassifyAsImages() {
-        for identifier in [
-            UTType.png.identifier,
-            UTType.jpeg.identifier,
-            UTType.tiff.identifier,
-            UTType.image.identifier,
-            AgentImageDropClassifier.legacyPNGPasteboardType,
-            AgentImageDropClassifier.legacyTIFFPasteboardType
-        ] {
-            XCTAssertEqual(
-                AgentImageDropClassifier.classify(typeIdentifiers: [identifier], fileURLs: []),
-                .images,
-                identifier
-            )
+final class AgentAttachmentDropClassifierTests: XCTestCase {
+    func testFileURLsAreAcceptedWithoutAnExtensionAllowlistOrHoverRead() {
+        for identifier in [UTType.pdf.identifier, UTType.swiftSource.identifier, UTType.data.identifier] {
+            XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [UTType.fileURL.identifier, identifier]))
+        }
+        XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [UTType.fileURL.identifier]))
+    }
+
+    func testRawImagesIncludingLegacyPasteboardTypesAreAccepted() {
+        for identifier in [UTType.png.identifier, UTType.jpeg.identifier, UTType.tiff.identifier,
+                           UTType.image.identifier, "Apple PNG pasteboard type", "NeXT TIFF v4.0 pasteboard type"] {
+            XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [identifier]), identifier)
         }
     }
 
-    func testImageFileURLClassifiesAsImages() {
-        let url = URL(fileURLWithPath: "/tmp/does-not-need-to-exist/screenshot.png")
-        XCTAssertTrue(AgentImageDropClassifier.isImageFileURL(url))
-        XCTAssertEqual(
-            AgentImageDropClassifier.classify(
-                typeIdentifiers: [UTType.fileURL.identifier],
-                fileURLs: [URL(fileURLWithPath: "/tmp/notes.txt"), url]
-            ),
-            .images
-        )
-    }
-
-    func testNonImageFilesAndTextAreNotImages() {
-        XCTAssertEqual(
-            AgentImageDropClassifier.classify(
-                typeIdentifiers: [UTType.fileURL.identifier, UTType.swiftSource.identifier],
-                fileURLs: [URL(fileURLWithPath: "/tmp/Main.swift")]
-            ),
-            .notImages
-        )
-        XCTAssertEqual(
-            AgentImageDropClassifier.classify(
-                typeIdentifiers: [UTType.utf8PlainText.identifier, UTType.rtf.identifier],
-                fileURLs: nil
-            ),
-            .notImages
-        )
-        XCTAssertFalse(AgentImageDropClassifier.isImageFileURL(URL(string: "https://example.com/a.png")!))
-    }
-
-    func testUnreadFileURLsAreUndetermined() {
-        XCTAssertEqual(
-            AgentImageDropClassifier.classify(typeIdentifiers: [UTType.fileURL.identifier], fileURLs: nil),
-            .undetermined
-        )
+    func testTextWebLinksAndUnaddressableBinaryDataRemainUnclaimed() {
+        for identifier in [UTType.utf8PlainText.identifier, UTType.rtf.identifier, UTType.url.identifier, UTType.data.identifier] {
+            XCTAssertFalse(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [identifier]), identifier)
+        }
     }
 }
 
-final class AgentImageDropTrackerTests: XCTestCase {
+final class AgentAttachmentDropTrackerTests: XCTestCase {
     func testDropRoutesToTabCapturedAtDragStart() {
         let dragStartTab = UUID()
-        let laterTab = UUID()
-        var tracker = AgentImageDropTracker()
-
-        tracker.begin(tabID: dragStartTab, classification: .images)
+        var tracker = AgentAttachmentDropTracker()
+        tracker.begin(tabID: dragStartTab, acceptsAttachments: true, dragID: "first-drag")
         XCTAssertTrue(tracker.isHighlighted)
-
-        XCTAssertEqual(tracker.takeDropTarget(fallbackTabID: laterTab), dragStartTab)
+        XCTAssertEqual(tracker.takeDropTarget(fallbackTabID: UUID()), dragStartTab)
         XCTAssertFalse(tracker.isActive)
         XCTAssertNil(tracker.capturedTabID)
     }
@@ -76,35 +39,37 @@ final class AgentImageDropTrackerTests: XCTestCase {
     func testCapturedTabSurvivesExitUntilTheNextDrag() {
         let first = UUID()
         let second = UUID()
-        var tracker = AgentImageDropTracker()
-
-        tracker.begin(tabID: first, classification: .images)
+        var tracker = AgentAttachmentDropTracker()
+        tracker.begin(tabID: first, acceptsAttachments: true, dragID: "first-drag")
         tracker.exit()
         XCTAssertFalse(tracker.isHighlighted)
         XCTAssertEqual(tracker.capturedTabID, first)
-
-        tracker.begin(tabID: second, classification: .images)
+        tracker.begin(tabID: second, acceptsAttachments: true, dragID: "second-drag")
         XCTAssertEqual(tracker.takeDropTarget(fallbackTabID: nil), second)
+    }
+
+    func testSameDragPreservesItsDestinationAcrossPaneEditorHandoffs() {
+        let original = UUID()
+        var tracker = AgentAttachmentDropTracker()
+        tracker.begin(tabID: original, acceptsAttachments: true, dragID: "first-drag")
+        tracker.exit()
+        tracker.begin(tabID: UUID(), acceptsAttachments: true, dragID: "first-drag")
+        XCTAssertEqual(tracker.takeDropTarget(fallbackTabID: nil), original)
     }
 
     func testFallbackTabIsUsedWhenNothingWasCaptured() {
         let fallback = UUID()
-        var tracker = AgentImageDropTracker()
+        var tracker = AgentAttachmentDropTracker()
         XCTAssertEqual(tracker.takeDropTarget(fallbackTabID: fallback), fallback)
     }
 
-    func testStaleAsynchronousClassificationIsIgnored() {
-        var tracker = AgentImageDropTracker()
-        let firstGeneration = tracker.begin(tabID: UUID(), classification: .undetermined)
-        tracker.exit()
-        XCTAssertFalse(tracker.resolve(.images, generation: firstGeneration), "Resolution after exit must not relight")
+    func testUnsupportedDragDoesNotHighlightAndDropClearsItsState() {
+        var tracker = AgentAttachmentDropTracker()
+        tracker.begin(tabID: UUID(), acceptsAttachments: false, dragID: "first-drag")
         XCTAssertFalse(tracker.isHighlighted)
-
-        let secondGeneration = tracker.begin(tabID: UUID(), classification: .undetermined)
-        XCTAssertFalse(tracker.resolve(.images, generation: firstGeneration))
-        XCTAssertEqual(tracker.classification, .undetermined)
-        XCTAssertTrue(tracker.resolve(.images, generation: secondGeneration))
-        XCTAssertTrue(tracker.isHighlighted)
+        XCTAssertEqual(tracker.acceptsAttachments, false)
+        _ = tracker.takeDropTarget(fallbackTabID: nil)
+        XCTAssertFalse(tracker.isActive)
     }
 }
 

@@ -23,6 +23,10 @@ enum AttachmentPasteboard {
     }
 
     static func regularFileURLs(in pasteboard: NSPasteboard) -> [URL] {
+        fileURLs(in: pasteboard).filter(isRegularFile)
+    }
+
+    static func fileURLs(in pasteboard: NSPasteboard) -> [URL] {
         var urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
         for item in pasteboard.pasteboardItems ?? [] {
             if let fileURLString = item.string(forType: .fileURL),
@@ -38,7 +42,7 @@ enum AttachmentPasteboard {
         var seenPaths: Set<String> = []
         return urls
             .map(\.standardizedFileURL)
-            .filter { isRegularFile($0) && seenPaths.insert($0.path).inserted }
+            .filter { $0.isFileURL && seenPaths.insert($0.path).inserted }
     }
 }
 
@@ -73,10 +77,10 @@ enum ImagePasteboardTypes {
 final class AttachmentAwareTextView: NSTextView {
     var attachmentPasteHandler: ((NSPasteboard) -> Bool)?
     var enablesAttachmentPasteHandling = false
-    /// Keeps the pane-wide image overlay lit while the text view owns an image drag.
-    /// Text and non-image drags are never reported.
-    var imageDragHoverHandler: ((Bool) -> Void)?
-    private var isReportingImageDragHover = false
+    /// Bridges attachment drags to the pane's shared drop owner; ordinary text remains editable.
+    var attachmentDropHandler: ((NSPasteboard) -> Bool)?
+    var attachmentDragHoverHandler: ((Bool, NSPasteboard?) -> Void)?
+    private var isReportingAttachmentDragHover = false
     var commandReturnHandler: (() -> Bool)?
     /// Which key press triggers `commandReturnHandler`; `nil` keeps the fixed Command-Return.
     var commandReturnMatcher: ((NSEvent) -> Bool)?
@@ -175,77 +179,52 @@ final class AttachmentAwareTextView: NSTextView {
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard isEditable else { return [] }
-        setImageDragHover(enablesAttachmentPasteHandling && canHandleImageDrop(from: sender.draggingPasteboard))
-        let superOperation = super.draggingEntered(sender)
-        if superOperation != [] {
-            return superOperation
+        if attachmentDropHandler != nil,
+           RepoPromptDomainRuntime.AgentAttachmentDropClassifier.accepts(typeIdentifiers: (sender.draggingPasteboard.types ?? []).map(\.rawValue))
+        {
+            setAttachmentDragHover(true, pasteboard: sender.draggingPasteboard)
+            return .copy
         }
-        guard enablesAttachmentPasteHandling else {
-            return []
-        }
-        return canHandleAttachmentDrop(from: sender.draggingPasteboard) ? .copy : []
+        setAttachmentDragHover(false)
+        return super.draggingEntered(sender)
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
-        setImageDragHover(false)
+        setAttachmentDragHover(false)
         super.draggingExited(sender)
     }
 
     override func concludeDragOperation(_ sender: NSDraggingInfo?) {
-        setImageDragHover(false)
+        setAttachmentDragHover(false)
         super.concludeDragOperation(sender)
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
         guard isEditable else { return false }
-        guard enablesAttachmentPasteHandling else {
-            return super.prepareForDragOperation(sender)
-        }
-        if canHandleAttachmentDrop(from: sender.draggingPasteboard) {
-            return true
-        }
+        if attachmentDropHandler != nil,
+           RepoPromptDomainRuntime.AgentAttachmentDropClassifier.accepts(typeIdentifiers: (sender.draggingPasteboard.types ?? []).map(\.rawValue))
+        { return true }
         return super.prepareForDragOperation(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        setImageDragHover(false)
+        setAttachmentDragHover(false)
         guard isEditable else { return false }
-        guard enablesAttachmentPasteHandling else {
-            return super.performDragOperation(sender)
-        }
-        let pasteboard = sender.draggingPasteboard
-        guard canHandleAttachmentDrop(from: pasteboard) else {
-            return super.performDragOperation(sender)
-        }
-        _ = attachmentPasteHandler?(pasteboard)
-        // Consume attachable drops so file paths are not inserted into the text body.
-        return true
+        if let attachmentDropHandler,
+           RepoPromptDomainRuntime.AgentAttachmentDropClassifier.accepts(typeIdentifiers: (sender.draggingPasteboard.types ?? []).map(\.rawValue))
+        { return attachmentDropHandler(sender.draggingPasteboard) }
+        return super.performDragOperation(sender)
     }
 
-    /// Ends any reported image-drag hover (the view is being torn down mid-drag).
-    func endImageDragHover() {
-        setImageDragHover(false)
+    /// Ends any reported attachment hover when the editor is torn down mid-drag.
+    func endAttachmentDragHover() {
+        setAttachmentDragHover(false)
     }
 
-    private func setImageDragHover(_ isActive: Bool) {
-        guard isReportingImageDragHover != isActive else { return }
-        isReportingImageDragHover = isActive
-        imageDragHoverHandler?(isActive)
-    }
-
-    /// Same rules as the pane-wide drop target (`AgentImageDropClassifier`).
-    private func canHandleImageDrop(from pasteboard: NSPasteboard) -> Bool {
-        let typeIdentifiers = (pasteboard.types ?? []).map(\.rawValue)
-        let urls = (pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? [])
-            .filter(\.isFileURL)
-        return RepoPromptDomainRuntime.AgentImageDropClassifier.classify(typeIdentifiers: typeIdentifiers, fileURLs: urls) == .images
-    }
-
-    private func canHandleAttachmentDrop(from pasteboard: NSPasteboard) -> Bool {
-        if let types = pasteboard.types, types.contains(where: isImageLikePasteboardType) {
-            return true
-        }
-        return !AttachmentPasteboard.regularFileURLs(in: pasteboard).isEmpty
+    private func setAttachmentDragHover(_ isActive: Bool, pasteboard: NSPasteboard? = nil) {
+        guard isReportingAttachmentDragHover != isActive || isActive else { return }
+        isReportingAttachmentDragHover = isActive
+        attachmentDragHoverHandler?(isActive, pasteboard)
     }
 
     private func isImageLikePasteboardType(_ type: NSPasteboard.PasteboardType) -> Bool {
@@ -335,7 +314,8 @@ struct ResizableTextField: View {
     var onReturn: () -> Void
     @Binding var resetTrigger: Bool
     var onAttachmentPaste: ((NSPasteboard) -> Bool)?
-    var onImageDragHoverChange: ((Bool) -> Void)?
+    var onAttachmentDrop: ((NSPasteboard) -> Bool)?
+    var onAttachmentDragHoverChange: ((Bool, NSPasteboard?) -> Void)?
     var features: ResizableTextFieldFeatures = .plain
     /// Revision for intentional programmatic text changes while the editor is focused.
     var externalUpdateTick: Int? = .none
@@ -409,7 +389,8 @@ struct ResizableTextField: View {
             placeholder: placeholder,
             onReturn: onReturn,
             onAttachmentPaste: onAttachmentPaste,
-            onImageDragHoverChange: onImageDragHoverChange,
+            onAttachmentDrop: onAttachmentDrop,
+            onAttachmentDragHoverChange: onAttachmentDragHoverChange,
             features: features,
             externalUpdateTick: externalUpdateTick,
             isReadOnly: isReadOnly,
@@ -455,7 +436,8 @@ struct CustomTextField: NSViewRepresentable {
     var placeholder: String
     var onReturn: () -> Void
     var onAttachmentPaste: ((NSPasteboard) -> Bool)?
-    var onImageDragHoverChange: ((Bool) -> Void)?
+    var onAttachmentDrop: ((NSPasteboard) -> Bool)?
+    var onAttachmentDragHoverChange: ((Bool, NSPasteboard?) -> Void)?
     var features: ResizableTextFieldFeatures = .plain
     var externalUpdateTick: Int? = .none
     var isReadOnly = false
@@ -547,8 +529,9 @@ struct CustomTextField: NSViewRepresentable {
         textView.commandReturnMatcher = commandReturnMatcher
         textView.readOnlyReturnHandler = onReadOnlyReturn
         textView.attachmentPasteHandler = isReadOnly ? nil : onAttachmentPaste
+        textView.attachmentDropHandler = isReadOnly ? nil : onAttachmentDrop
         textView.enablesAttachmentPasteHandling = !isReadOnly && onAttachmentPaste != nil
-        textView.imageDragHoverHandler = isReadOnly ? nil : onImageDragHoverChange
+        textView.attachmentDragHoverHandler = isReadOnly ? nil : onAttachmentDragHoverChange
         context.coordinator.configureFileTagSupport(
             textView: textView,
             enabled: features.enableFileTagOverlay && !isReadOnly,
@@ -589,8 +572,9 @@ struct CustomTextField: NSViewRepresentable {
         textView.commandReturnMatcher = commandReturnMatcher
         textView.readOnlyReturnHandler = onReadOnlyReturn
         textView.attachmentPasteHandler = isReadOnly ? nil : onAttachmentPaste
+        textView.attachmentDropHandler = isReadOnly ? nil : onAttachmentDrop
         textView.enablesAttachmentPasteHandling = !isReadOnly && onAttachmentPaste != nil
-        textView.imageDragHoverHandler = isReadOnly ? nil : onImageDragHoverChange
+        textView.attachmentDragHoverHandler = isReadOnly ? nil : onAttachmentDragHoverChange
         if textView.font != fontPreset.nsFont {
             textView.font = fontPreset.nsFont
             Task { @MainActor in
@@ -674,8 +658,9 @@ struct CustomTextField: NSViewRepresentable {
         guard let textView = nsView.documentView as? AttachmentAwareTextView else { return }
         textView.delegate = nil
         textView.attachmentPasteHandler = nil
-        textView.endImageDragHover()
-        textView.imageDragHoverHandler = nil
+        textView.attachmentDropHandler = nil
+        textView.endAttachmentDragHover()
+        textView.attachmentDragHoverHandler = nil
         textView.commandReturnHandler = nil
         textView.commandReturnMatcher = nil
         textView.readOnlyReturnHandler = nil
