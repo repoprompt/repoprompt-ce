@@ -8005,6 +8005,24 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             )
         }
 
+        /// These carriers belong to a live window. Capture through its save owner so a
+        /// deferred UI publication is recaptured instead of racing a caller-local proposal.
+        func persistActiveCarriers() async throws -> URL {
+            let manager = window.workspaceManager
+            let workspace = try XCTUnwrap(manager.activeWorkspace)
+            manager.markWorkspaceDirty()
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: workspace.id, source: WorkspaceSaveSource("inventoryFixture")
+            )
+            let persistedID: UUID? = if case let .persisted(workspaceID, _) = outcome {
+                workspaceID
+            } else {
+                nil
+            }
+            XCTAssertEqual(try XCTUnwrap(persistedID, "Fixture save must persist: \(outcome)"), workspace.id)
+            return manager.workspaceFileURL(for: workspace)
+        }
+
         init(window: WindowState, runtime: MCPDomainRuntime, directory: URL, ownsRuntime: Bool = true) {
             self.window = window
             self.runtime = runtime
@@ -8409,7 +8427,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 session.selectedAgent = .claudeCode
                 fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
                 try await AsyncTestWait.waitUntil("notification provider available") { fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
-                _ = try await fixture.window.workspaceManager.saveWorkspaceToFileAsync(XCTUnwrap(fixture.window.workspaceManager.activeWorkspace))
+                _ = try await fixture.persistActiveCarriers()
                 var writes = 0
                 vm.test_setAgentSessionSaver { _, _, _ in
                     writes += 1
@@ -8516,7 +8534,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testActiveManagedRunSurvivesCarrierSessionSwitch() async throws {
-        try await assertExactTargetFlow(placement: "historical", duringRun: "switch")
+        try await assertExactTargetFlow(placement: "historical", duringRun: "switch", deferredFixturePublication: true)
     }
 
     func testActiveManagedRunSurvivesUnstash() async throws {
@@ -8559,7 +8577,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         try await assertExactTargetFlow(placement: "historical", duringRun: "shutdown-active", longWatch: true)
     }
 
-    private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false) async throws {
+    private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false, deferredFixturePublication: Bool = false) async throws {
         // This is the full-access OFF approval-card flow. Never inherit the machine's real setting.
         let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
         OverseerGlobalAutoApprove.isEnabled = { false }
@@ -8725,10 +8743,32 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let workspace = targetFixture.window.workspaceManager.workspaces[workspaceIndex]
             // Unlike the read-only inventory fixtures, this test dispatches a real write. Publish
             // both carriers through the workspace owner so a save cannot reload their older disk tabs.
-            let sourceWorkspaceURL = try await targetFixture.window.workspaceManager.saveWorkspaceToFileAsync(workspace)
-            _ = try await observerFixture.window.workspaceManager.saveWorkspaceToFileAsync(
-                XCTUnwrap(observerFixture.window.workspaceManager.activeWorkspace)
-            )
+            let targetManager = targetFixture.window.workspaceManager
+            let targetPrompt = targetFixture.window.promptManager
+            let nextFixtureView: FilesTab = targetPrompt.storedActiveSubView == .selected ? .context : .selected
+            var fixturePreparations = 0
+            if deferredFixturePublication {
+                targetManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                    guard workspaceID == workspace.id else { return }
+                    fixturePreparations += 1
+                    if fixturePreparations == 1 {
+                        targetPrompt.setActiveFilesTab(nextFixtureView, source: .user)
+                    } else {
+                        targetManager.publishActiveComposeTabSnapshot(commitToMemory: true)
+                    }
+                }
+            }
+            defer { targetManager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let sourceWorkspaceURL = try await targetFixture.persistActiveCarriers()
+            targetManager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            if deferredFixturePublication {
+                XCTAssertEqual(fixturePreparations, 2, "The active save must recapture one pending UI edit")
+                let saved = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: Data(contentsOf: sourceWorkspaceURL), fileURL: sourceWorkspaceURL
+                )
+                XCTAssertEqual(saved.composeTabs.first { $0.id == targetTab.id }?.activeSubView, nextFixtureView)
+            }
+            _ = try await observerFixture.persistActiveCarriers()
             if let prior = targetVM.sessions[targetTab.id] {
                 prior.saveDebounceTask?.cancel()
                 prior.persistedLoadTask?.cancel()
@@ -8755,7 +8795,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 placed.composeTabs[0].activeAgentSessionID = UUID()
                 targetFixture.carriers = placed
                 try targetFixture.installCarriers()
-                _ = try await targetFixture.window.workspaceManager.saveWorkspaceToFileAsync(placed)
+                _ = try await targetFixture.persistActiveCarriers()
                 targetVM.test_removeSession(tabID: targetTab.id)
             } else if placement == "inactive" {
                 let created = try targetFixture.window.workspaceManager.createPersistentWorkspace(name: "Unrelated visible workspace", repoPaths: [])
