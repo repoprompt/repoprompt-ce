@@ -880,6 +880,21 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
             XCTAssertEqual(held.pathSearchIndex?.search("Overlay", limit: 100).count, 0)
         }
 
+        func testDeltaMergeWorkIsLinearAcrossCatalogSizes() throws {
+            for count in [64, 1024, 16384] {
+                var fixture = CatalogDeltaFixture(fileCount: count)
+                let previous = fixture.authoritative()
+                // Reverse the input order so this also exercises replacement sorting.
+                let additions = [
+                    fixture.addFile(number: count + 10000, name: "Z-last.swift"),
+                    fixture.addFile(number: count + 10001, name: "A-first.swift")
+                ]
+                let event = fixture.event(generation: 1, upsertedFiles: additions)
+                let patched = try assertBoundedCatalogPatch(fixture, previous: previous, event: event)
+                assertCatalogParity(patched, fixture.authoritative(generation: 1))
+            }
+        }
+
         func testMaterializedDeltaParityAt200001Files() throws {
             var fixture = CatalogDeltaFixture(fileCount: 200_001)
             fixture.managedOnlyFileIDs = [CatalogDeltaFixture.id(201_000)]
@@ -887,10 +902,9 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
             XCTAssertEqual(fixture.files.count, 200_001)
             XCTAssertEqual(held.files.count, 200_000)
             var current = held
-            var candidateSeconds = 0.0
-            var referenceSeconds = 0.0
             let heldFirst = try catalogFileBytes(XCTUnwrap(held.files.first))
-            // Four fixed checkpoints. Setup and byte/query assertions are outside construction timing.
+            // Exercise the same four checkpoints as the original #1573 benchmark, but
+            // guard work and base ownership rather than machine-dependent elapsed time.
             for checkpoint in 0 ..< 4 {
                 var changed: [WorkspaceFileRecord] = []
                 var upsertedFolders: [WorkspaceFolderRecord] = []
@@ -929,7 +943,7 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
                             fixture.addFile(number: 400_001 + sequence * 2, name: "Overlay-\(sequence).md")
                         ]
                         let event = fixture.event(generation: UInt64(4 + sequence), upsertedFiles: additions)
-                        current = try XCTUnwrap(fixture.patch(current, event: event)).shard
+                        current = try assertBoundedCatalogPatch(fixture, previous: current, event: event)
                     }
                     changed = [
                         fixture.addFile(number: 400_068, name: "Overlay-34.swift"),
@@ -944,21 +958,11 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
                     removedFileIDs: removed,
                     modifiedFileIDs: modified
                 )
-                let start = DispatchTime.now().uptimeNanoseconds
-                let result = try XCTUnwrap(fixture.patch(current, event: event))
-                candidateSeconds += Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
-                current = result.shard
-                let referenceStart = DispatchTime.now().uptimeNanoseconds
+                current = try assertBoundedCatalogPatch(fixture, previous: current, event: event)
                 let reference = fixture.authoritative(generation: generation)
-                referenceSeconds += Double(DispatchTime.now().uptimeNanoseconds - referenceStart) / 1e9
                 assertCatalogParity(current, reference)
                 XCTAssertEqual(try catalogFileBytes(XCTUnwrap(held.files.first)), heldFirst)
             }
-            print("CATALOG_DELTA_200001 candidate_checkpoints_seconds=\(candidateSeconds) authoritative_checkpoints_seconds=\(referenceSeconds)")
-            // Calibrated debug construction totals: 1.912–1.928 s versus 30.247–30.325 s.
-            // Fourfold local runner headroom; parity/oracle/setup work is outside this budget.
-            XCTAssertLessThan(candidateSeconds, 8)
-            XCTAssertLessThan(candidateSeconds, referenceSeconds * 0.5)
         }
     }
 
@@ -1072,7 +1076,7 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
         }
 
         func patch(_ old: WorkspaceFileContextStore.RootCatalogShardComparisonView, event: WorkspaceAppliedIndexBatchEvent)
-            -> (shard: WorkspaceFileContextStore.RootCatalogShardComparisonView, logicalMutationCount: Int, changedFileIDs: Set<UUID>)?
+            -> (shard: WorkspaceFileContextStore.RootCatalogShardComparisonView, logicalMutationCount: Int, changedFileIDs: Set<UUID>, work: WorkspaceFileContextStore.RootCatalogPatchWork)?
         {
             WorkspaceFileContextStore.patchedRootCatalogShardForTesting(
                 previous: old, root: root, event: event, filesByID: files, foldersByID: folders,
@@ -1080,6 +1084,37 @@ final class WorkspaceRootCatalogRetentionTests: XCTestCase {
                 managedOnlyFileIDs: managedOnlyFileIDs
             )
         }
+    }
+
+    /// O(N + D log D) merge: one file pass, two folder passes, and sorting only D
+    /// replacements. The D² comparison allowance is a conservative sorting bound for
+    /// these tiny deltas, not a runner calibration. Materializing flat arrays is O(N).
+    private func assertBoundedCatalogPatch(
+        _ fixture: CatalogDeltaFixture,
+        previous: WorkspaceFileContextStore.RootCatalogShardComparisonView,
+        event: WorkspaceAppliedIndexBatchEvent,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> WorkspaceFileContextStore.RootCatalogShardComparisonView {
+        let observer = WorkspaceFileSearchCatalogBuildObserver()
+        let result = try WorkspaceFileSearchDebugContext.$catalogBuildObserver.withValue(observer) {
+            try XCTUnwrap(fixture.patch(previous, event: event), file: file, line: line)
+        }
+        let work = result.work
+        let fileDelta = Set(event.upsertedFiles.map(\.id) + event.modifiedFileIDs).count
+        let folderDelta = Set(event.upsertedFolders.map(\.id) + event.modifiedFolderIDs).count
+        XCTAssertEqual(work.fileVisits, previous.files.count, file: file, line: line)
+        XCTAssertEqual(work.folderVisits, previous.folders.count * 2, file: file, line: line)
+        XCTAssertLessThanOrEqual(work.sortedFileCount, fileDelta, file: file, line: line)
+        XCTAssertLessThanOrEqual(work.sortedFolderCount, folderDelta, file: file, line: line)
+        XCTAssertLessThanOrEqual(work.fileComparisons, previous.files.count + fileDelta + fileDelta * fileDelta, file: file, line: line)
+        XCTAssertLessThanOrEqual(work.folderComparisons, previous.folders.count + folderDelta + folderDelta * folderDelta, file: file, line: line)
+        XCTAssertEqual(observer.snapshot().sortInvocationCount, 0, "No authoritative catalog sort during a patch", file: file, line: line)
+        let oldIndex = try XCTUnwrap(previous.pathSearchIndex, file: file, line: line)
+        let newIndex = try XCTUnwrap(result.shard.pathSearchIndex, file: file, line: line)
+        XCTAssertTrue(newIndex.baseOwnerForTesting === oldIndex.baseOwnerForTesting, "A small delta must not rebuild the full path index", file: file, line: line)
+        XCTAssertNotEqual(newIndex.buildKind, .full, file: file, line: line)
+        return result.shard
     }
 
     private func catalogFileBytes(_ file: WorkspaceFileRecord) -> [[UInt8]] {

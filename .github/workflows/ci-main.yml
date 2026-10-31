@@ -8,9 +8,13 @@ on:
       - main
   workflow_dispatch:
 
+# Finish selected main qualification instead of discarding running work on every
+# merge. Keep only the newest pending automatic push; manual runs and reruns are
+# exact-source requests and cannot be coalesced by later pushes.
 concurrency:
-  group: ci-main-${{ github.ref }}
-  cancel-in-progress: true
+  group: >-
+    ci-main-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

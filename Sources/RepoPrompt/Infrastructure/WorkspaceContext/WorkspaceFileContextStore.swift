@@ -3035,7 +3035,23 @@ actor WorkspaceFileContextStore {
         let folders: [WorkspaceFolderRecord]
         let logicalMutationCount: Int
         let pathIndexChangedFileIDs: Set<UUID>
+        #if DEBUG
+            var work = RootCatalogPatchWork()
+        #endif
     }
+
+    #if DEBUG
+        /// Actual merge work, not elapsed time. Flat immutable arrays require linear visits;
+        /// only replacement records may be sorted. Kept local to each build (no global counters).
+        struct RootCatalogPatchWork {
+            var fileVisits = 0
+            var folderVisits = 0
+            var fileComparisons = 0
+            var folderComparisons = 0
+            var sortedFileCount = 0
+            var sortedFolderCount = 0
+        }
+    #endif
 
     private struct SearchCatalogRootDependency: Hashable {
         let canonicalIdentity: String
@@ -7569,7 +7585,7 @@ actor WorkspaceFileContextStore {
             folderIDsByPath: [String: UUID],
             managedOnlyFileIDs: Set<UUID> = [],
             managedOnlyFolderIDs: Set<UUID> = []
-        ) -> (shard: RootCatalogShardComparisonView, logicalMutationCount: Int, changedFileIDs: Set<UUID>)? {
+        ) -> (shard: RootCatalogShardComparisonView, logicalMutationCount: Int, changedFileIDs: Set<UUID>, work: RootCatalogPatchWork)? {
             guard !event.requiresFullResync, !event.isRootUnload,
                   let output = mergeRootCatalogShardRecords(
                       event: event,
@@ -7597,7 +7613,7 @@ actor WorkspaceFileContextStore {
                 previousPathSearchIndex: previous.pathSearchIndex,
                 appliedIndexGeneration: event.generation
             )
-            return (comparisonView(shard), output.logicalMutationCount, output.pathIndexChangedFileIDs)
+            return (comparisonView(shard), output.logicalMutationCount, output.pathIndexChangedFileIDs, output.work)
         }
 
         func applyAppliedIndexEventToRootCatalogShardForTesting(
@@ -9573,6 +9589,21 @@ actor WorkspaceFileContextStore {
               removedFolderPaths.isDisjoint(with: replacementFolderPaths)
         else { return nil }
 
+        #if DEBUG
+            var work = RootCatalogPatchWork()
+            func filePrecedes(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
+                work.fileComparisons += 1
+                return searchRootCatalogFilePrecedes(lhs, rhs)
+            }
+            func folderPrecedes(_ lhs: WorkspaceFolderRecord, _ rhs: WorkspaceFolderRecord) -> Bool {
+                work.folderComparisons += 1
+                return searchCatalogFolderPrecedes(lhs, rhs)
+            }
+        #else
+            let filePrecedes = searchRootCatalogFilePrecedes
+            let folderPrecedes = searchCatalogFolderPrecedes
+        #endif
+
         // Only affected ancestor membership is collected, not another whole-root identity map.
         var neededFolderIDs = Set<UUID>()
         func validateParentChain(from startingID: UUID?) -> Bool {
@@ -9610,6 +9641,9 @@ actor WorkspaceFileContextStore {
         var foundModifiedFolderIDs = Set<UUID>()
         // Resolve displaced identities before checking retained parent links in the merge pass.
         for folder in oldFolders {
+            #if DEBUG
+                work.folderVisits += 1
+            #endif
             if modifiedFolderIDs.contains(folder.id) { foundModifiedFolderIDs.insert(folder.id) }
             if removedFolderIDs.contains(folder.id) { foundRemovedFolderIDs.insert(folder.id) }
             if removedFolderPaths.contains(folder.standardizedRelativePath) {
@@ -9645,15 +9679,22 @@ actor WorkspaceFileContextStore {
               foundModifiedFolderIDs == modifiedFolderIDs,
               neededFolderIDs.isSubset(of: representedNeededFolderIDs)
         else { return nil }
-        let sortedFolderReplacements = folderReplacements.values.sorted(by: searchCatalogFolderPrecedes)
+        #if DEBUG
+            work.sortedFolderCount = folderReplacements.count
+            work.sortedFileCount = fileReplacements.count
+        #endif
+        let sortedFolderReplacements = folderReplacements.values.sorted(by: folderPrecedes)
         var folders: [WorkspaceFolderRecord] = []
         folders.reserveCapacity(oldFolders.count + sortedFolderReplacements.count)
         var folderCursor = 0
         for folder in oldFolders {
+            #if DEBUG
+                work.folderVisits += 1
+            #endif
             if touchedFolderIDs.contains(folder.id) { continue }
             guard folder.parentFolderID.map({ !absentFolderIDs.contains($0) }) ?? true else { return nil }
             while folderCursor < sortedFolderReplacements.count,
-                  searchCatalogFolderPrecedes(sortedFolderReplacements[folderCursor], folder)
+                  folderPrecedes(sortedFolderReplacements[folderCursor], folder)
             {
                 folders.append(sortedFolderReplacements[folderCursor])
                 folderCursor += 1
@@ -9662,7 +9703,7 @@ actor WorkspaceFileContextStore {
         }
         folders.append(contentsOf: sortedFolderReplacements[folderCursor...])
 
-        let sortedFileReplacements = fileReplacements.values.sorted(by: searchRootCatalogFilePrecedes)
+        let sortedFileReplacements = fileReplacements.values.sorted(by: filePrecedes)
         var files: [WorkspaceFileRecord] = []
         files.reserveCapacity(oldFiles.count + sortedFileReplacements.count)
         var fileCursor = 0
@@ -9671,6 +9712,9 @@ actor WorkspaceFileContextStore {
         var foundRemovedFilePaths = Set<String>()
         var foundModifiedFileIDs = Set<UUID>()
         for file in oldFiles {
+            #if DEBUG
+                work.fileVisits += 1
+            #endif
             if modifiedFileIDs.contains(file.id) { foundModifiedFileIDs.insert(file.id) }
             if removedFileIDs.contains(file.id) { foundRemovedFileIDs.insert(file.id) }
             if removedFilePaths.contains(file.standardizedRelativePath) {
@@ -9679,7 +9723,7 @@ actor WorkspaceFileContextStore {
             if let replacement = fileReplacements[file.id], file.isByteIdentical(to: replacement) {
                 touchedFileIDs.remove(file.id)
                 while fileCursor < sortedFileReplacements.count,
-                      searchRootCatalogFilePrecedes(sortedFileReplacements[fileCursor], file)
+                      filePrecedes(sortedFileReplacements[fileCursor], file)
                 {
                     files.append(sortedFileReplacements[fileCursor])
                     fileCursor += 1
@@ -9706,7 +9750,7 @@ actor WorkspaceFileContextStore {
             }
             guard file.parentFolderID.map({ !absentFolderIDs.contains($0) }) ?? true else { return nil }
             while fileCursor < sortedFileReplacements.count,
-                  searchRootCatalogFilePrecedes(sortedFileReplacements[fileCursor], file)
+                  filePrecedes(sortedFileReplacements[fileCursor], file)
             {
                 files.append(sortedFileReplacements[fileCursor])
                 fileCursor += 1
@@ -9718,12 +9762,16 @@ actor WorkspaceFileContextStore {
               foundModifiedFileIDs == modifiedFileIDs
         else { return nil }
         files.append(contentsOf: sortedFileReplacements[fileCursor...])
-        return RootCatalogShardBuilderOutput(
+        var output = RootCatalogShardBuilderOutput(
             files: files,
             folders: folders,
             logicalMutationCount: touchedFileIDs.count + touchedFolderIDs.count,
             pathIndexChangedFileIDs: touchedFileIDs
         )
+        #if DEBUG
+            output.work = work
+        #endif
+        return output
     }
 
     private static func catalogFileBytesEqual(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
