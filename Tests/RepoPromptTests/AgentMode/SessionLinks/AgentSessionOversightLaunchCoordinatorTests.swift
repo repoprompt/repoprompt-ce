@@ -520,7 +520,8 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
     }
 
     /// Actual bridge/authority/launch reconciliation with READY fake addresses, not VM routing,
-    /// provider startup or painted UI. Keep one representative scale fixture and explicit budgets.
+    /// provider startup or painted UI. Gate candidate visits/publications, with
+    /// wall-clock samples retained as diagnostics for a controlled performance run.
     func testScaleRestoreRefreshAndMenuBudgets() async throws {
         for chatCount in [30, 300] {
             let candidates = (0 ..< chatCount).map { index in
@@ -554,7 +555,6 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             await fixture.bridge.test_settleLaunchReconciliation()
             await fixture.bridge.test_settleProjections()
             let restoreMS = milliseconds(since: restoreStart)
-            XCTAssertLessThanOrEqual(restoreMS, 1000, "READY 300/3/5/10 restore budget")
             for intent in intents {
                 XCTAssertEqual(fixture.bridge.test_launchEntryState(for: intent), .active)
             }
@@ -574,18 +574,28 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             var menuSamples: [Double] = []
             for sample in 0 ... 20 {
                 let reads = fixture.host.candidateCallCount
+                let visits = fixture.host.fullCandidateVisits
+                let boundedVisits = fixture.host.boundedCandidateVisits
+                let publications = fixture.host.projectionCount
                 let start = ContinuousClock.now
                 await fixture.bridge.test_settleProjections()
                 let refreshMS = milliseconds(since: start)
                 XCTAssertEqual(fixture.host.candidateCallCount - reads, 2)
+                XCTAssertEqual(fixture.host.fullCandidateVisits - visits, 2 * chatCount)
+                XCTAssertLessThanOrEqual(fixture.host.boundedCandidateVisits - boundedVisits, 500)
+                XCTAssertLessThanOrEqual(fixture.host.projectionCount - publications, 15)
                 let summaryReads = fixture.host.candidateCallCount
                 XCTAssertEqual(fixture.bridge.sidebarOversightSummary(for: subject.domainEndpoint)?.availableObserverCount, 5)
                 XCTAssertEqual(fixture.host.candidateCallCount, summaryReads, "Closed row must not enumerate candidates")
                 let menuStart = ContinuousClock.now
+                let menuVisits = fixture.host.fullCandidateVisits
+                let menuBoundedVisits = fixture.host.boundedCandidateVisits
                 let menu = fixture.bridge.sidebarOversightMenu(for: subject.domainEndpoint)
                 let menuMS = milliseconds(since: menuStart)
                 XCTAssertEqual(menu, expectedMenu)
                 XCTAssertEqual(fixture.host.candidateCallCount - summaryReads, 1)
+                XCTAssertEqual(fixture.host.fullCandidateVisits - menuVisits, chatCount)
+                XCTAssertLessThanOrEqual(fixture.host.boundedCandidateVisits - menuBoundedVisits, 20)
                 if sample > 0 { refreshSamples.append(refreshMS)
                     menuSamples.append(menuMS)
                 }
@@ -593,8 +603,6 @@ final class AgentSessionOversightLaunchCoordinatorTests: XCTestCase {
             let sparseReads = fixture.host.candidateCallCount
             await fixture.bridge.test_refreshStatus(sessionIDs: [candidates[0].sessionID])
             XCTAssertEqual(fixture.host.candidateCallCount, sparseReads, "Sparse status performs no full discovery")
-            XCTAssertLessThanOrEqual(refreshSamples.sorted()[18], 50, "Warm full refresh nearest-rank p95 budget")
-            XCTAssertLessThanOrEqual(menuSamples.sorted()[18], 50, "Open-time menu nearest-rank p95 budget")
             XCTAssertEqual(fixture.host.providerTaskRequests, 0)
             XCTAssertTrue(fixture.host.hydrationRequests.isEmpty)
             print("OVERSIGHT_SCALE chats=\(chatCount) windows=3 observers=5 links=10 restoreMS=\(restoreMS) restoreReads=\(restoreReads) restoreVisits=\(restoreVisits) publications=\(restorePublications) refreshMS=\(refreshSamples) menuMS=\(menuSamples)")
