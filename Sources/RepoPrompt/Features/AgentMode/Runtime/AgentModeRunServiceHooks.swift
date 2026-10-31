@@ -100,6 +100,7 @@ extension AgentModeRunService {
         let finalizePendingToolCalls: (AgentTabSession, AgentSessionRunState) -> Void
         let finalizePendingToolCallsWithUpperBound: (AgentTabSession, AgentSessionRunState, Int?) -> Void
         let flushPendingAssistantDelta: (AgentTabSession) -> Void
+        let beginClaudeProviderOutputSegment: (AgentTabSession) -> Void
         let clearPendingAssistantDelta: (AgentTabSession) -> Void
     }
 

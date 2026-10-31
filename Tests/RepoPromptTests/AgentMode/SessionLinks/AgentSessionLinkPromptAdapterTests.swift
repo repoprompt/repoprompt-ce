@@ -3889,6 +3889,24 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     private var configuration = SessionLinkNativeConfigurationFixture()
     private(set) var sentMessages: [String] = []
+    private(set) var inputBoundaryCalls: [String] = []
+    private var immediateReplyDuringSend = false
+    private var rejectBeforeWrite = false
+
+    func setRejectBeforeWrite(_ enabled: Bool) {
+        rejectBeforeWrite = enabled
+    }
+
+    private var interruptedTurnID: UUID?
+
+    func setInterruptedTurnID(_ id: UUID) {
+        interruptedTurnID = id
+    }
+
+    func setImmediateReplyDuringSend(_ enabled: Bool) {
+        immediateReplyDuringSend = enabled
+    }
+
     private var lastSentTurnID: UUID?
 
     func completeLastTurn(text: String? = nil, status: NativeAgentRuntimeTurnStatus = .completed) {
@@ -3999,7 +4017,20 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
 
     func sendUserMessage(_ text: String, configuration proof: NativeAgentRuntimeConfigurationProof) async throws -> UUID {
         try configuration.validate(proof)
+        if rejectBeforeWrite {
+            await sendSuspension?()
+            throw NativeAgentRuntimeControllerError.configurationNotCurrent
+        }
+        inputBoundaryCalls.append("send")
         sentMessages.append(text)
+        if immediateReplyDuringSend {
+            let id = UUID()
+            lastSentTurnID = id
+            continuation?.yield(.stream(.init(type: "content", text: "immediate-steer-reply")))
+            continuation?.yield(.turnsCompleted(turnIDs: [id], status: .completed))
+            await sendSuspension?()
+            return id
+        }
         await sendSuspension?()
         if failSendAfterRecord {
             throw NativeAgentRuntimeControllerError.processNotRunning
@@ -4028,8 +4059,13 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         return turnID
     }
 
-    func interruptTurn(reason _: String) async -> NativeAgentRuntimeInterruptOutcome {
-        .noTurnInFlight
+    func interruptTurn(reason: String) async -> NativeAgentRuntimeInterruptOutcome {
+        inputBoundaryCalls.append("interrupt:\(reason)")
+        if let id = interruptedTurnID {
+            interruptedTurnID = nil
+            continuation?.yield(.turnsCompleted(turnIDs: [id], status: .cancelled))
+        }
+        return .noTurnInFlight
     }
 
     func shutdown() async {
@@ -4038,7 +4074,9 @@ actor MonitorFakeNativeController: NativeAgentRuntimeControlling {
         continuation?.finish()
     }
 
-    func respondToPermissionRequest(id _: String, decision _: AgentApprovalDecision) async {}
+    func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async {
+        inputBoundaryCalls.append("permission:\(id):\(decision)")
+    }
 }
 
 /// Records each run-policy install while forwarding it to the shared manager, so a Claude run's

@@ -419,6 +419,7 @@ final class AgentQuietCheckInLifecycleTests: XCTestCase {
                     finalizePendingToolCalls: base.transcript.finalizePendingToolCalls,
                     finalizePendingToolCallsWithUpperBound: base.transcript.finalizePendingToolCallsWithUpperBound,
                     flushPendingAssistantDelta: base.transcript.flushPendingAssistantDelta,
+                    beginClaudeProviderOutputSegment: base.transcript.beginClaudeProviderOutputSegment,
                     clearPendingAssistantDelta: base.transcript.clearPendingAssistantDelta
                 ),
                 providerInput: base.providerInput, interactions: base.interactions,

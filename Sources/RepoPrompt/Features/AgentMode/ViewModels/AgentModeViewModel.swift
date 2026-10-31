@@ -1261,17 +1261,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await runService.test_publishNaturalCompletion(session)
         }
 
+        @discardableResult
         func test_initializeRunService(
             mcpServerEnabler: MCPServerEnabler? = nil,
             connectionPolicyInstaller: ConnectionPolicyInstaller? = nil,
             expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil
-        ) {
+        ) -> AgentModeRunService {
             if mcpServerEnabler == nil, connectionPolicyInstaller == nil, expectedPIDPolicyArmer == nil {
                 _ = runService
             } else {
                 precondition(sessions.values.allSatisfy { $0.activeRunOwnership == nil })
                 runService = makeRunService(mcpServerEnabler: mcpServerEnabler, connectionPolicyInstaller: connectionPolicyInstaller, expectedPIDPolicyArmer: expectedPIDPolicyArmer)
             }
+            return runService
         }
 
         func test_consumeClaudeTerminalEvents(
@@ -1285,7 +1287,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             for session: TabSession,
             initialMessage: String
         ) async {
-            await startFollowUpRun(for: session, initialMessage: initialMessage)
+            await startFollowUpRun(for: session, instruction: .providerOnly(initialMessage))
         }
 
         var test_isCursorModelPollingActive: Bool {
@@ -2507,13 +2509,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     var repromptDefaultModel: (provider: AgentProviderKind?, model: AIModel)?
 
     private func makeClaudeCoordinatorHostCapabilities() -> ClaudeAgentModeCoordinator.HostCapabilities {
-        ClaudeAgentModeCoordinator.HostCapabilities(
+        var capabilities = ClaudeAgentModeCoordinator.HostCapabilities(
             isSessionCurrent: { [weak self] session in
                 guard let self else { return false }
                 return sessions[session.tabID] === session
             },
             requestUIRefresh: { [weak self] session, urgent in
                 guard let self, sessions[session.tabID] === session else { return }
+                session.noteMonitorObservationInputsChanged()
+                handleObservedMCPStateChange(for: session)
                 requestUIRefresh(tabID: session.tabID, urgent: urgent)
             },
             scheduleSave: { [weak self] session in
@@ -2571,6 +2575,76 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 self?.acceptAgentSessionLinkDispatch(session: session, context: context, claim: claim)
             }
         )
+        capabilities.adoptProviderTurn = { [weak self] session, listener, turnID, fence in
+            guard let self else { return false }
+            let activation = session.mcpControlActivationGeneration
+            defer {
+                if sessions[session.tabID] === session, session.mcpControlActivationGeneration == activation,
+                   fence.permitsStart(of: session),
+                   listener.subscription == nil || session.activeRunOwnership != nil
+                {
+                    session.mcpFollowUpRunPending = false
+                    handleObservedMCPStateChange(for: session)
+                }
+            }
+            return await runService.adoptClaudeProviderTurn(session: session, listener: listener, turnID: turnID, fence: fence) {
+                await self.prepareClaudeProviderEpoch(session: session, fence: fence)
+            }
+        }
+        capabilities.cleanupProviderRun = { [weak self] session, runID in
+            guard let self else { return }
+            await cleanupMCPRunRoutingIfPresent(boundSessionID: boundSessionID(for: session.tabID), liveSession: session, explicitRunID: runID, reason: "claudeNative.providerInitiated")
+        }
+        return capabilities
+    }
+
+    func preparedOversightRuntimeIsBusy() async -> Bool {
+        for session in sessions.values {
+            let fence = AgentRunStartStopFence(session: session)
+            if session.runState.isActive || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
+            if let controller = session.claudeController {
+                let busy = await controller.hasTurnInFlight
+                guard sessions[session.tabID] === session, fence.permitsStart(of: session),
+                      session.claudeController.map({ ObjectIdentifier($0) }) == ObjectIdentifier(controller)
+                else { return true }
+                if busy || session.runState.isActive || claudeCoordinator.hasPendingProviderWork(for: session) { return true }
+            }
+        }
+        return false
+    }
+
+    private func prepareClaudeProviderEpoch(session: TabSession, fence: AgentRunStartStopFence) async -> Bool {
+        guard sessions[session.tabID] === session, fence.permitsStart(of: session), !Task.isCancelled else { return false }
+        session.mcpFollowUpRunPending = true
+        handleObservedMCPStateChange(for: session)
+        guard let original = session.mcpControlContext else { return true }
+        let activation = session.mcpControlActivationGeneration
+        if original.preparedEpoch == nil {
+            do {
+                try await withMCPRunEpochTransition(sessionID: original.sessionID, kind: .relatedFollowUp) {
+                    await self.prepareMCPWaitTrackingForRunStart(session: session, stopFence: fence)
+                    guard session.mcpControlContext?.preparedEpoch != nil else { throw CancellationError() }
+                }
+            } catch { return false }
+        }
+        guard !Task.isCancelled, fence.permitsStart(of: session), sessions[session.tabID] === session,
+              session.mcpControlActivationGeneration == activation,
+              let context = session.mcpControlContext,
+              context.activationID == original.activationID,
+              let prepared = context.preparedEpoch, context.currentEpoch == prepared,
+              mcpControlledSession(sessionID: context.sessionID) === session
+        else { return false }
+        let storeEpoch = await AgentRunSessionStore.currentEpoch(for: context.registration)
+        let snapshot = await AgentRunSessionStore.snapshot(for: context.registration)
+        guard !Task.isCancelled, fence.permitsStart(of: session), sessions[session.tabID] === session,
+              session.mcpControlActivationGeneration == activation,
+              session.mcpControlContext?.registration == context.registration,
+              session.mcpControlContext?.preparedEpoch == prepared,
+              storeEpoch == prepared, snapshot?.status.isTerminal != true,
+              prepared.activationID == context.activationID,
+              prepared.registrationGeneration == context.registration.generation
+        else { return false }
+        return true
     }
 
     init(
@@ -3571,6 +3645,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 flushPendingAssistantDelta: { [weak self] session in
                     self?.flushPendingAssistantDelta(session)
                 },
+                beginClaudeProviderOutputSegment: { [weak self] session in
+                    self?.flushPendingAssistantDelta(session)
+                    self?.endActiveAssistantSegment(session)
+                },
                 clearPendingAssistantDelta: { [weak self] session in
                     self?.clearPendingAssistantDelta(session)
                 }
@@ -3707,15 +3785,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                         )
                         return
                     }
-                    let stopFence = instruction.stopFence ?? AgentRunStartStopFence(session: session)
+                    let instruction = instruction.retainingStopFence(instruction.stopFence ?? AgentRunStartStopFence(session: session))
                     Task { @MainActor [weak self, weak session] in
                         guard let self, let session else { return }
-                        await startFollowUpRun(
-                            for: session,
-                            initialMessage: instruction.providerText,
-                            stopFence: stopFence,
-                            skipsSlashExpansion: instruction.skipsSlashExpansion
-                        )
+                        await startFollowUpRun(for: session, instruction: instruction)
                     }
                 },
                 startTypedACPFollowUpRun: { [weak self] session, instruction in
@@ -3843,9 +3916,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     private func startFollowUpRun(
         for session: TabSession,
-        initialMessage: String,
-        stopFence: AgentRunStartStopFence? = nil,
-        skipsSlashExpansion: Bool = false
+        instruction: TabSession.PendingInstruction
     ) async {
         guard sessions[session.tabID] === session else {
             session.mcpFollowUpRunPending = false
@@ -3860,11 +3931,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             handleObservedMCPStateChange(for: session)
             return
         }
+        let fence = instruction.stopFence ?? AgentRunStartStopFence(session: session)
+        let outcome = AgentRunStartOutcomeRecorder()
         await startAgentRun(
             tabID: session.tabID,
-            initialMessage: initialMessage,
-            directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: skipsSlashExpansion, stopFence: stopFence)
+            initialMessage: instruction.providerText,
+            directStartOptions: AgentDirectRunStartOptions(skipsSlashExpansion: instruction.skipsSlashExpansion, stopFence: fence),
+            startOutcome: outcome
         )
+        if !outcome.outcome.didStart,
+           sessions[session.tabID] === session, fence.permitsStart(of: session),
+           session.selectedAgent.usesClaudeNativeRuntime,
+           session.activeRunOwnership.map({ session.claudeTerminalAnchor?.0 == $0 }) == true
+        {
+            // Terminal dispatch dequeued this instruction before adoption won admission.
+            // Its original typed payload stays owed to the next ordinary terminal boundary.
+            session.pendingInstructions.insert(instruction.retainingStopFence(fence), at: 0)
+            session.isDirty = true
+            updateBindingsFromSession(session)
+            scheduleSave(for: session.tabID)
+        }
     }
 
     /// Build the generic orchestration hooks that provider tool tracking handlers need.
@@ -5999,6 +6085,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             }
         }
 
+        if session.claudeController != nil {
+            let retiredRunID = session.runID
+            claudeCoordinator.prepareForConversationResetSync(session)
+            if let retiredRunID {
+                Task { await self.cleanupMCPRunRoutingIfPresent(boundSessionID: previousSessionID, liveSession: nil, explicitRunID: retiredRunID, reason: "claudeNative.rebind") }
+            }
+        }
         if invalidateAsyncWork {
             cancelPersistedLoad(for: session)
             removePendingUIRefresh(for: session.tabID)
@@ -8499,7 +8592,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             await test_afterMCPStoreEpochBegan?()
         #endif
         guard case let .accepted(epoch) = result,
-              stopFence.permitsStart(of: session),
+              stopFence.binding == session.persistentSessionBindingIdentity,
+              !session.bindingTransitionInProgress,
               session.mcpControlActivationGeneration == activationGeneration,
               var context = session.mcpControlContext,
               context.activationID == originalContext.activationID,
@@ -8521,6 +8615,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             context.pendingEpochTransition = nil
         }
         session.mcpControlContext = context
+        // An accepted epoch belongs to this binding even if Stop won during the actor hop.
+        // Retain it unconsumed for the next start; never leave the store ahead of its owner.
+        guard stopFence.permitsStart(of: session), !Task.isCancelled else { return }
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true
             handleObservedMCPStateChange(for: session)
@@ -8623,7 +8720,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                session.agentTask == nil,
                session.pendingInstructions.isEmpty,
                session.claudeSteeringFlushTask == nil,
-               session.acpSteeringFlushTask == nil
+               session.acpSteeringFlushTask == nil,
+               !claudeCoordinator.hasPendingProviderWork(for: session)
             {
                 Self.steeringDebugLog("[AgentRunSteeringWake] clearing stale MCP running mask sessionID=\(context.sessionID) tab=\(session.tabID) runState=\(session.runState.rawValue) terminal=\(terminalStatus.rawValue) followUp=\(session.mcpFollowUpRunPending) superseding=\(session.pendingSupersedingTurnCompletions)")
                 session.mcpFollowUpRunPending = false
@@ -21914,6 +22012,75 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         let originalBindingToken = session.currentRestorationBindingToken
         let originalWorkspaceID = workspaceManager?.activeWorkspaceID
         let originalStopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)
+        var preparedClaudeEvents: ClaudeAttemptEventReservation?
+        var claudeEventsTransferred = false
+        defer {
+            if !claudeEventsTransferred, let preparedClaudeEvents {
+                preparedClaudeEvents.listener.close(preparedClaudeEvents.subscription, returningTail: true)
+                preparedClaudeEvents.listener.terminalPublished(for: preparedClaudeEvents.subscription)
+            }
+        }
+        func recordClaudeStartRefusal() {
+            let message = ClaudeAgentModeCoordinator.inputNotSentMessage
+            startOutcome?.recordStartFailure(message: message)
+            if directStartOptions.localComposerCandidate != nil {
+                session.appendItem(.error(message, sequenceIndex: session.nextSequenceIndex))
+                session.isDirty = true
+                scheduleSave(for: tabID)
+                requestUIRefresh(tabID: tabID, urgent: true)
+            }
+        }
+        if session.selectedAgent.usesClaudeNativeRuntime, session.claudeController != nil {
+            // Reserve before host preparation suspends. If adoption already won preparation,
+            // only a plain local instruction can transfer to the existing steering owner.
+            if let adoption = claudeCoordinator.pendingProviderAdoption(for: session) {
+                await adoption.value
+                guard originalStopFence.permitsStart(of: session), sessions[tabID] === session,
+                      session.currentRestorationBindingToken == originalBindingToken,
+                      workspaceManager?.activeWorkspaceID == originalWorkspaceID
+                else {
+                    startOutcome?.recordStartFailure(message: nil)
+                    return nil
+                }
+            }
+            if session.runState.isActive {
+                guard session.activeRunOwnership.map({ session.claudeTerminalAnchor?.0 == $0 }) == true,
+                      directStartOptions.localComposerCandidate != nil,
+                      directStartOptions.periodicWakeID == nil, directStartOptions.laneUpdateWakeID == nil,
+                      directStartOptions.providerControlCommand == nil, directStartOptions.selfCompactDispatchID == nil,
+                      !directStartOptions.skipsUserAugmentation, !directStartOptions.ignoresPendingHandoff,
+                      codexFallbackContext == nil
+                else {
+                    recordClaudeStartRefusal()
+                    return nil
+                }
+                let existingItem = directStartOptions.initialUserItemID.flatMap { id in session.items.first { $0.id == id } }
+                let userItem = existingItem ?? AgentChatItem.user(initialMessage, sequenceIndex: session.nextSequenceIndex)
+                if existingItem == nil { session.appendItem(userItem) }
+                if let owner = session.activeRunOwnership { session.claudeTerminalAnchor = (owner, .exact(userItem.id)) }
+                submitActiveProviderSteering(
+                    .claudeNativeInterrupt, session: session, wrappedText: initialMessage,
+                    attachmentsToSend: attachments, taggedFilesToSend: taggedFileAttachments,
+                    trimmedText: initialMessage, userItem: userItem,
+                    userInputTokenEstimate: Self.estimateRuntimeTokens(for: initialMessage),
+                    localComposerCandidate: directStartOptions.localComposerCandidate,
+                    skipsSlashExpansion: directStartOptions.skipsSlashExpansion
+                )
+                candidateTransferred = true
+                startOutcome?.recordAccepted()
+                updateBindingsFromSession(session)
+                scheduleSave(for: tabID)
+                requestUIRefresh(tabID: tabID, urgent: true)
+                return nil
+            }
+            if session.claudeController != nil {
+                guard let reservation = claudeCoordinator.reserveEventsForHostPreparation(for: session) else {
+                    recordClaudeStartRefusal()
+                    return nil
+                }
+                preparedClaudeEvents = reservation
+            }
+        }
         await prepareSessionForRunStart(tabID: tabID, session: session)
         guard sessions[tabID] === session,
               session.currentRestorationBindingToken == originalBindingToken,
@@ -22030,7 +22197,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
 
+        guard preparedClaudeEvents?.listener.isCurrent() != false else {
+            recordClaudeStartRefusal()
+            return nil
+        }
         candidateTransferred = true
+        claudeEventsTransferred = true
         return await runService.startRun(
             tabID: tabID,
             session: session,
@@ -22044,7 +22216,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             startOutcome: startOutcome,
             stopFence: stopFence,
             localComposerCandidate: directStartOptions.localComposerCandidate,
-            initialUserItemID: directStartOptions.initialUserItemID
+            initialUserItemID: directStartOptions.initialUserItemID,
+            preparedClaudeEvents: preparedClaudeEvents
         )
     }
 
@@ -22358,14 +22531,19 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 // very last item if system events (e.g. rate-limit telemetry) were
                 // interleaved, which can prematurely finalize the streaming segment.
                 // Walk past system items but stop at tool calls, user messages, etc.
+                let attemptStartKey = session.quietLedger.startKey(owner: owner) ?? session.nextSequenceIndex
+                let providerStartKey = session.claudeProviderOutputBoundary.flatMap { $0.attemptID == owner.attemptID ? $0.startSequenceIndex : nil }
+                let outputStartKey = max(attemptStartKey, providerStartKey ?? attemptStartKey)
                 let tailAssistantIndex: Int? = {
-                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session) {
+                    if let streamingAssistantIndex = self.resumableStreamingAssistantIndexAcrossTrailingUserInterjections(in: session),
+                       session.items[streamingAssistantIndex].sequenceIndex >= outputStartKey
+                    {
                         return streamingAssistantIndex
                     }
                     for i in session.items.indices.reversed() {
                         switch session.items[i].kind {
                         case .assistant:
-                            return i
+                            return session.items[i].sequenceIndex >= outputStartKey ? i : nil
                         case .system:
                             continue
                         default:
@@ -24060,6 +24238,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         origin: AgentModeRunService.CancellationOrigin
     ) {
         cancelPendingInstruction(for: session)
+        claudeCoordinator.cancelPendingProviderAdoption(for: session)
         // Every cancellation fences this session's own deferred starts.
         session.stopState.invalidateScheduledStarts()
         // Overseer-facing withdrawal belongs to an explicit user or managed Stop only.
