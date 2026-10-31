@@ -9868,7 +9868,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                     tabID: snapshot.id
                 ) ?? liveUISelection
             }
-            snapshot.expandedFolders = fileManager.snapshotExpandedFolderFullPaths()
+            // Expansion comes from a Set. Equal UI emissions and saves must retain the
+            // stored order instead of treating incidental enumeration order as a content edit.
+            let expandedFolders = fileManager.snapshotExpandedFolderFullPaths()
+            if let base,
+               expandedFolders == base.expandedFolders
+               || Set(expandedFolders) == Set(base.expandedFolders)
+            {
+                snapshot.expandedFolders = base.expandedFolders
+            } else {
+                snapshot.expandedFolders = expandedFolders
+            }
             snapshot.promptText = promptViewModel.promptText
             snapshot.selectedMetaPromptIDs = promptViewModel.getSelectedPromptIDsSnapshot()
             snapshot.activeSubView = promptViewModel.storedActiveSubView
@@ -11059,11 +11069,6 @@ class WorkspaceManagerViewModel: ObservableObject {
             )
             snapshot.selection = saveSelection.selection
             let storedTab = workspace.composeTabs[tabIndex]
-            // Expansion is collected from a Set. Preserve the stored order when membership did
-            // not change, so a timer capture cannot turn incidental ordering into a new document.
-            if Set(snapshot.expandedFolders) == Set(storedTab.expandedFolders) {
-                snapshot.expandedFolders = storedTab.expandedFolders
-            }
             // The caller still owns dirty-state persistence and interrupted-save convergence.
             // This guard only avoids publishing a capture that adds timestamps without content.
             let tabChanged = Self.composeTabSnapshotHasMeaningfulChanges(snapshot, comparedTo: storedTab, touchModified: false)
