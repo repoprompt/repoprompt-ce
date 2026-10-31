@@ -860,6 +860,7 @@ extension OracleViewModel {
         resolvedLaneIndex: Int = 0,
         implicitSessionID: UUID? = nil,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
+        onQueryCreated: ((UUID) -> Void)? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async throws
         -> [String: Value]
@@ -1001,6 +1002,7 @@ extension OracleViewModel {
                 oracleAttachments: attachments,
                 completionPolicy: contextBuilderScope == nil ? .interactive : .contextBuilderStrict,
                 contextBuilderScope: contextBuilderScope,
+                onQueryCreated: onQueryCreated,
                 onProgress: onProgress
             )
         }

@@ -13,6 +13,8 @@ struct OracleMemberPresentation: Equatable {
 
     let status: Status
     var errorMessage: String?
+    var providerID: String?
+    var capturedModelName: String?
 
     static let unknown = Self(status: .unknown)
 }
@@ -67,7 +69,9 @@ struct OracleGroupPresentation: Equatable {
                 }
                 lanes[member.laneID] = OracleMemberPresentation(
                     status: status,
-                    errorMessage: result.error.map { "[\($0.code)] \($0.message)" }
+                    errorMessage: result.error.map { "[\($0.code)] \($0.message)" },
+                    providerID: result.executionProfile?.providerID ?? result.providerID ?? member.model.providerID,
+                    capturedModelName: result.capturedModelName
                 )
             }
         }
@@ -82,7 +86,23 @@ struct OracleGroupPresentation: Equatable {
               session.oracleGroupSize == members.count,
               session.oracleModelRaw == member.model.modelID
         else { return .unknown }
-        return lanes[member.laneID] ?? .unknown
+        var presentation = lanes[member.laneID] ?? .unknown
+        presentation.providerID = presentation.providerID ?? member.model.providerID
+        return presentation
+    }
+
+    mutating func captureModelName(
+        _ name: String?,
+        member: OracleGroupMember,
+        turnID: OracleTurnID,
+        invocationID: UUID
+    ) {
+        guard !isTerminal, self.invocationID == invocationID, self.turnID == turnID,
+              members.contains(member)
+        else { return }
+        var presentation = lanes[member.laneID] ?? .unknown
+        presentation.capturedModelName = name
+        lanes[member.laneID] = presentation
     }
 
     mutating func receive(_ event: OracleProgressEvent) {
@@ -95,7 +115,11 @@ struct OracleGroupPresentation: Equatable {
         else { return }
         sequences[laneID] = sequence
         // Settlement is live, nonterminal evidence; only durable results establish an outcome.
-        lanes[laneID] = .init(status: event.kind == .laneStarted ? .streaming : .settled)
+        let capturedModelName = lanes[laneID]?.capturedModelName
+        lanes[laneID] = .init(
+            status: event.kind == .laneStarted ? .streaming : .settled,
+            capturedModelName: capturedModelName
+        )
     }
 
     mutating func endExecution() {

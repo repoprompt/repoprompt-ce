@@ -443,9 +443,16 @@ struct OracleExecutionResolver {
             }
             return model
         }
+        let capturedReferences = try zip(roster.orderedModels, models).map { reference, model in
+            try OracleModelReference(
+                providerID: AppOracleGroupRouting.providerID(for: model),
+                modelID: reference.modelID
+            )
+        }
+        let capturedRoster = try OracleRoster(primary: capturedReferences[0], additional: Array(capturedReferences.dropFirst()))
         return try ResolvedOracleExecution(
             mode: mode,
-            roster: roster,
+            roster: capturedRoster,
             models: models,
             promptConfiguration: capturePromptConfiguration(chatPreset, mode),
             selection: selection,

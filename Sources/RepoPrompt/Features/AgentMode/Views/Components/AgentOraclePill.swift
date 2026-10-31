@@ -442,38 +442,55 @@ struct AgentOraclePill: View {
             if let presented = presentedSession(for: presentation) {
                 let members = groupMemberSessions(for: presented)
                 if members.count > 1 {
-                    HStack(spacing: 6) {
-                        ForEach(members) { member in
-                            let laneIndex = member.oracleLaneIndex ?? 0
-                            let status = oracleViewModel.oracleMemberPresentation(for: member)
-                            let label = OracleViewModel.oracleLabel(laneIndex: laneIndex)
-                            Button {
-                                openRequestGeneration &+= 1
-                                present(
-                                    sessionID: member.id,
-                                    isExplicit: presentation.isExplicit,
-                                    actionPolicy: presentation.actionPolicy,
-                                    generation: openRequestGeneration
-                                )
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Circle()
-                                        .fill(laneDotColor(for: member))
-                                        .frame(width: 6, height: 6)
-                                    Text("\(label) · \(status.status.rawValue)")
-                                        .lineLimit(1)
+                    ScrollView(.horizontal) {
+                        HStack(spacing: 6) {
+                            ForEach(members) { member in
+                                let laneIndex = member.oracleLaneIndex ?? 0
+                                let status = oracleViewModel.oracleMemberPresentation(for: member)
+                                let label = "Oracle \(laneIndex + 1)"
+                                let provider = status.providerID.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Provider unavailable"
+                                let isSelected = member.id == presented.id
+                                Button {
+                                    openRequestGeneration &+= 1
+                                    present(
+                                        sessionID: member.id,
+                                        isExplicit: presentation.isExplicit,
+                                        actionPolicy: presentation.actionPolicy,
+                                        generation: openRequestGeneration
+                                    )
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        if isSelected {
+                                            Image(systemName: "checkmark")
+                                                .accessibilityHidden(true)
+                                        }
+                                        Circle()
+                                            .fill(laneDotColor(for: member))
+                                            .frame(width: 6, height: 6)
+                                        Text("\(label) · \(provider) · \(status.status.rawValue)")
+                                            .lineLimit(1)
+                                    }
+                                    .fixedSize(horizontal: true, vertical: false)
                                 }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .accessibilityLabel("\(label): \(provider), \(status.status.rawValue)")
+                                .accessibilityAddTraits(isSelected ? .isSelected : [])
+                                .hoverTooltip(
+                                    [provider, status.status.rawValue, status.errorMessage]
+                                        .compactMap(\.self).joined(separator: "\n")
+                                )
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .accessibilityLabel("\(label): \(status.status.rawValue)")
-                            .hoverTooltip(
-                                [member.oracleModelRaw, status.status.rawValue, status.errorMessage]
-                                    .compactMap(\.self).joined(separator: "\n")
-                            )
                         }
+                        .padding(.vertical, 2)
                     }
-                    if let errorMessage = oracleViewModel.oracleMemberPresentation(for: presented).errorMessage {
+                    .fixedSize(horizontal: false, vertical: true)
+                    let selected = oracleViewModel.oracleMemberPresentation(for: presented)
+                    Text(selected.capturedModelName.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 } ?? "Model unavailable")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    if let errorMessage = selected.errorMessage {
                         Text(errorMessage)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                             .foregroundStyle(.secondary)
