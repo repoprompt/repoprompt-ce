@@ -1,5 +1,6 @@
 import RepoPromptFileSystem
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 
 //
 //  MCPServerViewModel.swift
@@ -339,31 +340,9 @@ final class MCPServerViewModel: ObservableObject {
     // MARK: Configuration constants
 
     /// -----------------------------------------------------------------
-    struct CodeStructureRequest: Equatable {
-        let direction: WorkspaceCodemapStructureTraversalDirection?
-        let maximumDepth: Int
-        let includesSignatures: Bool
-        let size: WorkspaceCodemapGraphOutputSize
-        let budget: WorkspaceCodemapGraphQueryBudget
-
-        init(
-            direction: WorkspaceCodemapStructureTraversalDirection?,
-            maximumDepth: Int,
-            includesSignatures: Bool,
-            size: WorkspaceCodemapGraphOutputSize,
-            budget: WorkspaceCodemapGraphQueryBudget
-        ) {
-            self.direction = direction
-            self.maximumDepth = maximumDepth
-            self.includesSignatures = includesSignatures
-            self.size = size
-            self.budget = budget
-        }
-    }
-
     private static let maximumCodeStructureSeedCount = 8192
 
-    static func codeStructureSeedLimit(for _: CodeStructureRequest) -> Int {
+    static func codeStructureSeedLimit(for _: WorkspaceCodemapStructureRequest) -> Int {
         maximumCodeStructureSeedCount
     }
 
@@ -377,7 +356,7 @@ final class MCPServerViewModel: ObservableObject {
         private var codeStructureUniqueSeedCandidatesVisitedForTesting = 0
         private var codeStructureLogicalPathComputationsForTesting = 0
         private var codeStructureCoordinatorInvocationsForTesting = 0
-        private var lastCodeStructureRequestForTesting: CodeStructureRequest?
+        private var lastCodeStructureRequestForTesting: WorkspaceCodemapStructureRequest?
 
         func resetCodeStructureAdmissionWorkCountsForTesting() {
             codeStructureUniqueSeedCandidatesVisitedForTesting = 0
@@ -397,7 +376,7 @@ final class MCPServerViewModel: ObservableObject {
             lastCodeStructureRequestForTesting = nil
         }
 
-        func capturedCodeStructureRequestForTesting() -> CodeStructureRequest? {
+        func capturedCodeStructureRequestForTesting() -> WorkspaceCodemapStructureRequest? {
             lastCodeStructureRequestForTesting
         }
     #endif
@@ -6082,7 +6061,7 @@ final class MCPServerViewModel: ObservableObject {
 
     func buildCodeStructureDTO(
         fromRecords files: [WorkspaceFileRecord],
-        request: CodeStructureRequest,
+        request: WorkspaceCodemapStructureRequest,
         includePathNotFoundIssue: Bool,
         requestedPaths: [String] = [],
         lookupContext: WorkspaceLookupContext = .visibleWorkspace
@@ -6111,132 +6090,54 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
-        let store = promptVM.workspaceFileContextStore
-        switch await store.rootScopeAvailability(lookupContext.rootScope) {
-        case .available:
-            break
-        case .sessionWorktreeUnavailable:
-            return Self.codeStructureUnavailableReply(
-                issue: .init(
-                    code: "git_root_unavailable",
-                    phase: "seed_resolution",
-                    path: nil,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "The session-bound worktree root is unavailable."
-                ),
-                size: request.size,
-                worktreeScope: worktreeScope
-            )
-        }
-
-        let roots = await store.rootRefs(scope: lookupContext.rootScope)
-        let allowedRootIDs = Set(roots.map(\.id))
-        var uniqueFilesByStandardizedFullPath: [String: WorkspaceFileRecord] = [:]
-        for file in files where allowedRootIDs.contains(file.rootID) {
-            if uniqueFilesByStandardizedFullPath[file.standardizedFullPath] == nil {
-                uniqueFilesByStandardizedFullPath[file.standardizedFullPath] = file
-            }
-        }
-        if uniqueFilesByStandardizedFullPath.isEmpty, includePathNotFoundIssue {
-            return Self.codeStructureUnavailableReply(
-                issue: .init(
-                    code: "path_not_found",
-                    phase: "seed_resolution",
-                    path: requestedPaths.first,
-                    retryable: false,
-                    retryAfterMilliseconds: nil,
-                    attempted: nil,
-                    limit: nil,
-                    message: "No requested path resolved to a file."
-                ),
-                size: request.size,
-                worktreeScope: worktreeScope
-            )
-        }
-
-        let logicalRootNames = await lookupContext.logicalRootDisplayNamesByRootID(store: store)
-        let orderedFiles = uniqueFilesByStandardizedFullPath.values.sorted { lhs, rhs in
-            let left = Self.logicalCodeStructurePath(
-                for: lhs,
-                roots: roots,
-                lookupContext: lookupContext,
-                logicalRootDisplayNamesByRootID: logicalRootNames
-            )
-            let right = Self.logicalCodeStructurePath(
-                for: rhs,
-                roots: roots,
-                lookupContext: lookupContext,
-                logicalRootDisplayNamesByRootID: logicalRootNames
-            )
-            if left != right { return left.utf8.lexicographicallyPrecedes(right.utf8) }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphSnapshot)
-        let aggregate = try await store.queryCodemapStructureGraphs(
-            seedFileIDs: orderedFiles.map(\.id),
-            direction: request.direction,
-            maximumDepth: request.maximumDepth,
-            budget: request.budget,
-            rootScope: lookupContext.rootScope,
-            logicalRootDisplayNamesByRootID: logicalRootNames
+        let boundLogicalNames = Dictionary(
+            (lookupContext.bindingProjection?.boundRootsForMetadata ?? []).map {
+                ($0.physicalRoot.id, $0.logicalRoot.name)
+            },
+            uniquingKeysWith: { current, _ in current }
         )
-        try Task.checkCancellation()
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphTraversal)
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureGraphRevalidation)
-        let initialRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
-        let renderableFileIDs = aggregate.roots.flatMap { root -> [UUID] in
-            if case .invalid? = initialRevalidation[root.rootEpoch] { return [] }
-            return root.nodes.map(\.fileID)
-        }
-
-        let presentation: WorkspaceCodemapOperationPresentation?
-        if request.includesSignatures, !renderableFileIDs.isEmpty {
-            #if DEBUG
-                codeStructureCoordinatorInvocationsForTesting += 1
-            #endif
-            presentation = try await WorkspaceCodemapPresentationCoordinator(
-                store: store,
-                policy: WorkspaceCodemapPresentationRequestPolicy(
-                    maximumReadinessRounds: 4096,
-                    initialBackoffMilliseconds: 25,
-                    maximumBackoffMilliseconds: 250,
-                    maximumTotalWait: .milliseconds(workspaceCodemapProductionDemandWaitMilliseconds),
-                    maximumCandidateDemandCount: request.budget.maximumNodeCount
-                ),
-                structurePhaseDidChange: { phase in
+        let result = try await WorkspaceCodemapStructureQueryExecutor(store: promptVM.workspaceFileContextStore)
+            .execute(
+                files: files,
+                request: request,
+                includePathNotFoundIssue: includePathNotFoundIssue,
+                rootScope: lookupContext.rootScope,
+                boundLogicalNames: boundLogicalNames,
+                presentationWillStart: {
+                    #if DEBUG
+                        self.codeStructureCoordinatorInvocationsForTesting += 1
+                    #endif
+                },
+                phaseDidChange: { phase in
                     await MCPToolExecutionHandlerPhaseContext.report(phase.mcpToolExecutionHandlerPhase)
                 }
-            ).structureSignaturePresentation(
-                fileIDs: renderableFileIDs,
-                rootScope: lookupContext.rootScope,
-                logicalRootDisplayNamesByRootID: logicalRootNames
             )
-        } else {
-            presentation = nil
+        switch result {
+        case .scopeUnavailable:
+            return Self.codeStructureUnavailableReply(
+                issue: .init(
+                    code: "git_root_unavailable", phase: "seed_resolution", path: nil,
+                    retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                    message: "The session-bound worktree root is unavailable."
+                ),
+                size: request.size, worktreeScope: worktreeScope
+            )
+        case .noRequestedFiles:
+            return Self.codeStructureUnavailableReply(
+                issue: .init(
+                    code: "path_not_found", phase: "seed_resolution", path: requestedPaths.first,
+                    retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                    message: "No requested path resolved to a file."
+                ),
+                size: request.size, worktreeScope: worktreeScope
+            )
+        case let .completed(aggregate, presentation, revalidation):
+            return Self.codeStructureReplyDTO(
+                aggregate: aggregate, presentation: presentation, revalidation: revalidation,
+                includesSignatures: request.includesSignatures, budget: request.budget,
+                size: request.size, worktreeScope: worktreeScope
+            )
         }
-        try Task.checkCancellation()
-
-        let finalRevalidation = await store.revalidateCodemapStructureGraphs(aggregate)
-        var revalidation = initialRevalidation
-        for (rootEpoch, result) in finalRevalidation {
-            if case .invalid? = revalidation[rootEpoch] { continue }
-            revalidation[rootEpoch] = result
-        }
-        try Task.checkCancellation()
-        await MCPToolExecutionHandlerPhaseContext.report(.getCodeStructureAssembly)
-        return Self.codeStructureReplyDTO(
-            aggregate: aggregate,
-            presentation: presentation,
-            revalidation: revalidation,
-            includesSignatures: request.includesSignatures,
-            budget: request.budget,
-            size: request.size,
-            worktreeScope: worktreeScope
-        )
     }
 
     static func codeStructureReplyDTO(
@@ -6614,20 +6515,6 @@ final class MCPServerViewModel: ObservableObject {
         case .missing: .missing
         case .tooCommon: .tooCommon
         }
-    }
-
-    private static func logicalCodeStructurePath(
-        for file: WorkspaceFileRecord,
-        roots: [WorkspaceRootRef],
-        lookupContext: WorkspaceLookupContext,
-        logicalRootDisplayNamesByRootID: [UUID: String]
-    ) -> String {
-        lookupContext.logicalDisplayPath(
-            for: file,
-            roots: roots,
-            rootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
-            display: .relative
-        ) ?? file.standardizedRelativePath
     }
 
     private static func codeStructureDirectionName(

@@ -1,3 +1,4 @@
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 private struct AgentContextDrawerSwitchKey: Equatable {

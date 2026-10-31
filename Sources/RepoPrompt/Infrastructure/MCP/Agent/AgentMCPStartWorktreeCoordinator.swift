@@ -4,6 +4,7 @@ import RepoPromptInstrumentation
 import RepoPromptProcess
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 @MainActor

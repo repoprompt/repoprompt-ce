@@ -2,6 +2,7 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 import RepoPromptFoundation
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 @MainActor

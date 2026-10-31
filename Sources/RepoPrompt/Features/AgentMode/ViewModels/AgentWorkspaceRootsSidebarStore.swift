@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import RepoPromptFileSystem
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 struct AgentWorkspaceCodemapPresentation: Equatable {

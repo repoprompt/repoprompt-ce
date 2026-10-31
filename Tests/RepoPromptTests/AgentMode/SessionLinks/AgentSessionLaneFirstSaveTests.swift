@@ -4,6 +4,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 @MainActor
@@ -1888,6 +1889,53 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             XCTAssertNil(lane.codexController)
             XCTAssertNil(lane.claudeController)
             XCTAssertNil(lane.acpController)
+        }
+    }
+
+    func testAuthorityRevisionConflictBeforeLanePublicationLeavesNoLaneOrProvider() async throws {
+        try await withFixture(ephemeral: false) { fixture in
+            let manager = fixture.window.workspaceManager
+            let viewModel = fixture.window.agentModeViewModel
+            let originalTabs = try XCTUnwrap(manager.activeWorkspace).composeTabs.map(\.id)
+            let originalRuntimeTabs = Set(viewModel.sessions.keys)
+            var published = false
+            var sessionSaveCount = 0
+            viewModel.test_afterOversightLaneProvision = { _ in published = true }
+            viewModel.test_setAgentSessionSaver { _, _, _ in
+                sessionSaveCount += 1
+                throw CancellationError()
+            }
+            manager.setWorkspacePersistenceOutcomeOverrideForTesting(
+                .rejected(reason: "workspace_save_failed", category: .authorityRevisionConflict)
+            )
+            defer {
+                manager.setWorkspacePersistenceOutcomeOverrideForTesting(nil)
+                viewModel.test_afterOversightLaneProvision = nil
+            }
+            do {
+                _ = try await viewModel.mcpCreateOversightLane(
+                    creatorSessionID: UUID(), sessionName: "Rejected lane",
+                    selection: fixture.selection, expectedWorkspaceID: fixture.workspaceID
+                )
+                XCTFail("A workspace authority conflict cannot prove a fresh lane")
+            } catch let AgentSessionLaneDestinationFailure.admissionRejected(failure) {
+                XCTAssertEqual(failure.reason, "workspace_persistence_rejected")
+                XCTAssertEqual(failure.saveResult, "workspace_save_failed")
+                XCTAssertEqual(failure.category, WorkspacePersistenceFailureCategory.authorityRevisionConflict.rawValue)
+                XCTAssertFalse(failure.workingCommitted)
+                XCTAssertNil(failure.retainedAdmission, "A pre-publication conflict cannot retain an allocated lane")
+            } catch {
+                XCTFail("Unexpected lane rejection: \(error)")
+            }
+            XCTAssertFalse(published, "pre-publication rejection must never reach lane configuration")
+            XCTAssertEqual(sessionSaveCount, 0)
+            XCTAssertEqual(manager.activeWorkspace?.composeTabs.map(\.id), originalTabs)
+            XCTAssertEqual(Set(viewModel.sessions.keys), originalRuntimeTabs)
+            for session in viewModel.sessions.values {
+                XCTAssertNil(session.provider)
+                XCTAssertNil(session.runID)
+                XCTAssertFalse(session.runState.isActive)
+            }
         }
     }
 

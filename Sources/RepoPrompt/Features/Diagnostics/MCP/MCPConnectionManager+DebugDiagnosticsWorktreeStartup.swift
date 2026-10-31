@@ -1,4 +1,5 @@
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 // MARK: - DEBUG Worktree Startup Benchmark Diagnostics
 

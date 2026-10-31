@@ -1,4 +1,5 @@
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 struct FilePreviewPopover: View {

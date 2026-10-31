@@ -2,8 +2,122 @@ import Foundation
 @testable import RepoPromptApp
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
+
+final class WorkspaceContextCompositionTests: XCTestCase {
+    func testAppHostsPreserveProcessWideHelperIdentities() {
+        let first = WorkspaceFileContextHost.app()
+        let second = WorkspaceFileContextHost.app()
+        XCTAssertTrue(first.rootReusableSnapshotCoordinator === second.rootReusableSnapshotCoordinator)
+        XCTAssertTrue(first.rootMaterializationHintEvaluator === second.rootMaterializationHintEvaluator)
+        XCTAssertTrue(first.rootSeedPlanner === second.rootSeedPlanner)
+        XCTAssertTrue(first.workspaceStateAuthority === second.workspaceStateAuthority)
+        XCTAssertTrue(first.rootReusableSnapshotCoordinator === WorkspaceRootReusableSnapshotCoordinator.shared)
+        XCTAssertTrue(first.rootMaterializationHintEvaluator === WorkspaceRootMaterializationHintEvaluator.shared)
+        XCTAssertTrue(first.rootSeedPlanner === WorkspaceRootSeedPlanner.shared)
+    }
+
+    func testClientPreservesConcreteGitProcessErrorClassification() {
+        let client: any WorkspaceGitClient = GitService()
+        XCTAssertTrue(client.isGitProcessError(GitService.GitError(message: "probe failed")))
+        XCTAssertFalse(client.isGitProcessError(CancellationError()))
+        XCTAssertFalse(client.isGitProcessError(POSIXError(.EACCES)))
+        XCTAssertFalse(client.isGitProcessError(NSError(domain: "GitService.GitError", code: 1)))
+    }
+
+    func testRequiredHostDoesNotBypassRefusingFileSystemFactory() async throws {
+        let root = try makeTestDirectory(name: #function)
+        let original = WorkspaceFileContextHost.app()
+        let paths = CodemapLockedValues<String>()
+        let host = WorkspaceFileContextHost(
+            rootReusableSnapshotCoordinator: original.rootReusableSnapshotCoordinator,
+            rootMaterializationHintEvaluator: original.rootMaterializationHintEvaluator,
+            rootSeedPlanner: original.rootSeedPlanner,
+            workspaceStateAuthority: original.workspaceStateAuthority,
+            worktreeSeedGitService: original.worktreeSeedGitService,
+            fileSystemFactory: WorkspaceFileSystemServiceFactory { path, _, _, _, _ in
+                paths.append(path)
+                throw NSError(domain: "WorkspaceContextCompositionTests.refused", code: 1)
+            }
+        )
+        let store = WorkspaceFileContextStore(
+            host: host,
+            codemapRuntimeProvider: { throw CancellationError() },
+            codemapGitEligibilityProbe: .production(),
+            nonGitCodeMapsEnabled: false
+        )
+        do {
+            _ = try await store.loadRoot(path: root.path)
+            XCTFail("Host refusal must not fall back to a concrete filesystem constructor")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "WorkspaceContextCompositionTests.refused")
+        }
+        XCTAssertEqual(paths.values, [root.path])
+        let roots = await store.roots()
+        XCTAssertTrue(roots.isEmpty)
+    }
+
+    #if DEBUG
+        func testEveryNeutralPreparationReasonReachesOriginalAppReasonCounter() {
+            let recorder = WorktreeStartupPreparationInstrumentation.Recorder(preparationID: UUID())
+            let neutral: any WorkspacePreparationRecording = recorder
+            for reason in WorkspacePreparationReason.allCases {
+                neutral.recordPreparationReason(reason)
+            }
+            let snapshot = recorder.snapshot()
+            XCTAssertEqual(WorkspacePreparationReason.allCases.count, snapshot.reasons.count)
+            for reason in WorkspacePreparationReason.allCases {
+                let appReason = WorktreeStartupPreparationInstrumentation.Reason(rawValue: reason.rawValue)
+                XCTAssertNotNil(appReason)
+                if let appReason { XCTAssertEqual(snapshot.reasons[appReason], 1, reason.rawValue) }
+            }
+        }
+
+        func testReplaySignpostToggleUsesHostPreferenceCallback() {
+            let originalHooks = FileSystemRuntimeHooks.current
+            defer { FileSystemRuntimeHooks.install(originalHooks) }
+            FileSystemRuntimeHooks.install(FileSystemRuntimeHooks(
+                preferenceEnabled: { $0 == "enableRepoFileReplaySignposts" }
+            ))
+            XCTAssertTrue(RepoFileReplayPerf.isEnabled)
+            FileSystemRuntimeHooks.install(FileSystemRuntimeHooks())
+            XCTAssertFalse(RepoFileReplayPerf.isEnabled)
+        }
+    #endif
+}
+
+final class WorkspaceCodemapStructureQueryExecutorTests: XCTestCase {
+    @MainActor
+    func testEmptyRequestedFilesStopBeforeGraphButEmptySelectionContinuesWithoutPresentation() async throws {
+        let store = WorkspaceFileContextStore()
+        let executor = WorkspaceCodemapStructureQueryExecutor(store: store)
+        let request = WorkspaceCodemapStructureRequest(
+            direction: nil, maximumDepth: 1, includesSignatures: false, size: .medium,
+            budget: WorkspaceCodemapGraphQueryBudget(
+                maximumTokenCount: 6000, maximumNodeCount: 120, maximumEdgeCount: 1000,
+                maximumGraphByteCount: 100_000, graphEvidenceTokenCount: 1500, renderTokenCount: 4500
+            )
+        )
+        let phases = CodemapLockedValues<WorkspaceCodemapStructureExecutionPhase>()
+        let starts = CodemapLockedValues<Bool>()
+        let missing = try await executor.execute(
+            files: [], request: request, includePathNotFoundIssue: true, rootScope: .allLoaded,
+            boundLogicalNames: [:], presentationWillStart: { starts.append(true) }, phaseDidChange: { phases.append($0) }
+        )
+        guard case .noRequestedFiles = missing else { return XCTFail("Requested empty inputs must report no files") }
+        XCTAssertTrue(phases.values.isEmpty)
+        let selection = try await executor.execute(
+            files: [], request: request, includePathNotFoundIssue: false, rootScope: .allLoaded,
+            boundLogicalNames: [:], presentationWillStart: { starts.append(true) }, phaseDidChange: { phases.append($0) }
+        )
+        guard case let .completed(_, presentation, _) = selection else { return XCTFail("Empty selection must execute") }
+        XCTAssertNil(presentation)
+        XCTAssertTrue(starts.values.isEmpty)
+        XCTAssertEqual(phases.values, [.graphSnapshot, .graphTraversal, .graphRevalidation, .assembly])
+    }
+}
 
 final class WorkspaceRootCatalogAdmissibilityTests: XCTestCase {
     func testCatalogAdmissionPrecedesSearchAdmissionOnlyAfterCatalogCompletion() {

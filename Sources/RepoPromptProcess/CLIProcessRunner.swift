@@ -95,6 +95,32 @@ private final class ProcessDescriptorCleanup: @unchecked Sendable {
     }
 }
 
+/// Owns stdin until DispatchIO closes it, including after a bounded caller return.
+/// DispatchIO serializes channel operations; its cleanup callback alone closes the handle.
+private final class ProcessInputWriter: @unchecked Sendable {
+    private let channel: DispatchIO
+    private let queue = DispatchQueue(label: "RepoPromptProcess.bufferedInput")
+
+    init(fileHandle: FileHandle, data: Data?) {
+        channel = DispatchIO(type: .stream, fileDescriptor: fileHandle.fileDescriptor, queue: queue) { _ in
+            try? fileHandle.close()
+        }
+        if let data, !data.isEmpty {
+            let bytes = data.withUnsafeBytes { DispatchData(bytes: $0) }
+            let channel = channel
+            channel.write(offset: 0, data: bytes, queue: queue) { done, _, _ in
+                if done { channel.close() }
+            }
+        } else {
+            channel.close()
+        }
+    }
+
+    func stop() {
+        channel.close(flags: .stop)
+    }
+}
+
 /// Resolves a reader drain/deadline race once, without awaiting an uncancellable loser.
 private final class ProcessDrainCompletion: @unchecked Sendable {
     private let lock = NSLock()
@@ -189,6 +215,9 @@ package final class CLIProcessRunner {
     private let registry = ProcessRegistry()
     private let gate: TaskSemaphore
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
+    private let beforeNonStreamingRead: (@Sendable () -> Void)?
+    private let beforeNonStreamingDrain: (@Sendable () -> Void)?
+    private let nonStreamingDrainTimeout: TimeInterval
     private let beforeStreamingRead: (@Sendable () -> Void)?
     private let beforeStreamingDrain: (@Sendable () -> Void)?
     private let streamingDrainTimeout: TimeInterval
@@ -199,13 +228,20 @@ package final class CLIProcessRunner {
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = { pid in
             ChildProcessExitObserver(pid: pid)
         },
+        beforeNonStreamingRead: (@Sendable () -> Void)? = nil,
+        beforeNonStreamingDrain: (@Sendable () -> Void)? = nil,
+        nonStreamingDrainTimeout: TimeInterval = 5,
         beforeStreamingRead: (@Sendable () -> Void)? = nil,
         beforeStreamingDrain: (@Sendable () -> Void)? = nil,
         streamingDrainTimeout: TimeInterval = 5
     ) {
+        precondition(nonStreamingDrainTimeout.isFinite && nonStreamingDrainTimeout >= 0 && nonStreamingDrainTimeout < Double(Int64.max) / 1_000_000_000)
         self.config = config
         gate = TaskSemaphore(max(concurrencyLimit, 1))
         self.processExitObserverFactory = processExitObserverFactory
+        self.beforeNonStreamingRead = beforeNonStreamingRead
+        self.beforeNonStreamingDrain = beforeNonStreamingDrain
+        self.nonStreamingDrainTimeout = nonStreamingDrainTimeout
         self.beforeStreamingRead = beforeStreamingRead
         self.beforeStreamingDrain = beforeStreamingDrain
         self.streamingDrainTimeout = streamingDrainTimeout
@@ -339,68 +375,24 @@ package final class CLIProcessRunner {
                 log("Failed to launch \(resolvedCommand): \(error)")
                 throw error
             }
-            // Use AsyncScope.withCleanup to ensure cleanup completes before gate is released
+            let stdoutCapture = ShellOutputCapture(fileHandle: spawned.stdout, beforeRead: beforeNonStreamingRead)
+            let stderrCapture = ShellOutputCapture(fileHandle: spawned.stderr, beforeRead: beforeNonStreamingRead)
+            let inputData = stdin?.data(using: .utf8)
+            if let inputData, config.logStdinSampleBytes > 0, let collector = config.logCollector,
+               let (sample, truncated) = makeUTF8Sample(from: inputData, limit: config.logStdinSampleBytes)
+            {
+                collector.appendSection(title: "STDIN (sample)", content: sample + (truncated ? "…" : ""))
+            }
+            let inputWriter = spawned.stdin.map { ProcessInputWriter(fileHandle: $0, data: inputData) }
             return try await AsyncScope.withCleanup {
                 await registry.add(spawned)
             } cleanup: {
-                await cleanupProcess(pid: spawned.pid)
+                inputWriter?.stop()
+                stdoutCapture.stop()
+                stderrCapture.stop()
+                _ = await registry.remove(pid: spawned.pid)
             } operation: {
-                // 1) Immediately start draining child output (prevents cross‑pipe back‑pressure)
-                let group = DispatchGroup()
-                var stdoutData = Data()
-                var stderrData = Data()
-
-                group.enter()
-                DispatchQueue.global(qos: .userInitiated).async {
-                    defer { group.leave() }
-                    let chunkSize = 64 * 1024
-                    while true {
-                        guard let chunk = try? spawned.stdout.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                        stdoutData.append(chunk)
-                    }
-                }
-
-                group.enter()
-                DispatchQueue.global(qos: .utility).async {
-                    defer { group.leave() }
-                    let chunkSize = 64 * 1024
-                    while true {
-                        guard let chunk = try? spawned.stderr.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                        stderrData.append(chunk)
-                    }
-                }
-
-                // 2) Feed stdin concurrently, in chunks; close when done
-                if let stdin, !stdin.isEmpty,
-                   let stdinHandle = spawned.stdin,
-                   let data = stdin.data(using: .utf8)
-                {
-                    if config.logStdinSampleBytes > 0, let collector = config.logCollector,
-                       let (sample, truncated) = makeUTF8Sample(from: data, limit: config.logStdinSampleBytes)
-                    {
-                        let suffix = truncated ? "…" : ""
-                        collector.appendSection(title: "STDIN (sample)", content: sample + suffix)
-                    }
-                    group.enter()
-                    DispatchQueue.global(qos: .userInitiated).async {
-                        defer { group.leave()
-                            stdinHandle.closeFile()
-                        }
-                        let chunkSize = 64 * 1024
-                        var offset = 0
-                        while offset < data.count {
-                            let end = min(offset + chunkSize, data.count)
-                            let chunk = data.subdata(in: offset ..< end)
-                            do { try stdinHandle.write(contentsOf: chunk) }
-                            catch { break } // EPIPE or early exit; stop writing
-                            offset = end
-                        }
-                    }
-                } else {
-                    spawned.stdin?.closeFile()
-                }
-
-                // 3) Wait asynchronously for termination
+                // The waiter remains the sole owner of child termination and reaping.
                 let waitTask = Task.detached { () throws -> (Int32, Bool) in
                     // Use async, cooperative waiting to avoid blocking the pool
                     try await Self.waitForTerminationAsync(
@@ -413,35 +405,37 @@ package final class CLIProcessRunner {
                     }
                 }
 
-                let status: Int32
-                let timedOut: Bool
-                do {
-                    let termination: (Int32, Bool) = if cancelChildOnTaskCancellation {
-                        try await withTaskCancellationHandler {
-                            let result = try await waitTask.value
-                            try Task.checkCancellation()
-                            return result
-                        } onCancel: {
-                            spawned.stdin?.closeFile()
-                            // Let the waiter own cancellation signalling and reaping. It may
-                            // already have reaped the child before this handler runs.
-                            waitTask.cancel()
+                let waitAndDrain = {
+                    let (status, timedOut) = try await waitTask.value
+                    inputWriter?.stop()
+                    if cancelChildOnTaskCancellation { try Task.checkCancellation() }
+                    let deadline = DispatchTime.now() + nonStreamingDrainTimeout
+                    beforeNonStreamingDrain?()
+                    let captured: (Data, Data)? = await withCheckedContinuation { continuation in
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            guard let stdout = stdoutCapture.drainedData(deadline: deadline),
+                                  let stderr = stderrCapture.drainedData(deadline: deadline)
+                            else { continuation.resume(returning: nil)
+                                return
+                            }
+                            continuation.resume(returning: (stdout, stderr))
                         }
-                    } else {
-                        try await waitTask.value
                     }
-                    (status, timedOut) = termination
-                } catch {
-                    spawned.stdout.closeFile()
-                    spawned.stderr.closeFile()
-                    await Self.waitForGroup(group)
-                    throw error
+                    if cancelChildOnTaskCancellation { try Task.checkCancellation() }
+                    guard let (stdout, stderr) = captured else {
+                        throw CLIProcessRunnerError.waitFailed("Output readers for owned process \(spawned.pid) did not drain successfully before deadline")
+                    }
+                    return (status, timedOut, stdout, stderr)
                 }
-
-                // Proactively close FDs and wait for readers to finish
-                spawned.stdout.closeFile()
-                spawned.stderr.closeFile()
-                await Self.waitForGroup(group)
+                let (status, timedOut, stdoutData, stderrData) = try await withTaskCancellationHandler {
+                    try await waitAndDrain()
+                } onCancel: {
+                    guard cancelChildOnTaskCancellation else { return }
+                    inputWriter?.stop()
+                    stdoutCapture.stop()
+                    stderrCapture.stop()
+                    waitTask.cancel()
+                }
                 if !stdoutData.isEmpty {
                     config.logCollector?.appendDataSection(title: "STDOUT", data: stdoutData)
                 }

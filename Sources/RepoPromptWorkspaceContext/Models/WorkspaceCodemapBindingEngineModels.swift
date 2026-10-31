@@ -1,0 +1,1003 @@
+import Foundation
+import RepoPromptCodeMapCore
+import RepoPromptFileSystem
+import RepoPromptPersistence
+import RepoPromptVCS
+
+#if !DEBUG
+    package struct WorkspaceCodemapManifestMeasurementAggregate: Equatable {}
+#endif
+
+package struct WorkspaceCodemapBindingEnginePolicy: Equatable {
+    package static let `default` = WorkspaceCodemapBindingEnginePolicy()
+
+    let maximumRootCount: Int
+    let maximumActiveRequestCountPerRoot: Int
+    let maximumActiveRequestCount: Int
+    let maximumOwnerCountPerRoot: Int
+    let maximumActiveRequestCountPerOwner: Int
+    let maximumQueuedRequestCountPerRoot: Int
+    let maximumQueuedRequestCountPerOwner: Int
+    let maximumQueuedRequestCount: Int
+    let maximumActiveTaskCountPerRoot: Int
+    let maximumActiveTaskCountPerOwner: Int
+    let maximumActiveTaskCount: Int
+    let maximumManifestAdoptionRecordCount: Int
+    let maximumRetainedManifestRecordCountPerRoot: Int
+    let maximumRetainedManifestRecordCount: Int
+    let maximumManifestAdoptionLeaseCountPerRoot: Int
+    let maximumManifestAdoptionLeaseCount: Int
+    let maximumManifestAdoptionLeaseByteCountPerRoot: UInt64
+    let maximumManifestAdoptionLeaseByteCount: UInt64
+    let maximumCapabilityRetryCount: Int
+    let maximumValidatedWorktreeByteCount: Int64
+    let maximumRetainedSourceByteCountPerRoot: UInt64
+    let maximumRetainedSourceByteCountPerOwner: UInt64
+    let maximumRetainedSourceByteCount: UInt64
+    let maximumConcurrentMaterializationCountPerRoot: Int
+    let maximumConcurrentMaterializationCountPerOwner: Int
+    let maximumConcurrentMaterializationCount: Int
+    let maximumConsecutiveDemandAdmissions: Int
+    let maximumAutomaticSelectionMatchedCandidateByteCount: UInt64
+    let maximumActiveGraphIndexBatchCountPerRoot: Int
+    let maximumActiveGraphIndexBatchCount: Int
+    let maximumGraphIndexCatalogPageEntryCount: Int
+    let maximumGraphIndexCatalogPagePathByteCount: UInt64
+    let maximumGraphIndexBatchCandidateCount: Int
+    let graphIndexProgressPublicationMinimumIntervalMilliseconds: UInt64
+    let maximumGraphIndexChangeByteCount: UInt64
+    let maximumRetainedGraphIndexByteCountPerRoot: UInt64
+    let maximumRetainedGraphIndexByteCount: UInt64
+    let maximumStagedGraphIndexGraphByteCountPerRoot: UInt64
+    let maximumStagedGraphIndexGraphByteCount: UInt64
+    let maximumQueuedGraphIndexManifestMutationByteCountPerRoot: UInt64
+    let maximumQueuedGraphIndexManifestMutationByteCount: UInt64
+    let maximumManifestWriterDeferredItemCount: Int
+    let manifestWriterDeferredRetryMilliseconds: UInt64
+    let graphIndexRetryInitialMilliseconds: UInt64
+    let graphIndexRetryMaximumMilliseconds: UInt64
+    let graphIndexRetryJitterPercent: UInt64
+    let graphIndexWorkerNoProgressTimeoutMilliseconds: UInt64
+    let maximumGraphIndexWorkerRecoveryCount: UInt64
+
+    init(
+        maximumRootCount: Int = 64,
+        maximumActiveRequestCountPerRoot: Int = 1024,
+        maximumActiveRequestCount: Int = 4096,
+        maximumOwnerCountPerRoot: Int = 256,
+        maximumActiveRequestCountPerOwner: Int = 64,
+        maximumQueuedRequestCountPerRoot: Int = 1024,
+        maximumQueuedRequestCountPerOwner: Int = 64,
+        maximumQueuedRequestCount: Int = 4096,
+        maximumActiveTaskCountPerRoot: Int = 1024,
+        maximumActiveTaskCountPerOwner: Int = 64,
+        maximumActiveTaskCount: Int = 4096,
+        maximumManifestAdoptionRecordCount: Int = 8192,
+        maximumRetainedManifestRecordCountPerRoot: Int = 8192,
+        maximumRetainedManifestRecordCount: Int = 32768,
+        maximumManifestAdoptionLeaseCountPerRoot: Int = 4096,
+        maximumManifestAdoptionLeaseCount: Int = 16384,
+        maximumManifestAdoptionLeaseByteCountPerRoot: UInt64 = 256 * 1024 * 1024,
+        maximumManifestAdoptionLeaseByteCount: UInt64 = 1024 * 1024 * 1024,
+        maximumCapabilityRetryCount: Int = 1,
+        maximumValidatedWorktreeByteCount: Int64 = 8 * 1024 * 1024,
+        maximumRetainedSourceByteCountPerRoot: UInt64 = 128 * 1024 * 1024,
+        maximumRetainedSourceByteCountPerOwner: UInt64 = 32 * 1024 * 1024,
+        maximumRetainedSourceByteCount: UInt64 = 512 * 1024 * 1024,
+        maximumConcurrentMaterializationCountPerRoot: Int = 16,
+        maximumConcurrentMaterializationCountPerOwner: Int = 4,
+        maximumConcurrentMaterializationCount: Int = 64,
+        maximumConsecutiveDemandAdmissions: Int = 8,
+        maximumAutomaticSelectionMatchedCandidateByteCount: UInt64 = 8 * 1024 * 1024,
+        maximumActiveGraphIndexBatchCountPerRoot: Int = 1,
+        maximumActiveGraphIndexBatchCount: Int = 2,
+        maximumGraphIndexCatalogPageEntryCount: Int = 64,
+        maximumGraphIndexCatalogPagePathByteCount: UInt64 = 256 * 1024,
+        maximumGraphIndexBatchCandidateCount: Int = 64,
+        graphIndexProgressPublicationMinimumIntervalMilliseconds: UInt64 = 100,
+        maximumGraphIndexChangeByteCount: UInt64 = 8 * 1024 * 1024,
+        maximumRetainedGraphIndexByteCountPerRoot: UInt64 = 32 * 1024 * 1024,
+        maximumRetainedGraphIndexByteCount: UInt64 = 128 * 1024 * 1024,
+        maximumStagedGraphIndexGraphByteCountPerRoot: UInt64 = 192 * 1024 * 1024,
+        maximumStagedGraphIndexGraphByteCount: UInt64 = 512 * 1024 * 1024,
+        maximumQueuedGraphIndexManifestMutationByteCountPerRoot: UInt64 = 8 * 1024 * 1024,
+        maximumQueuedGraphIndexManifestMutationByteCount: UInt64 = 32 * 1024 * 1024,
+        maximumManifestWriterDeferredItemCount: Int = 256,
+        manifestWriterDeferredRetryMilliseconds: UInt64 = 100,
+        graphIndexRetryInitialMilliseconds: UInt64 = 250,
+        graphIndexRetryMaximumMilliseconds: UInt64 = 30000,
+        graphIndexRetryJitterPercent: UInt64 = 20,
+        graphIndexWorkerNoProgressTimeoutMilliseconds: UInt64 = 120_000,
+        maximumGraphIndexWorkerRecoveryCount: UInt64 = 3
+    ) {
+        precondition(maximumRootCount > 0)
+        precondition(maximumActiveRequestCountPerRoot > 0)
+        precondition(maximumActiveRequestCount > 0)
+        precondition(maximumOwnerCountPerRoot > 0)
+        precondition(maximumActiveRequestCountPerOwner > 0)
+        precondition(maximumQueuedRequestCountPerRoot > 0)
+        precondition(maximumQueuedRequestCountPerOwner > 0)
+        precondition(maximumQueuedRequestCount > 0)
+        precondition(maximumActiveTaskCountPerRoot > 0)
+        precondition(maximumActiveTaskCountPerOwner > 0)
+        precondition(maximumActiveTaskCount > 0)
+        precondition(maximumManifestAdoptionRecordCount > 0)
+        precondition(maximumRetainedManifestRecordCountPerRoot > 0)
+        precondition(maximumRetainedManifestRecordCount > 0)
+        precondition(maximumManifestAdoptionLeaseCountPerRoot > 0)
+        precondition(maximumManifestAdoptionLeaseCount > 0)
+        precondition(maximumManifestAdoptionLeaseByteCountPerRoot > 0)
+        precondition(maximumManifestAdoptionLeaseByteCount > 0)
+        precondition(maximumCapabilityRetryCount >= 0 && maximumCapabilityRetryCount <= 1)
+        precondition(maximumValidatedWorktreeByteCount > 0)
+        precondition(maximumRetainedSourceByteCountPerRoot > 0)
+        precondition(maximumRetainedSourceByteCountPerOwner > 0)
+        precondition(maximumRetainedSourceByteCount > 0)
+        precondition(maximumConcurrentMaterializationCountPerRoot > 0)
+        precondition(maximumConcurrentMaterializationCountPerOwner > 0)
+        precondition(maximumConcurrentMaterializationCount > 0)
+        precondition(maximumConsecutiveDemandAdmissions > 0)
+        precondition(maximumAutomaticSelectionMatchedCandidateByteCount > 0)
+        precondition(maximumActiveGraphIndexBatchCountPerRoot > 0)
+        precondition(maximumActiveGraphIndexBatchCount > 0)
+        precondition(maximumActiveGraphIndexBatchCount >= maximumActiveGraphIndexBatchCountPerRoot)
+        precondition(maximumGraphIndexCatalogPageEntryCount > 0)
+        precondition(maximumGraphIndexCatalogPagePathByteCount > 0)
+        precondition(maximumGraphIndexBatchCandidateCount > 0)
+        precondition(maximumGraphIndexBatchCandidateCount <= maximumGraphIndexCatalogPageEntryCount)
+        precondition((25 ... 1000).contains(graphIndexProgressPublicationMinimumIntervalMilliseconds))
+        precondition(maximumGraphIndexChangeByteCount > 0)
+        precondition(maximumRetainedGraphIndexByteCountPerRoot > 0)
+        precondition(maximumRetainedGraphIndexByteCount > 0)
+        precondition(maximumRetainedGraphIndexByteCount >= maximumRetainedGraphIndexByteCountPerRoot)
+        precondition(maximumStagedGraphIndexGraphByteCountPerRoot > 0)
+        precondition(maximumStagedGraphIndexGraphByteCount > 0)
+        precondition(maximumStagedGraphIndexGraphByteCount >= maximumStagedGraphIndexGraphByteCountPerRoot)
+        precondition(maximumQueuedGraphIndexManifestMutationByteCountPerRoot > 0)
+        precondition(maximumQueuedGraphIndexManifestMutationByteCount > 0)
+        precondition(
+            maximumQueuedGraphIndexManifestMutationByteCount >=
+                maximumQueuedGraphIndexManifestMutationByteCountPerRoot
+        )
+        precondition(maximumManifestWriterDeferredItemCount > 0)
+        precondition(manifestWriterDeferredRetryMilliseconds > 0)
+        precondition(graphIndexRetryInitialMilliseconds > 0)
+        precondition(graphIndexRetryMaximumMilliseconds >= graphIndexRetryInitialMilliseconds)
+        precondition(graphIndexRetryJitterPercent <= 100)
+        precondition(graphIndexWorkerNoProgressTimeoutMilliseconds > 0)
+        precondition(maximumGraphIndexWorkerRecoveryCount > 0)
+        self.maximumRootCount = maximumRootCount
+        self.maximumActiveRequestCountPerRoot = maximumActiveRequestCountPerRoot
+        self.maximumActiveRequestCount = maximumActiveRequestCount
+        self.maximumOwnerCountPerRoot = maximumOwnerCountPerRoot
+        self.maximumActiveRequestCountPerOwner = maximumActiveRequestCountPerOwner
+        self.maximumQueuedRequestCountPerRoot = maximumQueuedRequestCountPerRoot
+        self.maximumQueuedRequestCountPerOwner = maximumQueuedRequestCountPerOwner
+        self.maximumQueuedRequestCount = maximumQueuedRequestCount
+        self.maximumActiveTaskCountPerRoot = maximumActiveTaskCountPerRoot
+        self.maximumActiveTaskCountPerOwner = maximumActiveTaskCountPerOwner
+        self.maximumActiveTaskCount = maximumActiveTaskCount
+        self.maximumManifestAdoptionRecordCount = maximumManifestAdoptionRecordCount
+        self.maximumRetainedManifestRecordCountPerRoot = maximumRetainedManifestRecordCountPerRoot
+        self.maximumRetainedManifestRecordCount = maximumRetainedManifestRecordCount
+        self.maximumManifestAdoptionLeaseCountPerRoot = maximumManifestAdoptionLeaseCountPerRoot
+        self.maximumManifestAdoptionLeaseCount = maximumManifestAdoptionLeaseCount
+        self.maximumManifestAdoptionLeaseByteCountPerRoot = maximumManifestAdoptionLeaseByteCountPerRoot
+        self.maximumManifestAdoptionLeaseByteCount = maximumManifestAdoptionLeaseByteCount
+        self.maximumCapabilityRetryCount = maximumCapabilityRetryCount
+        self.maximumValidatedWorktreeByteCount = maximumValidatedWorktreeByteCount
+        self.maximumRetainedSourceByteCountPerRoot = maximumRetainedSourceByteCountPerRoot
+        self.maximumRetainedSourceByteCountPerOwner = maximumRetainedSourceByteCountPerOwner
+        self.maximumRetainedSourceByteCount = maximumRetainedSourceByteCount
+        self.maximumConcurrentMaterializationCountPerRoot = maximumConcurrentMaterializationCountPerRoot
+        self.maximumConcurrentMaterializationCountPerOwner = maximumConcurrentMaterializationCountPerOwner
+        self.maximumConcurrentMaterializationCount = maximumConcurrentMaterializationCount
+        self.maximumConsecutiveDemandAdmissions = maximumConsecutiveDemandAdmissions
+        self.maximumAutomaticSelectionMatchedCandidateByteCount =
+            maximumAutomaticSelectionMatchedCandidateByteCount
+        self.maximumActiveGraphIndexBatchCountPerRoot = maximumActiveGraphIndexBatchCountPerRoot
+        self.maximumActiveGraphIndexBatchCount = maximumActiveGraphIndexBatchCount
+        self.maximumGraphIndexCatalogPageEntryCount = maximumGraphIndexCatalogPageEntryCount
+        self.maximumGraphIndexCatalogPagePathByteCount = maximumGraphIndexCatalogPagePathByteCount
+        self.maximumGraphIndexBatchCandidateCount = maximumGraphIndexBatchCandidateCount
+        self.graphIndexProgressPublicationMinimumIntervalMilliseconds =
+            graphIndexProgressPublicationMinimumIntervalMilliseconds
+        self.maximumGraphIndexChangeByteCount = maximumGraphIndexChangeByteCount
+        self.maximumRetainedGraphIndexByteCountPerRoot = maximumRetainedGraphIndexByteCountPerRoot
+        self.maximumRetainedGraphIndexByteCount = maximumRetainedGraphIndexByteCount
+        self.maximumStagedGraphIndexGraphByteCountPerRoot = maximumStagedGraphIndexGraphByteCountPerRoot
+        self.maximumStagedGraphIndexGraphByteCount = maximumStagedGraphIndexGraphByteCount
+        self.maximumQueuedGraphIndexManifestMutationByteCountPerRoot =
+            maximumQueuedGraphIndexManifestMutationByteCountPerRoot
+        self.maximumQueuedGraphIndexManifestMutationByteCount =
+            maximumQueuedGraphIndexManifestMutationByteCount
+        self.maximumManifestWriterDeferredItemCount = maximumManifestWriterDeferredItemCount
+        self.manifestWriterDeferredRetryMilliseconds = manifestWriterDeferredRetryMilliseconds
+        self.graphIndexRetryInitialMilliseconds = graphIndexRetryInitialMilliseconds
+        self.graphIndexRetryMaximumMilliseconds = graphIndexRetryMaximumMilliseconds
+        self.graphIndexRetryJitterPercent = graphIndexRetryJitterPercent
+        self.graphIndexWorkerNoProgressTimeoutMilliseconds = graphIndexWorkerNoProgressTimeoutMilliseconds
+        self.maximumGraphIndexWorkerRecoveryCount = maximumGraphIndexWorkerRecoveryCount
+    }
+}
+
+struct WorkspaceCodemapObservedStaleAuthorityError: Error, Equatable {
+    let currentAuthority: CodeMapRootManifestAuthority
+    let observedPredecessorAuthority: CodeMapRootManifestAuthority?
+
+    var currentAuthorityGeneration: UInt64 {
+        currentAuthority.authorityGeneration
+    }
+
+    var observedPredecessorAuthorityGeneration: UInt64? {
+        observedPredecessorAuthority?.authorityGeneration
+    }
+}
+
+package struct WorkspaceCodemapManifestWriterRetryWaiter {
+    let sleep: @Sendable (Duration) async throws -> Void
+
+    package static let production = Self { duration in
+        try await Task.sleep(for: duration)
+    }
+}
+
+struct WorkspaceCodemapBindingRootRegistration: Equatable {
+    let capabilityRequest: WorkspaceCodemapRootCapabilityRequest
+    let catalogGeneration: UInt64
+    let ingressGeneration: UInt64
+
+    init(
+        rootID: UUID,
+        rootLifetimeID: UUID,
+        loadedRootURL: URL,
+        catalogGeneration: UInt64,
+        ingressGeneration: UInt64
+    ) {
+        capabilityRequest = WorkspaceCodemapRootCapabilityRequest(
+            rootID: rootID,
+            rootLifetimeID: rootLifetimeID,
+            loadedRootURL: loadedRootURL
+        )
+        self.catalogGeneration = catalogGeneration
+        self.ingressGeneration = ingressGeneration
+    }
+}
+
+struct WorkspaceCodemapManifestBindingCandidate {
+    let identity: WorkspaceCodemapArtifactBindingIdentity
+    let requestGeneration: UInt64
+    let pathGeneration: UInt64
+    let ingressGeneration: UInt64
+}
+
+package struct WorkspaceCodemapBindingCatalogClient: @unchecked Sendable {
+    let resolveManifestBinding: @Sendable (
+        WorkspaceCodemapRootEpoch,
+        String
+    ) async -> WorkspaceCodemapManifestBindingCandidate?
+    let readGraphIndexCatalogPage: @Sendable (
+        WorkspaceCodemapGraphIndexCatalogPageRequest
+    ) async -> WorkspaceCodemapGraphIndexCatalogPageDisposition
+    let revalidateGraphIndexCatalogToken: @Sendable (
+        WorkspaceCodemapRootEpoch,
+        WorkspaceCodemapGraphIndexCatalogToken
+    ) async -> WorkspaceCodemapGraphIndexCatalogTokenDisposition
+    let publishMarkerReadiness: @Sendable (
+        WorkspaceCodemapMarkerReadinessUpdate
+    ) async -> Bool
+    /// Reports that the root authority behind one registration is no longer current, so the owner
+    /// can fence mutations and schedule cleanup and re-resolution. Routed like
+    /// `publishMarkerReadiness`, so a detached route drops the notification instead of needing a
+    /// second session callback channel.
+    ///
+    /// The payload is the originating registration rather than the root epoch alone. Same-epoch
+    /// authority replacement reuses the epoch, so an epoch-keyed route lookup can hand a delayed
+    /// report to the registration that already replaced the reporting one; carrying the
+    /// registration lets the recipient reject exactly that case.
+    let reportRootAuthorityInvalidated: @Sendable (
+        WorkspaceCodemapBindingRootRegistration
+    ) async -> Void
+
+    init(
+        _ resolveManifestBinding: @escaping @Sendable (
+            WorkspaceCodemapRootEpoch,
+            String
+        ) async -> WorkspaceCodemapManifestBindingCandidate?
+    ) {
+        self.init(
+            resolveManifestBinding,
+            readGraphIndexCatalogPage: { _ in .unavailable(.catalogUnavailable) },
+            revalidateGraphIndexCatalogToken: { _, _ in .unavailable(.catalogUnavailable) },
+            publishMarkerReadiness: { _ in false }
+        )
+    }
+
+    init(
+        _ resolveManifestBinding: @escaping @Sendable (
+            WorkspaceCodemapRootEpoch,
+            String
+        ) async -> WorkspaceCodemapManifestBindingCandidate?,
+        readGraphIndexCatalogPage: @escaping @Sendable (
+            WorkspaceCodemapGraphIndexCatalogPageRequest
+        ) async -> WorkspaceCodemapGraphIndexCatalogPageDisposition,
+        revalidateGraphIndexCatalogToken: @escaping @Sendable (
+            WorkspaceCodemapRootEpoch,
+            WorkspaceCodemapGraphIndexCatalogToken
+        ) async -> WorkspaceCodemapGraphIndexCatalogTokenDisposition,
+        publishMarkerReadiness: @escaping @Sendable (
+            WorkspaceCodemapMarkerReadinessUpdate
+        ) async -> Bool = { _ in false },
+        reportRootAuthorityInvalidated: @escaping @Sendable (
+            WorkspaceCodemapBindingRootRegistration
+        ) async -> Void = { _ in }
+    ) {
+        self.resolveManifestBinding = resolveManifestBinding
+        self.readGraphIndexCatalogPage = readGraphIndexCatalogPage
+        self.revalidateGraphIndexCatalogToken = revalidateGraphIndexCatalogToken
+        self.publishMarkerReadiness = publishMarkerReadiness
+        self.reportRootAuthorityInvalidated = reportRootAuthorityInvalidated
+    }
+
+    package static let unavailable = WorkspaceCodemapBindingCatalogClient { _, _ in nil }
+}
+
+package struct WorkspaceCodemapValidatedSourceReaderClient: @unchecked Sendable {
+    let read: @Sendable (
+        WorkspaceCodemapArtifactBindingIdentity,
+        GitBlobLStatFingerprint,
+        Int64,
+        UUID
+    ) async throws -> ValidatedRawFileContentSnapshot
+}
+
+struct WorkspaceCodemapBindingDemand: Equatable {
+    let owner: WorkspaceCodemapLiveDemandOwner
+    let identity: WorkspaceCodemapArtifactBindingIdentity
+    let requestGeneration: UInt64
+    let catalogGeneration: UInt64
+    let pathGeneration: UInt64
+    let ingressGeneration: UInt64
+    let priority: CodeMapArtifactBuildPriority
+    let language: LanguageType
+}
+
+enum WorkspaceCodemapBindingRegistrationResult {
+    case registered(adoptedReadyCount: Int)
+    case exactDuplicate
+    case unavailable(WorkspaceCodemapRootCapabilityState)
+    case busy
+    case failed
+}
+
+package enum WorkspaceCodemapBindingDemandRejection: Equatable {
+    case rootNotRegistered
+    case capabilityUnavailable
+    case rootEpochMismatch
+    case rootPathMismatch
+    case invalidIdentity
+    case catalogGenerationMismatch
+    case requestGenerationInvalid
+    case stalePathGeneration
+    case staleIngressGeneration
+    case languageMismatch
+    case classificationMismatch
+    case sourceAuthorityUnavailable
+    case overlayRejected
+    case staleCompletion
+}
+
+package enum WorkspaceCodemapBindingDemandUnavailableReason: Equatable {
+    case unsupportedFileType
+    case missing
+    case securityExcluded
+    case nonRegular
+    case oversized
+    case transient
+    case terminalArtifact(WorkspaceCodemapLiveArtifactOutcome)
+}
+
+package enum WorkspaceCodemapBindingDemandResult {
+    case ready(WorkspaceCodemapLiveReadySnapshot)
+    case alreadyReady(WorkspaceCodemapLiveReadySnapshot)
+    case unavailable(WorkspaceCodemapBindingDemandUnavailableReason)
+    case busy(retryAfterMilliseconds: Int?)
+    case rejected(WorkspaceCodemapBindingDemandRejection)
+    case cancelled
+}
+
+enum WorkspaceCodemapPublishedArtifactLookupSource: String, Equatable {
+    case graphIndexCAS
+    case locatorCAS
+}
+
+enum WorkspaceCodemapPublishedArtifactLookupMissReason: String, Error, Equatable {
+    case rootUnavailable
+    case currentnessMismatch
+    case unsupportedFileType
+    case graphIndexMissing
+    case artifactMissing
+}
+
+struct WorkspaceCodemapPublishedArtifactLookupRequest {
+    let ownerID: UUID
+    let identity: WorkspaceCodemapArtifactBindingIdentity
+    let requestGeneration: UInt64
+    let catalogGeneration: UInt64
+    let pathGeneration: UInt64
+    let ingressGeneration: UInt64
+    let language: LanguageType
+}
+
+struct WorkspaceCodemapPublishedArtifactLookupHit {
+    let handle: CodeMapArtifactHandle
+    let source: WorkspaceCodemapPublishedArtifactLookupSource
+}
+
+enum WorkspaceCodemapPublishedArtifactLookupResult {
+    case hit(WorkspaceCodemapPublishedArtifactLookupHit)
+    case miss(WorkspaceCodemapPublishedArtifactLookupMissReason)
+    case cancelled
+}
+
+enum WorkspaceCodemapBindingManifestState: Equatable {
+    case unavailable
+    case miss
+    case clean(generation: UInt64)
+    case dirtyRetryRequired
+}
+
+struct WorkspaceCodemapBindingInvalidationResult: Equatable {
+    let revokedOverlayCount: Int
+    let cancelledRequestCount: Int
+    let manifestWriteFailed: Bool
+}
+
+package enum WorkspaceCodemapBindingEngineHookKind: String, Hashable {
+    case capabilityEligible
+    case capabilityTerminalUnavailable
+    case capabilityTransientRetry
+    case classificationClean
+    case classificationWorktree
+    case classificationUnavailable
+    case locatorFastPath
+    case casFastPath
+    case build
+    case manifestLoadHit
+    case manifestLoadMiss
+    case manifestAdopted
+    case manifestRevisionQueued
+    case manifestWaiterInstalled
+    case manifestWrite
+    case manifestFailure
+    case overlayReady
+    case overlayUnavailable
+    case overlayExactDuplicate
+    case materialization
+    case staleDrop
+    case cancellation
+    case busy
+    case failure
+    case invalidation
+    case publishedArtifactLookupHit
+    case publishedArtifactLookupMiss
+    #if DEBUG
+        case publishedArtifactPostLookupCurrentnessRejection
+        case manifestStoreAttempt
+    #endif
+    case rootUnload
+    case graphIndexRunScheduled
+    case graphIndexRunStarted
+    case graphIndexFirstChange
+    case graphIndexChangePublished
+    case graphIndexCoverageComplete
+    case graphIndexCoverageCancelled
+    case graphIndexCoverageSuperseded
+    case graphIndexEnvelopeHit
+    case graphIndexEnvelopeStale
+    case graphIndexEnvelopeInvalid
+    case graphIndexTerminalRecordHit
+    case graphIndexLocatorMiss
+    case graphIndexLocatorCorrupt
+    case graphIndexCASMiss
+    case graphIndexArtifactBuildJoined
+    case graphIndexArtifactBuildStarted
+    case graphIndexArtifactBuildCompleted
+    case graphIndexCatalogPage
+    case graphIndexCatalogCandidates
+    case graphIndexCatalogPathBytes
+    case graphIndexBatchQueued
+    case graphIndexBatchStarted
+    case graphIndexBatchCompleted
+    case graphIndexBatchCancelled
+    case graphIndexRetry
+    case graphIndexRootOvertake
+    case graphIndexExplicitOvertake
+    case graphIndexBudget
+    #if DEBUG
+        case graphIndexPhaseEntered
+        case graphIndexPageAccepted
+        case graphIndexCheckpointed
+        case graphIndexWorkerFinished
+    #endif
+}
+
+/// Hook payloads deliberately contain no physical or logical path.
+struct WorkspaceCodemapBindingEngineHookEvent {
+    let kind: WorkspaceCodemapBindingEngineHookKind
+    let rootEpoch: WorkspaceCodemapRootEpoch?
+    let artifactStorageDigest: String?
+    let numericValue: UInt64
+    let graphIndexPhase: WorkspaceCodemapGraphIndexPhase?
+    let retryAfterMilliseconds: UInt64?
+    let publishedArtifactLookupSource: WorkspaceCodemapPublishedArtifactLookupSource?
+    let publishedArtifactLookupMissReason: WorkspaceCodemapPublishedArtifactLookupMissReason?
+    let invalidationReason: WorkspaceCodemapLiveOverlayInvalidationReason?
+
+    init(
+        kind: WorkspaceCodemapBindingEngineHookKind,
+        rootEpoch: WorkspaceCodemapRootEpoch?,
+        artifactStorageDigest: String?,
+        numericValue: UInt64,
+        graphIndexPhase: WorkspaceCodemapGraphIndexPhase? = nil,
+        retryAfterMilliseconds: UInt64? = nil,
+        publishedArtifactLookupSource: WorkspaceCodemapPublishedArtifactLookupSource? = nil,
+        publishedArtifactLookupMissReason: WorkspaceCodemapPublishedArtifactLookupMissReason? = nil,
+        invalidationReason: WorkspaceCodemapLiveOverlayInvalidationReason? = nil
+    ) {
+        self.kind = kind
+        self.rootEpoch = rootEpoch
+        self.artifactStorageDigest = artifactStorageDigest
+        self.numericValue = numericValue
+        self.graphIndexPhase = graphIndexPhase
+        self.retryAfterMilliseconds = retryAfterMilliseconds
+        self.publishedArtifactLookupSource = publishedArtifactLookupSource
+        self.publishedArtifactLookupMissReason = publishedArtifactLookupMissReason
+        self.invalidationReason = invalidationReason
+    }
+}
+
+package struct WorkspaceCodemapBindingEngineHooks {
+    let event: @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void
+    let afterManifestRevisionQueuedBeforeWaiterInstall: @Sendable (
+        WorkspaceCodemapRootEpoch,
+        UInt64
+    ) async -> Void
+    let afterManifestStoreWriteBeforeCompletion: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
+    #if DEBUG
+        /// Deterministic async race seam immediately before manifest persistence.
+        let beforeManifestStoreWrite: @Sendable (WorkspaceCodemapRootEpoch) async -> Void
+        /// Deterministic race seam, structurally absent from non-DEBUG products.
+        let afterPublishedArtifactLookupBeforeCurrentnessValidation: @Sendable (
+            WorkspaceCodemapRootEpoch
+        ) async -> Void
+    #endif
+
+    init(
+        event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+        afterManifestRevisionQueuedBeforeWaiterInstall: @escaping @Sendable (
+            WorkspaceCodemapRootEpoch,
+            UInt64
+        ) async -> Void = { _, _ in },
+        afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (WorkspaceCodemapRootEpoch) async -> Void = { _ in }
+    ) {
+        self.event = event
+        self.afterManifestRevisionQueuedBeforeWaiterInstall =
+            afterManifestRevisionQueuedBeforeWaiterInstall
+        self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+        #if DEBUG
+            beforeManifestStoreWrite = { _ in }
+            afterPublishedArtifactLookupBeforeCurrentnessValidation = { _ in }
+        #endif
+    }
+
+    #if DEBUG
+        init(
+            event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+            afterManifestRevisionQueuedBeforeWaiterInstall: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch,
+                UInt64
+            ) async -> Void = { _, _ in },
+            afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in },
+            afterPublishedArtifactLookupBeforeCurrentnessValidation: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void
+        ) {
+            self.event = event
+            self.afterManifestRevisionQueuedBeforeWaiterInstall =
+                afterManifestRevisionQueuedBeforeWaiterInstall
+            self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+            beforeManifestStoreWrite = { _ in }
+            self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
+                afterPublishedArtifactLookupBeforeCurrentnessValidation
+        }
+
+        init(
+            debugBeforeManifestStoreWrite: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void,
+            event: @escaping @Sendable (WorkspaceCodemapBindingEngineHookEvent) -> Void = { _ in },
+            afterManifestRevisionQueuedBeforeWaiterInstall: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch,
+                UInt64
+            ) async -> Void = { _, _ in },
+            afterManifestStoreWriteBeforeCompletion: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in },
+            afterPublishedArtifactLookupBeforeCurrentnessValidation: @escaping @Sendable (
+                WorkspaceCodemapRootEpoch
+            ) async -> Void = { _ in }
+        ) {
+            self.event = event
+            self.afterManifestRevisionQueuedBeforeWaiterInstall =
+                afterManifestRevisionQueuedBeforeWaiterInstall
+            self.afterManifestStoreWriteBeforeCompletion = afterManifestStoreWriteBeforeCompletion
+            beforeManifestStoreWrite = debugBeforeManifestStoreWrite
+            self.afterPublishedArtifactLookupBeforeCurrentnessValidation =
+                afterPublishedArtifactLookupBeforeCurrentnessValidation
+        }
+    #endif
+
+    package static let none = WorkspaceCodemapBindingEngineHooks()
+}
+
+struct WorkspaceCodemapBindingEngineCounters: Equatable {
+    var capabilityResolutions: UInt64 = 0
+    var capabilityRetries: UInt64 = 0
+    var classifications: UInt64 = 0
+    var cleanClassifications: UInt64 = 0
+    var worktreeClassifications: UInt64 = 0
+    var locatorFastPaths: UInt64 = 0
+    var casFastPaths: UInt64 = 0
+    var builds: UInt64 = 0
+    var manifestLoads: UInt64 = 0
+    var manifestAdoptions: UInt64 = 0
+    var demandManifestAdoptionBypasses: UInt64 = 0
+    var demandManifestAdoptionWaits: UInt64 = 0
+    var manifestWrites: UInt64 = 0
+    var manifestFailures: UInt64 = 0
+    var manifestWriteBatches: UInt64 = 0
+    var manifestWriteRetries: UInt64 = 0
+    var manifestWriteItems: UInt64 = 0
+    var manifestWriteBatchBytes: UInt64 = 0
+    var manifestWriteCoalescedItems: UInt64 = 0
+    var manifestWriterPeakQueuedItems: UInt64 = 0
+    var materializations: UInt64 = 0
+    var materializedBytes: UInt64 = 0
+    var validatedWorktreeReads: UInt64 = 0
+    var validatedWorktreeBytes: UInt64 = 0
+    var overlayReadyPublications: UInt64 = 0
+    var overlayUnavailablePublications: UInt64 = 0
+    var overlayExactDuplicateCompletions: UInt64 = 0
+    var staleCompletionDrops: UInt64 = 0
+    var cancellations: UInt64 = 0
+    var busyRejections: UInt64 = 0
+    var failures: UInt64 = 0
+    var publishedArtifactGraphIndexCASHits: UInt64 = 0
+    var publishedArtifactLocatorCASHits: UInt64 = 0
+    var publishedArtifactLookupMisses: UInt64 = 0
+    #if DEBUG
+        var publishedArtifactPostLookupCurrentnessRejections: UInt64 = 0
+        var graphIndexPageManifestLoads: UInt64 = 0
+        var graphIndexPageManifestSubmissions: UInt64 = 0
+        var graphIndexPageManifestWaits: UInt64 = 0
+        var graphIndexPageManifestWrites: UInt64 = 0
+        var graphIndexPageManifestSnapshotRecordVolume: UInt64 = 0
+        var graphIndexPageManifestSnapshotByteVolume: UInt64 = 0
+        var graphIndexSealManifestSubmissions: UInt64 = 0
+        var graphIndexSealManifestWaits: UInt64 = 0
+        var graphIndexSealManifestWrites: UInt64 = 0
+        var graphIndexSealManifestAuthorityResubmissions: UInt64 = 0
+        var graphIndexSealManifestSnapshotRecordVolume: UInt64 = 0
+        var graphIndexSealManifestSnapshotByteVolume: UInt64 = 0
+        var graphIndexManifestStagedRecords: UInt64 = 0
+        var graphIndexManifestStagedBytes: UInt64 = 0
+        var graphIndexManifestStagesDegraded: UInt64 = 0
+    #endif
+    var graphIndexRunsScheduled: UInt64 = 0
+    var graphIndexRunsStarted: UInt64 = 0
+    var graphIndexFirstChanges: UInt64 = 0
+    var graphIndexChangesPublished: UInt64 = 0
+    var graphIndexChangeBytes: UInt64 = 0
+    var graphIndexCoveragesCompleted: UInt64 = 0
+    var graphIndexCoveragesCancelled: UInt64 = 0
+    var graphIndexCoveragesSuperseded: UInt64 = 0
+    var graphIndexEnvelopeHits: UInt64 = 0
+    var graphIndexEnvelopeStale: UInt64 = 0
+    var graphIndexEnvelopeInvalid: UInt64 = 0
+    var graphIndexTerminalRecordHits: UInt64 = 0
+    var graphIndexLocatorMisses: UInt64 = 0
+    var graphIndexLocatorCorruptions: UInt64 = 0
+    var graphIndexCASMisses: UInt64 = 0
+    var graphIndexArtifactBuildsJoined: UInt64 = 0
+    var graphIndexArtifactBuildsStarted: UInt64 = 0
+    var graphIndexArtifactBuildsCompleted: UInt64 = 0
+    var graphIndexCatalogPages: UInt64 = 0
+    var graphIndexCatalogCandidates: UInt64 = 0
+    var graphIndexCatalogPathBytes: UInt64 = 0
+    var graphIndexBatchesQueued: UInt64 = 0
+    var graphIndexBatchesStarted: UInt64 = 0
+    var graphIndexBatchesCompleted: UInt64 = 0
+    var graphIndexRetries: UInt64 = 0
+    var graphIndexRootOvertakes: UInt64 = 0
+    var graphIndexExplicitOvertakes: UInt64 = 0
+    var graphIndexBudgetRejections: UInt64 = 0
+    var graphIndexCancelledBatches: UInt64 = 0
+    /// Wall-clock nanoseconds spent processing graph-index batches, summed across roots.
+    var graphIndexBatchNanoseconds: UInt64 = 0
+    /// Graph slots published to the overlay by graph-index batches (pending and classified).
+    var graphIndexPublishedSlots: UInt64 = 0
+    /// Nanoseconds spent inside overlay graph-slot publications.
+    var graphIndexPublishNanoseconds: UInt64 = 0
+
+    init(initialValue: UInt64 = 0) {
+        capabilityResolutions = initialValue
+        capabilityRetries = initialValue
+        classifications = initialValue
+        cleanClassifications = initialValue
+        worktreeClassifications = initialValue
+        locatorFastPaths = initialValue
+        casFastPaths = initialValue
+        builds = initialValue
+        manifestLoads = initialValue
+        manifestAdoptions = initialValue
+        demandManifestAdoptionBypasses = initialValue
+        demandManifestAdoptionWaits = initialValue
+        manifestWrites = initialValue
+        manifestFailures = initialValue
+        manifestWriteBatches = initialValue
+        manifestWriteRetries = initialValue
+        manifestWriteItems = initialValue
+        manifestWriteBatchBytes = initialValue
+        manifestWriteCoalescedItems = initialValue
+        manifestWriterPeakQueuedItems = initialValue
+        materializations = initialValue
+        materializedBytes = initialValue
+        validatedWorktreeReads = initialValue
+        validatedWorktreeBytes = initialValue
+        overlayReadyPublications = initialValue
+        overlayUnavailablePublications = initialValue
+        overlayExactDuplicateCompletions = initialValue
+        staleCompletionDrops = initialValue
+        cancellations = initialValue
+        busyRejections = initialValue
+        failures = initialValue
+        publishedArtifactGraphIndexCASHits = initialValue
+        publishedArtifactLocatorCASHits = initialValue
+        publishedArtifactLookupMisses = initialValue
+        #if DEBUG
+            publishedArtifactPostLookupCurrentnessRejections = initialValue
+            graphIndexPageManifestLoads = initialValue
+            graphIndexPageManifestSubmissions = initialValue
+            graphIndexPageManifestWaits = initialValue
+            graphIndexPageManifestWrites = initialValue
+            graphIndexPageManifestSnapshotRecordVolume = initialValue
+            graphIndexPageManifestSnapshotByteVolume = initialValue
+            graphIndexSealManifestSubmissions = initialValue
+            graphIndexSealManifestWaits = initialValue
+            graphIndexSealManifestWrites = initialValue
+            graphIndexSealManifestAuthorityResubmissions = initialValue
+            graphIndexSealManifestSnapshotRecordVolume = initialValue
+            graphIndexSealManifestSnapshotByteVolume = initialValue
+            graphIndexManifestStagedRecords = initialValue
+            graphIndexManifestStagedBytes = initialValue
+            graphIndexManifestStagesDegraded = initialValue
+        #endif
+        graphIndexRunsScheduled = initialValue
+        graphIndexRunsStarted = initialValue
+        graphIndexFirstChanges = initialValue
+        graphIndexChangesPublished = initialValue
+        graphIndexChangeBytes = initialValue
+        graphIndexCoveragesCompleted = initialValue
+        graphIndexCoveragesCancelled = initialValue
+        graphIndexCoveragesSuperseded = initialValue
+        graphIndexEnvelopeHits = initialValue
+        graphIndexEnvelopeStale = initialValue
+        graphIndexEnvelopeInvalid = initialValue
+        graphIndexTerminalRecordHits = initialValue
+        graphIndexLocatorMisses = initialValue
+        graphIndexLocatorCorruptions = initialValue
+        graphIndexCASMisses = initialValue
+        graphIndexArtifactBuildsJoined = initialValue
+        graphIndexArtifactBuildsStarted = initialValue
+        graphIndexArtifactBuildsCompleted = initialValue
+        graphIndexCatalogPages = initialValue
+        graphIndexCatalogCandidates = initialValue
+        graphIndexCatalogPathBytes = initialValue
+        graphIndexBatchesQueued = initialValue
+        graphIndexBatchesStarted = initialValue
+        graphIndexBatchesCompleted = initialValue
+        graphIndexRetries = initialValue
+        graphIndexRootOvertakes = initialValue
+        graphIndexExplicitOvertakes = initialValue
+        graphIndexBudgetRejections = initialValue
+        graphIndexCancelledBatches = initialValue
+        graphIndexBatchNanoseconds = initialValue
+        graphIndexPublishedSlots = initialValue
+        graphIndexPublishNanoseconds = initialValue
+    }
+}
+
+package enum WorkspaceCodemapGraphIndexWorkerCompletionReason: String, Hashable {
+    case complete
+    case budgetLimited
+    case cancelled
+    case superseded
+    case currentnessLost
+    case admissionUnavailable
+    case checkpointTransitionRejected
+    case generationResetRejected
+    case retryCancelled
+    case watchdogNoProgress
+    case watchdogRecoveryExhausted
+    case prioritizeRestart
+}
+
+/// Terminal execution blockers are independent of graph coverage. `available` means that
+/// execution has no terminal blocker, not that the graph has finished indexing.
+enum WorkspaceCodemapGraphIndexExecutionState: Hashable {
+    case available
+    case exhausted
+    case budgetLimited(WorkspaceCodemapGraphIndexBudget)
+
+    package var budget: WorkspaceCodemapGraphIndexBudget? {
+        if case let .budgetLimited(budget) = self { return budget }
+        return nil
+    }
+}
+
+enum WorkspaceCodemapGraphIndexWatchdogDisposition: Hashable {
+    case current
+    case restarted
+    case restartRequested
+    case exhausted
+    case terminal
+    case unavailable
+}
+
+package enum WorkspaceCodemapGraphIndexPrioritizeDisposition: Hashable {
+    case scheduled
+    case restarted
+    case promoted
+    case alreadyComplete
+    case unavailable
+}
+
+/// Per-root graph-index batch timing and slot counts. Per-batch cost should stay flat as a root
+/// grows; a rising `lastBatchDurationNanoseconds` at constant batch size signals superlinear work.
+struct WorkspaceCodemapGraphIndexBatchTiming: Hashable {
+    static let zero = Self()
+
+    var batchCount: UInt64 = 0
+    var lastBatchDurationNanoseconds: UInt64 = 0
+    var maximumBatchDurationNanoseconds: UInt64 = 0
+    var totalBatchDurationNanoseconds: UInt64 = 0
+    var lastBatchPublishedSlotCount: UInt64 = 0
+    var publishedSlotCount: UInt64 = 0
+    var lastBatchPublishDurationNanoseconds: UInt64 = 0
+    var totalPublishDurationNanoseconds: UInt64 = 0
+}
+
+package struct WorkspaceCodemapBindingEngineGraphIndexRootAccounting: Equatable {
+    let rootEpoch: WorkspaceCodemapRootEpoch
+    package let jobID: UUID
+    package let phase: WorkspaceCodemapGraphIndexPhase
+    package let progress: WorkspaceCodemapGraphIndexProgress
+    package let workerPresent: Bool
+    package let workerRecoveryCount: UInt64
+    package let lastWorkerCompletionReason: WorkspaceCodemapGraphIndexWorkerCompletionReason?
+    package let isPriorityPromoted: Bool
+    package let isQueuedForAdmission: Bool
+    package let queuePosition: Int?
+    package let queuedBatchCount: Int
+    package let activeBatchCount: Int
+    package let drainingBatchCount: Int
+    package let resources: WorkspaceCodemapGraphIndexResourceAccounting
+    package let retryAttempt: UInt64
+    package let retry: WorkspaceCodemapGraphIndexRetry?
+    package let budget: WorkspaceCodemapGraphIndexBudget?
+    package let scheduledUptimeNanoseconds: UInt64
+    package let admissionWaitStartUptimeNanoseconds: UInt64?
+    package let admittedUptimeNanoseconds: UInt64?
+    package let phaseEnteredUptimeNanoseconds: UInt64
+    package let lastProgressUptimeNanoseconds: UInt64
+    package let workerFinishedUptimeNanoseconds: UInt64?
+    package let lastProjectedSupportedCandidateTotal: UInt64?
+    package let pageStartProcessedCandidateBaseline: UInt64?
+    package let pageOrdinal: UInt64
+    package let cursorPresent: Bool
+    package let cursorFingerprint: String?
+    package let inBatchCandidateCount: UInt64?
+    package let inBatchResolvedCandidateCount: UInt64?
+    package let checkpointPresent: Bool
+    package let manifestMeasurements: WorkspaceCodemapManifestMeasurementAggregate
+    let batchTiming: WorkspaceCodemapGraphIndexBatchTiming
+}
+
+package struct WorkspaceCodemapBindingEngineAccounting: Equatable {
+    let rootCount: Int
+    let eligibleRootCount: Int
+    let unavailableRootCount: Int
+    let activeRequestCount: Int
+    let queuedRequestCount: Int
+    let ownerCount: Int
+    let reservedSourceByteCount: UInt64
+    let manifestAdoptionLeaseCount: Int
+    let manifestAdoptionLeaseByteCount: UInt64
+    let rootAdmissionHistoryCount: Int
+    let ownerAdmissionHistoryCount: Int
+    let dirtyManifestCount: Int
+    let counters: WorkspaceCodemapBindingEngineCounters
+    let graphIndexJobCount: Int
+    let suspendedGraphIndexJobCount: Int
+    let queuedGraphIndexBatchCount: Int
+    let activeGraphIndexBatchCount: Int
+    let drainingGraphIndexTaskCount: Int
+    let graphIndexResources: WorkspaceCodemapGraphIndexResourceAccounting
+    let graphIndexRoots: [WorkspaceCodemapBindingEngineGraphIndexRootAccounting]
+
+    init(
+        rootCount: Int,
+        eligibleRootCount: Int,
+        unavailableRootCount: Int,
+        activeRequestCount: Int,
+        queuedRequestCount: Int,
+        ownerCount: Int,
+        reservedSourceByteCount: UInt64,
+        manifestAdoptionLeaseCount: Int,
+        manifestAdoptionLeaseByteCount: UInt64,
+        rootAdmissionHistoryCount: Int,
+        ownerAdmissionHistoryCount: Int,
+        dirtyManifestCount: Int,
+        counters: WorkspaceCodemapBindingEngineCounters,
+        graphIndexJobCount: Int = 0,
+        suspendedGraphIndexJobCount: Int = 0,
+        queuedGraphIndexBatchCount: Int = 0,
+        activeGraphIndexBatchCount: Int = 0,
+        drainingGraphIndexTaskCount: Int = 0,
+        graphIndexResources: WorkspaceCodemapGraphIndexResourceAccounting = .zero,
+        graphIndexRoots: [WorkspaceCodemapBindingEngineGraphIndexRootAccounting] = []
+    ) {
+        self.rootCount = rootCount
+        self.eligibleRootCount = eligibleRootCount
+        self.unavailableRootCount = unavailableRootCount
+        self.activeRequestCount = activeRequestCount
+        self.queuedRequestCount = queuedRequestCount
+        self.ownerCount = ownerCount
+        self.reservedSourceByteCount = reservedSourceByteCount
+        self.manifestAdoptionLeaseCount = manifestAdoptionLeaseCount
+        self.manifestAdoptionLeaseByteCount = manifestAdoptionLeaseByteCount
+        self.rootAdmissionHistoryCount = rootAdmissionHistoryCount
+        self.ownerAdmissionHistoryCount = ownerAdmissionHistoryCount
+        self.dirtyManifestCount = dirtyManifestCount
+        self.counters = counters
+        self.graphIndexJobCount = graphIndexJobCount
+        self.suspendedGraphIndexJobCount = suspendedGraphIndexJobCount
+        self.queuedGraphIndexBatchCount = queuedGraphIndexBatchCount
+        self.activeGraphIndexBatchCount = activeGraphIndexBatchCount
+        self.drainingGraphIndexTaskCount = drainingGraphIndexTaskCount
+        self.graphIndexResources = graphIndexResources
+        self.graphIndexRoots = graphIndexRoots
+    }
+}
+
+/// How the engine's graph pull loop pauses after a committed diff while indexing is in progress.
+///
+/// The pause only coalesces pending publications into fewer commits; the engine interrupts it
+/// whenever a caller needs the graph caught up (for example before reporting graph-index
+/// completion) and when the pull task is cancelled. Tests inject a gated pause to force the path.
+package struct WorkspaceCodemapGraphPullPause {
+    /// Receives the wall-clock nanoseconds the preceding apply took.
+    let pause: @Sendable (_ applyNanoseconds: UInt64) async -> Void
+
+    /// Pauses for twice the apply time, capped at 250 ms; sub-millisecond commits do not pause.
+    package static let production = WorkspaceCodemapGraphPullPause { applyNanoseconds in
+        let (scaled, overflow) = applyNanoseconds.multipliedReportingOverflow(by: 2)
+        let maximum: UInt64 = 250_000_000
+        let pause = overflow ? maximum : min(scaled, maximum)
+        guard pause >= 1_000_000 else { return }
+        try? await Task.sleep(nanoseconds: pause)
+    }
+}

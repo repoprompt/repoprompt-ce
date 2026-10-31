@@ -1,5 +1,6 @@
 import Foundation
 import RepoPromptShared
+import RepoPromptWorkspaceContext
 
 // MARK: - MCP Debug Logging
 

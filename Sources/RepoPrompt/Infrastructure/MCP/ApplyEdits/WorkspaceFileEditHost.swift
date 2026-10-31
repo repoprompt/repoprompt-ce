@@ -1,6 +1,7 @@
 import Foundation
 import RepoPromptDomainRuntime
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 
 struct WorkspaceFileEditHost: FileEditHost {
     @MainActor

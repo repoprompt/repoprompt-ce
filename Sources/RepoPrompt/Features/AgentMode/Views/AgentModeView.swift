@@ -1,6 +1,7 @@
 import Combine
 import RepoPromptFileSystem
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 /// Agent Mode view - a chat-style interface for long-running agent interactions

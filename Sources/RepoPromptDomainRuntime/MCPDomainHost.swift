@@ -392,6 +392,16 @@ package actor MCPDomainHost {
         return handle
     }
 
+    #if DEBUG
+        /// Observes the existing progress actor for deterministic test barriers only.
+        package func debugRequestProgressStateForTesting(
+            _ handle: MCPDomainRequestProgressHandle
+        ) -> MCPRequestProgressState? {
+            guard let record = requestProgressByStateID[handle.stateID], record.handle == handle else { return nil }
+            return record.state
+        }
+    #endif
+
     package func sendRequestProgress(
         _ handle: MCPDomainRequestProgressHandle,
         through transport: any MCPDomainProgressTransport,

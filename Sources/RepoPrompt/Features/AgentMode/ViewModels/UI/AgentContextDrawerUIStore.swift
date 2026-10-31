@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptWorkspaceContext
 
 @MainActor
 final class AgentContextDrawerPresentationStore: ObservableObject {

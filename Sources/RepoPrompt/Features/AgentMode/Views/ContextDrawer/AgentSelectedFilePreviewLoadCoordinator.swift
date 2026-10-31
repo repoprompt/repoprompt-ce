@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 
 @MainActor
 final class AgentSelectedFilePreviewLoadCoordinator: ObservableObject {

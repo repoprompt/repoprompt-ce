@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import RepoPromptSettingsCore
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 
 struct AgentContextSelectionMutationTarget {
     let identity: WorkspaceSelectionIdentity

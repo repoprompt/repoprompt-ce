@@ -8,6 +8,7 @@ import RepoPromptFoundation
 import RepoPromptInstrumentation
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import SwiftUI
 

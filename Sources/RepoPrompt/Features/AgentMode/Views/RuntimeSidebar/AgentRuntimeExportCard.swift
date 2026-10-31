@@ -1,6 +1,7 @@
 import Combine
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 private enum AgentSelectedFilesPopoverTab {

@@ -2,6 +2,7 @@ import CoreServices
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 final class FSEventStreamLivenessCorrectionTests: XCTestCase {

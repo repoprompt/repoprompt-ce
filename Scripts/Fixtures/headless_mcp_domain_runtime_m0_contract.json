@@ -605,7 +605,7 @@
         "symbol": "WindowSettingsManager"
       },
       {
-        "path": "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionCoordinator.swift",
+        "path": "Sources/RepoPromptWorkspaceContext/Selection/WorkspaceSelectionCoordinator.swift",
         "symbol": "WorkspaceSelectionCoordinator"
       }
     ],

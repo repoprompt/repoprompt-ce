@@ -19,24 +19,24 @@ final class TaskLocalPayloadLayoutGuardTests: XCTestCase {
     /// fixed-size scalar. Anything else must use `BoxedTaskLocal`.
     private static let reviewedFixedSizeTaskLocals: [String: String] = [
         "Sources/RepoPrompt/Features/Workspaces/WorkspaceModel.swift#recorder": "final class",
-        "Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift#readinessWaitTimeoutOverrideForTesting":
+        "Sources/RepoPromptWorkspaceContext/Search/StoreBackedWorkspaceSearch.swift#readinessWaitTimeoutOverrideForTesting":
             "frozen stdlib Duration",
-        "Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift#freshnessWaitTimeoutOverrideForTesting":
+        "Sources/RepoPromptWorkspaceContext/Search/StoreBackedWorkspaceSearch.swift#freshnessWaitTimeoutOverrideForTesting":
             "frozen stdlib Duration",
-        "Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift#freshnessWaitOperationOverrideForTesting":
+        "Sources/RepoPromptWorkspaceContext/Search/StoreBackedWorkspaceSearch.swift#freshnessWaitOperationOverrideForTesting":
             "closure",
         "Sources/RepoPrompt/Features/Diagnostics/App/WorktreeStartupInstrumentation.swift#currentRecorder": "final class",
         "Sources/RepoPrompt/Features/Diagnostics/App/WorkspaceProjectionDecodeDiagnostics.swift#attempt": "final class",
-        "Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift#activePublicationInvalidationRecorder":
+        "Sources/RepoPromptWorkspaceContext/WorkspaceFileContextStore.swift#activePublicationInvalidationRecorder":
             "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentGitCapture": "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolWorkCountDiagnostics.swift#currentReadFileCapture": "final class",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPInvocationContext.swift#diagnosticSink": "closure",
         "Sources/RepoPrompt/Infrastructure/MCP/MCPToolObserverDiagnostics.swift#recorder": "final class",
-        "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#collector": "final class",
-        "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#catalogBuildObserver":
+        "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#collector": "final class",
+        "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#catalogBuildObserver":
             "final class",
-        "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#coldStartCollector":
+        "Sources/RepoPromptWorkspaceContext/Search/WorkspaceFileSearchDebugTiming.swift#coldStartCollector":
             "final class",
         "Sources/RepoPrompt/Infrastructure/VCS/GitService.swift#currentReceiptParentLookupTrace": "final class",
         "Sources/RepoPrompt/Infrastructure/VCS/GitService.swift#worktreeCreationCommitFence":

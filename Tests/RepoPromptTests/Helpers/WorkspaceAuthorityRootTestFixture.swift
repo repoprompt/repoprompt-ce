@@ -6,6 +6,7 @@ import RepoPromptSecureStorage
 import RepoPromptSettingsCore
 import RepoPromptShared
 import RepoPromptVCS
+@testable import RepoPromptWorkspaceContext
 import XCTest
 
 #if DEBUG

@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSecureStorage
@@ -88,6 +89,74 @@ enum AgentSessionLinkEndpointTestSupport {
             endpoint: endpoint(viewModel, tabID: tabID, file: file, line: line),
             allowsSupplement: allowsSupplement
         )
+    }
+}
+
+/// In-process canonical ingress for the existing session contract fixtures. Routing and endpoint
+/// resolution remain controlled by each fixture; this is not socket/PID, packaged, or provider proof.
+/// The production host owns registration generations, invocation cancellation and settlement.
+@MainActor
+final class SessionContractHost {
+    let runtime: MCPDomainRuntime
+    let connectionID = UUID()
+    let windowID: Int
+    private let directory: URL
+    private var registration: DomainConnectionRegistration?
+
+    init(windowID: Int) {
+        self.windowID = windowID
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("session-contract-host-\(UUID())")
+        runtime = MCPDomainRuntime(configuration: .init(
+            mode: .app, profileIdentifier: "session-contract",
+            storageDirectory: directory.appendingPathComponent("authority"),
+            workspaceStorageDirectory: directory.appendingPathComponent("workspaces"),
+            eventDirectory: directory.appendingPathComponent("events"),
+            temporaryDirectory: directory.appendingPathComponent("tmp"), externalReloadInterval: nil
+        ))
+    }
+
+    func start(_ bindings: [MCPDomainToolBinding]) async throws {
+        try await runtime.start()
+        try await runtime.toolRegistry.register(
+            registrationID: .init(), scope: .window(id: windowID), bindings: bindings
+        )
+        _ = await runtime.routingCoordinator.registerConnection(connectionID: connectionID, operationID: UUID())
+        registration = try await runtime.routingCoordinator.currentRegistration(connectionID: connectionID)
+    }
+
+    func call(_ toolName: String, _ arguments: [String: Value]) async throws -> [String: Value] {
+        let result = try await invoke(toolName, arguments)
+        return try XCTUnwrap(result.objectValue)
+    }
+
+    func invoke(_ toolName: String, _ arguments: [String: Value]) async throws -> Value {
+        let registration = try XCTUnwrap(registration)
+        let invocationID = UUID()
+        let resolution = try await runtime.domainHost.resolve(toolName: toolName, scope: .window(id: windowID))
+        let security = DomainToolInvocationSecurityContext(
+            principal: DomainClientPrincipal(
+                principalID: UUID(), stableKey: "session-contract", displayName: "Session contract fixture",
+                kind: .appProxy, assurance: .displayNameOnly, processID: nil, runID: nil,
+                provider: nil, verifiedIdentityFingerprint: nil
+            ),
+            connectionID: connectionID, connectionGeneration: registration.generation,
+            invocationID: invocationID, runtimeID: runtime.identity.runtimeID,
+            runtimeGeneration: runtime.identity.lifecycleGeneration, ephemeralGrantedToolNames: []
+        )
+        return try await runtime.domainHost.invoke(.init(
+            invocationID: invocationID, connectionID: connectionID, resolution: resolution,
+            arguments: arguments, securityContext: security
+        ))
+    }
+
+    func cleanup() async {
+        _ = await runtime.shutdown()
+        let snapshot = await runtime.domainHost.snapshot()
+        XCTAssertEqual(snapshot.activeInvocationCount, 0)
+        XCTAssertEqual(snapshot.activeResourceAdmissionLeaseCount, 0)
+        XCTAssertEqual(snapshot.resourceAdmissionWaiterCount, 0)
+        try? FileManager.default.removeItem(at: directory)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
     }
 }
 

@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptFoundation
+import RepoPromptWorkspaceContext
 
 extension MCPServerViewModel {
     struct ManageSelectionInputs {

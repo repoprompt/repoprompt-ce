@@ -3,6 +3,7 @@ import Dispatch
 import Foundation
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
+@testable import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 import XCTest
 

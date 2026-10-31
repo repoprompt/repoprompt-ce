@@ -10,11 +10,11 @@ final class GitWorkspaceAuthorityLockReentryGuardTests: XCTestCase {
     func testReviewedLockOwnersUseSameThreadReentryCheckedLocks() throws {
         let root = try RepoRoot.url()
         let authoritySource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceStateAuthority.swift",
             root: root
         )
         let watermarksSource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceMetadataMonitor.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceMetadataMonitor.swift",
             root: root
         )
         let authority = try Self.typeSource(named: "GitWorkspaceAuthoritySynchronousState", in: authoritySource)
@@ -29,11 +29,11 @@ final class GitWorkspaceAuthorityLockReentryGuardTests: XCTestCase {
     func testClosureInvocationsInReviewedLockOwnersCarryExplicitMarker() throws {
         let root = try RepoRoot.url()
         let authoritySource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceStateAuthority.swift",
             root: root
         )
         let watermarksSource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceMetadataMonitor.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceMetadataMonitor.swift",
             root: root
         )
         let authority = try Self.typeSource(named: "GitWorkspaceAuthoritySynchronousState", in: authoritySource)
@@ -64,12 +64,15 @@ final class GitWorkspaceAuthorityLockReentryGuardTests: XCTestCase {
 
         XCTAssertEqual(Self.reentrancyMarkerViolations(in: reviewed), [])
         XCTAssertEqual(Self.reentrancyMarkerViolations(in: unreviewed), ["callback()"])
+
+        let accessQualified = "package func install(_ value: Int, capturedUsing token: Int) { marker() }"
+        XCTAssertEqual(Self.functionBodies(named: "install", in: accessQualified).count, 1)
     }
 
     func testInstallAndPublicationPermitKeepMonitorBeforeAuthorityMirrorOrder() throws {
         let root = try RepoRoot.url()
         let authoritySource = try Self.source(
-            at: "Sources/RepoPrompt/Infrastructure/VCS/GitWorkspaceStateAuthority.swift",
+            at: "Sources/RepoPromptWorkspaceContext/Git/GitWorkspaceStateAuthority.swift",
             root: root
         )
         let authority = try Self.typeSource(named: "GitWorkspaceStateAuthority", in: authoritySource)
@@ -112,7 +115,7 @@ final class GitWorkspaceAuthorityLockReentryGuardTests: XCTestCase {
 
     private static func functionBodies(named name: String, in source: String) -> [String] {
         let escapedName = NSRegularExpression.escapedPattern(for: name)
-        let pattern = #"(?m)^\s*(?:nonisolated\s+)?func\s+\#(escapedName)(?:<[^>]+>)?\s*\("#
+        let pattern = #"(?m)^\s*(?:package\s+)?(?:nonisolated\s+)?func\s+\#(escapedName)(?:<[^>]+>)?\s*\("#
         guard let expression = try? NSRegularExpression(pattern: pattern) else { return [] }
         let range = NSRange(source.startIndex..., in: source)
         return expression.matches(in: source, range: range).compactMap { match in

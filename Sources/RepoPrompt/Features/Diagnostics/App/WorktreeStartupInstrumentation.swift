@@ -2,6 +2,7 @@ import Foundation
 import RepoPromptInstrumentation
 import RepoPromptShared
 import RepoPromptVCS
+import RepoPromptWorkspaceContext
 #if DEBUG
     import CryptoKit
 #endif
@@ -1481,6 +1482,27 @@ struct AppWorkspaceStartupEventRecorder: WorkspaceStartupEventRecording {
     extension WorktreeStartupPreparationInstrumentation.Span: WorkspacePreparationSpan {}
 
     extension WorktreeStartupPreparationInstrumentation.Recorder: WorkspacePreparationRecording {
+        func recordPreparationReason(_ reason: WorkspacePreparationReason) {
+            let appReason: WorktreeStartupPreparationInstrumentation.Reason = switch reason {
+            case .absent: .absent
+            case .bypassed: .bypassed
+            case .rootIdentityChanged: .rootIdentityChanged
+            case .authorityGenerationChanged: .authorityGenerationChanged
+            case .watermarkAdvanced: .watermarkAdvanced
+            case .coverageLost: .coverageLost
+            case .monitorUnavailable: .monitorUnavailable
+            case .controlOrTopologyEvent: .controlOrTopologyEvent
+            case .monitorGap: .monitorGap
+            case .replacement: .replacement
+            case .capacityEviction: .capacityEviction
+            case .staleCurrentness: .staleCurrentness
+            case .fallback: .fallback
+            case .failure: .failure
+            case .cancellation: .cancellation
+            }
+            recordReason(appReason)
+        }
+
         func beginPhase(_ phase: WorkspacePreparationPhase) -> any WorkspacePreparationSpan {
             begin(phase)
         }

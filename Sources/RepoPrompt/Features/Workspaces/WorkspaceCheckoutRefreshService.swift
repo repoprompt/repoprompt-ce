@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptWorkspaceContext
 import RepoPromptWorkspaceCore
 
 enum WorkspaceCheckoutSearchIndexRefreshBehavior: Equatable {

@@ -1,4 +1,5 @@
 import RepoPromptInstrumentation
+import RepoPromptWorkspaceContext
 import SwiftUI
 
 struct AgentStatusPillsRow: View {
