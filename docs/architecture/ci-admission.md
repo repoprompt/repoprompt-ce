@@ -25,6 +25,16 @@ notarization, Computer Use release compatibility, or a distributable artifact.
 Existing main-only Sentry/candidate workflows remain supplemental; their scheduling
 and recovery changes are intentionally outside this admission change.
 
+The universal packaging operation retains conductor's four-hour deadline. Its
+workflow step allows 245 minutes and the job allows 270 minutes, so the operation
+can report its own timeout and leave time for smoke and diagnostic upload. A
+two-hour outer job deadline previously cancelled a still-running package on main
+(run `41206584853`). This changes the runner envelope, not compiler budgets or
+admission obligations. The secret-free package job uses unbuffered Python output
+and an isolated conductor state directory. It retains raw job logs alongside the
+manifest and smoke diagnostics, including when packaging fails; a missing
+manifest must not also discard the build's failure evidence.
+
 ## Candidate and evidence boundaries
 
 PRs check out `github.sha` (the synthetic merge), never just the topic head.

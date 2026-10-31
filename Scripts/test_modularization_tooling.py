@@ -347,6 +347,22 @@ class CatalogTests(unittest.TestCase):
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
 
+    def test_package_deadlines_outlive_the_conductor_artifact_budget(self) -> None:
+        # The old 120-minute job killed a valid four-hour operation on main.
+        # Compare the independent owners rather than pinning another timeout copy.
+        root = SCRIPT_DIR.parent
+        products = (root / '.github/workflows/ci-integration-products.yml').read_text()
+        package = products.split('\n  package:\n', 1)[1]
+        job_seconds = int(package.split('    timeout-minutes:', 1)[1].splitlines()[0]) * 60
+        step = package.split('      - name: Package secret-free universal ad-hoc release candidate\n', 1)[1]
+        step = step.split('\n      - name:', 1)[0]
+        step_seconds = int(step.split('        timeout-minutes:', 1)[1].splitlines()[0]) * 60
+        operation_seconds = conductor.OperationRegistry(root)._default_timeout('release', {'subcommand': 'artifact'})
+        self.assertGreaterEqual(step_seconds, operation_seconds + 5 * 60,
+                                'Conductor must report its own deadline before GitHub cancels the step')
+        self.assertGreaterEqual(job_seconds, step_seconds + 15 * 60,
+                                'Preflight, smoke, and diagnostic upload need time outside the package step')
+
     def test_style_shell_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
         import os
         import textwrap
