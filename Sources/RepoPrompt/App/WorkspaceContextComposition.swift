@@ -202,6 +202,7 @@ extension WorkspaceFileContextStore {
             unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
             startupFeatureFlags: WorktreeStartupFeatureFlags = .standaloneOperationalDefault(),
             enableCatalogShardShadowValidation: Bool = true,
+            pathSearchCompactionPolicyForTesting: WorkspacePathSearchCompactionPolicy = .production,
             codemapRuntimeProvider: @escaping CodeMapArtifactRuntimeProvider.Factory = {
                 try CodeMapArtifactRuntime.processWide()
             },
@@ -235,6 +236,7 @@ extension WorkspaceFileContextStore {
                 unloadTerminationPolicy: unloadTerminationPolicy,
                 startupFeatureFlags: startupFeatureFlags,
                 enableCatalogShardShadowValidation: enableCatalogShardShadowValidation,
+                pathSearchCompactionPolicyForTesting: pathSearchCompactionPolicyForTesting,
                 codemapRuntimeProvider: codemapRuntimeProvider,
                 codemapLocalGitClassificationProbe: codemapLocalGitClassificationProbe,
                 codemapGitEligibilityProbe: codemapGitEligibilityProbe,

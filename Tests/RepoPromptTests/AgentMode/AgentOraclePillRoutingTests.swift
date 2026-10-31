@@ -634,7 +634,12 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             let prepared = try makeCanonicalOracleGroup(fixture: fixture).group
             var member = makeProjection(member: prepared.members[1], group: prepared, fixture: fixture)
             member.messages = [StoredMessage(isUser: false, rawText: "Error: not an outcome")]
-            vm.sessions = [member]
+            let sibling = makeProjection(member: prepared.members[0], group: prepared, fixture: fixture)
+            vm.sessions = [sibling, member]
+            let pill = AgentOraclePill(
+                oracleViewModel: vm, windowID: -1, currentTabID: fixture.tabID,
+                activeAgentSessionID: nil, activeRunID: nil
+            )
             let turnID = try XCTUnwrap(prepared.turns.last?.id)
             let started = OracleProgressEvent(
                 kind: .laneStarted, groupID: prepared.group.id, turnID: turnID,
@@ -648,11 +653,42 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             vm.receiveOracleGroupProgress(started, owner: prepared.owner)
             XCTAssertEqual(vm.oracleMemberPresentation(for: member).status, .streaming)
             vm.receiveOracleGroupProgress(OracleProgressEvent(
+                kind: .laneStarted, groupID: prepared.group.id, turnID: turnID,
+                laneID: prepared.members[0].laneID, sequence: 0
+            ), owner: prepared.owner)
+            vm.receiveOracleGroupProgress(OracleProgressEvent(
                 kind: .laneSettled, groupID: prepared.group.id, turnID: turnID,
                 laneID: prepared.members[1].laneID, sequence: 1, text: canonicalStatus.rawValue
             ), owner: prepared.owner)
             vm.receiveOracleGroupProgress(started, owner: prepared.owner)
-            XCTAssertEqual(vm.oracleMemberPresentation(for: member).status, .unknown, "settled progress is not publication")
+            XCTAssertEqual(pill.memberDotState(for: member), .settled, "settled progress is not publication")
+            XCTAssertEqual(pill.memberDotState(for: member).rawValue, "Settled · awaiting group")
+            XCTAssertEqual(pill.memberDotState(for: sibling), .streaming, "sibling is still running")
+            XCTAssertNil(vm.oracleMemberPresentation(for: member).errorMessage)
+            vm.recordOracleGroupPresentation(prepared)
+            let ignoredEvents = [
+                OracleProgressEvent(
+                    kind: .laneStarted, groupID: prepared.group.id, turnID: turnID,
+                    laneID: prepared.members[1].laneID, sequence: 1
+                ),
+                OracleProgressEvent(
+                    kind: .laneSettled, groupID: prepared.group.id, turnID: turnID,
+                    laneID: prepared.members[1].laneID
+                ),
+                OracleProgressEvent(
+                    kind: .laneStarted, groupID: prepared.group.id, turnID: OracleTurnID(rawValue: UUID()),
+                    laneID: prepared.members[1].laneID, sequence: 2
+                ),
+                OracleProgressEvent(
+                    kind: .groupSettled, groupID: prepared.group.id, turnID: turnID,
+                    sequence: 2, text: canonicalStatus.rawValue
+                )
+            ]
+            for event in ignoredEvents {
+                vm.receiveOracleGroupProgress(event, owner: prepared.owner)
+            }
+            XCTAssertEqual(pill.memberDotState(for: member), .settled, "stale, missing and mismatched evidence cannot reset settlement")
+            XCTAssertEqual(pill.memberDotState(for: sibling), .streaming)
 
             let terminal = try terminalGroup(prepared, secondaryStatus: canonicalStatus)
             vm.recordOracleGroupPresentation(terminal)
@@ -679,7 +715,14 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             vm.receiveOracleGroupProgress(started, owner: prepared.owner)
             vm.recordOracleGroupPresentation(terminal)
             XCTAssertEqual(vm.oracleMemberPresentation(for: member).status, .unknown, "new turn fences old results/events")
+            vm.receiveOracleGroupProgress(OracleProgressEvent(
+                kind: .laneSettled, groupID: replacement.group.id, turnID: nextTurn.id,
+                laneID: prepared.members[1].laneID, sequence: 0, text: "completed"
+            ), owner: prepared.owner)
+            await vm.finishOracleGroupPresentation(invocationID: UUID())
+            XCTAssertEqual(pill.memberDotState(for: member), .settled, "unrelated invocation cannot end settlement")
             await vm.finishOracleGroupPresentation(invocationID: invocationID)
+            vm.recordOracleGroupPresentation(replacement)
             vm.receiveOracleGroupProgress(OracleProgressEvent(
                 kind: .laneStarted, groupID: replacement.group.id, turnID: nextTurn.id,
                 laneID: prepared.members[1].laneID, sequence: 0

@@ -159,6 +159,10 @@ protocol CodexSessionControlling: AnyObject {
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot
+    func readNativeToolProbeSnapshot(
+        expectedTurnID: String,
+        timeout: TimeInterval?
+    ) async throws -> CodexNativeSessionController.ThreadSnapshot
     func outstandingBlockingNativeToolCallNames() async -> [String]
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
@@ -642,6 +646,9 @@ final class CodexNativeSessionController {
         let runtimeStatus: RuntimeStatus
         let currentTurnID: String?
         let activeTurnIDs: [String]
+        /// False when bounded metadata omits older turns; absence cannot prove uniqueness.
+        /// Describes pagination coverage, not whether turn metadata or items were requested.
+        let hasCompleteTurnMetadata: Bool
         /// Identifier paired with `latestTurnStatus`; this is the last terminal turn, not an active turn.
         let latestTerminalTurnID: String?
         let latestTurnStatus: TurnStatus?
@@ -657,6 +664,7 @@ final class CodexNativeSessionController {
             runtimeStatus: RuntimeStatus,
             currentTurnID: String?,
             activeTurnIDs: [String],
+            hasCompleteTurnMetadata: Bool = true,
             latestTerminalTurnID: String? = nil,
             latestTurnStatus: TurnStatus?,
             latestTurnFailure: TurnFailure? = nil,
@@ -670,6 +678,7 @@ final class CodexNativeSessionController {
             self.runtimeStatus = runtimeStatus
             self.currentTurnID = currentTurnID
             self.activeTurnIDs = activeTurnIDs
+            self.hasCompleteTurnMetadata = hasCompleteTurnMetadata
             self.latestTerminalTurnID = latestTerminalTurnID
             self.latestTurnStatus = latestTurnStatus
             self.latestTurnFailure = latestTurnFailure
@@ -893,6 +902,18 @@ final class CodexNativeSessionController {
     private var threadPath: String?
     private var activeSessionReference: SessionRef?
     private var threadBindingContext: ThreadBindingContext?
+    // Captured from the client's authoritative launch resolution, never independently resolved.
+    private var usesBoundedThreadSnapshots = false
+    private static let snapshotTurnLimit = 32
+
+    private static func supportsBoundedThreadSnapshots(_ version: CodexRuntimeAuthority.Version) -> Bool {
+        version >= CodexRuntimeAuthority.Version(major: 0, minor: 164, patch: 0)
+    }
+
+    private static var snapshotTurnPageParams: [String: Any] {
+        ["limit": snapshotTurnLimit, "sortDirection": "desc", "itemsView": "notLoaded"]
+    }
+
     private var routingCurrentTurnID: String?
     private var authoritativeLifecycleTurnID: String?
     private var activeTurnIDs: Set<String> = []
@@ -1797,6 +1818,10 @@ final class CodexNativeSessionController {
     ) async throws -> [String: Any] {
         if let resumeThreadID {
             var params: [String: Any] = ["threadId": resumeThreadID]
+            if usesBoundedThreadSnapshots {
+                params["excludeTurns"] = true
+                params["initialTurnsPage"] = Self.snapshotTurnPageParams
+            }
             if let rolloutPath = existing?.rolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines),
                !rolloutPath.isEmpty
             {
@@ -1816,7 +1841,8 @@ final class CodexNativeSessionController {
             // preserves original instructions across resume (confirmed by Codex protocol
             // tests: resume_switches_models_preserves_base_instructions). Resending them
             // wastes ~5-6k tokens on every reconnect for no benefit.
-            return try await requestWithCompatibleAppServerRequestValueStyle(
+            let deadline = ProcessInfo.processInfo.systemUptime + (timeout ?? options.requestTimeout ?? 5)
+            var result = try await requestWithCompatibleAppServerRequestValueStyle(
                 method: "thread/resume",
                 timeout: timeout
             ) { requestValueStyle in
@@ -1826,6 +1852,26 @@ final class CodexNativeSessionController {
                 requestParams["approvalsReviewer"] = effectiveApprovalReviewer.appServerRequestValue
                 return requestParams
             }
+            try Task.checkCancellation()
+            try Self.validateThreadSnapshotResponse(result, expectedThreadID: resumeThreadID, requiresPage: false)
+            // The protocol permits an absent/null initial page even when one was requested.
+            // Fetch one bounded metadata page, never retry resume with full history.
+            if usesBoundedThreadSnapshots,
+               result["initialTurnsPage"] == nil || result["initialTurnsPage"] is NSNull
+            {
+                var pageParams = Self.snapshotTurnPageParams
+                pageParams["threadId"] = resumeThreadID
+                result["initialTurnsPage"] = try await performRequest(
+                    method: "thread/turns/list", params: pageParams,
+                    timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/turns/list")
+                )
+            }
+            try Task.checkCancellation()
+            if usesBoundedThreadSnapshots {
+                _ = try Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/resume")
+            }
+            try Self.validateThreadSnapshotResponse(result, expectedThreadID: resumeThreadID, requiresPage: usesBoundedThreadSnapshots)
+            return result
         }
 
         var params: [String: Any] = [:]
@@ -1909,6 +1955,7 @@ final class CodexNativeSessionController {
             let runtime: CodexRuntimeAuthority.Runtime
             do {
                 runtime = try await client.prepareRuntimeForLaunch()
+                usesBoundedThreadSnapshots = Self.supportsBoundedThreadSnapshots(runtime.version)
                 #if DEBUG
                     await recordLifecyclePhase(
                         .runtimeResolution,
@@ -2107,20 +2154,72 @@ final class CodexNativeSessionController {
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> ThreadSnapshot {
+        try await readThreadSnapshot(includeTurns: includeTurns, nativeToolTurnID: nil, timeout: timeout)
+    }
+
+    /// Only the watchdog with an existing local tool span requests current-turn item evidence.
+    /// Older runtimes retain their existing rich read; modern runtimes never load prior items.
+    func readNativeToolProbeSnapshot(
+        expectedTurnID: String,
+        timeout: TimeInterval?
+    ) async throws -> ThreadSnapshot {
+        guard let turnID = Self.nonEmptyString(expectedTurnID) else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        return try await readThreadSnapshot(includeTurns: true, nativeToolTurnID: turnID, timeout: timeout)
+    }
+
+    private func readThreadSnapshot(
+        includeTurns: Bool,
+        nativeToolTurnID: String?,
+        timeout: TimeInterval?
+    ) async throws -> ThreadSnapshot {
         guard let threadID,
               !threadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let result = try await performRequest(
+        let bounded = usesBoundedThreadSnapshots && includeTurns
+        let deadline = (timeout ?? options.requestTimeout).map { ProcessInfo.processInfo.systemUptime + $0 }
+        var result = try await performRequest(
             method: "thread/read",
             params: [
                 "threadId": threadID,
-                "includeTurns": includeTurns
+                "includeTurns": includeTurns && !bounded
             ],
             timeout: timeout
         )
-        return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
+        try Self.validateThreadSnapshotResponse(result, expectedThreadID: threadID, requiresPage: false)
+        let thread = result["thread"] as? [String: Any] ?? [:]
+        let hydrateCurrentTurn = bounded && nativeToolTurnID != nil
+            && Self.parseThreadRuntimeStatus(from: thread["status"]).isActive
+        if bounded {
+            try Task.checkCancellation()
+            let remaining = deadline.map { $0 - ProcessInfo.processInfo.systemUptime }
+            if let remaining, remaining <= 0 {
+                throw CodexAppServerClient.ClientError.requestFailed(.init(
+                    method: "thread/turns/list", code: nil,
+                    message: "Request timed out while reading thread snapshot", data: nil
+                ))
+            }
+            // Replace the metadata page, rather than adding another legacy rollout scan.
+            // Idle threads stay metadata-only: their latest completed turn may itself be huge.
+            var params = Self.snapshotTurnPageParams
+            if hydrateCurrentTurn {
+                params["limit"] = 1
+                params["itemsView"] = "full"
+            }
+            params["threadId"] = threadID
+            result["initialTurnsPage"] = try await performRequest(
+                method: "thread/turns/list", params: params, timeout: remaining
+            )
+            try Self.validateThreadSnapshotResponse(result, expectedThreadID: threadID, requiresPage: true)
+        }
+        try Task.checkCancellation()
+        return Self.parseThreadSnapshot(
+            from: result, fallbackEffort: nil,
+            authoritativeToolTurnID: hydrateCurrentTurn ? nativeToolTurnID : nil
+        )
     }
 
     func outstandingBlockingNativeToolCallNames() async -> [String] {
@@ -2401,30 +2500,91 @@ final class CodexNativeSessionController {
         if let authoritativeLifecycleTurnID {
             return try await interruptUserTurn(expectedTurnID: authoritativeLifecycleTurnID)
         }
-        let snapshot = try await readThreadSnapshot(
-            includeTurns: true,
-            timeout: min(options.requestTimeout ?? 5, 5)
-        )
-        let observedTurnIDs = Array(
-            Set(snapshot.activeTurnIDs + [snapshot.currentTurnID].compactMap(\.self))
-        ).sorted()
-        guard observedTurnIDs.count == 1,
-              let reconciledTurnID = observedTurnIDs.first
-        else {
+        let timeout = min(options.requestTimeout ?? 5, 5)
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        guard let expectedThreadID = Self.nonEmptyString(threadID) else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        let observedTurnIDs: [String]
+        if usesBoundedThreadSnapshots {
+            observedTurnIDs = try await readActiveTurnIDsForInterrupt(threadID: expectedThreadID, deadline: deadline)
+        } else {
+            let snapshot = try await readThreadSnapshot(includeTurns: true, timeout: timeout)
+            observedTurnIDs = Array(Set(snapshot.activeTurnIDs + [snapshot.currentTurnID].compactMap(\.self))).sorted()
+        }
+        guard observedTurnIDs.count == 1, let reconciledTurnID = observedTurnIDs.first else {
             throw CodexTurnInterruptError.noUniqueActiveTurn(
                 authoritativeTurnID: authoritativeLifecycleTurnID,
                 observedTurnIDs: observedTurnIDs
             )
         }
+        guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+        if let authoritativeLifecycleTurnID, authoritativeLifecycleTurnID != reconciledTurnID {
+            throw CodexTurnInterruptError.reconciliationFailed(
+                expectedTurnID: reconciledTurnID, authoritativeTurnID: authoritativeLifecycleTurnID
+            )
+        }
         _ = try await performRequest(
             method: "turn/interrupt",
-            params: [
-                "threadId": snapshot.conversationID,
-                "turnId": reconciledTurnID
-            ],
-            timeout: options.requestTimeout
+            params: ["threadId": expectedThreadID, "turnId": reconciledTurnID],
+            timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "turn/interrupt")
         )
         return CodexTurnInterruptReceipt(interruptedTurnID: reconciledTurnID)
+    }
+
+    /// Only Stop needs exhaustive turn uniqueness. Do not retain prior turns or load their items.
+    private func readActiveTurnIDsForInterrupt(threadID expectedThreadID: String, deadline: TimeInterval) async throws -> [String] {
+        let metadata = try await performRequest(
+            method: "thread/read", params: ["threadId": expectedThreadID, "includeTurns": false],
+            timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/read")
+        )
+        try Self.validateThreadSnapshotResponse(metadata, expectedThreadID: expectedThreadID, requiresPage: false)
+        var activeTurnIDs: Set<String> = []
+        var cursor: String?
+        var requestedCursors: Set<String> = []
+        repeat {
+            guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+            var params = Self.snapshotTurnPageParams
+            params["threadId"] = expectedThreadID
+            if let cursor {
+                guard requestedCursors.insert(cursor).inserted else { throw CodexAppServerClient.ClientError.invalidResponse }
+                params["cursor"] = cursor
+            }
+            let page = try await performRequest(
+                method: "thread/turns/list", params: params,
+                timeout: Self.remainingControlPlaneTimeout(deadline: deadline, method: "thread/turns/list")
+            )
+            try Task.checkCancellation()
+            guard threadID == expectedThreadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+            let turns = try Self.validatedTurnMetadataPage(page)
+            for turn in turns {
+                guard let status = turn["status"] as? String, let turnID = turn["id"] as? String else {
+                    throw CodexAppServerClient.ClientError.invalidResponse
+                }
+                if Self.isThreadSnapshotTurnActive(status) {
+                    activeTurnIDs.insert(turnID)
+                } else if Self.parseTerminalTurnStatus(from: status) == nil {
+                    // An unknown status must not establish that an omitted active turn is absent.
+                    throw CodexAppServerClient.ClientError.invalidResponse
+                }
+            }
+            if activeTurnIDs.count > 1 {
+                return activeTurnIDs.sorted()
+            }
+            cursor = page["nextCursor"] as? String
+        } while cursor != nil
+        return activeTurnIDs.sorted()
+    }
+
+    private static func remainingControlPlaneTimeout(deadline: TimeInterval, method: String) throws -> TimeInterval {
+        try Task.checkCancellation()
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining.isFinite, remaining > 0 else {
+            throw CodexAppServerClient.ClientError.requestFailed(.init(
+                method: method, code: nil, message: "Request timed out after exhausting the shared reconciliation deadline", data: nil
+            ))
+        }
+        return remaining
     }
 
     func compactThread() async throws {
@@ -2474,6 +2634,7 @@ final class CodexNativeSessionController {
         let timeout = min(options.requestTimeout ?? 5, 5)
         do {
             let snapshot = try await readThreadSnapshot(includeTurns: true, timeout: timeout)
+            guard snapshot.hasCompleteTurnMetadata else { return .refreshed(nil) }
             reconcileActiveTurnRoutingState(from: snapshot)
             return .refreshed(snapshot.currentTurnID)
         } catch {
@@ -2742,9 +2903,39 @@ final class CodexNativeSessionController {
         #endif
     }
 
+    private static func validateThreadSnapshotResponse(
+        _ result: [String: Any],
+        expectedThreadID: String,
+        requiresPage: Bool
+    ) throws {
+        guard let thread = result["thread"] as? [String: Any],
+              thread["id"] as? String == expectedThreadID
+        else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        if requiresPage {
+            guard let page = result["initialTurnsPage"] as? [String: Any] else {
+                throw CodexAppServerClient.ClientError.invalidResponse
+            }
+            _ = try validatedTurnMetadataPage(page)
+        }
+    }
+
+    private static func validatedTurnMetadataPage(_ page: [String: Any]) throws -> [[String: Any]] {
+        guard let turns = page["data"] as? [[String: Any]],
+              turns.count <= snapshotTurnLimit,
+              turns.allSatisfy({ nonEmptyString($0["id"] as? String) != nil && nonEmptyString($0["status"] as? String) != nil }),
+              page["nextCursor"] == nil || page["nextCursor"] is NSNull || nonEmptyString(page["nextCursor"] as? String) != nil
+        else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        return turns
+    }
+
     private static func parseThreadSnapshot(
         from result: [String: Any],
-        fallbackEffort: String?
+        fallbackEffort: String?,
+        authoritativeToolTurnID: String? = nil
     ) -> ThreadSnapshot {
         let thread = result["thread"] as? [String: Any] ?? [:]
         let conversationID = firstString(in: thread, keys: ["id", "threadId", "thread_id", "threadID"]) ?? ""
@@ -2752,7 +2943,14 @@ final class CodexNativeSessionController {
         let model = result["model"] as? String
         let reasoningEffort = result["reasoningEffort"] as? String ?? fallbackEffort
         let runtimeStatus = parseThreadRuntimeStatus(from: thread["status"])
-        let turns = thread["turns"] as? [[String: Any]] ?? []
+        let page = result["initialTurnsPage"] as? [String: Any]
+        // Our bounded requests are newest-first; the legacy parser expects chronological order.
+        let turns: [[String: Any]] = if let data = page?["data"] as? [[String: Any]] {
+            Array(data.reversed())
+        } else {
+            thread["turns"] as? [[String: Any]] ?? []
+        }
+        let hasCompleteTurnMetadata = page?["nextCursor"] == nil || page?["nextCursor"] is NSNull
         var activeTurnIDs: [String] = []
         var latestTerminalTurnID: String?
         var latestTurnStatus: TurnStatus?
@@ -2769,7 +2967,10 @@ final class CodexNativeSessionController {
                 let itemsView = firstString(in: turn, keys: ["itemsView", "items_view"])?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .lowercased()
-                if turn["items"] is [[String: Any]], itemsView == nil || itemsView == "full" {
+                if let items = turn["items"] as? [[String: Any]],
+                   itemsView == "full" || (page == nil && itemsView == nil),
+                   page == nil || items.allSatisfy({ nonEmptyString($0["id"] as? String) != nil && nonEmptyString($0["type"] as? String) != nil })
+                {
                     authoritativeActiveTurnIDs.insert(turnID)
                 }
                 if let items = turn["items"] as? [[String: Any]] {
@@ -2784,7 +2985,15 @@ final class CodexNativeSessionController {
                 latestTurnFailure = parsedStatus == .failed ? parseTurnFailure(from: turn) : nil
             }
         }
-        let hasAuthoritativeActiveTurnItems = !activeTurnIDs.isEmpty
+        // Ordinary bounded pages request no items and carry no item authority. Only the
+        // watchdog's full latest-turn page may corroborate the exact captured active turn.
+        // Older-turn truncation does not truncate that turn's full command set, which is
+        // essential for the coordinator's process-ID ambiguity check.
+        let hasExactCurrentTurnItems = authoritativeToolTurnID.map {
+            runtimeStatus.isActive && turns.count == 1 && activeTurnIDs == [$0]
+        } ?? false
+        let hasAuthoritativeActiveTurnItems = (page == nil || hasExactCurrentTurnItems)
+            && !activeTurnIDs.isEmpty
             && activeTurnIDs.allSatisfy(authoritativeActiveTurnIDs.contains)
         return ThreadSnapshot(
             conversationID: conversationID,
@@ -2794,6 +3003,7 @@ final class CodexNativeSessionController {
             runtimeStatus: runtimeStatus,
             currentTurnID: activeTurnIDs.last,
             activeTurnIDs: activeTurnIDs,
+            hasCompleteTurnMetadata: hasCompleteTurnMetadata,
             latestTerminalTurnID: latestTerminalTurnID,
             latestTurnStatus: latestTurnStatus,
             latestTurnFailure: latestTurnFailure,
@@ -4858,6 +5068,17 @@ final class CodexNativeSessionController {
             params: [String: Any]
         ) -> LivenessActivity? {
             parseLivenessActivity(method: method, params: params)
+        }
+
+        func test_configureSnapshotRuntime(version: CodexRuntimeAuthority.Version) {
+            usesBoundedThreadSnapshots = Self.supportsBoundedThreadSnapshots(version)
+        }
+
+        func test_resumeThreadBinding(existing: SessionRef, timeout: TimeInterval = 5) async throws -> [String: Any] {
+            try await requestThreadBinding(
+                resumeThreadID: existing.conversationID, existing: existing, baseInstructions: "",
+                model: nil, serviceTier: nil, configOverrides: [:], timeout: timeout
+            )
         }
 
         static func test_parseThreadSnapshot(
@@ -9864,6 +10085,13 @@ extension CodexSessionControlling {
     ) async throws -> CodexNativeSessionController.ThreadSnapshot {
         assertionFailure("\(type(of: self)) must implement readThreadSnapshot(includeTurns:timeout:)")
         throw CodexAppServerClient.ClientError.invalidResponse
+    }
+
+    func readNativeToolProbeSnapshot(
+        expectedTurnID _: String,
+        timeout: TimeInterval?
+    ) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        try await readThreadSnapshot(includeTurns: true, timeout: timeout)
     }
 
     func setThreadName(_: String, threadID _: String?) async throws {}

@@ -295,6 +295,7 @@ struct AgentOraclePill: View {
     private func laneDotColor(for session: ChatSession) -> Color {
         switch memberDotState(for: session) {
         case .streaming: Color.purple
+        case .settled: Color.blue
         case .failed: Color.red
         case .completed: Color.green
         case .cancelled: Color.orange

@@ -1111,6 +1111,239 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         await fixture.coordinator.shutdownCodexSession(session)
     }
 
+    /// Regression for the 2026-10-28 incident: a Codex controller reconnect while Computer Use
+    /// is armed used to permanently disarm the tab. `ensureCodexNativeSession` runs
+    /// `computerUseForNextTurn` before `prepareCodexController` awaits the in-flight
+    /// CU-including retirement; the retirement is a transient fence that must only defer the
+    /// decision, never disarm.
+    func testComputerUseArmedSurvivesReconnectRetirementStillInFlight() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([], shouldManageCodexTooling: false)
+        _ = try installRestoredBinding(fixture)
+        let session = fixture.session
+        let otherChat = fixture.viewModel.session(for: UUID())
+        otherChat.selectedAgent = .codexExec
+        otherChat.runState = .idle
+        otherChat.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        let gate = TestReleaseFence(name: "armed Computer Use controller retirement")
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session),
+            responses: []
+        )
+        controller.shutdownGate = gate
+        controller.setRecoverySnapshot(.init(
+            conversationID: "armed-cu-thread", rolloutPath: nil, model: nil, reasoningEffort: nil,
+            runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil
+        ))
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        let activationID = try XCTUnwrap(session.pendingCodexComputerUseActivation?.id)
+        var flags: [Bool] = []
+        let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, enabled in
+            flags.append(enabled)
+            return WedgeFakeCodexController(runID: runID, responses: [.success("armed-cu-thread")])
+        }
+
+        let ensure = Task { await coordinator.ensureCodexNativeSession(session: session) }
+        defer {
+            gate.release()
+            ensure.cancel()
+        }
+        let gateEntered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(gateEntered, "reconnect must retire the CU controller")
+        XCTAssertTrue(session.isCodexComputerUseArmed, "A transient retirement fence must not disarm Computer Use")
+        XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
+
+        gate.release()
+        await ensure.value
+        XCTAssertTrue(session.isCodexComputerUseArmed, "Arming must survive the transient retirement fence")
+        XCTAssertEqual(session.pendingCodexComputerUseActivation?.id, activationID)
+        XCTAssertEqual(flags, [true], "The replacement controller must activate Computer Use")
+        XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
+        XCTAssertEqual(controller.shutdownCount, 1)
+        XCTAssertFalse(session.items.contains { $0.kind == .error && $0.text == CodexComputerUseWorkflow.ineligibleMessage })
+        XCTAssertTrue(otherChat.isCodexComputerUseArmed, "A reconnect in one tab must not disarm another tab")
+        await coordinator.shutdownCodexSession(session)
+    }
+
+    /// The managed-auth recovery retry ("Refreshing Codex authentication…") registers the same
+    /// CU-including retirement before calling `ensureCodexNativeSession`; it must keep Computer
+    /// Use armed and activate it once the retirement completes.
+    func testComputerUseArmedSurvivesManagedAuthRecoveryRetirement() async {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture(
+            [[.success(Self.oldThreadID)]],
+            shouldManageCodexTooling: false,
+            authRecovery: MonitorStubCodexAuthRecovery()
+        )
+        let session = fixture.session
+        let gate = TestReleaseFence(name: "managed-auth Computer Use retirement")
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session),
+            responses: []
+        )
+        controller.shutdownGate = gate
+        controller.setRecoverySnapshot(.init(
+            conversationID: Self.oldThreadID, rolloutPath: nil, model: nil, reasoningEffort: nil,
+            runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil
+        ))
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        session.codexPendingAuthRetryTurn = .init(
+            text: "recover auth", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil,
+            attachmentReservationID: nil, expectedTurnID: nil, auditTurnID: nil
+        )
+
+        let recovery = Task {
+            await fixture.coordinator.test_handleCodexNativeEvent(
+                .error("account/chatgptAuthTokens/refresh"),
+                session: session,
+                sourceController: controller
+            )
+        }
+        defer {
+            gate.release()
+            recovery.cancel()
+        }
+        let gateEntered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(gateEntered, "auth recovery must retire the CU controller")
+        XCTAssertTrue(session.isCodexComputerUseArmed, "The managed-auth retirement fence must not disarm Computer Use")
+
+        gate.release()
+        await recovery.value
+        XCTAssertTrue(session.isCodexComputerUseArmed, "Arming must survive the managed-auth retirement fence")
+        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [true])
+        XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
+        XCTAssertEqual(fixture.factory.controllers.last?.startedTexts, ["recover auth"], "The recovered session must replay the pending auth-retry turn")
+        XCTAssertFalse(session.items.contains { $0.kind == .error && $0.text == CodexComputerUseWorkflow.ineligibleMessage })
+        await fixture.coordinator.shutdownCodexSession(session)
+    }
+
+    /// In production `handleCodexNativeEvent` runs on `session.codexEventTask`, so managed-auth
+    /// recovery retires the controller — and tears down the listener — from inside the listener
+    /// task itself. That intentional teardown must not count as supersession: Computer Use stays
+    /// armed through the retirement and the pending turn replays on the replacement controller.
+    func testManagedAuthRecoveryInsideEventTaskKeepsComputerUseArmed() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture(
+            [[.success(Self.oldThreadID)]],
+            shouldManageCodexTooling: false,
+            authRecovery: MonitorStubCodexAuthRecovery()
+        )
+        let session = fixture.session
+        let gate = TestReleaseFence(name: "managed-auth event-task Computer Use retirement")
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session),
+            responses: []
+        )
+        controller.shutdownGate = gate
+        controller.setRecoverySnapshot(.init(
+            conversationID: Self.oldThreadID, rolloutPath: nil, model: nil, reasoningEffort: nil,
+            runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil
+        ))
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        session.codexPendingAuthRetryTurn = .init(
+            text: "recover auth", attachments: [], model: nil, reasoningEffort: nil, serviceTier: nil,
+            attachmentReservationID: nil, expectedTurnID: nil, auditTurnID: nil
+        )
+
+        session.codexEventTaskRunID = session.runID
+        session.codexEventTask = Task {
+            await fixture.coordinator.test_handleCodexNativeEvent(
+                .error("account/chatgptAuthTokens/refresh"),
+                session: session,
+                sourceController: controller,
+                dispatchedOnEventTask: true
+            )
+        }
+        let recovery = try XCTUnwrap(session.codexEventTask)
+        defer {
+            gate.release()
+            recovery.cancel()
+        }
+        let gateEntered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(gateEntered, "auth recovery must retire the CU controller")
+        XCTAssertTrue(session.isCodexComputerUseArmed, "The managed-auth retirement fence must not disarm Computer Use")
+
+        gate.release()
+        await recovery.value
+        XCTAssertTrue(session.isCodexComputerUseArmed, "Retiring the listener's own controller must not disarm Computer Use")
+        XCTAssertEqual(fixture.factory.computerUseEnabledFlags, [true])
+        XCTAssertEqual(session.codexControllerFeatureState?.computerUseEnabled, true)
+        XCTAssertEqual(fixture.factory.controllers.last?.startedTexts, ["recover auth"], "The recovered session must replay the pending auth-retry turn")
+        XCTAssertFalse(session.items.contains { $0.kind == .error && $0.text == CodexComputerUseWorkflow.ineligibleMessage })
+        XCTAssertNotNil(session.codexEventTask, "The replacement controller must install its own listener")
+        XCTAssertEqual(session.codexEventTaskRunID, session.runID)
+        await fixture.coordinator.shutdownCodexSession(session)
+    }
+
+    /// A structural ineligibility arriving while a transient fence is still resolving must
+    /// refuse and disarm once the fence clears, never wait forever and never activate.
+    func testComputerUseStructuralIneligibilityArrivingDuringTransientWaitStillDisarms() async throws {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([], shouldManageCodexTooling: false)
+        _ = try installRestoredBinding(fixture)
+        let session = fixture.session
+        let gate = TestReleaseFence(name: "armed Computer Use controller retirement")
+        let controller = WedgeFakeCodexController(
+            runID: AgentModeProcessRunIdentity.startFreshProcessRun(for: session),
+            responses: []
+        )
+        controller.shutdownGate = gate
+        controller.setRecoverySnapshot(.init(
+            conversationID: "armed-cu-thread", rolloutPath: nil, model: nil, reasoningEffort: nil,
+            runtimeStatus: .idle, currentTurnID: nil, activeTurnIDs: [], latestTurnStatus: nil
+        ))
+        session.codexController = controller
+        session.codexControllerFeatureState = .init(computerUseEnabled: true, goalSupportEnabled: false, reasoningSummariesEnabled: false, memoriesEnabled: false, capabilities: .disabled)
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        var flags: [Bool] = []
+        let coordinator = makeComputerUseCoordinator(fixture: fixture) { runID, enabled in
+            flags.append(enabled)
+            return WedgeFakeCodexController(runID: runID, responses: [.success("armed-cu-thread")])
+        }
+
+        let ensure = Task { await coordinator.ensureCodexNativeSession(session: session) }
+        defer {
+            gate.release()
+            ensure.cancel()
+        }
+        let gateEntered = await gate.waitUntilEntered(timeout: 4)
+        XCTAssertTrue(gateEntered)
+        session.parentSessionID = UUID()
+        gate.release()
+        await ensure.value
+        XCTAssertFalse(session.isCodexComputerUseArmed)
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertTrue(
+            session.items.contains { $0.kind == .error && $0.text == CodexComputerUseWorkflow.ineligibleMessage },
+            "Structural ineligibility surfacing during the transient wait must still refuse"
+        )
+        await coordinator.shutdownCodexSession(session)
+    }
+
+    /// Structural ineligibility with no transient fence refuses exactly as before.
+    func testComputerUseStructuralIneligibilityStillDisarms() async {
+        CodexComputerUseWorkflow.setEnabledForTesting(true)
+        defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+        let fixture = makeFixture([], shouldManageCodexTooling: false)
+        let session = fixture.session
+        session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
+        session.parentSessionID = UUID()
+        let admitted = await fixture.coordinator.test_computerUseForNextTurn(session: session)
+        XCTAssertFalse(admitted)
+        XCTAssertNil(session.pendingCodexComputerUseActivation)
+        XCTAssertFalse(session.isCodexComputerUseArmed)
+    }
+
     func testComputerUseSessionShutdownAndPersistedRestoreDoNotRearm() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(true)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
@@ -1337,8 +1570,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let entered = await gate.waitUntilEntered(timeout: 4)
         XCTAssertTrue(entered)
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        let rearmed = await coordinator.test_computerUseForNextTurn(session: session)
-        XCTAssertFalse(rearmed)
+        let rearmedCheck = Task { await coordinator.test_computerUseForNextTurn(session: session) }
         var claimBegan = false
         var claimCompleted = false
         let claim = Task {
@@ -1349,6 +1581,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         try await AsyncTestWait.waitUntil("ownership claim begins", timeout: 4) { claimBegan }
         XCTAssertFalse(claimCompleted, "A detached companion must finish retiring before control can publish")
         gate.release()
+        let rearmed = await rearmedCheck.value
+        XCTAssertFalse(rearmed)
         await claim.value
         XCTAssertEqual(controller.shutdownCount, 1)
         await coordinator.shutdownCodexSession(session)
@@ -1371,8 +1605,7 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         let entered = await gate.waitUntilEntered(timeout: 4)
         XCTAssertTrue(entered)
         session.pendingCodexComputerUseActivation = .init(id: UUID(), createdAt: Date())
-        let rearmed = await coordinator.test_computerUseForNextTurn(session: session)
-        XCTAssertFalse(rearmed, "Retirement must block a fresh activation even after the old controller was detached")
+        let rearmedCheck = Task { await coordinator.test_computerUseForNextTurn(session: session) }
         var secondBegan = false
         var secondCompleted = false
         let second = Task {
@@ -1383,6 +1616,8 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         try await AsyncTestWait.waitUntil("second revocation begins", timeout: 4) { secondBegan }
         XCTAssertFalse(secondCompleted, "Already disarmed is not proof that physical retirement has completed")
         gate.release()
+        let rearmed = await rearmedCheck.value
+        XCTAssertFalse(rearmed, "An activation staged during a revoke's retirement must lose to the disarm")
         await first.value
         await second.value
         XCTAssertEqual(controller.shutdownCount, 1)

@@ -501,6 +501,16 @@ package struct WorkspaceFolderRecord: Identifiable, Equatable, Hashable {
     package let parentFolderID: UUID?
     package let modificationDate: Date?
 
+    func isByteIdentical(to other: Self) -> Bool {
+        id == other.id && rootID == other.rootID && parentFolderID == other.parentFolderID
+            && modificationDate == other.modificationDate
+            && name.utf8.elementsEqual(other.name.utf8)
+            && relativePath.utf8.elementsEqual(other.relativePath.utf8)
+            && standardizedRelativePath.utf8.elementsEqual(other.standardizedRelativePath.utf8)
+            && fullPath.utf8.elementsEqual(other.fullPath.utf8)
+            && standardizedFullPath.utf8.elementsEqual(other.standardizedFullPath.utf8)
+    }
+
     package init(
         id: UUID = UUID(),
         rootID: UUID,
@@ -532,6 +542,16 @@ package struct WorkspaceFileRecord: Identifiable, Equatable, Hashable {
     package let standardizedFullPath: String
     package let parentFolderID: UUID?
     package let modificationDate: Date?
+
+    func isByteIdentical(to other: Self) -> Bool {
+        id == other.id && rootID == other.rootID && parentFolderID == other.parentFolderID
+            && modificationDate == other.modificationDate
+            && name.utf8.elementsEqual(other.name.utf8)
+            && relativePath.utf8.elementsEqual(other.relativePath.utf8)
+            && standardizedRelativePath.utf8.elementsEqual(other.standardizedRelativePath.utf8)
+            && fullPath.utf8.elementsEqual(other.fullPath.utf8)
+            && standardizedFullPath.utf8.elementsEqual(other.standardizedFullPath.utf8)
+    }
 
     package init(
         id: UUID = UUID(),
