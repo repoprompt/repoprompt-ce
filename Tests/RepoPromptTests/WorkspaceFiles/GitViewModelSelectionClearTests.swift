@@ -193,3 +193,103 @@ final class GitViewModelSelectionClearTests: XCTestCase {
         let relativePath: String
     }
 }
+
+@MainActor
+final class GitViewModelPollingBackoffTests: XCTestCase {
+    private let base: UInt64 = 2_500_000_000
+
+    func testUnchangedResultsBackOffToBoundAndChangeRestoresBase() async throws {
+        let model = GitViewModel()
+        let root = makeRoot("one")
+        model.updateRootFolders([root])
+        let detection = GitStatusActor.RepoDetection(
+            rootPath: root.fullPath, isGitRepo: false, backendKind: nil, gitWorktreeContext: nil
+        )
+        for expected in [base, 5_000_000_000, 10_000_000_000, 20_000_000_000, 30_000_000_000, 30_000_000_000] {
+            let finish = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+            finish([detection], true)
+            XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, expected)
+        }
+        let finish = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        finish([.init(rootPath: root.fullPath, isGitRepo: true, backendKind: nil, gitWorktreeContext: nil)], true)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+        await model.shutdownForWindowClose()
+    }
+
+    func testRootChangeAndExplicitActivityResetWithoutOldCompletionUndoingIt() async throws {
+        let model = GitViewModel()
+        let first = makeRoot("one")
+        let second = makeRoot("two")
+        model.updateRootFolders([first])
+        for _ in 0 ..< 5 {
+            let finish = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+            finish([], true)
+        }
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, 30_000_000_000)
+        let oldFinish = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        model.updateRootFolders([second])
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+        oldFinish([], true)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+
+        let pending = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        model.isPopoverVisible = true
+        pending([], true)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+        model.isPopoverVisible = false
+        let unchanged = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        unchanged([], true)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base * 2)
+        // This resets even with no selected repository; no Git operation is required.
+        await model.fetchUnstagedFiles(trigger: .explicitRefresh)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+        await model.shutdownForWindowClose()
+    }
+
+    func testExplicitRefreshFencesOldUnchangedCompletionWithSameRoots() async throws {
+        let model = GitViewModel()
+        model.updateRootFolders([makeRoot("one")])
+        let first = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        first([], true)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base * 2)
+        let pending = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        await model.fetchUnstagedFiles(trigger: .explicitRefresh)
+        XCTAssertFalse(model.isPopoverVisible)
+        pending([], true)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+        await model.shutdownForWindowClose()
+    }
+
+    func testUnchangedRefreshWhilePopoverIsVisibleKeepsBaseInterval() async throws {
+        let model = GitViewModel()
+        model.updateRootFolders([makeRoot("one")])
+        model.isPopoverVisible = true
+        let finish = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        finish([], true)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+        await model.shutdownForWindowClose()
+    }
+
+    func testCancelledRefreshDoesNotAdvanceDelayAndWindowCloseJoinsLoop() async throws {
+        let model = GitViewModel()
+        model.updateRootFolders([makeRoot("one")])
+        let finish = try XCTUnwrap(model.test_beginPeriodicGitContextRefresh())
+        XCTAssertNil(model.test_beginPeriodicGitContextRefresh(), "Refreshes must not overlap")
+        finish([], false)
+        XCTAssertEqual(model.test_gitContextRefreshDelayNanoseconds, base)
+        XCTAssertTrue(model.test_hasGitContextRefreshTask)
+        await model.shutdownForWindowClose()
+        XCTAssertFalse(model.test_hasGitContextRefreshTask)
+        XCTAssertEqual(model.test_pendingWindowCloseTaskCount, 0)
+    }
+
+    private func makeRoot(_ name: String) -> FolderViewModel {
+        // Model-only roots: no scratch directories or Git repositories are created.
+        let path = "/nonexistent/item4-polling/" + name
+        return FolderViewModel(
+            folder: Folder(name: name, path: path, modificationDate: .distantPast),
+            rootPath: path,
+            isExpanded: true
+        )
+    }
+}
