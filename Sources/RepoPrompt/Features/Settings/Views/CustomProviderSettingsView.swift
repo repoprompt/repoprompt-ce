@@ -37,6 +37,15 @@ struct CustomProviderSettingsView: View {
     }
 
     var body: some View {
+        ScrollView {
+            settingsContent
+        }
+        .alert(isPresented: $showAlert) {
+            Alert(title: Text("Custom Provider"), message: Text(alertMessage), dismissButton: .default(Text("OK")))
+        }
+    }
+
+    private var settingsContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center) {
                 Text("OpenAI-Compatible Provider Configuration")
@@ -151,9 +160,6 @@ struct CustomProviderSettingsView: View {
             }
         }
         .padding(.horizontal)
-        .alert(isPresented: $showAlert) {
-            Alert(title: Text("Custom Provider"), message: Text(alertMessage), dismissButton: .default(Text("OK")))
-        }
     }
 
     private var modelListSection: some View {
@@ -170,17 +176,15 @@ struct CustomProviderSettingsView: View {
                     .foregroundColor(.secondary)
                 Spacer()
             } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 8) {
-                        ForEach(filteredModels, id: \.self) { model in
-                            modelRow(model)
-                        }
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(filteredModels, id: \.self) { model in
+                        modelRow(model)
+                    }
 
-                        if !searchText.isEmpty, viewModel.availableCustomModels.count > 20 {
-                            Text("Showing first 20").font(.caption).foregroundColor(.secondary).padding(.vertical, 8)
-                        } else if searchText.isEmpty, viewModel.availableCustomModels.count > 20 {
-                            Text("Showing first 20").font(.caption).foregroundColor(.secondary).padding(.vertical, 8)
-                        }
+                    if !searchText.isEmpty, viewModel.availableCustomModels.count > 20 {
+                        Text("Showing first 20").font(.caption).foregroundColor(.secondary).padding(.vertical, 8)
+                    } else if searchText.isEmpty, viewModel.availableCustomModels.count > 20 {
+                        Text("Showing first 20").font(.caption).foregroundColor(.secondary).padding(.vertical, 8)
                     }
                 }
             }

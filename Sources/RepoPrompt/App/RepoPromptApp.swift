@@ -209,9 +209,8 @@ struct RepoPromptSwiftUIApp: App {
 
 @MainActor
 public enum RepoPromptApplication {
-    /// Each attempt re-runs the full bootstrap: exclusive profile lease, running-app guard,
-    /// verified publication, and debug preferences replaced only after a successful publish.
-    /// The existing debug profile is never silently reused while release may be writing.
+    /// Reuse initialized debug state, importing production only into an empty profile.
+    /// Failed preparation never opens app stores over a partial profile.
     private static func checkDebugStateBoundary() {
         var startEmpty = false
         while true {
@@ -222,13 +221,13 @@ public enum RepoPromptApplication {
                 let cleanRequested = startEmpty || ProcessInfo.processInfo.arguments.contains(DebugStateBootstrap.cleanSlateArgument)
                 let offerStartEmpty = !cleanRequested && DebugStateBootstrap.startEmptyCanRecover(from: error)
                 let alert = NSAlert()
-                alert.messageText = "Debug state snapshot could not be prepared"
+                alert.messageText = "Debug profile could not be opened"
                 var details = "\(error.localizedDescription)\nProduction and prior debug state were preserved."
                 if offerStartEmpty {
                     details += "\n\nRetry attempts another capture. If production changed during capture, a retry may succeed once its writes pause briefly."
                         + "\n\nStart Empty opens this launch with an isolated, empty debug profile. The current debug profile and"
                         + " its preferences are archived, not deleted, under “RepoPrompt CE Debug Recovery”. Production state is"
-                        + " never modified, and the next normal launch captures production again."
+                        + " never modified. Later launches keep this independent debug profile and any changes you make."
                 }
                 alert.informativeText = details
                 alert.addButton(withTitle: "Quit")
@@ -247,8 +246,8 @@ public enum RepoPromptApplication {
         if let code = ClaudeCLIUsageCollector.runIfInvoked(arguments: ProcessInfo.processInfo.arguments) { exit(code) }
         // Before defaults migration, provider launch snapshots, property wrappers,
         // or any settings/session singleton can observe or normalize this profile.
-        Self.checkDebugStateBoundary()
         let bootstrapSpan = StartupPhaseLog.begin(.bootstrap)
+        Self.checkDebugStateBoundary()
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
         let defaultsReport = BundleIdentityDefaultsMigration.migrateIfNeeded()
         let defaultsOutcome: IdentityTransitionDiagnosticEvent.Outcome = switch defaultsReport.outcome {
