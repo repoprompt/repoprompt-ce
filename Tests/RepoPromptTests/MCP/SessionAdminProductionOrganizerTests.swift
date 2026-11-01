@@ -805,6 +805,56 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
         }
     }
 
+    func testHumanOwnershipAndSuppressionSurviveDelegatedAdministration() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make()
+            do {
+                let vm = fixture.window.agentModeViewModel
+                _ = try await vm.sessionTitleCoordinator.apply(.humanRename("Human subject"), tabID: fixture.targetTab.id)
+                let rename = try await fixture.call("rename", ["name": .string("Agent replacement")])
+                XCTAssertEqual(rename["changed_count"], .int(0))
+                XCTAssertEqual(rename["items"]?.arrayValue?.first?.objectValue?["reason"], .string("human_owned"))
+                let url = "https://github.com/acme/app/pull/42"
+                let report = try AgentSessionPullRequestEvidence.report(url: url, relationship: "related", provenance: "humanAssociation")
+                let associated = try await vm.sessionTitleCoordinator.apply(.associate([report], human: true), tabID: fixture.targetTab.id)
+                let correction = try await fixture.call("correct_pr_associations", ["remove_pr_urls": .array([.string(url)]), "expected_title_revision": .string(String(associated.revision))])
+                XCTAssertEqual(correction["changed_count"], .int(0))
+                XCTAssertEqual(correction["items"]?.arrayValue?.first?.objectValue?["reason"], .string("human_owned"))
+                _ = try await vm.sessionTitleCoordinator.apply(.correct(add: [], remove: [report.identity], human: true), tabID: fixture.targetTab.id)
+                let replay = try await fixture.call("associate_pr", ["url": .string(url)])
+                XCTAssertEqual(replay["changed_count"], .int(0))
+                XCTAssertEqual(replay["items"]?.arrayValue?.first?.objectValue?["reason"], .string("suppressed"))
+                try fixture.assertTarget(name: "Human subject", pinned: false, group: nil)
+                await fixture.cleanup()
+            } catch { await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
+    func testReplicatedTitleAndPRProjectionUsesSharedRevisionWithoutSelectingPeer() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            let fixture = try await Fixture.make(isolated: true)
+            let mirror = try await fixture.addReplica()
+            do {
+                let selection = mirror.promptManager.activeComposeTabID
+                let vm = fixture.window.agentModeViewModel
+                let named = try await vm.sessionTitleCoordinator.apply(.humanRename("Shared subject"), tabID: fixture.targetTab.id)
+                XCTAssertEqual(mirror.workspaceManager.composeTab(with: fixture.targetTab.id)?.name, "Shared subject")
+                let report = try AgentSessionPullRequestEvidence.report(url: "https://github.com/acme/app/pull/42", relationship: "created")
+                let associated = try await mirror.agentModeViewModel.sessionTitleCoordinator.apply(.associate([report], human: false), tabID: fixture.targetTab.id)
+                XCTAssertEqual(associated.revision, named.revision + 1)
+                XCTAssertEqual(fixture.window.workspaceManager.composeTab(with: fixture.targetTab.id)?.name, "PR #42 — Shared subject")
+                XCTAssertEqual(mirror.promptManager.activeComposeTabID, selection)
+                await fixture.removeReplica(mirror)
+                await fixture.cleanup()
+            } catch { await fixture.removeReplica(mirror)
+                await fixture.cleanup()
+                throw error
+            }
+        }
+    }
+
     func testRenamePinGroupAndUndoReachWorkspaceAndSidebarWithoutChangingSelection() async throws {
         try await MCPSharedServerTestLease.shared.withLease { _ in
             let fixture = try await Fixture.make()
@@ -843,7 +893,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
             let fixture = try await Fixture.make()
             do {
                 let rename = try await fixture.call("rename", ["name": .string("Agent title")])
-                fixture.window.agentModeViewModel.renameSession(tabID: fixture.targetTab.id, to: "User title")
+                _ = try await fixture.window.agentModeViewModel.sessionTitleCoordinator.apply(.humanRename("User title"), tabID: fixture.targetTab.id)
                 let undo = try await fixture.undo(rename)
                 let item = try XCTUnwrap(undo["items"]?.arrayValue?.first?.objectValue)
                 XCTAssertEqual(item["status"], .string("skipped"))
@@ -1585,13 +1635,16 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 XCTAssertEqual(window.promptManager.currentComposeTabs.map(\.id), [fixture.callerTab.id, fixture.targetTab.id])
                 XCTAssertEqual(window.promptManager.activeComposeTabID, fixture.callerTab.id)
                 let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
-                let entries = [fixture.callerTab, fixture.targetTab].map { tab in
-                    AgentSessionIndexEntry(
+                let entries = try [fixture.callerTab, fixture.targetTab].map { tab in
+                    var entry = AgentSessionIndexEntry(
                         id: tab.activeAgentSessionID!, tabID: tab.id, name: tab.name,
                         savedAt: Date(timeIntervalSince1970: 0), itemCount: 0, autoEditEnabled: false,
                         hasUnknownConversationContent: false, isMCPOriginated: false,
                         worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
                     )
+                    // These are parent-named lanes, not unknowable legacy/human titles.
+                    entry.titleMetadata = try AgentSessionTitlePolicy.apply(.startupProposal(tab.name), to: nil, name: "Agent Session")
+                    return entry
                 }
                 try window.agentModeViewModel.test_installSessionIndexSnapshot(
                     Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) }),

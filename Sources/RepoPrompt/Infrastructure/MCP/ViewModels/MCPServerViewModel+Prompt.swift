@@ -142,9 +142,18 @@ extension MCPServerViewModel {
 
     @MainActor
     private func renameComposeTabIfDefault(tabID: UUID, newName: String) {
-        guard let tab = workspaceManager?.composeTab(with: tabID),
-              tab.hasDefaultName,
-              tab.name != newName else { return }
+        guard let tab = workspaceManager?.composeTab(with: tabID) else { return }
+        if tab.activeAgentSessionID != nil || tab.agentTitleProjection != nil {
+            guard let model = WindowStatesManager.shared.window(withID: windowID)?.agentModeViewModel,
+                  let target = try? model.resolveAgentSessionLifecycleMutationTarget(
+                      tabID: tabID,
+                      expectedSessionID: tab.activeAgentSessionID,
+                      intent: .setStatus
+                  ) else { return }
+            try? model.renameSession(target: target, to: newName)
+            return
+        }
+        guard tab.hasDefaultName, tab.name != newName else { return }
         promptVM.renameComposeTab(tabID, to: newName)
     }
 }

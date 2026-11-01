@@ -5,6 +5,7 @@ import RepoPromptDomainRuntime
 /// One field a reversible organize call changed: the value before, and the value the call wrote.
 enum AgentSessionOrganizeFieldChange: Equatable {
     case name(before: String, after: String)
+    case title(before: AgentSessionTitleMetadata, after: AgentSessionTitleMetadata)
     case pinned(before: Bool, beforeRank: Int?, after: Bool)
     /// Pin rank only (reorders and rank materialization).
     case pinRank(before: Int?, after: Int?)
@@ -66,7 +67,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
     AgentSessionAdministrationTargetDeriving, AgentSessionAdministrationUndoing
 {
     let operations: Set<DomainAgentSessionTargetOperation> = [
-        .adminRename, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
+        .adminRename, .adminAssociatePR, .adminCorrectPRs, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
         .adminArchive, .adminUnarchive
     ]
 
@@ -278,7 +279,31 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             guard let raw = try AgentSessionAdminArguments.string(args, "name"),
                   !AgentSession.validatedName(raw).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else { throw AgentSessionAdminArguments.invalid("rename requires a non-empty name.") }
-            return finish(context, payload: rename(context, name: AgentSession.validatedName(raw)))
+            return await finish(context, payload: mutateTitles(context, command: .adminRename(raw)))
+        case .adminAssociatePR, .adminCorrectPRs:
+            let revision: UInt64?
+            if let raw = try AgentSessionAdminArguments.string(args, "expected_title_revision") {
+                guard let value = UInt64(raw), !raw.isEmpty, raw.allSatisfy({ $0.isASCII && $0.isNumber }) else { throw AgentSessionAdminArguments.invalid("expected_title_revision must be a decimal UInt64 string.") }
+                revision = value
+            } else { revision = nil }
+            func urls(_ key: String) throws -> [String] {
+                guard let raw = args[key] else { return [] }
+                guard let entries = raw.arrayValue, entries.count <= 64,
+                      entries.allSatisfy({ $0.stringValue != nil }) else { throw AgentSessionAdminArguments.invalid("\(key) requires at most 64 URL strings.") }
+                return entries.compactMap(\.stringValue)
+            }
+            let trustedHosts = backend.trustedPullRequestHosts(context.targets)
+            func report(_ url: String) throws -> AgentSessionPullRequestAssociation {
+                try AgentSessionPullRequestEvidence.report(url: url, relationship: "related", provenance: "delegatedAgentAssociation", trustedHosts: trustedHosts)
+            }
+            if batch.request.operation == .adminAssociatePR {
+                guard let url = try AgentSessionAdminArguments.string(args, "url") else { throw AgentSessionAdminArguments.invalid("associate_pr requires url.") }
+                return try await finish(context, payload: mutateTitles(context, command: .associate([report(url)], human: false), expectedRevision: revision))
+            }
+            guard let revision else { throw AgentSessionAdminArguments.invalid("correct_pr_associations requires expected_title_revision.") }
+            let additions = try urls("add_pr_urls").map(report)
+            let removals = try urls("remove_pr_urls").map { try AgentSessionPullRequestIdentity(url: $0, trustedHosts: trustedHosts) }
+            return await finish(context, payload: mutateTitles(context, command: .correct(add: additions, remove: removals, human: false), expectedRevision: revision))
         case .adminSetPin:
             guard let pinned = try AgentSessionAdminArguments.bool(args, "pinned") else {
                 throw AgentSessionAdminArguments.invalid("set_pin requires pinned (boolean).")
@@ -381,17 +406,36 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
         }
     }
 
-    private func rename(_ context: Context, name: String) -> AgentSessionOrganizeUndoPayload? {
-        let states = currentOnly(context, eligibleStates(context, archived: false) { $0.name == name })
-        let changed = backend.rename(states.map(\.sessionID), to: name)
-        let after = backend.states(of: Array(changed))
-        record(context, attempted: states, changed: changed)
-        return .fields(states.filter { changed.contains($0.sessionID) }.compactMap { state in
-            // Store what was actually written (rename validates the name).
-            after[state.sessionID].map {
-                AgentSessionOrganizeFieldRestore(sessionID: state.sessionID, change: .name(before: state.name, after: $0.name))
+    private func mutateTitles(_ context: Context, command: AgentSessionTitleCommand, expectedRevision: UInt64? = nil) async -> AgentSessionOrganizeUndoPayload? {
+        var restores: [AgentSessionOrganizeFieldRestore] = []
+        for id in context.targets {
+            guard context.isCurrent(id) else { context.add(id, .failed, "scope_no_longer_current")
+                continue
             }
-        })
+            do {
+                let before = try await backend.titleSnapshot(id)
+                let after = try await backend.commitTitle(
+                    id,
+                    command: command,
+                    expectedRevision: expectedRevision ?? before.revision,
+                    isAuthorized: { context.isCurrent(id) }
+                )
+                context.add(id, before.metadata == after.metadata ? .unchanged : .changed)
+                var receipts = context.extra["titles"]?.objectValue ?? [:]
+                receipts[id.uuidString] = .object([
+                    "session_name": .string(after.name),
+                    "title_revision": .string(String(after.revision)),
+                    "persistence_state": .string(after.persistenceState)
+                ])
+                context.extra["titles"] = .object(receipts)
+                if before.metadata != after.metadata, let afterMetadata = after.metadata, afterMetadata.state != nil,
+                   let prior = before.metadata ?? (try? AgentSessionTitleMetadata(.legacy(before.name))), prior.state != nil
+                {
+                    restores.append(.init(sessionID: id, change: .title(before: prior, after: afterMetadata)))
+                }
+            } catch { context.add(id, .failed, error.localizedDescription) }
+        }
+        return restores.isEmpty ? nil : .fields(restores)
     }
 
     private func setPin(_ context: Context, pinned: Bool) -> AgentSessionOrganizeUndoPayload? {
@@ -756,6 +800,34 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
     /// One fresh read region, then bounded batches. CAS and each target's lease remain mandatory;
     /// pin mutations still use the shared PromptViewModel path, never direct field writes.
     private func undoFields(_ restores: [AgentSessionOrganizeFieldRestore], context: Context) async {
+        if restores.contains(where: { if case .title = $0.change { return true }
+            return false
+        }) {
+            for restore in restores {
+                guard case let .title(before, after) = restore.change else { continue }
+                let id = restore.sessionID
+                guard context.isCurrent(id) else { context.add(id, .failed, "scope_no_longer_current")
+                    continue
+                }
+                do {
+                    let current = try await backend.titleSnapshot(id)
+                    guard current.metadata == after else { context.add(id, .skipped, current.metadata?.state == nil ? "unsupported_title_metadata" : "changed_since")
+                        continue
+                    }
+                    _ = try await backend.commitTitle(
+                        id,
+                        command: .restore(before),
+                        expectedRevision: current.revision,
+                        isAuthorized: { context.isCurrent(id) }
+                    )
+                    context.add(id, .changed)
+                } catch { context.add(id, .failed, error.localizedDescription) }
+            }
+            await undoFields(restores.filter { if case .title = $0.change { return false }
+                return true
+            }, context: context)
+            return
+        }
         let states = backend.states(of: restores.map(\.sessionID))
         var pending: [AgentSessionOrganizeFieldRestore] = []
         var outcomes: [UUID: (AgentSessionAdminItemResult.Status, String?)] = [:]
@@ -771,6 +843,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             }
             let matches: Bool = switch restore.change {
             case let .name(_, after): state.name == after
+            case .title: false
             case let .pinned(_, _, after): state.isPinned == after
             case let .pinRank(_, after): state.isPinned && state.pinnedOrder == after
             case let .group(_, _, after, afterOrder): state.sidebarGroup == after && state.sidebarGroupOrder == afterOrder
@@ -793,6 +866,7 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             }
             switch restore.change {
             case let .name(before, _): names[id] = before
+            case .title: break
             case let .pinned(before, beforeRank, _):
                 pins[before, default: []].append(id)
                 if before, let beforeRank { ranksAfterPin[id] = beforeRank }

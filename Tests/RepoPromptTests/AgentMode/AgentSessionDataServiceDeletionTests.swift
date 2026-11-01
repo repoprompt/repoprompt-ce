@@ -1235,3 +1235,430 @@ final class AgentSessionMetadataCommitTests: XCTestCase {
         }
     }
 }
+
+// MARK: - AgentSessionTitlePolicyTests
+
+final class AgentSessionTitlePolicyTests: XCTestCase {
+    func testStaleTurnClosureCannotCloseAnotherRefinement() throws {
+        let turn = UUID()
+        let metadata = try XCTUnwrap(AgentSessionTitlePolicy.apply(.seed("Stable title policy", turnID: turn), to: nil, name: "T1"))
+        XCTAssertNil(try AgentSessionTitlePolicy.apply(.closeRefinement(turnID: UUID()), to: metadata, name: "T1"))
+        let closed = try AgentSessionTitlePolicy.apply(.closeRefinement(turnID: turn), to: metadata, name: "T1")
+        XCTAssertEqual(closed?.state?.refinement.phase, "closed")
+    }
+
+    private func seeded(_ task: String = "# Session title ownership", turn: UUID) throws -> AgentSessionTitleMetadata {
+        try XCTUnwrap(AgentSessionTitlePolicy.apply(.seed(task, turnID: turn), to: nil, name: "T17"))
+    }
+
+    func testWrapperHeavySeedsAndActivityLeads() {
+        XCTAssertEqual(AgentSessionTitlePolicy.seed(from: "# Deep Plan Mode\n\n# Session title ownership\nYou are an agent"), "Session title ownership")
+        XCTAssertEqual(AgentSessionTitlePolicy.seed(from: "<file_map>\nwrong topic\n</file_map><task>Debug launch artifact reuse</task>"), "Debug launch artifact reuse")
+        XCTAssertNil(AgentSessionTitlePolicy.seed(from: "You are the single bounded DESIGN CRITIC\n<context>wrong topic</context>"))
+        XCTAssertEqual(AgentSessionTitlePolicy.seed(from: "Prepare debug launch reuse PR"), "Debug launch reuse PR")
+    }
+
+    func testWrapperOnlyPayloadDoesNotConsumeFirstMeaningfulTask() throws {
+        XCTAssertNil(try AgentSessionTitlePolicy.apply(.seed("You are the bounded critic\n<context>Injected context</context>", turnID: UUID()), to: nil, name: "T17"))
+    }
+
+    func testUndoRestoresUnknownAssociationFieldsFromBeforeEnvelope() throws {
+        let human = try XCTUnwrap(AgentSessionTitlePolicy.apply(.humanRename("Subject"), to: nil, name: "T1"))
+        let report = try AgentSessionPullRequestEvidence.report(url: "https://github.com/acme/app/pull/42", relationship: "created")
+        let associated = try XCTUnwrap(AgentSessionTitlePolicy.apply(.associate([report], human: false), to: human, name: "Subject"))
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(associated)) as? [String: Any])
+        var prs = try XCTUnwrap(object["pullRequests"] as? [[String: Any]])
+        prs[0]["futureEvidence"] = "preserve"
+        object["pullRequests"] = prs
+        let before = try JSONDecoder().decode(AgentSessionTitleMetadata.self, from: JSONSerialization.data(withJSONObject: object))
+        let after = try XCTUnwrap(AgentSessionTitlePolicy.apply(.correct(add: [], remove: [report.identity], human: false), to: before, name: "Subject"))
+        let undo = try XCTUnwrap(AgentSessionTitlePolicy.apply(.restore(before), to: after, name: "Subject"))
+        let restored = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(undo)) as? [String: Any])
+        XCTAssertEqual((restored["pullRequests"] as? [[String: Any]])?.first?["futureEvidence"] as? String, "preserve")
+        XCTAssertEqual(undo.revision, (after.revision ?? 0) + 1)
+    }
+
+    func testOneProposalAndOneQualityCorrection() throws {
+        let turn = UUID()
+        let start = try seeded(turn: turn)
+        let rejected = try XCTUnwrap(AgentSessionTitlePolicy.apply(.agentProposal("Prepare debug launch reuse PR", turnID: turn), to: start, name: "unused"))
+        XCTAssertEqual(rejected.state?.baseTitle, start.state?.baseTitle)
+        XCTAssertEqual(rejected.state?.refinement.qualityRejections, 1)
+        let final = try XCTUnwrap(AgentSessionTitlePolicy.apply(.agentProposal("Debug launch artifact reuse", turnID: turn), to: rejected, name: "unused"))
+        XCTAssertEqual(final.state?.baseTitle, "Debug launch artifact reuse")
+        XCTAssertThrowsError(try AgentSessionTitlePolicy.apply(.agentProposal("Another topic", turnID: turn), to: final, name: "unused"))
+    }
+
+    func testHumanOwnershipBeatsDelegatedAdminEvenForTNumberAndSameText() throws {
+        let turn = UUID()
+        let start = try seeded("T17", turn: turn)
+        let human = try XCTUnwrap(AgentSessionTitlePolicy.apply(.humanRename(" T17 "), to: start, name: "T17"))
+        XCTAssertEqual(human.state?.source, "human")
+        XCTAssertEqual(human.state?.baseTitle, "T17")
+        XCTAssertThrowsError(try AgentSessionTitlePolicy.apply(.adminRename("Replacement"), to: human, name: "T17"))
+        XCTAssertThrowsError(try AgentSessionTitlePolicy.apply(.agentProposal("Replacement", turnID: turn), to: human, name: "T17"))
+        XCTAssertThrowsError(try AgentSessionTitlePolicy.apply(.adminRename("Replacement"), to: nil, name: "Legacy manual title"))
+    }
+
+    func testDelegatedStartupTitleIsFinalAndContinuationDoesNotReopen() throws {
+        let title = try XCTUnwrap(AgentSessionTitlePolicy.apply(.startupProposal("Session naming evidence"), to: nil, name: "Agent Session"))
+        XCTAssertEqual(title.state?.source, "agentProposal")
+        XCTAssertEqual(title.state?.refinement.phase, "closed")
+        XCTAssertNil(try AgentSessionTitlePolicy.apply(.seed("A new turn", turnID: UUID()), to: title, name: "unused"))
+    }
+
+    func testPRCompositionPreservesManualBaseAndCanonicalOrder() throws {
+        let human = try XCTUnwrap(AgentSessionTitlePolicy.apply(.humanRename("My  exact subject"), to: nil, name: "T1"))
+        let first = try AgentSessionPullRequestEvidence.report(url: "https://github.com/Acme/App/pull/123?x=y", relationship: "created")
+        let second = try AgentSessionPullRequestEvidence.report(url: "https://github.com/acme/app/pull/12", relationship: "related")
+        let result = try XCTUnwrap(AgentSessionTitlePolicy.apply(.associate([first, second], human: false), to: human, name: "unused"))
+        XCTAssertEqual(result.state?.displayName, "PR #12, #123 — My exact subject")
+        XCTAssertEqual(result.state?.source, "human")
+        XCTAssertNil(try AgentSessionTitlePolicy.apply(.associate([first], human: false), to: result, name: "unused"))
+        let third = try AgentSessionPullRequestEvidence.report(url: "https://github.com/acme/tools/pull/12", relationship: "created")
+        let multi = try XCTUnwrap(AgentSessionTitlePolicy.apply(.associate([third], human: false), to: result, name: "unused"))
+        XCTAssertEqual(multi.state?.displayName, "PR acme/app#12, acme/app#123, acme/tools#12 — My exact subject")
+    }
+
+    func testHumanSuppressionBlocksReportsAndRemovalCannotHitCapacity() throws {
+        var metadata = try seeded(turn: UUID())
+        for number in 1 ... 65 {
+            let report = try AgentSessionPullRequestEvidence.report(url: "https://github.com/acme/app/pull/\(number)", relationship: "created")
+            metadata = try XCTUnwrap(AgentSessionTitlePolicy.apply(.associate([report], human: true), to: metadata, name: "unused"))
+            XCTAssertThrowsError(try AgentSessionTitlePolicy.apply(.correct(add: [], remove: [report.identity], human: false), to: metadata, name: "unused"))
+            metadata = try XCTUnwrap(AgentSessionTitlePolicy.apply(.correct(add: [], remove: [report.identity], human: true), to: metadata, name: "unused"))
+            XCTAssertThrowsError(try AgentSessionTitlePolicy.apply(.associate([report], human: false), to: metadata, name: "unused"))
+        }
+        XCTAssertEqual(metadata.state?.suppressedPullRequests.count, 65)
+        XCTAssertEqual(metadata.state?.pullRequests.count, 0)
+    }
+
+    func testOpaqueFutureAndUnknownFieldsRoundTripWithoutIntegerLoss() throws {
+        let data = Data("{\"metadataVersion\":2,\"revision\":18446744073709551615,\"future\":{\"id\":18446744073709551614}}".utf8)
+        let opaque = try JSONDecoder().decode(AgentSessionTitleMetadata.self, from: data)
+        XCTAssertNil(opaque.state)
+        XCTAssertEqual(opaque.revision, UInt64.max)
+        XCTAssertEqual(try JSONDecoder().decode(AgentSessionTitleMetadata.self, from: JSONEncoder().encode(opaque)), opaque)
+        XCTAssertThrowsError(try AgentSessionTitlePolicy.apply(.humanRename("Do not discard future state"), to: opaque, name: "Stored title"))
+        let known = try seeded(turn: UUID())
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(known)) as? [String: Any])
+        object["future"] = ["nested": "keep me"]
+        let extended = try JSONDecoder().decode(AgentSessionTitleMetadata.self, from: JSONSerialization.data(withJSONObject: object))
+        let edited = try XCTUnwrap(AgentSessionTitlePolicy.apply(.humanRename("Human"), to: extended, name: "unused"))
+        let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(edited)) as? [String: Any])
+        XCTAssertEqual((encoded["future"] as? [String: String])?["nested"], "keep me")
+    }
+
+    func testStrictPRURLIdentity() throws {
+        for invalid in ["https://github.com/a/b/issues/1", "http://github.com/a/b/pull/1", "https://github.com/a/b/pull/0", "https://github.com/a/b/pull/1e2", "https://github.com/a/b/pull/18446744073709551616", "https://user@github.com/a/b/pull/1", "https://untrusted.example/a/b/pull/1"] {
+            XCTAssertThrowsError(try AgentSessionPullRequestIdentity(url: invalid), invalid)
+        }
+        let identity = try AgentSessionPullRequestIdentity(url: "https://github.com/A/B/pull/9007199254740993")
+        XCTAssertEqual(identity.number, 9_007_199_254_740_993)
+        XCTAssertEqual(identity.url, "https://github.com/a/b/pull/9007199254740993")
+    }
+}
+
+// MARK: - AgentSessionTitlePersistenceTests
+
+final class AgentSessionTitlePersistenceTests: XCTestCase {
+    private func fixture() throws -> (AgentSessionDataService, WorkspaceModel, URL) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("title-persistence-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return (AgentSessionDataService(), WorkspaceModel(name: "Title tests", repoPaths: [], customStoragePath: directory), directory)
+    }
+
+    func testSuspendedLoadRepairCannotOverwriteNewerPRTitle() async throws {
+        let (service, workspace, directory) = try fixture()
+        let folder = directory.appendingPathComponent("AgentSessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var original = AgentSession(workspaceID: workspace.id, name: "T1")
+        original.serializationVersion = AgentSession.currentSerializationVersion - 1
+        let file = folder.appendingPathComponent("AgentSession-\(original.id.uuidString).json")
+        try JSONEncoder().encode(original).write(to: file)
+        let fence = TestReleaseFence(name: "title load repair admission")
+        await service.test_setBeforeLoadRepairWriteHook { _ in await fence.enterAndWait() }
+        let loading = Task { try await service.loadAgentSession(from: file) }
+        addTeardownBlock {
+            fence.release()
+            _ = await loading.result
+            await service.test_setBeforeLoadRepairWriteHook(nil)
+        }
+        guard await fence.waitUntilEntered() else { return }
+        _ = try await service.commitTitleMutation(
+            id: original.id,
+            workspace: workspace,
+            expectedRevision: 0,
+            fallbackName: "T1",
+            command: .humanRename("New subject")
+        )
+        let report = try AgentSessionPullRequestEvidence.report(url: "https://github.com/acme/app/pull/42", relationship: "created")
+        _ = try await service.commitTitleMutation(
+            id: original.id,
+            workspace: workspace,
+            expectedRevision: 1,
+            fallbackName: "T1",
+            command: .associate([report], human: false)
+        )
+        _ = try await service.saveAgentSession(original, for: workspace)
+        fence.release()
+        let loaded = try await loading.value
+        XCTAssertEqual(loaded.name, "PR #42 — New subject")
+        let stored = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
+        XCTAssertEqual(stored.titleMetadata?.revision, 2)
+        XCTAssertEqual(stored.name, loaded.name)
+    }
+
+    func testCASAndStaleTranscriptSaveKeepNewestTitleAndPR() async throws {
+        let (service, workspace, _) = try fixture()
+        let session = AgentSession(workspaceID: workspace.id, composeTabID: UUID(), name: "T1")
+        let file = try await service.saveAgentSession(session, for: workspace)
+        let before = try await service.prepareTitleState(id: session.id, workspace: workspace, fallbackName: "wrong")
+        XCTAssertEqual(before.revision, 0)
+        let named = try await service.commitTitleMutation(
+            id: session.id,
+            workspace: workspace,
+            expectedRevision: 0,
+            fallbackName: "wrong",
+            command: .humanRename("Permanent subject")
+        )
+        XCTAssertEqual(named.revision, 1)
+        do {
+            _ = try await service.commitTitleMutation(
+                id: session.id,
+                workspace: workspace,
+                expectedRevision: 0,
+                fallbackName: "wrong",
+                command: .humanRename("Stale window")
+            )
+            XCTFail("Expected a CAS conflict")
+        } catch { XCTAssertEqual(error as? AgentSessionTitleError, .conflict) }
+        let report = try AgentSessionPullRequestEvidence.report(url: "https://github.com/acme/app/pull/123", relationship: "created")
+        let associated = try await service.commitTitleMutation(
+            id: session.id,
+            workspace: workspace,
+            expectedRevision: 1,
+            fallbackName: "wrong",
+            command: .associate([report], human: false)
+        )
+        XCTAssertEqual(associated.persistenceState, "pending")
+        _ = try await service.saveAgentSession(session, for: workspace)
+        let stored = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
+        XCTAssertEqual(stored.name, "PR #123 — Permanent subject")
+        XCTAssertEqual(stored.titleMetadata?.revision, 2)
+        XCTAssertEqual(stored.titleMetadata?.state?.source, "human")
+        let fresh = AgentSessionDataService()
+        let header = try await fresh.loadAgentSessionStub(from: file, recoverMissingMetadata: false, persistRecoveredMetadata: false)
+        XCTAssertEqual(header.titleMetadata, stored.titleMetadata)
+        let metadata = try await fresh.listAgentSessionsMeta(for: workspace)
+        XCTAssertEqual(metadata.first?.titleMetadata, stored.titleMetadata)
+        let receipt = try await service.prepareTitleState(id: session.id, workspace: workspace, fallbackName: "wrong")
+        XCTAssertEqual(receipt.persistenceState, "persisted")
+    }
+
+    func testFutureOpaqueMetadataSurvivesNilSnapshotSave() async throws {
+        let (service, workspace, _) = try fixture()
+        let opaque = try JSONDecoder().decode(
+            AgentSessionTitleMetadata.self,
+            from: Data("{\"metadataVersion\":2,\"revision\":18446744073709551615,\"extra\":{\"number\":18446744073709551614}}".utf8)
+        )
+        var original = AgentSession(workspaceID: workspace.id, name: "Future visible name", titleMetadata: opaque)
+        let file = try await service.saveAgentSession(original, for: workspace)
+        original.titleMetadata = nil
+        original.name = "Stale name"
+        _ = try await service.saveAgentSession(original, for: workspace)
+        let stored = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
+        XCTAssertEqual(stored.titleMetadata, opaque)
+        XCTAssertEqual(stored.name, "Future visible name")
+    }
+
+    func testLegacyHeaderReadDoesNotRewriteOrCreateDerivedTitleMetadata() async throws {
+        let (service, workspace, _) = try fixture()
+        let original = AgentSession(workspaceID: workspace.id, name: "Legacy manual title")
+        let file = try await service.saveAgentSession(original, for: workspace)
+        let bytes = try Data(contentsOf: file)
+        let stub = try await service.loadAgentSessionStub(from: file, recoverMissingMetadata: false, persistRecoveredMetadata: false)
+        XCTAssertNil(stub.titleMetadata)
+        XCTAssertEqual(try Data(contentsOf: file), bytes)
+        let record = AgentSessionMetadataRecord.record(from: original, fileURL: file, observedFileSize: nil, observedFileModificationDate: nil)
+        XCTAssertTrue(record.matchesIndexedSessionMetadata(record))
+        XCTAssertTrue(record.lacksTranscriptDerivedFields)
+        XCTAssertNil(record.titleMetadata)
+    }
+
+    func testReorderedEnqueueCannotSupersedePreparedSuccessor() async throws {
+        let (_, _, directory) = try fixture()
+        let file = directory.appendingPathComponent("writer.json")
+        let writer = AgentSessionDiskWriter()
+        let newer = try await writer.enqueueAndWait(data: Data("newer".utf8), url: file, preparationSequence: 2)
+        let older = try await writer.enqueueAndWait(data: Data("older".utf8), url: file, preparationSequence: 1)
+        XCTAssertNotNil(newer)
+        XCTAssertNil(older)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "newer")
+    }
+
+    func testMalformedCurrentResetPreservesRecoveryAndCannotBeUndoneByOldOpaqueSave() async throws {
+        let (service, workspace, directory) = try fixture()
+        let malformed = try JSONDecoder().decode(
+            AgentSessionTitleMetadata.self,
+            from: Data("{\"metadataVersion\":1,\"revision\":9,\"baseTitle\":42}".utf8)
+        )
+        let original = AgentSession(workspaceID: workspace.id, name: "PR #123 — Keep visible text", titleMetadata: malformed)
+        let file = try await service.saveAgentSession(original, for: workspace)
+        let bytes = try Data(contentsOf: file)
+        let reset = try await service.resetMalformedTitle(id: original.id, workspace: workspace, expectedRevision: 9)
+        XCTAssertEqual(reset.metadata?.state?.baseTitle, original.name)
+        XCTAssertEqual(reset.metadata?.state?.source, "human")
+        XCTAssertEqual(reset.revision, 10)
+        _ = try await service.saveAgentSession(original, for: workspace)
+        let stored = try JSONDecoder().decode(AgentSession.self, from: Data(contentsOf: file))
+        XCTAssertEqual(stored.titleMetadata, reset.metadata)
+        let recovery = directory.appendingPathComponent("AgentSessions/.title-metadata-recovery")
+        let copies = try FileManager.default.contentsOfDirectory(at: recovery, includingPropertiesForKeys: nil)
+        XCTAssertEqual(copies.count, 1)
+        XCTAssertEqual(try Data(contentsOf: XCTUnwrap(copies.first)), bytes)
+    }
+}
+
+// MARK: - AgentSessionTitleLifecycleTests
+
+@MainActor
+final class AgentSessionTitleLifecycleTests: XCTestCase {
+    func testActivityIsEphemeralAndReasoningDoesNotReplaceIt() {
+        let session = AgentTabSession(tabID: UUID())
+        session.runState = .running
+        session.titleTaskTurnID = UUID()
+        session.activeTaskTurnID = session.titleTaskTurnID
+        session.activeTask = "Checking title persistence"
+        session.runningStatusSource = .reasoning
+        session.runningStatusText = "Considering alternatives"
+        XCTAssertEqual(session.displayedRunningStatusText, "Checking title persistence")
+        session.runningStatusSource = .reconnect
+        session.runningStatusText = "Reconnecting"
+        XCTAssertEqual(session.displayedRunningStatusText, "Reconnecting")
+        session.runState = .waitingForApproval
+        XCTAssertEqual(session.displayedRunningStatusText, "Waiting for approval")
+        session.runState = .idle
+        XCTAssertNil(session.activeTask)
+        XCTAssertNil(session.activeTaskTurnID)
+    }
+
+    func testSameSessionNewBindingGenerationClearsRuntimeTitleState() throws {
+        let session = AgentTabSession(tabID: UUID())
+        let id = UUID()
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id))
+        session.titleMetadata = try AgentSessionTitlePolicy.apply(.humanRename("Subject"), to: nil, name: "T1")
+        session.titleTaskTurnID = UUID()
+        session.activeTaskTurnID = session.titleTaskTurnID
+        session.activeTask = "Old task"
+        session.unreportedPullRequestNotice = "Old notice"
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: id))
+        XCTAssertNil(session.titleMetadata)
+        XCTAssertNil(session.activeTask)
+        XCTAssertNil(session.titleTaskTurnID)
+        XCTAssertNil(session.unreportedPullRequestNotice)
+    }
+
+    func testSessionlessHumanTitlePromotesOnlyToFirstDurableIdentity() throws {
+        var tab = ComposeTabState(name: "T17")
+        let metadata = try XCTUnwrap(AgentSessionTitlePolicy.apply(.humanRename("T17"), to: nil, name: tab.name))
+        tab.agentTitleProjection = .init(sessionID: nil, titleMetadata: metadata)
+        let first = UUID()
+        tab.activeAgentSessionID = first
+        XCTAssertEqual(tab.agentTitleProjection?.sessionID, first)
+        XCTAssertEqual(tab.agentTitleProjection?.titleMetadata.state?.source, "human")
+        tab.activeAgentSessionID = UUID()
+        XCTAssertNil(tab.agentTitleProjection)
+    }
+}
+
+// MARK: - AgentSessionPullRequestEvidenceTests
+
+final class AgentSessionPullRequestEvidenceTests: XCTestCase {
+    private func event(_ command: String = "gh pr create --repo owner/repo", output: String = "https://github.com/owner/repo/pull/42\n", exit: Int? = 0, truncated: Bool = false) -> AgentNativeCommandCompletion {
+        .init(invocationID: UUID(), command: command, argv: nil, exitCode: exit, output: output, isError: false, isTruncated: truncated)
+    }
+
+    func testOrdinaryNativeCommandsDoNotReadRepositoryHostConfiguration() {
+        var lookups = 0
+        func hosts() -> Set<String> {
+            lookups += 1
+            return ["github.com"]
+        }
+        XCTAssertEqual(AgentSessionNativePullRequestObserver.observe(event("git status"), trustedHosts: hosts()), .ignored)
+        XCTAssertEqual(lookups, 0)
+        _ = AgentSessionNativePullRequestObserver.observe(event(), trustedHosts: hosts())
+        XCTAssertEqual(lookups, 1)
+    }
+
+    func testLiteralNativeCreationAndRepositoryArguments() {
+        for command in ["gh pr create --repo owner/repo", "gh pr create -Rowner/repo", "gh pr create --title 'Literal title' -R owner/repo"] {
+            guard case let .association(value) = AgentSessionNativePullRequestObserver.observe(event(command)) else { return XCTFail(command) }
+            XCTAssertEqual(value.identity.number, 42)
+            XCTAssertEqual(value.provenance, "observedShellCreation")
+        }
+        XCTAssertEqual(AgentSessionNativePullRequestObserver.observe(event("gh pr create -Rother/repo")), .notice("repository_conflict"))
+    }
+
+    func testAmbiguousOrIncompleteOutputNeverAssociates() {
+        for value in [event(output: "Created https://github.com/owner/repo/pull/42"), event(output: "https://github.com/owner/repo/pull/41\nhttps://github.com/owner/repo/pull/42"), event(exit: nil), event(truncated: true), event(output: "https://unknown.example/owner/repo/pull/42")] {
+            guard case .notice = AgentSessionNativePullRequestObserver.observe(value) else { return XCTFail("Expected nonmutating notice") }
+        }
+        XCTAssertEqual(AgentSessionNativePullRequestObserver.observe(event(exit: 1)), .ignored)
+    }
+
+    func testShellCompositionCannotBecomeEvidence() {
+        XCTAssertEqual(AgentSessionNativePullRequestObserver.observe(event("gh pr create && echo https://github.com/owner/repo/pull/42")), .notice("unsupported_command_shape"))
+        for command in ["echo gh pr create", "zsh -lc 'gh pr create'", "mcp__Bash gh pr create"] {
+            XCTAssertEqual(AgentSessionNativePullRequestObserver.observe(event(command)), .ignored)
+        }
+    }
+
+    func testNativeDecoderRequiresInvocationArgumentsAndRetainsTruncation() {
+        let result = #"{"command":"gh pr create","exitCode":0,"stdout":"https://github.com/owner/repo/pull/42","output_truncated":true}"#
+        let event = AgentNativeCommandCompletion.decode(invocationID: UUID(), argsJSON: nil, resultJSON: result, isError: false)
+        XCTAssertNil(event.command, "Tool output cannot supply invocation provenance")
+        XCTAssertTrue(event.isTruncated)
+        XCTAssertEqual(AgentSessionNativePullRequestObserver.observe(event), .ignored)
+    }
+
+    func testWorktreeRemoteHostUsesCommonRepositoryConfig() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("title-hosts-\(UUID())", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let main = root.appendingPathComponent("main/.git", isDirectory: true)
+        let admin = main.appendingPathComponent("worktrees/lane", isDirectory: true)
+        let lane = root.appendingPathComponent("lane", isDirectory: true)
+        try FileManager.default.createDirectory(at: admin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: lane, withIntermediateDirectories: true)
+        try Data("gitdir: ../main/.git/worktrees/lane\n".utf8).write(to: lane.appendingPathComponent(".git"))
+        try Data("../..\n".utf8).write(to: admin.appendingPathComponent("commondir"))
+        try Data("[remote \"origin\"]\n url = https://git.example/acme/app.git\n".utf8).write(to: main.appendingPathComponent("config"))
+        XCTAssertEqual(AgentSessionPullRequestHosts.configured(repositoryPaths: [lane.path]), ["github.com", "git.example"])
+    }
+
+    func testDryRunIsNeverCreationEvidence() {
+        let value = AgentNativeCommandCompletion(
+            invocationID: UUID(),
+            command: nil,
+            argv: ["gh", "pr", "create", "--dry-run", "--body", "Preview\nhttps://github.com/owner/repo/pull/42"],
+            exitCode: 0,
+            output: "https://github.com/owner/repo/pull/42",
+            isError: false,
+            isTruncated: false
+        )
+        XCTAssertEqual(AgentSessionNativePullRequestObserver.observe(value), .notice("non_creating_command"))
+    }
+
+    func testConfiguredRemoteHostsDoNotTrustUnrelatedConfigURLs() {
+        let config = "[remote \"origin\"]\n url = git@git.example:owner/repo.git\n[other]\n url = https://untrusted.example/repo"
+        XCTAssertEqual(AgentSessionPullRequestHosts.remoteHosts(config: config), ["git.example"])
+    }
+
+    func testEnterpriseRequiresExplicitTrustedHost() throws {
+        let url = "https://git.example/owner/repo/pull/42"
+        XCTAssertThrowsError(try AgentSessionPullRequestEvidence.report(url: url, relationship: "created"))
+        let value = try AgentSessionPullRequestEvidence.report(url: url, relationship: "created", trustedHosts: ["git.example"])
+        XCTAssertEqual(value.identity.host, "git.example")
+    }
+}

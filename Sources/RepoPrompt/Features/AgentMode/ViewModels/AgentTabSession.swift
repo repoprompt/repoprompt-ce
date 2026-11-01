@@ -251,6 +251,9 @@ final class AgentTabSession: ObservableObject {
     @Published var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
+            if !runState.isActive { activeTask = nil
+                activeTaskTurnID = nil
+            }
             if runState == .waitingForApproval || runState == .waitingForQuestion {
                 noteAcceptedTaskInput()
             }
@@ -260,6 +263,27 @@ final class AgentTabSession: ObservableObject {
     }
 
     @Published var runningStatusText: String? = nil
+    var titleMetadata: AgentSessionTitleMetadata?
+    var titlePersistenceState = "not_needed"
+    var titleTaskTurnID: UUID?
+    var titlePreparationTask: Task<Void, Never>?
+    @Published var activeTask: String?
+    var activeTaskTurnID: UUID?
+    var unreportedPullRequestNotice: String?
+    var observedPRInvocations: [UUID] = []
+
+    var displayedRunningStatusText: String? {
+        switch runState {
+        case .waitingForApproval: return "Waiting for approval"
+        case .waitingForQuestion: return "Waiting for an answer"
+        case .waitingForUser: return "Waiting for instructions"
+        default: break
+        }
+        if runningStatusSource == .reconnect { return runningStatusText }
+        if runState.isActive, activeTaskTurnID == titleTaskTurnID, let activeTask { return activeTask }
+        return runningStatusText
+    }
+
     /// Ephemeral cancellation generation and managed-stop gate; never persisted.
     var stopState = AgentRunStopState() {
         didSet {
@@ -1709,6 +1733,11 @@ final class AgentTabSession: ObservableObject {
     /// instruction, applyEditsReview, MCP control, run cancellation) remain
     /// on the VM and are called separately by each teardown path.
     func cancelEphemeralRuntimeState() {
+        titlePreparationTask?.cancel()
+        titlePreparationTask = nil
+        activeTask = nil
+        activeTaskTurnID = nil
+        titleTaskTurnID = nil
         selfCompactNativeCompletion?.cancelRuntimeWork()
         selfCompactNativeCompletion = nil
         // Without its worker, an active request could never settle and would hold overseer delivery,
@@ -1813,6 +1842,7 @@ final class AgentTabSession: ObservableObject {
 
     @discardableResult
     func beginPersistentBindingTransition() -> UInt64 {
+        clearEphemeralTitleStateForRebind()
         // The existing full endpoint is retired by this generation change. No saved verdicts.
         resetQuietLedgerForBinding()
         oversight.clearWakeSuppression()
@@ -1835,6 +1865,7 @@ final class AgentTabSession: ObservableObject {
     func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
         precondition(binding == nil || binding?.tabID == tabID)
         if persistentSessionBindingIdentity != binding {
+            clearEphemeralTitleStateForRebind()
             invalidateLocalInputStructure()
             oversight.overseerActivation = nil
             oversight.clearWakeSuppression()
@@ -1844,6 +1875,20 @@ final class AgentTabSession: ObservableObject {
         persistentSessionBindingDidChange?()
         bindingTransitionInProgress = false
         restorationReadiness = currentRestorationBindingToken.map { .pending($0) } ?? .unbound
+    }
+
+    private func clearEphemeralTitleStateForRebind() {
+        guard persistentSessionBindingIdentity != nil else { return }
+        titlePreparationTask?.cancel()
+        titlePreparationTask = nil
+        activeTask = nil
+        activeTaskTurnID = nil
+        titleTaskTurnID = nil
+        unreportedPullRequestNotice = nil
+        observedPRInvocations.removeAll()
+        if persistentSessionBindingIdentity != nil { titleMetadata = nil
+            titlePersistenceState = "not_needed"
+        }
     }
 
     var currentRestorationBindingToken: AgentSessionRestorationBindingToken? {

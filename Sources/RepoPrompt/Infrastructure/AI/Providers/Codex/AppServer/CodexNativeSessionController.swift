@@ -567,6 +567,7 @@ final class CodexNativeSessionController {
         case toolCall(name: String, invocationID: UUID?, argsJSON: String?, mcpIdentity: MCPToolIdentity? = nil)
         case toolResult(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?, mcpIdentity: MCPToolIdentity? = nil)
         case commandExecutionRunning(CommandExecutionRunningUpdate)
+        case nativeCommandCompleted(AgentNativeCommandCompletion)
         case livenessActivity(LivenessActivity)
         case errorNotification(ErrorNotification)
         case error(String)
@@ -936,6 +937,7 @@ final class CodexNativeSessionController {
     /// Used to suppress late output deltas that arrive after completion.
     private var terminalFileChangeItemIDs: Set<String> = []
     private var commandExecutionMirrorStateByItemID: [String: CommandExecutionMirrorState] = [:]
+    private var nativeCommandArgsByInvocation: [UUID: String] = [:]
     private var appServerRequestValueStyle: CodexAgentToolPreferences.AppServerRequestValueStyle = .configStyle
 
     var hasActiveThread: Bool {
@@ -2835,6 +2837,7 @@ final class CodexNativeSessionController {
         fileChangeStateByItemID.removeAll(keepingCapacity: false)
         terminalFileChangeItemIDs.removeAll(keepingCapacity: false)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: false)
+        nativeCommandArgsByInvocation.removeAll(keepingCapacity: false)
         finishEventsStreamIfNeeded()
         if expectedMCPClientName != nil {
             await client.clearExpectedAgentPIDRegistration()
@@ -2877,6 +2880,7 @@ final class CodexNativeSessionController {
         fileChangeStateByItemID.removeAll(keepingCapacity: true)
         terminalFileChangeItemIDs.removeAll(keepingCapacity: true)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: true)
+        nativeCommandArgsByInvocation.removeAll(keepingCapacity: true)
     }
 
     private func applyThreadResponse(_ result: [String: Any], fallbackEffort: String?) -> SessionRef {
@@ -3442,12 +3446,14 @@ final class CodexNativeSessionController {
         isBindingSession = true
         bufferedInbound.removeAll(keepingCapacity: true)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: true)
+        nativeCommandArgsByInvocation.removeAll(keepingCapacity: true)
     }
 
     private func cancelBindingSession() {
         isBindingSession = false
         bufferedInbound.removeAll(keepingCapacity: false)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: true)
+        nativeCommandArgsByInvocation.removeAll(keepingCapacity: true)
     }
 
     private func finishBindingAndDrainBufferedInbound() async {
@@ -4108,6 +4114,17 @@ final class CodexNativeSessionController {
             }
 
             if let toolEvent = parseToolLifecycleEvent(method: method, params: params) {
+                if isCommandExecution {
+                    switch toolEvent {
+                    case let .call(_, invocationID, argsJSON, _):
+                        if let invocationID, let argsJSON, argsJSON.utf8.count <= 32768 { nativeCommandArgsByInvocation[invocationID] = argsJSON }
+                    case let .result(_, invocationID, argsJSON, resultJSON, isError, _):
+                        if let invocationID {
+                            let original = nativeCommandArgsByInvocation.removeValue(forKey: invocationID)
+                            await emit(.nativeCommandCompleted(.decode(invocationID: invocationID, argsJSON: argsJSON ?? original, resultJSON: resultJSON, isError: isError)))
+                        }
+                    }
+                }
                 await emitToolLifecycleEvent(toolEvent, method: method)
             }
         case "item/fileChange/outputDelta":
@@ -4141,6 +4158,7 @@ final class CodexNativeSessionController {
                 let emitted = markToolEventEmitted(key: "call:\(beginEvent.dedupKey)")
                 Self.logCodexDebug("[CodexNativeController] execCommandBegin callID=\(beginEvent.dedupKey) invocationID=\(beginEvent.invocationID?.uuidString ?? "nil") processID=\(beginEvent.processID ?? "nil") emitted=\(emitted)")
                 if emitted {
+                    if let invocationID = beginEvent.invocationID, let args = beginEvent.argsJSON, args.utf8.count <= 32768 { nativeCommandArgsByInvocation[invocationID] = args }
                     await emit(.toolCall(name: "bash", invocationID: beginEvent.invocationID, argsJSON: beginEvent.argsJSON))
                 }
                 if beginEvent.invocationID != nil || beginEvent.processID != nil {
@@ -4171,6 +4189,10 @@ final class CodexNativeSessionController {
                 let emitted = markToolEventEmitted(key: "result:\(completion.dedupKey)")
                 Self.logCodexDebug("[CodexNativeController] execCommandEnd callID=\(completion.dedupKey) invocationID=\(completion.invocationID?.uuidString ?? "nil") processID=\(completion.processID ?? "nil") emitted=\(emitted)")
                 guard emitted else { break }
+                if let invocationID = completion.invocationID {
+                    let original = nativeCommandArgsByInvocation.removeValue(forKey: invocationID)
+                    await emit(.nativeCommandCompleted(.decode(invocationID: invocationID, argsJSON: completion.argsJSON ?? original, resultJSON: completion.resultJSON, isError: completion.isError)))
+                }
                 await emit(.toolResult(
                     name: "bash",
                     invocationID: completion.invocationID,
@@ -6379,6 +6401,8 @@ final class CodexNativeSessionController {
             "toolCall tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil")"
         case let .toolResult(name, invocationID, _, resultJSON, isError, _):
             "toolResult tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count)"
+        case let .nativeCommandCompleted(completion):
+            "nativeCommandCompleted invocationID=\(completion.invocationID)"
         case let .commandExecutionRunning(update):
             "commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)"
         case let .approvalRequest(request):
@@ -7347,6 +7371,9 @@ final class CodexNativeSessionController {
         {
             payload["aggregatedOutput"] = Self.sanitizeCommandOutput(output)
         }
+        for key in ["truncated", "isTruncated", "outputTruncated", "output_truncated", "summaryOnly", "summary_only"] {
+            if let value = candidate[key] as? Bool { payload[key] = value }
+        }
         let commandActions = candidate["commandActions"] ?? candidate["command_actions"]
         if let commandActions, JSONSerialization.isValidJSONObject(["commandActions": commandActions]) {
             payload["commandActions"] = commandActions
@@ -7799,6 +7826,9 @@ final class CodexNativeSessionController {
             payload["aggregatedOutput"] = Self.sanitizeCommandOutput(output)
         }
 
+        for key in ["truncated", "isTruncated", "outputTruncated", "output_truncated", "summaryOnly", "summary_only"] {
+            if let value = message[key] as? Bool { payload[key] = value }
+        }
         let resultJSON = jsonString(from: payload) ?? Self.minimalCompletedCommandExecutionResultJSON
         let isError = Self.commandExecutionEndIsError(exitCode: exitCode, status: status)
 

@@ -162,6 +162,7 @@ struct AgentSession: Codable, Identifiable {
     var workspaceID: UUID?
     var composeTabID: UUID?
     var name: String
+    var titleMetadata: AgentSessionTitleMetadata?
     var savedAt: Date
     var fileURL: URL?
 
@@ -292,6 +293,7 @@ struct AgentSession: Codable, Identifiable {
         workspaceID: UUID? = nil,
         composeTabID: UUID? = nil,
         name: String = "Agent Session",
+        titleMetadata: AgentSessionTitleMetadata? = nil,
         savedAt: Date = Date(),
         fileURL: URL? = nil,
         items: [AgentChatItemPersist] = [],
@@ -342,6 +344,7 @@ struct AgentSession: Codable, Identifiable {
         self.workspaceID = workspaceID
         self.composeTabID = composeTabID
         self.name = name
+        self.titleMetadata = titleMetadata
         self.savedAt = savedAt
         self.fileURL = fileURL
         self.items = items
@@ -394,6 +397,7 @@ struct AgentSession: Codable, Identifiable {
         case workspaceID
         case composeTabID
         case name
+        case titleMetadata
         case savedAt
         case fileURL
         case items
@@ -449,6 +453,7 @@ struct AgentSession: Codable, Identifiable {
         workspaceID = try container.decodeIfPresent(UUID.self, forKey: .workspaceID)
         composeTabID = try container.decodeIfPresent(UUID.self, forKey: .composeTabID)
         name = try container.decode(String.self, forKey: .name)
+        titleMetadata = try container.decodeIfPresent(AgentSessionTitleMetadata.self, forKey: .titleMetadata)
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         fileURL = try container.decodeIfPresent(URL.self, forKey: .fileURL)
         items = try container.decodeIfPresent([AgentChatItemPersist].self, forKey: .items) ?? []

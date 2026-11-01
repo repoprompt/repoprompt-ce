@@ -757,6 +757,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private let dataService = AgentSessionDataService.shared
+    lazy var sessionTitleCoordinator = AgentSessionTitleCoordinator(viewModel: self)
     private var sidebarPrioritizedIndexBuilder: SidebarPrioritizedIndexBuilder = { request in
         try await AgentSessionDataService.shared.buildPrioritizedSidebarIndex(request)
     }
@@ -3898,6 +3899,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             },
             addToolOutputTokens: { [weak self] payload, session in
                 self?.addToolOutputTokens(payload, for: session)
+            },
+            nativeCommandResult: { [weak self] event, session in
+                self?.recordNativePullRequestCompletion(event, session: session)
             }
         )
     }
@@ -4027,6 +4031,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         guard let promptManager else { return }
         installPromptManagerCascadeResolvers(promptManager)
         installAgentSessionLifecycleProjectionAuthority()
+        NotificationCenter.default.publisher(for: AgentSessionTitleCoordinator.didPublish)
+            .sink { [weak self] notification in
+                guard let publication = notification.userInfo?["publication"] as? AgentSessionTitleCoordinator.Publication else { return }
+                self?.receiveSessionTitle(publication)
+            }
+            .store(in: &cancellables)
 
         // Observe post-storage tab changes. This notification does not replay the current value;
         // setAgentModeActive(true) remains the explicit activation bootstrap.
@@ -5308,9 +5318,26 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             guard let self else { return }
             if !session.runState.isActive {
                 completeNextAgentTurnRuntimeFooterIfNeeded(for: session, endedAt: Date())
+                if let refinement = session.titleMetadata?.state?.refinement, refinement.phase == "firstTask", let turnID = refinement.turnID {
+                    let binding = session.currentRestorationBindingToken
+                    Task { [weak self, weak session] in
+                        guard let self, let session, sessions[session.tabID] === session,
+                              session.currentRestorationBindingToken == binding else { return }
+                        _ = try? await sessionTitleCoordinator.apply(
+                            .closeRefinement(turnID: turnID),
+                            tabID: session.tabID,
+                            isAuthorized: { [weak session] in session?.currentRestorationBindingToken == binding }
+                        )
+                    }
+                }
             }
             persistRunStateTransitionIfNeeded(for: session)
             republishTranscriptPresentationForRunStateChangeIfNeeded(session)
+        }
+        if let tab = workspaceManager?.composeTab(with: tabID),
+           let projection = tab.agentTitleProjection, projection.sessionID == tab.activeAgentSessionID
+        {
+            newSession.titleMetadata = projection.titleMetadata
         }
         // Initialize new session with current UI selection
         newSession.selectedAgent = selectedAgent
@@ -5612,6 +5639,9 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     private func seedUnhydratedSession(_ session: TabSession, from indexEntry: AgentSessionIndexEntry) {
+        if (session.titleMetadata?.revision ?? 0) <= (indexEntry.titleMetadata?.revision ?? 0) {
+            session.titleMetadata = indexEntry.titleMetadata
+        }
         let normalizedSelection = AgentModelCatalog.normalizePersistedSelection(
             agentRaw: indexEntry.agentKindRaw,
             modelRaw: indexEntry.agentModelRaw
@@ -7582,6 +7612,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // earned.
         session.recordRestorationAuthoritative(.persistedPayloadApplied)
         session.hasLoadedPersistedState = true
+        session.titleMetadata = agentSession.titleMetadata
+        session.activeTask = nil
+        session.activeTaskTurnID = nil
+        session.titleTaskTurnID = nil
         restoreClaudeEffort(from: agentSession, to: session)
 
         let autoEditEnabled = agentSession.autoEditEnabled
@@ -8659,7 +8693,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let resolvedStatusText: String? = {
             if canonicalTerminalState == nil,
-               let existing = session.runningStatusText?.trimmingCharacters(in: .whitespacesAndNewlines),
+               let existing = session.displayedRunningStatusText?.trimmingCharacters(in: .whitespacesAndNewlines),
                !existing.isEmpty
             {
                 return existing
@@ -10296,6 +10330,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 id: existingEntry.id,
                 tabID: session.tabID,
                 name: existingEntry.name,
+                titleMetadata: existingEntry.titleMetadata,
                 lastUserMessageAt: existingEntry.lastUserMessageAt,
                 savedAt: existingEntry.savedAt,
                 lastRunStateRaw: existingEntry.lastRunStateRaw,
@@ -11084,6 +11119,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             onCreated: { [self] tab in
                 if let freshCreation {
                     capturedFreshSession = captureFreshSessionCreation(tab: tab, claim: freshCreation)
+                    if let session = capturedFreshSession?.session {
+                        let initial = try? AgentSessionTitleMetadata(.legacy("Agent Session"))
+                        session.titleMetadata = initial
+                        if let name, let proposed = try? AgentSessionTitlePolicy.apply(.startupProposal(name), to: initial, name: "Agent Session") {
+                            session.titleMetadata = proposed
+                        }
+                    }
                     return capturedFreshSession != nil
                 }
                 return true
@@ -14114,8 +14156,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             if waitingPrompt != session.uiWaitingPrompt {
                 waitingPrompt = session.uiWaitingPrompt
             }
-            if runningStatusText != session.runningStatusText {
-                runningStatusText = session.runningStatusText
+            if runningStatusText != session.displayedRunningStatusText {
+                runningStatusText = session.displayedRunningStatusText
             }
             if activeAgentRunStartedAt != session.activeAgentRunStartedAt {
                 activeAgentRunStartedAt = session.activeAgentRunStartedAt
@@ -14679,8 +14721,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 waitingPrompt = session.uiWaitingPrompt
                 invalidation.formUnion([.composer, .runInteraction])
             }
-            if runningStatusText != session.runningStatusText {
-                runningStatusText = session.runningStatusText
+            if runningStatusText != session.displayedRunningStatusText {
+                runningStatusText = session.displayedRunningStatusText
                 invalidation.insert(.runInteraction)
             }
             if activeAgentRunStartedAt != session.activeAgentRunStartedAt {
@@ -16301,6 +16343,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             id: sessionID,
             tabID: tabID,
             name: name,
+            titleMetadata: sessions[tabID]?.titleMetadata ?? ownerValidatedSessionIndex[sessionID]?.titleMetadata,
             lastUserMessageAt: lastUserMessageAt,
             savedAt: savedAt,
             lastRunStateRaw: lastRunStateRaw,
@@ -18094,12 +18137,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Build the persisted session only for the binding generation captured below.
         let lastUserMessageAt = persistableSnapshot.lastUserMessageAt
         let canonicalItemCount = persistableSnapshot.canonicalVisibleRowCount
-        let sessionName = resolvedSessionDisplayName(for: tabID)
+        let sessionName = session.titleMetadata?.state?.displayName ?? resolvedSessionDisplayName(for: tabID)
         var agentSession = AgentSession(
             id: sessionID,
             workspaceID: workspace.id,
             composeTabID: tabID,
             name: sessionName,
+            titleMetadata: session.titleMetadata,
             items: [],
             transcript: persistableSnapshot.transcript,
             itemCount: canonicalItemCount,
@@ -20148,6 +20192,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
         let turnRuntimeAnchorRollback = recordAgentTurnUserAnchor(for: session, userItem: userItem)
         session.appendItem(userItem)
+        beginSessionTitleTask(session, payload: bubbleText, turnID: userItem.id, allowsSeed: managedTurn == nil)
         // Only the validated composer ingress supplies this positive token. Shared MCP/API
         // defaults and attachment-only synthetic bubble labels never qualify.
         let localComposerCandidate = composerOrigin == .localComposer && isLocalComposerInput
@@ -21930,6 +21975,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             return true
         }
         guard periodicStartIsCurrent() else { return nil }
+        let titleBinding = session.currentRestorationBindingToken
+        await session.titlePreparationTask?.value
+        guard sessions[tabID] === session, session.currentRestorationBindingToken == titleBinding,
+              !Task.isCancelled else { return nil }
         let originalBindingToken = session.currentRestorationBindingToken
         let originalWorkspaceID = workspaceManager?.activeWorkspaceID
         let originalStopFence = directStartOptions.stopFence ?? AgentRunStartStopFence(session: session)
@@ -24473,76 +24522,298 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     /// Agent-mode sidebar rows are session-first, but the user-facing title is also
     /// mirrored through the compose tab so window/tab UI and persisted workspace
     /// state stay in sync.
-    func renameSession(
-        target: AgentSessionLifecycleAuthority.MutationTarget,
-        to newName: String
-    ) throws {
-        let validatedName = AgentSession.validatedName(newName)
-        guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let session = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
-        guard let identitySessionID = target.identity?.sessionID else {
-            promptManager?.renameComposeTab(target.tabID, to: validatedName)
-            return
+    func renameSession(target: AgentSessionLifecycleAuthority.MutationTarget, to newName: String) throws {
+        _ = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+        Task { [weak self] in
+            guard let self else { return }
+            _ = try? await updateSessionStatus(target: target, sessionName: newName, activeTask: nil, pullRequests: [])
         }
-        guard let session, session.activeAgentSessionID == identitySessionID else {
-            throw MCPError.invalidParams(
-                "The Agent session identity changed before its title could be persisted."
-            )
-        }
-        if var entry = ownerValidatedSessionIndex[identitySessionID] {
-            entry.name = validatedName
-            applyLocalSessionIndexUpsert(entry)
-        }
-        session.isDirty = true
-        scheduleSave(for: target.tabID)
-        handleObservedMCPStateChange(for: session)
-        codexCoordinator.scheduleCodexThreadNameSyncIfPossible(
-            for: session,
-            name: validatedName,
-            explicitThreadID: session.codexConversationID,
-            source: "renameSession.lifecycleAuthority"
-        )
-        promptManager?.renameComposeTab(target.tabID, to: validatedName)
     }
 
+    /// UI-only wrapper. Delegated administration must use .adminRename, never this route.
     func renameSession(tabID: UUID, to newName: String) {
-        let validatedName = AgentSession.validatedName(newName)
-        guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-
-        promptManager?.renameComposeTab(tabID, to: validatedName)
-
-        guard let sessionID = boundSessionID(for: tabID) else { return }
-        if var entry = ownerValidatedSessionIndex[sessionID] {
-            entry.name = validatedName
-            applyLocalSessionIndexUpsert(entry)
-        }
-
-        if let session = sessions[tabID] {
-            if session.activeAgentSessionID == nil {
-                _ = installPersistentSessionBindingUpdatingInferredWorkspace(
-                    sessionID: sessionID,
-                    on: session,
-                    invalidateAsyncWork: true
-                )
+        if sessions[tabID] == nil, boundSessionID(for: tabID) != nil { _ = session(for: tabID) }
+        guard let target = try? resolveAgentSessionLifecycleMutationTarget(tabID: tabID, expectedSessionID: boundSessionID(for: tabID), intent: .setStatus) else { return }
+        if target.identity?.sessionID == nil {
+            if let metadata = try? AgentSessionTitlePolicy.apply(.humanRename(newName), to: workspaceManager?.composeTab(with: tabID)?.agentTitleProjection?.titleMetadata, name: resolvedSessionDisplayName(for: tabID)) {
+                let snapshot = AgentSessionTitleSnapshot(metadata: metadata, name: metadata.state?.displayName ?? newName, persistenceState: "pending")
+                sessions[tabID]?.titleMetadata = metadata
+                promptManager?.applyAgentTitleProjection(tabID: tabID, sessionID: nil, snapshot: snapshot)
             }
-            session.isDirty = true
-            scheduleSave(for: tabID)
-            handleObservedMCPStateChange(for: session)
-            codexCoordinator.scheduleCodexThreadNameSyncIfPossible(
-                for: session,
-                name: validatedName,
-                explicitThreadID: session.codexConversationID,
-                source: "renameSession"
+            return
+        }
+        Task { [weak self] in
+            guard let self, (try? requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)) != nil else { return }
+            _ = try? await sessionTitleCoordinator.apply(.humanRename(newName), tabID: tabID)
+        }
+    }
+
+    var trustedPullRequestHosts: Set<String> {
+        AgentSessionPullRequestHosts.configured(repositoryPaths: workspaceManager?.activeWorkspace?.repoPaths ?? [])
+    }
+
+    func recordNativePullRequestCompletion(_ event: AgentNativeCommandCompletion, session: TabSession) {
+        guard sessions[session.tabID] === session, !session.observedPRInvocations.contains(event.invocationID) else { return }
+        session.observedPRInvocations.append(event.invocationID)
+        if session.observedPRInvocations.count > 128 { session.observedPRInvocations.removeFirst() }
+        let binding = session.currentRestorationBindingToken
+        switch AgentSessionNativePullRequestObserver.observe(event, trustedHosts: trustedPullRequestHosts) {
+        case .ignored: return
+        case let .notice(reason):
+            session.unreportedPullRequestNotice = "PR may be unreported — Add PR… (\(reason))"
+            syncSidebarUIState()
+        case let .association(association):
+            Task { [weak self, weak session] in
+                guard let self, let session, sessions[session.tabID] === session,
+                      session.currentRestorationBindingToken == binding else { return }
+                do {
+                    _ = try await sessionTitleCoordinator.apply(.associate([association], human: false), tabID: session.tabID)
+                    session.unreportedPullRequestNotice = nil
+                } catch {
+                    if error as? AgentSessionTitleError != .denied("suppressed") {
+                        session.unreportedPullRequestNotice = "PR may be unreported — Add PR…"
+                    }
+                }
+                syncSidebarUIState()
+            }
+        }
+    }
+
+    func validateSessionTitleEditorTarget(_ target: AgentSessionLifecycleAuthority.MutationTarget) throws {
+        _ = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+        guard boundSessionID(for: target.tabID) == target.identity?.sessionID else {
+            throw AgentSessionTitleError.denied("session_identity_changed")
+        }
+    }
+
+    func applySessionTitleEditorCommand(
+        _ command: AgentSessionTitleCommand,
+        target: AgentSessionLifecycleAuthority.MutationTarget,
+        expectedRevision: UInt64
+    ) async throws -> AgentSessionTitleSnapshot {
+        try validateSessionTitleEditorTarget(target)
+        return try await sessionTitleCoordinator.apply(
+            command,
+            tabID: target.tabID,
+            expectedRevision: expectedRevision,
+            isAuthorized: { [weak self] in (try? self?.validateSessionTitleEditorTarget(target)) != nil }
+        )
+    }
+
+    func resetSessionTitleMetadata(target: AgentSessionLifecycleAuthority.MutationTarget, expectedRevision: UInt64) async throws -> AgentSessionTitleSnapshot {
+        try validateSessionTitleEditorTarget(target)
+        guard let workspace = workspaceManager?.activeWorkspace, let sessionID = target.identity?.sessionID else {
+            throw AgentSessionTitleError.denied("session_not_persisted")
+        }
+        let after = try await dataService.resetMalformedTitle(id: sessionID, workspace: workspace, expectedRevision: expectedRevision)
+        try validateSessionTitleEditorTarget(target)
+        let publication = AgentSessionTitleCoordinator.Publication(workspaceID: workspace.id, sessionID: sessionID, snapshot: after)
+        receiveSessionTitle(publication)
+        NotificationCenter.default.post(name: AgentSessionTitleCoordinator.didPublish, object: nil, userInfo: ["publication": publication])
+        sessions[target.tabID]?.isDirty = true
+        scheduleSave(for: target.tabID)
+        Task { [weak self] in await self?.flushSave(for: target.tabID) }
+        return after
+    }
+
+    func currentSessionTitle(tabID: UUID) async throws -> AgentSessionTitleSnapshot {
+        guard let workspace = workspaceManager?.activeWorkspace, let tab = workspaceManager?.composeTab(with: tabID) else { throw AgentSessionTitleError.denied("workspace_not_loaded") }
+        guard let sessionID = boundSessionID(for: tabID) else {
+            let metadata = sessions[tabID]?.titleMetadata ?? tab.agentTitleProjection?.titleMetadata
+            return .init(metadata: metadata, name: metadata?.state?.displayName ?? tab.name, persistenceState: "not_needed")
+        }
+        return try await dataService.prepareTitleState(
+            id: sessionID,
+            workspace: workspace,
+            fallbackName: tab.name,
+            fallbackMetadata: sessions[tabID]?.titleMetadata ?? tab.agentTitleProjection?.titleMetadata ?? ownerValidatedSessionIndex[sessionID]?.titleMetadata
+        )
+    }
+
+    func commitSessionTitle(
+        _ command: AgentSessionTitleCommand,
+        tabID: UUID,
+        expectedRevision: UInt64? = nil,
+        isAuthorized: @escaping @MainActor () -> Bool = { true }
+    ) async throws -> AgentSessionTitleSnapshot {
+        guard let workspace = workspaceManager?.activeWorkspace, let tab = workspaceManager?.composeTab(with: tabID) else {
+            throw AgentSessionTitleError.denied("workspace_not_loaded")
+        }
+        let sessionID = boundSessionID(for: tabID)
+        if sessionID != nil, sessions[tabID] == nil { _ = session(for: tabID) }
+        let target = try resolveAgentSessionLifecycleMutationTarget(tabID: tabID, expectedSessionID: sessionID, intent: .setStatus)
+        guard isAuthorized() else { throw AgentSessionTitleError.denied("scope_no_longer_current") }
+        guard let sessionID else {
+            switch command {
+            case .associate, .correct: throw AgentSessionTitleError.denied("session_not_persisted")
+            default: break
+            }
+            let metadata = sessions[tabID]?.titleMetadata ?? tab.agentTitleProjection?.titleMetadata
+            if let expectedRevision, expectedRevision != (metadata?.revision ?? 0) { throw AgentSessionTitleError.conflict }
+            let after = try AgentSessionTitlePolicy.apply(command, to: metadata, name: tab.name) ?? metadata
+            let snapshot = AgentSessionTitleSnapshot(metadata: after, name: after?.state?.displayName ?? tab.name, persistenceState: "pending")
+            sessions[tabID]?.titleMetadata = after
+            promptManager?.applyAgentTitleProjection(tabID: tabID, sessionID: nil, snapshot: snapshot)
+            return snapshot
+        }
+        let before = try await dataService.prepareTitleState(
+            id: sessionID,
+            workspace: workspace,
+            fallbackName: tab.name,
+            fallbackMetadata: sessions[tabID]?.titleMetadata ?? tab.agentTitleProjection?.titleMetadata ?? ownerValidatedSessionIndex[sessionID]?.titleMetadata
+        )
+        _ = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+        guard isAuthorized(), !Task.isCancelled else { throw AgentSessionTitleError.denied("scope_no_longer_current") }
+        let after: AgentSessionTitleSnapshot
+        do {
+            after = try await dataService.commitTitleMutation(
+                id: sessionID,
+                workspace: workspace,
+                expectedRevision: expectedRevision ?? before.revision,
+                fallbackName: before.name,
+                command: command
             )
-        } else if let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot {
-            Task { [dataService] in
-                try? await dataService.renameAgentSession(
-                    id: sessionID,
-                    to: validatedName,
-                    for: workspace
-                )
+        } catch AgentSessionTitleError.conflict {
+            guard case .associate = command, expectedRevision == nil else { throw AgentSessionTitleError.conflict }
+            let current = try await dataService.prepareTitleState(id: sessionID, workspace: workspace, fallbackName: before.name)
+            _ = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+            guard isAuthorized(), !Task.isCancelled else { throw AgentSessionTitleError.denied("scope_no_longer_current") }
+            after = try await dataService.commitTitleMutation(
+                id: sessionID,
+                workspace: workspace,
+                expectedRevision: current.revision,
+                fallbackName: current.name,
+                command: command
+            )
+        }
+        _ = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+        let publication = AgentSessionTitleCoordinator.Publication(workspaceID: workspace.id, sessionID: sessionID, snapshot: after)
+        receiveSessionTitle(publication)
+        NotificationCenter.default.post(name: AgentSessionTitleCoordinator.didPublish, object: nil, userInfo: ["publication": publication])
+        if after != before {
+            if let session = sessions[tabID], session.hasLoadedPersistedState {
+                session.isDirty = true
+                scheduleSave(for: tabID)
+                if case .associate = command { Task { [weak self] in await self?.flushSave(for: tabID) } }
+                if case .correct = command { Task { [weak self] in await self?.flushSave(for: tabID) } }
+            } else {
+                Task { [dataService] in
+                    guard let persisted = try? await dataService.loadAgentSession(id: sessionID, for: workspace) else { return }
+                    _ = try? await dataService.saveAgentSession(persisted, for: workspace)
+                }
             }
         }
+        return after
+    }
+
+    private func receiveSessionTitle(_ publication: AgentSessionTitleCoordinator.Publication) {
+        guard let workspace = workspaceManager?.activeWorkspace, workspace.id == publication.workspaceID else { return }
+        for tab in workspace.composeTabs where tab.activeAgentSessionID == publication.sessionID {
+            let currentRevision = sessions[tab.id]?.titleMetadata?.revision ?? tab.agentTitleProjection?.titleMetadata.revision ?? 0
+            guard currentRevision <= publication.snapshot.revision else { continue }
+            let session = sessions[tab.id]
+            guard session == nil || session?.activeAgentSessionID == publication.sessionID else { continue }
+            let nameChanged = tab.name != publication.snapshot.name
+            let metadataChanged = session?.titleMetadata != publication.snapshot.metadata
+            session?.titleMetadata = publication.snapshot.metadata
+            session?.titlePersistenceState = publication.snapshot.persistenceState
+            if var entry = ownerValidatedSessionIndex[publication.sessionID] {
+                entry.name = publication.snapshot.name
+                entry.titleMetadata = publication.snapshot.metadata
+                applyLocalSessionIndexUpsert(entry)
+            }
+            promptManager?.applyAgentTitleProjection(tabID: tab.id, sessionID: publication.sessionID, snapshot: publication.snapshot)
+            if let session {
+                handleObservedMCPStateChange(for: session)
+                if nameChanged {
+                    codexCoordinator.scheduleCodexThreadNameSyncIfPossible(
+                        for: session,
+                        name: publication.snapshot.name,
+                        explicitThreadID: session.codexConversationID,
+                        source: "titleProjection"
+                    )
+                }
+                if metadataChanged { syncSidebarUIState() }
+            }
+        }
+    }
+
+    private func beginSessionTitleTask(_ session: TabSession, payload: String, turnID: UUID, allowsSeed: Bool) {
+        session.activeTask = nil
+        session.activeTaskTurnID = nil
+        let previousTurnID = session.titleTaskTurnID ?? session.titleMetadata?.state?.refinement.turnID
+        session.titleTaskTurnID = turnID
+        let binding = session.currentRestorationBindingToken
+        let previous = session.titlePreparationTask
+        // The submission/rollback gate is intentionally synchronous. Provider startup awaits this
+        // bounded preparation rather than inserting a suspension into accepted-user-row publication.
+        session.titlePreparationTask = Task { [weak self, weak session] in
+            await previous?.value
+            guard let self, let session, !Task.isCancelled, sessions[session.tabID] === session,
+                  session.currentRestorationBindingToken == binding else { return }
+            if let previousTurnID { _ = try? await sessionTitleCoordinator.apply(.closeRefinement(turnID: previousTurnID), tabID: session.tabID) }
+            if allowsSeed { _ = try? await sessionTitleCoordinator.apply(.seed(payload, turnID: turnID), tabID: session.tabID) }
+        }
+    }
+
+    func updateSessionStatus(
+        target: AgentSessionLifecycleAuthority.MutationTarget,
+        sessionName: String?,
+        activeTask: String?,
+        pullRequests: [AgentSessionPullRequestAssociation]
+    ) async throws -> [String: Value] {
+        let session = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+        let turnID = session?.titleTaskTurnID
+        var result: [String: Value] = ["session_name_applied": .bool(false)]
+        if let sessionName, !sessionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            result["session_name"] = .string(sessionName)
+            do {
+                guard let turnID else { throw AgentSessionTitleError.denied("refinement_closed") }
+                let before = session?.titleMetadata?.state
+                let after = try await sessionTitleCoordinator.apply(.agentProposal(sessionName, turnID: turnID), tabID: target.tabID)
+                let rejected = (after.metadata?.state?.refinement.qualityRejections ?? 0) > (before?.refinement.qualityRejections ?? 0)
+                result["session_name_applied"] = .bool(!rejected)
+                if rejected { result["session_name_reason"] = .string("activity_phrase") }
+            } catch { result["session_name_reason"] = .string(error.localizedDescription) }
+        }
+        _ = try requireCurrentAgentSessionLifecycleTarget(target, intent: .setStatus)
+        if let activeTask {
+            if let session, let turnID, session.titleTaskTurnID == turnID, session.runState.isActive {
+                let invalidControl = activeTask.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) && !CharacterSet.whitespacesAndNewlines.contains($0) }
+                if invalidControl {
+                    result["active_task_applied"] = .bool(false)
+                    result["active_task_reason"] = .string("invalid_activity_text")
+                } else {
+                    let normalized = String(activeTask.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ").prefix(120))
+                    if session.activeTask != (normalized.isEmpty ? nil : normalized) {
+                        session.activeTask = normalized.isEmpty ? nil : normalized
+                        session.activeTaskTurnID = normalized.isEmpty ? nil : turnID
+                        if currentTabID == target.tabID { runningStatusText = session.displayedRunningStatusText }
+                        handleObservedMCPStateChange(for: session)
+                        syncSidebarUIState()
+                    }
+                    result["active_task_applied"] = .bool(true)
+                }
+            } else {
+                result["active_task_applied"] = .bool(false)
+                result["active_task_reason"] = .string("stale_turn")
+            }
+        }
+        if !pullRequests.isEmpty {
+            do {
+                _ = try await sessionTitleCoordinator.apply(.associate(pullRequests, human: false), tabID: target.tabID)
+                session?.unreportedPullRequestNotice = nil
+                result["pull_requests_applied"] = .bool(true)
+            } catch { result["pull_requests_applied"] = .bool(false)
+                result["pull_requests_reason"] = .string(error.localizedDescription)
+            }
+        }
+        result["current_session_name"] = .string(resolvedSessionDisplayName(for: target.tabID))
+        if let session {
+            result["title_revision"] = .string(String(session.titleMetadata?.revision ?? 0))
+            result["persistence_state"] = .string(session.titlePersistenceState)
+        }
+        return result
     }
 
     private func cleanupACPStateForDeletedSession(_ session: TabSession) async {

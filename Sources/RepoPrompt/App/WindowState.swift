@@ -1408,7 +1408,9 @@ class WindowState: ObservableObject {
             workspaceID: workspace.id,
             tabID: tabID,
             agentSessionID: agentSessionID,
-            tabName: tab.name
+            tabName: tab.name,
+            titleRevision: (agentModeViewModel.sessions[tabID]?.titleMetadata ?? tab.agentTitleProjection?.titleMetadata)?.revision,
+            titleBindingToken: agentModeViewModel.sessions[tabID]?.currentRestorationBindingToken
         )
     }
 
@@ -1492,6 +1494,9 @@ class WindowState: ObservableObject {
             },
             delete: { [weak self] target in
                 self?.confirmDeleteAgentChatFromTitlebar(target: target)
+            },
+            managePullRequests: { [weak self] target in
+                self?.renameAgentChatFromTitlebar(target: target)
             }
         )
     }
@@ -1525,9 +1530,12 @@ class WindowState: ObservableObject {
     }
 
     private func refreshAgentChatTitleCluster() {
+        let target = currentAgentTitlebarChatOptionsTarget()
+        let metadata = target.flatMap { agentModeViewModel.sessions[$0.tabID]?.titleMetadata ?? workspaceManager.composeTab(with: $0.tabID)?.agentTitleProjection?.titleMetadata }
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
-            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil
+            titleMetadata: metadata,
+            showsChatOptions: target != nil
         )
     }
 
@@ -1607,35 +1615,13 @@ class WindowState: ObservableObject {
 
     private func renameAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {
         guard agentChatTitleClusterMenuTargetIsValid(target) else { return }
-        let currentName = target.tabName
-        let alert = NSAlert()
-        alert.messageText = "Rename chat"
-        alert.informativeText = "Choose a new name for this chat."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Rename")
-        alert.addButton(withTitle: "Cancel")
-
-        let input = NSTextField(string: currentName)
-        input.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
-        input.selectText(nil)
-        alert.accessoryView = input
-
-        let applyRename: (NSApplication.ModalResponse) -> Void = { [weak self, weak input] response in
-            guard response == .alertFirstButtonReturn,
-                  let self,
-                  let input,
-                  agentChatTitleClusterMenuTargetIsValid(target)
-            else { return }
-            let newName = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !newName.isEmpty, newName != currentName else { return }
-            agentModeViewModel.renameSession(tabID: target.tabID, to: newName)
-        }
-
-        if let window = nsWindow {
-            alert.beginSheetModal(for: window, completionHandler: applyRename)
-        } else {
-            applyRename(alert.runModal())
-        }
+        AgentSessionPullRequestEditorPresenter.present(
+            viewModel: agentModeViewModel,
+            tabID: target.tabID,
+            sessionID: target.agentSessionID,
+            workspaceID: target.workspaceID,
+            expectedBinding: target.titleBindingToken
+        )
     }
 
     private func confirmDeleteAgentChatFromTitlebar(target: AgentChatOptionsMenuTarget) {

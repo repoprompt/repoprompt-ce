@@ -4019,6 +4019,28 @@ class PromptViewModel: ObservableObject {
         )
     }
 
+    /// Projection-only title publication. It deliberately does not claim human authorship or
+    /// call renameSession again, and never changes the selected tab or user-activity timestamp.
+    @MainActor
+    func applyAgentTitleProjection(tabID: UUID, sessionID: UUID?, snapshot: AgentSessionTitleSnapshot) {
+        guard let manager = workspaceManager, let workspace = manager.activeWorkspace else { return }
+        let changed = manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [tabID]) { _, tab in
+            guard tab.activeAgentSessionID == sessionID else { return }
+            if let old = tab.agentTitleProjection?.titleMetadata.revision, old > snapshot.revision { return }
+            tab.name = snapshot.name
+            tab.agentTitleProjection = snapshot.metadata.map { .init(sessionID: sessionID, titleMetadata: $0) }
+        }
+        guard changed.contains(tabID) else { return }
+        manager.markWorkspaceDirty()
+        manager.pollAndSaveState()
+        if let current = manager.activeWorkspace { loadComposeTabsFromWorkspace(current) }
+        NotificationCenter.default.post(
+            name: .composeTabNameChanged,
+            object: nil,
+            userInfo: ["tabID": tabID, "windowID": windowID, "name": snapshot.name]
+        )
+    }
+
     @MainActor
     func closeComposeTabs(
         withIDs ids: Set<UUID>,

@@ -1,7 +1,7 @@
 import Foundation
 
 /// How a delegation operation relates to batch confirmation cards (design §2.5).
-package enum DomainDelegationScopeConfirmationClass: String, Hashable, Sendable {
+package enum DomainDelegationScopeConfirmationClass: String, Hashable {
     /// Read-only or scope-lifecycle; never carded.
     case none
     /// Reversible; carded only when it affects more items than the scope threshold.
@@ -14,7 +14,7 @@ package enum DomainDelegationScopeConfirmationClass: String, Hashable, Sendable 
 }
 
 /// Which guardrail family an operation consumes.
-package enum DomainDelegationScopeGuardrailUse: String, Hashable, Sendable {
+package enum DomainDelegationScopeGuardrailUse: String, Hashable {
     /// Creates one new live session below the target (its organizational parent).
     case session
     /// Creates one new worktree.
@@ -48,7 +48,7 @@ package extension DomainAgentSessionTargetOperation {
             nil
         case .adminInventory, .adminGet, .adminTree, .adminLinks, .adminWorktreeInventory:
             .observe
-        case .adminRename, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
+        case .adminRename, .adminAssociatePR, .adminCorrectPRs, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
              .adminArchive, .adminUnarchive:
             .organize
         case .adminLink, .adminUnlink, .adminReparent, .adminAdopt, .adminRelease:
@@ -136,7 +136,7 @@ package extension DomainAgentSessionTargetOperation {
             .alwaysCarded
         case .adminAdopt:
             .adoption
-        case .adminRename, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
+        case .adminRename, .adminAssociatePR, .adminCorrectPRs, .adminSetPin, .adminReorderPins, .adminSetGroup, .adminReorderGroups,
              .adminArchive, .adminUnarchive, .adminLink, .adminUnlink, .adminReparent, .adminRelease,
              .adminSetModel, .adminSetEffort, .adminWorktreeBind, .adminWorktreeUnbind:
             .reversible

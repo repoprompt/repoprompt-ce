@@ -52,6 +52,9 @@ actor AgentSessionDataService {
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let diskWriter = AgentSessionDiskWriter()
+    // Actor-owned state shared only with the title persistence extension.
+    var titleHighWaterByFileURL: [URL: AgentSessionTitleSnapshot] = [:]
+    private var sessionPreparationSequence: UInt64 = 0
     private static let sidebarStreamMetadataIndexReconciliationDelaySeconds: TimeInterval = 2.0
 
     private struct MetadataIndexReconciliationTaskState {
@@ -111,12 +114,13 @@ actor AgentSessionDataService {
 
     // MARK: - Lightweight decode helpers
 
-    private struct AgentSessionHeader: Decodable {
+    struct AgentSessionHeader: Decodable {
         let id: UUID
         let serializationVersion: Int?
         let workspaceID: UUID?
         let composeTabID: UUID?
         let name: String
+        let titleMetadata: AgentSessionTitleMetadata?
         let savedAt: Date
         let itemCount: Int?
         let transcriptProjectionCounts: AgentTranscriptProjectionCounts?
@@ -300,7 +304,7 @@ actor AgentSessionDataService {
         stored.itemCount = metadata.itemCount
         stored.transcriptProjectionCounts = metadata.transcriptProjectionCounts
         stored.lastUserMessageAt = metadata.lastUserMessageAt
-        return stored
+        return reconcileTitle(in: stored, fileURL: fileURL)
     }
 
     private func normalizeLoadedSession(
@@ -407,8 +411,8 @@ actor AgentSessionDataService {
         )
     }
 
-    private func writeDataAtomically(_ data: Data, to fileURL: URL) async throws -> AgentSessionDiskWriter.Receipt? {
-        try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL)
+    private func writeDataAtomically(_ data: Data, to fileURL: URL, preparationSequence: UInt64? = nil) async throws -> AgentSessionDiskWriter.Receipt? {
+        try await diskWriter.enqueueAndWait(data: data, url: fileURL.standardizedFileURL, preparationSequence: preparationSequence)
     }
 
     private func finishMetadataPublication(for fileURL: URL) {
@@ -448,6 +452,18 @@ actor AgentSessionDataService {
         return await AgentSessionWorktreeMergeReconciler.reconcile(operations, hooks: hooks)
     }
 
+    func hasPendingMetadataPublication(for fileURL: URL) -> Bool {
+        metadataPublicationsByURL[fileURL] != nil
+    }
+
+    /// Shared title extension uses the same canonical path and deletion fence as ordinary saves.
+    func titleStateFileURL(id: UUID, workspace: WorkspaceModel) throws -> URL {
+        let fileURL = try ensureAgentSessionsFolder(for: workspace)
+            .appendingPathComponent("AgentSession-\(id.uuidString).json").standardizedFileURL
+        try ensureSessionWriteAllowed(id, fileURL: fileURL)
+        return fileURL
+    }
+
     private func ensureSessionWriteAllowed(_ sessionID: UUID, fileURL: URL) throws {
         let fileURL = fileURL.standardizedFileURL
         guard !deletedSessionFileURLs.contains(fileURL) else {
@@ -466,6 +482,8 @@ actor AgentSessionDataService {
         folder: URL,
         isLoadRepair: Bool
     ) async throws {
+        sessionPreparationSequence += 1
+        let preparationSequence = sessionPreparationSequence
         let fileURL = fileURL.standardizedFileURL
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
         metadataPublicationsByURL[fileURL, default: MetadataPublication()].activeCount += 1
@@ -476,7 +494,39 @@ actor AgentSessionDataService {
             }
         #endif
         try ensureSessionWriteAllowed(session.id, fileURL: fileURL)
-        let receipt = try await writeDataAtomically(encodedData, to: fileURL)
+        // A load repair (or the DEBUG gate) may have suspended after preparing its bytes.
+        // Reconcile again at final admission so a newer title cannot be overwritten by that repair.
+        let admittedSession = reconcileTitle(in: session, fileURL: fileURL)
+        let encodedData = admittedSession.titleMetadata == session.titleMetadata && admittedSession.name == session.name
+            ? encodedData : try encoder.encode(admittedSession)
+        let session = admittedSession
+        let receipt: AgentSessionDiskWriter.Receipt?
+        do {
+            receipt = try await writeDataAtomically(encodedData, to: fileURL, preparationSequence: preparationSequence)
+        } catch {
+            if titleHighWaterByFileURL[fileURL]?.metadata == session.titleMetadata {
+                titleHighWaterByFileURL[fileURL]?.persistenceState = "failed"
+                if let workspaceID = session.workspaceID, let snapshot = titleHighWaterByFileURL[fileURL] {
+                    let publication = AgentSessionTitleCoordinator.Publication(workspaceID: workspaceID, sessionID: session.id, snapshot: snapshot)
+                    Task { @MainActor in
+                        NotificationCenter.default.post(name: AgentSessionTitleCoordinator.didPublish, object: nil, userInfo: ["publication": publication])
+                    }
+                }
+            }
+            throw error
+        }
+        if receipt != nil, !deletedSessionFileURLs.contains(fileURL), let metadata = session.titleMetadata,
+           (titleHighWaterByFileURL[fileURL]?.revision ?? 0) <= (metadata.revision ?? 0)
+        {
+            let snapshot = AgentSessionTitleSnapshot(metadata: metadata, name: session.name, persistenceState: "persisted")
+            titleHighWaterByFileURL[fileURL] = snapshot
+            if let workspaceID = session.workspaceID {
+                let publication = AgentSessionTitleCoordinator.Publication(workspaceID: workspaceID, sessionID: session.id, snapshot: snapshot)
+                Task { @MainActor in
+                    NotificationCenter.default.post(name: AgentSessionTitleCoordinator.didPublish, object: nil, userInfo: ["publication": publication])
+                }
+            }
+        }
         #if DEBUG
             if let testAfterSessionWriteHook {
                 await testAfterSessionWriteHook(fileURL)
@@ -1241,6 +1291,9 @@ actor AgentSessionDataService {
             throw AgentSessionDataError.sessionDeleted(session.id)
         }
 
+        if titleHighWaterByFileURL[fileURL] == nil, FileManager.default.fileExists(atPath: fileURL.path) {
+            _ = try prepareTitleState(id: session.id, workspace: workspace, fallbackName: session.name)
+        }
         let sessionToSave = sessionPreparedForStorage(
             session,
             fileURL: fileURL,
@@ -1260,19 +1313,6 @@ actor AgentSessionDataService {
         return fileURL
     }
 
-    func renameAgentSession(
-        id: UUID,
-        to newName: String,
-        for workspace: WorkspaceModel
-    ) async throws {
-        let validatedName = AgentSession.validatedName(newName)
-        guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        guard var session = try await loadAgentSession(id: id, for: workspace) else { return }
-        guard session.name != validatedName else { return }
-        session.name = validatedName
-        _ = try await saveAgentSession(session, for: workspace)
-    }
-
     /// Load an AgentSession from disk.
     func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
         let filename = fileURL.lastPathComponent
@@ -1282,7 +1322,7 @@ actor AgentSessionDataService {
 
         do {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-            let session = try decoder.decode(AgentSession.self, from: data)
+            let session = try reconcileTitle(in: decoder.decode(AgentSession.self, from: data), fileURL: fileURL)
             if session.selfCompactPersistenceWarning {
                 try preserveMalformedSelfCompactRecord(data, from: fileURL)
             }
@@ -1314,7 +1354,7 @@ actor AgentSessionDataService {
             } else {
                 try await persistLoadedMetadataIfIndexPresent(runtimeSession, fileURL: fileURL, observedData: data)
             }
-            return runtimeSession
+            return reconcileTitle(in: runtimeSession, fileURL: fileURL)
         } catch {
             throw AgentSessionDataError.loadFailed(error)
         }
@@ -1334,6 +1374,7 @@ actor AgentSessionDataService {
         do {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
             let header = try decoder.decode(AgentSessionHeader.self, from: data)
+            observeTitle(metadata: header.titleMetadata, name: header.name, fileURL: fileURL)
             var recoveredLastUserMessageAt = header.lastUserMessageAt
             var recoveredProjectionCounts = header.transcriptProjectionCounts
             var count = recoveredProjectionCounts?.canonicalVisibleRowCount ?? header.itemCount ?? 0
@@ -1386,7 +1427,8 @@ actor AgentSessionDataService {
                 serializationVersion: header.serializationVersion ?? AgentSession.legacyUnversionedSerializationVersion,
                 workspaceID: header.workspaceID,
                 composeTabID: header.composeTabID,
-                name: header.name,
+                name: titleHighWaterByFileURL[fileURL.standardizedFileURL]?.name ?? header.name,
+                titleMetadata: titleHighWaterByFileURL[fileURL.standardizedFileURL]?.metadata ?? header.titleMetadata,
                 savedAt: header.savedAt,
                 fileURL: fileURL,
                 items: [],
@@ -1475,6 +1517,7 @@ actor AgentSessionDataService {
                         id: session.id,
                         composeTabID: session.composeTabID,
                         name: session.name,
+                        titleMetadata: session.titleMetadata,
                         lastModified: lastModified,
                         itemCount: session.effectiveItemCount,
                         agentKind: session.agentKind,
@@ -1531,6 +1574,7 @@ actor AgentSessionDataService {
                             id: session.id,
                             composeTabID: session.composeTabID,
                             name: session.name,
+                            titleMetadata: session.titleMetadata,
                             lastModified: lastModified,
                             itemCount: session.effectiveItemCount,
                             agentKind: session.agentKind,
@@ -1797,6 +1841,7 @@ actor AgentSessionDataService {
         // Publish the irreversible fact before the reporter hop: a late admitted write must be
         // withdrawn even while committed cleanup is suspended. A refused attempt never sets this.
         committedSessionDeletionFileURLs.insert(fileURL)
+        titleHighWaterByFileURL.removeValue(forKey: fileURL.standardizedFileURL)
         await AgentSessionDurableDeletionReporter.didCommitDurableDeletion(attempt, fileRemoved: fileRemoved)
         // Retained images belong to the committed session; a refused attempt never reaches here.
         AgentSessionAttachmentStore.removeSessionFolder(sessionID: sessionID, agentSessionsFolder: fileURL.deletingLastPathComponent())
@@ -1809,6 +1854,7 @@ actor AgentSessionDataService {
         folder: URL
     ) async throws {
         guard committedSessionDeletionFileURLs.contains(fileURL) else { return }
+        titleHighWaterByFileURL.removeValue(forKey: fileURL.standardizedFileURL)
         try AppProfileLocations.current.validateMetadataFile(fileURL)
         try? FileManager.default.removeItem(at: fileURL)
         await removeMetadataRecords(

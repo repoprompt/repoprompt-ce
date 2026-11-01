@@ -519,6 +519,7 @@ extension AgentModeViewModel {
             tabID: tab.id,
             order: order,
             normalizedName: AgentSessionRestoreSupport.normalizedSessionTitle(tab.name),
+            titleMetadata: tab.agentTitleProjection?.titleMetadata,
             activeAgentSessionID: tab.activeAgentSessionID,
             isPinned: tab.isPinned,
             pinnedOrder: tab.pinnedOrder,
@@ -559,6 +560,10 @@ extension AgentModeViewModel {
                     runState: session.runState,
                     lastActivityAt: session.lastActivityAt,
                     lastUserMessageAt: session.lastUserMessageAt,
+                    titleMetadata: session.titleMetadata,
+                    activeTask: session.activeTask == nil ? nil : session.displayedRunningStatusText,
+                    unreportedPullRequestNotice: session.unreportedPullRequestNotice,
+                    titleBindingToken: session.currentRestorationBindingToken,
                     worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
                     worktreeMergeAttention: AgentWorktreeMergeBlockerSelector.sidebarAttention(
                         in: session.worktreeMergeOperations
