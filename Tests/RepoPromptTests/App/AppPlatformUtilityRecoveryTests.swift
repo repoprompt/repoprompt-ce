@@ -2302,3 +2302,61 @@ extension TipHistoryStoreTests {
         await store.shutdown()
     }
 }
+
+/// Throttle decision behind the activation-triggered passive appcast re-check (#110).
+final class SparkleActivationUpdateCheckTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_000_000)
+
+    func testMinimumIntervalIsAboutHourlyAndWellBelowPeriodicTimer() {
+        XCTAssertEqual(SparkleUpdaterManager.activationCheckMinimumInterval, 60 * 60)
+    }
+
+    func testNeverCheckedAndNeverAttemptedChecksImmediately() {
+        XCTAssertTrue(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: 0,
+            lastAttempt: nil,
+            now: now
+        ))
+    }
+
+    func testRecentAttemptThrottlesEvenWithoutSuccessfulCheck() {
+        // A failing feed must not be hammered on every focus change.
+        XCTAssertFalse(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: 0,
+            lastAttempt: now.addingTimeInterval(-10 * 60),
+            now: now
+        ))
+    }
+
+    func testRecentSuccessfulCheckThrottlesWithoutInMemoryAttempt() {
+        XCTAssertFalse(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-30 * 60).timeIntervalSince1970,
+            lastAttempt: nil,
+            now: now
+        ))
+    }
+
+    func testStaleCheckAndStaleAttemptAllowRecheck() {
+        XCTAssertTrue(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-2 * 60 * 60).timeIntervalSince1970,
+            lastAttempt: now.addingTimeInterval(-2 * 60 * 60),
+            now: now
+        ))
+    }
+
+    func testExactMinimumIntervalBoundaryAllowsRecheck() {
+        let interval: TimeInterval = 600
+        XCTAssertTrue(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-interval).timeIntervalSince1970,
+            lastAttempt: now.addingTimeInterval(-interval),
+            now: now,
+            minimumInterval: interval
+        ))
+        XCTAssertFalse(SparkleUpdaterManager.shouldPerformActivationCheck(
+            lastSuccessfulCheckTimestamp: now.addingTimeInterval(-interval + 1).timeIntervalSince1970,
+            lastAttempt: nil,
+            now: now,
+            minimumInterval: interval
+        ))
+    }
+}

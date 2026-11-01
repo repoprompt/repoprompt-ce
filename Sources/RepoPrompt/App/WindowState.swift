@@ -861,6 +861,19 @@ class WindowState: ObservableObject {
             self?.retirePendingRestoreEntry()
         }
 
+        // The per-window MCP tools switch is part of the saved window session (#143), so a change
+        // re-captures the session like a workspace switch does. Persistence stays gated during
+        // restore, so the auto-start seeding at launch cannot overwrite the saved snapshot.
+        mcpServer.$windowToolsEnabled
+            .dropFirst()
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, !isClosing else { return }
+                windowStatesManager?.persistWindowSession(reason: "mcpToolsEnabled:\(windowID)")
+            }
+            .store(in: &cancellables)
+
         // Process any queued commands once the workspace is initialized
         workspaceManager.onceInitialized { [weak self] in
             guard let self else { return }
@@ -1863,7 +1876,22 @@ class WindowState: ObservableObject {
         windowStatesManager?.windowRestoreExecutionDidChange()
         displacedCompletion?()
         StartupPhaseLog.mark(.restoreEntryAssigned, window: windowID)
+        applyRestoredMCPToolsPreference(entry.mcpToolsEnabled)
         applyPendingRestoreEntryIfPossible()
+    }
+
+    /// A restored window keeps its own MCP tools switch (#143). The preference is independent of
+    /// the workspace the entry names, so it applies at acceptance rather than after the switch.
+    /// New windows keep seeding from the global default inside `MCPServerViewModel`; a `nil`
+    /// (legacy) preference leaves that seeding untouched, and the global default is never written.
+    private func applyRestoredMCPToolsPreference(_ preference: Bool?) {
+        guard let preference else { return }
+        // Compared inside the task so the view model's own auto-start seeding task, enqueued at
+        // composition, has already recorded its intent; a redundant transition is then skipped.
+        Task { [weak self] in
+            guard let self, preference != mcpServer.windowToolsAreRequested else { return }
+            _ = await mcpServer.setWindowToolsEnabled(preference)
+        }
     }
 
     /// Completes a not-yet-dispatched restore exactly once without dispatching it. Its protection
@@ -2020,7 +2048,8 @@ class WindowState: ObservableObject {
             isEphemeral: workspace.isEphemeral,
             primaryRepoPath: workspace.repoPaths.first.map { ($0 as NSString).expandingTildeInPath },
             lastFocused: isCurrentlyFocused,
-            workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id)
+            workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id),
+            mcpToolsEnabled: mcpServer.windowToolsAreRequested
         )
     }
 

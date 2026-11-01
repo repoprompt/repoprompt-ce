@@ -127,3 +127,115 @@ final class WindowStatesManagerObservationScopeTests: XCTestCase {
         var count = 0
     }
 }
+
+/// #143 (chunk 3): the per-window "Enable MCP tools for this window" switch is part of the saved
+/// window session. New windows still seed from the global default; restored windows use their own
+/// saved value; neither path writes the global default.
+@MainActor
+final class WindowSessionMCPToolsPreferenceTests: XCTestCase {
+    func testLegacySnapshotDecodesWithoutPreferenceAndExplicitValuesStayPerWindow() throws {
+        let workspaceID = UUID()
+        let legacy = """
+        {"version":1,"windows":[
+          {"windowKind":"standard","workspaceID":"\(workspaceID.uuidString)","isSystemWorkspace":false,"isEphemeral":false,"lastFocused":true}
+        ]}
+        """
+        let decodedLegacy = try JSONDecoder().decode(WindowSessionSnapshot.self, from: Data(legacy.utf8))
+        XCTAssertNil(decodedLegacy.windows[0].mcpToolsEnabled)
+
+        // Two windows on the same workspace may restore different values.
+        let snapshot = WindowSessionSnapshot(version: 1, windows: [
+            makeEntry(workspaceID: workspaceID, mcpToolsEnabled: true),
+            makeEntry(workspaceID: workspaceID, mcpToolsEnabled: false),
+            makeEntry(workspaceID: workspaceID, mcpToolsEnabled: nil)
+        ])
+        let roundTripped = try JSONDecoder().decode(WindowSessionSnapshot.self, from: JSONEncoder().encode(snapshot))
+        XCTAssertEqual(roundTripped.windows.map(\.mcpToolsEnabled), [true, false, nil])
+    }
+
+    func testRestoredEnabledPreferenceOverridesDisabledGlobalDefaultWithoutMutatingIt() async throws {
+        let window = try await makeWindow(globalDefault: false)
+        XCTAssertFalse(window.mcpServer.windowToolsAreRequested)
+
+        window.applyWindowRestoreEntry(makeEntry(workspaceID: UUID(), mcpToolsEnabled: true))
+        try await waitUntil("restored preference enables tools") { window.mcpServer.windowToolsAreRequested }
+        XCTAssertFalse(GlobalSettingsStore.shared.mcpAutoStart(), "Restoring a window never writes the global default")
+    }
+
+    func testRestoredDisabledPreferenceOverridesEnabledGlobalDefault() async throws {
+        let window = try await makeWindow(globalDefault: true)
+        try await waitUntil("global default seeds the new window") { window.mcpServer.windowToolsAreRequested }
+
+        window.applyWindowRestoreEntry(makeEntry(workspaceID: UUID(), mcpToolsEnabled: false))
+        try await waitUntil("restored preference disables tools") { !window.mcpServer.windowToolsAreRequested }
+        XCTAssertTrue(GlobalSettingsStore.shared.mcpAutoStart())
+    }
+
+    func testLegacyEntryWithoutPreferenceKeepsGlobalDefaultSeeding() async throws {
+        let window = try await makeWindow(globalDefault: false)
+        window.applyWindowRestoreEntry(makeEntry(workspaceID: UUID(), mcpToolsEnabled: nil))
+        // Give any (incorrect) transition a chance to run before asserting nothing changed.
+        for _ in 0 ..< 5 {
+            await Task.yield()
+        }
+        XCTAssertFalse(window.mcpServer.windowToolsAreRequested)
+    }
+
+    func testLiveSessionCaptureRecordsThisWindowsSwitch() async throws {
+        let window = try await makeWindow(globalDefault: false)
+        let workspace = WorkspaceModel(name: "Captured", repoPaths: [NSTemporaryDirectory()])
+        await window.workspaceManager.awaitInitialized()
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        window.setWorkspaceInstanceAssignment(.init(workspaceID: workspace.id, number: 1))
+
+        XCTAssertEqual(window.sessionCaptureCandidate().entry?.mcpToolsEnabled, false)
+
+        _ = await window.mcpServer.setWindowToolsEnabled(true)
+        XCTAssertEqual(window.sessionCaptureCandidate().entry?.mcpToolsEnabled, true)
+        XCTAssertFalse(GlobalSettingsStore.shared.mcpAutoStart())
+    }
+
+    // MARK: - Helpers
+
+    private func makeWindow(globalDefault: Bool) async throws -> WindowState {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(globalDefault, commit: false)
+        let window = WindowState()
+        addTeardownBlock { @MainActor in
+            _ = await window.mcpServer.setWindowToolsEnabled(false)
+            window.beginClose()
+            await window.tearDown()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        }
+        return window
+    }
+
+    private func makeEntry(workspaceID: UUID, mcpToolsEnabled: Bool?) -> WindowSessionEntry {
+        WindowSessionEntry(
+            windowKind: .standard,
+            workspaceID: workspaceID,
+            workspaceName: "Saved",
+            isSystemWorkspace: false,
+            isEphemeral: false,
+            primaryRepoPath: nil,
+            lastFocused: true,
+            workspaceInstanceNumber: 1,
+            mcpToolsEnabled: mcpToolsEnabled
+        )
+    }
+
+    private func waitUntil(
+        _ description: String,
+        timeout: TimeInterval = 10,
+        _ condition: @MainActor () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else {
+                return XCTFail("Timed out waiting for: \(description)")
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+    }
+}
