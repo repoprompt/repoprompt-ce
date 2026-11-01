@@ -112,3 +112,55 @@ final class CodexComputerUseCompanionToolNameTests: XCTestCase {
         XCTAssertFalse(MCPIntegrationHelper.isComputerUseCompanionToolName(nil))
     }
 }
+
+/// Issue #20: Computer Use setup reports what RepoPrompt can verify and gives honest guidance for
+/// the macOS permissions it cannot read.
+final class CodexComputerUseSetupStatusTests: XCTestCase {
+    func testReadyCompanionAndSignedRuntime() {
+        let status = CodexComputerUseSetupStatus.evaluate(companionPath: "/Applications/Codex.app/client", runtimeMessage: nil)
+        XCTAssertEqual(status.companion.state, .ready)
+        XCTAssertEqual(status.runtime.state, .ready)
+    }
+
+    func testMissingCompanionNeedsAction() {
+        let status = CodexComputerUseSetupStatus.evaluate(companionPath: nil, runtimeMessage: nil)
+        XCTAssertEqual(status.companion.state, .needsAction)
+        XCTAssertTrue(status.companion.detail.contains("Install the Computer Use plugin"))
+    }
+
+    func testRuntimeCheckInProgressAndFailure() {
+        let checking = CodexComputerUseSetupStatus.evaluate(
+            companionPath: nil,
+            runtimeMessage: CodexComputerUseWorkflow.checkingRuntimeMessage
+        )
+        XCTAssertEqual(checking.runtime.state, .checking)
+
+        let failed = CodexComputerUseSetupStatus.evaluate(
+            companionPath: "/client",
+            runtimeMessage: CodexComputerUseWorkflow.runtimeRequirementMessage
+        )
+        XCTAssertEqual(failed.runtime.state, .needsAction)
+        XCTAssertEqual(failed.runtime.detail, CodexComputerUseWorkflow.runtimeRequirementMessage)
+    }
+
+    func testPrivacyPaneLinksTargetEachPaneWithFallback() {
+        XCTAssertEqual(
+            CodexComputerUsePrivacyPane.screenRecording.settingsURLs.map(\.absoluteString),
+            [
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension"
+            ]
+        )
+        XCTAssertEqual(
+            CodexComputerUsePrivacyPane.accessibility.settingsURLs.first?.absoluteString,
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+        )
+    }
+
+    func testGuidanceAttributesPermissionsToCodexComputerUse() {
+        for text in [CodexComputerUseSetupStatus.permissionGuidance, CodexComputerUseWorkflow.disabledMessage] {
+            XCTAssertTrue(text.contains("Codex Computer Use, not"), text)
+            XCTAssertFalse(text.contains("granted manually"), text)
+        }
+    }
+}
