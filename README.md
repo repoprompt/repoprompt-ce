@@ -41,15 +41,17 @@ and local development.
 For development and quick evaluation, double-click
 [`Launch RepoPrompt CE.command`](Launch%20RepoPrompt%20CE.command) in Finder.
 
-The launcher requires Python 3, builds RepoPrompt CE through the coordinated
-developer daemon, opens the debug app, and keeps a small terminal window
-available for rebuild, status, and stop controls. It does not provide an
+The launcher requires Python 3 and reuses the packaged debug app through the
+coordinated developer daemon, without rebuilding. On first use, press `r` to build
+and package it once; press `r` again after source edits you want to run. Ordinary
+launches preserve the existing isolated debug profile. The terminal window has
+rebuild, fresh-profile, status, and stop controls. It does not provide an
 uncoordinated no-Python fallback because lifecycle actions validate the exact
 debug executable path. It preserves an explicit compatible `DEVELOPER_DIR`, or
 selects an installed full Xcode for the launcher process without changing the
 system-wide `xcode-select` setting.
 
-The debug launcher uses an available `Apple Development:` signing identity. If
+Builds use an available `Apple Development:` signing identity. If
 your Mac does not have one, run the same debug app from Terminal with explicit
 ad-hoc signing:
 
@@ -76,9 +78,45 @@ Apple Development signing path.
 | Key | Action                                      |
 | --- | ------------------------------------------- |
 | `r` | Rebuild and relaunch                        |
+| `f` | Launch packaged app with a fresh production-profile snapshot |
 | `s` | Show app status                             |
 | `x` | Stop the app                                |
 | `q` | Close the launcher without stopping the app |
+
+#### Reuse or explicitly refresh the debug profile
+
+```bash
+make dev-run              # build/package once (or rebuild after source edits), then launch
+make dev-launch-existing  # reuse this checkout's packaged app and existing debug profile
+make dev-fresh-profile    # reuse packaged app, but explicitly import production data
+# Equivalent explicit profile flag:
+./conductor app launch-existing --require-current -- --fresh-profile
+# Distinct empty reset (clean wins if both flags are supplied):
+./conductor app launch-existing --require-current -- --debug-clean-slate
+```
+
+The packaged app lives under `~/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app`;
+its isolated mutable profile is `~/Library/Application Support/RepoPrompt CE Debug`.
+There is no second build cache or automatic source-tree scan. Reuse checks bundle
+provenance; a missing, foreign-checkout, older-commit, or pre-reuse-policy bundle
+requires one explicit rebuild. Uncommitted edits still require `r` to incorporate.
+
+A first ordinary launch starts with an empty isolated profile if none exists.
+`--fresh-profile` copies the existing allowlisted production settings, workflows,
+workspaces, and conversation data through the safe snapshot/rebase pipeline; it
+does not copy provider homes/authentication or rebuildable caches. Large imports
+can take minutes. It is a one-launch request, not a persisted preference: later
+ordinary launches keep the imported profile and subsequent debug edits. Running
+the flag again explicitly refreshes it again. Production is never modified.
+
+Fresh import and empty reset archive the previous profile in `RepoPrompt CE Debug Recovery`;
+only the three newest recognized snapshot archives are retained. Plain reuse does
+not create an archive or reinstall old snapshot preferences. Older debug binaries
+still import production automatically—avoid launching them against valued debug state.
+
+This removes repeated production-copy and build work, not the separate workspace
+catalog initialization cost. A successful launcher result confirms the process
+exists, not that its window, workspace, or agent provider is ready.
 
 ### Install a local production build
 

@@ -6,6 +6,9 @@ import RepoPromptShared
 /// Bounded, read-only source capture followed by a same-volume atomic publish.
 /// No live app store may be opened until this startup operation succeeds.
 struct DebugStateSnapshot {
+    static let seedPreferencesFileName = "seedPreferences.plist"
+    static let pendingPreferencesMarkerName = "seedPreferences.pending"
+
     struct Stamp: Equatable {
         let inode: UInt64
         let size: Int64
@@ -473,7 +476,8 @@ struct DebugStateSnapshot {
             try data.write(to: target, options: .withoutOverwriting)
             bytes += data.count
         }
-        try preferences.write(to: stage.appendingPathComponent("seedPreferences.plist"), options: .withoutOverwriting)
+        try preferences.write(to: stage.appendingPathComponent(Self.seedPreferencesFileName), options: .withoutOverwriting)
+        try Data().write(to: stage.appendingPathComponent(Self.pendingPreferencesMarkerName), options: .withoutOverwriting)
         try plan.verifyDatabaseReads()
         let receipt = Receipt(
             version: 1,

@@ -30,7 +30,11 @@ make doctor     # verify Swift/Xcode command line tool setup, SDK, signing diagn
 make dev-run    # coordinated build, package, stop existing RepoPrompt, and launch the debug app
 ```
 
-`make dev-run` routes through the developer daemon (see "Developer daemon / coordinated validation") and remains the ordinary FIFO coordinated launch path. For a user-directed newest lifecycle action, use `./conductor app relaunch`; the Finder launcher uses that operation when `python3` is available. The uncoordinated equivalents are `make run` or `./Scripts/run.sh`.
+`make dev-run` routes through the developer daemon and explicitly builds/packages before launching. After one build, ordinary launches should use `make dev-launch-existing`: reuse this checkout's packaged app and existing isolated profile, without building. The Finder launcher does the same; `r` explicitly rebuilds/relaunches and `f` imports a fresh production-profile snapshot. `./conductor app relaunch` remains the user-directed newest rebuild/lifecycle action. The uncoordinated build-and-launch equivalents are `make run` or `./Scripts/run.sh`.
+
+Debug profile policy: ordinary launches preserve the existing `RepoPrompt CE Debug` files and preferences; if absent, app stores start empty. Explicit `--fresh-profile` imports production through the existing safe snapshot pipeline for that launch only. Use `make dev-fresh-profile` or `./conductor app launch-existing --require-current -- --fresh-profile`. Later ordinary launches reuse the imported profile and debug edits; supplying the flag again explicitly refreshes again. `--debug-clean-slate` remains an explicit empty reset and takes precedence over fresh import. Both archive prior debug state under `RepoPrompt CE Debug Recovery` (only three newest recognized snapshots retained); neither writes production or copies provider homes/authentication. Ordinary reuse does no production capture or archive. Interrupted preference installation is completed before stores open, never by replaying old seed preferences on every launch. Large explicit imports and workspace-catalog initialization can still take time; process existence is not UI/agent readiness.
+
+`--require-current` rejects missing/incompatible provenance, foreign-checkout, older-commit, or pre-profile-reuse-policy bundles before stopping any app; rebuild once when rejected. It does not detect uncommitted source edits: rebuild explicitly to include them. The existing shared `DebugApps/RepoPrompt.app` is the reusable artifact; do not introduce another app cache or bypass daemon locks.
 
 Debug packaging may auto-detect an Apple Development signing identity for a valid local app signature and persistent, team-isolated Keychain storage. Set `DEBUG_SECURE_STORAGE_BACKEND=alternate-in-memory` to opt out of persistence for a signed debug build. If no stable identity is available, set `ALLOW_ADHOC_SIGNING=1` to build an ad-hoc debug app; ad-hoc debug builds use ephemeral in-memory secure storage, so API keys and secure permission changes do not persist across launches. Release packaging requires `SIGN_IDENTITY` and continues to use real Keychain storage.
 
@@ -160,7 +164,8 @@ make dev-status
 make dev-build
 make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRODUCT=RepoPrompt|repoprompt-mcp|all, default all)
 make dev-run
-make dev-launch-existing                         # launch current DebugApps bundle without building
+make dev-launch-existing                         # reuse packaged app + existing profile; no build
+make dev-fresh-profile                           # reuse packaged app + explicit production import
 make dev-test                                       # full coordinated test suite
 make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
 make dev-provider-test                              # RepoPromptAgentProviders package tests (FILTER= also supported)
@@ -193,8 +198,8 @@ Daemon output defaults are intentionally concise for agent use: synchronous `dev
 Behavior notes:
 
 - `make dev-run` (daemon `run`) builds/packages a unique staged app under heavy admission, releases that heavy slot, then takes the live-app lock for stop/staged-bundle activation/open/confirm against the shared `DebugApps/RepoPrompt.app` bundle. A build/package failure performs no lifecycle action and does not mutate the live bundle.
-- `./conductor app launch-existing` / `make dev-launch-existing` requires the shared debug app bundle to already exist, reports bundle provenance, never waits for heavy admission, and never falls back to building.
-- `./conductor app relaunch` is the overriding interactive relaunch used by the Finder launcher; like `app stop`, it can cancel older active or queued `liveApp` work. It builds/packages before replacing the visible app, so a failure before lifecycle work begins does not itself stop or reopen an already-running app.
+- `./conductor app launch-existing` requires the shared debug app bundle to already exist, reports bundle provenance, never waits for heavy admission, and never falls back to building. `make dev-launch-existing` adds `--require-current` for strict checkout/commit/profile-policy admission before stop/open. `make dev-fresh-profile` adds the one-launch `--fresh-profile` import flag. A newly empty profile may need explicit import before smoke flows that assume existing workspaces.
+- `./conductor app relaunch` is the overriding explicit rebuild/relaunch (Finder launcher `r`); like `app stop`, it can cancel older active or queued `liveApp` work. It builds/packages before replacing the visible app, so a failure before lifecycle work begins does not itself stop or reopen an already-running app.
 - Do not assume an in-flight `run`, `smoke`, or diagnostics job will complete if another operator issues `app stop` or interactive `app relaunch`.
 - `make dev-smoke` is the non-disruptive live-only check: it assumes the CE debug app is already running and the debug CLI is installed/resolvable.
 - `make dev-smoke-launch` (or `./conductor smoke --launch`) builds/packages and launches the debug app before smoke validation.
