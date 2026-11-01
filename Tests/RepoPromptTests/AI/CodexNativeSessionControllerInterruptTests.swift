@@ -132,6 +132,11 @@ final class CodexCLIProviderPerfRecorderTests: XCTestCase {
             requestTimeout: 10
         ) as? CodexNativeSessionController)
 
+        XCTAssertTrue(provider.interactiveSessionOptions(
+            excludeServers: [], requestTimeout: 10
+        ).exactResponseUsageEnabled)
+        XCTAssertFalse(CodexNativeSessionController.Options.agentModeDefault().exactResponseUsageEnabled)
+
         await controller.debugRecordLifecyclePhaseForTesting()
 
         XCTAssertEqual(recorder.recordedPhases(), [.runtimeResolution])
@@ -176,6 +181,88 @@ final class CodexMCPDiscoveryPolicyTests: XCTestCase {
 
 final class CodexAppServerFramingTests: XCTestCase {
     private let budget = 64 * 1024 * 1024
+
+    func testExactResponseUsageNormalizationIsOptInAndDoesNotMirrorText() async throws {
+        for enabled in [false, true] {
+            var options = CodexNativeSessionController.Options.agentModeDefault()
+            XCTAssertFalse(options.exactResponseUsageEnabled)
+            options.exactResponseUsageEnabled = enabled
+            let controller = CodexNativeSessionController(
+                client: CodexAppServerClient(), runID: UUID(), tabID: UUID(), windowID: 1,
+                workspacePaths: .uniform(NSTemporaryDirectory()), options: options,
+                requestExecutor: { method, params, _ in
+                    XCTAssertEqual(method, "thread/start")
+                    XCTAssertEqual(params?["experimentalRawEvents"] as? Bool, enabled ? true : nil)
+                    return [:]
+                }
+            )
+            _ = try await controller.test_startThreadBinding()
+            await controller.test_installThreadState(threadID: "thread", authoritativeTurnID: "turn", routingTurnID: "turn")
+            let stream = controller.events
+            let usages: [CodexJSONValue?] = [
+                .object(["inputTokens": .number(0), "outputTokens": .number(7)]),
+                .null, nil,
+                .object(["inputTokens": .number(-1), "outputTokens": .number(1)]),
+                .object(["inputTokens": .number(1.5), "outputTokens": .number(1)]),
+                .object(["inputTokens": .string("1"), "outputTokens": .number(1)]),
+                .object(["inputTokens": .bool(true), "outputTokens": .number(1)]),
+                .object(["inputTokens": .number(1e30), "outputTokens": .number(1)]),
+                .object(["inputTokens": .number(9_007_199_254_740_992), "outputTokens": .number(1)]),
+                .object(["inputTokens": .number(1)])
+            ]
+            for (index, usage) in usages.enumerated() {
+                var params: [String: CodexJSONValue] = [
+                    "threadId": .string("thread"), "turnId": .string("turn"),
+                    "responseId": .string("response-\(index)")
+                ]
+                params["usage"] = usage
+                await controller.test_handleNotification(method: "rawResponse/completed", params: params)
+            }
+            let malformedResponseIDs: [CodexJSONValue?] = [nil, .number(7), .string("")]
+            for responseID in malformedResponseIDs {
+                var params: [String: CodexJSONValue] = [
+                    "threadId": .string("thread"), "turnId": .string("turn"),
+                    "usage": .object(["inputTokens": .number(2), "outputTokens": .number(3)])
+                ]
+                params["responseId"] = responseID
+                await controller.test_handleNotification(method: "rawResponse/completed", params: params)
+            }
+            await controller.test_handleNotification(method: "rawResponse/completed", params: ["usage": .null])
+            await controller.test_handleNotification(method: "rawResponseItem/completed", params: [
+                "threadId": .string("thread"), "turnId": .string("turn"),
+                "item": .object([
+                    "type": .string("message"),
+                    "role": .string("assistant"),
+                    "content": .array([.object(["type": .string("output_text"), "text": .string("mirror")])])
+                ])
+            ])
+            await controller.shutdown()
+            var normalized: [CodexNativeSessionController.ResponseUsage?] = []
+            var missingResponseIDs = 0
+            for await event in stream {
+                switch event {
+                case let .responseUsage(threadID, turnID, responseID, usage):
+                    XCTAssertEqual(threadID, "thread")
+                    XCTAssertEqual(turnID, "turn")
+                    if responseID == nil {
+                        missingResponseIDs += 1
+                        XCTAssertEqual(usage, .init(inputTokens: 2, outputTokens: 3))
+                    } else {
+                        normalized.append(usage)
+                    }
+                case .assistantDelta, .canonicalAssistantDelta, .assistantCompleted:
+                    XCTFail("Raw response mirrors must not emit text")
+                default: break
+                }
+            }
+            XCTAssertEqual(missingResponseIDs, enabled ? 3 : 0)
+            XCTAssertEqual(normalized.count, enabled ? usages.count : 0)
+            if enabled {
+                XCTAssertEqual(normalized[0], .init(inputTokens: 0, outputTokens: 7))
+                XCTAssertTrue(normalized.dropFirst().allSatisfy { $0 == nil })
+            }
+        }
+    }
 
     @MainActor
     func testLargeResumeSettlesWithRestoredStateAndTokenReplayAcrossChunkings() async throws {

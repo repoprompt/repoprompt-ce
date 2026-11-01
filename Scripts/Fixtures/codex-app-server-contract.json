@@ -431,6 +431,7 @@
         "baseInstructions",
         "config",
         "cwd",
+        "experimentalRawEvents",
         "model",
         "serviceTier"
       ],

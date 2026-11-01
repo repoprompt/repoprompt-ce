@@ -9,6 +9,65 @@ import SwiftOpenAI
 import XCTest
 
 final class OracleTransportActivityPropagationTests: XCTestCase {
+    func testCodexExactUsageAggregationAndAttribution() async throws {
+        typealias Event = CodexNativeSessionController.Event
+        func usage(_ id: String?, _ input: Int?, _ output: Int = 0, thread: String = "matrix", turn: String = "matrix") -> Event {
+            .responseUsage(
+                threadID: thread,
+                turnID: turn,
+                responseID: id,
+                usage: input.map { .init(inputTokens: $0, outputTokens: output) }
+            )
+        }
+        let cases: [([Event], Int?, Int?)] = [
+            ([usage("a", 2, 3), usage("b", 5, 7), usage("a", 2, 3)], 7, 10),
+            ([usage("a", 0), usage("other", 9, thread: "wrong"), usage("old", 9, turn: "wrong")], 0, 0),
+            ([usage("a", 2), usage("a", 3)], nil, nil),
+            ([usage("a", 2), usage("b", nil)], nil, nil),
+            ([usage("a", 2), usage(nil, 3)], nil, nil),
+            ([usage("a", Int.max), usage("b", 1)], nil, nil),
+            ([usage("a", 0, Int.max), usage("b", 0, 1)], nil, nil),
+            ([], nil, nil)
+        ]
+        for (events, input, output) in cases {
+            let controller = RecordingCodexController()
+            controller.scriptedEvents = events + [.assistantDelta("text"), .turnCompleted(turnID: "matrix", status: .completed)]
+            let provider = CodexCLIProvider(sessionControllerFactory: { _, _ in controller })
+            let stream = try await provider.streamMessage(AIMessage(systemPrompt: "", userMessage: "test"), model: .codexCliGpt5Low)
+            var results: [AIStreamResult] = []
+            for try await result in stream {
+                results.append(result)
+            }
+            let stop = try XCTUnwrap(results.first { $0.type == "message_stop" })
+            XCTAssertEqual(stop.promptTokens, input)
+            XCTAssertEqual(stop.completionTokens, output)
+            XCTAssertEqual(results.compactMap(\.text).joined(), "text")
+            XCTAssertEqual(stop.cleanupHandle?.conversationID, "matrix")
+            XCTAssertFalse(controller.hasActiveThread)
+        }
+    }
+
+    func testCodexRecoveredSuccessDiscardsConsumedPartialUsage() async throws {
+        let controller = RecordingCodexController()
+        controller.recoverTerminal = true
+        controller.scriptedEvents = [
+            .responseUsage(threadID: "matrix", turnID: "matrix", responseID: "partial", usage: .init(inputTokens: 12, outputTokens: 3)),
+            .assistantCompleted(.init(scope: .init(turnID: "matrix", itemID: "answer"), text: "recovered text"))
+        ]
+        let provider = CodexCLIProvider(sessionControllerFactory: { _, _ in controller })
+        let stream = try await provider.streamMessage(AIMessage(systemPrompt: "", userMessage: "test"), model: .codexCliGpt5Low)
+        var results: [AIStreamResult] = []
+        for try await result in stream {
+            results.append(result)
+        }
+        let stop = try XCTUnwrap(results.first { $0.type == "message_stop" })
+        XCTAssertNil(stop.promptTokens)
+        XCTAssertNil(stop.completionTokens)
+        XCTAssertEqual(results.compactMap(\.text).joined(), "recovered text")
+        XCTAssertEqual(stop.cleanupHandle?.conversationID, "matrix")
+        XCTAssertFalse(controller.hasActiveThread)
+    }
+
     func testOpenAIDecodedChunkAdapterPreservesChoiceAndDeltaSemantics() throws {
         func chunk(_ object: [String: Any]) throws -> ChatCompletionChunkObject {
             let data = try JSONSerialization.data(withJSONObject: object)
@@ -1037,6 +1096,8 @@ private final class RecordingCodexController: CodexSessionControllerPassiveStubD
         let attachmentFilesExisted: [Bool]
     }
 
+    var scriptedEvents: [CodexNativeSessionController.Event]?
+    var recoverTerminal = false
     private let lock = NSLock()
     private var turn: Turn?
     private var active = false
@@ -1077,8 +1138,28 @@ private final class RecordingCodexController: CodexSessionControllerPassiveStubD
             return FileManager.default.fileExists(atPath: path)
         }
         lock.withLock { turn = Turn(text: text, attachmentFilesExisted: existed) }
-        stream.continuation.yield(.turnCompleted(turnID: "matrix", status: .completed))
+        if let scriptedEvents {
+            for event in scriptedEvents {
+                stream.continuation.yield(event)
+            }
+        } else {
+            stream.continuation.yield(.turnCompleted(turnID: "matrix", status: .completed))
+        }
         return CodexTurnStartReceipt(provisionalSubmissionID: "matrix")
+    }
+
+    func readThreadSnapshot(includeTurns _: Bool, timeout _: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        .init(
+            conversationID: "matrix",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil,
+            runtimeStatus: .idle,
+            currentTurnID: nil,
+            activeTurnIDs: [],
+            latestTerminalTurnID: "matrix",
+            latestTurnStatus: recoverTerminal ? .completed : nil
+        )
     }
 
     func shutdown() async {
