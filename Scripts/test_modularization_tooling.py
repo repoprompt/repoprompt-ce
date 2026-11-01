@@ -347,6 +347,15 @@ class CatalogTests(unittest.TestCase):
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
 
+    def test_supplemental_product_workflows_are_manual_only(self) -> None:
+        # The integration profile above already gates both products. Automatic
+        # copies consume scarce macOS runners without adding an admission gate.
+        for name in ('ci-main.yml', 'release-candidate.yml'):
+            with self.subTest(workflow=name):
+                workflow = (SCRIPT_DIR.parent / '.github/workflows' / name).read_text()
+                events = workflow.split('\non:\n', 1)[1].split('\n\n', 1)[0]
+                self.assertEqual(events.strip(), 'workflow_dispatch:')
+
     def test_package_deadlines_outlive_the_conductor_artifact_budget(self) -> None:
         # The old 120-minute job killed a valid four-hour operation on main.
         # Compare the independent owners rather than pinning another timeout copy.
