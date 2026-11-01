@@ -145,6 +145,7 @@ run_preflight() {
     require_file "$ROOT_DIR/ThirdPartyLicenses/codex/NOTICE"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/extract_staged_release.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_installer_launcher.py"
     require_file "$RUN_WITHOUT_GITHUB_TOKENS"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
@@ -159,6 +160,10 @@ run_preflight() {
     feed_url="$(plutil -extract SUFeedURL raw "$ROOT_DIR/AppBundle/Info.plist.template")"
     [[ "$sparkle_version" == "2.9.2" ]] || fail "Expected vendored Sparkle 2.9.2, got $sparkle_version"
     [[ "$feed_url" == "$EXPECTED_FEED_URL" ]] || fail "Expected CE Sparkle feed $EXPECTED_FEED_URL, got $feed_url"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_installer_launcher.py" \
+        --info-plist "$ROOT_DIR/AppBundle/Info.plist.template" \
+        --entitlements "$ROOT_DIR/AppBundle/RepoPrompt.entitlements.template" \
+        --label "Release source Sparkle installer launcher"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
@@ -615,24 +620,50 @@ submit_notarization() {
         --timeout "${NOTARYTOOL_TIMEOUT:-30m}"
 }
 
-stage_publish_release() {
+# The secret-free stage runs as five phases so the Publish Release workflow can
+# show each one as its own step. `stage-publish` runs the same phases in the
+# same order in one process; the phases share state only through files on disk
+# (dist/, .build/release, and the Sentry symbol directory).
+require_stage_inputs() {
     sentry_linking_enabled ||
         fail "Official release staging requires REPOPROMPT_ENABLE_SENTRY=1"
     require_env RELEASE_TAG
     require_env RELEASE_COMMIT
     require_command ditto
+}
+
+# Phase 1: the only staging phase that may use a GitHub token.
+stage_verify_source() {
+    require_stage_inputs
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     require_release_tag_matches_metadata
+}
+
+# Phase 2: lockfile-stable dependency resolution, preflight, and a fresh dist/.
+stage_prepare() {
+    require_stage_inputs
     unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN
     resolve_without_lockfile_drift
     run_preflight
     prepare_dist
+}
+
+# Phase 3: the long universal (arm64 + x86_64) ad-hoc release build.
+stage_package() {
+    require_stage_inputs
+    unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN
     "$RUN_WITHOUT_GITHUB_TOKENS" env -u SIGN_IDENTITY \
         REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR="$CONTROL_PLANE_SCRIPTS_DIR" \
         REPOPROMPT_ENABLE_SENTRY=1 \
         RELEASE_ALLOW_ADHOC_SIGNING=1 \
         "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" release
+}
+
+# Phase 4: validate the packaged app and its Sentry debug symbols.
+stage_validate() {
+    require_stage_inputs
+    unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN
     run_preflight
     validate_packaged_legal "$APP_BUNDLE"
     validate_public_app "$APP_BUNDLE" "$BUILD_ARTIFACT_MANIFEST" "Release staging"
@@ -642,6 +673,12 @@ stage_publish_release() {
         "$APP_NAME" \
         "repoprompt-mcp.dSYM" \
         "repoprompt-mcp"
+}
+
+# Phase 5: write the secret-free staged archive and its checksum into dist/.
+stage_archive() {
+    require_stage_inputs
+    unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN
     TMP_DIR="$(mktemp -d)"
     local stage_root="$TMP_DIR/release-stage"
     mkdir -p "$stage_root/.build/release"
@@ -664,6 +701,14 @@ stage_publish_release() {
     )
     printf 'OK: secret-free release source staged for %s.\n' "$RELEASE_TAG"
     printf 'Created staged release artifact: %s\n' "$STAGE_ARCHIVE"
+}
+
+stage_publish_release() {
+    stage_verify_source
+    stage_prepare
+    stage_package
+    stage_validate
+    stage_archive
 }
 
 publish_staged_release() {
@@ -777,8 +822,13 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         preflight) run_preflight ;;
         artifact) package_release_candidate ;;
         stage-publish) stage_publish_release ;;
+        stage-verify-source) stage_verify_source ;;
+        stage-prepare) stage_prepare ;;
+        stage-package) stage_package ;;
+        stage-validate) stage_validate ;;
+        stage-archive) stage_archive ;;
         publish-staged) publish_staged_release ;;
         finalize-sentry) recover_sentry_finalization ;;
-        *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|publish-staged|finalize-sentry" ;;
+        *) fail "Usage: $0 sync-cli-version|preflight|artifact|stage-publish|stage-verify-source|stage-prepare|stage-package|stage-validate|stage-archive|publish-staged|finalize-sentry" ;;
     esac
 fi

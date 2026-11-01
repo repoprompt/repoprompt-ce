@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One clean CI build of root test bundles with import and type-check ratchets."""
+"""One clean CI build of root test bundles with import, type-check, and warning ratchets."""
 
 from __future__ import annotations
 
@@ -21,6 +21,12 @@ BASELINE = ROOT / 'docs/migrations/build-modularization/build-ratchets.json'
 APP_WARNING = re.compile(r'(?:^|[/ ])(Sources/RepoPrompt/[^:\n]+\.swift):(\d+):(\d+): warning: (.+)')
 DURATION = re.compile(r'\b(\d+)ms\b')
 ANSI_CSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+SOURCE_WARNING = re.compile(
+    r'^\s*(?P<path>/[^:\n]+\.(?:swift|c|h|m|mm|cpp)):(?P<line>\d+):(?P<column>\d+): warning:\s*(?P<message>.+?)\s*$')
+# Swift's diagnostic-group links are OSC 8 hyperlinks: ESC ] 8 ; ; url ST.
+ANSI_OSC = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+TYPECHECK_TIMING = re.compile(r'took \d+ms to type-check')
+FIRST_PARTY_ROOTS = ('Sources/', 'Tests/', 'Packages/')
 
 
 def classify_warning(line: str) -> tuple[str, int, tuple[str, str, str, str]] | None:
@@ -47,6 +53,51 @@ def record_warning(
     durations[key] = max(duration, durations.get(key, 0))
 
 
+def first_party_warning(line: str, root: Path) -> tuple[str, str, str, str] | None:
+    """Identity of a repository-owned source warning, or None.
+
+    The compiler repeats a diagnostic once per frontend job that type-checks the
+    file (#519), so the identity is path, line, column, and message. Type-check
+    timing warnings are induced by this build's -warn-long-* flags and belong to
+    the type-check ratchet, not this one. Dependency checkouts live under .build.
+    """
+    match = SOURCE_WARNING.match(ANSI_CSI.sub('', ANSI_OSC.sub('', line)))
+    if not match or TYPECHECK_TIMING.search(match['message']):
+        return None
+    path = Path(match['path'])
+    for base in (root, root.resolve()):
+        try:
+            relative = path.relative_to(base).as_posix()
+            break
+        except ValueError:
+            continue
+    else:
+        return None
+    if not relative.startswith(FIRST_PARTY_ROOTS) or '/.build/' in f'/{relative}':
+        return None
+    return relative, match['line'], match['column'], match['message']
+
+
+def warning_summary(warnings: set[tuple[str, str, str, str]], limit: int = 10) -> list[str]:
+    by_file: dict[str, int] = {}
+    for path, _, _, _ in warnings:
+        by_file[path] = by_file.get(path, 0) + 1
+    ranked = sorted(by_file.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    return [f'  {count:4d}  {path}' for path, count in ranked]
+
+
+def report_warning_ratchet(warnings: set[tuple[str, str, str, str]], budget: dict) -> bool:
+    """Print the unique first-party warning count against its ceiling; True when above it.
+
+    A clean build sees every warning; an incremental build can only undercount.
+    """
+    ceiling = budget['first_party_unique']
+    print(f'warning ratchet: first-party unique warnings {len(warnings)}/{ceiling}', flush=True)
+    for summary in warning_summary(warnings):
+        print(summary, flush=True)
+    return len(warnings) > ceiling
+
+
 def timing_counts(durations: dict[tuple[str, str, str, str], int]) -> dict[str, int]:
     counts = {'function_body': 0, 'expression': 0}
     for (_, _, _, kind), duration in durations.items():
@@ -55,21 +106,32 @@ def timing_counts(durations: dict[tuple[str, str, str, str], int]) -> dict[str, 
     return counts
 
 
-def write_timing_report(root: Path, durations: dict, baseline: dict, enforce: bool, exit_code: int) -> None:
+def write_timing_report(root: Path, durations: dict, baseline: dict, enforce: bool, exit_code: int,
+                        warnings: set[tuple[str, str, str, str]] | None = None,
+                        warning_budget: dict | None = None) -> None:
     """Keep per-location maximums on success AND failure; never change the timing budget."""
     destination = root / '.build/modularization/typecheck-timing.json'
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps({
+    report = {
         'schema': 1, 'policy': 'clean-enforcing' if enforce else 'incremental-report-only',
         'build_exit_code': exit_code, 'budget': baseline, 'counts': timing_counts(durations),
         'locations': [dict(path=path, line=int(line), column=int(column), kind=kind, duration_ms=duration)
                       for (path, line, column, kind), duration in sorted(durations.items())],
-    }, sort_keys=True) + '\n', encoding='utf-8')
+    }
+    if warnings is not None:
+        report['first_party_warnings'] = {
+            'budget': warning_budget, 'unique': len(warnings),
+            'locations': [dict(path=path, line=int(line), column=int(column), message=message)
+                          for path, line, column, message in sorted(warnings)],
+        }
+    destination.write_text(json.dumps(report, sort_keys=True) + '\n', encoding='utf-8')
 
 
 def main() -> int:
     invalidate_build_identity(ROOT)
-    baseline = json.loads(BASELINE.read_text(encoding='utf-8'))['typecheck']
+    ratchets = json.loads(BASELINE.read_text(encoding='utf-8'))
+    baseline = ratchets['typecheck']
+    warning_budget = ratchets['warnings']
     enforce_timing = os.environ.get('TYPECHECK_RATCHET_ENFORCE', '1') == '1'
     if enforce_timing:
         clean = subprocess.run(['swift', 'package', 'clean'], cwd=ROOT, check=False)
@@ -81,6 +143,7 @@ def main() -> int:
         '-Xswiftc', '-Xfrontend', '-Xswiftc', '-warn-long-expression-type-checking=499',
     ]
     durations: dict[tuple[str, str, str, str], int] = {}
+    warnings: set[tuple[str, str, str, str]] = set()
     print('$ ' + ' '.join(command), flush=True)
     process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                text=True, bufsize=1)
@@ -88,10 +151,14 @@ def main() -> int:
     for line in process.stdout:
         print(line, end='', flush=True)
         record_warning(line, durations)
+        warning = first_party_warning(line, ROOT)
+        if warning:
+            warnings.add(warning)
     code = process.wait()
-    write_timing_report(ROOT, durations, baseline, enforce_timing, code)
+    write_timing_report(ROOT, durations, baseline, enforce_timing, code, warnings, warning_budget)
     if code:
         return code
+    warnings_regressed = report_warning_ratchet(warnings, warning_budget)
     counts = timing_counts(durations)
     print(f'type-check ratchet: app bodies >=1000ms {counts["function_body"]}/{baseline["function_bodies_1000ms"]}; '
           f'expressions >=500ms {counts["expression"]}/{baseline["expressions_500ms"]}', flush=True)
@@ -102,9 +169,15 @@ def main() -> int:
                  counts['expression'] > baseline['expressions_500ms'])
     if regressed and enforce_timing:
         print('type-check ratchet regressed', file=sys.stderr)
+    if warnings_regressed and enforce_timing:
+        print('warning ratchet regressed: fix the new first-party warnings '
+              '(lower first_party_unique in build-ratchets.json after a verified cleanup)', file=sys.stderr)
+    if (regressed or warnings_regressed) and enforce_timing:
         return 1
     if regressed:
         print('::warning::type-check timing exceeds baseline (report-only on this run)', flush=True)
+    if warnings_regressed:
+        print('::warning::first-party warnings exceed baseline (report-only on this run)', flush=True)
     if sources_import_module(ROOT / 'Tests', 'Testing'):
         print('CI shard direct XCTest runner cannot run Swift Testing; add a separate runner before introducing it',
               file=sys.stderr)
