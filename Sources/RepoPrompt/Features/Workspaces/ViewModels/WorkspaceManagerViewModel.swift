@@ -162,6 +162,11 @@ final class WorkspaceFileDecodeCache: @unchecked Sendable {
         let decoded = try Self.decodeWorkspace(documentBytes: data)
         let workspace = decoded.workspace
         let normalizationRequiresSave = decoded.normalizationRequiresSave
+        WorkspaceUnreadableDocumentBackup.preserveIfNeeded(
+            documentBytes: data,
+            documentURL: standardizedURL,
+            droppedComposeTabCount: workspace.composeTabsDroppedDuringDecode
+        )
 
         if let keyAfterRead = try? metadataKey(for: fileURL),
            keyAfterRead == keyBeforeRead
@@ -17327,14 +17332,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         documentBytes: Data,
         fileURL: URL
     ) throws -> WorkspaceModel {
-        _ = fileURL
         #if DEBUG
-            return try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
+            let workspace = try WorkspaceProjectionDecodeDiagnostics.measure(inputBytes: documentBytes.count) {
                 try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
             }
         #else
-            return try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
+            let workspace = try WorkspaceFileDecodeCache.decodeWorkspace(documentBytes: documentBytes).workspace
         #endif
+        // The domain authority re-writes this document from the projected value, so the original
+        // bytes must be preserved here, before any projection consumer can commit a lossy copy.
+        WorkspaceUnreadableDocumentBackup.preserveIfNeeded(
+            documentBytes: documentBytes,
+            documentURL: fileURL,
+            droppedComposeTabCount: workspace.composeTabsDroppedDuringDecode
+        )
+        return workspace
     }
 
     nonisolated static func loadWorkspaceFromFileResult(
@@ -17348,8 +17360,12 @@ class WorkspaceManagerViewModel: ObservableObject {
             try AppProfileLocations.current.validateCustomWorkspaceDirectory(customRoot)
         }
         let normalizationSaveTask: Task<Void, Never>?
+        // A lossy decode never writes itself back on its own: the normalized value would replace
+        // tabs this build could not read. The original bytes were preserved at decode time, and
+        // an explicit user save remains possible.
         if scheduleNormalizationWriteback,
            !cachedResult.workspace.isEphemeral,
+           !cachedResult.workspace.composeTabsDecodeWasLossy,
            cachedResult.normalizationRequiresSave,
            WorkspaceFileDecodeCache.shared.claimNormalizationSave(for: cachedResult.cacheKey)
         {

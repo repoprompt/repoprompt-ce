@@ -28,6 +28,10 @@ struct WindowSessionEntry: Codable {
     var lastFocused: Bool
     /// Sticky instance number for this workspace in this window (for deterministic restore)
     var workspaceInstanceNumber: Int?
+    /// This window's "Enable MCP tools for this window" switch. `nil` (legacy snapshots) keeps
+    /// the new-window seeding from the global default; an explicit value is restored per window
+    /// and never written back to that default (#143).
+    var mcpToolsEnabled: Bool?
 }
 
 struct WindowSessionCaptureCandidate {

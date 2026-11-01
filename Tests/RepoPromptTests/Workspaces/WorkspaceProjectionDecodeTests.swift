@@ -476,3 +476,172 @@ import XCTest
         }
     }
 #endif
+
+#if DEBUG
+    /// #335: a single unreadable compose tab must not collapse the workspace into a fresh `T1`, and a
+    /// lossy decode must preserve the original document before anything can save over it.
+    final class WorkspaceComposeTabsLossyDecodeTests: XCTestCase {
+        private var temporaryRoot: URL!
+
+        override func setUp() async throws {
+            WorkspaceFileDecodeCache.shared.removeAllForTesting()
+            temporaryRoot = FileManager.default.temporaryDirectory
+                .resolvingSymlinksInPath()
+                .appendingPathComponent("lossy-compose-tabs-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: temporaryRoot, withIntermediateDirectories: true)
+        }
+
+        override func tearDown() async throws {
+            WorkspaceFileDecodeCache.shared.removeAllForTesting()
+            try? FileManager.default.removeItem(at: temporaryRoot)
+        }
+
+        func testCleanDocumentDecodesAllTabsWithoutLossFlag() throws {
+            let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: cleanDocument())
+            XCTAssertEqual(decoded.composeTabs.map(\.name), ["Alpha", "Beta", "Gamma"])
+            XCTAssertEqual(decoded.composeTabsDroppedDuringDecode, 0)
+            XCTAssertFalse(decoded.composeTabsDecodeWasLossy)
+        }
+
+        func testSingleUnreadableTabIsDroppedWhileSiblingsAndActiveTabSurvive() throws {
+            let decoded = try JSONDecoder().decode(
+                WorkspaceModel.self,
+                from: document(mutating: { $0 = corruptingTab(at: 1, in: $0) })
+            )
+            XCTAssertEqual(decoded.composeTabs.map(\.name), ["Alpha", "Gamma"])
+            XCTAssertEqual(decoded.composeTabsDroppedDuringDecode, 1)
+            XCTAssertTrue(decoded.composeTabsDecodeWasLossy)
+            XCTAssertEqual(decoded.activeComposeTabID, Self.tabID(0), "The surviving active tab keeps its identity")
+            XCTAssertFalse(decoded.normalizationRequiresSave)
+        }
+
+        func testUnreadableArrayStillFallsBackToSingleTabButIsFlagged() throws {
+            let decoded = try JSONDecoder().decode(
+                WorkspaceModel.self,
+                from: document(mutating: { $0["composeTabs"] = "not-an-array" })
+            )
+            XCTAssertEqual(decoded.composeTabs.count, 1)
+            XCTAssertEqual(decoded.composeTabs[0].name, "T1")
+            XCTAssertTrue(decoded.composeTabsDecodeWasLossy)
+        }
+
+        func testLossFlagIsTransientAndDoesNotAffectEqualityOrEncoding() throws {
+            var decoded = try JSONDecoder().decode(
+                WorkspaceModel.self,
+                from: document(mutating: { $0 = corruptingTab(at: 2, in: $0) })
+            )
+            let reencoded = try JSONDecoder().decode(WorkspaceModel.self, from: JSONEncoder().encode(decoded))
+            XCTAssertFalse(reencoded.composeTabsDecodeWasLossy)
+            XCTAssertEqual(reencoded.composeTabs.map(\.name), ["Alpha", "Beta"])
+            decoded.composeTabsDroppedDuringDecode = 0
+            XCTAssertEqual(reencoded, decoded)
+        }
+
+        func testLossyFileLoadPreservesOriginalBytesOnceAndSkipsNormalizationWriteback() throws {
+            let original = try document(mutating: { $0["composeTabs"] = "not-an-array" })
+            let fileURL = temporaryRoot.appendingPathComponent("workspace.json")
+            try original.write(to: fileURL)
+
+            let first = try WorkspaceManagerViewModel.loadWorkspaceFromFileResult(
+                at: fileURL, scheduleNormalizationWriteback: true
+            )
+            XCTAssertTrue(first.workspace.composeTabsDecodeWasLossy)
+            XCTAssertTrue(first.normalizationRequiresSave, "Normalization synthesized T1")
+            XCTAssertNil(first.normalizationSaveTask, "A lossy decode must not write itself back")
+
+            let backupURL = WorkspaceUnreadableDocumentBackup.backupURL(for: fileURL, documentBytes: original)
+            XCTAssertEqual(try Data(contentsOf: backupURL), original)
+            XCTAssertEqual(try Data(contentsOf: fileURL), original, "The original file is untouched")
+
+            // A second load (cache cleared) finds the existing backup and does not add another.
+            WorkspaceFileDecodeCache.shared.removeAllForTesting()
+            let second = try WorkspaceManagerViewModel.loadWorkspaceFromFileResult(
+                at: fileURL, scheduleNormalizationWriteback: true
+            )
+            XCTAssertNil(second.normalizationSaveTask)
+            XCTAssertEqual(try backupFiles().count, 1)
+            XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        }
+
+        func testCleanFileLoadWritesNoBackup() throws {
+            let original = try cleanDocument()
+            let fileURL = temporaryRoot.appendingPathComponent("workspace.json")
+            try original.write(to: fileURL)
+            _ = try WorkspaceManagerViewModel.loadWorkspaceFromFileResult(
+                at: fileURL, scheduleNormalizationWriteback: false
+            )
+            XCTAssertEqual(try backupFiles().count, 0)
+        }
+
+        func testDomainProjectionDecodePreservesOriginalBytesForExistingDocument() throws {
+            let original = try document(mutating: { $0 = corruptingTab(at: 0, in: $0) })
+            let fileURL = temporaryRoot.appendingPathComponent("workspace.json")
+            try original.write(to: fileURL)
+
+            let projected = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                documentBytes: original, fileURL: fileURL
+            )
+            XCTAssertEqual(projected.composeTabs.map(\.name), ["Beta", "Gamma"])
+            XCTAssertEqual(try backupFiles().count, 1)
+            XCTAssertEqual(
+                try Data(contentsOf: WorkspaceUnreadableDocumentBackup.backupURL(for: fileURL, documentBytes: original)),
+                original
+            )
+
+            // Projections for documents that are not on disk (synthetic, deleted) write nothing.
+            let missingURL = temporaryRoot.appendingPathComponent("missing").appendingPathComponent("workspace.json")
+            _ = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(documentBytes: original, fileURL: missingURL)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: missingURL.deletingLastPathComponent().path))
+        }
+
+        // MARK: - Fixtures
+
+        private static func tabID(_ ordinal: Int) -> UUID {
+            UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", ordinal + 1))!
+        }
+
+        private func model() -> WorkspaceModel {
+            let date = Date(timeIntervalSince1970: 100)
+            let tabs = ["Alpha", "Beta", "Gamma"].enumerated().map { index, name in
+                ComposeTabState(id: Self.tabID(index), name: name, lastModified: date, promptText: "prompt \(index)")
+            }
+            return WorkspaceModel(
+                id: UUID(uuidString: "11111111-1111-1111-1111-111111111111")!,
+                dateModified: date,
+                name: "Lossy Fixture",
+                repoPaths: ["/synthetic-root"],
+                lastUsed: date,
+                composeTabs: tabs,
+                activeComposeTabID: tabs[0].id
+            )
+        }
+
+        private func cleanDocument() throws -> Data {
+            try document(mutating: { _ in })
+        }
+
+        private func document(mutating mutate: (inout [String: Any]) -> Void) throws -> Data {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .sortedKeys
+            var object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: encoder.encode(model())) as? [String: Any]
+            )
+            mutate(&object)
+            return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        }
+
+        /// Replaces one tab's `promptText` with a number, which the tab decoder rejects.
+        private func corruptingTab(at index: Int, in object: [String: Any]) -> [String: Any] {
+            var object = object
+            var tabs = object["composeTabs"] as? [[String: Any]] ?? []
+            tabs[index]["promptText"] = 42
+            object["composeTabs"] = tabs
+            return object
+        }
+
+        private func backupFiles() throws -> [URL] {
+            try FileManager.default.contentsOfDirectory(at: temporaryRoot, includingPropertiesForKeys: nil)
+                .filter { $0.lastPathComponent.hasPrefix(WorkspaceUnreadableDocumentBackup.fileNamePrefix) }
+        }
+    }
+#endif
