@@ -2,6 +2,18 @@ import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
 final class CodexDiscoveredEffortTests: XCTestCase {
+    func testParsingUsesOneDiscoverySnapshotForIdentityAndEffort() {
+        var reads = 0
+        func loadRecords() -> [CodexDynamicModelRecord] {
+            reads += 1
+            return reads == 1 ? [record("gpt-future", efforts: ["max"])] : []
+        }
+        let selection = CodexModelSpecifier(raw: "gpt-future-max", discoveredRecords: loadRecords())
+        XCTAssertEqual(selection.appServerModelParam, "gpt-future")
+        XCTAssertEqual(selection.appServerEffortParam, "max")
+        XCTAssertEqual(reads, 1)
+    }
+
     func testStructuredSpeedCatalogWinsAndLegacyCatalogStillWorks() {
         XCTAssertEqual(CodexServiceTierVariantCatalog.advertisedTiers(from: [
             "serviceTiers": [["id": "ultrafast", "name": "Ultrafast", "description": "Account access"]],

@@ -3,6 +3,32 @@ import Foundation
 import XCTest
 
 final class AgentCodexModelRegistryCacheTests: XCTestCase {
+    func testPreferredCatalogOwnsFastVariantIdentityDespiteConflictingPersistence() {
+        let key = "CodexDynamicModelRecords"
+        let original = UserDefaults.standard.object(forKey: key)
+        defer { UserDefaults.standard.set(original, forKey: key) }
+        let base = CodexAppServerClient.RemoteModel(
+            id: "gpt-5.5", model: "gpt-5.5", displayName: "GPT-5.5", description: "", isDefault: true,
+            supportedReasoningEfforts: [.init(reasoningEffort: "max", description: "")], defaultReasoningEffort: "max"
+        )
+        let collision = remoteModel(id: "gpt-5.5-fast-max", displayName: "Separate model", isDefault: false)
+        CodexDynamicModelStore.save([base, collision])
+        let registry = AgentCodexModelRegistry()
+
+        let preferred = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [base])
+        let fast = preferred.first { $0.rawValue == "gpt-5.5-fast-max" }
+        XCTAssertEqual(fast?.effortVariant?.baseModelRaw, "gpt-5.5-fast")
+        XCTAssertEqual(fast?.effortVariant?.reasoningEffort, .max)
+        XCTAssertEqual(fast?.displayName, "GPT-5.5 Fast Max")
+
+        CodexDynamicModelStore.save([])
+        let withCollision = registry.resolvedOptions(staticOptions: [], preferredLiveModels: [base, collision])
+        let exact = withCollision.first { $0.rawValue == collision.id }
+        XCTAssertEqual(exact?.displayName, "Separate Model")
+        XCTAssertNil(exact?.effortVariant, "An exact advertised ID must stay a separate model")
+        XCTAssertFalse(withCollision.contains { $0.rawValue == "gpt-5.5-max-fast" })
+    }
+
     func testSpeedOnlyRefreshInvalidatesPickerAndPersistsCapabilities() {
         let registry = AgentCodexModelRegistry()
         let persistenceKey = "CodexDynamicModelRecords"

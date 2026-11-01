@@ -37,7 +37,8 @@ struct CodexModelSpecifier: Equatable {
 
         // A provider-advertised exact ID is a model, even when its name ends in a
         // familiar effort token. Only synthesized variants may be decomposed.
-        if discoveredRecords().contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(raw) }) {
+        let records = discoveredRecords()
+        if records.contains(where: { CodexModelIdentity.key($0.id) == CodexModelIdentity.key(raw) }) {
             return (raw, nil, nil)
         }
 
@@ -67,7 +68,7 @@ struct CodexModelSpecifier: Equatable {
                 candidateEffort,
                 forBaseCandidate: candidate,
                 rawModel: raw,
-                records: discoveredRecords()
+                records: records
             ) {
                 base = candidate
                 effort = candidateEffort
