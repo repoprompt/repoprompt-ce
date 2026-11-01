@@ -15502,6 +15502,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         let rootName: String
     }
 
+    /// After three catch-up passes, let the existing keep-fresh listener finish in the
+    /// background. Continuous catalog churn must not hold workspace hydration forever.
+    nonisolated static let maxSearchIndexConvergenceRebuilds = 3
+
     private nonisolated static var maxConcurrentWorkspaceRootLoads: Int {
         3
     }
@@ -15902,10 +15906,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             _ = await warmedGeneration
         #endif
         guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+        var convergenceRebuilds = 0
         while true {
             let currentCatalogGeneration = await fileManager.workspaceFileContextStore.catalogGeneration(rootScope: .visibleWorkspace)
-            guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
+            guard !Task.isCancelled,
+                  isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id)
+            else { return }
             guard currentCatalogGeneration != indexGeneration else { break }
+            guard convergenceRebuilds < Self.maxSearchIndexConvergenceRebuilds else { break }
+            convergenceRebuilds += 1
             #if DEBUG
                 let loopSearchCatalogSnapshotStartMS = restorePerfRecorder.timestampMSIfEnabled()
             #endif
@@ -15968,6 +15977,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "catalogFolders": "\(snapshot.diagnostics.folderCount)",
                 "catalogFiles": "\(snapshot.diagnostics.fileCount)",
                 "rebuildCount": "\(searchIndexRebuildCount)",
+                "convergenceRebuilds": "\(convergenceRebuilds)",
                 "failureCount": "\(failures.count)",
                 "catalogSnapshotDuration": restorePerfRecorder.formatMS(totalSearchCatalogSnapshotDurationMS),
                 "searchRebuildDuration": restorePerfRecorder.formatMS(totalSearchIndexRebuildDurationMS),

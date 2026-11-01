@@ -5,6 +5,218 @@ import RepoPromptPersistence
 import XCTest
 
 final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
+    func testPausedRootSurvivesReloadAndGlobalOverrideWithoutAdmittingWork() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        try workspace.write("struct Feature {}\n", to: "Feature.swift")
+        let suite = "CodemapPauseTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let policy = WorkspaceCodemapRootPausePolicy(defaults: defaults)
+        policy.setPaused(true, rootPath: workspace.rootURL.path)
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore(pausePolicy: policy)
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        await store.unloadRoot(id: loaded.id)
+        // Reconstruct both the policy and store, as on application restart.
+        let restoredPolicy = WorkspaceCodemapRootPausePolicy(defaults: defaults)
+        let restored = fixture.makeProductionStore(pausePolicy: restoredPolicy)
+        let reloaded = try await restored.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await restored.unloadRoot(id: reloaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        XCTAssertNotEqual(loaded.id, reloaded.id)
+        let status = await restored.codemapRootStatusSnapshot(rootID: reloaded.id)
+        XCTAssertEqual(status?.isGenerationSuspended, true)
+        let files = await restored.files(inRoot: reloaded.id)
+        let result = try await restored.queryCodemapStructureGraphs(
+            seedFileIDs: files.map(\.id), direction: nil, maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+        )
+        XCTAssertEqual(result.status, .unavailable)
+        XCTAssertEqual(result.roots.first?.issues.first?.code, "root_paused")
+        let dto = await Self.structureDTO(result)
+        XCTAssertNil(dto.retry)
+        XCTAssertTrue(try Self.formattedStructure(dto).contains("paused"))
+        let admission = await restored.prioritizeCodemapGraphIndexNow(rootID: reloaded.id)
+        XCTAssertEqual(admission, .unavailable)
+        await restored.setCodeMapsGloballyDisabled(true)
+        let globallyDisabled = try await restored.queryCodemapStructureGraphs(
+            seedFileIDs: files.map(\.id), direction: nil, maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+        )
+        XCTAssertEqual(globallyDisabled.roots.first?.issues.first?.code, "codemaps_disabled")
+        await restored.setCodeMapsGloballyDisabled(false)
+        XCTAssertTrue(restoredPolicy.isPaused(rootPath: workspace.rootURL.path))
+        XCTAssertTrue(fixture.builtSourceTexts.values.isEmpty)
+        _ = await restored.setCodemapGenerationSuspended(rootID: reloaded.id, suspended: false)
+        let engine = try fixture.runtime().bindingEngine()
+        _ = try await waitForGraphCompletion(engine: engine, rootID: reloaded.id)
+        XCTAssertFalse(WorkspaceCodemapRootPausePolicy(defaults: defaults).isPaused(rootPath: workspace.rootURL.path))
+    }
+
+    func testUnsupportedSeedsAreNonRetryableAndDoNotHideSupportedResults() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        try workspace.write("struct Feature {}\n", to: "Feature.swift")
+        try workspace.write("# Documentation\n", to: "README.md")
+        try workspace.write("a\tb\n", to: "data.tsv")
+        let fixture = try CodemapStoreFixture(name: #function, forbidCodeMapGitProcesses: true)
+        let store = fixture.makeProductionStore()
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let files = await store.files(inRoot: loaded.id)
+        let unsupported = files.filter { $0.standardizedRelativePath != "Feature.swift" }
+        let pending = try await store.queryCodemapStructureGraphs(
+            seedFileIDs: unsupported.map(\.id), direction: nil, maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+        )
+        XCTAssertEqual(pending.status, .unavailable)
+        XCTAssertEqual(pending.issues.count, 2)
+        XCTAssertTrue(pending.roots.isEmpty)
+        XCTAssertTrue(pending.issues.allSatisfy { $0.code == "unsupported_file_type" && !$0.retryable })
+        let unsupportedDTO = await Self.structureDTO(pending)
+        XCTAssertNil(unsupportedDTO.retry)
+        let engine = try fixture.runtime().bindingEngine()
+        _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        let mixed = try await store.queryCodemapStructureGraphs(
+            seedFileIDs: files.map(\.id), direction: nil, maximumDepth: 1,
+            budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+        )
+        XCTAssertEqual(mixed.status, .partial)
+        XCTAssertEqual(mixed.roots.flatMap(\.nodes).count, 1)
+        XCTAssertEqual(mixed.issues.count, 2)
+        let dto = await Self.structureDTO(mixed)
+        XCTAssertNil(dto.retry)
+        XCTAssertTrue(try Self.formattedStructure(dto).contains("does not support Code Maps"))
+    }
+
+    func testGraphRetriesExhaustWithoutCheckpointAndOnlyExplicitRetryRestarts() async throws {
+        for failAfterPageAcceptance in [false, true] {
+            let workspace = try PlainWorkspaceFixture(name: #function)
+            try workspace.write("struct Feature {}\n", to: "Feature.swift")
+            let recover = CodemapLockedValues<Bool>()
+            let events = CodemapLockedValues<WorkspaceCodemapBindingEngineHookEvent>()
+            let fixture = try CodemapStoreFixture(
+                name: #function,
+                enginePolicy: .init(
+                    graphIndexRetryInitialMilliseconds: 1,
+                    graphIndexRetryMaximumMilliseconds: 1,
+                    graphIndexRetryJitterPercent: 0,
+                    maximumGraphIndexConsecutiveRetryCount: 2
+                ),
+                engineHooks: .init(event: { events.append($0) }),
+                catalogTransform: { client in
+                    WorkspaceCodemapBindingCatalogClient(
+                        client.resolveManifestBinding,
+                        readGraphIndexCatalogPage: { request in
+                            if !failAfterPageAcceptance, recover.values.last != true {
+                                return .unavailable(.catalogUnavailable)
+                            }
+                            return await client.readGraphIndexCatalogPage(request)
+                        },
+                        revalidateGraphIndexCatalogToken: { epoch, token in
+                            if failAfterPageAcceptance, recover.values.last != true {
+                                return .unavailable(.catalogUnavailable)
+                            }
+                            return await client.revalidateGraphIndexCatalogToken(epoch, token)
+                        },
+                        publishMarkerReadiness: client.publishMarkerReadiness,
+                        reportRootAuthorityInvalidated: client.reportRootAuthorityInvalidated
+                    )
+                },
+                forbidCodeMapGitProcesses: true
+            )
+            let store = fixture.makeProductionStore()
+            let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+            addTeardownBlock {
+                await store.unloadRoot(id: loaded.id)
+                await fixture.shutdown()
+                workspace.cleanup()
+            }
+            let engine = try fixture.runtime().bindingEngine()
+            try await AsyncTestWait.waitUntil("graph retry terminal reaches store", timeout: 30) {
+                await store.codemapRootStatusSnapshot(rootID: loaded.id)?.unavailableReason == .retryExhausted
+            }
+            let status = await store.codemapRootStatusSnapshot(rootID: loaded.id)
+            XCTAssertTrue(AgentWorkspaceCodemapPresentation.make(status).canRetry)
+            XCTAssertFalse(AgentWorkspaceCodemapPresentation.make(status).isActivelyMapping)
+            let accounting = await engine.accounting()
+            let root = try XCTUnwrap(accounting.graphIndexRoots.first)
+            XCTAssertEqual(root.phase, .retryExhausted)
+            XCTAssertEqual(root.retryAttempt, 2)
+            XCTAssertNil(root.progress.catalogCompletion)
+            XCTAssertEqual(events.values.count(where: { $0.kind == .graphIndexRetry && $0.graphIndexPhase == .suspendedBusy }), 2)
+            let files = await store.files(inRoot: loaded.id)
+            let result = try await store.queryCodemapStructureGraphs(
+                seedFileIDs: files.map(\.id), direction: nil, maximumDepth: 1,
+                budget: Self.graphOnlyStructureBudget, rootScope: .allLoaded
+            )
+            let dto = await Self.structureDTO(result)
+            XCTAssertEqual(dto.roots.first?.index.reason, "graph_retry_exhausted")
+            XCTAssertNil(dto.retry)
+            recover.append(true)
+            _ = await engine.scheduleGraphIndex(rootEpoch: root.rootEpoch)
+            let stillStopped = await engine.accounting().graphIndexRoots.first
+            XCTAssertEqual(stillStopped?.phase, .retryExhausted)
+            _ = await store.prioritizeCodemapGraphIndexNow(rootID: loaded.id)
+            _ = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+            try await AsyncTestWait.waitUntil("explicit retry clears terminal status", timeout: 30) {
+                await store.codemapRootStatusSnapshot(rootID: loaded.id)?.unavailableReason == nil
+            }
+        }
+    }
+
+    func testSuccessfulPageCheckpointsResetConsecutiveRetryBudget() async throws {
+        let workspace = try PlainWorkspaceFixture(name: #function)
+        try workspace.write("struct First {}\n", to: "A.swift")
+        try workspace.write("struct Second {}\n", to: "B.swift")
+        let reads = CodemapLockedValues<Bool>()
+        let events = CodemapLockedValues<WorkspaceCodemapBindingEngineHookEvent>()
+        let fixture = try CodemapStoreFixture(
+            name: #function,
+            enginePolicy: .init(
+                maximumGraphIndexCatalogPageEntryCount: 1,
+                maximumGraphIndexBatchCandidateCount: 1,
+                graphIndexRetryInitialMilliseconds: 1,
+                graphIndexRetryMaximumMilliseconds: 1,
+                graphIndexRetryJitterPercent: 0,
+                maximumGraphIndexConsecutiveRetryCount: 2
+            ),
+            engineHooks: .init(event: { events.append($0) }),
+            catalogTransform: { client in
+                WorkspaceCodemapBindingCatalogClient(
+                    client.resolveManifestBinding,
+                    readGraphIndexCatalogPage: { request in
+                        reads.append(true)
+                        if reads.values.count % 3 != 0 { return .unavailable(.catalogUnavailable) }
+                        return await client.readGraphIndexCatalogPage(request)
+                    },
+                    revalidateGraphIndexCatalogToken: client.revalidateGraphIndexCatalogToken,
+                    publishMarkerReadiness: client.publishMarkerReadiness,
+                    reportRootAuthorityInvalidated: client.reportRootAuthorityInvalidated
+                )
+            },
+            forbidCodeMapGitProcesses: true
+        )
+        let store = fixture.makeProductionStore()
+        let loaded = try await store.loadRoot(path: workspace.rootURL.path)
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+            await fixture.shutdown()
+            workspace.cleanup()
+        }
+        let engine = try fixture.runtime().bindingEngine()
+        let completed = try await waitForGraphCompletion(engine: engine, rootID: loaded.id)
+        XCTAssertEqual(completed.retryAttempt, 0)
+        XCTAssertGreaterThan(events.values.count(where: { $0.kind == .graphIndexRetry }), 2)
+        XCTAssertEqual(completed.progress.counts.processedCandidateCount, 2)
+    }
+
     func testBudgetLimitedGraphProjectsAsTerminalWithoutRetry() async throws {
         let repository = try ReviewGitRepositoryFixture(name: #function)
         let rootURL = try repository.makeRepository(
@@ -1470,6 +1682,14 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         // including the capability record whose release writes the epoch's tombstone.
         let quiescedRoot = try await store.loadRoot(path: workspace.rootURL.path)
         addTeardownBlock { await store.unloadRoot(id: quiescedRoot.id) }
+        // Pause is now a durable path preference, not an epoch-local flag. This new
+        // lifetime must explicitly resume before exercising the quiesced cleanup case.
+        let restoredPause = await store.codemapRootStatusSnapshot(rootID: quiescedRoot.id)
+        XCTAssertEqual(restoredPause?.isGenerationSuspended, true)
+        let resumedQuiescedRoot = await store.setCodemapGenerationSuspended(
+            rootID: quiescedRoot.id, suspended: false
+        )
+        XCTAssertEqual(resumedQuiescedRoot, .changed)
         _ = try await waitForGraphCompletion(engine: engine, rootID: quiescedRoot.id)
         let beforeQuiescedUnload = await engine.capabilitySnapshotForTesting()
         XCTAssertEqual(beforeQuiescedUnload.activeRecordCount, 1)
@@ -1661,7 +1881,9 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
     private func waitForGraphCompletion(
         engine: WorkspaceCodemapBindingEngine,
         rootID: UUID,
-        timeout: Duration = .seconds(120)
+        timeout: Duration = .seconds(120),
+        file: StaticString = #filePath,
+        line: UInt = #line
     ) async throws -> WorkspaceCodemapBindingEngineGraphIndexRootAccounting {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: timeout)
@@ -1674,6 +1896,9 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(25))
         }
+        let roots = await engine.accounting().graphIndexRoots
+        let states = roots.map { "phase=\($0.phase) retries=\($0.retryAttempt)" }
+        XCTFail("Graph completion timed out: \(states)", file: file, line: line)
         throw GraphWaitError.timedOut
     }
 

@@ -173,6 +173,7 @@ actor MCPBootstrapLease {
     private let routingStateOwner: (@MainActor @Sendable () -> Bool)?
     private let routeAuthorityResolver: (MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision
 
+    private(set) var lastAcquireWasTimeout = false
     private var hasAcquired = false
     private var hasReleased = false
     private var cleanupRequested = false
@@ -305,6 +306,7 @@ actor MCPBootstrapLease {
             )
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) waiting to acquire global MCP gate")
             let gateAcquisition = await HeadlessAgentConnectionGate.acquireWithDiagnostics(spec.gateID)
+            lastAcquireWasTimeout = gateAcquisition.timedOut
             if gateAcquisition.acquired {
                 ownsGate = true
             }
@@ -314,7 +316,8 @@ actor MCPBootstrapLease {
                     "active_gate_id_at_start": gateAcquisition.activeConnectionIDAtStart?.uuidString ?? "nil",
                     "queue_depth_at_start": String(gateAcquisition.queueDepthAtStart),
                     "queue_depth_at_acquire": String(gateAcquisition.queueDepthAtAcquire),
-                    "wait_duration_ms": String(format: "%.3f", gateAcquisition.waitDurationMS)
+                    "wait_duration_ms": String(format: "%.3f", gateAcquisition.waitDurationMS),
+                    "timed_out": String(gateAcquisition.timedOut)
                 ]
             )
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) global MCP gate acquired=\(gateAcquisition.acquired)")

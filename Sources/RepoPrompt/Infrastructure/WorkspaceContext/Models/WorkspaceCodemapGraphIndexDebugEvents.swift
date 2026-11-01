@@ -30,6 +30,7 @@ import RepoPromptPersistence
         case workerCheckpointTransitionRejected
         case workerGenerationResetRejected
         case workerRetryCancelled
+        case workerRetryExhausted
         case watchdogNoProgress
         case watchdogRecoveryExhausted
         case prioritizeRestart

@@ -59,12 +59,15 @@ final class CodemapStoreFixture: @unchecked Sendable {
     private let runtimeTracker: CodemapRuntimeTracker
     private let runtimeProvider: CodeMapArtifactRuntimeProvider
     private let codeMapGitService: GitService
+    private let pauseDefaultsSuite: String
+    private let pausePolicy: WorkspaceCodemapRootPausePolicy
 
     init(
         name: String,
         capabilityHooks: WorkspaceCodemapRootCapabilityServiceHooks = .none,
         enginePolicy: WorkspaceCodemapBindingEnginePolicy = .default,
         engineHooks: WorkspaceCodemapBindingEngineHooks = .none,
+        catalogTransform: @escaping @Sendable (WorkspaceCodemapBindingCatalogClient) -> WorkspaceCodemapBindingCatalogClient = { $0 },
         manifestStoreHooks: CodeMapRootManifestStoreHooks = .none,
         globalCodeMapsDisabled: @escaping @Sendable () async -> Bool = { false },
         graphPullPause: WorkspaceCodemapGraphPullPause = .production,
@@ -147,7 +150,7 @@ final class CodemapStoreFixture: @unchecked Sendable {
                             gitService: codeMapGitService
                         ),
                         sourceReader: registry.makeValidatedSourceReaderClient(),
-                        catalogClient: registry.makeBindingCatalogClient(),
+                        catalogClient: catalogTransform(registry.makeBindingCatalogClient()),
                         overlay: overlay,
                         policy: enginePolicy,
                         hooks: engineHooks,
@@ -165,9 +168,13 @@ final class CodemapStoreFixture: @unchecked Sendable {
         self.runtimeTracker = runtimeTracker
         self.runtimeProvider = runtimeProvider
         self.codeMapGitService = codeMapGitService
+        let pauseDefaultsSuite = "CodemapStoreFixture-\(UUID().uuidString)"
+        self.pauseDefaultsSuite = pauseDefaultsSuite
+        pausePolicy = WorkspaceCodemapRootPausePolicy(defaults: UserDefaults(suiteName: pauseDefaultsSuite)!)
     }
 
     deinit {
+        UserDefaults(suiteName: pauseDefaultsSuite)?.removePersistentDomain(forName: pauseDefaultsSuite)
         try? FileManager.default.removeItem(at: sandbox)
     }
 
@@ -179,19 +186,24 @@ final class CodemapStoreFixture: @unchecked Sendable {
             codemapRuntimeProvider: { try runtimeProvider.runtime() },
             codemapLocalGitClassificationProbe: .init { _ in .requiresGitPreflight },
             codemapGitEligibilityProbe: .init { _ in .eligible },
-            codeMapsGloballyDisabled: codeMapsGloballyDisabled
+            codeMapsGloballyDisabled: codeMapsGloballyDisabled,
+            codemapRootPausePolicy: pausePolicy
         )
     }
 
     /// Store that admits roots through the production local proof and Git preflight, sharing the
     /// fixture's instrumented Git service with the engine's Code Map collaborators.
-    func makeProductionStore(nonGitCodeMapsEnabled: Bool = true) -> WorkspaceFileContextStore {
+    func makeProductionStore(
+        nonGitCodeMapsEnabled: Bool = true,
+        pausePolicy: WorkspaceCodemapRootPausePolicy? = nil
+    ) -> WorkspaceFileContextStore {
         let runtimeProvider = runtimeProvider
         return WorkspaceFileContextStore(
             codemapRuntimeProvider: { try runtimeProvider.runtime() },
             codemapLocalGitClassificationProbe: .production,
             codemapGitEligibilityProbe: .production(gitService: codeMapGitService),
-            nonGitCodeMapsEnabled: nonGitCodeMapsEnabled
+            nonGitCodeMapsEnabled: nonGitCodeMapsEnabled,
+            codemapRootPausePolicy: pausePolicy ?? self.pausePolicy
         )
     }
 

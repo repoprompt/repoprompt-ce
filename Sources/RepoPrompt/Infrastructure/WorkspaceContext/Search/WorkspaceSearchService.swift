@@ -131,6 +131,16 @@ actor WorkspaceSearchService {
             )
         }
 
+        /// Deterministically exercise a nonconverging hydration barrier without changing
+        /// the actual search index or keep-fresh authority.
+        private var rebuildIndexReportedGenerationTransformForTesting: (@Sendable (UInt64) -> UInt64)?
+
+        func setRebuildIndexReportedGenerationTransformForTesting(
+            _ transform: (@Sendable (UInt64) -> UInt64)?
+        ) {
+            rebuildIndexReportedGenerationTransformForTesting = transform
+        }
+
         func setSearchDidCaptureGenerationHandler(
             _ handler: (@Sendable (UInt64?) async -> Void)?
         ) {
@@ -271,7 +281,11 @@ actor WorkspaceSearchService {
         commit(prepared)
         activeRebuildGeneration = nil
         await reconcileBoundCatalogAfterManualRebuild()
-        return snapshot.generation
+        #if DEBUG
+            return rebuildIndexReportedGenerationTransformForTesting?(snapshot.generation) ?? snapshot.generation
+        #else
+            return snapshot.generation
+        #endif
     }
 
     @discardableResult
