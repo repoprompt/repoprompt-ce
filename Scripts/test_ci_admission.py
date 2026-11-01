@@ -166,7 +166,7 @@ class TimingProtocolTests(unittest.TestCase):
             timing = metadata.with_name('typecheck-timing.json')
             timing.write_text('{stale measurement')
             baseline = root / 'baseline.json'
-            baseline.write_text(json.dumps({'typecheck': {}}))
+            baseline.write_text(json.dumps({'typecheck': {}, 'warnings': {'first_party_unique': 0}}))
             with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
                     mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}), \
                     mock.patch.object(ci_build.subprocess, 'run', return_value=subprocess.CompletedProcess([], 2)):
@@ -182,7 +182,8 @@ class TimingProtocolTests(unittest.TestCase):
                 root = Path(directory)
                 baseline = root / 'baseline.json'
                 baseline.write_text(json.dumps({'typecheck': {
-                    'function_bodies_1000ms': 0, 'expressions_500ms': budget}}))
+                    'function_bodies_1000ms': 0, 'expressions_500ms': budget},
+                    'warnings': {'first_party_unique': 0}}))
                 process = mock.Mock(stdout=io.StringIO(warning + warning))
                 process.wait.return_value = build_status
                 listing = subprocess.CompletedProcess([], 0, stdout='CoreTests.Example/testOne\n')
