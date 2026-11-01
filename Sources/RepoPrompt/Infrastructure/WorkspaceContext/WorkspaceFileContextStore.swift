@@ -372,6 +372,11 @@ actor WorkspaceFileContextStore {
     private static let maximumRetainedCodemapPresentationRecordsPerRoot = 64
     private static let maximumCodemapPresentationRequestsPerBundle = 4096
 
+    #if DEBUG
+        /// Follows value copies of a root without changing its canonical indexes.
+        private final class RootMutationOwnership: Sendable {}
+    #endif
+
     private struct RootState {
         let lifetimeID: UUID
         let root: WorkspaceRootRecord
@@ -381,6 +386,9 @@ actor WorkspaceFileContextStore {
         var childFolderIDsByFolderID: [UUID: [UUID]]
         var childFileIDsByFolderID: [UUID: [UUID]]
         var fileExtensionCounts: [String: Int] = [:]
+        #if DEBUG
+            var mutationOwnership = RootMutationOwnership()
+        #endif
     }
 
     private struct FileExtensionCatalogSummary {
@@ -3243,6 +3251,7 @@ actor WorkspaceFileContextStore {
             var indexedFileVisits = 0
             var parentFolderProbes = 0
             var eventSortComparisons = 0
+            var sharedRootInventoryRecords = 0
         }
 
         private var indexDeltaPublicationWorkForTesting: IndexDeltaPublicationWork?
@@ -23874,6 +23883,16 @@ actor WorkspaceFileContextStore {
     private func indexFiles(_ items: [FSItemDTO], root: WorkspaceRootRecord, state: inout RootState, indexes: inout RootIndexBuffers) {
         for item in items {
             #if DEBUG
+                if indexDeltaPublicationWorkForTesting != nil,
+                   !isKnownUniquelyReferenced(&state.mutationOwnership)
+                {
+                    // Charge the inventory exposed to copy-on-write at this
+                    // mutation, then detach the probe along with this value.
+                    // One initial snapshot is bounded; a copied root per file is not.
+                    indexDeltaPublicationWorkForTesting?.sharedRootInventoryRecords +=
+                        state.fileIDsByRelativePath.count + state.folderIDsByRelativePath.count
+                    state.mutationOwnership = RootMutationOwnership()
+                }
                 indexDeltaPublicationWorkForTesting?.indexedFileVisits += 1
             #endif
             let relativePath = StandardizedPath.relative(item.relativePath)

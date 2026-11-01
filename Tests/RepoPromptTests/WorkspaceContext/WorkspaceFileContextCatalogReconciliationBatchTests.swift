@@ -212,13 +212,18 @@ final class CatalogBulkAddPerformanceTests: XCTestCase {
         let start = ContinuousClock.now
         let work = try await store.applyIndexDeltasWithFakeDiskForTesting(rootID: root.id, deltas: deltas)
         let elapsed = start.duration(to: .now)
-        print("CATALOG_BULK_ADD files=\(fileCount) existingFolders=\(folderCount) newFolders=\(folderCount) duration=\(elapsed)")
+        print("CATALOG_BULK_ADD files=\(fileCount) existingFolders=\(folderCount) newFolders=\(folderCount) duration=\(elapsed) sharedRootRecords=\(work.sharedRootInventoryRecords)")
         // Gate work at the mutation/publication owner rather than comparing two
         // wall-clock samples on a shared runner. Each file has exactly two
         // ancestors; discovering its new child folder adds one parent lookup.
         XCTAssertEqual(work.ancestorMembershipProbes, fileCount * 2)
         XCTAssertEqual(work.indexedFileVisits, fileCount)
         XCTAssertEqual(work.parentFolderProbes, fileCount + folderCount)
+        XCTAssertLessThanOrEqual(
+            work.sharedRootInventoryRecords,
+            fileCount + folderCount * 2,
+            "Detach at most one retained inventory, never copy root state for every added file"
+        )
         let folderEventCount = fileCount * 2 + folderCount
         func sortBudget(_ count: Int) -> Int {
             2 * count * Int(ceil(log2(Double(count))))
