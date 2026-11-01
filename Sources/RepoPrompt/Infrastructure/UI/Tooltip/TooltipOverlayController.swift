@@ -269,7 +269,7 @@ final class TooltipOverlayController {
     // MARK: TooltipWindow
 
     /// ---------------------------------------------------------------------
-    private final class TooltipWindow: NSWindow {
+    final class TooltipWindow: NSWindow {
         init(contentSize: CGSize) {
             let rect = NSRect(origin: .zero, size: contentSize)
             super.init(
@@ -283,7 +283,12 @@ final class TooltipOverlayController {
             hasShadow = true
             level = .floating
             ignoresMouseEvents = true
-            contentView = NSHostingView(rootView: AnyView(EmptyView()))
+            let hosting = NSHostingView(rootView: AnyView(EmptyView()))
+            // The controller measures the bubble and owns the window frame. Letting
+            // NSHostingView also update contentMinSize/contentMaxSize feeds SwiftUI
+            // measurement back into AppKit's constraint pass and can loop indefinitely.
+            hosting.sizingOptions = []
+            contentView = hosting
         }
     }
 }

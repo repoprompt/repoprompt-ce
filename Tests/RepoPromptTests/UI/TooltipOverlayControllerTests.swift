@@ -1,5 +1,6 @@
 import AppKit
 @testable import RepoPromptApp
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -259,6 +260,32 @@ final class TooltipPendingPresentationTests: XCTestCase {
 
 @MainActor
 final class TooltipOverlayControllerTests: XCTestCase {
+    func testBubbleContentChangesPreserveControllerOwnedWindowSize() throws {
+        let window = TooltipOverlayController.TooltipWindow(contentSize: NSSize(width: 240, height: 80))
+        let hosting = try XCTUnwrap(window.contentView as? NSHostingView<AnyView>)
+        let minimum = window.contentMinSize
+        let maximum = window.contentMaxSize
+
+        for preset in FontScalePreset.allCases {
+            for text in ["Short", String(repeating: "A wrapped tooltip with several words. ", count: 12)] {
+                hosting.rootView = AnyView(TooltipBubble(content: TooltipContent(text), preset: preset))
+                let size = NSSize(width: ceil(240 * preset.scaleFactor), height: ceil(80 * preset.scaleFactor))
+                window.setContentSize(size)
+                window.updateConstraintsIfNeeded()
+                hosting.layoutSubtreeIfNeeded()
+
+                XCTAssertEqual(window.contentMinSize, minimum)
+                // AppKit can normalize its initial Float-sized unlimited sentinel
+                // to CGFloat.greatestFiniteMagnitude. Neither may become a cap
+                // derived from the SwiftUI content.
+                XCTAssertGreaterThanOrEqual(window.contentMaxSize.width, maximum.width)
+                XCTAssertGreaterThanOrEqual(window.contentMaxSize.height, maximum.height)
+                XCTAssertEqual(hosting.frame.size, size)
+            }
+        }
+        XCTAssertFalse(window.isVisible)
+    }
+
     func testConstrainedTopLeftUsesScreenIntersectingAnchor() throws {
         let firstVisibleFrame = NSRect(x: 0, y: 0, width: 1000, height: 760)
         let secondVisibleFrame = NSRect(x: 1000, y: 0, width: 1000, height: 780)
