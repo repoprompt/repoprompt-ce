@@ -133,7 +133,7 @@ enum CodexDynamicModelMapper {
         // A future model can gain Ultrafast on refresh without a model-version allowlist.
         let speedRecords = records.compactMap { record -> CodexDynamicModelRecord? in
             guard !normalizeID(record.id).isEmpty,
-                  CodexModelSpecifier(raw: record.id).serviceTier == nil,
+                  CodexModelSpecifier(raw: record.id, discoveredRecords: records).serviceTier == nil,
                   let tier = record.serviceTiers.first(where: {
                       $0.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                           == CodexServiceTierVariantCatalog.ultrafastServiceTier
@@ -156,7 +156,8 @@ enum CodexDynamicModelMapper {
             let baseName = formatBaseDisplayName(
                 record.displayName,
                 fallbackModel: record.model,
-                fallbackID: baseID
+                fallbackID: baseID,
+                records: records
             )
             let baseDescription = record.description.trimmingCharacters(in: .whitespacesAndNewlines)
             let rawEfforts = record.supportedReasoningEfforts.map(\.reasoningEffort)
@@ -208,10 +209,18 @@ enum CodexDynamicModelMapper {
             }
         }
 
-        return options.sorted(by: optionPrecedes)
+        return options.sorted { compareOptions($0, $1, discoveredRecords: records) }
     }
 
     static func optionPrecedes(_ lhs: CodexDynamicModelOption, _ rhs: CodexDynamicModelOption) -> Bool {
+        compareOptions(lhs, rhs, discoveredRecords: [])
+    }
+
+    private static func compareOptions(
+        _ lhs: CodexDynamicModelOption,
+        _ rhs: CodexDynamicModelOption,
+        discoveredRecords: [CodexDynamicModelRecord]
+    ) -> Bool {
         if lhs.isDefault != rhs.isDefault {
             return lhs.isDefault && !rhs.isDefault
         }
@@ -225,8 +234,8 @@ enum CodexDynamicModelMapper {
                 return leftRank < rightRank
             }
         } else {
-            if AIModel.codexBaseModelPrecedes(leftBase, rightBase) { return true }
-            if AIModel.codexBaseModelPrecedes(rightBase, leftBase) { return false }
+            if AIModel.codexBaseModelPrecedes(leftBase, rightBase, discoveredRecords: discoveredRecords) { return true }
+            if AIModel.codexBaseModelPrecedes(rightBase, leftBase, discoveredRecords: discoveredRecords) { return false }
         }
 
         let displayComparison = lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName)
@@ -247,7 +256,8 @@ enum CodexDynamicModelMapper {
             return formatBaseDisplayName(
                 exactRecord.displayName,
                 fallbackModel: exactRecord.model,
-                fallbackID: exactID
+                fallbackID: exactID,
+                records: records
             )
         }
 
@@ -264,7 +274,8 @@ enum CodexDynamicModelMapper {
                 return formatBaseDisplayName(
                     record.displayName,
                     fallbackModel: record.model,
-                    fallbackID: baseID
+                    fallbackID: baseID,
+                    records: records
                 )
             }
 
@@ -274,7 +285,8 @@ enum CodexDynamicModelMapper {
                 let baseName = formatBaseDisplayName(
                     record.displayName,
                     fallbackModel: record.model,
-                    fallbackID: baseID
+                    fallbackID: baseID,
+                    records: records
                 )
                 return "\(baseName) \(effortEntry.effort.displayName)"
             }
@@ -335,20 +347,20 @@ enum CodexDynamicModelMapper {
         id.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func formatBaseDisplayName(_ preferred: String, fallbackModel: String, fallbackID: String) -> String {
+    private static func formatBaseDisplayName(_ preferred: String, fallbackModel: String, fallbackID: String, records: [CodexDynamicModelRecord]) -> String {
         let preferredTrimmed = preferred.trimmingCharacters(in: .whitespacesAndNewlines)
         if !preferredTrimmed.isEmpty {
-            return humanizeLabel(preferredTrimmed)
+            return humanizeLabel(preferredTrimmed, records: records)
         }
         let fallbackModelTrimmed = fallbackModel.trimmingCharacters(in: .whitespacesAndNewlines)
         if !fallbackModelTrimmed.isEmpty {
-            return humanizeLabel(fallbackModelTrimmed)
+            return humanizeLabel(fallbackModelTrimmed, records: records)
         }
-        return humanizeLabel(fallbackID)
+        return humanizeLabel(fallbackID, records: records)
     }
 
-    private static func humanizeLabel(_ raw: String) -> String {
-        if let alias = AIModel.codexPreviewDisplayAlias(for: raw) {
+    private static func humanizeLabel(_ raw: String, records: [CodexDynamicModelRecord]) -> String {
+        if let alias = AIModel.codexPreviewDisplayAlias(for: raw, discoveredRecords: records) {
             return alias
         }
 
