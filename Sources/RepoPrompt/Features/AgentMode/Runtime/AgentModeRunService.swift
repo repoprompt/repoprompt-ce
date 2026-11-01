@@ -143,6 +143,35 @@ final class AgentModeRunService {
         )
     }
 
+    func adoptClaudeProviderTurn(
+        session: AgentTabSession,
+        listener: ClaudeControllerEventListener,
+        turnID: UUID,
+        fence: AgentRunStartStopFence,
+        prepareEpoch: () async -> Bool
+    ) async -> Bool {
+        await listener.awaitTerminalPublication()
+        if let previous = session.lastTerminalCommitRevision {
+            await terminalCommitBarrier.awaitTerminalPublication(for: previous.ownership, lifecycle: session.runLifecycle)
+        }
+        if session.mcpControlContext != nil, session.lastTerminalCommitRevision != nil {
+            guard case .accepted = session.runLifecycle.lastTerminalPublicationResult else { return false }
+        }
+        guard !Task.isCancelled, listener.isCurrent(), fence.permitsStart(of: session),
+              listener.pendingProviderTurnID == turnID, listener.subscription == nil,
+              listener.runtimeFailure == nil,
+              !session.runLifecycle.terminalCommitInProgress,
+              !session.runState.isActive, session.agentTask == nil,
+              session.pendingInstructions.isEmpty, session.operationAdmissionFailureMessage == nil
+        else { return listener.subscription != nil }
+        guard await prepareEpoch(), !Task.isCancelled, listener.isCurrent(), fence.permitsStart(of: session),
+              listener.pendingProviderTurnID == turnID, listener.subscription == nil, listener.runtimeFailure == nil,
+              !session.runState.isActive, session.agentTask == nil, session.pendingInstructions.isEmpty,
+              session.operationAdmissionFailureMessage == nil
+        else { return listener.subscription != nil }
+        return claudeRunner.adoptProviderTurn(session: session, listener: listener, turnID: turnID)
+    }
+
     func oracleToolSettlementCallbacks(
         session: AgentTabSession,
         invocationID: UUID,
@@ -198,8 +227,16 @@ final class AgentModeRunService {
         startOutcome: AgentRunStartOutcomeRecorder? = nil,
         stopFence: AgentRunStartStopFence? = nil,
         localComposerCandidate: UUID? = nil,
-        initialUserItemID: UUID? = nil
+        initialUserItemID: UUID? = nil,
+        preparedClaudeEvents: ClaudeAttemptEventReservation? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
+        var claudeEventsTransferred = false
+        defer {
+            if !claudeEventsTransferred, let preparedClaudeEvents {
+                preparedClaudeEvents.listener.close(preparedClaudeEvents.subscription, returningTail: true)
+                preparedClaudeEvents.listener.terminalPublished(for: preparedClaudeEvents.subscription)
+            }
+        }
         var candidateTransferred = false
         defer {
             if !candidateTransferred {
@@ -305,6 +342,7 @@ final class AgentModeRunService {
         }
         if selectedAgent.usesClaudeNativeRuntime {
             candidateTransferred = true
+            claudeEventsTransferred = true
             await claudeRunner.startRun(
                 tabID: tabID,
                 session: session,
@@ -317,9 +355,10 @@ final class AgentModeRunService {
                 selfCompactDispatchID: selfCompactDispatchID,
                 stopFence: stopFence,
                 localComposerCandidate: localComposerCandidate,
-                initialUserItemID: initialUserItemID
+                initialUserItemID: initialUserItemID,
+                preparedEvents: preparedClaudeEvents,
+                startOutcome: startOutcome
             )
-            recordNonCodexStartOutcome(startOutcome, session: session)
             return nil
         }
         if let acpRunRequest {
@@ -980,7 +1019,7 @@ final class AgentModeRunService {
         steeringID: UUID
     ) {
         guard session.selectedAgent.usesClaudeNativeRuntime,
-              session.runState == .running,
+              session.runState == .running || session.runState == .waitingForApproval,
               let runID = session.runID,
               let runAttemptID = session.activeRunAttemptID,
               let steeringIndex = session.pendingClaudeSteeringInstructions.firstIndex(where: { $0.id == steeringID })
@@ -995,10 +1034,11 @@ final class AgentModeRunService {
         }
 
         let claimableTurnIDs = session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs)
-        guard !claimableTurnIDs.isEmpty else { return }
+        let liveSuccessorIDs = session.claudeLiveSuccessorTurnIDs.intersection(session.claudeExpectedTurnIDs)
+        guard !claimableTurnIDs.isEmpty || !liveSuccessorIDs.isEmpty else { return }
 
         session.claudeSupersedingProtectedTurnIDs.formUnion(claimableTurnIDs)
-        session.pendingClaudeSteeringInstructions[steeringIndex].supersedingProtectedTurnIDs.formUnion(claimableTurnIDs)
+        session.pendingClaudeSteeringInstructions[steeringIndex].supersedingProtectedTurnIDs.formUnion(claimableTurnIDs.union(liveSuccessorIDs))
         session.pendingSupersedingTurnCompletions += claimableTurnIDs.count
     }
 
@@ -1006,8 +1046,15 @@ final class AgentModeRunService {
         for instructions: [AgentTabSession.ClaudeSteeringInstruction],
         session: AgentTabSession
     ) {
-        let protectedTurnIDs = Set(instructions.flatMap(\.supersedingProtectedTurnIDs))
+        let relevantInstructions = instructions.filter { $0.targetRunAttemptID == session.activeRunAttemptID }
+        guard !relevantInstructions.isEmpty else { return }
+        let claimedTurnIDs = Set(relevantInstructions.flatMap(\.supersedingProtectedTurnIDs))
+        let laterProviderIDs = session.claudeLiveSuccessorTurnIDs
+            .intersection(session.claudeExpectedTurnIDs)
+            .intersection(session.claudeSupersedingProtectedTurnIDs)
+        let protectedTurnIDs = claimedTurnIDs.union(laterProviderIDs)
         guard !protectedTurnIDs.isEmpty else { return }
+        dependencies.claudeCoordinator.notifySteeringSettlement(session: session, protectedIDs: protectedTurnIDs)
 
         let unconsumedTurnIDs = protectedTurnIDs
             .intersection(session.claudeExpectedTurnIDs)
@@ -1050,7 +1097,7 @@ final class AgentModeRunService {
     @discardableResult
     func submitQueuedClaudeSteeringIfSupported(session: AgentTabSession) async -> Bool {
         guard session.selectedAgent.usesClaudeNativeRuntime,
-              session.runState == .running
+              session.runState == .running || session.runState == .waitingForApproval
         else {
             return false
         }
@@ -1081,7 +1128,10 @@ final class AgentModeRunService {
             guard let self, let session else { return }
             defer {
                 session.claudeSteeringFlushTask = nil
-                if session.runState == .running,
+                if session.activeRunOwnership == ownership {
+                    self.dependencies.claudeCoordinator.recheckSteeringSettlement(session: session)
+                }
+                if session.runState == .running || session.runState == .waitingForApproval,
                    session.selectedAgent.usesClaudeNativeRuntime,
                    !session.pendingClaudeSteeringInstructions.isEmpty
                 {
@@ -1185,6 +1235,7 @@ final class AgentModeRunService {
                     session, steering.skipsSlashExpansion
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush sending native interrupt id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID)")
+                var inputWasAttempted = false
                 let sendOutcome = await dependencies.claudeCoordinator.sendClaudeNativeMessage(
                     session: session,
                     text: augmentedSteeringText,
@@ -1192,7 +1243,8 @@ final class AgentModeRunService {
                     intent: .runAttempt(ownership: ownership, runID: runID),
                     // The active runner owns the current controller's event stream. Replacing it
                     // here would strand the runner, so steering must keep failing closed.
-                    allowsCatalogRouteControllerRecovery: false
+                    allowsCatalogRouteControllerRecovery: false,
+                    inputAttemptChanged: { inputWasAttempted = $0 }
                 )
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush send completed id=\(steering.id) tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) outcome=\(String(describing: sendOutcome))")
                 switch sendOutcome {
@@ -1200,11 +1252,20 @@ final class AgentModeRunService {
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, true)
                     await hooks.continuation.signalMCPInstructionDelivered(session)
                 case .failed:
+                    if inputWasAttempted, session.activeRunOwnership == ownership {
+                        dependencies.claudeCoordinator.notifySteeringSettlement(session: session, protectedIDs: steering.supersedingProtectedTurnIDs, inputWasAttempted: true)
+                    }
                     hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
                     // Re-insert the failed instruction so it's included in the restore.
                     // The coordinator deliberately leaves the live run state and
                     // ownership untouched; the owner event loop settles later.
-                    session.pendingClaudeSteeringInstructions.insert(steering, at: 0)
+                    var restoredSteering = steering
+                    if inputWasAttempted {
+                        // Draft recovery cannot unprotect buffered answers before the owner
+                        // consumes the uncertain-write failure and retires the attempt.
+                        restoredSteering.supersedingProtectedTurnIDs.removeAll()
+                    }
+                    session.pendingClaudeSteeringInstructions.insert(restoredSteering, at: 0)
                     if let dequeuedUserInputTokens {
                         session.pendingNonCodexUserInputTokenQueue.insert(dequeuedUserInputTokens, at: 0)
                     }
@@ -1224,7 +1285,7 @@ final class AgentModeRunService {
         runID: UUID,
         runAttemptID: UUID
     ) -> Bool {
-        session.runState == .running
+        (session.runState == .running || session.runState == .waitingForApproval)
             && session.selectedAgent.usesClaudeNativeRuntime
             && session.runID == runID
             && session.activeRunAttemptID == runAttemptID
@@ -1377,7 +1438,7 @@ final class AgentModeRunService {
         admission: AgentRunCancellationAdmission
     ) -> Bool {
         guard admission.scope == .pendingStart, admission.claim(for: session) else { return false }
-        hooks.prepareForCancellation(session, .userStop, .explicitStop)
+        _ = hooks.prepareForCancellation(session, .userStop, .explicitStop)
         withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
         return true
     }
@@ -1396,7 +1457,24 @@ final class AgentModeRunService {
             guard admission.scope == .activeRun, admission.claim(for: session) else { return }
             outcomeRecorder?.recordCancellationInitiated()
         }
-        hooks.prepareForCancellation(session, intent, origin)
+        let withdrawingProviderAdoption = dependencies.claudeCoordinator.hasPendingProviderAdoption(for: session)
+            && session.activeRunOwnership == nil
+        let providerTeardown = hooks.prepareForCancellation(session, intent, origin)
+        if withdrawingProviderAdoption {
+            if intent == .userStop, origin == .explicitStop {
+                withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            }
+            hooks.bindingObservation.updateBindings(session)
+            hooks.persistence.scheduleSave(session)
+            if let revision = session.lastTerminalCommitRevision {
+                await terminalCommitBarrier.awaitTerminalPublication(for: revision.ownership, lifecycle: session.runLifecycle)
+                if completion == .terminalTeardownCompleted {
+                    await terminalCommitBarrier.awaitTerminalTeardown(for: revision.ownership, lifecycle: session.runLifecycle)
+                }
+            }
+            if completion == .terminalTeardownCompleted { await providerTeardown?() }
+            return
+        }
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
@@ -1497,6 +1575,7 @@ final class AgentModeRunService {
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,
             supportsFollowUp: false,
             notifyTurnComplete: false,
+            terminalAnchor: session.terminalAnchor(for: ownership),
             providerDrainGeneration: session.providerTerminalDrainGeneration,
             providerBuffersAreDrained: { [dependencies] in
                 session.selectedAgent != .codexExec

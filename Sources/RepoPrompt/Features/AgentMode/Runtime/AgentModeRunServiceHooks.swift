@@ -100,6 +100,7 @@ extension AgentModeRunService {
         let finalizePendingToolCalls: (AgentTabSession, AgentSessionRunState) -> Void
         let finalizePendingToolCallsWithUpperBound: (AgentTabSession, AgentSessionRunState, Int?) -> Void
         let flushPendingAssistantDelta: (AgentTabSession) -> Void
+        let beginClaudeProviderOutputSegment: (AgentTabSession) -> Void
         let clearPendingAssistantDelta: (AgentTabSession) -> Void
     }
 
@@ -258,9 +259,10 @@ extension AgentModeRunService {
         let terminalSettlement: TerminalSettlementHooks
         let continuation: RunContinuationHooks
         /// Host-owned synchronous deferred-work cleanup, before the terminal shortcut.
+        /// Returns the exact withdrawn provider cleanup for teardown-completed cancellation.
         var prepareForCancellation: (
             AgentTabSession, DomainAgentRunCancellationIntent, AgentModeRunService.CancellationOrigin
-        ) -> Void = { _, _, _ in }
+        ) -> (@MainActor () async -> Void)? = { _, _, _ in nil }
     }
 }
 

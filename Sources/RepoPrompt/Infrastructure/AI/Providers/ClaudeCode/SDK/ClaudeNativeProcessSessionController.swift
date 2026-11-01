@@ -83,6 +83,7 @@ final actor ClaudeNativeProcessSessionController {
         case runtimeInit(RuntimeInitStatus)
         case approvalRequest(AgentApprovalRequest)
         case approvalCancelled(requestID: String)
+        case providerTurnStarted(turnID: UUID)
         case turnCompleted(turnID: UUID, status: TurnStatus)
         /// Keyed answer group, including singleton groups. Legacy positional answers use turnCompleted.
         case turnsCompleted(turnIDs: [UUID], status: TurnStatus)
@@ -210,7 +211,7 @@ final actor ClaudeNativeProcessSessionController {
     private var translator: ClaudeSDKNDJSONTranslator
     private var sessionID: String?
     private var turnInFlight: Bool {
-        correlation.hasOutstanding || !deferredCompletions.isEmpty
+        correlation.hasOutstanding || correlation.providerTurnID != nil || !deferredCompletions.isEmpty
     }
 
     private var correlation = ClaudeNativeTurnCorrelation()
@@ -264,6 +265,12 @@ final actor ClaudeNativeProcessSessionController {
 
     private var eventsContinuation: AsyncStream<Event>.Continuation?
     private var eventsStream: AsyncStream<Event>
+    private var eventsGeneration: UInt64 = 1
+
+    var eventStreamSnapshot: (generation: UInt64, stream: AsyncStream<Event>) {
+        (eventsGeneration, eventsStream)
+    }
+
     var events: AsyncStream<Event> {
         eventsStream
     }
@@ -400,6 +407,7 @@ final actor ClaudeNativeProcessSessionController {
 
     func ensureEventsStreamReady() {
         guard eventsContinuation == nil else { return }
+        eventsGeneration &+= 1
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
         eventsContinuation = stream.continuation
@@ -411,6 +419,7 @@ final actor ClaudeNativeProcessSessionController {
     func resetEventsStreamForNewRun() {
         eventsContinuation?.finish()
         eventsContinuation = nil
+        eventsGeneration &+= 1
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
         eventsContinuation = stream.continuation
@@ -638,7 +647,7 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     private func interruptRunningTurn(reason: String) async -> InterruptOutcome {
-        guard correlation.hasOutstanding else { return .noTurnInFlight }
+        guard correlation.hasOutstanding || correlation.providerTurnID != nil else { return .noTurnInFlight }
         let target = correlation.enabled ? correlation.beginInterrupt() : nil
         do {
             // Wait for interrupt control-response ACK to confirm Claude received the interrupt.
@@ -1407,7 +1416,7 @@ final actor ClaudeNativeProcessSessionController {
             "length": text.count
         ] as [String: Any])
         // Recovery is still subject to execution ownership; a queued host input is not its owner.
-        if !correlationFailed, !correlation.enabled || correlation.ownsOutput {
+        if !correlationFailed, !correlation.enabled || correlation.ownsOutput || correlation.ownsProviderOutput {
             emit(.stream(AIStreamResult(type: "content", text: text)))
         }
         return true
@@ -1570,6 +1579,7 @@ final actor ClaudeNativeProcessSessionController {
         var ownsOutput = true
         if correlation.enabled {
             do {
+                let previousProviderTurnID = correlation.providerTurnID
                 var frameOwnsOutput: Bool?
                 if Self.isMainThreadActivity(payload) {
                     frameOwnsOutput = try correlation.observeActivity(payload)
@@ -1580,16 +1590,18 @@ final actor ClaudeNativeProcessSessionController {
                 {
                     frameOwnsOutput = try correlation.observeActivity(["user_message_uuid": commandID])
                 }
+                if let providerID = correlation.providerTurnID, providerID != previousProviderTurnID {
+                    emit(.providerTurnStarted(turnID: providerID))
+                }
                 if isResultPayload {
                     let resolved = try correlation.resolve(payload)
-                    ownsOutput = !resolved.inputIDs.isEmpty
+                    ownsOutput = !resolved.inputIDs.isEmpty || resolved.providerTurnID != nil
                     let stopReason = streamResults.last(where: { $0.type == "message_stop" })?.stopReason
                     let status: TurnStatus = resolved.interrupted ? .cancelled : determineTurnStatus(from: payload, stopReasonHint: stopReason)
-                    completion = DeferredCompletion(executionID: resolved.executionID, inputIDs: resolved.inputIDs, status: status, keyed: true)
+                    completion = DeferredCompletion(executionID: resolved.executionID, inputIDs: resolved.inputIDs + (resolved.providerTurnID.map { [$0] } ?? []), status: status, keyed: true)
                 } else {
-                    // Subagent frames have their own stream. Reject them without
-                    // changing the main-thread message's ownership for later deltas.
-                    ownsOutput = !Self.isSubagentActivity(payload) && (frameOwnsOutput ?? correlation.ownsOutput)
+                    // Reject subagent frames without changing main-thread ownership.
+                    ownsOutput = !Self.isSubagentActivity(payload) && (frameOwnsOutput ?? (correlation.ownsOutput || correlation.ownsProviderOutput))
                 }
             } catch {
                 correlationFailed = true
@@ -2195,7 +2207,11 @@ final actor ClaudeNativeProcessSessionController {
         switch request.subtype {
         case "can_use_tool":
             // An approval may be the first evidence of a provider-started execution.
+            let previousProviderTurnID = correlation.providerTurnID
             try? correlation.observeActivity([:])
+            if let providerID = correlation.providerTurnID, providerID != previousProviderTurnID {
+                emit(.providerTurnStarted(turnID: providerID))
+            }
             let payload = request.request
             let toolName = (payload["tool_name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let input = payload["input"] as? [String: Any] ?? [:]

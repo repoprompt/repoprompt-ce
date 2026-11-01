@@ -377,7 +377,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         }
     }
 
-    private final class WrittenLines: @unchecked Sendable {
+    fileprivate final class WrittenLines: @unchecked Sendable {
         private let lock = NSLock()
         private var lines: [Data] = []
         func append(_ line: Data) {
@@ -1411,12 +1411,20 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
     }
 
     private func completions(_ events: [ClaudeNativeProcessSessionController.Event]) -> [([UUID], ClaudeNativeProcessSessionController.TurnStatus)] {
-        events.compactMap {
+        let providerIDs = Set(events.compactMap { event -> UUID? in
+            if case let .providerTurnStarted(id) = event { return id }
+            return nil
+        })
+        return events.compactMap {
+            let ids: [UUID]
+            let status: ClaudeNativeProcessSessionController.TurnStatus
             switch $0 {
-            case let .turnCompleted(id, status): ([id], status)
-            case let .turnsCompleted(ids, status): (ids, status)
-            default: nil
+            case let .turnCompleted(id, value): (ids, status) = ([id], value)
+            case let .turnsCompleted(group, value): (ids, status) = (group, value)
+            default: return nil
             }
+            let hostIDs = ids.filter { !providerIDs.contains($0) }
+            return hostIDs.isEmpty ? nil : (hostIDs, status)
         }
     }
 
@@ -1443,6 +1451,39 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         await fulfillment(of: [finished], timeout: 2)
         await controller.shutdown()
         return await reader.value
+    }
+
+    func testProviderOnlyInterruptReachesTransportAndCannotCancelFollowingHostInput() async throws {
+        let controller = await controller()
+        let controls = ClaudeNativeApprovalAndResumeTests.WrittenLines()
+        await controller.test_installConfigurationTransport(controlRequest: { request in
+            try controls.append(JSONSerialization.data(withJSONObject: request))
+            return [:]
+        }, write: { _ in })
+        try await feed(initFrame, to: controller)
+        try await feed(assistant(text: "provider work"), to: controller)
+        let outcome = await controller.test_interruptRunningTurn(reason: "host supersedes provider")
+        XCTAssertEqual(outcome, .acknowledged)
+        XCTAssertEqual(controls.count, 1)
+        let request = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(controls.line(at: 0))) as? [String: Any])
+        XCTAssertEqual(request["subtype"] as? String, "interrupt")
+        let hostID = try await controller.sendUserMessage("replacement")
+        try await feed(result(text: "interrupted provider"), to: controller)
+        try await feed(result([hostID]), to: controller)
+        let events = await finish(controller)
+        let providerID = try XCTUnwrap(events.compactMap { event -> UUID? in
+            if case let .providerTurnStarted(id) = event { return id }
+            return nil
+        }.first)
+        XCTAssertTrue(events.contains { event in
+            switch event {
+            case let .turnCompleted(id, status): id == providerID && status == .cancelled
+            case let .turnsCompleted(ids, status): ids == [providerID] && status == .cancelled
+            default: false
+            }
+        })
+        XCTAssertEqual(completions(events).map(\.0), [[hostID]])
+        XCTAssertEqual(completions(events).map(\.1), [.completed])
     }
 
     func testFirstInputAndZeroTurnCommandsUseExactEchoWithoutAnEchoLatch() async throws {
@@ -1487,12 +1528,20 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
             if case let .stream(result) = event { return result.text }
             return nil
         }.joined()
-        XCTAssertFalse(text.contains("unowned"))
+        XCTAssertTrue(text.contains("unowned"), "C2 routes provider output under its own start boundary")
+        let starts = events.compactMap { event -> UUID? in
+            if case let .providerTurnStarted(id) = event { return id }
+            return nil
+        }
+        XCTAssertEqual(starts.count, 2, "The later unstamped main-thread probe is a second live provider execution")
+        XCTAssertTrue(events.contains { if case let .turnsCompleted(ids, _) = $0 { return ids.contains(starts[0]) && !ids.contains(host) }
+            return false
+        })
         XCTAssertFalse(text.contains("duplicate"))
         XCTAssertFalse(text.contains("stale answer"))
-        XCTAssertFalse(text.contains("child answer"))
-        XCTAssertFalse(text.contains("subagent ownership probe"))
-        XCTAssertFalse(text.contains("Unsolicited background"))
+        XCTAssertFalse(text.contains("child answer"), "A subagent frame cannot establish main-thread ownership")
+        XCTAssertTrue(text.contains("subagent ownership probe"))
+        XCTAssertTrue(text.contains("Unsolicited background"), "Plaintext salvage now belongs to the live provider execution")
         XCTAssertTrue(text.contains("owned text"))
         XCTAssertTrue(events.contains { if case .approvalRequest = $0 { return true }
             return false
@@ -1504,6 +1553,76 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         if let inputID { frame["user_message_uuid"] = inputID.uuidString }
         if let parentKey { frame[parentKey] = "synthetic-parent-tool" }
         return frame
+    }
+
+    func testCommandLifecycleStartedAdoptsProviderOutputAndMatchingResult() async throws {
+        let controller = await controller()
+        try await feed(initFrame, to: controller)
+        let providerInput = UUID()
+        try await feed(["type": "command_lifecycle", "state": "started", "command_uuid": providerInput.uuidString], to: controller)
+        try await feed(assistant(text: "provider start"), to: controller)
+        try await feed(streamEvent([
+            "type": "content_block_delta", "delta": ["type": "text_delta", "text": "provider continuation"]
+        ]), to: controller)
+        try await feed(result([providerInput], text: "provider final"), to: controller)
+        let events = await finish(controller)
+        let providerIDs = events.compactMap { event -> UUID? in
+            if case let .providerTurnStarted(id) = event { return id }
+            return nil
+        }
+        XCTAssertEqual(providerIDs.count, 1)
+        XCTAssertTrue(events.contains { event in
+            if case let .turnsCompleted(ids, status) = event, ids == providerIDs {
+                if case .completed = status { return true }
+            }
+            return false
+        })
+        let text = events.compactMap { event -> String? in
+            if case let .stream(value) = event { return value.text }
+            return nil
+        }.joined()
+        XCTAssertTrue(text.contains("provider continuation"))
+        XCTAssertTrue(text.contains("provider final"))
+    }
+
+    func testProviderPickupRejectsForeignDeltasWithoutHidingHostOutput() async throws {
+        let controller = await controller()
+        try await feed(initFrame, to: controller)
+        try await feed(assistant(text: "provider start"), to: controller)
+        let host = try await controller.sendUserMessage("B")
+        try await feed(assistant(host), to: controller)
+        let foreign = UUID()
+        try await feed(streamEvent([
+            "type": "message_start", "message": ["id": foreign.uuidString, "role": "assistant"]
+        ], inputID: foreign), to: controller)
+        try await feed(streamEvent([
+            "type": "content_block_delta", "delta": ["type": "text_delta", "text": "stale foreign delta"]
+        ]), to: controller)
+        try await feed(streamEvent([
+            "type": "message_start", "message": ["id": host.uuidString, "role": "assistant"]
+        ], inputID: host), to: controller)
+        try await feed(streamEvent([
+            "type": "content_block_delta", "delta": ["type": "text_delta", "text": "host delta"]
+        ]), to: controller)
+        try await feed(result([host]), to: controller)
+        let events = await finish(controller)
+        let providerIDs = events.compactMap { event -> UUID? in
+            if case let .providerTurnStarted(id) = event { return id }
+            return nil
+        }
+        XCTAssertEqual(providerIDs.count, 1)
+        let completed = events.compactMap { event -> [UUID]? in
+            if case let .turnsCompleted(ids, status) = event, case .completed = status { return ids }
+            return nil
+        }
+        XCTAssertEqual(completed.count, 1)
+        XCTAssertEqual(Set(completed.first ?? []), Set([host] + providerIDs))
+        let output = events.compactMap { event -> String? in
+            if case let .stream(value) = event { return value.text ?? value.reasoning }
+            return nil
+        }.joined()
+        XCTAssertFalse(output.contains("stale foreign delta"))
+        XCTAssertTrue(output.contains("host delta"))
     }
 
     func testForeignMessageRejectionPersistsAcrossDeltasWithoutRetiringHostInput() async throws {
@@ -1653,6 +1772,73 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         }
     }
 
+    func testProviderStartPrecedesDeferredHostCompletionOnIdleAndFallback() async throws {
+        for useIdle in [true, false] {
+            let controller = await controller(fallback: useIdle ? 10 : 0.01)
+            let stream = await controller.events
+            try await feed(initFrame, to: controller)
+            let host = try await controller.sendUserMessage("host A")
+            let completed = expectation(description: "A completes after U starts")
+            let reader = Task {
+                var events: [ClaudeNativeProcessSessionController.Event] = []
+                for await event in stream {
+                    events.append(event)
+                    switch event {
+                    case let .turnsCompleted(ids, _) where ids == [host]: completed.fulfill()
+                    case let .turnCompleted(id, _) where id == host: completed.fulfill()
+                    default: break
+                    }
+                }
+                return events
+            }
+            try await feed(["type": "system", "subtype": "session_state_changed", "state": "busy"], to: controller)
+            let provider = UUID()
+            let batched = try [
+                result([host], text: "host answer"),
+                ["type": "command_lifecycle", "state": "started", "command_uuid": provider.uuidString]
+            ].map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+            await controller.test_handleConfigurationStdoutChunk(batched)
+            if useIdle {
+                try await feed(["type": "system", "subtype": "session_state_changed", "state": "idle"], to: controller)
+            } else {
+                try await Task.sleep(for: .milliseconds(30))
+            }
+            await fulfillment(of: [completed], timeout: 2)
+            try await feed(assistant(provider, text: "provider output"), to: controller)
+            try await feed([
+                "type": "control_request", "request_id": "provider-approval",
+                "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]
+            ], to: controller)
+            await controller.shutdown()
+            let events = await reader.value
+            let startIndex = try XCTUnwrap(events.firstIndex { event in
+                if case .providerTurnStarted = event { return true }
+                return false
+            })
+            let completionIndex = try XCTUnwrap(events.firstIndex { event in
+                switch event {
+                case let .turnsCompleted(ids, _): ids == [host]
+                case let .turnCompleted(id, _): id == host
+                default: false
+                }
+            })
+            XCTAssertLessThan(startIndex, completionIndex)
+            let hostAnswerIndex = try XCTUnwrap(events.firstIndex { event in
+                if case let .stream(value) = event { return value.text == "host answer" }
+                return false
+            })
+            XCTAssertLessThan(hostAnswerIndex, startIndex, "Host final text precedes U's start, even when A's completion is deferred")
+            XCTAssertEqual(events.count { event in
+                if case let .stream(value) = event { return value.text == "provider output" }
+                return false
+            }, 1)
+            XCTAssertEqual(events.count { event in
+                if case let .approvalRequest(request) = event { return request.requestID == .claudeControl("provider-approval") }
+                return false
+            }, 1)
+        }
+    }
+
     func testUnsupportedVersionRetainsLegacySettlement() async throws {
         let controller = await controller()
         var old = initFrame
@@ -1701,7 +1887,7 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         let b = UUID()
         state.register(b)
         let token = state.beginInterrupt()
-        XCTAssertFalse(try state.observeActivity(assistant(text: "U")))
+        XCTAssertTrue(try state.observeActivity(assistant(text: "U")), "Provider output is visible in C2 without acquiring B")
         XCTAssertFalse(state.ownsOutput)
         var interruptedResult = result()
         interruptedResult["is_error"] = true
@@ -1793,32 +1979,24 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
     }
 
     private actor InterruptGate {
-        private let entered: XCTestExpectation
+        nonisolated let entered: AsyncStream<Void>
+        private let enteredContinuation: AsyncStream<Void>.Continuation
         private var response: CheckedContinuation<[String: Any], Error>?
-        private var releasedFailure: Bool?
-        private(set) var didEnter = false
 
-        init(entered: XCTestExpectation) {
-            self.entered = entered
+        init() {
+            let pair = AsyncStream<Void>.makeStream()
+            entered = pair.stream
+            enteredContinuation = pair.continuation
         }
 
         func request() async throws -> [String: Any] {
-            didEnter = true
-            entered.fulfill()
-            // Cleanup can release the gate before a delayed request reaches it.
-            if let failed = releasedFailure {
-                if failed {
-                    throw ClaudeNativeProcessSessionController.ControllerError.controlRequestTimedOut(requestID: "test-interrupt")
-                }
-                return [:]
-            }
-            return try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { continuation in
                 response = continuation
+                enteredContinuation.yield(())
             }
         }
 
         func release(failed: Bool = false) {
-            releasedFailure = failed
             if failed {
                 response?.resume(throwing: ClaudeNativeProcessSessionController.ControllerError.controlRequestTimedOut(requestID: "test-interrupt"))
             } else { response?.resume(returning: [:]) }
@@ -1834,18 +2012,11 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
             let a = try await controller.sendUserMessage("A")
             try await feed(assistant(a), to: controller)
             let b = try await controller.sendUserMessage("B")
-            let entered = expectation(description: "Interrupt request enters gate: \(ordering)")
-            let gate = InterruptGate(entered: entered)
+            let gate = InterruptGate()
             await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+            var entered = gate.entered.makeAsyncIterator()
             let interrupt = Task { await controller.test_interruptRunningTurn(reason: "synthetic steer") }
-            await fulfillment(of: [entered], timeout: 2)
-            guard await gate.didEnter else {
-                await gate.release(failed: true)
-                await controller.shutdown()
-                interrupt.cancel()
-                _ = await interrupt.value
-                continue
-            }
+            await entered.next()
             if ordering == "ack-before-result" {
                 await gate.release()
                 let outcome = await interrupt.value
@@ -1881,18 +2052,11 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
                 let b = try await controller.sendUserMessage("B")
                 var hostIDs = [b]
                 if grouped { try await hostIDs.append(controller.sendUserMessage("C")) }
-                let entered = expectation(description: "Interrupt unowned execution: ackFirst=\(ackFirst), grouped=\(grouped)")
-                let gate = InterruptGate(entered: entered)
+                let gate = InterruptGate()
                 await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+                var entered = gate.entered.makeAsyncIterator()
                 let interrupt = Task { await controller.test_interruptRunningTurn(reason: "interrupt provider-owned work") }
-                await fulfillment(of: [entered], timeout: 2)
-                guard await gate.didEnter else {
-                    await gate.release(failed: true)
-                    await controller.shutdown()
-                    interrupt.cancel()
-                    _ = await interrupt.value
-                    continue
-                }
+                await entered.next()
                 if ackFirst {
                     await gate.release()
                     let outcome = await interrupt.value
@@ -1923,7 +2087,7 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
                     if case let .stream(value) = event { return value.text ?? value.reasoning }
                     return nil
                 }.joined()
-                XCTAssertFalse(output.contains("unowned"))
+                XCTAssertTrue(output.contains("unowned"), "An adopted provider turn keeps its own output")
                 XCTAssertFalse(output.contains("duplicate host final"))
                 XCTAssertTrue(output.contains("host final"))
             }
@@ -1941,18 +2105,11 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
             let a = try await controller.sendUserMessage("A")
             try await feed(assistant(a), to: controller)
             let b = try await controller.sendUserMessage("B")
-            let entered = expectation(description: "Interrupt host A: ackFirst=\(ackFirst)")
-            let gate = InterruptGate(entered: entered)
+            let gate = InterruptGate()
             await controller.test_setConfigurationControlRequest { _ in try await gate.request() }
+            var entered = gate.entered.makeAsyncIterator()
             let interrupt = Task { await controller.test_interruptRunningTurn(reason: "interrupt host A") }
-            await fulfillment(of: [entered], timeout: 2)
-            guard await gate.didEnter else {
-                await gate.release(failed: true)
-                await controller.shutdown()
-                interrupt.cancel()
-                _ = await interrupt.value
-                continue
-            }
+            await entered.next()
             if ackFirst {
                 await gate.release()
                 let outcome = await interrupt.value
@@ -2078,5 +2235,1540 @@ final class ClaudeNativeTurnCorrelationTests: XCTestCase {
         XCTAssertNil(ClaudeIntegratedAgentModeRunner.settleCompletedTurnIDs([b], session: session))
         session.claudeExpectedTurnIDs = [b, c]
         XCTAssertEqual(ClaudeIntegratedAgentModeRunner.settleCompletedTurnIDs([b], session: session, waitForAllUnprotected: false), true, "Legacy settlement keeps its prior first-unprotected boundary")
+    }
+}
+
+@MainActor
+final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
+    private struct Fixture {
+        let harness: AgentSessionLinkRunnerHarness
+        let session: AgentTabSession
+        let controller: ClaudeNativeProcessSessionController
+        let listener: ClaudeControllerEventListener
+    }
+
+    private func fixture(mcp: Bool = false, write: @escaping @Sendable (Data) throws -> Void = { _ in }) async throws -> Fixture {
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() })
+        let session = harness.host.session(for: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.runState = .completed
+        let runID = UUID()
+        session.installRunID(runID)
+        let controller = ClaudeNativeProcessSessionController(runID: runID, tabID: session.tabID, windowID: 1, workspacePath: nil, config: .discovery(commandName: "/usr/bin/false"))
+        await controller.test_installConfigurationTransport(write: write)
+        session.claudeController = controller
+        if mcp {
+            let id = UUID()
+            let registration = await AgentRunSessionStore.register(sessionID: id)
+            session.mcpControlContext = .init(
+                sessionID: id,
+                activationID: UUID(),
+                registration: registration,
+                currentEpoch: nil,
+                preparedEpoch: nil,
+                pendingEpochTransition: nil,
+                originatingConnectionID: nil,
+                interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+                suppressUserNotifications: true,
+                forceAutoEditEnabled: false,
+                autoEditEnabledBeforeOverride: false,
+                taskLabelKind: .pair
+            )
+        }
+        let installed = await harness.host.claudeCoordinator.test_installEventListener(for: session)
+        let listener = try XCTUnwrap(installed)
+        try await feed(["type": "system", "subtype": "init", "claude_code_version": "2.1.292", "capabilities": ["msg_lifecycle_v1"]], controller)
+        return Fixture(harness: harness, session: session, controller: controller, listener: listener)
+    }
+
+    private func cleanup(_ fixture: Fixture) async {
+        await fixture.harness.host.claudeCoordinator.shutdownClaudeSession(fixture.session)
+        if let context = fixture.session.mcpControlContext { await AgentRunSessionStore.cleanup(registration: context.registration) }
+        fixture.harness.host.test_setAfterMCPStoreEpochBegan(nil)
+    }
+
+    private func feed(_ payload: [String: Any], _ controller: ClaudeNativeProcessSessionController) async throws {
+        try await controller.test_receiveConfigurationResponseLine(JSONSerialization.data(withJSONObject: payload))
+    }
+
+    private func assistant(_ text: String) -> [String: Any] {
+        ["type": "assistant", "message": ["id": UUID().uuidString, "role": "assistant", "content": [["type": "text", "text": text]]]]
+    }
+
+    private func result(_ text: String = "done") -> [String: Any] {
+        ["type": "result", "subtype": "success", "result": text, "usage": ["input_tokens": 5, "output_tokens": 7]]
+    }
+
+    private func until(_ message: String, timeout: Duration = .seconds(5), _ predicate: () -> Bool) async {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while !predicate(), ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(predicate(), message)
+    }
+
+    func testTwoProviderAttemptsKeepProcessAndPublishRelatedEpochsWithoutUserRows() async throws {
+        let f = try await fixture(mcp: true)
+        let runID = f.session.runID
+        var epochs: [AgentRunTurnEpoch] = []
+        for index in 0 ..< 2 {
+            try await feed(assistant("provider-\(index)"), f.controller)
+            await until("provider work adopts") { f.session.runState == .running }
+            let owner = try XCTUnwrap(f.session.activeRunOwnership)
+            try epochs.append(XCTUnwrap(owner.turnEpoch))
+            XCTAssertEqual(f.session.runID, runID)
+            XCTAssertEqual(f.session.activeNonCodexTurnTokenAccumulator?.estimatedUserInputTokens, 0)
+            XCTAssertFalse(f.session.items.contains { $0.kind == .user })
+            if case .none = f.session.terminalAnchor(for: owner) {} else { XCTFail("Pure provider attempt has no user anchor") }
+            try await feed(result("provider-final-\(index)"), f.controller)
+            await until("terminal publication completes") { f.session.runState == .completed && !f.session.runLifecycle.terminalCommitInProgress }
+            guard case .accepted = f.session.runLifecycle.lastTerminalPublicationResult else { XCTFail("Epoch must accept exactly one terminal")
+                break
+            }
+            XCTAssertNil(f.session.agentTask)
+            XCTAssertTrue(f.session.pendingTurnRuntimeAnchors.isEmpty)
+        }
+        XCTAssertEqual(epochs.count, 2)
+        XCTAssertNotEqual(epochs.first?.id, epochs.last?.id)
+        XCTAssertEqual(epochs.map(\.transitionKind), [.relatedFollowUp, .relatedFollowUp])
+        XCTAssertEqual(epochs.first?.continuityGeneration, epochs.last?.continuityGeneration)
+        XCTAssertTrue(f.session.items.contains { $0.text.contains("provider-final-0") })
+        XCTAssertTrue(f.session.items.contains { $0.text.contains("provider-final-1") })
+        XCTAssertFalse(f.listener.isBusy)
+        await cleanup(f)
+    }
+
+    func testFinalOnlyProviderReplyDoesNotReplaceCompletedAssistant() async throws {
+        let f = try await fixture()
+        f.session.appendItem(.user("earlier question", sequenceIndex: f.session.nextSequenceIndex))
+        let previous = AgentChatItem.assistant("earlier answer", sequenceIndex: f.session.nextSequenceIndex)
+        f.session.appendItem(previous)
+        let providerInput = UUID()
+        try await feed(["type": "command_lifecycle", "state": "started", "command_uuid": providerInput.uuidString], f.controller)
+        await until("provider turn is adopted") { f.session.runState == .running }
+        try await feed([
+            "type": "result", "subtype": "success", "result": "new provider answer",
+            "user_message_uuid": providerInput.uuidString
+        ], f.controller)
+        await until("provider attempt completes") { f.session.runState == .completed && f.session.agentTask == nil }
+        XCTAssertEqual(f.session.items.first(where: { $0.id == previous.id })?.text, previous.text)
+        XCTAssertEqual(f.session.items.count(where: { $0.kind == .user }), 1)
+        let answers = f.session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(answers.count, 2)
+        XCTAssertNotEqual(answers.last?.id, previous.id)
+        XCTAssertEqual(answers.last?.text, "new provider answer")
+        await cleanup(f)
+    }
+
+    func testApprovalFirstAdoptsBeforePermissionAndStopRetiresListener() async throws {
+        let f = try await fixture()
+        try await feed(["type": "control_request", "request_id": "permission-first", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
+        await until("Approval-first cannot hang invisibly") { f.session.runState == .waitingForApproval }
+        XCTAssertEqual(f.session.pendingApproval?.requestID, .claudeControl("permission-first"))
+        XCTAssertNotNil(f.session.activeRunOwnership)
+        await f.harness.host.cancelAgentRun(tabID: f.session.tabID, completion: .terminalTeardownCompleted)
+        XCTAssertEqual(f.session.runState, .cancelled)
+        XCTAssertNil(f.session.claudeController)
+        XCTAssertNil(f.listener.subscription)
+        XCTAssertFalse(f.listener.isBusy)
+        try await feed(assistant("late"), f.controller)
+        XCTAssertEqual(f.session.runState, .cancelled)
+        await cleanup(f)
+    }
+
+    func testNoiseSubagentsAndReconnectWithoutReplayDoNotCreateAttempts() async throws {
+        let f = try await fixture()
+        let historical = AgentChatItem.error("persisted history", sequenceIndex: f.session.nextSequenceIndex)
+        f.session.appendItem(historical)
+        var child = assistant("child")
+        child["parent_tool_use_id"] = "parent-tool"
+        for frame in [child, ["type": "system", "subtype": "task_notification"], ["type": "system", "subtype": "task_progress"], ["type": "user", "message": ["role": "user", "content": [["type": "tool_result", "tool_use_id": "orphan", "content": "tool output"]]]]] {
+            try await feed(frame, f.controller)
+        }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertNil(f.session.activeRunOwnership)
+        XCTAssertEqual(f.session.items.map(\.id), [historical.id])
+        let repeated = await f.harness.host.claudeCoordinator.test_installEventListener(for: f.session)
+        XCTAssertTrue(repeated === f.listener)
+        await f.controller.resetEventsStreamForNewRun()
+        let replacement = await f.harness.host.claudeCoordinator.test_installEventListener(for: f.session)
+        XCTAssertTrue(replacement === f.listener)
+        XCTAssertEqual(f.session.items.map(\.id), [historical.id])
+        try await feed(assistant("new live work"), f.controller)
+        try await feed(result("new live work final"), f.controller)
+        await until("Only live work is admitted") { f.session.lastTerminalCommitRevision != nil }
+        XCTAssertEqual(f.session.items.count(where: { $0.text.contains("new live work") }), 1)
+        await cleanup(f)
+    }
+
+    func testSameChunkTailSurvivesTerminalAndAttemptCancellationDoesNotKillReader() async throws {
+        let f = try await fixture()
+        try await feed(assistant("one"), f.controller)
+        await until("first starts") { f.session.runState == .running }
+        let first = f.session.activeRunOwnership
+        // A single controller ingress hop leaves no runner scheduling opportunity between frames.
+        let frames = try [result("one-final"), assistant("two"), result("two-final")].map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+        await f.controller.test_handleConfigurationStdoutChunk(frames)
+        await until("next execution survives unread-tail handback") { f.session.lastTerminalCommitRevision?.ownership != first && f.session.lastTerminalCommitRevision != nil && f.session.runState == .completed }
+        XCTAssertTrue(f.session.items.contains { $0.text.contains("one") })
+        XCTAssertTrue(f.session.items.contains { $0.text.contains("two") })
+        XCTAssertNil(f.listener.subscription)
+        await cleanup(f)
+    }
+
+    func testConsumedProviderStartKeepsHostAttemptAliveThroughDeferredCompletion() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        var deliveredStart = false
+        listener.test_onDelivery = { event in
+            if case .providerTurnStarted = event { deliveredStart = true }
+        }
+        // The controller has already resolved A, but its completion is deferred until idle/fallback.
+        await controller.emit(.stream(.init(type: "final_content", text: "host answer")))
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("U's start was consumed by A's inbox") { deliveredStart }
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("A's completion is consumed") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        XCTAssertTrue(session.runState.isActive, "U must retain an owner after A completes")
+        await controller.emit(.approvalRequest(.init(
+            requestID: .claudeControl("provider-approval"), method: "control/can_use_tool",
+            kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+        )))
+        await until("U's approval is presented") { session.runState == .waitingForApproval }
+        XCTAssertEqual(session.pendingApproval?.requestID, .claudeControl("provider-approval"))
+        await controller.emit(.stream(.init(type: "final_content", text: "provider output")))
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .completed))
+        await until("provider work settles once") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertTrue(session.items.contains { $0.kind == .assistant && $0.text == "host answer" })
+        XCTAssertEqual(session.items.count(where: { $0.text.contains("provider output") }), 1)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .assistant }), 2)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testChainedConsumedProviderStartsKeepTheSameOwner() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let firstProviderID = UUID()
+        let secondProviderID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: firstProviderID))
+        await until("first provider start is consumed") { session.claudeExpectedTurnIDs.contains(firstProviderID) }
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("host result is retained for provider work") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        XCTAssertTrue(session.runState.isActive)
+        await controller.emit(.providerTurnStarted(turnID: secondProviderID))
+        await until("second provider start is consumed") { session.claudeExpectedTurnIDs.contains(secondProviderID) }
+        await controller.emit(.turnsCompleted(turnIDs: [firstProviderID], status: .completed))
+        await until("first provider completion is consumed") { !session.claudeExpectedTurnIDs.contains(firstProviderID) }
+        XCTAssertTrue(session.runState.isActive)
+        await controller.emit(.stream(.init(type: "final_content", text: "second provider answer")))
+        await controller.emit(.turnsCompleted(turnIDs: [secondProviderID], status: .completed))
+        await until("second provider work settles") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertEqual(session.items.count(where: { $0.kind == .assistant && $0.text == "second provider answer" }), 1)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testSteeringRetainedProviderSuccessorDoesNotCancelReplacement() async throws {
+        for successorFinishesBeforeSend in [true, false] {
+            let (h, session, controller, _) = try await spyFixture()
+            let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(row)
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            await service.startRun(
+                tabID: session.tabID, session: session, initialUserMessage: row.text,
+                initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+            )
+            await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+            let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+            let providerID = UUID()
+            await controller.emit(.providerTurnStarted(turnID: providerID))
+            await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+            await until("host completion is retained") { !session.claudeExpectedTurnIDs.contains(hostID) }
+            XCTAssertTrue(session.runState.isActive)
+            await controller.setTurnInFlight(true)
+            await controller.setInterruptedTurnID(providerID)
+            let gate = Gate()
+            await controller.setSendSuspension { await gate.wait() }
+            try queueSteer("replacement B", in: session, service: h.service)
+            let accepted = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+            XCTAssertTrue(accepted)
+            await until("replacement write is held") { gate.isWaiting }
+            if successorFinishesBeforeSend {
+                await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .cancelled))
+                await until("interrupted provider completes") { !session.claudeExpectedTurnIDs.contains(providerID) }
+                XCTAssertTrue(session.runState.isActive)
+            }
+            gate.open()
+            await until("replacement input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+            if !successorFinishesBeforeSend {
+                await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .cancelled))
+                await until("interrupted provider completes") { !session.claudeExpectedTurnIDs.contains(providerID) }
+                XCTAssertTrue(session.runState.isActive)
+            }
+            await controller.completeLastTurn(status: .completed)
+            await until("replacement completes") { session.runState == .completed && session.agentTask == nil }
+            XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testAcceptedReplacementSurvivesQueuedNoWriteSteerAfterProviderCancellation() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("A registers") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("U starts inside A's inbox") { session.claudeExpectedTurnIDs.contains(providerID) }
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("A completes while U remains") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertTrue(session.claudeExpectedTurnIDs.contains(providerID))
+        await controller.setTurnInFlight(true)
+        await controller.setInterruptedTurnID(providerID)
+        try queueSteer("replacement B", in: session, service: h.service)
+        let acceptedB = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedB)
+        await until("B registers") { !session.claudeExpectedTurnIDs.subtracting([providerID]).isEmpty }
+        let replacementID = try XCTUnwrap(session.claudeExpectedTurnIDs.subtracting([providerID]).first)
+        let gate = Gate()
+        h.host.claudeCoordinator.installHostCapabilities(.init(
+            isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
+            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
+                return .unavailable
+            },
+            hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
+            decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
+            acquireAgentSessionLinkPhysicalDispatch: { _, _ in true }, recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+            recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in }, acceptAgentSessionLinkPromptClaim: { _, _, _ in }
+        ), providerBindingService: h.host.providerBindingService)
+        try queueSteer("refused C", in: session, service: h.service)
+        let acceptedC = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedC)
+        await until("C protects B while waiting on route") {
+            gate.isWaiting && session.claudeSupersedingProtectedTurnIDs.contains(replacementID)
+        }
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .cancelled))
+        await controller.emit(.turnsCompleted(turnIDs: [replacementID], status: .completed))
+        await until("B result is consumed") { !session.claudeExpectedTurnIDs.contains(replacementID) }
+        XCTAssertTrue(session.runState.isActive)
+        gate.open()
+        await until("refused C releases B") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+        let sentCount = await controller.sentCount
+        XCTAssertEqual(sentCount, 2, "Only A and B were written")
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testQueuedSteerBeforeReplacementRegistrationCannotRestoreProviderCancellation() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("A registers") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("U starts inside A's inbox") { session.claudeExpectedTurnIDs.contains(providerID) }
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("A completes while U remains") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        await controller.setTurnInFlight(true)
+        let sendGate = Gate()
+        await controller.setSendSuspension { await sendGate.wait() }
+        try queueSteer("replacement B", in: session, service: service)
+        let acceptedB = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedB)
+        await until("B send is held before registration") { sendGate.isWaiting }
+        let preparationGate = Gate()
+        h.host.test_beforeACPToolIdleWait = { await preparationGate.wait() }
+        defer { h.host.test_beforeACPToolIdleWait = nil }
+        h.host.claudeCoordinator.installHostCapabilities(.init(
+            isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
+            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            qualifyAgentSessionLinkProviderInputRoute: { _, _ in .unavailable },
+            hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
+            decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
+            acquireAgentSessionLinkPhysicalDispatch: { _, _ in true }, recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+            recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in }, acceptAgentSessionLinkPromptClaim: { _, _, _ in }
+        ), providerBindingService: h.host.providerBindingService)
+        try queueSteer("refused C", in: session, service: service)
+        let acceptedC = await service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(acceptedC)
+        XCTAssertTrue(
+            session.pendingClaudeSteeringInstructions.last?.supersedingProtectedTurnIDs.contains(providerID) == true,
+            "C claims U before B is accepted"
+        )
+        sendGate.open()
+        await until("B registers and C waits before interrupt") {
+            preparationGate.isWaiting && !session.claudeExpectedTurnIDs.subtracting([providerID]).isEmpty
+        }
+        let replacementID = try XCTUnwrap(session.claudeExpectedTurnIDs.subtracting([providerID]).first)
+        XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.contains(replacementID))
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .cancelled))
+        await controller.emit(.turnsCompleted(turnIDs: [replacementID], status: .completed))
+        await until("U and B results are consumed") { session.claudeExpectedTurnIDs.isEmpty }
+        await controller.setTurnInFlight(false)
+        preparationGate.open()
+        await until("refused C releases only B") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+        let sentCount = await controller.sentCount
+        XCTAssertEqual(sentCount, 2, "Only A and B were written")
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testProviderStartAfterReplacementWriteSurvivesDeferredCompletion() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let firstProviderID = UUID()
+        let secondProviderID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: firstProviderID))
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("host result is retained") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        await controller.setTurnInFlight(true)
+        await controller.setInterruptedTurnID(firstProviderID)
+        try queueSteer("replacement B", in: session, service: h.service)
+        let accepted = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        await until("replacement input is registered") {
+            !session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs).isEmpty
+        }
+        let replacementID = try XCTUnwrap(session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs).first)
+        await controller.emit(.turnsCompleted(turnIDs: [firstProviderID], status: .cancelled))
+        await until("interrupted provider result is consumed") { !session.claudeExpectedTurnIDs.contains(firstProviderID) }
+        await controller.emit(.stream(.init(type: "final_content", text: "replacement answer")))
+        await controller.emit(.providerTurnStarted(turnID: secondProviderID))
+        await controller.emit(.turnsCompleted(turnIDs: [replacementID], status: .completed))
+        await until("replacement completion is retained for later provider work") {
+            !session.claudeExpectedTurnIDs.contains(replacementID)
+        }
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertTrue(session.claudeExpectedTurnIDs.contains(secondProviderID))
+        await controller.emit(.stream(.init(type: "final_content", text: "later provider answer")))
+        await controller.emit(.turnsCompleted(turnIDs: [secondProviderID], status: .completed))
+        await until("later provider work settles") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["replacement answer", "later provider answer"])
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testAdoptedProviderFinalOnlySuccessorKeepsBothAnswers() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let firstProviderID = UUID()
+        let secondProviderID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: firstProviderID))
+        await until("first provider turn is adopted") { session.runState == .running }
+        await controller.emit(.stream(.init(type: "final_content", text: "first provider answer")))
+        await controller.emit(.providerTurnStarted(turnID: secondProviderID))
+        await until("second provider start is consumed") { session.claudeExpectedTurnIDs.contains(secondProviderID) }
+        await controller.emit(.turnsCompleted(turnIDs: [firstProviderID], status: .completed))
+        await until("first provider result is consumed") { !session.claudeExpectedTurnIDs.contains(firstProviderID) }
+        XCTAssertTrue(session.runState.isActive)
+        await controller.emit(.stream(.init(type: "final_content", text: "second provider answer")))
+        await controller.emit(.turnsCompleted(turnIDs: [secondProviderID], status: .completed))
+        await until("second provider work settles") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["first provider answer", "second provider answer"])
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testQueuedSteerDoesNotMergeAdoptedProviderFinalOnlyAnswers() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let firstProviderID = UUID()
+        let secondProviderID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: firstProviderID))
+        await until("first provider turn is adopted") { session.runState == .running }
+        try queueSteer("queued replacement", in: session, service: h.service)
+        XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.contains(firstProviderID))
+        await controller.emit(.stream(.init(type: "final_content", text: "first provider answer")))
+        await controller.emit(.providerTurnStarted(turnID: secondProviderID))
+        await controller.emit(.stream(.init(type: "final_content", text: "second provider answer")))
+        await until("both final-only answers are visible") {
+            session.items.count(where: { $0.kind == .assistant }) == 2
+        }
+        XCTAssertEqual(session.items.filter { $0.kind == .assistant }.map(\.text), ["first provider answer", "second provider answer"])
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testLaterProviderFailureOrCancellationOutranksDeferredHostSuccess() async throws {
+        for status: NativeAgentRuntimeTurnStatus in [.failed, .cancelled] {
+            let (h, session, controller, _) = try await spyFixture()
+            let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(row)
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            await service.startRun(
+                tabID: session.tabID, session: session, initialUserMessage: row.text,
+                initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+            )
+            await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+            let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+            let providerID = UUID()
+            await controller.emit(.stream(.init(type: "final_content", text: "host answer")))
+            await controller.emit(.providerTurnStarted(turnID: providerID))
+            await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+            await until("host result is retained for later provider work") { !session.claudeExpectedTurnIDs.contains(hostID) }
+            XCTAssertTrue(session.runState.isActive)
+            await controller.emit(.turnsCompleted(turnIDs: [providerID], status: status))
+            await until("later provider result publishes") { session.agentTask == nil }
+            XCTAssertEqual(session.runState, status == .failed ? .failed : .cancelled)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testDeferredEmptyHostResultSeparatesLaterProviderDelta() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+        let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+        let providerID = UUID()
+        await controller.emit(.stream(.init(type: "content", text: "host partial")))
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .completed))
+        await until("deferred A is consumed") { !session.claudeExpectedTurnIDs.contains(hostID) }
+        await controller.emit(.stream(.init(type: "content", text: "provider continuation")))
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .completed))
+        await until("later provider settles") { session.agentTask == nil }
+        let answers = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(answers.map(\.text), ["host partial", "provider continuation"])
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testRefusedEpochDeniesPendingApprovalAndRecordsOnce() async throws {
+        let writes = ClaudeNativeApprovalAndResumeTests.WrittenLines()
+        let f = try await fixture(mcp: true, write: { writes.append($0) })
+        let context = try XCTUnwrap(f.session.mcpControlContext)
+        // Replace the store registration without replacing the captured control activation.
+        let successor = await AgentRunSessionStore.register(sessionID: context.sessionID)
+        try await feed(["type": "control_request", "request_id": "refused-permission", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
+        await until("failed preparation cancels exact provider work") { f.session.claudeController == nil }
+        XCTAssertNil(f.session.activeRunOwnership)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending)
+        XCTAssertNil(f.session.mcpControlContext?.pendingEpochTransition)
+        await until("refused permission is explicitly denied") { writes.count == 1 }
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: 0))) as? [String: Any])
+        XCTAssertEqual(frame["type"] as? String, "control_response")
+        let response = try XCTUnwrap(frame["response"] as? [String: Any])
+        XCTAssertEqual(response["request_id"] as? String, "refused-permission")
+        let decision = try XCTUnwrap(response["response"] as? [String: Any])
+        XCTAssertEqual(decision["behavior"] as? String, "deny")
+        XCTAssertEqual(decision["interrupt"] as? Bool, true)
+        XCTAssertEqual(f.session.items.count(where: { $0.text == "RepoPrompt stopped Claude work because it could not attach it to this session." }), 1)
+        await AgentRunSessionStore.cleanup(registration: successor)
+        await cleanup(f)
+    }
+
+    @MainActor
+    private final class Gate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        var isWaiting: Bool {
+            continuation != nil
+        }
+
+        func wait() async {
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func open() {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    private func spyFixture(replacement: MonitorFakeNativeController? = nil, mcp: Bool = false) async throws -> (AgentSessionLinkRunnerHarness, AgentTabSession, MonitorFakeNativeController, ClaudeControllerEventListener) {
+        let controller = MonitorFakeNativeController()
+        var creations = 0
+        let harness = AgentSessionLinkRunnerHarness(headlessProviderFactory: { _, _ in AgentSessionLinkCapturingHeadlessProvider() }, claudeControllerFactory: { _, _, _, _ in
+            creations += 1
+            return creations > 1 ? replacement ?? controller : controller
+        })
+        let session = harness.host.session(for: UUID())
+        session.selectedAgent = .claudeCode
+        session.hasLoadedPersistedState = true
+        session.runState = .completed
+        let runID = UUID()
+        session.installRunID(runID)
+        session.providerSessionID = "monitor-native-session"
+        let outcome = await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session, intent: .reconnect(runID: runID, providerSessionID: "monitor-native-session", currency: session.persistentBindingTransitionToken()))
+        XCTAssertEqual(outcome, .ready)
+        let installed = await harness.host.claudeCoordinator.test_installEventListener(for: session)
+        if mcp {
+            let id = UUID()
+            let registration = await AgentRunSessionStore.register(sessionID: id)
+            session.mcpControlContext = .init(
+                sessionID: id, activationID: UUID(), registration: registration,
+                currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil,
+                originatingConnectionID: nil, interactionTransport: .mcp(sessionID: id, originatingConnectionID: nil),
+                suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair
+            )
+        }
+        return try (harness, session, controller, XCTUnwrap(installed))
+    }
+
+    private func queueSteer(_ text: String, in session: AgentTabSession, service: AgentModeRunService) throws {
+        let owner = try XCTUnwrap(session.activeRunOwnership)
+        let row = AgentChatItem.user(text, sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let id = UUID()
+        session.pendingClaudeSteeringInstructions.append(.init(
+            id: id,
+            targetRunID: session.runID,
+            targetRunAttemptID: owner.attemptID,
+            providerText: text,
+            attachments: [],
+            taggedFileAttachments: [],
+            draftText: text,
+            optimisticUserItemID: row.id,
+            createdAt: Date()
+        ))
+        service.protectCurrentClaudeTurnForAcceptedSteeringIfNeeded(session: session, steeringID: id)
+    }
+
+    func testViewModelAdoptionRaceAugmentsLocalAttachmentOnceAndDoesNotConvertLaneWake() async throws {
+        let (h, session, controller, _) = try await spyFixture(mcp: true)
+        let gate = Gate()
+        h.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("provider epoch preparation is held") { gate.isWaiting }
+        let row = AgentChatItem.user("local race input", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let candidate = session.registerLocalComposerCandidate(itemID: row.id, at: session.items.count - 1)
+        let attachmentURL = "https://example.invalid/synthesized-attachment.png"
+        let attachment = AgentFileAttachment(source: .url(attachmentURL), title: "synthetic attachment")
+        let localOutcome = AgentRunStartOutcomeRecorder()
+        let local = Task { @MainActor in
+            await h.host.startAgentRun(
+                tabID: session.tabID, initialMessage: row.text, attachments: [attachment],
+                directStartOptions: .init(localComposerCandidate: candidate, initialUserItemID: row.id),
+                startOutcome: localOutcome
+            )
+        }
+        let laneOutcome = AgentRunStartOutcomeRecorder()
+        let lane = Task { @MainActor in
+            await h.host.startAgentRun(tabID: session.tabID, initialMessage: "", directStartOptions: .laneUpdate(wakeID: UUID()), startOutcome: laneOutcome)
+        }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await controller.setInterruptedTurnID(providerID)
+        await controller.setImmediateReplyDuringSend(true)
+        gate.open()
+        _ = await local.value
+        _ = await lane.value
+        await until("one local steer completes the adopted owner") { session.runState == .completed && session.agentTask == nil }
+        let messages = await controller.sentMessages
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertEqual(messages.first?.components(separatedBy: attachmentURL).count, 2, "The attachment is rendered exactly once")
+        XCTAssertTrue(messages.first?.contains(row.text) == true)
+        XCTAssertEqual(localOutcome.outcome, .accepted)
+        XCTAssertFalse(laneOutcome.outcome.didStart)
+        XCTAssertEqual(session.items.count { $0.kind == .user }, 1, "The lane wake must not create a synthetic input")
+        let owner = try XCTUnwrap(session.lastTerminalCommitRevision?.ownership)
+        if case let .exact(id) = session.terminalAnchor(for: owner) { XCTAssertEqual(id, row.id) } else { XCTFail("The transferred real user row owns the terminal anchor") }
+        h.host.test_setAfterMCPStoreEpochBegan(nil)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        if let context = session.mcpControlContext { await AgentRunSessionStore.cleanup(registration: context.registration) }
+    }
+
+    func testAlreadyAdoptedLocalSendSteersAndCompetingStartupCannotClaimAcceptance() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("provider adoption has already finished") { session.runState == .running && listener.adoptionTask == nil }
+        let owner = try XCTUnwrap(session.activeRunOwnership)
+        let refused = AgentRunStartOutcomeRecorder()
+        await h.service.startRun(tabID: session.tabID, session: session, initialUserMessage: "contending startup", initialMessageForRun: "contending startup", attachments: [], startOutcome: refused)
+        XCTAssertFalse(refused.outcome.didStart, "Another active owner must not overwrite a startup refusal as accepted")
+        XCTAssertEqual(session.activeRunOwnership, owner)
+        let row = AgentChatItem.user("local after adoption", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(row)
+        let candidate = session.registerLocalComposerCandidate(itemID: row.id, at: session.items.count - 1)
+        await controller.setInterruptedTurnID(providerID)
+        await controller.setImmediateReplyDuringSend(true)
+        let accepted = AgentRunStartOutcomeRecorder()
+        _ = await h.host.startAgentRun(tabID: session.tabID, initialMessage: row.text, directStartOptions: .init(localComposerCandidate: candidate, initialUserItemID: row.id), startOutcome: accepted)
+        await until("late local send completes the adopted owner") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertTrue(accepted.outcome.didStart)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, owner)
+        let messages = await controller.sentMessages
+        XCTAssertEqual(messages.count, 1)
+        XCTAssertTrue(messages[0].contains(row.text))
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testInternalCancellationDuringPendingAdoptionPreservesQueuedLocalWork() async throws {
+        let f = try await fixture(mcp: true)
+        let gate = Gate()
+        f.harness.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+        try await feed(assistant("pending provider"), f.controller)
+        await until("provider epoch preparation is held") { gate.isWaiting }
+        f.session.pendingInstructions.append("queued local input")
+        let adoption = f.listener.adoptionTask
+        await f.harness.host.cancelAgentRun(tabID: f.session.tabID, origin: .internalLifecycle)
+        gate.open()
+        await adoption?.value
+        XCTAssertEqual(f.session.pendingInstructions.map(\.providerText), ["queued local input"])
+        XCTAssertNil(f.session.claudeController)
+        XCTAssertFalse(f.listener.isBusy)
+        await cleanup(f)
+    }
+
+    func testRetiredPreparationInboxCannotLoseFreshProcessAnswer() async throws {
+        let replacement = MonitorFakeNativeController()
+        let (h, session, _, oldListener) = try await spyFixture(replacement: replacement)
+        let oldRunID = session.runID
+        let reservation = try XCTUnwrap(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session))
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        await replacement.setImmediateReplyDuringSend(true)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: "fresh replacement input",
+            initialMessageForRun: "fresh replacement input", attachments: [], preparedClaudeEvents: reservation
+        )
+        await until("fresh process answer reaches its replacement reservation") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertNotEqual(session.runID, oldRunID)
+        XCTAssertFalse(oldListener.isCurrent())
+        XCTAssertTrue(reservation.subscription.isClosed)
+        XCTAssertEqual(session.claudeController.map { ObjectIdentifier($0) }, ObjectIdentifier(replacement))
+        XCTAssertTrue(session.items.contains { $0.text.contains("immediate-steer-reply") })
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testHostPreparationReservationOwnsProviderStartBeforeRunnerDispatch() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        let reservation = try XCTUnwrap(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session))
+        var presentedDeniedApproval = false
+        listener.test_onDelivery = { event in
+            if case .approvalRequest = event { presentedDeniedApproval = true }
+        }
+        XCTAssertNil(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session), "A competing startup fails closed without replacing the inbox")
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.setInterruptedTurnID(providerID)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.approvalRequest(.init(requestID: .claudeControl("parked-host-start"), method: "control/can_use_tool", kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool")))
+        await until("host-preparation approval is parked") { listener.pendingApprovalIDs == ["parked-host-start"] }
+        XCTAssertNil(session.activeRunOwnership, "Async host preparation retains admission; provider work cannot adopt over it")
+        XCTAssertNil(listener.adoptionTask)
+        XCTAssertTrue(listener.subscription === reservation.subscription)
+        await controller.setImmediateReplyDuringSend(true)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: "host start",
+            initialMessageForRun: "host start", attachments: [], preparedClaudeEvents: reservation
+        )
+        await until("host answer completes its sole attempt") { session.runState == .completed && session.agentTask == nil }
+        let calls = await controller.inputBoundaryCalls
+        XCTAssertEqual(calls, ["permission:parked-host-start:cancel", "interrupt:interrupt", "send"])
+        XCTAssertFalse(presentedDeniedApproval)
+        XCTAssertNil(session.pendingApproval)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .completed)
+        XCTAssertNil(listener.subscription)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testApprovalSteerProtectsProviderWorkAndImmediateAnswerWaitsForHostIDRegistration() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.approvalRequest(.init(requestID: .claudeControl("steer-permission"), method: "control/can_use_tool", kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool")))
+        await until("provider approval is visible") { session.runState == .waitingForApproval }
+        let owner = try XCTUnwrap(session.activeRunOwnership)
+        try queueSteer("replacement instruction", in: session, service: h.service)
+        XCTAssertTrue(session.claudeSupersedingProtectedTurnIDs.contains(providerID))
+        let gate = Gate()
+        await controller.setInterruptedTurnID(providerID)
+        await controller.setImmediateReplyDuringSend(true)
+        await controller.setSendSuspension { await gate.wait() }
+        let accepted = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        await until("write receipt is held after immediate reply") { gate.isWaiting }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(session.activeRunOwnership, owner, "An immediate reply cannot outrun expected-ID registration")
+        XCTAssertNil(session.pendingApproval)
+        XCTAssertEqual(session.runState, .running, "The replacement must not wait on a cancelled approval")
+        let calls = await controller.inputBoundaryCalls
+        XCTAssertEqual(calls, ["permission:steer-permission:cancel", "interrupt:interrupt", "send"])
+        gate.open()
+        await until("host result finishes the same attempt") { session.runState == .completed && session.agentTask == nil }
+        XCTAssertTrue(session.claudeExpectedTurnIDs.isEmpty)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, owner)
+        if case .exact = session.terminalAnchor(for: owner) {} else { XCTFail("A real steer supplies its exact user anchor") }
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testLateApprovalCancellationDoesNotReopenWaitingStateAfterSteer() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.approvalRequest(.init(
+            requestID: .claudeControl("late-steer-permission"), method: "control/can_use_tool",
+            kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+        )))
+        await until("provider approval is visible") { session.runState == .waitingForApproval }
+        try queueSteer("replacement instruction", in: session, service: h.service)
+        await controller.setInterruptedTurnID(providerID)
+        let accepted = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        await until("replacement send is registered") {
+            !session.claudeExpectedTurnIDs.subtracting(session.claudeSupersedingProtectedTurnIDs).isEmpty
+                && session.pendingApproval == nil
+        }
+        XCTAssertEqual(session.runState, .running)
+        var deliveredLateCancellation = false
+        listener.test_onDelivery = { event in
+            if case .approvalCancelled = event { deliveredLateCancellation = true }
+        }
+        await controller.emit(.approvalCancelled(requestID: "late-steer-permission"))
+        await until("late cancellation is delivered") { deliveredLateCancellation }
+        XCTAssertNil(session.pendingApproval)
+        XCTAssertEqual(session.runState, .running)
+        await controller.completeLastTurn(status: .completed)
+        await until("replacement completes") { session.runState == .completed && session.agentTask == nil }
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testDefinitivelyUnsentSteerReleasesCompletedProviderWork() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("provider starts") { session.runState == .running }
+        let gate = Gate()
+        // Refuse the real coordinator's route gate, before its physical input boundary.
+        h.host.claudeCoordinator.installHostCapabilities(.init(
+            isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
+            stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+            qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
+                return .unavailable
+            },
+            hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
+            decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
+            acquireAgentSessionLinkPhysicalDispatch: { _, _ in true }, recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+            recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in }, acceptAgentSessionLinkPromptClaim: { _, _, _ in }
+        ), providerBindingService: h.host.providerBindingService)
+        try queueSteer("never sent", in: session, service: h.service)
+        _ = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        await until("route qualification is held") { gate.isWaiting }
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .completed))
+        await until("protected answer is consumed") { session.claudeExpectedTurnIDs.isEmpty }
+        XCTAssertEqual(session.runState, .running)
+        gate.open()
+        await until("definite refusal releases retained answer") { session.runState == .completed && session.agentTask == nil }
+        let count = await controller.sentCount
+        XCTAssertEqual(count, 0)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testNoWriteSteerReleasesChainedProviderWorkWithoutHidingHostFailure() async throws {
+        for secondCompletesBeforeRefusal in [true, false] {
+            let (h, session, controller, _) = try await spyFixture()
+            let row = AgentChatItem.user("host A", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(row)
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            await service.startRun(
+                tabID: session.tabID, session: session, initialUserMessage: row.text,
+                initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+            )
+            await until("host input is registered") { !session.claudeExpectedTurnIDs.isEmpty }
+            let hostID = try XCTUnwrap(session.claudeExpectedTurnIDs.first)
+            let firstProviderID = UUID()
+            let secondProviderID = UUID()
+            await controller.emit(.providerTurnStarted(turnID: firstProviderID))
+            await controller.emit(.turnsCompleted(turnIDs: [hostID], status: .failed))
+            await until("failed host answer is retained") { !session.claudeExpectedTurnIDs.contains(hostID) }
+            XCTAssertTrue(session.runState.isActive)
+            let gate = Gate()
+            h.host.claudeCoordinator.installHostCapabilities(.init(
+                isSessionCurrent: { $0 === session }, requestUIRefresh: { _, _ in }, scheduleSave: { _ in },
+                stageClaudeResumeRecoveryHandoff: { _ in }, prependPendingHandoff: { text, _ in text },
+                qualifyAgentSessionLinkProviderInputRoute: { _, _ in await gate.wait()
+                    return .unavailable
+                },
+                hasCurrentAgentSessionLinkProviderInputRoute: { _, _ in false },
+                decorateAgentSessionLinkPrompt: { text, _, _ in .init(text: text, claim: nil, mustAbortDispatch: false) },
+                acquireAgentSessionLinkPhysicalDispatch: { _, _ in true }, recordAgentSessionLinkPhysicalDispatchNotAttempted: { _, _ in },
+                recordAgentSessionLinkPhysicalDispatchFailure: { _, _ in }, acceptAgentSessionLinkPromptClaim: { _, _, _ in }
+            ), providerBindingService: h.host.providerBindingService)
+            try queueSteer("never sent", in: session, service: h.service)
+            let accepted = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+            XCTAssertTrue(accepted)
+            await until("route qualification is held") { gate.isWaiting }
+            await controller.emit(.providerTurnStarted(turnID: secondProviderID))
+            await controller.emit(.turnsCompleted(turnIDs: [firstProviderID], status: .completed))
+            await until("first provider result is consumed") { !session.claudeExpectedTurnIDs.contains(firstProviderID) }
+            if secondCompletesBeforeRefusal {
+                await controller.emit(.turnsCompleted(turnIDs: [secondProviderID], status: .completed))
+                await until("second provider result is consumed") { !session.claudeExpectedTurnIDs.contains(secondProviderID) }
+            }
+            gate.open()
+            if !secondCompletesBeforeRefusal {
+                await until("definite refusal releases second provider") {
+                    !session.claudeSupersedingProtectedTurnIDs.contains(secondProviderID)
+                        && session.claudeSteeringFlushTask == nil
+                }
+                await controller.emit(.turnsCompleted(turnIDs: [secondProviderID], status: .completed))
+            }
+            await until("host failure remains authoritative") { session.runState == .failed && session.agentTask == nil }
+            let sentCount = await controller.sentCount
+            XCTAssertEqual(sentCount, 1, "Only the original host input reached the controller")
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testTypedZeroWriteSteerRefusalReleasesCompletedProviderWork() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("provider starts") { session.runState == .running }
+        let gate = Gate()
+        await controller.setRejectBeforeWrite(true)
+        await controller.setSendSuspension { await gate.wait() }
+        try queueSteer("never written", in: session, service: h.service)
+        _ = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        await until("controller validation is held") { gate.isWaiting }
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .completed))
+        gate.open()
+        await until("typed zero-write refusal releases provider success") { session.runState == .completed && session.agentTask == nil }
+        let count = await controller.sentCount
+        XCTAssertEqual(count, 0)
+        XCTAssertNotNil(session.claudeController)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testStopWithdrawsProviderApprovalParkedInHostPreparationReservation() async throws {
+        let writes = ClaudeNativeApprovalAndResumeTests.WrittenLines()
+        let f = try await fixture(write: { writes.append($0) })
+        let reservation = try XCTUnwrap(f.harness.host.claudeCoordinator.reserveEventsForHostPreparation(for: f.session))
+        try await feed(["type": "control_request", "request_id": "parked-permission", "request": ["subtype": "can_use_tool", "tool_name": "Bash", "input": ["command": "echo fixture"]]], f.controller)
+        await until("unowned provider work and its approval reach the reserved inbox") {
+            f.session.mcpFollowUpRunPending && f.listener.pendingApprovalIDs == ["parked-permission"]
+        }
+        XCTAssertNil(f.session.activeRunOwnership)
+        XCTAssertTrue(f.harness.host.claudeCoordinator.hasPendingProviderAdoption(for: f.session))
+        XCTAssertEqual(f.listener.pendingApprovalIDs, ["parked-permission"])
+        await f.harness.host.cancelAgentRun(tabID: f.session.tabID)
+        await until("parked approval is denied") { writes.count == 1 }
+        let frame = try XCTUnwrap(JSONSerialization.jsonObject(with: XCTUnwrap(writes.line(at: 0))) as? [String: Any])
+        let response = try XCTUnwrap(frame["response"] as? [String: Any])
+        XCTAssertEqual(response["request_id"] as? String, "parked-permission")
+        let decision = try XCTUnwrap(response["response"] as? [String: Any])
+        XCTAssertEqual(decision["behavior"] as? String, "deny")
+        XCTAssertEqual(decision["interrupt"] as? Bool, true)
+        XCTAssertFalse(f.listener.isBusy)
+        XCTAssertNil(f.session.claudeController)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending)
+        XCTAssertTrue(reservation.subscription.isClosed)
+        await cleanup(f)
+    }
+
+    func testPendingProviderCancellationWaitsForWithdrawnControllerTeardown() async throws {
+        for hasSettledPredecessor in [false, true] {
+            let (h, session, controller, listener) = try await spyFixture()
+            if hasSettledPredecessor {
+                let predecessorID = UUID()
+                await controller.emit(.providerTurnStarted(turnID: predecessorID))
+                await until("predecessor starts") { session.activeRunOwnership != nil }
+                await controller.emit(.turnsCompleted(turnIDs: [predecessorID], status: .completed))
+                await until("predecessor settles") {
+                    session.runState == .completed && !session.runLifecycle.terminalCommitInProgress && session.activeRunOwnership == nil
+                }
+                XCTAssertNotNil(session.lastTerminalCommitRevision)
+            } else {
+                XCTAssertNil(session.lastTerminalCommitRevision)
+            }
+            let reservation = try XCTUnwrap(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session))
+            let providerID = UUID()
+            await controller.emit(.providerTurnStarted(turnID: providerID))
+            await controller.emit(.approvalRequest(.init(
+                requestID: .claudeControl("parked-teardown-approval"), method: "control/can_use_tool",
+                kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+            )))
+            await until("provider approval is parked in host preparation") {
+                listener.pendingApprovalIDs == ["parked-teardown-approval"] && listener.isBusy
+            }
+            XCTAssertTrue(listener.subscription === reservation.subscription)
+            XCTAssertNil(session.activeRunOwnership)
+            let predecessorOwnership = session.lastTerminalCommitRevision?.ownership
+            let shutdownGate = Gate()
+            await controller.setShutdownSuspension { await shutdownGate.wait() }
+            let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+            var returned = false
+            let cancellation = Task { @MainActor in
+                await service.cancelRun(
+                    tabID: session.tabID, session: session, intent: .runtimeShutdown,
+                    completion: .terminalTeardownCompleted
+                )
+                returned = true
+            }
+            await until("withdrawn controller shutdown is held") { shutdownGate.isWaiting }
+            XCTAssertNil(session.claudeController)
+            XCTAssertNil(session.activeRunOwnership, "Withdrawal must not invent a provider attempt")
+            XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, predecessorOwnership)
+            XCTAssertFalse(returned, "Teardown-completed cancellation must join this provider, not just the predecessor")
+            let shutdownsBeforeRelease = await controller.shutdownCount
+            XCTAssertEqual(shutdownsBeforeRelease, 0)
+            let calls = await controller.inputBoundaryCalls
+            XCTAssertTrue(calls.contains("permission:parked-teardown-approval:cancel"))
+            shutdownGate.open()
+            await cancellation.value
+            XCTAssertTrue(returned)
+            let shutdownsAfterRelease = await controller.shutdownCount
+            XCTAssertEqual(shutdownsAfterRelease, 1)
+            XCTAssertTrue(reservation.subscription.isClosed)
+            await h.host.claudeCoordinator.shutdownClaudeSession(session)
+        }
+    }
+
+    func testReplacementTransportReopensTheExistingAttemptInboxAfterEOF() async throws {
+        let f = try await fixture()
+        let inbox = try XCTUnwrap(f.listener.reserve())
+        inbox.finish()
+        f.listener.detachTransport()
+        await f.controller.resetEventsStreamForNewRun()
+        _ = await f.harness.host.claudeCoordinator.test_installEventListener(for: f.session)
+        XCTAssertTrue(f.listener.subscription === inbox)
+        var returned = false
+        let waiter = Task { @MainActor in
+            let event = await inbox.next()
+            returned = true
+            return event
+        }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertFalse(returned, "An old transport EOF must not end the replacement reservation")
+        inbox.append(.settlementRecheck)
+        let event = await waiter.value
+        if case .settlementRecheck = event {} else { XCTFail("Replacement event must reach the retained reservation") }
+        f.listener.close(inbox, returningTail: false)
+        await cleanup(f)
+    }
+
+    func testUncertainSteerWriteCannotReplayProtectedProviderSuccess() async throws {
+        let (h, session, controller, _) = try await spyFixture()
+        let providerID = UUID()
+        await controller.setTurnInFlight(true)
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await until("provider starts") { session.runState == .running }
+        let owner = try XCTUnwrap(session.activeRunOwnership)
+        try queueSteer("replacement instruction", in: session, service: h.service)
+        let gate = Gate()
+        await controller.setFailSendAfterRecord(true)
+        await controller.setSendSuspension { await gate.wait() }
+        let accepted = await h.service.submitQueuedClaudeSteeringIfSupported(session: session)
+        XCTAssertTrue(accepted)
+        await until("physical write receipt is held") { gate.isWaiting }
+        await controller.emit(.turnsCompleted(turnIDs: [providerID], status: .completed))
+        XCTAssertEqual(session.activeRunOwnership, owner)
+        gate.open()
+        await until("uncertain write fails and retires instead of replaying success") { session.runState == .failed && session.claudeController == nil && session.agentTask == nil }
+        XCTAssertEqual(session.lastTerminalCommitRevision?.ownership, owner)
+        XCTAssertEqual(session.lastTerminalCommitRevision?.terminalState, .failed)
+        try await AsyncTestWait.waitUntil("retired controller cleanup finishes", timeout: 2) { await controller.shutdownCount == 1 }
+        let shutdowns = await controller.shutdownCount
+        XCTAssertEqual(shutdowns, 1)
+    }
+
+    private func seedHydratedHistory(_ history: AgentTranscript, harness: AgentSessionLinkRunnerHarness, session: AgentTabSession, pendingUser: AgentChatItem? = nil) {
+        // Mirror preparePersistedHydration's structured branch and hydrateSession: normalize
+        // frozen caps, derive canonical working rows, install cold presentation and cursor.
+        var saved = history
+        if let pendingUser {
+            saved.turns += AgentTranscriptIO.buildTranscript(from: [pendingUser], terminalState: .running, nextSequenceIndex: pendingUser.sequenceIndex + 1, policy: .liveSession(hidePendingQuestionToolCall: false)).turns
+            saved.nextSequenceIndex = pendingUser.sequenceIndex + 1
+            saved = AgentTranscriptCompactor.compact(saved, mode: .preserveDurableFrontier)
+        }
+        let transcript = AgentTranscriptProjectionBuilder.normalizedFrozenDetailedToolTailLimits(in: saved)
+        let canonicalItems = AgentTranscriptIO.workingSourceItems(from: transcript)
+        session.setItemsSilently(canonicalItems, reason: .persistedSessionHydration)
+        harness.host.applyTranscriptPresentation(transcript, sourceItems: canonicalItems, to: session, isColdLoad: true)
+        session.nextSequenceIndex = transcript.nextSequenceIndex
+        session.hasSentFirstMessage = transcript.turns.contains { $0.request != nil }
+        XCTAssertEqual(session.transcript, transcript)
+    }
+
+    private func measureOrdinaryTerminalCommit(history: AgentTranscript) async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        h.host.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(true)
+        // Ordinary input admission precedes dispatch, as on the composer path.
+        let row = AgentChatItem.user("ordinary live input", sequenceIndex: history.nextSequenceIndex)
+        seedHydratedHistory(history, harness: h, session: session, pendingUser: row)
+        let baseline = session.transcriptPerformanceSnapshot
+        var terminalStarted: ContinuousClock.Instant?
+        listener.test_onDelivery = { event in
+            if case .turnsCompleted = event {
+                terminalStarted = .now
+            }
+        }
+        await controller.setImmediateReplyDuringSend(true)
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+        await service.startRun(
+            tabID: session.tabID, session: session, initialUserMessage: row.text,
+            initialMessageForRun: row.text, attachments: [], initialUserItemID: row.id
+        )
+        await until("ordinary saved-history attempt publishes", timeout: .seconds(15)) { terminalStarted != nil && session.agentTask == nil && session.runState == .completed && !session.runLifecycle.terminalCommitInProgress }
+        let elapsed = try XCTUnwrap(terminalStarted).duration(to: .now)
+        let metrics = session.transcriptPerformanceSnapshot
+        print("C2 hydrated ordinary terminal=\(elapsed) incrementalAttempts=\(metrics.incrementalImportAttemptCount - baseline.incrementalImportAttemptCount) successes=\(metrics.incrementalImportSuccessCount - baseline.incrementalImportSuccessCount) fallbacks=\(metrics.incrementalImportFallbackCount - baseline.incrementalImportFallbackCount) importMS=\(String(describing: metrics.lastImportDurationMS))")
+        XCTAssertLessThan(elapsed, .seconds(15))
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
+    func testLargeSavedTranscriptDoesNotMultiplyLiveRoutingWork() async throws {
+        // Seed the retention tiers left by live compaction, then let the real compactor
+        // trim and normalize once. Replaying every intermediate compaction is quadratic.
+        let setupStarted = ContinuousClock.now
+        var history = AgentTranscript.empty
+        for index in stride(from: 0, to: 20000, by: 2) {
+            history.turns += AgentTranscriptIO.buildTranscript(
+                from: [.user("saved-user-\(index)", sequenceIndex: index), .assistant("saved-answer-\(index + 1)", sequenceIndex: index + 1)],
+                terminalState: .completed, nextSequenceIndex: index + 2,
+                policy: .liveSession(hidePendingQuestionToolCall: false)
+            ).turns
+            history.nextSequenceIndex = index + 2
+        }
+        // Keep 34 summary turns plus the final full turn, matching the measured live
+        // fixture's 9,999 frozen turns, 2 working rows, and 70 working units.
+        for index in history.turns.indices.dropLast() {
+            history.turns[index].retentionTier = index < 9965 ? .archived : .summary
+        }
+        history = AgentTranscriptCompactor.compact(history, mode: .recomputeAll)
+        XCTAssertEqual(history.nextSequenceIndex, 20000)
+        XCTAssertEqual(history.turns.count, 10000)
+        XCTAssertEqual(AgentTranscriptIO.workingSourceItems(from: history).count, 2)
+        XCTAssertEqual(history.compactionFrontier?.frozenPrefixTurnCount, 9999)
+        XCTAssertEqual(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history), 70)
+        print("C2 compacted setup=\(setupStarted.duration(to: .now)) seededItems=20000 turns=\(history.turns.count) workingRows=\(AgentTranscriptIO.workingSourceItems(from: history).count) frozenPrefix=\(history.compactionFrontier?.frozenPrefixTurnCount ?? 0) workingUnits=\(AgentTranscriptCompactor.estimatedWorkingUnitCount(for: history))")
+        AgentTranscriptDebugInstrumentation.configure(.init(refreshAttemptHandler: { metrics in
+            print("C2 refresh tab=\(metrics.tabID) state=\(metrics.runState) path=\(metrics.incrementalPath)")
+        }))
+        defer { AgentTranscriptDebugInstrumentation.reset() }
+        var counts: [Int] = []
+        for seedCount in [0, 20000] {
+            let setupStarted = ContinuousClock.now
+            print("C2 routing fixture begin seed=\(seedCount)")
+            let f = try await fixture(mcp: true)
+            f.harness.host.test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(true)
+            seedHydratedHistory(seedCount == 0 ? .empty : history, harness: f.harness, session: f.session)
+            let baseline = f.session.transcriptPerformanceSnapshot
+            var terminalStarted: ContinuousClock.Instant?
+            var terminalDurations: [Duration] = []
+            print("C2 routing fixture ready seed=\(seedCount) setup=\(setupStarted.duration(to: .now))")
+            var resume: CheckedContinuation<Void, Never>?
+            var preparationCount = 0
+            f.harness.host.test_setAfterMCPStoreEpochBegan {
+                preparationCount += 1
+                if preparationCount == 2, let terminalStarted { terminalDurations.append(terminalStarted.duration(to: .now)) }
+                if preparationCount == 1 { await withCheckedContinuation { resume = $0 } }
+            }
+            var receivedCompletions = 0
+            f.listener.test_onReceive = { event in
+                if case .turnsCompleted = event { receivedCompletions += 1 }
+            }
+            var deliveries: [String: Int] = [:]
+            f.listener.test_onDelivery = { event in
+                if case .turnsCompleted = event {
+                    terminalStarted = .now
+                }
+                if case let .stream(value) = event, value.type == "task_progress", let text = value.text {
+                    deliveries[text, default: 0] += 1
+                }
+            }
+            let started = ContinuousClock.now
+            try await feed(assistant("first-live"), f.controller)
+            await until("hold the adoption gap") { resume != nil }
+            let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
+            XCTAssertTrue(busy)
+            var frames: [[String: Any]] = []
+            for i in 0 ..< 998 {
+                frames.append(["type": "system", "subtype": "task_progress", "description": "progress-\(i)"])
+            }
+            frames += [result("first-terminal"), assistant("second-live")]
+            for i in 998 ..< 1996 {
+                frames.append(["type": "system", "subtype": "task_progress", "description": "progress-\(i)"])
+            }
+            frames.append(result("second-terminal"))
+            XCTAssertEqual(frames.count + 1, 2000)
+            let bytes = try frames.map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+            await f.controller.test_handleConfigurationStdoutChunk(bytes)
+            await until("the whole burst is parked") { receivedCompletions == 2 }
+            XCTAssertGreaterThan(f.listener.test_handoffCount, 1996, "One input burst is retained losslessly, not count-capped")
+            resume?.resume()
+            resume = nil
+            await until("both bursts settle", timeout: .seconds(15)) { preparationCount == 2 && deliveries.count == 1996 && f.session.runState == .completed && !f.session.runLifecycle.terminalCommitInProgress && !f.listener.isBusy }
+            let elapsed = started.duration(to: .now)
+            try terminalDurations.append(XCTUnwrap(terminalStarted).duration(to: .now))
+            XCTAssertEqual(terminalDurations.count, 2)
+            XCTAssertTrue(terminalDurations.allSatisfy { $0 < .seconds(15) })
+            XCTAssertLessThan(elapsed, .seconds(15), "Generous DEBUG end-to-end budget; counts, not timing alone, prove routing work")
+            XCTAssertEqual(deliveries.count, 1996)
+            XCTAssertTrue(deliveries.values.allSatisfy { $0 == 1 })
+            counts.append(deliveries.values.reduce(0, +))
+            XCTAssertNil(f.listener.subscription)
+            XCTAssertEqual(f.listener.test_handoffCount, 0)
+            XCTAssertFalse(f.listener.isBusy)
+            let metrics = f.session.transcriptPerformanceSnapshot
+            print("C2 routing seed=\(seedCount) frames=2000 deliveredProgress=\(counts.last!) elapsed=\(elapsed) terminals=\(terminalDurations) incrementalAttempts=\(metrics.incrementalImportAttemptCount - baseline.incrementalImportAttemptCount) successes=\(metrics.incrementalImportSuccessCount - baseline.incrementalImportSuccessCount) fallbacks=\(metrics.incrementalImportFallbackCount - baseline.incrementalImportFallbackCount) importMS=\(String(describing: metrics.lastImportDurationMS))")
+            await cleanup(f)
+        }
+        XCTAssertEqual(counts, [1996, 1996])
+        try await measureOrdinaryTerminalCommit(history: history)
+    }
+
+    func testAdoptedTurnsKeepRealMCPRouteUntilStopAndLateCleanupCannotRevokeSuccessor() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            try await AppGlobalMCPServiceComposition.shared.ensureRegistered()
+            let manager = ServerNetworkManager.shared
+            let window = WindowState(domainRuntime: AppDomainRuntimeComposition.shared.runtime)
+            WindowStatesManager.shared.registerWindowState(window)
+            let registration = try await AppDomainRuntimeComposition.shared.register(window.mcpServer.windowMCPToolCatalogService)
+            let vm = window.agentModeViewModel
+            var connections: [PersistentMCPTestEndpoint] = []
+            var runIDs: [UUID] = []
+            var session: AgentTabSession?
+            var storeRegistration: AgentRunSessionStore.Registration?
+            let cleanup: @MainActor () async -> Void = {
+                if let session { await vm.claudeCoordinator.shutdownClaudeSession(session) }
+                if let storeRegistration { await AgentRunSessionStore.cleanup(registration: storeRegistration) }
+                for connection in connections {
+                    connection.client.close()
+                    await connection.connectionManager.stop()
+                    await manager.debugRemoveConnection(connection.connectionID)
+                }
+                for runID in runIDs {
+                    await manager.clearClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: window.windowID, runID: runID)
+                    await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+                }
+                await window.tearDown()
+                await AppDomainRuntimeComposition.shared.unregister(registration.handle)
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+            do {
+                await window.workspaceManager.awaitInitialized()
+                let tabID = UUID(), sessionID = UUID()
+                var workspace = WorkspaceModel(name: "Claude adopted route fixture", repoPaths: [])
+                workspace.isEphemeral = true
+                workspace.composeTabs = [ComposeTabState(id: tabID, name: "Claude route", activeAgentSessionID: sessionID)]
+                workspace.activeComposeTabID = tabID
+                let persisted = AgentSession(id: sessionID, workspaceID: workspace.id, composeTabID: tabID, name: "Claude route", agentKind: AgentProviderKind.claudeCode.rawValue)
+                _ = try await AgentSessionDataService.shared.saveAgentSession(persisted, for: workspace)
+                window.workspaceManager.workspaces.append(workspace)
+                let switched = await window.workspaceManager.switchWorkspace(to: workspace, saveState: false)
+                XCTAssertTrue(switched.didSwitch)
+                window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+                let live = await vm.ensureSessionReady(tabID: tabID, reconnectActiveProviders: false)
+                session = live
+                let registered = await AgentRunSessionStore.register(sessionID: sessionID)
+                storeRegistration = registered
+                live.mcpControlContext = .init(sessionID: sessionID, activationID: UUID(), registration: registered, currentEpoch: nil, preparedEpoch: nil, pendingEpochTransition: nil, originatingConnectionID: nil, interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil), suppressUserNotifications: true, forceAutoEditEnabled: false, autoEditEnabledBeforeOverride: false, taskLabelKind: .pair)
+                let controller = MonitorFakeNativeController()
+                let runID = UUID()
+                runIDs.append(runID)
+                live.installRunID(runID)
+                live.claudeController = controller
+                _ = await vm.claudeCoordinator.test_installEventListener(for: live)
+                @MainActor func connect(_ runID: UUID) async throws -> PersistentMCPTestEndpoint {
+                    await manager.installClientConnectionPolicy(for: AgentProviderKind.claudeMCPClientID, windowID: window.windowID, restrictedTools: AgentModeMCPToolPolicy.restrictedTools, oneShot: true, reason: "Claude adoption route regression", ttl: 60, tabID: tabID, runID: runID, additionalTools: [MCPWindowToolName.getFileTree], purpose: .agentModeRun, taskLabelKind: .pair, allowsAgentExternalControlTools: false)
+                    await manager.setEnabled(true)
+                    let endpoint = try await PersistentMCPTestEndpoint.make(label: "claude-adoption-route", networkManager: manager, clientName: AgentProviderKind.claudeMCPClientID, requiredToolNames: [MCPWindowToolName.getFileTree])
+                    connections.append(endpoint)
+                    return endpoint
+                }
+                @MainActor func callTree(_ connection: PersistentMCPTestEndpoint, runID: UUID) async throws {
+                    let response = try await connection.callTool(name: MCPWindowToolName.getFileTree, arguments: ["type": "roots"], timeoutSeconds: 3)
+                    let object = try MCPExportWatchdogIntegrationTests.responseObject(from: response)
+                    XCTAssertNil(object["error"])
+                    let result = try XCTUnwrap(object["result"] as? [String: Any])
+                    XCTAssertNotEqual(result["isError"] as? Bool, true)
+                    let routed = await manager.debugCachedRunID(for: connection.connectionID)
+                    XCTAssertEqual(routed, runID)
+                    XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), connection.connectionID)
+                }
+                let connection = try await connect(runID)
+                var epochs: [AgentRunTurnEpoch] = []
+                for index in 0 ..< 2 {
+                    let turnID = UUID()
+                    await controller.emit(.providerTurnStarted(turnID: turnID))
+                    await until("real-route provider turn adopts") { live.runState == .running }
+                    try epochs.append(XCTUnwrap(live.activeRunOwnership?.turnEpoch))
+                    XCTAssertEqual(live.runID, runID)
+                    try await callTree(connection, runID: runID)
+                    await controller.emit(.stream(.init(type: "content", text: "route answer \(index)")))
+                    await controller.emit(.turnsCompleted(turnIDs: [turnID], status: .completed))
+                    await until("real-route terminal publishes") { live.runState == .completed && !live.runLifecycle.terminalCommitInProgress }
+                    XCTAssertEqual(window.mcpServer.connectionID(forRunID: runID), connection.connectionID)
+                }
+                XCTAssertNotEqual(epochs[0], epochs[1])
+                let preparation = Gate()
+                vm.test_setAfterMCPStoreEpochBegan { await preparation.wait() }
+                defer { preparation.open()
+                    vm.test_setAfterMCPStoreEpochBegan(nil)
+                }
+                let installedListener = await vm.claudeCoordinator.test_installEventListener(for: live)
+                let listener = try XCTUnwrap(installedListener)
+                await controller.emit(.providerTurnStarted(turnID: UUID()))
+                await until("third turn waits in fresh epoch preparation") { preparation.isWaiting }
+                XCTAssertEqual(vm.mcpSnapshot(for: live)?.status, .running)
+                let adoption = listener.adoptionTask
+                let candidate = try XCTUnwrap(vm.agentSessionLinkCandidate(tabID: tabID, sessionID: sessionID, tabName: "Claude route", isWindowClosing: false))
+                let observer = DomainAgentSessionLinkEndpointIdentity(windowID: 2, workspaceID: UUID(), tabID: UUID(), sessionID: UUID(), persistentBindingGeneration: UUID(), bindingTransitionGeneration: 1)
+                let stop = await vm.agentSessionLinkPerformStop(
+                    to: candidate,
+                    request: .init(requestID: UUID(), linkID: UUID(), linkGeneration: 1, observerEndpoint: observer, observerDisplayName: "Overseer"),
+                    liveness: { .init(observerEndpointIsLive: true, targetEndpointIsLive: true, targetWindowIsClosing: false) },
+                    queueHasCommittedDrain: { false }, withdrawInbound: { true }, commitAuthorization: { .committed }
+                )
+                if case let .settled(receipt) = stop {
+                    XCTAssertEqual(receipt.result, .stopped)
+                    XCTAssertEqual(receipt.stopRequested, true)
+                    XCTAssertEqual(receipt.resultingRunState, "pending_start_withdrawn")
+                } else { XCTFail("Pending adoption must produce an attributed managed Stop receipt") }
+                preparation.open()
+                await adoption?.value
+                XCTAssertNil(live.activeRunOwnership)
+                XCTAssertFalse(live.mcpFollowUpRunPending)
+                try await AsyncTestWait.waitUntil("Stop retires the process route", timeout: 3) {
+                    await manager.debugCachedRunID(for: connection.connectionID) == nil
+                }
+                XCTAssertNil(window.mcpServer.connectionID(forRunID: runID))
+                let successorID = UUID()
+                runIDs.append(successorID)
+                live.installRunID(successorID)
+                let successor = try await connect(successorID)
+                await vm.cleanupMCPRunRoutingForDiscardedSession(boundSessionID: sessionID, liveSession: live, explicitRunID: runID, reason: "late retired Claude cleanup fixture")
+                try await callTree(successor, runID: successorID)
+            } catch {
+                await cleanup()
+                throw error
+            }
+            await cleanup()
+        }
+    }
+
+    func testNextProviderAttemptWaitsForPriorTerminalPublication() async throws {
+        let f = try await fixture(mcp: true)
+        let gate = Gate()
+        f.harness.host.test_setTerminalPublicationOverride { revision, successor, session in
+            await gate.wait()
+            f.harness.host.test_setTerminalPublicationOverride(nil)
+            return await f.harness.host.test_publishTerminalCommit(revision, successorKind: successor, for: session)
+        }
+        try await feed(assistant("first"), f.controller)
+        await until("first attempt starts") { f.session.runState == .running }
+        let first = try XCTUnwrap(f.session.activeRunOwnership)
+        let epochPreparation = Gate()
+        f.harness.host.test_setAfterMCPStoreEpochBegan { await epochPreparation.wait() }
+        let bytes = try [result("first-final"), assistant("second")].map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+        await f.controller.test_handleConfigurationStdoutChunk(bytes)
+        await until("prior publication is held") { gate.isWaiting && f.listener.pendingProviderTurnID != nil }
+        XCTAssertTrue(f.session.runLifecycle.terminalCommitInProgress)
+        XCTAssertEqual(f.session.mcpControlContext?.currentEpoch, first.turnEpoch)
+        XCTAssertNil(f.session.activeRunOwnership)
+        gate.open()
+        await until("handed-back turn is preparing its fresh epoch") { epochPreparation.isWaiting }
+        XCTAssertTrue(f.session.mcpFollowUpRunPending)
+        XCTAssertEqual(f.harness.host.mcpSnapshot(for: f.session)?.status, .running)
+        epochPreparation.open()
+        await until("second starts after publication") { f.session.runState == .running && f.session.activeRunOwnership?.attemptID != first.attemptID }
+        XCTAssertNotEqual(f.session.activeRunOwnership?.turnEpoch, first.turnEpoch)
+        try await feed(result("second-final"), f.controller)
+        await until("second publishes") { f.session.runState == .completed && !f.session.runLifecycle.terminalCommitInProgress }
+        await cleanup(f)
+    }
+
+    func testQueuedFollowUpIsRetainedWhenHandedBackProviderWorkWinsAdmission() async throws {
+        let f = try await fixture(mcp: true)
+        let publication = Gate()
+        f.harness.host.test_setTerminalPublicationOverride { revision, successor, session in
+            await publication.wait()
+            f.harness.host.test_setTerminalPublicationOverride(nil)
+            return await f.harness.host.test_publishTerminalCommit(revision, successorKind: successor, for: session)
+        }
+        try await feed(assistant("first"), f.controller)
+        await until("first provider attempt starts") { f.session.runState == .running }
+        let first = try XCTUnwrap(f.session.activeRunOwnership)
+        let queued = AgentTabSession.PendingInstruction(providerText: "queued follow-up M", localDraftText: "local draft M", stopFence: .init(session: f.session), skipsSlashExpansion: true)
+        f.session.pendingInstructions.append(queued)
+        let bytes = try [result("first-final"), assistant("second")].map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+        await f.controller.test_handleConfigurationStdoutChunk(bytes)
+        await until("prior publication and provider handback are held") { publication.isWaiting && f.listener.pendingProviderTurnID != nil }
+        publication.open()
+        await until("provider adoption wins and the refused follow-up remains owed") {
+            f.session.runState == .running && f.session.activeRunOwnership?.attemptID != first.attemptID && f.session.pendingInstructions == [queued]
+        }
+        XCTAssertEqual(f.session.pendingInstructions, [queued], "Provider text, local draft, original Stop fence and expansion policy must survive together")
+        await f.harness.host.cancelAgentRun(tabID: f.session.tabID)
+        XCTAssertTrue(f.session.pendingInstructions.isEmpty, "Only explicit Stop withdraws the retained follow-up")
+        await cleanup(f)
+    }
+
+    func testStopWithdrawsHandedBackWorkWithoutBypassingPriorTerminalPublication() async throws {
+        let f = try await fixture(mcp: true)
+        let publication = Gate()
+        f.harness.host.test_setTerminalPublicationOverride { revision, successor, session in
+            await publication.wait()
+            f.harness.host.test_setTerminalPublicationOverride(nil)
+            return await f.harness.host.test_publishTerminalCommit(revision, successorKind: successor, for: session)
+        }
+        try await feed(assistant("first"), f.controller)
+        await until("first provider attempt starts") { f.session.runState == .running }
+        let first = try XCTUnwrap(f.session.activeRunOwnership)
+        let bytes = try [result("first-final"), assistant("second")].map { try JSONSerialization.data(withJSONObject: $0) + Data([10]) }.reduce(Data(), +)
+        await f.controller.test_handleConfigurationStdoutChunk(bytes)
+        await until("prior publication and next adoption are held") { publication.isWaiting && f.listener.pendingProviderTurnID != nil }
+        var stopReturned = false
+        let stop = Task { @MainActor in
+            await f.harness.host.cancelAgentRun(tabID: f.session.tabID, completion: .terminalTeardownCompleted)
+            stopReturned = true
+        }
+        await until("pending provider work is detached") { f.session.claudeController == nil }
+        XCTAssertFalse(stopReturned)
+        XCTAssertEqual(f.session.runState, .completed, "Stop of unadopted work must not rewrite its predecessor's terminal outcome")
+        publication.open()
+        await stop.value
+        XCTAssertFalse(f.session.runLifecycle.terminalCommitInProgress)
+        XCTAssertEqual(f.session.lastTerminalCommitRevision?.ownership, first)
+        if case .accepted = f.session.runLifecycle.lastTerminalPublicationResult {} else { XCTFail("The predecessor still publishes its one accepted terminal result") }
+        XCTAssertFalse(f.listener.isBusy)
+        XCTAssertNil(f.session.activeRunOwnership)
+        await cleanup(f)
+    }
+
+    func testUnexpectedStreamEndFailsOwnedProviderAttempt() async throws {
+        let f = try await fixture()
+        try await feed(assistant("unfinished"), f.controller)
+        await until("provider attempt starts") { f.session.runState == .running }
+        let owner = f.session.activeRunOwnership
+        await f.controller.test_handleStdoutEOF()
+        await until("EOF fails rather than silently idling or restarting") { f.session.runState == .failed && f.session.claudeController == nil }
+        XCTAssertEqual(f.session.lastTerminalCommitRevision?.ownership, owner)
+        XCTAssertNil(f.listener.subscription)
+        await cleanup(f)
+    }
+
+    func testPreparedSuccessorIsConsumedWithoutAnotherEpochTransition() async throws {
+        let f = try await fixture(mcp: true)
+        await f.harness.host.prepareMCPWaitTrackingForRunStart(session: f.session, stopFence: .init(session: f.session))
+        let prepared = try XCTUnwrap(f.session.mcpControlContext?.preparedEpoch)
+        var preparations = 0
+        f.harness.host.test_setAfterMCPStoreEpochBegan { preparations += 1 }
+        try await feed(assistant("prepared successor"), f.controller)
+        await until("successor is adopted") { f.session.runState == .running }
+        XCTAssertEqual(f.session.activeRunOwnership?.turnEpoch, prepared)
+        XCTAssertNil(f.session.mcpControlContext?.preparedEpoch)
+        XCTAssertNil(f.session.mcpControlContext?.pendingEpochTransition)
+        XCTAssertEqual(preparations, 0)
+        try await feed(result(), f.controller)
+        await until("successor terminal is published") { f.session.runState == .completed && !f.session.runLifecycle.terminalCommitInProgress }
+        await cleanup(f)
+    }
+
+    func testRebindRetiresPendingOwnerWithoutWritingIntoReplacementOrSecondWindow() async throws {
+        let f = try await fixture(mcp: true)
+        let other = try await fixture()
+        let gate = Gate()
+        f.harness.host.test_setAfterMCPStoreEpochBegan { await gate.wait() }
+        try await feed(assistant("old binding"), f.controller)
+        await until("old epoch preparation is held") { gate.isWaiting }
+        let adoption = f.listener.adoptionTask
+        _ = f.harness.host.test_installPersistentSessionBinding(sessionID: UUID(), on: f.session)
+        gate.open()
+        await adoption?.value
+        try await feed(assistant("stale work"), f.controller)
+        try await feed(assistant("other window"), other.controller)
+        try await feed(result("other-window-final"), other.controller)
+        await until("other window independently settles") { other.session.runState == .completed && other.session.lastTerminalCommitRevision != nil }
+        XCTAssertNil(f.session.claudeController)
+        XCTAssertNil(f.session.activeRunOwnership)
+        XCTAssertTrue(f.session.items.isEmpty, "No refusal or stale output may write into the replacement binding")
+        XCTAssertFalse(f.listener.isCurrent())
+        XCTAssertTrue(other.session.items.contains { $0.text.contains("other-window-final") })
+        await cleanup(f)
+        await cleanup(other)
+    }
+
+    func testStopDuringEpochPreparationCannotReadoptOrRetainRunningMask() async throws {
+        let f = try await fixture(mcp: true)
+        var resume: CheckedContinuation<Void, Never>?
+        f.harness.host.test_setAfterMCPStoreEpochBegan {
+            await withCheckedContinuation { resume = $0 }
+        }
+        try await feed(assistant("pending adoption"), f.controller)
+        await until("epoch preparation is suspended") { resume != nil }
+        XCTAssertTrue(f.listener.isBusy)
+        XCTAssertTrue(f.session.mcpFollowUpRunPending)
+        XCTAssertEqual(f.harness.host.mcpSnapshot(for: f.session)?.status, .running)
+        let busy = await f.harness.host.preparedOversightRuntimeIsBusy()
+        XCTAssertTrue(busy)
+        let adoption = f.listener.adoptionTask
+        await f.harness.host.cancelAgentRun(tabID: f.session.tabID)
+        resume?.resume()
+        resume = nil
+        await adoption?.value
+        await until("pending owner is retired") { !f.listener.isBusy && f.session.claudeController == nil }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertNil(f.session.activeRunOwnership)
+        XCTAssertNil(f.session.agentTask)
+        XCTAssertFalse(f.session.mcpFollowUpRunPending)
+        XCTAssertNil(f.session.mcpControlContext?.pendingEpochTransition)
+        XCTAssertEqual(f.session.runState, .cancelled)
+        XCTAssertNil(f.session.lastTerminalCommitRevision, "Withdrawing preparation must not synthesize a terminal attempt under the old epoch")
+        if let context = f.session.mcpControlContext {
+            let epoch = await AgentRunSessionStore.currentEpoch(for: context.registration)
+            XCTAssertEqual(context.currentEpoch, epoch, "Accepted-but-cancelled preparation cannot strand the store ahead of its owner")
+            XCTAssertEqual(context.preparedEpoch, epoch)
+        }
+        await cleanup(f)
     }
 }
