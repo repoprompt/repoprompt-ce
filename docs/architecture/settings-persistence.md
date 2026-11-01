@@ -212,20 +212,20 @@ compiled build flavor; `applicationStateDirectoryName` selects mutable state.
 | Oversight intents, scope continuity, worktree ownership | Same release root | Same debug root |
 | One-click recovery archive in Downloads | `RepoPrompt-Backup` | `RepoPrompt-Debug-Backup` |
 
-Release paths and formats are unchanged. Each normal debug **app process launch**
-prepares a new independent working snapshot of production state before app stores
-open. `--debug-clean-slate` skips the production seed for that launch only; it is
-not a preference, and the next normal launch seeds production again. This is
-state initialization, not a compiler/cache cold build. Ordinary refresh retains
-this debug profile's transactional oversight DB and legacy continuity records.
-Workspaces containing saved debug endpoints (or named by a saved workspace scope)
-retain their intact debug-owned tabs/conversations, rather than replacing their
-identities with the production baseline. Their debug windows are retained too;
-settings and unrelated workspaces still refresh. Runtime restoration remains
-responsible for profile/identity validation: retaining bytes does not mint authority.
-Missing original endpoints stay recorded, not fabricated or silently revoked.
-`--debug-clean-slate` intentionally archives rather than carries this debug control
-continuity; it is a genuinely clean launch, not an ordinary restart. Existing provider homes,
+Release paths and formats are unchanged. Debug imports an independent production
+snapshot **once, only when both its application-state directory and its persisted
+preference domain are empty**. Finder's `.DS_Store` alone does not count as state.
+An existing profile, including one created by an older build or a headless runtime,
+is reused without production capture or preference replay. Debug settings, CLI
+provider connection flags, workspaces, conversations, window continuity and local
+approvals therefore survive ordinary restarts. Later production changes do not
+replace Debug state. Runtime restoration remains responsible for profile/identity
+validation: retaining bytes does not mint authority.
+
+`--debug-clean-slate` explicitly archives the current Debug profile and preferences
+and creates an empty independent profile. Later ordinary launches keep that profile
+and the changes made in it; they do not reimport production. This is state
+initialization, not a compiler/cache cold build. Existing provider homes,
 authentication, Keychain items and harmless runtime caches remain shared; the
 bootstrap never copies credentials or requires a new login.
 
@@ -278,27 +278,36 @@ bytes intact. Prior debug-only work and its preferences are recoverable under
 snapshots are retained. An unclassified pre-bootstrap original is preserved separately rather than pruned as an owned seed; unrelated files and unrecognized crash leftovers are not
 deleted. Normal startup is silent. Failure presents an actionable debug-only error
 instead of opening a partial mixture: Quit, Retry, or — for production-capture
-failures — Start Empty, which runs this launch in clean mode (prior debug profile
-and preferences archived, not deleted). The prior debug profile is never reused
-automatically while release may be writing. `debugSeed.json` and the redacted
-startup receipt record profile/schema, clean mode, count/bytes and capture time. `debugSeedSources.json` records the source/destination manifest and
+failures — Start Empty, which creates a persistent empty profile (prior debug profile
+and preferences archived, not deleted). `debugSeed.json` and the redacted
+startup receipt record profile/schema, clean mode, count/bytes and capture time.
+New snapshots also include a unique preference-publication identifier. The identifier
+is saved together with the imported Debug preferences, so an interruption between
+directory publication and preference application finishes that already-published
+snapshot on the next launch without recapturing production. Old receipts without
+this identifier are adopted without replaying their stale preference snapshot.
+`debugSeedSources.json` records the source/destination manifest and
 preserved-but-not-seeded exceptions; unavailable workspace IDs are recorded separately.
 CLI requests do not re-seed a running app. Explicit standalone headless profiles
 remain independent and do not run the app launch bootstrap. The default debug
 headless runtime and interactive policy administrator hold shared admission on a
-stable sibling profile lock for their store lifetime. Bootstrap requires exclusive
-admission before capture/publication; the app then retains shared admission. A
-busy owner causes an explicit startup refusal, never a swap under a live writer.
+stable sibling profile lock for their store lifetime. Ordinary app startup also
+takes shared admission, allowing safe reuse alongside a headless writer. Import,
+explicit reset and unfinished preference publication require exclusive admission;
+the app then retains shared admission. A busy owner blocks those replacements,
+never permitting a swap under a live writer. Empty-profile decisions are checked
+again after exclusive admission to handle another initializer winning the race.
 
-Missing release preference data is not an empty domain: ordinary startup retains
-prior debug preferences when that source is absent, and retains debug-only Agent
-Mode diagnostic toggles even when release preferences are available. Ordinary
-refresh also carries debug runtime settings/grants/bindings, settings/preset backups,
-workspace cleanup backups and self-compact recovery bytes verbatim. Clean-slate
-continues to archive rather than carry these bytes. Continuity retention reads the
-owning legacy Codable models and read-only database projection; incompatible input
-aborts refresh without displacing the previous profile. Archived endpoint backing
-counts even when no compose tab currently selects it.
+Missing release preference data is not an empty domain. The snapshot primitive
+retains prior debug preferences when that source is absent, and retains debug-only
+Agent Mode diagnostic toggles even when release preferences are available. Its
+explicit refresh behavior also preserves debug runtime settings/grants/bindings,
+settings/preset backups, workspace cleanup backups and self-compact recovery bytes.
+Normal startup does not invoke this refresh for an existing profile. Clean-slate
+archives rather than carries these bytes. Continuity retention reads the owning
+legacy Codable models and read-only database projection; incompatible input aborts
+capture without displacing the previous profile. Archived endpoint backing counts
+even when no compose tab currently selects it.
 
 Copied Agent session items, transcript request anchors and response activities
 rebase only typed local image references under the copied workspace's managed

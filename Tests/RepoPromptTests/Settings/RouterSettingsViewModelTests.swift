@@ -1,11 +1,48 @@
+import AppKit
 import Combine
 @testable import RepoPromptApp
 import RepoPromptSecureStorage
 import RepoPromptSettingsCore
+import SwiftUI
 import XCTest
 
 @MainActor
 final class RouterSettingsViewModelTests: XCTestCase {
+    func testAgentDecisionsBottomRemainsReachableAtEveryFontSizeAndAfterResize() async throws {
+        let fixture = try makeFixture()
+        await fixture.viewModel.refresh()
+
+        for preset in FontScalePreset.allCases {
+            let initialSize = CGSize(width: 640, height: 480)
+            let host = SettingsWindowScrollingFixture(
+                content: RouterSettingsView(viewModel: fixture.viewModel),
+                preset: preset,
+                size: initialSize
+            )
+            defer { host.tearDown() }
+            try host.assertBottomReachable(size: initialSize)
+            try host.assertBottomReachable(size: CGSize(width: 560, height: 360))
+        }
+    }
+
+    func testProviderFormsKeepLongModelListsReachableInSmallSettingsWindow() throws {
+        let fixture = try makeFixture()
+        let models = (0 ..< 20).map { "test-model-\($0)" }
+        fixture.api.isCustomProviderValid = true
+        fixture.api.availableCustomModels = models
+        fixture.api.fetchedOpenRouterModels = models
+        let panes = [
+            AnyView(CustomProviderSettingsView(viewModel: fixture.api)),
+            AnyView(OpenRouterSettingsView(viewModel: fixture.api))
+        ]
+        for pane in panes {
+            let size = CGSize(width: 560, height: 360)
+            let host = SettingsWindowScrollingFixture(content: pane, preset: .extraLarge, size: size)
+            defer { host.tearDown() }
+            try host.assertBottomReachable(size: size)
+        }
+    }
+
     func testOpenAICardUnmountsSecureFieldAcrossCollapseAndResignsFocus() async throws {
         let secureKeys = SecureKeysService(secureStorage: TestSecureStorageBackend())
         let credentials = OpenAIDecisionsRouterCredentialService(secureKeys: secureKeys) { _, _ in
@@ -1700,5 +1737,126 @@ private struct SettingsTestBackend: DecisionService {
 
     func decide(_ request: FiniteChoiceDecisionRequest) async -> DecisionOutcome {
         .cancelled
+    }
+}
+
+@MainActor
+final class SettingsWindowSizingTests: XCTestCase {
+    func testOversizedRestoredFrameFitsOnScreen() {
+        let screen = NSRect(x: 0, y: 40, width: 1280, height: 720)
+        let restored = NSRect(x: 160, y: -2400, width: 1500, height: 3200)
+        XCTAssertEqual(
+            SettingsWindowCoordinator.frameFittingVisibleScreen(restored, visibleFrame: screen),
+            screen
+        )
+    }
+
+    func testExistingSizeIsPreservedAndMovedWithinNegativeOriginScreen() {
+        let screen = NSRect(x: -1920, y: 60, width: 1920, height: 1020)
+        let restored = NSRect(x: -2100, y: -100, width: 960, height: 700)
+        let fitted = SettingsWindowCoordinator.frameFittingVisibleScreen(restored, visibleFrame: screen)
+        XCTAssertEqual(fitted.size, restored.size)
+        XCTAssertEqual(fitted.origin, NSPoint(x: -1920, y: 60))
+        XCTAssertEqual(
+            SettingsWindowCoordinator.frameFittingVisibleScreen(fitted, visibleFrame: screen),
+            fitted
+        )
+    }
+}
+
+@MainActor
+final class SettingsWindowScrollingFixture {
+    private let hostingController: NSHostingController<AnyView>
+    private let window: NSWindow
+
+    init(content: some View, preset: FontScalePreset, size: NSSize) {
+        _ = NSApplication.shared
+        hostingController = SettingsWindowCoordinator.makeHostingController(
+            rootView: AnyView(
+                SettingsDetailViewport {
+                    content
+                }
+                .environment(\.repoPromptFontScalePreset, preset)
+                .environment(\.font, preset.font)
+                .environment(\.accessibilityReduceMotion, true)
+            )
+        )
+        window = NSWindow(contentViewController: hostingController)
+        window.styleMask = [.titled, .resizable]
+        window.isReleasedWhenClosed = false
+        window.setContentSize(size)
+    }
+
+    func assertBottomReachable(size: NSSize, file: StaticString = #filePath, line: UInt = #line) throws {
+        window.setContentSize(size)
+        try waitFor("a scrollable settings document", file: file, line: line) {
+            guard let scroll = self.scrollView, let document = scroll.documentView else { return false }
+            return scroll.contentSize.height > 0
+                && document.bounds.height > scroll.contentSize.height + 100
+                && abs(scroll.bounds.height - size.height) < 2
+        }
+        let scroll = try XCTUnwrap(scrollView, file: file, line: line)
+        let document = try XCTUnwrap(scroll.documentView, file: file, line: line)
+        XCTAssertEqual(hostingController.view.bounds.height, size.height, accuracy: 1, file: file, line: line)
+        XCTAssertLessThanOrEqual(scroll.bounds.height, size.height + 1, file: file, line: line)
+        var previousHeight: CGFloat?
+        var stablePasses = 0
+        try waitFor("the bottom of the settings pane to enter the viewport", file: file, line: line) {
+            let height = document.bounds.height
+            let bottom = document.isFlipped
+                ? document.bounds.maxY - scroll.contentView.bounds.height
+                : document.bounds.minY
+            scroll.contentView.scroll(to: NSPoint(x: 0, y: bottom))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            let visible = scroll.documentVisibleRect
+            let isAtBottom = document.isFlipped
+                ? abs(visible.maxY - document.bounds.maxY) < 2
+                : abs(visible.minY - document.bounds.minY) < 2
+            if isAtBottom, let previousHeight, abs(height - previousHeight) < 1 {
+                stablePasses += 1
+            } else {
+                stablePasses = 0
+            }
+            previousHeight = height
+            return stablePasses >= 2
+        }
+    }
+
+    func tearDown() {
+        window.contentViewController = nil
+    }
+
+    private var scrollView: NSScrollView? {
+        descendants(of: hostingController.view)
+            .compactMap { $0 as? NSScrollView }
+            .max { ($0.documentView?.bounds.height ?? 0) < ($1.documentView?.bounds.height ?? 0) }
+    }
+
+    private func descendants(of view: NSView) -> [NSView] {
+        [view] + view.subviews.flatMap(descendants(of:))
+    }
+
+    private func waitFor(
+        _ description: String,
+        file: StaticString,
+        line: UInt,
+        until condition: () -> Bool
+    ) throws {
+        let deadline = Date().addingTimeInterval(2)
+        repeat {
+            hostingController.view.needsLayout = true
+            hostingController.view.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            if condition() { return }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        } while Date() < deadline
+        let scroll = scrollView
+        let diagnostic = "host=\(hostingController.view.bounds), scroll=\(String(describing: scroll?.bounds)), document=\(String(describing: scroll?.documentView?.bounds))"
+        XCTFail("Timed out waiting for \(description): \(diagnostic)", file: file, line: line)
+        throw ScrollLayoutFailure.timedOut
+    }
+
+    private enum ScrollLayoutFailure: Error {
+        case timedOut
     }
 }

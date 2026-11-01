@@ -304,6 +304,7 @@ package struct DomainPersistenceCoordinator {
 
     private let configuration: DomainRuntimeConfiguration
     private let identity: DomainRuntimeIdentity
+    private let runtimeRoot: URL
     private let cancellation: DomainBlockingCancellation?
 
     package init(
@@ -312,16 +313,21 @@ package struct DomainPersistenceCoordinator {
     ) {
         self.configuration = configuration
         self.identity = identity
+        runtimeRoot = configuration.storageDirectory.appendingPathComponent(
+            Self.runtimeDirectoryName(profileIdentifier: configuration.profileIdentifier), isDirectory: true
+        )
         cancellation = nil
     }
 
     private init(
         configuration: DomainRuntimeConfiguration,
         identity: DomainRuntimeIdentity,
+        runtimeRoot: URL,
         cancellation: DomainBlockingCancellation
     ) {
         self.configuration = configuration
         self.identity = identity
+        self.runtimeRoot = runtimeRoot
         self.cancellation = cancellation
     }
 
@@ -359,7 +365,7 @@ package struct DomainPersistenceCoordinator {
     }
 
     private func blockingWorker(_ cancellation: DomainBlockingCancellation) -> Self {
-        Self(configuration: configuration, identity: identity, cancellation: cancellation)
+        Self(configuration: configuration, identity: identity, runtimeRoot: runtimeRoot, cancellation: cancellation)
     }
 
     private func withLock<T>(at url: URL, _ body: () throws -> T) throws -> T {
@@ -383,12 +389,6 @@ package struct DomainPersistenceCoordinator {
             .prefix(48)
         let digest = DomainContentDigest.sha256(Data(profileIdentifier.utf8)).prefix(12)
         return "DomainRuntime/v1/\(safe)-\(digest)"
-    }
-
-    private var runtimeRoot: URL {
-        configuration.storageDirectory.appendingPathComponent(
-            Self.runtimeDirectoryName(profileIdentifier: configuration.profileIdentifier), isDirectory: true
-        )
     }
 
     package var oracleStorageRoot: URL {

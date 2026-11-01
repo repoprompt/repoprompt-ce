@@ -167,7 +167,7 @@ final class DebugStateBootstrapTests: XCTestCase {
         }
     }
 
-    func testEveryNormalSeedRefreshesByValueAndCleanSlateDoesNotStick() throws {
+    func testExplicitSnapshotCopiesByValueAndCleanResetArchivesPriorDebugState() throws {
         let f = Fixture()
         defer { f.cleanup() }
         let settings = f.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
@@ -335,7 +335,7 @@ final class DebugStateBootstrapTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: unknown), Data("preserve".utf8))
     }
 
-    func testNormalRefreshPreservesDebugApprovalsAndEndpointWorkspaceWhileRefreshingOtherState() throws {
+    func testExplicitSnapshotPreservesDebugApprovalsAndEndpointWorkspaceWhileRefreshingOtherState() throws {
         let f = Fixture()
         defer { f.cleanup() }
         let workspaceID = UUID(), sessionID = UUID(), tabID = UUID()
@@ -962,5 +962,231 @@ extension DebugStateBootstrapTests {
         let unrecoverable: [Error] = [DebugStateSnapshot.Failure.cancelled, DebugStateSnapshot.Failure.unsafeDestination, DebugProfileAccessLease.Failure.busy, ProfileLocationError.releaseAlias("/fixture")]
         XCTAssertEqual(recoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: true, count: recoverable.count))
         XCTAssertEqual(unrecoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: false, count: unrecoverable.count))
+    }
+}
+
+final class DebugProfileInitializationTests: XCTestCase {
+    private let connectionKeys = [
+        "ClaudeCodeConnected", "CodexCLIConnected", "OpenCodeCLIConnected",
+        "CursorCLIConnected", "GrokBuildCLIConnected"
+    ]
+
+    func testNormalRelaunchPreservesEveryCLIConnectionAndDebugSettings() throws {
+        try withProfile { fixture, defaults, domain in
+            let sourceSettings = fixture.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let debugSettings = fixture.debug.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let releasePreferences = Dictionary(uniqueKeysWithValues: connectionKeys.map { ($0, false) })
+            try writeReleasePreferences(releasePreferences, fixture: fixture)
+            try fixture.writeJSON(["value": "production"], sourceSettings)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+            XCTAssertEqual(try Data(contentsOf: debugSettings), try Data(contentsOf: sourceSettings))
+            for key in connectionKeys {
+                XCTAssertFalse(defaults.bool(forKey: key), key)
+                defaults.set(true, forKey: key)
+            }
+            defaults.set(17, forKey: "fontSize")
+            try fixture.writeJSON(["value": "debug-only"], debugSettings)
+            let debugBytes = try Data(contentsOf: debugSettings)
+            let receiptURL = fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json")
+            let receiptBytes = try Data(contentsOf: receiptURL)
+            try fixture.writeJSON(["value": "production changed"], sourceSettings)
+            try writeReleasePreferences(releasePreferences, fixture: fixture)
+
+            for _ in 0 ..< 2 {
+                XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+                for key in connectionKeys {
+                    XCTAssertTrue(defaults.bool(forKey: key), key)
+                }
+                XCTAssertEqual(defaults.integer(forKey: "fontSize"), 17)
+                XCTAssertEqual(try Data(contentsOf: debugSettings), debugBytes)
+                XCTAssertEqual(try Data(contentsOf: receiptURL), receiptBytes)
+            }
+            XCTAssertEqual(try fixture.object(sourceSettings)["value"] as? String, "production changed")
+        }
+    }
+
+    func testExistingDebugFilesOrPreferencesWithoutReceiptAreAdopted() throws {
+        for hasExistingFile in [false, true] {
+            try withProfile { fixture, defaults, domain in
+                let existingFile = fixture.debug.applicationSupportRoot.appendingPathComponent("unknown-debug-state.bin")
+                let bytes = Data([0, 17, 255])
+                if hasExistingFile {
+                    try fixture.write(bytes, existingFile)
+                } else {
+                    defaults.set(false, forKey: "ClaudeCodeConnected")
+                }
+                let previousPreferences = defaults.persistentDomain(forName: domain) ?? [:]
+
+                XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+
+                XCTAssertTrue(NSDictionary(dictionary: previousPreferences).isEqual(to: defaults.persistentDomain(forName: domain) ?? [:]))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json").path))
+                if hasExistingFile { XCTAssertEqual(try Data(contentsOf: existingFile), bytes) }
+            }
+        }
+    }
+
+    func testLegacyReceiptWithoutPublicationIDDoesNotReplayOldPreferences() throws {
+        try withProfile { fixture, defaults, domain in
+            let receiptURL = fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json")
+            try fixture.writeJSON([
+                "version": 1, "profile": fixture.debug.preferencesDomain,
+                "cleanSlate": false, "copiedFiles": 0, "copiedBytes": 0, "seconds": 0
+            ], receiptURL)
+            let snapshotURL = fixture.debug.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
+            let staleSnapshot = Data("not a plist: warm launches must not load this snapshot".utf8)
+            try fixture.write(staleSnapshot, snapshotURL)
+            defaults.set(true, forKey: "CodexCLIConnected")
+            defaults.set(19, forKey: "fontSize")
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+
+            XCTAssertTrue(defaults.bool(forKey: "CodexCLIConnected"))
+            XCTAssertEqual(defaults.integer(forKey: "fontSize"), 19)
+            XCTAssertNil(defaults.object(forKey: DebugStateBootstrap.preferencesIDKey))
+            XCTAssertEqual(try Data(contentsOf: snapshotURL), staleSnapshot)
+        }
+    }
+
+    func testExplicitCleanSlateRemainsEmptyUntilAnotherExplicitReset() throws {
+        try withProfile { fixture, defaults, domain in
+            try writeReleasePreferences(["CodexCLIConnected": true], fixture: fixture)
+            let sourceSettings = fixture.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let debugSettings = fixture.debug.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            try fixture.writeJSON(["value": "production"], sourceSettings)
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, cleanSlate: true), .reset)
+            let resetID = try XCTUnwrap(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey))
+            XCTAssertNil(defaults.object(forKey: "CodexCLIConnected"))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: debugSettings.path))
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .reused)
+            XCTAssertNil(defaults.object(forKey: "CodexCLIConnected"))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: debugSettings.path))
+            XCTAssertEqual(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey), resetID)
+
+            defaults.set(true, forKey: "CodexCLIConnected")
+            try fixture.writeJSON(["value": "new debug settings"], debugSettings)
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, cleanSlate: true), .reset)
+            XCTAssertNil(defaults.object(forKey: "CodexCLIConnected"))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: debugSettings.path))
+            XCTAssertNotEqual(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey), resetID)
+            XCTAssertEqual(try fixture.object(sourceSettings)["value"] as? String, "production")
+        }
+    }
+
+    func testInterruptedPreferencePublicationRecoversOnceWithoutRecapturingProduction() throws {
+        try withProfile { fixture, defaults, domain in
+            let sourceSettings = fixture.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            let debugSettings = fixture.debug.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+            try fixture.writeJSON(["value": "captured production"], sourceSettings)
+            defaults.set(false, forKey: "ClaudeCodeConnected")
+            let receipt = try DebugStateBootstrap.seed(
+                locations: fixture.debug,
+                cleanSlate: false,
+                releasePreferences: ["ClaudeCodeConnected": true, "fontSize": 15]
+            )
+            try fixture.writeJSON(["value": "new production state"], sourceSettings)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .recoveredPreferences)
+            XCTAssertTrue(defaults.bool(forKey: "ClaudeCodeConnected"))
+            XCTAssertEqual(defaults.integer(forKey: "fontSize"), 15)
+            XCTAssertEqual(defaults.string(forKey: DebugStateBootstrap.preferencesIDKey), try XCTUnwrap(receipt.preferencesID).uuidString)
+            XCTAssertEqual(try fixture.object(debugSettings)["value"] as? String, "captured production")
+
+            defaults.set(false, forKey: "ClaudeCodeConnected")
+            defaults.set(21, forKey: "fontSize")
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain, preferenceSourceURL: fixture.home), .reused)
+            XCTAssertFalse(defaults.bool(forKey: "ClaudeCodeConnected"))
+            XCTAssertEqual(defaults.integer(forKey: "fontSize"), 21)
+        }
+    }
+
+    func testHeadlessWriterAllowsReuseButPreventsImportAndReset() throws {
+        for hasExistingPreferences in [false, true] {
+            try withProfile { fixture, defaults, domain in
+                if hasExistingPreferences { defaults.set(true, forKey: "CursorCLIConnected") }
+                let writer = try DebugProfileAccessLease.acquire(locations: fixture.debug, exclusive: false)
+                withExtendedLifetime(writer) {
+                    if hasExistingPreferences {
+                        XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .reused)
+                    } else {
+                        XCTAssertThrowsError(try prepare(fixture, defaults: defaults, domain: domain)) { error in
+                            guard case DebugProfileAccessLease.Failure.busy = error else { return XCTFail("Unexpected error: \(error)") }
+                        }
+                    }
+                    XCTAssertThrowsError(try prepare(fixture, defaults: defaults, domain: domain, cleanSlate: true)) { error in
+                        guard case DebugProfileAccessLease.Failure.busy = error else { return XCTFail("Unexpected error: \(error)") }
+                    }
+                }
+                XCTAssertEqual(defaults.bool(forKey: "CursorCLIConnected"), hasExistingPreferences)
+                XCTAssertNil(defaults.object(forKey: DebugStateBootstrap.preferencesIDKey))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json").path))
+            }
+        }
+    }
+
+    func testFailedInitialImportLeavesNoCompletedProfileAndCanRetry() throws {
+        try withProfile { fixture, defaults, domain in
+            let sourcePreferences = releasePreferencesURL(fixture)
+            try fixture.write(Data("invalid property list".utf8), sourcePreferences)
+
+            XCTAssertThrowsError(try prepare(fixture, defaults: defaults, domain: domain))
+            XCTAssertTrue((defaults.persistentDomain(forName: domain) ?? [:]).isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.debug.applicationSupportRoot.path))
+
+            try writeReleasePreferences(["GrokBuildCLIConnected": true], fixture: fixture)
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+            XCTAssertTrue(defaults.bool(forKey: "GrokBuildCLIConnected"))
+        }
+    }
+
+    func testFinderBookkeepingAloneDoesNotSuppressInitialImport() throws {
+        try withProfile { fixture, defaults, domain in
+            try fixture.write(Data([0]), fixture.debug.applicationSupportRoot.appendingPathComponent(".DS_Store"))
+            try writeReleasePreferences(["OpenCodeCLIConnected": true], fixture: fixture)
+
+            XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .imported)
+            XCTAssertTrue(defaults.bool(forKey: "OpenCodeCLIConnected"))
+        }
+    }
+
+    private func withProfile(_ body: (DebugStateBootstrapTests.Fixture, UserDefaults, String) throws -> Void) throws {
+        let fixture = DebugStateBootstrapTests.Fixture()
+        let domain = "DebugProfileInitializationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer {
+            defaults.removePersistentDomain(forName: domain)
+            fixture.cleanup()
+        }
+        try body(fixture, defaults, domain)
+    }
+
+    private func prepare(
+        _ fixture: DebugStateBootstrapTests.Fixture,
+        defaults: UserDefaults,
+        domain: String,
+        cleanSlate: Bool = false,
+        preferenceSourceURL: URL? = nil
+    ) throws -> DebugStateBootstrap.PreparationAction {
+        try DebugStateBootstrap.prepareProfile(
+            locations: fixture.debug,
+            defaults: defaults,
+            preferencesDomain: domain,
+            cleanSlate: cleanSlate,
+            preferenceSourceURL: preferenceSourceURL
+        ).action
+    }
+
+    private func releasePreferencesURL(_ fixture: DebugStateBootstrapTests.Fixture) -> URL {
+        fixture.home.appendingPathComponent("Library/Preferences/\(fixture.release.preferencesDomain).plist")
+    }
+
+    private func writeReleasePreferences(_ preferences: [String: Any], fixture: DebugStateBootstrapTests.Fixture) throws {
+        try fixture.write(
+            PropertyListSerialization.data(fromPropertyList: preferences, format: .binary, options: 0),
+            releasePreferencesURL(fixture)
+        )
     }
 }

@@ -10,6 +10,19 @@ struct OpenRouterSettingsView: View {
     @State private var showAdvancedSettings = false
 
     var body: some View {
+        ScrollView {
+            settingsContent
+        }
+        .alert(isPresented: $showAlert) {
+            Alert(
+                title: Text("OpenRouter Settings"),
+                message: Text(alertMessage),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+    }
+
+    private var settingsContent: some View {
         VStack(alignment: .leading, spacing: 12) {
             headerSection
 
@@ -64,13 +77,6 @@ struct OpenRouterSettingsView: View {
             }
         }
         .padding(.horizontal)
-        .alert(isPresented: $showAlert) {
-            Alert(
-                title: Text("OpenRouter Settings"),
-                message: Text(alertMessage),
-                dismissButton: .default(Text("OK"))
-            )
-        }
     }
 }
 
@@ -218,26 +224,23 @@ extension OpenRouterSettingsView {
             // 1) Custom-added models at top
             Text("Registered Models").font(.caption).fontWeight(.semibold)
 
-            ScrollView(.vertical, showsIndicators: true) {
-                LazyVStack(alignment: .leading) {
-                    ForEach(viewModel.customOpenRouterModels, id: \.self) { model in
-                        HStack {
-                            Text("\(model)")
-                            Spacer()
-                            Button(action: {
-                                removeCustomOpenRouterModel(model)
-                            }) {
-                                Image(systemName: "trash")
-                                    .foregroundColor(.red)
-                            }
-                            .buttonStyle(PlainButtonStyle())
+            LazyVStack(alignment: .leading) {
+                ForEach(viewModel.customOpenRouterModels, id: \.self) { model in
+                    HStack {
+                        Text("\(model)")
+                        Spacer()
+                        Button(action: {
+                            removeCustomOpenRouterModel(model)
+                        }) {
+                            Image(systemName: "trash")
+                                .foregroundColor(.red)
                         }
-                        .padding(.vertical, 4)
+                        .buttonStyle(PlainButtonStyle())
                     }
+                    .padding(.vertical, 4)
                 }
-                .padding(.trailing, 20)
             }
-            .frame(maxHeight: 80)
+            .padding(.trailing, 20)
 
             Divider()
 
@@ -273,21 +276,18 @@ extension OpenRouterSettingsView {
                         .padding()
                     Spacer()
                 } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading) {
-                            ForEach(filtered.prefix(20), id: \.self) { model in
-                                modelRow(model)
-                            }
-                            if filtered.count > 20 {
-                                Text("Showing first 20 models")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .padding(.vertical, 4)
-                            }
+                    LazyVStack(alignment: .leading) {
+                        ForEach(filtered.prefix(20), id: \.self) { model in
+                            modelRow(model)
                         }
-                        .padding(.trailing, 20)
+                        if filtered.count > 20 {
+                            Text("Showing first 20 models")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .padding(.vertical, 4)
+                        }
                     }
-                    .frame(maxHeight: 400)
+                    .padding(.trailing, 20)
                 }
             }
         }

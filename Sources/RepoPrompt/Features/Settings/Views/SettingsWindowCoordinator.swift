@@ -94,7 +94,7 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
             return
         }
 
-        let hostingController = NSHostingController(rootView: rootView)
+        let hostingController = Self.makeHostingController(rootView: rootView)
         let window = NSWindow(contentViewController: hostingController)
         window.styleMask = [.titled, .closable, .resizable]
         window.isReleasedWhenClosed = false
@@ -134,7 +134,7 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
             .receive(on: DispatchQueue.main)
             .sink { [weak window] preset in
                 guard let window else { return }
-                window.contentMinSize = Self.minContentSize(for: preset)
+                Self.updateWindowSizing(window, preset: preset)
             }
             .store(in: &cancellables)
 
@@ -196,9 +196,50 @@ final class SettingsWindowCoordinator: NSObject, ObservableObject, NSWindowDeleg
     }
 
     private func show(windowController: NSWindowController) {
+        if let window = windowController.window {
+            Self.updateWindowSizing(window, preset: FontScaleManager.shared.preset)
+        }
         NSApp.activate(ignoringOtherApps: true)
         windowController.showWindow(nil)
         windowController.window?.makeKeyAndOrderFront(nil)
+    }
+
+    static func makeHostingController<Content: View>(rootView: Content) -> NSHostingController<Content> {
+        let controller = NSHostingController(rootView: rootView)
+        // The window owns the viewport; a long settings pane must not replace its size constraints.
+        controller.sizingOptions = []
+        return controller
+    }
+
+    static func frameFittingVisibleScreen(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
+        guard visibleFrame.width > 0, visibleFrame.height > 0 else { return frame }
+        let size = NSSize(
+            width: min(frame.width, visibleFrame.width),
+            height: min(frame.height, visibleFrame.height)
+        )
+        return NSRect(
+            x: min(max(frame.minX, visibleFrame.minX), visibleFrame.maxX - size.width),
+            y: min(max(frame.minY, visibleFrame.minY), visibleFrame.maxY - size.height),
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    private static func updateWindowSizing(_ window: NSWindow, preset: FontScalePreset) {
+        let minimum = minContentSize(for: preset)
+        guard let screen = window.screen ?? NSScreen.main else {
+            window.contentMinSize = minimum
+            return
+        }
+        let availableContent = window.contentRect(forFrameRect: screen.visibleFrame).size
+        window.contentMinSize = NSSize(
+            width: min(minimum.width, availableContent.width),
+            height: min(minimum.height, availableContent.height)
+        )
+        let fittedFrame = frameFittingVisibleScreen(window.frame, visibleFrame: screen.visibleFrame)
+        if fittedFrame != window.frame {
+            window.setFrame(fittedFrame, display: window.isVisible)
+        }
     }
 
     private func updateTitle(for window: NSWindow, using tab: SettingsTab) {
