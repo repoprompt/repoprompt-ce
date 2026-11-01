@@ -439,6 +439,7 @@ payload = {
     "repoRoot": str(root),
     "worktreePath": str(root),
     "worktreeName": root.name,
+    "debugProfileReuse": True,
     "branch": git(["rev-parse", "--abbrev-ref", "HEAD"]),
     "commit": git(["rev-parse", "HEAD"]),
     "dirty": bool(status),

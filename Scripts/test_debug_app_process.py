@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import shutil
 import signal
@@ -169,6 +172,108 @@ class LifecycleSurfaceTests(unittest.TestCase):
         self.assertIn("does not provide an uncoordinated no-Python fallback", agents)
         self.assertIn("does not provide an", readme)
         self.assertIn("uncoordinated no-Python fallback", readme)
+
+    def test_cached_artifact_admission_requires_checkout_capability_and_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            valid = {"version": 1, "debugProfileReuse": True, "repoRoot": str(root), "worktreePath": str(root), "commit": "abc"}
+            self.assertEqual(conductor.launch_bundle_currency_problems(root, valid, "abc"), [])
+            for payload in [None, {}, {**valid, "version": 2}, {**valid, "debugProfileReuse": False},
+                            {**valid, "repoRoot": str(root / "other")}, {**valid, "worktreePath": "relative"},
+                            {**valid, "commit": "old"}, {**valid, "commit": None}]:
+                with self.subTest(payload=payload):
+                    self.assertTrue(conductor.launch_bundle_currency_problems(root, payload, "abc"))
+            self.assertTrue(conductor.launch_bundle_currency_problems(root, valid, None))
+            alias = root / "alias"
+            alias.symlink_to(root, target_is_directory=True)
+            self.assertEqual(conductor.launch_bundle_currency_problems(alias, valid, "abc"), [])
+
+    def test_strict_rejection_precedes_stop_and_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "RepoPrompt.app"
+            executable = bundle / "Contents/MacOS/RepoPromptDebug"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("fake")
+            executable.chmod(0o755)
+            with patch.object(conductor, "debug_app_bundle_path", return_value=bundle), \
+                 patch.object(conductor, "machine_exclusive_lock", return_value=contextlib.nullcontext()), \
+                 patch.object(conductor, "_operation_app_stop_unlocked") as stop, \
+                 patch.object(conductor, "run_operation_command") as run, \
+                 patch.object(conductor, "current_repo_commit", return_value="abc"), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(conductor.operation_app_launch_existing(root, {"requireCurrent": True}), 1)
+                stop.assert_not_called()
+                run.assert_not_called()
+
+    def test_reuse_launch_never_packages_and_forwards_profile_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "RepoPrompt.app"
+            executable = bundle / "Contents/MacOS/RepoPromptDebug"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("fake")
+            executable.chmod(0o755)
+            args = {"requireCurrent": True, "appArgs": ["--fresh-profile", "argument with spaces"]}
+            with patch.object(conductor, "debug_app_bundle_path", return_value=bundle), \
+                 patch.object(conductor, "machine_exclusive_lock", return_value=contextlib.nullcontext()), \
+                 patch.object(conductor, "launch_bundle_currency_problems", return_value=[]), \
+                 patch.object(conductor, "report_launch_bundle_details", return_value=0), \
+                 patch.object(conductor, "_operation_app_stop_unlocked", return_value=0), \
+                 patch.object(conductor, "wait_for_debug_app_process", return_value=["123"]), \
+                 patch.object(conductor, "current_repo_commit", return_value="abc"), \
+                 patch.object(conductor, "package_debug_app_under_heavy") as package, \
+                 patch.object(conductor, "run_operation_command", return_value=(0, "", "")) as run, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(conductor.operation_app_launch_existing(root, args), 0)
+                package.assert_not_called()
+                self.assertEqual(run.call_args.args[1], ["open", "-n", str(bundle), "--args", *args["appArgs"]])
+
+    def test_require_current_and_app_arguments_parse_without_enqueuing(self) -> None:
+        with patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            self.assertEqual(conductor.handle_real_operation(None, "app", ["launch-existing", "--require-current", "--", "--fresh-profile"]), 0)
+            self.assertEqual(enqueue.call_args.args[2], {"subcommand": "launch-existing", "requireCurrent": True, "appArgs": ["--fresh-profile"]})
+            with self.assertRaises(conductor.ConductorError):
+                conductor.handle_real_operation(None, "app", ["relaunch", "--require-current"])
+
+    def test_oversized_or_malformed_provenance_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            path = conductor.debug_app_provenance_path(bundle)
+            path.parent.mkdir(parents=True)
+            for data in [b"not JSON", b"\xff", b"x" * (64 * 1024 + 1), json.dumps([]).encode()]:
+                path.write_bytes(data)
+                self.assertIsNone(conductor.read_debug_app_provenance(bundle))
+
+    def test_finder_reuses_by_default_and_refresh_is_explicit(self) -> None:
+        launcher = (SCRIPT_DIR.parent / "Launch RepoPrompt CE.command").read_text()
+        self.assertIn('cd "$ROOT_DIR" || exit 1\nlaunch_cached_app', launcher)
+        self.assertIn("app launch-existing --require-current", launcher)
+        self.assertIn("app relaunch", launcher)
+        self.assertIn("--fresh-profile", launcher)
+        self.assertIn("debugProfileReuse", (SCRIPT_DIR / "package_app.sh").read_text())
+
+    def test_finder_commands_reuse_refresh_and_rebuild_with_empty_or_spaced_arguments(self) -> None:
+        for app_args in ([], ["argument with spaces"]):
+            with self.subTest(app_args=app_args), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                launcher = self.copy_finder_launcher(root)
+                scripts = root / "Scripts"
+                scripts.mkdir()
+                resolver = scripts / "resolve_full_xcode_developer_dir.sh"
+                resolver.write_text('#!/bin/sh\nprintf "%s\\n" /fake/Xcode/Contents/Developer\n')
+                resolver.chmod(0o755)
+                mock = root / "conductor"
+                mock.write_text('#!/usr/bin/env python3\nimport json,os,sys\nwith open(os.environ["CALLS_LOG"], "a") as f: f.write(json.dumps(sys.argv[1:])+"\\n")\n')
+                mock.chmod(0o755)
+                log = root / "calls.jsonl"
+                result = subprocess.run(["/bin/bash", str(launcher), *app_args], input="frq", text=True,
+                                        capture_output=True, timeout=10, env={**os.environ, "CALLS_LOG": str(log), "TERM": "dumb"})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(calls[0], ["app", "launch-existing", "--require-current", *(["--", *app_args] if app_args else [])])
+                self.assertEqual(calls[1], ["app", "launch-existing", "--require-current", "--", "--fresh-profile", *app_args])
+                self.assertEqual(calls[2], ["app", "relaunch", *(["--", *app_args] if app_args else [])])
 
     def test_conductor_selftest_includes_process_helper_suite(self) -> None:
         makefile = (SCRIPT_DIR.parent / "Makefile").read_text(encoding="utf-8")

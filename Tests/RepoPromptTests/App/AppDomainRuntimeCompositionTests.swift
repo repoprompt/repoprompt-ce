@@ -964,3 +964,176 @@ extension DebugStateBootstrapTests {
         XCTAssertEqual(unrecoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: false, count: unrecoverable.count))
     }
 }
+
+final class DebugProfileReuseTests: XCTestCase {
+    typealias Fixture = DebugStateBootstrapTests.Fixture
+
+    private func withDefaults(_ body: (UserDefaults, String) throws -> Void) throws {
+        let domain = "DebugProfileReuseTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { defaults.removePersistentDomain(forName: domain) }
+        try body(defaults, domain)
+    }
+
+    /// Returning only the receipt simulates termination: each launch releases its lease.
+    @discardableResult
+    private func launch(
+        _ mode: DebugStateBootstrap.Mode, _ f: Fixture, _ defaults: UserDefaults, _ domain: String,
+        synchronize: (UserDefaults) -> Bool = { _ in true }
+    ) throws -> DebugStateSnapshot.Receipt? {
+        let preparation = try DebugStateBootstrap.prepare(
+            mode: mode, locations: f.debug, defaults: defaults,
+            preferencesDomain: domain, synchronize: synchronize
+        )
+        return preparation.receipt
+    }
+
+    func testModeIsExplicitAndNotSticky() {
+        XCTAssertEqual(DebugStateBootstrap.requestedMode(arguments: []), .reuse)
+        XCTAssertEqual(DebugStateBootstrap.requestedMode(arguments: ["app", "--fresh-profile"]), .fresh)
+        XCTAssertEqual(DebugStateBootstrap.requestedMode(arguments: ["--fresh-profile", "--debug-clean-slate"]), .clean)
+        XCTAssertEqual(DebugStateBootstrap.requestedMode(arguments: ["--fresh-profile-suffix"]), .reuse)
+        XCTAssertEqual(DebugStateBootstrap.requestedMode(arguments: []), .reuse)
+    }
+
+    func testFreshImportOnceThenReusePreservesDebugEditsWithoutReadingProduction() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let source = f.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+        let destination = f.debug.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+        try f.writeJSON(["value": "production"], source)
+        let preferences = f.home.appendingPathComponent("Library/Preferences/\(f.release.preferencesDomain).plist")
+        try f.write(PropertyListSerialization.data(fromPropertyList: ["fontSize": 19], format: .binary, options: 0), preferences)
+        try withDefaults { defaults, domain in
+            XCTAssertNotNil(try launch(.fresh, f, defaults, domain))
+            XCTAssertEqual(try Data(contentsOf: source), try Data(contentsOf: destination))
+            XCTAssertEqual(defaults.persistentDomain(forName: domain)?["fontSize"] as? Int, 19)
+            try f.writeJSON(["value": "debug edit"], destination)
+            let edited = try Data(contentsOf: destination)
+            let receipt = try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json"))
+            let recoveryCount = try FileManager.default.contentsOfDirectory(atPath: f.recovery.path).count
+            defaults.setPersistentDomain(["fontSize": 22], forName: domain)
+            // This alias would make production capture fail. Ordinary reuse must not inspect it.
+            try FileManager.default.createSymbolicLink(at: f.release.applicationSupportRoot.appendingPathComponent("Presets"), withDestinationURL: f.debug.applicationSupportRoot)
+            for _ in 0 ..< 2 {
+                XCTAssertNil(try launch(.reuse, f, defaults, domain))
+                XCTAssertEqual(try Data(contentsOf: destination), edited)
+                XCTAssertEqual(try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json")), receipt)
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: f.recovery.path).count, recoveryCount)
+                XCTAssertEqual(defaults.persistentDomain(forName: domain)?["fontSize"] as? Int, 22)
+            }
+            XCTAssertThrowsError(try launch(.fresh, f, defaults, domain))
+            XCTAssertEqual(try Data(contentsOf: destination), edited)
+        }
+    }
+
+    func testFirstOrdinaryLaunchDoesNotImportProductionOrPublishAnEmptyReset() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        try f.writeJSON(["value": "production"], f.release.applicationSupportRoot.appendingPathComponent("Settings/globalSettings.json"))
+        try withDefaults { defaults, domain in
+            defaults.setPersistentDomain(["fontSize": 23], forName: domain)
+            XCTAssertNil(try launch(.reuse, f, defaults, domain))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.debug.applicationSupportRoot.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.recovery.path))
+            XCTAssertEqual(defaults.persistentDomain(forName: domain)?["fontSize"] as? Int, 23)
+        }
+    }
+
+    func testLegacyReceiptAndSeedPreferencesNeverOverrideCurrentPreferences() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let stale = f.debug.applicationSupportRoot.appendingPathComponent(DebugStateSnapshot.seedPreferencesFileName)
+        try f.write(PropertyListSerialization.data(fromPropertyList: ["fontSize": 11], format: .binary, options: 0), stale)
+        // Receipts are historical evidence, not permission to replace or scan a legacy profile.
+        try f.write(Data("unknown future receipt".utf8), f.debug.applicationSupportRoot.appendingPathComponent("debugSeed.json"))
+        try withDefaults { defaults, domain in
+            defaults.setPersistentDomain(["fontSize": 21], forName: domain)
+            XCTAssertNil(try launch(.reuse, f, defaults, domain))
+            XCTAssertEqual(defaults.persistentDomain(forName: domain)?["fontSize"] as? Int, 21)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stale.path))
+        }
+    }
+
+    func testInterruptedPreferencesAreRepairedOnceAndSyncFailureStopsStartup() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let marker = f.debug.applicationSupportRoot.appendingPathComponent(DebugStateSnapshot.pendingPreferencesMarkerName)
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: ["fontSize": 19])
+        try withDefaults { defaults, domain in
+            XCTAssertThrowsError(try launch(.reuse, f, defaults, domain, synchronize: { _ in false })) { error in
+                XCTAssertTrue(error is DebugStateBootstrap.PendingPreferencesFailure)
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+            XCTAssertNil(try launch(.reuse, f, defaults, domain))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+            XCTAssertEqual(defaults.persistentDomain(forName: domain)?["fontSize"] as? Int, 19)
+            defaults.setPersistentDomain(["fontSize": 24], forName: domain)
+            XCTAssertNil(try launch(.reuse, f, defaults, domain))
+            XCTAssertEqual(defaults.persistentDomain(forName: domain)?["fontSize"] as? Int, 24)
+        }
+    }
+
+    func testRetryAfterPublishedPreferenceFailureNeverRecapturesOrPrunesArchives() throws {
+        for mode in [DebugStateBootstrap.Mode.fresh, .clean] {
+            let f = Fixture()
+            defer { f.cleanup() }
+            try withDefaults { defaults, domain in
+                _ = try launch(.clean, f, defaults, domain)
+                let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("valuable-debug-work")
+                try f.write(Data("preserve".utf8), sentinel)
+                var retryMode = mode
+                do {
+                    _ = try launch(mode, f, defaults, domain, synchronize: { _ in false })
+                    XCTFail("Expected pending preference failure")
+                } catch {
+                    retryMode = DebugStateBootstrap.retryMode(after: error, current: mode)
+                }
+                XCTAssertEqual(retryMode, .reuse)
+                let archived = try FileManager.default.contentsOfDirectory(at: f.recovery, includingPropertiesForKeys: nil)
+                    .filter { UUID(uuidString: $0.lastPathComponent) != nil }
+                XCTAssertEqual(archived.count, 1)
+                for _ in 0 ..< 4 {
+                    XCTAssertThrowsError(try launch(retryMode, f, defaults, domain, synchronize: { _ in false }))
+                }
+                XCTAssertNil(try launch(retryMode, f, defaults, domain))
+                XCTAssertEqual(try Data(contentsOf: XCTUnwrap(archived.first).appendingPathComponent("valuable-debug-work")), Data("preserve".utf8))
+                let after = try FileManager.default.contentsOfDirectory(at: f.recovery, includingPropertiesForKeys: nil)
+                    .filter { UUID(uuidString: $0.lastPathComponent) != nil }
+                XCTAssertEqual(after, archived)
+            }
+        }
+        XCTAssertEqual(DebugStateBootstrap.retryMode(after: DebugStateSnapshot.Failure.sourceChanged, current: .fresh), .fresh)
+    }
+
+    func testBrokenPendingPreferencesFailWithoutReplacingFiles() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let marker = f.debug.applicationSupportRoot.appendingPathComponent(DebugStateSnapshot.pendingPreferencesMarkerName)
+        try f.write(Data(), marker)
+        try withDefaults { defaults, domain in
+            defaults.setPersistentDomain(["fontSize": 25], forName: domain)
+            XCTAssertThrowsError(try launch(.reuse, f, defaults, domain))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: f.recovery.path))
+            XCTAssertEqual(defaults.persistentDomain(forName: domain)?["fontSize"] as? Int, 25)
+        }
+    }
+
+    func testCleanResetIsExplicitAndLaterOrdinaryLaunchKeepsItsState() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let sentinel = f.debug.applicationSupportRoot.appendingPathComponent("sentinel")
+        try f.write(Data("prior".utf8), sentinel)
+        try withDefaults { defaults, domain in
+            defaults.setPersistentDomain(["fontSize": 26], forName: domain)
+            XCTAssertEqual(try launch(.clean, f, defaults, domain)?.cleanSlate, true)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: sentinel.path))
+            XCTAssertTrue((defaults.persistentDomain(forName: domain) ?? [:]).isEmpty)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: f.recovery.path))
+            try f.write(Data("new debug work".utf8), sentinel)
+            XCTAssertNil(try launch(.reuse, f, defaults, domain))
+            XCTAssertEqual(try Data(contentsOf: sentinel), Data("new debug work".utf8))
+        }
+    }
+}

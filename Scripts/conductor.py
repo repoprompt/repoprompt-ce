@@ -319,7 +319,7 @@ Operation commands:
   ./conductor run [-- <app args...>]                  # build/package, then FIFO coordinated launch
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
-  ./conductor app launch-existing [-- <app args...>]   # launch existing DebugApps bundle without building
+  ./conductor app launch-existing [--require-current] [-- <app args...>] # reuse packaged debug app; --fresh-profile after -- imports production
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
   ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run] [--execution-location-ui]
     --execution-location-ui uses REPOPROMPT_EXECUTION_LOCATION_UI_SMOKE_WAIT (default 3s) and _CYCLES (default 3); Accessibility permission is required.
@@ -7749,8 +7749,12 @@ def debug_app_provenance_path(bundle: Path) -> Path:
 def read_debug_app_provenance(bundle: Path) -> Optional[Dict[str, Any]]:
     path = debug_app_provenance_path(bundle)
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        with path.open("rb") as handle:
+            data = handle.read(64 * 1024 + 1)
+        if len(data) > 64 * 1024:
+            return None
+        payload = json.loads(data)
+    except (FileNotFoundError, OSError, ValueError, UnicodeError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -7775,6 +7779,34 @@ def current_repo_commit(repo_root: Path) -> Optional[str]:
     return git_metadata_value(repo_root, ["rev-parse", "HEAD"])
 
 
+def launch_bundle_currency_problems(
+    repo_root: Path, provenance: Optional[Dict[str, Any]], current_commit: Optional[str]
+) -> List[str]:
+    """Strict reusable-artifact admission; never scans sources or starts a build."""
+    if not provenance:
+        return ["bundle provenance is missing or unreadable"]
+    problems: List[str] = []
+    if provenance.get("version") != 1:
+        problems.append("unsupported bundle provenance version")
+    if provenance.get("debugProfileReuse") is not True:
+        problems.append("bundle predates debug-profile reuse; rebuild once to avoid automatic production import")
+    try:
+        expected = repo_root.resolve()
+        for key in ("repoRoot", "worktreePath"):
+            raw = provenance.get(key)
+            if not isinstance(raw, str) or not Path(raw).is_absolute() or Path(raw).resolve() != expected:
+                problems.append("foreign worktree")
+                break
+    except (OSError, RuntimeError):
+        problems.append("foreign worktree unknown")
+    commit = provenance.get("commit")
+    if not current_commit or not isinstance(commit, str) or not commit:
+        problems.append("cannot verify bundle commit")
+    elif commit != current_commit:
+        problems.append("stale commit")
+    return problems
+
+
 def provenance_report_lines(repo_root: Path, bundle: Path) -> List[str]:
     provenance = read_debug_app_provenance(bundle)
     if not provenance:
@@ -7792,17 +7824,7 @@ def provenance_report_lines(repo_root: Path, bundle: Path) -> List[str]:
     lines.append(f"    commit: {commit[:12] if commit != '<unknown>' else commit}")
     lines.append(f"    dirty at build: {dirty if isinstance(dirty, bool) else '<unknown>'}")
     lines.append(f"    built: {built_at}")
-    flags: List[str] = []
-    try:
-        current_root = str(repo_root.resolve())
-        built_root = str(Path(repo).resolve(strict=False))
-        if built_root != current_root:
-            flags.append("foreign worktree")
-    except OSError:
-        flags.append("foreign worktree unknown")
-    current_commit = current_repo_commit(repo_root)
-    if current_commit and commit not in {"<unknown>", current_commit}:
-        flags.append("stale commit")
+    flags = launch_bundle_currency_problems(repo_root, provenance, current_repo_commit(repo_root))
     if flags:
         lines.append(f"    WARNING: {'; '.join(flags)}")
     return lines
@@ -8026,6 +8048,13 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
     try:
         with machine_exclusive_lock(live_app_lock_path(), metadata, "live-app lock"):
             if staged_bundle is None:
+                if args.get("requireCurrent"):
+                    problems = launch_bundle_currency_problems(repo_root, read_debug_app_provenance(bundle), current_repo_commit(repo_root))
+                    if problems:
+                        for problem in problems:
+                            print(f"ERROR: {problem}", flush=True)
+                        print("Rebuild once with './conductor app relaunch' (Finder launcher: press r). No app was stopped or opened.", flush=True)
+                        return 1
                 report_launch_bundle_details(repo_root, bundle)
             print("Stopping existing RepoPrompt CE debug app instance", flush=True)
             stop_code = _operation_app_stop_unlocked(repo_root, {"guardDelayedLaunch": bool(args.get("guardDelayedLaunch"))})
@@ -8876,9 +8905,12 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         args["appArgs"] = app_args
     elif operation == "app":
         if not rest or rest[0] not in {"status", "stop", "launch-existing", "relaunch"}:
-            raise ConductorError("usage: ./conductor app status|stop|launch-existing|relaunch [-- <app args...>]")
+            raise ConductorError("usage: ./conductor app status|stop|launch-existing [--require-current]|relaunch [-- <app args...>]")
         args["subcommand"] = rest[0]
         trailing = rest[1:]
+        if args["subcommand"] == "launch-existing" and trailing and trailing[0] == "--require-current":
+            args["requireCurrent"] = True
+            trailing = trailing[1:]
         if args["subcommand"] in {"status", "stop"} and trailing:
             raise ConductorError(f"app {args['subcommand']} does not accept application arguments")
         if args["subcommand"] in {"launch-existing", "relaunch"}:
