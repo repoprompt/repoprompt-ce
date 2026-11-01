@@ -5955,6 +5955,14 @@ extension ToolOutputFormatter {
             lines.append("- Run ID: `\(runID)`")
         }
         lines.append(contentsOf: formattedAgentRunWorktreeLines(worktrees))
+        if worktrees.isEmpty, object["worktree_binding_state"]?.stringValue == "unbound" {
+            lines.append("- Worktree: **unbound** (reads the logical root checkout)")
+        }
+        if let bindingWarning = object["worktree_binding_warning"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !bindingWarning.isEmpty
+        {
+            lines.append("- ⚠️ Worktree binding: \(bindingWarning)")
+        }
         // Wait metadata
         let waitMeta = object["wait"]?.objectValue
         let steeringMessage = waitMeta?["steering_message"]?.stringValue
@@ -6085,6 +6093,10 @@ extension ToolOutputFormatter {
         if let assistantText, !assistantText.isEmpty {
             let heading = isTerminal ? "Output" : "Preview"
             lines.append("\n**\(heading)**\n\n\(assistantText)")
+            if object["assistant_text_truncated"]?.boolValue == true {
+                let total = object["assistant_text_characters"]?.intValue.map { " of \($0) characters" } ?? ""
+                lines.append("\n_assistant_text truncated\(total); use `agent_manage get_log` for the full transcript._")
+            }
         }
         return [.text(lines.joined(separator: "\n"))]
     }

@@ -2508,4 +2508,90 @@ import XCTest
             return text
         }
     }
+
+    /// Issue #26: aborting the invoking Agent Mode thread must propagate into Context Builder work
+    /// it owns. This drives the real routed `context_builder` tool from a connection bound to the
+    /// invoking run and aborts through `cancelActiveToolsForRun(runID:)` — the exact entry
+    /// `AgentModeRunService.cancelRun` uses (`cancelMCPToolsForRun`) before stopping the provider.
+    @MainActor
+    final class ContextBuilderAgentRunAbortTests: XCTestCase {
+        func testAbortingInvokingRunDuringDiscoveryDisposesProviderAndLeavesNoSpinnerOrExecution() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A", "B", "Unrelated"], routedRuntime: true) { driver in
+                let context = try await driver.resolve()
+                let parent = try await driver.fixture.perform("actual invoking Agent Mode socket") {
+                    try await driver.connectInvokingAgent(context)
+                }
+                let invokingRunID = try XCTUnwrap(context.frozenTabContext.runID)
+                let observer = try XCTUnwrap(driver.vm.armStartupObservationForTesting(
+                    windowID: driver.window.windowID, workspaceID: driver.fixture.workspace.id,
+                    tabID: driver.tabID, invokingRunID: invokingRunID
+                ))
+
+                // Hold the discovery provider mid-stream: the thread is aborted *during* discovery.
+                let streaming = XCTestExpectation(description: "discovery provider stream held")
+                let gate = driver.fixture.makeGate()
+                driver.streamBody = { _ in
+                    streaming.fulfill()
+                    await gate.wait()
+                }
+
+                let settled = XCTestExpectation(description: "aborted context_builder request settled")
+                var outcome = "pending"
+                let request = driver.fixture.startOwnedTask {
+                    do {
+                        let reply = try await driver.invoke(using: parent)
+                        outcome = reply.isError == true ? "error" : "completed"
+                    } catch {
+                        outcome = "thrown"
+                    }
+                    settled.fulfill()
+                }
+                try await driver.fixture.awaitGateEvent(streaming)
+                let nestedRunID = try XCTUnwrap(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+                XCTAssertEqual(driver.streamStarts, 1)
+                XCTAssertEqual(driver.disposed, 0)
+                let session = try XCTUnwrap(driver.vm.sessions[driver.tabID])
+                XCTAssertTrue(session.agentRunState.isRunning, "discovery must be live before the abort")
+
+                // Abort the owning Agent Mode run. The routed tool execution is registered under the
+                // invoking run, so this is the same cancellation `AgentModeRunService.cancelRun` issues.
+                let cancelledExecutions = driver.window.mcpServer.cancelActiveToolsForRun(runID: invokingRunID, reason: "thread aborted")
+                XCTAssertEqual(cancelledExecutions, 1, "the live context_builder execution must be owned by the invoking run")
+
+                try await driver.fixture.awaitGateEvent(settled)
+                XCTAssertNotEqual(outcome, "completed", "an aborted request must not return a completion")
+                XCTAssertNotEqual(outcome, "pending")
+
+                // No leaked process: the discovery provider is disposed exactly once even though its
+                // stream body is still parked behind the gate.
+                XCTAssertEqual(driver.disposed, 1)
+                XCTAssertEqual(observer.runTerminalCount, 1)
+                XCTAssertNil(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+
+                // No stale spinner: the tab's run/cancel/plan indicators are all clear.
+                XCTAssertFalse(session.agentRunState.isRunning)
+                XCTAssertFalse(session.isAgentBusy)
+                XCTAssertFalse(session.isCancelling)
+                XCTAssertFalse(session.isBackgroundPlanGenerating)
+
+                // No orphaned tool execution remains registered for the aborted run.
+                try await driver.fixture.perform("invoking run has no active MCP tool executions") {
+                    try await driver.window.mcpServer.awaitNoActiveToolExecutions(runID: invokingRunID)
+                }
+                XCTAssertEqual(driver.window.mcpServer.cancelActiveToolsForRun(runID: invokingRunID, reason: "idempotent"), 0)
+
+                // Late provider progress after the abort cannot resurrect anything.
+                gate.release()
+                await request.value
+                try await driver.assertReleased(runID: nestedRunID)
+                try await driver.assertLeaseFailedExactlyOnce(runID: nestedRunID)
+                // Teardown joins asynchronously after the aborted reply settles; it must complete exactly once.
+                XCTAssertEqual(observer.teardownCount, 1)
+                XCTAssertEqual(driver.streamStarts, 1)
+                XCTAssertEqual(driver.disposed, 1)
+                XCTAssertNil(driver.committed, "an aborted discovery must not commit a routed result")
+                XCTAssertFalse(observer.description.contains("SENSITIVE_DISCOVERY_PROMPT"))
+            }
+        }
+    }
 #endif

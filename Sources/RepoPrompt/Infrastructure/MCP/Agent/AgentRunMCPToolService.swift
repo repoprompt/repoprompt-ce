@@ -2883,6 +2883,9 @@ struct AgentRunMCPToolService {
         let worktreeBindings = try worktreeBindings(from: object)
         let activeWorktreeMerges = try activeWorktreeMerges(from: object)
         let modelParameterSelections = try modelParameterSelections(from: agent)
+        let worktreeBindingState = object["worktree_binding_state"]?.stringValue
+            .flatMap(AgentRunMCPSnapshot.WorktreeBindingState.init(rawValue:))
+        let parentIsWorktreeBound = object["parent_worktree_bound"]?.boolValue
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
             runID: runID,
@@ -2903,7 +2906,9 @@ struct AgentRunMCPToolService {
             parentSessionID: parentSessionID,
             failureReason: failureReason,
             worktreeBindings: worktreeBindings,
-            appActiveWorktreeMerges: activeWorktreeMerges
+            appActiveWorktreeMerges: activeWorktreeMerges,
+            worktreeBindingState: worktreeBindingState,
+            parentIsWorktreeBound: parentIsWorktreeBound
         )
     }
 

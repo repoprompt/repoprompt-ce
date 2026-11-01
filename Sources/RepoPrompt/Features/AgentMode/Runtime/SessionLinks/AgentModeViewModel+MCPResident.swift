@@ -185,7 +185,8 @@ extension AgentModeViewModel {
             },
             // Availability is not published in resident memory; do not stat paths or invent it.
             worktreeBindings: [],
-            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            worktreeBindingState: .unknown
         )
     }
 

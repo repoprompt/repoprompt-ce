@@ -50,6 +50,17 @@ Status previews, queued jobs, interrupted jobs, and no-match test runs are not p
 
 Explicit conflict/approval gates remain binding even when source review or a rerun looks good. If told not to approve on conflict, post no approval while conflict remains; report it and seek authorized resolution. Use only operations actually advertised for this caller. Do not invent pin tools or use a tool's visibility as authority.
 
+## Child run responses: report, not transcript
+
+`agent_run` `start`/`poll`/`wait`/`steer` return a snapshot of the child, never its raw tool output. The contract is owned by `DomainAgentRunSnapshot.asObject()` in [DomainAgentSessionModels.swift](../../Sources/RepoPromptDomainRuntime/DomainAgentSessionModels.swift):
+
+- `status`, `status_text`, `failure_reason`, `interaction`/`interaction_id`, `session`, `agent`, `run_id`, `transcript_item_count`, `updated_at`.
+- `assistant_text`: the child's last assistant reply only (active runs: the current turn; terminal runs: the trailing response). It is capped at `assistantTextCharacterLimit` (16,000 characters). Longer replies are cut at the cap, suffixed with a truncation marker, and flagged with `assistant_text_truncated: true` plus `assistant_text_characters` (the original length). Raw transcript and tool detail stay reachable only through explicit operations (`agent_manage get_log`, `extract_handoff`).
+- `worktree_binding_state`: `bound`, `unbound`, or `unknown`. A bound child also carries `worktree` (first binding) and `worktree_bindings`; an unbound child publishes `worktree: null` and `worktree_bindings: []` explicitly rather than omitting the keys. `unknown` is reserved for projections that intentionally do not publish bindings (resident snapshots) and is never inferred from an empty list.
+- `parent_worktree_bound` and `worktree_binding_warning`: when a child was started from a worktree-bound parent but is itself unbound (for example `inherit_worktree=false` without explicit `worktree` arguments), the snapshot says so. Such a child reads the logical root checkout, not the parent's task worktree, so task-aware inspection can observe base/stale state.
+
+A structured outcome/findings/changed-files report schema is not part of this contract; a supervisor that needs more than the final reply must read the transcript explicitly.
+
 ## Validation and limits
 
 Regression checks cover emitted oversight guidance and its re-owed inventory revision, all three orchestrate variants, unchanged restricted capability rows, catalog migration convergence/budget, and the existing distinct escaped send/steer envelopes. They prove emitted wording and preserved source fences—not model compliance or live recovery success.

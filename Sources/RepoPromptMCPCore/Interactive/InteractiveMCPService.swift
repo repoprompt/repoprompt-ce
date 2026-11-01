@@ -101,6 +101,19 @@ package actor InteractiveMCPService: Service {
 
             """, stderr)
 
+        case let .bootstrapSocketUnavailable(errno):
+            fputs("""
+            \u{001B}[31mError: RepoPrompt's MCP socket is not accepting connections (retryable)\u{001B}[0m
+
+            The MCP bootstrap directory exists but its socket \(errno == ENOENT ? "is missing" : "refused the connection") (errno \(errno)).
+            This usually means RepoPrompt is restarting its MCP server; it is a transient reconnect window.
+
+            To fix:
+            1. Retry in a moment
+            2. If it persists, relaunch RepoPrompt.app
+
+            """, stderr)
+
         case .approvalDenied:
             fputs("""
             \u{001B}[31mError: Connection approval denied\u{001B}[0m
