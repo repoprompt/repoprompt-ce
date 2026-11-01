@@ -4529,6 +4529,9 @@ final class CodexNativeSessionController {
             // Null is valid; missing metadata or scope is not a decoded notification.
             turnScope(threadID: params["threadId"] as? String, turnID: params["turnId"] as? String) != nil
                 && params["metadata"] != nil ? .protocolMetadata : nil
+        case "thread/name/updated":
+            nonEmptyString(params["threadId"] as? String) != nil
+                && (params["threadName"] == nil || params["threadName"] is NSNull || params["threadName"] is String) ? .protocolMetadata : nil
         case "thread/settings/updated":
             nonEmptyString(params["threadId"] as? String) != nil
                 && isThreadSettingsMetadata(params["threadSettings"]) ? .protocolMetadata : nil

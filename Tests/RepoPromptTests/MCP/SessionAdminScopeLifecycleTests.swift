@@ -6,6 +6,159 @@ import RepoPromptPersistence
 import RepoPromptVCS
 import XCTest
 
+@MainActor
+final class DelegationScopeExpiryTests: XCTestCase {
+    /// Deliberately cancellation-insensitive to exercise the generation fence as well as cancellation.
+    private final class Sleeper {
+        var waits: [(TimeInterval, CheckedContinuation<Void, Never>)] = []
+        var onSleep: (() -> Void)?
+
+        func sleep(_ delay: TimeInterval) async {
+            await withCheckedContinuation { continuation in
+                waits.append((delay, continuation))
+                onSleep?()
+            }
+        }
+
+        func resumeFirst() {
+            waits.removeFirst().1.resume()
+        }
+
+        func finish() {
+            let remaining = waits
+            waits = []
+            for wait in remaining {
+                wait.1.resume()
+            }
+        }
+    }
+
+    private func grant(_ runtime: DelegationScopeRuntime, to session: UUID, seconds: Int?) throws -> DomainDelegationScopeRecord {
+        let request = try runtime.requestScope(
+            requesterSessionID: session, requesterTabID: nil, kind: .tree(rootSessionID: session),
+            capabilities: [.observe, .spawn], guardrails: .init(), expiresInSeconds: seconds,
+            reason: nil, idempotencyKey: nil
+        ).get()
+        return try runtime.approve(requestID: request.id).get()
+    }
+
+    func testDeadlineExpiresParentAndChildWithoutQueriesAndNotifiesEachOnce() async throws {
+        var now = Date(timeIntervalSince1970: 2_000_000)
+        let sleeper = Sleeper()
+        let armed = expectation(description: "earliest expiry armed")
+        sleeper.onSleep = { armed.fulfill() }
+        let runtime = DelegationScopeRuntime(
+            persistenceMode: .ephemeral, now: { now }, sleepForExpiry: { await sleeper.sleep($0) }, notifyCatalogChanged: { _ in }
+        )
+        defer { runtime.freezeForTermination()
+            sleeper.finish()
+        }
+        let parentSession = UUID(), childSession = UUID()
+        let parent = try grant(runtime, to: parentSession, seconds: 60)
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(parentSession, parent: nil)
+        provenance.add(childSession, parent: parentSession)
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let proof = try XCTUnwrap(projector.membershipProof(for: childSession, in: parent.grant))
+        let child = try runtime.attenuate(
+            parentScopeID: parent.id, presentedGeneration: parent.generation, caller: .agentSession(parentSession),
+            newGranteeSessionID: childSession, newGranteeMemberships: [proof], capabilities: [.observe], guardrails: parent.grant.guardrails
+        ).get()
+        let expired = expectation(description: "both grantees receive expiry")
+        expired.expectedFulfillmentCount = 2
+        var recipients: [UUID] = []
+        runtime.test_scopeDecision = { session, text in
+            XCTAssertTrue(text.contains("decision: expired"))
+            XCTAssertTrue(text.contains("grants no authority or new task"))
+            recipients.append(session)
+            expired.fulfill()
+        }
+        await fulfillment(of: [armed], timeout: 2)
+        XCTAssertEqual(sleeper.waits.map(\.0), [60])
+        // A delayed deadline sweeps all overdue scopes, not just the one used to arm it.
+        now = now.addingTimeInterval(90)
+        sleeper.resumeFirst()
+        await fulfillment(of: [expired], timeout: 2)
+        XCTAssertEqual(Set(recipients), [parentSession, childSession])
+        XCTAssertEqual(runtime.record(id: parent.id)?.state, .expired)
+        XCTAssertEqual(runtime.record(id: child.id)?.state, .expired)
+        _ = runtime.liveScopes(grantedTo: parentSession)
+        XCTAssertEqual(recipients.count, 2, "query fallback cannot duplicate timer notices")
+        XCTAssertTrue(sleeper.waits.isEmpty)
+    }
+
+    func testRevokingEarliestRearmsAndStaleSleeperCannotExpireSuccessor() async throws {
+        var now = Date(timeIntervalSince1970: 2_000_000)
+        let sleeper = Sleeper()
+        let firstArmed = expectation(description: "first deadline armed")
+        let secondArmed = expectation(description: "replacement deadline armed")
+        var sleeps = 0
+        sleeper.onSleep = {
+            sleeps += 1
+            (sleeps == 1 ? firstArmed : secondArmed).fulfill()
+        }
+        let returned = expectation(description: "cancelled sleeper returned")
+        let runtime = DelegationScopeRuntime(
+            persistenceMode: .ephemeral, now: { now }, sleepForExpiry: {
+                await sleeper.sleep($0)
+                if Task.isCancelled { returned.fulfill() }
+            }, notifyCatalogChanged: { _ in }
+        )
+        defer { runtime.freezeForTermination()
+            sleeper.finish()
+        }
+        let first = try grant(runtime, to: UUID(), seconds: 60)
+        let second = try grant(runtime, to: UUID(), seconds: 120)
+        await fulfillment(of: [firstArmed], timeout: 2)
+        runtime.revoke(scopeID: first.id)
+        await fulfillment(of: [secondArmed], timeout: 2)
+        XCTAssertEqual(sleeper.waits.map(\.0), [60, 120])
+        var notices: [String] = []
+        let expired = expectation(description: "surviving scope expires")
+        runtime.test_scopeDecision = { _, text in notices.append(text)
+            expired.fulfill()
+        }
+        now = now.addingTimeInterval(60)
+        sleeper.resumeFirst()
+        await fulfillment(of: [returned], timeout: 2)
+        XCTAssertTrue(notices.isEmpty)
+        XCTAssertEqual(runtime.record(id: second.id)?.state, .active)
+        now = now.addingTimeInterval(60)
+        sleeper.resumeFirst()
+        await fulfillment(of: [expired], timeout: 2)
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertTrue(notices[0].contains(second.id.uuidString))
+        XCTAssertEqual(runtime.record(id: second.id)?.state, .expired)
+    }
+
+    func testTerminationCancelsExpiryAndUnlimitedScopeArmsNothing() async throws {
+        var now = Date(timeIntervalSince1970: 2_000_000)
+        let sleeper = Sleeper()
+        let armed = expectation(description: "finite scope armed")
+        sleeper.onSleep = { armed.fulfill() }
+        let returned = expectation(description: "termination sleeper returned")
+        let runtime = DelegationScopeRuntime(
+            persistenceMode: .ephemeral, now: { now }, sleepForExpiry: {
+                await sleeper.sleep($0)
+                returned.fulfill()
+            }, notifyCatalogChanged: { _ in }
+        )
+        defer { sleeper.finish() }
+        _ = try grant(runtime, to: UUID(), seconds: nil)
+        XCTAssertTrue(sleeper.waits.isEmpty)
+        _ = try grant(runtime, to: UUID(), seconds: 60)
+        await fulfillment(of: [armed], timeout: 2)
+        var decisions = 0
+        runtime.test_scopeDecision = { _, _ in decisions += 1 }
+        runtime.freezeForTermination()
+        now = now.addingTimeInterval(120)
+        sleeper.resumeFirst()
+        await fulfillment(of: [returned], timeout: 2)
+        XCTAssertEqual(decisions, 0)
+        XCTAssertTrue(sleeper.waits.isEmpty)
+    }
+}
+
 /// Deterministic failure injection before a real SQLite transaction.
 private final class DelegationScopeFileWriteGate: @unchecked Sendable {
     private let lock = NSLock()
@@ -2968,6 +3121,33 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(fixture.structure.lastAuthorization?(), false, "a revoked scope cannot commit a late model change")
     }
 
+    func testForkDepthUsesCallerPlacementRatherThanTranscriptSource() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), source = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(source, parent: caller)
+        try fixture.grant(caller, guardrails: .init(maxDepth: 1))
+        let reply = try await fixture.value(.adminFork, caller: caller, targets: [source], key: "depth-one")
+        XCTAssertEqual(reply["result"], .string("forked"))
+        XCTAssertEqual(fixture.structure.forkCalls, [source])
+        XCTAssertEqual(fixture.provenance.sessions[fixture.structure.nextFork]?.effectiveOrganizationalParentID, caller)
+
+        let tooDeep = Fixture()
+        let ancestor = UUID()
+        tooDeep.provenance.add(ancestor, parent: nil)
+        tooDeep.provenance.add(caller, parent: ancestor)
+        tooDeep.provenance.add(source, parent: caller)
+        let parent = try tooDeep.grant(ancestor, guardrails: .init(maxDepth: 1))
+        let proof = try XCTUnwrap(tooDeep.projector.membershipProof(for: caller, in: parent.grant))
+        _ = try tooDeep.runtime.attenuate(
+            parentScopeID: parent.id, presentedGeneration: parent.generation, caller: .agentSession(ancestor),
+            newGranteeSessionID: caller, newGranteeMemberships: [proof], capabilities: [.spawn], guardrails: parent.grant.guardrails
+        ).get()
+        let refused = try await tooDeep.value(.adminFork, caller: caller, targets: [source], key: "depth-two")
+        XCTAssertEqual(refused["guardrail"], .string("max_depth"))
+        XCTAssertTrue(tooDeep.structure.forkCalls.isEmpty)
+    }
+
     func testForkIsIdempotentJoinsTheScopeAndHonorsGuardrails() async throws {
         let fixture = Fixture()
         let overseer = UUID(), a = UUID(), b = UUID()
@@ -3512,6 +3692,112 @@ final class SessionAdminStructureTests: XCTestCase {
         await fixture.worktreeHandler.settleDeferredBinds()
         XCTAssertEqual(fixture.worktreeHandler.deferredOutcomes[revokedTarget], .revoked)
         XCTAssertEqual(fixture.worktrees.bindCalls.count, 1, "a revoked scope never applies a queued bind")
+    }
+
+    func testWorktreeReleaseRefusesBindingsChangedSinceCardOrInsideTransition() async throws {
+        for duringTransition in [false, true] {
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            try fixture.grant(caller)
+            fixture.worktrees.bound[target] = [WorktreeHost.summary("approved")]
+            guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-stale"
+            ) else { return XCTFail("missing card") }
+            XCTAssertEqual(card.items.first?.worktreeIDs, ["approved"])
+            _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+            if duringTransition {
+                fixture.worktrees.beforeWrite = { fixture.worktrees.bound[target] = [WorktreeHost.summary("replacement")] }
+            } else {
+                fixture.worktrees.bound[target] = [WorktreeHost.summary("replacement")]
+            }
+            let reply = try await fixture.value(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-stale", confirmation: card.id
+            )
+            XCTAssertTrue(codes(reply).contains("worktree_binding_changed"))
+            XCTAssertTrue(fixture.worktrees.unbindCalls.isEmpty)
+            XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["replacement"])
+            XCTAssertNil(fixture.ownership.record(worktreeID: "replacement")?.releasedAt)
+            XCTAssertNil(fixture.ownership.record(worktreeID: "approved")?.releasedAt)
+            XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .approved)
+        }
+    }
+
+    func testWorktreeReleaseKeepsOriginalApprovalForLaterBatchItems() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), first = UUID(), second = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(first, parent: caller)
+        fixture.provenance.add(second, parent: caller)
+        try fixture.grant(caller)
+        fixture.worktrees.bound[first] = [WorktreeHost.summary("first")]
+        fixture.worktrees.bound[second] = [WorktreeHost.summary("second-approved")]
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminWorktreeRelease, caller: caller, targets: [first, second], key: "release-batch"
+        ) else { return XCTFail("missing card") }
+        _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+        fixture.worktrees.beforeWrite = { fixture.worktrees.bound[second] = [WorktreeHost.summary("second-replacement")] }
+        let reply = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [first, second], key: "release-batch", confirmation: card.id
+        )
+        XCTAssertEqual(fixture.worktrees.unbindCalls, [first])
+        XCTAssertEqual(items(reply)[second.uuidString]?["code"], .string("worktree_binding_changed"))
+        XCTAssertNotNil(fixture.ownership.record(worktreeID: "first")?.releasedAt)
+        XCTAssertNil(fixture.ownership.record(worktreeID: "second-replacement")?.releasedAt)
+        XCTAssertEqual(fixture.worktrees.bound[second]?.map(\.worktreeID), ["second-replacement"])
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .consumed, "The committed first item makes this approval single-use")
+    }
+
+    func testWorktreeReleaseCardShowsAndReleasesOnlyExplicitSelection() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("selected"), WorktreeHost.summary("not-selected")]
+        let args: [String: Value] = ["worktree_id": .string("selected")]
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminWorktreeRelease, caller: caller, targets: [target], args: args, key: "release-selected"
+        ) else { return XCTFail("missing card") }
+        XCTAssertEqual(card.items.first?.worktreeIDs, ["selected"])
+        XCTAssertFalse(card.items.first?.effect.contains("not-selected") ?? true)
+        _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("selected"), WorktreeHost.summary("new-unselected")]
+        let reply = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [target], args: args, key: "release-selected", confirmation: card.id
+        )
+        XCTAssertEqual(items(reply)[target.uuidString]?["result"], .string("released"))
+        XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["new-unselected"])
+        XCTAssertNotNil(fixture.ownership.record(worktreeID: "selected")?.releasedAt)
+        XCTAssertNil(fixture.ownership.record(worktreeID: "new-unselected")?.releasedAt)
+    }
+
+    func testWhollyRefusedWorktreeReleaseKeepsApprovalForIdleRetry() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("approved")]
+        fixture.worktrees.idle[target] = false
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminWorktreeRelease, caller: caller, targets: [target], key: "release-busy"
+        ) else { return XCTFail("missing card") }
+        _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+        let refused = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [target], key: "release-busy", confirmation: card.id
+        )
+        XCTAssertEqual(refused["result"], .string("not_applied"))
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .approved)
+        XCTAssertTrue(fixture.worktrees.unbindCalls.isEmpty)
+        fixture.worktrees.idle[target] = true
+        let retry = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [target], key: "release-busy", confirmation: card.id
+        )
+        XCTAssertEqual(retry["result"], .string("applied"))
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .consumed)
+        XCTAssertEqual(fixture.worktrees.unbindCalls, [target])
     }
 
     func testWorktreeReleaseIsAlwaysCardedUnbindsAndMarksStale() async throws {
@@ -4984,6 +5270,28 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(undone["result"], .string("undone"))
         XCTAssertEqual(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace), [a, x, b])
         XCTAssertFalse(fixture.organizer.written.contains(x), "undo never writes the outsider either")
+    }
+
+    func testReorderGroupsRefusesRankCollisionWithUnnamedGroupWithoutWrites() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "A")
+        let b = fixture.outsider("B")
+        let z = fixture.member("Z", group: "Z")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 0
+        fixture.organizer.states[b]?.sidebarGroup = "B"
+        fixture.organizer.states[b]?.sidebarGroupOrder = 0
+        fixture.organizer.states[z]?.sidebarGroupOrder = 1
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Z"), .string("A")]), "expected_order": .array([.string("A"), .string("Z")])
+        ])
+        XCTAssertEqual(reply["code"], .string("group_rank_collision"))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroupOrder, 0)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0)
+        XCTAssertEqual(fixture.organizer.states[z]?.sidebarGroupOrder, 1)
+        XCTAssertNil(reply["undo_token"])
     }
 
     func testReorderGroupsCASOverEveryMemberOfTheNamedGroups() async throws {
