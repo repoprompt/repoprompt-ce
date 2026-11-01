@@ -398,6 +398,9 @@ struct AgentManageMCPToolService {
                 isMCPOriginated: meta.isMCPOriginated,
                 modelParameterSelections: meta.acpModelParameterSelections
             )
+            if let revision = meta.titleMetadata?.revision {
+                entriesByID[meta.id]?["title_revision"] = .string(String(revision))
+            }
         }
 
         for entry in agentModeVM.sessionIndex.values {
@@ -414,6 +417,9 @@ struct AgentManageMCPToolService {
                 isMCPOriginated: entry.isMCPOriginated,
                 modelParameterSelections: entry.acpModelParameterSelections
             )
+            if let revision = entry.titleMetadata?.revision {
+                entriesByID[entry.id]?["title_revision"] = .string(String(revision))
+            }
         }
 
         for session in agentModeVM.sessions.values {
@@ -435,6 +441,13 @@ struct AgentManageMCPToolService {
                 isMCPOriginated: session.isMCPOriginated,
                 modelParameterSelections: session.acpModelParameterSelections
             )
+            if let revision = session.titleMetadata?.revision {
+                entriesByID[activeSessionID]?["title_revision"] = .string(String(revision))
+                entriesByID[activeSessionID]?["title_persistence_state"] = .string(session.titlePersistenceState)
+            }
+            if let task = session.activeTask, session.runState.isActive {
+                entriesByID[activeSessionID]?["active_task"] = .string(task)
+            }
         }
 
         // Agent-origin discovery is filtered to the caller's direct children so an unrelated sibling

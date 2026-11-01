@@ -4557,7 +4557,8 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             group: String? = nil, archived: Bool = false, run: DomainDelegationScopeTargetState = .idle
         ) {
             states[id] = AgentSessionOrganizeState(
-                sessionID: id, workspaceID: workspace, tabID: UUID(), name: name, isArchived: archived,
+                sessionID: id, workspaceID: workspace, tabID: UUID(), name: name,
+                titleMetadata: try? AgentSessionTitlePolicy.apply(.startupProposal(name), to: nil, name: "Agent Session"), isArchived: archived,
                 isPinned: pinned, pinnedOrder: pinnedOrder, sidebarGroup: group, sidebarGroupOrder: group == nil ? nil : 0,
                 runState: run
             )
@@ -4585,8 +4586,30 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
             }
         }
 
+        func commitTitle(
+            _ sessionID: UUID,
+            command: AgentSessionTitleCommand,
+            expectedRevision: UInt64,
+            isAuthorized: @escaping @MainActor () -> Bool
+        ) async throws -> AgentSessionTitleSnapshot {
+            guard isAuthorized(), var state = states[sessionID], !state.isArchived else { throw AgentSessionTitleError.denied("mutation_rejected") }
+            guard state.titleMetadata?.revision ?? 0 == expectedRevision else { throw AgentSessionTitleError.conflict }
+            if let metadata = try AgentSessionTitlePolicy.apply(command, to: state.titleMetadata, name: state.name) {
+                state.titleMetadata = metadata
+                state.name = metadata.state?.displayName ?? state.name
+                states[sessionID] = state
+                written.append(sessionID)
+            }
+            return .init(metadata: state.titleMetadata, name: state.name, persistenceState: "not_needed")
+        }
+
         func rename(_ sessionID: UUID, to name: String) -> Bool {
-            states[sessionID]?.name = name
+            guard var state = states[sessionID] else { return false }
+            if let metadata = try? AgentSessionTitlePolicy.apply(.humanRename(name), to: state.titleMetadata, name: state.name) {
+                state.titleMetadata = metadata
+                state.name = metadata.state?.displayName ?? name
+            }
+            states[sessionID] = state
             return true
         }
 
@@ -4939,7 +4962,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         ]
         let first = try await fixture.call(args)
         XCTAssertEqual(items(first)[a.uuidString], "changed")
-        fixture.organizer.states[a]?.name = "Changed by user"
+        _ = fixture.organizer.rename(a, to: "Changed by user")
         let replay = try await fixture.call(args)
         XCTAssertEqual(replay["idempotent_replay"], .bool(true))
         XCTAssertEqual(replay["undo_token"], first["undo_token"])
@@ -5617,7 +5640,7 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         // One user edit after the original operation must not hide the other target's undo.
         let renamedAgain = try await fixture.call(["op": .string("rename"), "targets": ids([a, b]), "name": .string("Again")])
         let partialToken = try XCTUnwrap(renamedAgain["undo_token"]?.stringValue)
-        fixture.organizer.states[b]?.name = "User title"
+        _ = fixture.organizer.rename(b, to: "User title")
         let partialUndo = try await fixture.call(["op": .string("undo"), "undo_token": .string(partialToken)])
         XCTAssertEqual(partialUndo["result"], .string("partially_undone"))
         XCTAssertEqual(partialUndo["changed_count"], .int(1))

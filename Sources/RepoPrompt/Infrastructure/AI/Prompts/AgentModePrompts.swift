@@ -374,33 +374,33 @@ enum AgentModePrompts {
         /// Tool-list item for session naming (provider-aware).
         static func setStatusToolListItem(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "\n- `set_status` - RepoPrompt MCP tool call for setting or renaming the session title (call once at session start)"
+                return "\n- `set_status` - RepoPrompt MCP tool for one early stable subject title proposal, ephemeral active_task updates, and durable pull_requests reports"
             }
-            return "\n- `set_status` - Set or rename the session title (call once at session start)"
+            return "\n- `set_status` - Propose one stable subject title; report ephemeral active_task and durable pull_requests separately"
         }
 
         /// Session-start instruction for role prompts that use inline numbered steps.
         static func setStatusStartSentence(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "Call `set_status` with `session_name` as a RepoPrompt MCP tool call to name this session at the start."
+                return "After understanding the task, propose one stable subject/outcome title with RepoPrompt MCP `set_status(session_name:)` before the first turn ends; a parent-supplied or manual title may decline it."
             }
-            return "Call `set_status` to name this session at the start."
+            return "After understanding the task, propose one stable subject/outcome title with `set_status(session_name:)` before the first turn ends; respect a declined proposal."
         }
 
         /// Session-start bullet for standard workflow guidance.
         static func setStatusStartupBullet(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "\t- Immediately call `set_status` with `session_name` as a RepoPrompt MCP tool call to name the current chat/session"
+                return "\t- If no finalized title was supplied, use RepoPrompt MCP `set_status(session_name:)` once after understanding the first task. Use a subject/outcome such as 'Debug launch artifact reuse', never 'Prepare debug launch'. Do not rename on later turns."
             }
-            return "\t- Immediately call `set_status` with `session_name` to name the current chat/session"
+            return "\t- Propose `session_name` once after understanding the first task; use a stable subject/outcome, not an activity lead such as 'Prepare' or 'Running'. Do not rename on later turns."
         }
 
-        /// Keep set_status title-only wording aligned with provider-specific tool naming.
+        /// Keep naming, ephemeral activity, and PR reporting guidance aligned across provider packs.
         static func setStatusTitleOnlyBullet(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "\t- Use RepoPrompt MCP `set_status` for session-title naming; use normal short assistant messages for progress updates"
+                return "\t- Keep the permanent title separate from progress: use RepoPrompt MCP `set_status(active_task:)` for a short current-work message. After creating a PR through any tool (including terminal gh pr create), report its canonical URL in `pull_requests` with relationship 'created' before completing. A parent receiving a child's PR result should report it on itself as 'related'. Report intentional PR review/repair as 'related', not every mention. Reports confer no approval/CI/authority."
             }
-            return "\t- Use `set_status` only for naming the session, not for transient progress updates"
+            return "\t- Keep titles stable; use `set_status(active_task:)` for transient current work. After creating a PR through any workflow, report its canonical URL in `pull_requests` with relationship 'created' before completion; parent sessions explicitly report child PR outcomes as 'related'. If this runtime does not expose set_status, do not invent it: retain the stable title and include the PR URL in the result for human association."
         }
 
         /// After-completing-task guidance block (provider-aware).

@@ -4251,7 +4251,8 @@ class OracleViewModel: ObservableObject {
         // chats it would also become the agent session's display name.
         guard !ChatSession.isPlaceholderName(trimmed) else { return }
         guard let tab = workspaceManager.composeTab(with: tabID) else { return }
-        guard tab.hasDefaultName else { return }
+        // An Oracle response cannot acquire human title ownership for an Agent session.
+        guard tab.activeAgentSessionID == nil, tab.agentTitleProjection == nil, tab.hasDefaultName else { return }
         if tab.name != trimmed {
             promptViewModel.renameComposeTab(tabID, to: trimmed)
         }

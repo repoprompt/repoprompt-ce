@@ -616,7 +616,7 @@ final class CodexCLIProvider: AIProvider {
                         await controller.cancelCurrentTurn()
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server requested permissions approval while interactive chat tools are disabled.")
 
-                    case .toolCall, .toolResult, .commandExecutionRunning:
+                    case .toolCall, .toolResult, .commandExecutionRunning, .nativeCommandCompleted:
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server emitted tool events while interactive chat tools are disabled.")
 
                     case .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:
@@ -792,7 +792,7 @@ final class CodexCLIProvider: AIProvider {
                         await controller.cancelCurrentTurn()
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server requested permissions approval while interactive chat tools are disabled.")
 
-                    case .toolCall, .toolResult, .commandExecutionRunning:
+                    case .toolCall, .toolResult, .commandExecutionRunning, .nativeCommandCompleted:
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server emitted tool events while interactive chat tools are disabled.")
 
                     case .reasoningDelta, .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:

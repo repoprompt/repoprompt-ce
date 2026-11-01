@@ -7,6 +7,8 @@ struct AgentChatOptionsMenuTarget: Equatable {
     let tabID: UUID
     let agentSessionID: UUID
     let tabName: String
+    var titleRevision: UInt64?
+    var titleBindingToken: AgentSessionRestorationBindingToken?
 }
 
 enum AgentSessionHandoffPrompt {
@@ -110,13 +112,14 @@ struct AgentChatOptionsMenuActions {
     let copyHandoffPrompt: (AgentChatOptionsMenuTarget) -> Void
     let copySessionID: (AgentSessionCopyIDTarget) -> Void
     let delete: (AgentChatOptionsMenuTarget) -> Void
+    var managePullRequests: ((AgentChatOptionsMenuTarget) -> Void)?
 }
 
 private final class AgentChatOptionsMenuItem: NSMenuItem {
     private let handler: () -> Void
 
     @MainActor
-    init(title: String, symbolName: String, shortcutName: KeyboardShortcuts.Name, handler: @escaping () -> Void) {
+    init(title: String, symbolName: String, shortcutName: KeyboardShortcuts.Name? = nil, handler: @escaping () -> Void) {
         self.handler = handler
         super.init(title: title, action: #selector(performHandler(_:)), keyEquivalent: "")
         target = self
@@ -126,7 +129,7 @@ private final class AgentChatOptionsMenuItem: NSMenuItem {
         // never part of `NSApp.mainMenu`, the only menu the recorder scans for conflicts, so it
         // reserves no keys. While the menu tracks, KeyboardShortcuts' event-tracking monitor
         // consumes registered shortcuts first, so a press still dispatches exactly once.
-        setShortcut(KeyboardShortcuts.getShortcut(for: shortcutName))
+        if let shortcutName { setShortcut(KeyboardShortcuts.getShortcut(for: shortcutName)) }
     }
 
     @available(*, unavailable)
@@ -180,6 +183,9 @@ enum AgentChatOptionsMenuPresenter {
                 shortcutName: .copyAgentSessionID,
                 handler: { actions.copySessionID(copySessionIDTarget) }
             ))
+        }
+        if let manage = actions.managePullRequests {
+            menu.addItem(AgentChatOptionsMenuItem(title: "Manage pull request associations…", symbolName: "link", handler: { manage(target) }))
         }
         menu.addItem(.separator())
         menu.addItem(AgentChatOptionsMenuItem(

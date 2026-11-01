@@ -1690,6 +1690,8 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// routing/binding indexes remain valid without an unrelated-carrier traversal.
     struct ComposeTabPresentation: Equatable {
         let id: UUID
+        let activeAgentSessionID: UUID?
+        var agentTitleProjection: AgentSessionTitleProjection?
         var name: String
         var lastModified: Date
         var isPinned: Bool
@@ -1699,6 +1701,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         init(_ tab: ComposeTabState) {
             id = tab.id
+            activeAgentSessionID = tab.activeAgentSessionID
+            agentTitleProjection = tab.agentTitleProjection
             name = tab.name
             lastModified = tab.lastModified
             isPinned = tab.isPinned
@@ -1709,6 +1713,7 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         func apply(to tab: inout ComposeTabState) {
             tab.name = name
+            tab.agentTitleProjection = agentTitleProjection
             tab.lastModified = lastModified
             tab.isPinned = isPinned
             tab.pinnedOrder = pinnedOrder

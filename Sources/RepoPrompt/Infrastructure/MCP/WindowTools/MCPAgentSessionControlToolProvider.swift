@@ -108,14 +108,19 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
             name: MCPWindowToolName.setStatus,
             freshnessPolicy: .none,
             description: """
-            Rename the current agent session/tab.
+            Propose one stable subject/outcome title, report current activity, or associate pull requests.
 
-            Use this tool near session start to set a helpful session title.
+            session_name is only an early naming proposal and may be declined; manual titles are protected. Do not rename at each work step. Use active_task for transient progress. After creating a PR through any workflow, report its canonical URL with relationship=created; intentional PR review/repair may report relationship=related. Reports are local assertions, not remote verification. Missing fields are no-ops; empty active_task clears activity. PR removal requires an explicit correction.
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
                 properties: [
-                    "session_name": .string(description: "Optional session/tab title to set for the active session tab.")
+                    "session_name": .string(description: "One early stable subject/outcome title proposal; not progress text. May be declined."),
+                    "active_task": .string(description: "Ephemeral current work message, max 120 characters; empty clears it."),
+                    "pull_requests": .array(description: "Canonical PR URLs intentionally created/related by this session. Additive, never removes associations.", items: .object(properties: [
+                        "url": .string(description: "Canonical HTTPS pull request URL."),
+                        "relationship": .string(description: "created or related.", enum: ["created", "related"])
+                    ], required: ["url", "relationship"]))
                 ],
                 required: []
             )
@@ -208,24 +213,29 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
         let targetWindow = try dependencies.requireTargetWindow()
         let target = try await dependencies.resolveAgentModeTabID(args, connectionID, .setStatus)
 
-        // Invariant: background status updates are tab-scoped and must not steal tab focus.
-        try await MainActor.run {
-            if let sessionNameToApply {
-                try targetWindow.agentModeViewModel.renameSession(
-                    target: target,
-                    to: sessionNameToApply
-                )
+        for key in ["session_name", "active_task"] where args[key] != nil && args[key]?.stringValue == nil {
+            throw MCPError.invalidParams("\(key) must be a string.")
+        }
+        var reports: [AgentSessionPullRequestAssociation] = []
+        if let raw = args["pull_requests"] {
+            guard let entries = raw.arrayValue, entries.count <= 64 else { throw MCPError.invalidParams("pull_requests must be an array of at most 64 reports.") }
+            for entry in entries {
+                guard let object = entry.objectValue, let url = object["url"]?.stringValue,
+                      let relationship = object["relationship"]?.stringValue
+                else {
+                    throw MCPError.invalidParams("Each PR report requires url and relationship.")
+                }
+                do { try reports.append(AgentSessionPullRequestEvidence.report(url: url, relationship: relationship, trustedHosts: targetWindow.agentModeViewModel.trustedPullRequestHosts)) }
+                catch { throw MCPError.invalidParams(error.localizedDescription) }
             }
         }
-
-        var result: [String: Value] = [
-            "ok": .bool(true),
-            "context_id": .string(target.tabID.uuidString),
-            "session_name_applied": .bool(sessionNameToApply != nil)
-        ]
-        if let sessionNameToApply {
-            result["session_name"] = .string(sessionNameToApply)
-        }
+        // Background updates remain caller/session scoped and never select a tab.
+        var result = try await targetWindow.agentModeViewModel.updateSessionStatus(
+            target: target, sessionName: sessionNameToApply, activeTask: args["active_task"]?.stringValue, pullRequests: reports
+        )
+        result["ok"] = .bool(true)
+        result["context_id"] = .string(target.tabID.uuidString)
+        if args["pull_requests"] != nil, reports.isEmpty { result["pull_requests_applied"] = .bool(false) }
         return .object(result)
     }
 

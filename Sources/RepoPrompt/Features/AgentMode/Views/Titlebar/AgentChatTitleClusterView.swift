@@ -5,6 +5,7 @@ import SwiftUI
 final class AgentChatTitleClusterModel: ObservableObject {
     struct State: Equatable {
         var title: String
+        var titleMetadata: AgentSessionTitleMetadata?
         var showsChatOptions: Bool
         /// Transient confirmation shown on the persistent title cluster.
         ///
@@ -20,9 +21,10 @@ final class AgentChatTitleClusterModel: ObservableObject {
         state = State(title: title, showsChatOptions: false, copiedNotice: nil)
     }
 
-    func update(title: String, showsChatOptions: Bool) {
+    func update(title: String, titleMetadata: AgentSessionTitleMetadata? = nil, showsChatOptions: Bool) {
         let nextState = State(
             title: title,
+            titleMetadata: titleMetadata,
             showsChatOptions: showsChatOptions,
             copiedNotice: state.copiedNotice
         )
@@ -51,7 +53,7 @@ struct AgentChatTitleClusterView: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            Text(model.state.title)
+            AgentSessionTitleLabel(title: model.state.title, metadata: model.state.titleMetadata)
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(1)
                 .truncationMode(.tail)

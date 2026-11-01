@@ -377,6 +377,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     private struct PendingCodexThreadNameSync {
+        let binding: AgentSessionRestorationBindingToken?
+        let titleRevision: UInt64?
         let tabID: UUID
         let name: String
         let explicitThreadID: String?
@@ -4956,6 +4958,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let explicitThreadID = trimmedThreadID?.isEmpty == false ? trimmedThreadID : nil
         let tabID = session.tabID
         pendingCodexThreadNameSyncByTabID[tabID] = PendingCodexThreadNameSync(
+            binding: session.currentRestorationBindingToken,
+            titleRevision: session.titleMetadata?.revision,
             tabID: tabID,
             name: validatedName,
             explicitThreadID: explicitThreadID,
@@ -4987,6 +4991,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard let pending = pendingCodexThreadNameSyncByTabID.removeValue(forKey: tabID) else { return }
             guard let session = weakSession,
                   session.selectedAgent == .codexExec,
+                  session.currentRestorationBindingToken == pending.binding,
+                  session.titleMetadata?.revision == pending.titleRevision || session.titleMetadata?.state?.displayName == pending.name,
                   let activeController = session.codexController,
                   Self.sameCodexControllerInstance(activeController, pending.controller)
             else {
@@ -10233,6 +10239,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] apply toolResult tool=\(toolName) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count) totalItems=\(session.items.count)")
             viewModel?.requestUIRefresh(tabID: session.tabID)
+        case let .nativeCommandCompleted(completion):
+            viewModel?.recordNativePullRequestCompletion(completion, session: session)
         case let .commandExecutionRunning(runningUpdate):
             guard session.runState.isActive
                 || shouldApplyCommandExecutionRunningUpdateToInactiveSession(runningUpdate, session: session)
@@ -11873,6 +11881,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case .toolCall: "toolCall"
             case .toolResult: "toolResult"
             case .commandExecutionRunning: "commandExecutionRunning"
+            case .nativeCommandCompleted: "nativeCommandCompleted"
             case .turnStarted: "turnStarted"
             case .turnCompleted: "turnCompleted"
             case .contextCompacted: "contextCompacted"
@@ -11912,6 +11921,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "toolCall tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil")"
         case let .toolResult(name, invocationID, _, resultJSON, isError, _):
             "toolResult tool=\(name) invocationID=\(invocationID?.uuidString ?? "nil") isError=\(isError.map(String.init(describing:)) ?? "nil") resultChars=\(resultJSON.count)"
+        case let .nativeCommandCompleted(completion):
+            "nativeCommandCompleted invocationID=\(completion.invocationID)"
         case let .commandExecutionRunning(update):
             "commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)"
         case let .turnStarted(turnID):
