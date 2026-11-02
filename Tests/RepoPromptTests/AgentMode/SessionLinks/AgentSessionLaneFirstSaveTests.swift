@@ -218,7 +218,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
                 requireTargetWindow: { fixture.window }, resolveRequestedTabID: { _ in nil },
                 resolveSpawnParentSourceTabID: { _ in nil }, resolveSpawnParentSessionID: { _, _ in creatorID },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
-                startRun: { target, _, _, viewModel, _, _, _, _, _, parent, _, _ in
+                startRun: { target, _, _, viewModel, _, _, _, _, _, parent, _, _, _ in
                     reachedStart = true
                     XCTAssertEqual(parent, creatorID)
                     XCTAssertEqual(viewModel.session(for: target.tabID).delegationScopeID, grant.id)
@@ -3409,7 +3409,7 @@ final class AgentSessionLaneFirstSaveTests: XCTestCase {
             requireTargetWindow: { fixture.window }, resolveRequestedTabID: { _ in requestedTabID },
             resolveSpawnParentSourceTabID: { _ in nil }, resolveSpawnParentSessionID: { _, _ in parentSessionID },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, viewModel, _, _, _, _, _, _, _, _ in
+            startRun: { target, _, _, viewModel, _, _, _, _, _, _, _, _, _ in
                 observation.reachedStarter = true
                 observation.targetTabID = target.tabID
                 observation.targetSessionID = target.sessionID

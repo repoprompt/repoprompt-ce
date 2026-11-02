@@ -1373,9 +1373,554 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
                 try await beforeHeartbeatOperation?()
                 return try await operation()
             },
-            startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
+            startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in
                 throw MCPError.internalError("startRun should not be used by steer resume tests")
             }
         )
+    }
+}
+
+@MainActor
+final class AgentRunStartBudgetTests: XCTestCase {
+    private actor Gate {
+        private var entered = false
+        private var released = false
+        private var entries: [CheckedContinuation<Void, Never>] = []
+        private var releases: [CheckedContinuation<Void, Never>] = []
+        func hold() async {
+            entered = true
+            entries.forEach { $0.resume() }
+            entries.removeAll()
+            if !released {
+                await withCheckedContinuation { releases.append($0) }
+            }
+        }
+
+        func waitUntilEntered() async {
+            if !entered {
+                await withCheckedContinuation { entries.append($0) }
+            }
+        }
+
+        func release() {
+            released = true
+            releases.forEach { $0.resume() }
+            releases.removeAll()
+        }
+    }
+
+    func testHeldSetupReturnsWithoutJoiningAndExternalCancellationPropagates() async throws {
+        let gate = Gate()
+        let finished = expectation(description: "late worker exits")
+        let expiry = AgentRunStartExpiry(toolName: "agent_run", budgetSeconds: 0.05)
+        let callerReturned = expectation(description: "setup caller returns while worker is held")
+        let start = ContinuousClock.now
+        let caller = Task {
+            defer { callerReturned.fulfill() }
+            let _: Int = try await AgentRunStartBudget.run(expiry: expiry) {
+                await gate.hold()
+                defer { finished.fulfill() }
+                try expiry.recordActivation(sessionID: UUID(), tabID: UUID())
+                XCTFail("Late activation must be fenced")
+                return 1
+            } onExpiry: { throw expiry.timeoutError }
+        }
+        await fulfillment(of: [callerReturned], timeout: 2)
+        let elapsed = start.duration(to: .now)
+        await gate.release()
+        do {
+            try await caller.value
+            XCTFail("Expected timeout")
+        } catch let error as AgentRunStartSetupTimeoutError {
+            XCTAssertEqual(error.description, "agent_run.start timed out after 0.05 seconds while preparing the session. No run was started and nothing was dispatched. Retry the start.")
+        }
+        XCTAssertLessThan(elapsed, .seconds(2))
+        XCTAssertTrue(expiry.expiredBeforeActivation)
+        await gate.release()
+        await fulfillment(of: [finished], timeout: 2)
+
+        let cancelledGate = Gate()
+        let cancelledWorker = expectation(description: "worker sees request cancellation")
+        let cancellationStage = expectation(description: "worker enters cancellation stage")
+        let cancellationReturned = expectation(description: "cancelled caller returns without joining")
+        let task = Task {
+            defer { cancellationReturned.fulfill() }
+            try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 60)) {
+                cancellationStage.fulfill()
+                await cancelledGate.hold()
+                XCTAssertTrue(Task.isCancelled)
+                cancelledWorker.fulfill()
+                return 1
+            } onExpiry: { 2 }
+        }
+        await fulfillment(of: [cancellationStage], timeout: 2)
+        task.cancel()
+        await fulfillment(of: [cancellationReturned], timeout: 2)
+        await cancelledGate.release()
+        do { _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch { XCTAssertTrue(error is CancellationError) }
+        await cancelledGate.release()
+        await fulfillment(of: [cancelledWorker], timeout: 2)
+    }
+
+    func testPreActivationExpiryVetoesRealStarterConfigurationAndDispatch() async throws {
+        let fixture = try await makeFixture()
+        let vm = fixture.window.agentModeViewModel
+        let gate = Gate()
+        let workerDone = expectation(description: "starter cleaned up")
+        var activationReached = false
+        vm.test_afterMCPControlActivation = { _ in activationReached = true
+            await gate.hold()
+        }
+        addTeardownBlock { @MainActor in vm.test_afterMCPControlActivation = nil
+            await fixture.cleanup()
+        }
+        addTeardownBlock { await gate.release() }
+        let target = try await vm.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: fixture.sessionID, createIfNeeded: false, sessionName: nil
+        )
+        let expiry = AgentRunStartExpiry(toolName: "agent_run", budgetSeconds: 5)
+        var dispatches = 0
+        let callerReturned = expectation(description: "preactivation caller returns before release")
+        let caller = Task {
+            defer { callerReturned.fulfill() }
+            let _: Int = try await AgentRunStartBudget.run(expiry: expiry) {
+                defer { workerDone.fulfill() }
+                _ = try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: target, message: "never dispatched", metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                    agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                    dispatchInstruction: { _, _, _, _, _ in dispatches += 1
+                        return .startedRun
+                    },
+                    startExpiry: expiry
+                )
+                return 1
+            } onExpiry: { throw expiry.timeoutError }
+        }
+        await fulfillment(of: [callerReturned], timeout: 6)
+        await gate.release()
+        do { try await caller.value
+            XCTFail("Expected timeout")
+        } catch { XCTAssertTrue(error is AgentRunStartSetupTimeoutError) }
+        XCTAssertTrue(activationReached, "Expiry must occur at the held activation boundary")
+        await gate.release()
+        await fulfillment(of: [workerDone], timeout: 3)
+        XCTAssertEqual(dispatches, 0)
+        XCTAssertNil(vm.mcpRegistration(sessionID: fixture.sessionID))
+
+        for mutationRace in 0 ..< 3 {
+            let cancelled = try await makeFixture()
+            let owner = cancelled.window.agentModeViewModel
+            let held = Gate()
+            let reached = expectation(description: "cancelled start reached mutation boundary")
+            let suspend: @MainActor () async -> Void = {
+                reached.fulfill()
+                await held.hold()
+            }
+            if mutationRace != 0 {
+                owner.test_beforeMCPSelectionCommit = suspend
+            } else {
+                owner.test_afterMCPControlActivation = { _ in await suspend() }
+            }
+            let originalAgent = cancelled.session.selectedAgent
+            let originalModel = cancelled.session.selectedModelRaw
+            let originalEffort = cancelled.session.selectedReasoningEffortRaw
+            XCTAssertNotEqual(originalEffort, "high", "Requested effort must expose an unintended configuration write")
+            let cancelledTarget = try await owner.mcpResolveOrCreateSessionTarget(
+                tabID: nil, sessionID: cancelled.sessionID, createIfNeeded: false, sessionName: nil
+            )
+            var cancelledDispatches = 0
+            let start = Task {
+                try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: cancelledTarget, message: "cancel before configuration",
+                    metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                    agentModeVM: owner, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: "high",
+                    dispatchInstruction: { _, _, _, _, _ in
+                        cancelledDispatches += 1
+                        return .startedRun
+                    }
+                )
+            }
+            addTeardownBlock { @MainActor in
+                start.cancel()
+                await held.release()
+                _ = try? await start.value
+                owner.test_afterMCPControlActivation = nil
+                owner.test_beforeMCPSelectionCommit = nil
+                await cancelled.cleanup()
+            }
+            await fulfillment(of: [reached], timeout: 3)
+            if mutationRace == 2 {
+                cancelled.session.runState = .running
+            } else {
+                start.cancel()
+            }
+            await held.release()
+            do {
+                _ = try await start.value
+                XCTFail("Cancelled start succeeded")
+            } catch {
+                if mutationRace == 2 {
+                    XCTAssertTrue(error is MCPError)
+                } else {
+                    XCTAssertTrue(error is CancellationError)
+                }
+            }
+            XCTAssertEqual(cancelled.session.selectedAgent, originalAgent)
+            XCTAssertEqual(cancelled.session.selectedModelRaw, originalModel)
+            XCTAssertEqual(cancelled.session.selectedReasoningEffortRaw, originalEffort)
+            XCTAssertEqual(cancelledDispatches, 0)
+            if mutationRace != 2 {
+                XCTAssertNil(owner.mcpRegistration(sessionID: cancelled.sessionID))
+            }
+            cancelled.session.runState = .idle
+            owner.test_afterMCPControlActivation = nil
+            owner.test_beforeMCPSelectionCommit = nil
+        }
+    }
+
+    func testPostActivationExpiryKeepsAgedPreEpochSessionPollableWaitableAndCancellable() async throws {
+        let fixture = try await makeFixture()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        let vm = fixture.window.agentModeViewModel
+        let sessionID = fixture.sessionID
+        XCTAssertEqual(fixture.session.runState, .idle)
+        fixture.session.mcpFollowUpRunPendingUpdatedAt = Date().addingTimeInterval(-60)
+        XCTAssertNil(fixture.session.mcpControlContext?.currentEpoch)
+        let cursor = try XCTUnwrap(vm.mcpWaitCursor(sessionID: sessionID))
+        XCTAssertNotNil(vm.mcpSnapshot(cursor: cursor))
+        let gate = Gate()
+        addTeardownBlock { await gate.release() }
+        let done = expectation(description: "accepted worker survives expiry")
+        let expiry = AgentRunStartExpiry(toolName: "agent_run", budgetSeconds: 0.05)
+        let callerReturned = expectation(description: "postactivation caller returns while worker is held")
+        var returned = false
+        let caller = Task {
+            defer { returned = true
+                callerReturned.fulfill()
+            }
+            return try await AgentRunStartBudget.run(expiry: expiry) {
+                try expiry.recordActivation(sessionID: sessionID, tabID: fixture.session.tabID)
+                await gate.hold()
+                XCTAssertFalse(Task.isCancelled)
+                done.fulfill()
+                return Value.null
+            } onExpiry: { AgentRunMCPToolService.startExpiryValue(sessionID: sessionID, agentModeVM: vm) }
+        }
+        await fulfillment(of: [callerReturned], timeout: 2)
+        if !returned { await gate.release() }
+        let value = try await caller.value
+        XCTAssertEqual(value.objectValue?["status"], .string("running"))
+        XCTAssertEqual(value.objectValue?["status_text"], .string("Queued to start"))
+        XCTAssertEqual(value.objectValue?["_meta"]?.objectValue?["wait_result"], .string("startup_pending"))
+        for op in ["poll", "wait"] {
+            let result = try await fixture.service.execute(args: [
+                "op": .string(op), "session_id": .string(sessionID.uuidString), "timeout": .double(0.01)
+            ])
+            XCTAssertEqual(result.objectValue?["status"], .string("running"), op)
+        }
+        XCTAssertTrue(fixture.session.mcpFollowUpRunPending)
+        _ = try await fixture.service.execute(args: ["op": .string("cancel"), "session_id": .string(sessionID.uuidString)])
+        XCTAssertFalse(fixture.session.mcpFollowUpRunPending)
+        await gate.release()
+        await fulfillment(of: [done], timeout: 2)
+        try await vm.mcpActivateControlContext(forTabID: fixture.session.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true)
+        let oldContext = fixture.session.mcpControlContext
+        let oldStamp = Date().addingTimeInterval(-60)
+        fixture.session.mcpFollowUpRunPendingUpdatedAt = oldStamp
+        await vm.prepareMCPWaitTrackingForRunStart(session: fixture.session, stopFence: AgentRunStartStopFence(session: fixture.session))
+        XCTAssertNotNil(fixture.session.mcpControlContext?.currentEpoch)
+        XCTAssertNotEqual(fixture.session.mcpControlContext, oldContext)
+        XCTAssertGreaterThan(try XCTUnwrap(fixture.session.mcpFollowUpRunPendingUpdatedAt), oldStamp)
+        XCTAssertEqual(vm.mcpSnapshot(sessionID: sessionID)?.status, .running)
+    }
+
+    func testExpiryPreservesDispatchedRunButMasksPriorRunBeforeDispatch() async throws {
+        let fixture = try await makeFixture()
+        let vm = fixture.window.agentModeViewModel
+        let session = fixture.session
+        let gate = Gate()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        addTeardownBlock { await gate.release() }
+        let priorRunID = UUID()
+        session.installRunID(priorRunID)
+        session.setRunningStatus("Prior run status", source: .transport)
+        let pending = AgentRunMCPToolService.startExpirySnapshot(sessionID: fixture.sessionID, agentModeVM: vm)
+        XCTAssertNil(pending.runID)
+        XCTAssertEqual(pending.statusText, AgentRunMCPSnapshot.startupPendingStatusText)
+
+        let target = try await vm.mcpResolveOrCreateSessionTarget(
+            tabID: nil, sessionID: fixture.sessionID, createIfNeeded: false, sessionName: nil
+        )
+        let expiry = AgentRunStartExpiry(toolName: "agent_run", budgetSeconds: 5)
+        let dispatched = expectation(description: "dispatch returns before expiry")
+        let returned = expectation(description: "expiry returns while post-dispatch worker is held")
+        let finished = expectation(description: "post-dispatch worker released")
+        let runID = UUID()
+        var expected: Value?
+        var callerReturned = false
+        let caller = Task {
+            defer { callerReturned = true
+                returned.fulfill()
+            }
+            return try await AgentRunStartBudget.run(expiry: expiry) {
+                defer { finished.fulfill() }
+                _ = try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: target, message: "dispatch then suspend", metadata: .init(connectionID: nil, clientName: nil, windowID: nil),
+                    agentModeVM: vm, agentRaw: nil, modelRaw: nil, reasoningEffortRaw: nil,
+                    dispatchInstruction: { _, _, _, _, _ in
+                        await vm.prepareMCPWaitTrackingForRunStart(session: session, stopFence: AgentRunStartStopFence(session: session))
+                        XCTAssertNotNil(session.mcpControlContext?.preparedEpoch)
+                        XCTAssertNotNil(session.mcpControlContext?.currentEpoch)
+                        let prepared = AgentRunMCPToolService.startExpirySnapshot(sessionID: fixture.sessionID, agentModeVM: vm)
+                        XCTAssertNil(prepared.runID, "A prepared epoch must not expose the prior run")
+                        XCTAssertEqual(prepared.statusText, AgentRunMCPSnapshot.startupPendingStatusText)
+                        session.installRunID(runID)
+                        _ = session.beginRunAttempt(source: "start-budget-expiry-test")
+                        session.runState = .running
+                        session.setRunningStatus("Thinking…", source: .transport)
+                        return .startedRun
+                    },
+                    startExpiry: expiry
+                )
+                var object = try XCTUnwrap(vm.mcpSnapshot(sessionID: fixture.sessionID)).asObject()
+                object["_meta"] = .object(["wait_result": .string("timed_out")])
+                object.removeValue(forKey: "updated_at")
+                expected = .object(object)
+                dispatched.fulfill()
+                await gate.hold()
+                return Value.null
+            } onExpiry: { AgentRunMCPToolService.startExpiryValue(sessionID: fixture.sessionID, agentModeVM: vm) }
+        }
+        await fulfillment(of: [dispatched, returned], timeout: 7)
+        if !callerReturned {
+            caller.cancel()
+        }
+        await gate.release()
+        let result = try await caller.value
+        XCTAssertNotNil(expected)
+        var object = try XCTUnwrap(result.objectValue)
+        XCTAssertNotNil(object.removeValue(forKey: "updated_at"))
+        XCTAssertEqual(Value.object(object), expected)
+        XCTAssertEqual(result.objectValue?["run_id"], .string(runID.uuidString))
+        XCTAssertEqual(result.objectValue?["status_text"], .string("Thinking…"))
+        await fulfillment(of: [finished], timeout: 2)
+    }
+
+    private enum Context {
+        @TaskLocal static var marker = ""
+    }
+
+    func testNormalSetupAndErrorSettlementPreserveResultsAndTaskLocals() async throws {
+        let fixture = try await makeFixture()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        var service = makeService(fixture)
+        service.testStartExpiryOverride = .init(toolName: "agent_run", budgetSeconds: 60)
+        let result = try await service.execute(args: ["op": .string("start"), "message": .string("hello"), "timeout": .double(0.1)])
+        XCTAssertEqual(result.objectValue?["session_id"], .string(fixture.sessionID.uuidString))
+        XCTAssertEqual(result.objectValue?["_meta"]?.objectValue?["wait_result"], .string("startup_pending"))
+        let inherited = try await Context.$marker.withValue("captured invocation") {
+            try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 10)) { Context.marker } onExpiry: { "" }
+        }
+        XCTAssertEqual(inherited, "captured invocation")
+        let value = try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 10)) { 42 } onExpiry: { -1 }
+        XCTAssertEqual(value, 42)
+        let expired = AgentRunMCPToolService.startExpiryValue(sessionID: UUID(), agentModeVM: fixture.window.agentModeViewModel)
+        XCTAssertEqual(expired.objectValue?["status"], .string("expired"))
+        XCTAssertEqual(expired.objectValue?["_meta"]?.objectValue?["wait_result"], .string("timed_out"))
+        let timeoutError = AgentRunStartSetupTimeoutError(toolName: "agent_run", budgetSeconds: 120)
+        XCTAssertEqual(timeoutError.localizedDescription, timeoutError.description)
+        let wire = ServerNetworkManager.toolErrorResult(rawJSON: true, message: timeoutError.localizedDescription)
+        guard case let .text(raw, _, _) = try XCTUnwrap(wire.content.first) else { return XCTFail("Expected raw error JSON") }
+        let object = try JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any]
+        XCTAssertEqual(object?["error"] as? String, timeoutError.description)
+        XCTAssertEqual(object?["is_error"] as? Bool, true)
+        struct Failure: Error {}
+        do {
+            let _: Int = try await AgentRunStartBudget.run(expiry: .init(toolName: "agent_run", budgetSeconds: 10)) { throw Failure() } onExpiry: { -1 }
+            XCTFail("Expected original failure")
+        } catch { XCTAssertTrue(error is Failure) }
+    }
+
+    func testDetachedAndZeroTimeoutUseCapturedConfiguredBudgetAndBatchStopsAtExpiry() async throws {
+        for (detach, timeout, expected) in [(true, 0.001, 120.0), (false, 0.0, 120.0), (false, 5.0, 5.0)] {
+            XCTAssertEqual(AgentRunMCPToolService.startBudgetSeconds(detach: detach, timeoutSeconds: timeout, capturedDefaultWaitSeconds: 120), expected)
+        }
+        let fixture = try await makeFixture()
+        addTeardownBlock { @MainActor in await fixture.cleanup() }
+        let service = makeService(fixture)
+        for arguments: [String: Value] in [
+            ["op": .string("start"), "message": .string("hello"), "detach": .bool(true), "timeout": .double(0.000001)],
+            ["op": .string("start"), "message": .string("hello"), "timeout": .int(0)]
+        ] {
+            let value = try await service.execute(args: arguments)
+            XCTAssertEqual(value.objectValue?["session_id"], .string(fixture.sessionID.uuidString))
+            XCTAssertNil(value.objectValue?["_meta"])
+        }
+        let expiry = AgentRunStartExpiry(toolName: "agent_explore", budgetSeconds: 0)
+        do { try expiry.beginNextChild()
+            XCTFail("No next child after deadline")
+        } catch { XCTAssertTrue(error is AgentRunStartSetupTimeoutError) }
+        XCTAssertNil(expiry.activatedSessionID)
+
+        let vm = fixture.window.agentModeViewModel
+        try await vm.mcpActivateControlContext(
+            forTabID: fixture.session.tabID, sessionID: fixture.sessionID,
+            originatingConnectionID: nil, taskLabelKind: .pair, startPending: true
+        )
+        var calls: [UUID] = []
+        var gate = Gate()
+        var heldChild = 2
+        var stage = XCTestExpectation(description: "unused stage")
+        var resumed = XCTestExpectation(description: "unused completion")
+        var noNextChild = XCTestExpectation(description: "unused next child")
+        noNextChild.isInverted = true
+        var explore = AgentExploreMCPToolService(
+            toolName: "agent_explore",
+            captureRequestMetadata: { .init(connectionID: nil, clientName: "start-budget-tests", windowID: fixture.window.windowID) },
+            requireTargetWindow: { fixture.window },
+            resolveSpawnSourceTabID: { _ in fixture.session.tabID },
+            resolveSpawnParentSessionID: { _, _ in fixture.sessionID },
+            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            startRun: { target, _, _, vm, agent, model, effort, _, _, _, _, _, expiry in
+                let id = try XCTUnwrap(target.sessionID)
+                calls.append(id)
+                try await vm.mcpActivateControlContext(
+                    forTabID: target.tabID, sessionID: id, originatingConnectionID: nil,
+                    taskLabelKind: .explore, startPending: true, creationHandle: target.creationHandle
+                )
+                try expiry?.recordActivation(sessionID: id, tabID: target.tabID)
+                try await vm.mcpConfigureSession(tabID: target.tabID, agentRaw: agent, modelRaw: model, reasoningEffortRaw: effort, creationHandle: target.creationHandle)
+                let held = calls.count == heldChild
+                if held { stage.fulfill()
+                    await gate.hold()
+                }
+                let committed = await vm.commitConfiguredSessionCreation(target: target)
+                XCTAssertTrue(committed)
+                let snapshot = try XCTUnwrap(vm.mcpSnapshot(sessionID: id))
+                if held { resumed.fulfill() }
+                return .init(snapshot: snapshot, delivery: .startedRun)
+            }
+        )
+        explore.testBeforeChildWorktreePreparation = { index, _ in
+            if index >= heldChild { noNextChild.fulfill() }
+        }
+        for (request, represented): ([String: Value], Int) in [
+            (["messages": .array([.string("a"), .string("b"), .string("c")])], 2),
+            (["messages": .array([.string("a"), .string("b"), .string("c")])], 1),
+            (["message": .string("a")], 1),
+            (["messages": .array([.string("a")])], 1)
+        ] {
+            calls = []
+            gate = Gate()
+            let heldGate = gate
+            addTeardownBlock { await heldGate.release() }
+            heldChild = represented
+            stage = expectation(description: "child reaches setup gate")
+            resumed = expectation(description: "child resumes after expiry")
+            noNextChild = expectation(description: "no next child preparation")
+            noNextChild.isInverted = true
+            explore.testStartExpiryOverride = .init(toolName: "agent_explore", budgetSeconds: 5)
+            var args = request
+            args["op"] = .string("start")
+            args["detach"] = .bool(true)
+            let startService = explore
+            let callerReturned = expectation(description: "explore caller returns while gate is held")
+            let capturedArgs = args
+            let caller = Task {
+                defer { callerReturned.fulfill() }
+                return try await startService.execute(args: capturedArgs)
+            }
+            await fulfillment(of: [stage], timeout: 4)
+            await fulfillment(of: [callerReturned], timeout: 6)
+            await heldGate.release()
+            let partial: Value
+            do { partial = try await caller.value }
+            catch { await heldGate.release()
+                throw error
+            }
+            XCTAssertEqual(calls.count, represented)
+            let ids = Value.array(calls.map { .string($0.uuidString) })
+            let isBatch = (request["messages"]?.arrayValue?.count ?? 1) > 1
+            if isBatch {
+                XCTAssertEqual(partial.objectValue?["session_ids"], ids)
+                XCTAssertEqual(partial.objectValue?["start"]?.objectValue?["session_ids"], ids)
+                XCTAssertEqual(partial.objectValue?["start"]?.objectValue?["started_count"], .int(represented))
+                XCTAssertEqual(partial.objectValue?["start"]?.objectValue?["result"], .string("poll"))
+                XCTAssertEqual(partial.objectValue?["unstarted_message_indices"], .array((represented ..< 3).map { .int($0) }))
+                let snapshots = try XCTUnwrap(partial.objectValue?["snapshots"]?.arrayValue)
+                XCTAssertEqual(snapshots.count, represented)
+                XCTAssertEqual(snapshots.compactMap { $0.objectValue?["session_id"] }, calls.map { .string($0.uuidString) })
+                let pending = try XCTUnwrap(snapshots.last?.objectValue)
+                XCTAssertEqual(pending["status"], .string("running"))
+                XCTAssertEqual(pending["status_text"], .string("Queued to start"))
+                XCTAssertNil(pending["run_id"])
+            } else {
+                XCTAssertEqual(partial.objectValue?["session_id"], try .string(XCTUnwrap(calls.first).uuidString))
+                XCTAssertEqual(partial.objectValue?["status"], .string("running"))
+                XCTAssertEqual(partial.objectValue?["status_text"], .string("Queued to start"))
+                XCTAssertNil(partial.objectValue?["run_id"])
+                XCTAssertNil(partial.objectValue?["start"])
+                XCTAssertNil(partial.objectValue?["unstarted_message_indices"])
+            }
+            XCTAssertEqual(partial.objectValue?["_meta"]?.objectValue?["wait_result"], .string("startup_pending"))
+            XCTAssertNil(partial.objectValue?["requested_count"])
+            await heldGate.release()
+            await fulfillment(of: [resumed], timeout: 3)
+            await fulfillment(of: [noNextChild], timeout: 0.2)
+        }
+
+        heldChild = Int.max
+        calls = []
+        explore.testStartExpiryOverride = .init(toolName: "agent_explore", budgetSeconds: 60)
+        let complete = try await explore.execute(args: [
+            "op": .string("start"), "messages": .array([.string("a"), .string("b")]), "detach": .bool(true)
+        ])
+        XCTAssertEqual(complete.objectValue?["start"]?.objectValue?["started_count"], .int(2))
+        XCTAssertNil(complete.objectValue?["unstarted_message_indices"])
+        XCTAssertNil(complete.objectValue?["requested_count"])
+    }
+
+    private func makeService(_ fixture: AgentRunMCPControlledSessionContext) -> AgentRunMCPToolService {
+        var service = AgentRunMCPToolService(
+            toolName: "agent_run",
+            captureRequestMetadata: { .init(connectionID: nil, clientName: "start-budget-tests", windowID: fixture.window.windowID) },
+            requireTargetWindow: { fixture.window },
+            resolveRequestedTabID: { _ in fixture.session.tabID },
+            resolveSpawnParentSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in nil },
+            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            startRun: { target, message, metadata, vm, agent, model, effort, label, workflow, parent, source, preserve, expiry in
+                try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
+                    target: target, message: message, metadata: metadata, agentModeVM: vm,
+                    agentRaw: agent, modelRaw: model, reasoningEffortRaw: effort,
+                    taskLabelKind: label, workflow: workflow, expectedParentSessionID: parent,
+                    oracleReviewSource: source, preserveRoutedInitialEffort: preserve,
+                    dispatchInstruction: { _, _, _, _, _ in .startedRun }, startExpiry: expiry
+                )
+            }
+        )
+        service.resolveOracleReviewLaunchSource = { _, window in
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tabID = fixture.session.tabID
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: AgentRunOracleReviewLaunchSnapshot(
+                    route: .explicitWindowActiveCompose, windowID: window.windowID,
+                    workspaceID: workspace.id, tabID: tabID, selectionRevision: 0,
+                    promptText: "", selection: StoredSelection(), sourceAgentSessionID: nil, routedRunID: nil
+                ),
+                source: .unavailable(.init(
+                    delegationID: UUID(), sourceTabID: tabID, workspaceID: workspace.id,
+                    sourceAgentSessionID: nil, sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Synthetic MCP release-catalog fixture")
+                ))
+            )
+        }
+        return service
+    }
+
+    private func makeFixture() async throws -> AgentRunMCPControlledSessionContext {
+        try await .make(workspaceNamePrefix: "Start budget", workspaceSwitchReason: "start-budget-tests", clientName: "start-budget-tests", unusedStartRunMessage: "unused")
     }
 }

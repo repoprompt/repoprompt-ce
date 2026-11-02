@@ -299,7 +299,8 @@ struct AgentRunMCPToolService {
         _ workflow: AgentWorkflowDefinition?,
         _ expectedParentSessionID: UUID?,
         _ oracleReviewSource: AgentRunOracleReviewSource?,
-        _ preserveRoutedInitialEffort: Bool
+        _ preserveRoutedInitialEffort: Bool,
+        _ startExpiry: AgentRunStartExpiry?
     ) async throws -> AgentExternalMCPRunStarter.StartOutcome
     typealias ResolveOracleReviewLaunchSource = @MainActor (
         _ metadata: RequestMetadata,
@@ -483,16 +484,26 @@ struct AgentRunMCPToolService {
         }
     }
 
+    #if DEBUG
+        var testStartExpiryOverride: AgentRunStartExpiry?
+    #endif
+
+    nonisolated static func startBudgetSeconds(detach: Bool, timeoutSeconds: TimeInterval, capturedDefaultWaitSeconds: TimeInterval) -> TimeInterval {
+        detach || timeoutSeconds <= 0 ? capturedDefaultWaitSeconds : timeoutSeconds
+    }
+
+    @MainActor private struct StartResult {
+        let value: Value
+        let sessionID: UUID
+        let metadata: MCPRequestMetadata
+        let delivery: AgentModeViewModel.MCPInstructionDispatch
+        let running: Bool
+    }
+
     private func executeStart(args: [String: Value]) async throws -> Value {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
-        var worktreeStartupCorrelationID = UUID()
-        var worktreeStartupFlags = WorktreeStartupFeatureFlags.current()
-        var worktreeStartupServingControl = WorktreeStartupServingControl.automatic
-        #if DEBUG
-            var worktreeStartupBenchmarkToken: UUID?
-        #endif
         // start always creates a new session — reject explicit session_id
         if normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
@@ -504,8 +515,78 @@ struct AgentRunMCPToolService {
             capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
         )
 
-        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
+        let agentModeVM = targetWindow.agentModeViewModel
+        let defaultExpiry = AgentRunStartExpiry(toolName: toolName, budgetSeconds: Self.startBudgetSeconds(
+            detach: detach, timeoutSeconds: timeoutSeconds, capturedDefaultWaitSeconds: capturedDefaultWaitSeconds
+        ))
+        #if DEBUG
+            let expiry = testStartExpiryOverride ?? defaultExpiry
+        #else
+            let expiry = defaultExpiry
+        #endif
+        let result = try await AgentRunStartBudget.run(expiry: expiry) {
+            try await performStart(args: args, message: message, workflow: workflow, worktreeStartRequest: worktreeStartRequest, targetWindow: targetWindow, expiry: expiry)
+        } onExpiry: {
+            guard let sessionID = expiry.activatedSessionID else { throw expiry.timeoutError }
+            return StartResult(value: Self.startExpiryValue(sessionID: sessionID, agentModeVM: agentModeVM), sessionID: sessionID, metadata: .init(connectionID: nil, clientName: nil, windowID: nil), delivery: .startedRun, running: false)
+        }
+        if detach || !result.running || timeoutSeconds <= 0 {
+            return result.value
+        }
+        return try await waitForInterestingState(
+            sessionID: result.sessionID, agentModeVM: agentModeVM, metadata: result.metadata,
+            timeoutSeconds: timeoutSeconds, stage: "starting",
+            message: "Waiting for the started run to finish or request input...",
+            workflow: workflow, initialDelivery: result.delivery
+        )
+    }
+
+    static func startExpiryValue(sessionID: UUID, agentModeVM: AgentModeViewModel) -> Value {
+        let snapshot = startExpirySnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        var object = snapshot.asObject()
+        object["_meta"] = .object(["wait_result": .string(snapshot.isStartupPendingForMCPWait ? "startup_pending" : "timed_out")])
+        return .object(object)
+    }
+
+    static func startExpirySnapshot(sessionID: UUID, agentModeVM: AgentModeViewModel) -> AgentRunMCPSnapshot {
+        guard let live = agentModeVM.mcpSnapshot(sessionID: sessionID) else { return .expired(sessionID: sessionID) }
+        if let session = agentModeVM.mcpControlledSession(sessionID: sessionID),
+           let epoch = session.mcpControlContext?.currentEpoch
+        {
+            let ownership = session.runState.isActive
+                ? session.activeRunOwnership
+                : session.lastTerminalCommitRevision?.ownership
+            // Preparation alone leaves prior-run IDs/text visible; only this turn's attempt owns them.
+            if ownership?.turnEpoch == epoch, live.runID != nil || !live.isStartupPendingForMCPWait {
+                return live
+            }
+        }
+        return AgentRunMCPSnapshot(
+            sessionID: live.sessionID, runID: nil, tabID: live.tabID, sessionName: live.sessionName,
+            agentRaw: live.agentRaw, agentDisplayName: live.agentDisplayName, modelRaw: live.modelRaw,
+            reasoningEffortRaw: live.reasoningEffortRaw, modelParameterSelections: live.modelParameterSelections,
+            status: .running, statusText: AgentRunMCPSnapshot.startupPendingStatusText,
+            latestAssistantPreview: live.latestAssistantPreview, interaction: live.interaction, hookGate: live.hookGate,
+            transcriptItemCount: live.transcriptItemCount, updatedAt: live.updatedAt,
+            parentSessionID: live.parentSessionID, failureReason: live.failureReason,
+            worktreeBindings: live.worktreeBindings, activeWorktreeMerges: live.activeWorktreeMerges
+        )
+    }
+
+    private func performStart(
+        args: [String: Value], message: String, workflow: AgentWorkflowDefinition?,
+        worktreeStartRequest: AgentMCPStartWorktreeCoordinator.Request,
+        targetWindow: WindowState, expiry: AgentRunStartExpiry
+    ) async throws -> StartResult {
+        var worktreeStartupCorrelationID = UUID()
+        var worktreeStartupFlags = WorktreeStartupFeatureFlags.current()
+        var worktreeStartupServingControl = WorktreeStartupServingControl.automatic
+        #if DEBUG
+            var worktreeStartupBenchmarkToken: UUID?
+        #endif
+        try expiry.throwIfExpired()
+        let metadata = await captureRequestMetadata()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_run.start.")
         }
@@ -752,6 +833,7 @@ struct AgentRunMCPToolService {
             bindings: [AgentSessionWorktreeBinding]
         )?
         do {
+            try expiry.throwIfExpired()
             #if DEBUG
                 await testAfterTargetResolution?(target)
             #endif
@@ -944,6 +1026,7 @@ struct AgentRunMCPToolService {
         var providerDispatchAttempted = false
         var modelParameterStagingRollback: AgentModeViewModel.MCPModelParameterSelectionStagingRollback?
         do {
+            try expiry.throwIfExpired()
             try await Self.requireWritableWorkspaceAuthority(
                 targetWindow.workspaceManager.domainAuthorityAdmissionIssue(for: workspace.id)
             )
@@ -995,7 +1078,8 @@ struct AgentRunMCPToolService {
                 workflow,
                 spawnParentSessionID,
                 oracleLaunchSource.source,
-                routerSelectedTarget
+                routerSelectedTarget,
+                expiry
             )
             agentModeVM.mcpAcceptSessionTarget(target)
             agentModeVM.recordAgentSessionProviderLifecycle(
@@ -1019,7 +1103,9 @@ struct AgentRunMCPToolService {
                 }
             #endif
         } catch {
-            let providerFailureReason = if !providerDispatchAttempted {
+            let providerFailureReason = if error is AgentRunStartSetupTimeoutError {
+                "start_budget_expired"
+            } else if !providerDispatchAttempted {
                 lifecycleAdmissionAttempted
                     ? "lifecycle_identity_rejected"
                     : "workspace_authority_rejected"
@@ -1042,7 +1128,7 @@ struct AgentRunMCPToolService {
                     break
                 }
             }
-            let decoratedError = startWorktreeCoordinator.providerStartError(
+            let decoratedError = error is AgentRunStartSetupTimeoutError ? error : startWorktreeCoordinator.providerStartError(
                 error,
                 targetSessionID: target.sessionID,
                 agentModeVM: agentModeVM
@@ -1082,18 +1168,10 @@ struct AgentRunMCPToolService {
                 )
             }
         #endif
-        if detach || outcome.snapshot.status != .running || timeoutSeconds <= 0 {
-            return decoratedRunValue(snapshot: outcome.snapshot, workflow: workflow, delivery: outcome.delivery)
-        }
-        return try await waitForInterestingState(
-            sessionID: outcome.snapshot.sessionID,
-            agentModeVM: agentModeVM,
-            metadata: metadata,
-            timeoutSeconds: timeoutSeconds,
-            stage: "starting",
-            message: "Waiting for the started run to finish or request input...",
-            workflow: workflow,
-            initialDelivery: outcome.delivery
+        return StartResult(
+            value: decoratedRunValue(snapshot: outcome.snapshot, workflow: workflow, delivery: outcome.delivery),
+            sessionID: outcome.snapshot.sessionID, metadata: metadata, delivery: outcome.delivery,
+            running: outcome.snapshot.status == .running
         )
     }
 

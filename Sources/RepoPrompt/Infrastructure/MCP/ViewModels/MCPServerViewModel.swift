@@ -785,7 +785,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource, preserveRoutedInitialEffort in
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource, preserveRoutedInitialEffort, startExpiry in
                 try await AgentExternalMCPRunStarter.startPreservingCallerBinding(
                     target: target,
                     message: message,
@@ -805,7 +805,8 @@ final class MCPServerViewModel: ObservableObject {
                         #else
                             nil
                         #endif
-                    }()
+                    }(),
+                    startExpiry: startExpiry
                 )
             }
         )
@@ -1056,13 +1057,13 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _, preserveRoutedInitialEffort in
+            startRun: { [self] target, message, metadata, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _, preserveRoutedInitialEffort, startExpiry in
                 try await AgentExternalMCPRunStarter.startApplyingRequestBindingPolicy(
                     target: target,
                     message: message,
                     metadata: metadata,
-                    bindCurrentRequestToTab: { tabID, requestMetadata in
-                        try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: requestMetadata)
+                    bindCurrentRequestToTab: { tabID, requestMetadata, startExpiry in
+                        try await bindCurrentRequestToTabIfPossible(tabID: tabID, metadata: requestMetadata, startExpiry: startExpiry)
                     },
                     agentModeVM: agentModeVM,
                     agentRaw: agentRaw,
@@ -1070,7 +1071,8 @@ final class MCPServerViewModel: ObservableObject {
                     reasoningEffortRaw: reasoningEffortRaw,
                     taskLabelKind: taskLabelKind,
                     workflow: workflow,
-                    preserveRoutedInitialEffort: preserveRoutedInitialEffort
+                    preserveRoutedInitialEffort: preserveRoutedInitialEffort,
+                    startExpiry: startExpiry
                 )
             }
         )
@@ -4309,14 +4311,19 @@ final class MCPServerViewModel: ObservableObject {
 
     func bindCurrentRequestToTabIfPossible(
         tabID: UUID,
-        metadata: RequestMetadata
+        metadata: RequestMetadata,
+        startExpiry: AgentRunStartExpiry? = nil
     ) async throws {
         guard let connectionID = metadata.connectionID,
               let workspaceID = workspaceManager?.activeWorkspace?.id
         else {
             return
         }
-        if await shouldPreserveAgentRunSourceBinding(connectionID: connectionID, metadata: metadata) {
+        let preserve = await shouldPreserveAgentRunSourceBinding(connectionID: connectionID, metadata: metadata)
+        if startExpiry?.hasExpired == true {
+            return
+        }
+        if preserve {
             mcpServerViewModelDebugLog("bindCurrentRequestToTabIfPossible preserved agent-run source binding connectionID=\(connectionID) targetTab=\(tabID)")
             return
         }
@@ -4329,10 +4336,19 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
+    #if DEBUG
+        var test_shouldPreserveAgentRunSourceBinding: (@MainActor (UUID, RequestMetadata) async -> Bool)?
+    #endif
+
     private func shouldPreserveAgentRunSourceBinding(
         connectionID: UUID,
         metadata: RequestMetadata
     ) async -> Bool {
+        #if DEBUG
+            if let hook = test_shouldPreserveAgentRunSourceBinding {
+                return await hook(connectionID, metadata)
+            }
+        #endif
         guard await ServerNetworkManager.shared.runPurpose(for: connectionID) == .agentModeRun else {
             return false
         }

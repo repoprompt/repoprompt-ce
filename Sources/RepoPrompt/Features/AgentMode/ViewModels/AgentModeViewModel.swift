@@ -8527,6 +8527,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             context.pendingEpochTransition = nil
         }
         session.mcpControlContext = context
+        session.mcpFollowUpRunPendingUpdatedAt = Date()
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true
             handleObservedMCPStateChange(for: session)
@@ -8625,6 +8626,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let supersedingMaskIsStale = session.pendingSupersedingTurnCompletions > 0
                 && session.pendingSupersedingTurnCompletionsUpdatedAt.map { now.timeIntervalSince($0) > 15 } == true
             if let terminalStatus,
+               context.currentEpoch != nil,
                followUpMaskIsStale || supersedingMaskIsStale,
                session.agentTask == nil,
                session.pendingInstructions.isEmpty,
@@ -11753,6 +11755,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 )
             }
         }
+        try requireActivationOwner()
         // A new control activation owns a new launch lifecycle. Never retain review state from a
         // prior activation, including direct/source-equals-target starts that do not stage anew.
         mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
@@ -24970,6 +24973,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     func requireSessionConfigurationAdmission(
         _ session: TabSession, creationHandle: AgentSessionCreationHandle?
     ) throws {
+        try Task.checkCancellation()
         if let creationHandle {
             guard creationHandle.session === session else { throw PersistentBindingMutationError.staleTransition }
             try requireCurrentCreationPreparation(creationHandle)

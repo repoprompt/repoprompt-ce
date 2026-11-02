@@ -108,7 +108,7 @@ enum AgentMCPToolHelpers {
         return seconds
     }
 
-    private static func renderTimeout(_ seconds: TimeInterval) -> String {
+    static func renderTimeout(_ seconds: TimeInterval) -> String {
         seconds.rounded(.down) == seconds ? String(Int(seconds)) : String(seconds)
     }
 
