@@ -138,6 +138,7 @@ new-module:
 	python3 Scripts/modularization_new_module.py --name "$(NAME)" --family "$(FAMILY)"
 
 conductor-selftest:
+	python3 Scripts/test_conductor_swift_jobs.py
 	python3 Scripts/test_ci_test_coverage.py
 	python3 Scripts/test_ci_resolve_packages.py
 	python3 Scripts/test_codex_app_server_schema.py
