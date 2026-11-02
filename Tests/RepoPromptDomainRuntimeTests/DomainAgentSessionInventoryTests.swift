@@ -275,6 +275,10 @@ final class DomainAgentSessionInventoryTests: XCTestCase {
             "C and A swap their own values; B keeps 5"
         )
         // Named groups without distinct values get fresh values after every value in use.
+        let colliding: [(group: String, order: Int?)] = [("A", 0), ("B", 0), ("Z", 1)]
+        XCTAssertNil(DomainAgentSessionSidebarGroup.redistributedOrders(desired: ["Z", "A"], entries: colliding), "Unnamed B must not lose its slot")
+        XCTAssertEqual(DomainAgentSessionSidebarGroup.redistributedOrders(desired: ["Z", "B", "A"], entries: colliding), ["Z": 2, "B": 3, "A": 4], "Normalization can write all colliding carriers when explicitly named")
+
         let legacy: [(group: String, order: Int?)] = [("A", nil), ("B", 5), ("C", nil)]
         XCTAssertEqual(
             DomainAgentSessionSidebarGroup.redistributedOrders(desired: ["C", "A"], entries: legacy),

@@ -532,10 +532,15 @@ final class AgentSessionOrganizeOperationHandler: AgentSessionAdministrationOper
             return finish(context, payload: nil)
         }
         // The named groups' values are redistributed among them; only their carriers are written.
-        let values = DomainAgentSessionSidebarGroup.redistributedOrders(
+        guard let values = DomainAgentSessionSidebarGroup.redistributedOrders(
             desired: order,
             entries: entries.map { ($0.group, $0.order) }
-        )
+        ) else {
+            return .object(SessionAdminReply.diagnostic(code: "group_rank_collision", fields: [
+                "result": .string("not_applied"),
+                "detail": .string("A reordered group shares a rank with an unnamed group. Include all colliding groups with authority over their carriers, or ask the user to repair the group order.")
+            ]))
+        }
         var before: [UUID: (group: String, order: Int?)] = [:]
         var writes: [UUID: Int?] = [:]
         for entry in entries {

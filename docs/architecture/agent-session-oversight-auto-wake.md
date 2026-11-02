@@ -116,8 +116,9 @@ ascending as a deterministic tie-break). The runtime caches the per-grantee proj
 decoding all history on every status/render. Only this 16-item projection is bounded: the backing
 `scopeEndings` map and persisted terminal rows remain unbounded; retention pruning is deferred.
 Restore-time drops in `recoverContinuity` and `reactivate` (deleted sessions, orphan grants, invalid
-children) still record no ending evidence. Passive expiry projection can also hide a grant before
-lazy expiry materializes its ending. These are remaining observability gaps, not explained endings.
+children) still record no ending evidence. These are remaining observability gaps, not explained
+endings. A scope-owner deadline now materializes live expiry without a later query; authority checks
+still enforce wall-clock expiry independently if deadline execution is delayed.
 `record(id:)` remains authority-only; only status uses
 `statusRecord(id:)` to project persisted history. MCP status remains caller-owned; knowing another
 scope UUID does not authorize reading its historical details. Scope status also reports continuity
@@ -216,6 +217,9 @@ Rules that hold the scope design together:
 - **Cards bind arguments.** A batch card is bound to the scope generation, operation, item set,
   idempotency key, and a canonical digest of the call's other arguments. Changed arguments under
   the same key conflict instead of riding the approval, and an approval applies once.
+  Worktree-release rows also freeze the selected worktree IDs: a changed selection refuses before
+  application, and the host's mutation predicate fences the complete starting binding set across
+  suspensions. An explicit `worktree_id` card shows only that selected effect.
 - **Scopes are keyed by session, not by incarnation.** Unlike link grants, a scope is durable and is
   granted to a session UUID, so every live incarnation of that session (for example the same session
   open in two windows) holds it. The caller is still resolved only from exact server-owned run
@@ -271,7 +275,9 @@ Rules that hold the scope design together:
   claimed with `beginApplying` and settled with `finishApplying`, including when unticking brought
   the batch to or below the threshold, so a successful application always ends `applied` and a
   failed one (a thrown error, or a handler result that refuses the whole batch with a top-level
-  `denied`) returns the card to `approved`. Per-item refusals inside an applied batch consume it. Undo tokens are
+  `denied`) returns the card to `approved`. A wholly refused `worktree_release` (`not_applied`)
+  likewise keeps its approval for retry. Retire retains its existing single-use no-op and partial
+  receipt contract. Per-item refusals inside an applied or partially applied batch consume it. Undo tokens are
   re-authorized as the original operation over the original targets at redemption.
 
 Structural operations (Milestone 1, Lane C) keep those rules. They register through the same front
@@ -1496,7 +1502,12 @@ limits. It does not widen membership, grant human-only actions, or enable read-o
 Ordinary Grant still cannot exceed the request. Active delegations display the actual capabilities
 and allow immediate revocation. No tool argument can invoke Grant all or enable auto-approval.
 
-Grant, denial, and revocation generate app-authored decision notices for the requesting session.
+Grant, denial, revocation, and live expiry generate app-authored decision notices for the requesting session.
+The scope runtime owns one cancellable deadline at the earliest active grant's expiry, rearmed on
+scope changes and restoration and cancelled on termination. Its sweep expires every overdue scope
+and attenuated descendant through the existing authority, persistence, confirmation invalidation,
+and catalog publication paths. Query-triggered expiry remains a fallback; a terminal scope emits no
+second expiry notice. Expiry notices use the same requester delivery queue, not passive Auto-wake.
 These use noncomposer submission after the active turn settles, without reading/clearing the user's
 draft, attachments, workflow or interview state. The queue is bound to the presenting session and
 its Stop fence. It is not attention, a link grant, an interaction response, or passive Auto-wake;

@@ -584,14 +584,18 @@ package enum DomainAgentSessionSidebarGroup {
     /// current values are redistributed among them, so groups outside the call keep their values
     /// and their carriers are never written. When the named groups lack distinct values (legacy or
     /// malformed mirrors), fresh values after every value in use are assigned to them instead.
+    /// A collision with an unnamed group's rank refuses the reorder: redistributing that shared
+    /// slot would move an unapproved group even though its carriers were never written.
     package static func redistributedOrders(
         desired: [String],
         entries: [(group: String, order: Int?)]
-    ) -> [String: Int] {
+    ) -> [String: Int]? {
         let named = Set(desired)
         let currentNamed = orderedGroups(entries).filter(named.contains)
         let values = currentNamed.map { group in entries.filter { $0.group == group }.compactMap(\.order).min() }
         let explicit = values.compactMap(\.self)
+        let unnamedRanks = Set(entries.filter { !named.contains($0.group) }.compactMap(\.order))
+        guard unnamedRanks.isDisjoint(with: explicit) else { return nil }
         let slots: [Int]
         if explicit.count == values.count, Set(explicit).count == explicit.count {
             slots = explicit.sorted()
