@@ -419,12 +419,16 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
                 attributes: [.font: numeralFont]
             ).size().width
         )
+        // One direction per list keeps markers and continuation indents on the same side for
+        // every item, even when an item starts with a code span or a word in the other script.
+        let listDirection = MarkdownStructureDirection.baseWritingDirection(for: orderedList)
 
         for (idx, child) in orderedList.children.enumerated() {
             guard let listItem = child as? Markdown.ListItem else { continue }
 
             var listItemAttributes: [NSAttributedString.Key: Any] = [:]
             let paragraphStyle = NSMutableParagraphStyle()
+            MarkdownStructureDirection.apply(listDirection, to: paragraphStyle)
 
             let baseLeftMargin: CGFloat = 15.0
             let leftMarginOffset = baseLeftMargin + (20.0 * CGFloat(orderedList.listDepth))
@@ -476,6 +480,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         let result = NSMutableAttributedString()
 
         let font = NSFont.systemFont(ofSize: fontSize, weight: .regular).rounded()
+        // See `visitOrderedList`: one direction per list.
+        let listDirection = MarkdownStructureDirection.baseWritingDirection(for: unorderedList)
 
         // Iterate over each list item so we can prepend bullet + tab stops
         for case let listItem as Markdown.ListItem in unorderedList.children {
@@ -483,6 +489,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
             // Paragraph-style identical to reference implementation
             let paragraphStyle = NSMutableParagraphStyle()
+            MarkdownStructureDirection.apply(listDirection, to: paragraphStyle)
             let baseLeftMargin: CGFloat = 15.0
             let leftMarginOffset = baseLeftMargin + (20.0 * CGFloat(unorderedList.listDepth))
             let spacingFromIndex: CGFloat = 8.0
@@ -595,10 +602,13 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
         guard !rows.isEmpty else { return NSAttributedString() }
         removeCanonicalSeparatorRows(from: &rows, headerRowCount: &headerRowCount)
+        // One direction per table: every cell/row paragraph shares it, so columns keep a stable
+        // order and alignment whether a given cell holds Hebrew, Arabic or English.
+        let tableDirection = MarkdownStructureDirection.baseWritingDirection(for: table)
         if shouldUsePlainTableFallback(rows) {
-            return renderPlainTable(rows, table: table)
+            return renderPlainTable(rows, table: table, direction: tableDirection)
         }
-        return renderTextTable(rows, headerRowCount: headerRowCount, table: table)
+        return renderTextTable(rows, headerRowCount: headerRowCount, table: table, direction: tableDirection)
     }
 
     private func shouldUsePlainTableFallback(_ rows: [[NSAttributedString]]) -> Bool {
@@ -611,13 +621,16 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     private func renderPlainTable(
         _ rows: [[NSAttributedString]],
-        table sourceTable: Markdown.Table
+        table sourceTable: Markdown.Table,
+        direction: NSWritingDirection?
     ) -> NSAttributedString {
         let bodyFont = NSFont.systemFont(ofSize: max(fontSize - 1, 10), weight: .regular).rounded()
         let bodyAttributes: [NSAttributedString.Key: Any] = [
             .font: bodyFont,
             .foregroundColor: NSColor(forceTextColor ?? Color.primary)
         ]
+        let rowParagraphStyle = NSMutableParagraphStyle()
+        MarkdownStructureDirection.apply(direction, to: rowParagraphStyle)
         let result = NSMutableAttributedString()
         if sourceTable.hasPredecessor {
             result.append(NSAttributedString(string: "\n", attributes: bodyAttributes))
@@ -626,12 +639,19 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
             if rowIndex > 0 {
                 result.append(NSAttributedString(string: "\n", attributes: bodyAttributes))
             }
+            let rowStart = result.length
             for (columnIndex, cell) in row.enumerated() {
                 if columnIndex > 0 {
                     result.append(NSAttributedString(string: "  |  ", attributes: bodyAttributes))
                 }
                 result.append(cell)
             }
+            // Each row is one paragraph; a shared style keeps the column order stable per row.
+            result.addAttribute(
+                .paragraphStyle,
+                value: rowParagraphStyle,
+                range: NSRange(location: rowStart, length: result.length - rowStart)
+            )
         }
         if sourceTable.hasSuccessorConsideringBlockElements {
             result.append(NSAttributedString(string: "\n", attributes: bodyAttributes))
@@ -668,7 +688,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     private func renderTextTable(
         _ rows: [[NSAttributedString]],
         headerRowCount: Int,
-        table sourceTable: Markdown.Table
+        table sourceTable: Markdown.Table,
+        direction: NSWritingDirection?
     ) -> NSAttributedString {
         let columnCount = rows.map(\.count).max() ?? 0
         guard columnCount > 0 else { return NSAttributedString() }
@@ -704,7 +725,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
                 )
                 let paragraphStyle = tableParagraphStyle(
                     block: block,
-                    alignment: tableTextAlignment(for: sourceTable, columnIndex: columnIndex)
+                    alignment: tableTextAlignment(for: sourceTable, columnIndex: columnIndex),
+                    direction: direction
                 )
                 let cell = columnIndex < row.count
                     ? row[columnIndex]
@@ -756,10 +778,15 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         return block
     }
 
-    private func tableParagraphStyle(block: NSTextTableBlock, alignment: NSTextAlignment) -> NSParagraphStyle {
+    private func tableParagraphStyle(
+        block: NSTextTableBlock,
+        alignment: NSTextAlignment,
+        direction: NSWritingDirection?
+    ) -> NSParagraphStyle {
         let paragraphStyle = NSMutableParagraphStyle()
         paragraphStyle.textBlocks = [block]
         paragraphStyle.alignment = alignment
+        MarkdownStructureDirection.apply(direction, to: paragraphStyle)
         paragraphStyle.lineBreakMode = .byWordWrapping
         paragraphStyle.paragraphSpacing = 0
         paragraphStyle.paragraphSpacingBefore = 0
@@ -770,7 +797,11 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         let alignment = columnIndex < table.columnAlignments.count
             ? table.columnAlignments[columnIndex]
             : nil
-        switch alignment ?? .left {
+        // An unspecified column follows the table's direction (leading edge); LTR tables are
+        // unchanged because `.natural` resolves to left there.
+        switch alignment {
+        case nil:
+            return .natural
         case .left:
             return .left
         case .right:
