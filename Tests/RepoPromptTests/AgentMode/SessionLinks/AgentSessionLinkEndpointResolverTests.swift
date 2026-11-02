@@ -55,6 +55,91 @@ final class AgentSessionLinkEndpointResolverTests: XCTestCase {
         XCTAssertEqual(navigationCount, 0, "Stale attribution must not enter the focus/restore router")
     }
 
+    @MainActor
+    func testAttributionSourceReplacedDuringTabSwitchNeverNavigates() async {
+        let source = makeCandidate()
+        var matches = [source]
+        var navigationCount = 0
+        await AppDeepLinkRouter.routeLoadedAgentSession(
+            sessionID: source.sessionID,
+            resolve: { _ in matches },
+            isAvailable: { matches.contains($0) },
+            prepareNavigation: { _ in
+                // The tab switch suspends while the user opens a different session in that tab.
+                matches = []
+            },
+            navigate: { _ in navigationCount += 1 }
+        )
+        XCTAssertEqual(navigationCount, 0, "A badge click must not restore the replaced source")
+    }
+
+    @MainActor
+    func testAttributionRealTabApplicationPreservesCurrentSession() async throws {
+        for replaceSource in [false, true] {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("BadgeRouting-\(UUID())")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let window = WindowState(automaticProviderModelDiscoveryEnabled: false)
+            let windows = WindowStatesManager.shared
+            let originalWindows = windows.allWindows
+            windows.allWindows = [window]
+            defer {
+                windows.allWindows = originalWindows
+                window.workspaceManager.setComposeTabFastStateDidApplyHandlerForTesting(nil)
+                for session in window.agentModeViewModel.sessions.values {
+                    session.saveDebounceTask?.cancel()
+                }
+                try? FileManager.default.removeItem(at: root)
+            }
+            let manager = window.workspaceManager
+            await manager.awaitInitialized()
+            let workspace = manager.createWorkspace(name: "Badge routing", repoPaths: [], ephemeral: true)
+            await manager.switchWorkspace(to: workspace, saveState: false, reason: "badgeRoutingTest")
+            let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspace.id })
+            manager.workspaces[index].customStoragePath = root
+            try window.promptManager.loadComposeTabsFromWorkspace(XCTUnwrap(manager.activeWorkspace), syncPromptText: true)
+            let vm = window.agentModeViewModel
+            let createdSourceTabID = await vm.createAndActivateSessionTab()
+            let sourceTabID = try XCTUnwrap(createdSourceTabID)
+            let source = try XCTUnwrap(vm.sessions[sourceTabID])
+            let sourceID = try XCTUnwrap(source.activeAgentSessionID)
+            let sourceBinding = source.persistentSessionBindingIdentity
+            let replacementID = UUID()
+            let replacement = AgentSession(id: replacementID, workspaceID: workspace.id, composeTabID: sourceTabID, name: "New selection")
+            _ = try await AgentSessionDataService.shared.saveAgentSession(replacement, for: XCTUnwrap(manager.activeWorkspace))
+            _ = await vm.createAndActivateSessionTab()
+            var appliedSource = false
+            var replacementResult: AgentRouteSessionActivationResult?
+            manager.setComposeTabFastStateDidApplyHandlerForTesting { tabID in
+                guard tabID == sourceTabID else { return }
+                appliedSource = true
+                if replaceSource {
+                    replacementResult = await vm.activateRoutedAgentSession(
+                        tabID: sourceTabID, sessionID: replacementID, workspace: manager.activeWorkspace!
+                    )
+                }
+            }
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook { id in
+                if id == sourceID { XCTFail("Badge navigation must never hydrate the old source") }
+            }
+            await AppDeepLinkRouter(windowStatesManager: windows).routeLoadedAgentSession(sessionID: sourceID)
+            await AgentSessionDataService.shared.test_setAfterHydrationPrepareHook(nil)
+            XCTAssertTrue(appliedSource, "The badge must traverse the actual suspended tab application")
+            XCTAssertEqual(window.promptManager.activeComposeTabID, sourceTabID)
+            XCTAssertEqual(
+                manager.activeWorkspace?.composeTabs.first { $0.id == sourceTabID }?.activeAgentSessionID,
+                replaceSource ? replacementID : sourceID
+            )
+            XCTAssertEqual(vm.sessions[sourceTabID]?.activeAgentSessionID, replaceSource ? replacementID : sourceID)
+            if replaceSource {
+                XCTAssertEqual(replacementResult, .ready)
+            } else {
+                XCTAssertEqual(vm.sessions[sourceTabID]?.persistentSessionBindingIdentity, sourceBinding)
+            }
+            await vm.prepareForWindowClose()
+            await vm.test_drainSessionPersistenceAfterWindowClose()
+        }
+    }
+
     // MARK: - Fixtures
 
     private func makeCandidate(

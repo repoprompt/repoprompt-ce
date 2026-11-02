@@ -6,6 +6,7 @@ import SwiftUI
 
 extension EnvironmentValues {
     @Entry var agentWindowIsFocused: Bool = true
+    @Entry var navigateToLoadedAgentSession: @MainActor (UUID) async -> Void = { _ in }
 }
 
 // MARK: - Message Footer Strip
@@ -216,6 +217,7 @@ struct AgentMessageBubble: View {
     let showRunScopedToolCancel: Bool
     let cancelActiveToolsAction: (() -> Void)?
     let codexManagedLoginAction: CodexManagedLoginAction?
+    @Environment(\.navigateToLoadedAgentSession) private var navigateToLoadedAgentSession
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
@@ -459,7 +461,7 @@ struct AgentMessageBubble: View {
             isOpeningAttributionSource = true
             Task {
                 defer { isOpeningAttributionSource = false }
-                await AppDeepLinkRouter.shared.routeLoadedAgentSession(sessionID: attribution.sourceSessionID)
+                await navigateToLoadedAgentSession(attribution.sourceSessionID)
             }
         } label: {
             HStack(spacing: 4) {
