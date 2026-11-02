@@ -995,9 +995,14 @@ final class CodexCLIProvider: AIProvider {
         )
     }
 
-    private func makeRequestAppServerClient() -> CodexAppServerClient? {
+    func makeRequestAppServerClient() -> CodexAppServerClient? {
         guard sessionControllerFactory == nil else { return nil }
-        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(launchSnapshot: launchSnapshot)
+        // Raw item mirrors can include original image bytes and exceed the transport frame limit.
+        // Keep response-completed usage, but suppress the unused item mirror before server framing.
+        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(
+            launchSnapshot: launchSnapshot,
+            optOutNotificationMethods: ["rawResponseItem/completed"]
+        )
     }
 
     private func withActiveRequestAppServerClient<T>(

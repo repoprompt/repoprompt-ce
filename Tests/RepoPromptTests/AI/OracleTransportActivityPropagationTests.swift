@@ -20,7 +20,7 @@ final class OracleTransportActivityPropagationTests: XCTestCase {
             )
         }
         let cases: [([Event], Int?, Int?)] = [
-            ([usage("a", 2, 3), usage("b", 5, 7), usage("a", 2, 3)], 7, 10),
+            ([usage("a", 2, 3), .tokenUsage(.init(modelContextWindow: 100_000, lastTotalTokens: 900, totalTotalTokens: 9000)), usage("b", 5, 7), usage("a", 2, 3)], 7, 10),
             ([usage("a", 0), usage("other", 9, thread: "wrong"), usage("old", 9, turn: "wrong")], 0, 0),
             ([usage("a", 2), usage("a", 3)], nil, nil),
             ([usage("a", 2), usage("b", nil)], nil, nil),

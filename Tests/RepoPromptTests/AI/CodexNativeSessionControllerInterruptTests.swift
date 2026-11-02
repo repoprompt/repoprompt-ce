@@ -182,6 +182,97 @@ final class CodexMCPDiscoveryPolicyTests: XCTestCase {
 final class CodexAppServerFramingTests: XCTestCase {
     private let budget = 64 * 1024 * 1024
 
+    func testRawItemOptOutInitializationAndFakeServerContract() async throws {
+        let requestClient = try XCTUnwrap(CodexCLIProvider().makeRequestAppServerClient())
+        let requestOptOut = await requestClient.optOutNotificationMethods
+        let defaultOptOut = await CodexProviderHelpers.makeOwnedNonAgentAppServerClient().optOutNotificationMethods
+        XCTAssertEqual(requestOptOut, ["rawResponseItem/completed"])
+        XCTAssertEqual(defaultOptOut, [])
+        for optOut in [[], ["rawResponseItem/completed"]] {
+            let sent = AsyncStream<Data>.makeStream()
+            let client = CodexAppServerClient(
+                writeFrameHandler: { _, frame in sent.continuation.yield(frame) },
+                livenessProbe: { _ in true },
+                optOutNotificationMethods: optOut
+            )
+            var writes = sent.stream.makeAsyncIterator()
+            // Replacing Config (including the debug-logging path) must not lose the subscription policy.
+            await client.updateConfig(.init(enableDebugLogging: true))
+            var advertisedOptOut: [String] = []
+            for _ in 0 ..< 2 {
+                // A fresh transport resets initialization; the immutable policy must be reused.
+                await client.debugInstallTestTransport(initialized: false)
+                let generation = await client.debugTransportGeneration()
+                let startup = Task { try await client.startIfNeeded(initializationTimeout: 5) }
+                let nextFrame = await writes.next()
+                let frame = try XCTUnwrap(nextFrame)
+                let request = try XCTUnwrap(JSONSerialization.jsonObject(with: frame) as? [String: Any])
+                XCTAssertEqual(request["method"] as? String, "initialize")
+                let params = try XCTUnwrap(request["params"] as? [String: Any])
+                let capabilities = try XCTUnwrap(params["capabilities"] as? [String: Any])
+                XCTAssertEqual(capabilities["experimentalApi"] as? Bool, true)
+                XCTAssertEqual(capabilities["optOutNotificationMethods"] as? [String], optOut.isEmpty ? nil : optOut)
+                advertisedOptOut = capabilities["optOutNotificationMethods"] as? [String] ?? []
+                let response = try JSONSerialization.data(withJSONObject: ["id": XCTUnwrap(request["id"]), "result": [String: Any]()])
+                await client.debugIngestStdoutChunk(response + Data([10]), generation: generation)
+                let nextInitializedFrame = await writes.next()
+                let initializedFrame = try XCTUnwrap(nextInitializedFrame)
+                let initialized = try XCTUnwrap(JSONSerialization.jsonObject(with: initializedFrame) as? [String: Any])
+                XCTAssertEqual(initialized["method"] as? String, "initialized")
+                try await startup.value
+            }
+            guard !optOut.isEmpty else { continue }
+            var options = CodexNativeSessionController.Options.agentModeDefault()
+            options.exactResponseUsageEnabled = true
+            let controller = CodexNativeSessionController(
+                client: client, runID: UUID(), tabID: UUID(), windowID: 1,
+                workspacePaths: .uniform(NSTemporaryDirectory()), options: options
+            )
+            try await controller.test_beginBindingSession()
+            _ = await controller.test_finishBinding(
+                result: ["thread": ["id": "thread", "turns": []]], fallbackEffort: nil
+            )
+            await controller.test_installThreadState(threadID: "thread", authoritativeTurnID: "turn", routingTurnID: "turn")
+            let events = controller.events
+            await controller.test_ensureInboundStreamsStarted()
+            let generation = await client.debugTransportGeneration()
+            // Fake-server contract, not a real Codex run: honor the advertised exact-method opt-out
+            // before writing notifications, retaining canonical text, exact usage and terminal state.
+            let notifications: [(String, [String: Any])] = [
+                ("rawResponseItem/completed", ["threadId": "thread", "turnId": "turn", "item": ["type": "message", "content": "small mirror"]]),
+                ("item/completed", ["threadId": "thread", "turnId": "turn", "item": ["id": "answer", "type": "agentMessage", "text": "canonical text"]]),
+                ("rawResponse/completed", ["threadId": "thread", "turnId": "turn", "responseId": "response", "usage": ["inputTokens": 11, "outputTokens": 7]]),
+                ("turn/completed", ["threadId": "thread", "turn": ["id": "turn", "status": "completed"]])
+            ]
+            for (method, params) in notifications where !advertisedOptOut.contains(method) {
+                let frame = try JSONSerialization.data(withJSONObject: ["method": method, "params": params])
+                await client.debugIngestStdoutChunk(frame + Data([10]), generation: generation)
+            }
+            var text = ""
+            var usage: CodexNativeSessionController.ResponseUsage?
+            var completed = false
+            for await event in events {
+                switch event {
+                case let .assistantCompleted(payload): text = payload.text
+                case let .responseUsage(threadID, turnID, responseID, value):
+                    XCTAssertEqual(threadID, "thread")
+                    XCTAssertEqual(turnID, "turn")
+                    XCTAssertEqual(responseID, "response")
+                    usage = value
+                case let .turnCompleted(_, status, _):
+                    XCTAssertEqual(status, .completed)
+                    completed = true
+                default: break
+                }
+                if completed { break }
+            }
+            XCTAssertTrue(completed)
+            XCTAssertEqual(text, "canonical text")
+            XCTAssertEqual(usage, .init(inputTokens: 11, outputTokens: 7))
+            await controller.shutdown()
+        }
+    }
+
     func testExactResponseUsageNormalizationIsOptInAndDoesNotMirrorText() async throws {
         for enabled in [false, true] {
             var options = CodexNativeSessionController.Options.agentModeDefault()

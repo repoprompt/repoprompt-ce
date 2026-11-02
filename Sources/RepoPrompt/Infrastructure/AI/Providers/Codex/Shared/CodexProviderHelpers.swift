@@ -27,10 +27,12 @@ enum CodexProviderHelpers {
     /// These flows should not share transport/process state across chat, health checks,
     /// and model polling because failures become sticky across otherwise unrelated work.
     static func makeOwnedNonAgentAppServerClient(
-        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil
+        launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot? = nil,
+        optOutNotificationMethods: [String] = []
     ) -> CodexAppServerClient {
         CodexAppServerClient(
-            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot()
+            launchSnapshot: launchSnapshot ?? CodexRuntimeAuthority.currentLaunchSnapshot(),
+            optOutNotificationMethods: optOutNotificationMethods
         )
     }
 

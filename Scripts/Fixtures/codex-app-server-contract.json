@@ -13,6 +13,9 @@
         "clientInfo.version",
         "capabilities",
         "capabilities.experimentalApi"
+      ],
+      "maySend": [
+        "capabilities.optOutNotificationMethods"
       ]
     },
     {
