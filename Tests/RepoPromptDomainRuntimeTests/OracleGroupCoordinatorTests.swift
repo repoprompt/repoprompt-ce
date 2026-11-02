@@ -4,37 +4,34 @@ import os
 import XCTest
 
 final class OracleGroupCoordinatorTests: XCTestCase {
-    func testSilentEntryFreezesIndependentlyBeforeProgressAndFailureNormalization() async throws {
+    func testFinalLaneDurationsExcludeProgressAndFreezeBeforeFailureNormalization() async throws {
         let clock = OSAllocatedUnfairLock(initialState: ContinuousClock.now)
         let release = TimingEntryGate()
-        let fixture = try makeFixture(count: 2, clock: clock) { lane in
+        let replyID = UUID()
+        let fixture = try makeFixture(count: 2) { lane in
             clock.withLock { $0 = $0.advanced(by: lane == 0 ? .milliseconds(1250) : .seconds(2)) }
             if lane == 1 { throw OracleLaneFailure(message: "failure") }
-            return OracleLaneExecutionResponse(response: "silent success")
+            return OracleLaneExecutionResponse(response: "silent success", assistantReplyID: replyID)
         }
         let result = try await OracleGroupCoordinator().execute(
-            group: fixture.group, turnID: fixture.timing.turnID, input: fixture.input,
-            plans: fixture.plans, timing: fixture.timing,
+            group: fixture.group, turnID: OracleTurnID(), input: fixture.input,
+            plans: fixture.plans, elapsedNow: { clock.withLock { $0 } },
             progress: { event in
                 if event.kind == .laneStarted, event.laneID?.index == 1 {
                     await release.wait()
                 }
                 if event.kind == .laneSettled, event.laneID?.index == 0 {
-                    let frozen = fixture.timing.read(.lane(fixture.plans[0].lane.laneID))
-                    XCTAssertEqual(frozen.sample, .frozen(1.25))
-                    XCTAssertEqual(fixture.timing.read(.lane(fixture.plans[1].lane.laneID)).sample, .unavailable)
                     clock.withLock { $0 = $0.advanced(by: .seconds(10)) }
-                    // Reads, not notification delivery, determine stopped display evidence.
-                    XCTAssertEqual(fixture.timing.read(.lane(fixture.plans[0].lane.laneID)), frozen)
                     await release.open()
                 }
             }
         )
         XCTAssertEqual(result.oracleResults.map(\.elapsedSeconds), [1.25, 2])
+        XCTAssertEqual(result.oracleResults.map(\.assistantReplyID), [replyID, nil])
         XCTAssertEqual(result.oracleResults.map(\.status), [.completed, .failed])
     }
 
-    func testCancellationBeforeEntryHasNoElapsedAndMismatchedHandleIsRejected() async throws {
+    func testCancellationBeforeEntryHasNoElapsed() async throws {
         let fixture = try makeFixture(count: 2) { _ in
             XCTFail("Cancelled lane must not enter")
             return OracleLaneExecutionResponse(response: "unexpected")
@@ -43,8 +40,8 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         let release = TimingEntryGate()
         let task = Task {
             try await OracleGroupCoordinator().execute(
-                group: fixture.group, turnID: fixture.timing.turnID, input: fixture.input,
-                plans: fixture.plans, timing: fixture.timing,
+                group: fixture.group, turnID: OracleTurnID(), input: fixture.input,
+                plans: fixture.plans,
                 progress: { event in
                     if event.kind == .groupPrepared {
                         await enteredProgress.open()
@@ -59,48 +56,6 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         let result = try await task.value
         XCTAssertEqual(result.oracleResults.map(\.elapsedSeconds), [nil, nil])
         XCTAssertEqual(result.oracleResults.map(\.status), [.cancelled, .cancelled])
-        await XCTAssertOracleThrowsErrorAsync {
-            try await OracleGroupCoordinator().execute(
-                group: fixture.group, turnID: OracleTurnID(), input: fixture.input,
-                plans: fixture.plans, timing: fixture.timing
-            )
-        } verify: { XCTAssertEqual($0 as? OracleGroupCoordinatorError, .invalidLanePlan) }
-    }
-
-    func testTimingLifecycleReadNotificationsAndUnknownExitAreAbsorbing() throws {
-        let fixture = try makeFixture(count: 2)
-        let clock = OSAllocatedUnfairLock(initialState: ContinuousClock.now)
-        let notifications = OSAllocatedUnfairLock(initialState: [OracleGroupTiming.Snapshot]())
-        let timing = OracleGroupTiming(
-            invocationID: UUID(),
-            group: fixture.group,
-            turnID: fixture.timing.turnID,
-            laneIDs: fixture.plans.map(\.lane.laneID),
-            now: { clock.withLock { $0 } },
-            onChange: { handle in
-                let snapshot = handle.read(.group)
-                notifications.withLock { $0.append(snapshot) }
-            }
-        )
-        XCTAssertNotEqual(timing, fixture.timing)
-        XCTAssertEqual(timing, timing)
-        timing.start(.group)
-        timing.start(.lane(fixture.plans[0].lane.laneID))
-        clock.withLock { $0 = $0.advanced(by: .milliseconds(750)) }
-        let running = timing.read(.group)
-        XCTAssertEqual(running.sample, .running(0.75))
-        XCTAssertEqual(timing.freeze(.lane(fixture.plans[0].lane.laneID)), 0.75)
-        timing.invalidateRunning()
-        let closed = timing.read(.group)
-        XCTAssertEqual(closed.sample, .unavailable)
-        clock.withLock { $0 = $0.advanced(by: .seconds(100)) }
-        timing.start(.group)
-        timing.start(.lane(fixture.plans[1].lane.laneID))
-        XCTAssertNil(timing.freeze(.group))
-        XCTAssertEqual(timing.read(.group), closed)
-        XCTAssertEqual(timing.read(.lane(fixture.plans[0].lane.laneID)).sample, .frozen(0.75))
-        XCTAssertEqual(timing.read(.lane(fixture.plans[1].lane.laneID)).sample, .unavailable)
-        XCTAssertEqual(notifications.withLock { $0.count }, 4)
     }
 
     func testRejectsNoncontiguousLanePlans() async throws {
@@ -109,10 +64,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         await XCTAssertOracleThrowsErrorAsync {
             _ = try await OracleGroupCoordinator().execute(
                 group: fixture.group,
-                turnID: fixture.timing.turnID,
+                turnID: OracleTurnID(),
                 input: fixture.input,
-                plans: [fixture.plans[1], fixture.plans[0]],
-                timing: fixture.timing
+                plans: [fixture.plans[1], fixture.plans[0]]
             )
         } verify: {
             XCTAssertEqual($0 as? OracleGroupCoordinatorError, .invalidLanePlan)
@@ -126,10 +80,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
-            plans: fixture.plans,
-            timing: fixture.timing
+            plans: fixture.plans
         )
 
         XCTAssertEqual(result.status, .completed)
@@ -151,10 +104,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
-            plans: fixture.plans,
-            timing: fixture.timing
+            plans: fixture.plans
         )
 
         XCTAssertEqual(result.oracleResults.map(\.modelID), Array(repeating: "duplicate-model", count: 2))
@@ -179,10 +131,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
-            plans: fixture.plans,
-            timing: fixture.timing
+            plans: fixture.plans
         )
 
         XCTAssertEqual(result.status, .partialFailure)
@@ -206,10 +157,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
-            plans: fixture.plans,
-            timing: fixture.timing
+            plans: fixture.plans
         )
 
         XCTAssertEqual(result.status, .partialFailure)
@@ -227,10 +177,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
-            plans: fixture.plans,
-            timing: fixture.timing
+            plans: fixture.plans
         )
 
         XCTAssertEqual(result.oracleResults[1].error?.code, "  padded_code  ")
@@ -245,10 +194,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
-            plans: fixture.plans,
-            timing: fixture.timing
+            plans: fixture.plans
         )
 
         XCTAssertEqual(result.status, .partialFailure)
@@ -267,10 +215,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         }
         let result = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
-            plans: fixture.plans,
-            timing: fixture.timing
+            plans: fixture.plans
         )
 
         XCTAssertEqual(result.status, .failed)
@@ -296,10 +243,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         )
         _ = try await OracleGroupCoordinator().execute(
             group: fixture.group,
-            turnID: fixture.timing.turnID,
+            turnID: OracleTurnID(),
             input: fixture.input,
             plans: plans,
-            timing: fixture.timing,
             progress: { await progress.record($0) }
         )
         let eventsAtReturn = await progress.events()
@@ -327,10 +273,9 @@ final class OracleGroupCoordinatorTests: XCTestCase {
         let task = Task {
             try await OracleGroupCoordinator().execute(
                 group: fixture.group,
-                turnID: fixture.timing.turnID,
+                turnID: OracleTurnID(),
                 input: fixture.input,
                 plans: fixture.plans,
-                timing: fixture.timing,
                 progress: { await progress.record($0) }
             )
         }
@@ -355,11 +300,10 @@ final class OracleGroupCoordinatorTests: XCTestCase {
 
     private func makeFixture(
         count: Int,
-        clock: OSAllocatedUnfairLock<ContinuousClock.Instant>? = nil,
         operation: @escaping @Sendable (Int) async throws -> OracleLaneExecutionResponse = {
             OracleLaneExecutionResponse(response: "lane-\($0)")
         }
-    ) throws -> (group: OracleGroupDescriptor, input: OracleInput, plans: [OracleLanePlan], timing: OracleGroupTiming) {
+    ) throws -> (group: OracleGroupDescriptor, input: OracleInput, plans: [OracleLanePlan]) {
         let group = try OracleGroupDescriptor(size: count)
         let input = try OracleInput(mode: .chat, userMessage: "Frozen input")
         let plans = try (0 ..< count).map { index in
@@ -371,14 +315,7 @@ final class OracleGroupCoordinatorTests: XCTestCase {
                 operation: { _ in try await operation(index) }
             )
         }
-        let timing = OracleGroupTiming(
-            invocationID: UUID(),
-            group: group,
-            turnID: OracleTurnID(),
-            laneIDs: plans.map(\.lane.laneID),
-            now: { clock?.withLock { $0 } ?? .now }
-        )
-        return (group, input, plans, timing)
+        return (group, input, plans)
     }
 }
 

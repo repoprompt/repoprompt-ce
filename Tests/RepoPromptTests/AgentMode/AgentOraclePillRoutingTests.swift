@@ -2,7 +2,6 @@ import AppKit
 import Combine
 import Foundation
 import MCP
-import os
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
@@ -679,6 +678,11 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             let storedSession = try await vm.chatData.loadChatSession(from: fileURL)
             let query = try XCTUnwrap(storedSession.messages.first { $0.id == queryID && !$0.isUser })
             XCTAssertEqual(completion.result.oracleResults[member.laneID.index].capturedModelName, query.modelName)
+            XCTAssertEqual(completion.result.oracleResults[member.laneID.index].assistantReplyID, queryID)
+            let current = vm.oracleMemberPresentation(for: session)
+            XCTAssertEqual(current.assistantReplyID, queryID)
+            let elapsed = try XCTUnwrap(current.elapsedSeconds)
+            XCTAssertEqual(current.completedElapsedSeconds(for: AIChatMessage(id: queryID, content: "", isUser: false, isFinalized: true)), elapsed)
         }
         let projections = vm.sessions
         vm.sessions = []
@@ -932,7 +936,12 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let store = AppDomainRuntimeComposition.shared.oracleConversationStore
         try await store.create(prepared)
         addTeardownBlock { try? await self.deleteCanonicalOracleGroup(prepared) }
-        let terminal = try terminalGroup(prepared, secondaryStatus: .failed, elapsedSeconds: 61.25)
+        let terminal = try terminalGroup(
+            prepared,
+            secondaryStatus: .failed,
+            elapsedSeconds: 61.25,
+            assistantReplyIDs: [0: UUID(), 1: UUID()]
+        )
         _ = try await OracleGroupTerminalPublisher.publish(
             terminal: terminal,
             expectedRevision: prepared.revision,
@@ -966,7 +975,6 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         Error [provider_failed]: Synthetic lane failure
         """)
         await fixture.oracleViewModel.loadOracleGroupPresentation(containing: failed)
-        XCTAssertEqual(fixture.oracleViewModel.oracleGroupPresentation(for: failed)?.elapsedSample(.group), .frozen(61.25))
         XCTAssertEqual(fixture.oracleViewModel.oracleMemberPresentation(for: failed).elapsedSeconds, 61.25)
 
         let pill = AgentOraclePill(
@@ -996,125 +1004,44 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         }
     }
 
-    func testGroupedTimingBindingRejectsStaleAssociationAndCanonicalNilOverridesLocalEvidence() async throws {
+    func testGroupedCompletedFooterUsesPersistedExactReplyAndNeverBorrowsPriorTurn() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
         let vm = fixture.oracleViewModel
         let prepared = try makeCanonicalOracleGroup(fixture: fixture).group
-        let member = makeProjection(member: prepared.members[0], group: prepared, fixture: fixture)
-        vm.sessions = [member]
-        let invocationID = UUID()
-        let turnID = try XCTUnwrap(prepared.turns.last?.id)
-        let instant = ContinuousClock.now
-        let clock = OSAllocatedUnfairLock(initialState: instant)
-        let handle = OracleGroupTiming(
-            invocationID: invocationID,
-            group: prepared.group,
-            turnID: turnID,
-            laneIDs: prepared.members.map(\.laneID),
-            now: { clock.withLock { $0 } }
+        let sessions = prepared.members.map { makeProjection(member: $0, group: prepared, fixture: fixture) }
+        vm.sessions = sessions
+        let replyID = UUID()
+        let reply = AIChatMessage(id: replyID, content: "answer", isUser: false, isFinalized: true)
+        let other = AIChatMessage(content: "prior answer", isUser: false, isFinalized: true)
+        let terminal = try terminalGroup(
+            prepared,
+            secondaryStatus: .completed,
+            elapsedSeconds: 12.5,
+            assistantReplyIDs: [0: replyID]
         )
-        handle.start(.group)
-        vm.recordOracleGroupPresentation(prepared)
-        XCTAssertEqual(vm.oracleGroupPresentation(for: member)?.elapsedSample(.group), .unavailable)
-        vm.recordOracleGroupPresentation(prepared, invocationID: invocationID, timing: handle)
-        clock.withLock { $0 = instant.advanced(by: .seconds(7)) }
-        let bound = try XCTUnwrap(vm.oracleGroupPresentation(for: member))
-        XCTAssertTrue(bound.timing === handle)
-        XCTAssertEqual(bound.elapsedSample(.group), .running(7))
-        vm.recordOracleGroupPresentation(prepared) // Reopen/read of the same revision preserves the reference.
-        XCTAssertTrue(vm.oracleGroupPresentation(for: member)?.timing === handle)
-        let impostor = OracleGroupTiming(
-            invocationID: invocationID,
-            group: prepared.group,
-            turnID: turnID,
-            laneIDs: prepared.members.map(\.laneID)
+        let decoded = try JSONDecoder().decode(OracleGroupDocument.self, from: JSONEncoder().encode(terminal))
+        vm.recordOracleGroupPresentation(decoded)
+        XCTAssertEqual(vm.oracleMemberPresentation(for: sessions[0]).completedElapsedSeconds(for: reply), 12.5)
+        XCTAssertNil(vm.oracleMemberPresentation(for: sessions[0]).completedElapsedSeconds(for: other))
+        XCTAssertNil(vm.oracleMemberPresentation(for: sessions[1]).completedElapsedSeconds(for: reply), "Missing legacy link cannot borrow another lane's reply")
+        let nextTurn = try OracleTurnRecord(
+            input: OracleInput(mode: .chat, userMessage: "next"),
+            state: .prepared,
+            startedAt: terminal.updatedAt
         )
-        impostor.start(.group)
-        vm.receiveOracleGroupTiming(impostor, owner: prepared.owner, invocationID: invocationID)
-        vm.receiveOracleGroupTiming(handle, owner: prepared.owner, invocationID: UUID())
-        XCTAssertEqual(vm.oracleGroupPresentation(for: member), bound)
-        let event = OracleProgressEvent(
-            kind: .laneStarted,
-            groupID: prepared.group.id,
-            turnID: turnID,
-            laneID: prepared.members[0].laneID,
-            sequence: 0
+        let next = try OracleGroupDocument(
+            group: terminal.group, owner: terminal.owner, name: terminal.name,
+            revision: terminal.revision + 1, createdAt: terminal.createdAt, updatedAt: terminal.updatedAt,
+            roster: terminal.roster, members: terminal.members, turns: terminal.turns + [nextTurn]
         )
-        vm.receiveOracleGroupProgress(event, owner: prepared.owner, invocationID: UUID())
-        XCTAssertEqual(vm.oracleMemberPresentation(for: member).status, .unknown)
-        handle.freeze(.group)
-        var ended = bound
-        ended.endExecution()
-        vm.oracleGroupPresentations[bound.key] = ended
-        handle.invalidateRunning()
-        vm.receiveOracleGroupTiming(handle, owner: prepared.owner, invocationID: invocationID)
-        let cleaned = try XCTUnwrap(vm.oracleGroupPresentation(for: member))
-        XCTAssertNil(cleaned.invocationID)
-        XCTAssertEqual(cleaned.elapsedSample(.group), .frozen(7))
-        XCTAssertEqual(cleaned.timingRevision, handle.read(.group).revision)
-        XCTAssertEqual(vm.oracleMemberPresentation(for: member).status, .unknown)
-        try vm.recordOracleGroupPresentation(terminalGroup(prepared, secondaryStatus: .completed))
-        XCTAssertNil(vm.oracleGroupPresentation(for: member)?.timing)
-        XCTAssertEqual(vm.oracleGroupPresentation(for: member)?.elapsedSample(.group), .unavailable)
-        vm.receiveOracleGroupTiming(handle, owner: prepared.owner, invocationID: invocationID)
-        XCTAssertEqual(vm.oracleGroupPresentation(for: member)?.elapsedSample(.group), .unavailable)
-    }
-
-    func testGroupedTimingSilentEntryWakesAndFrozenReadStopsRefreshWithoutNotification() async throws {
-        let fixture = try await makeFixture()
-        defer { fixture.cleanup() }
-        let prepared = try makeCanonicalOracleGroup(fixture: fixture).group
-        let invocationID = UUID()
-        let turnID = try XCTUnwrap(prepared.turns.last?.id)
-        let instant = ContinuousClock.now
-        let handle = OracleGroupTiming(
-            invocationID: invocationID,
-            group: prepared.group,
-            turnID: turnID,
-            laneIDs: prepared.members.map(\.laneID),
-            now: { instant }
-        )
-        var presentation = OracleGroupPresentation(document: prepared, invocationID: invocationID, timing: handle)
-        let slot = OracleGroupTiming.Slot.lane(prepared.members[0].laneID)
-        XCTAssertFalse(AgentOraclePillLogic.elapsedNeedsRefresh(presentation.elapsedSample(slot)))
-        let original = presentation
-        handle.start(slot) // Actual entry with no text or progress event.
-        presentation.timingChanged(handle, invocationID: invocationID)
-        XCTAssertNotEqual(presentation, original)
-        XCTAssertTrue(AgentOraclePillLogic.elapsedNeedsRefresh(presentation.elapsedSample(slot)))
-        XCTAssertEqual(AgentOraclePillLogic.elapsedText(presentation.elapsedSample(slot), unpublished: true).visible, "0s")
-        handle.freeze(slot) // Hold invalidation: a label tick still reads the final runtime state.
-        let frozen = presentation.elapsedSample(slot)
-        XCTAssertFalse(AgentOraclePillLogic.elapsedNeedsRefresh(frozen))
-        let label = AgentOraclePillLogic.elapsedText(frozen, unpublished: true)
-        XCTAssertEqual(label.visible, "0s · unpublished")
-        XCTAssertEqual(label.spoken, "Elapsed 0 seconds, result not published")
-        XCTAssertEqual(AgentOraclePillLogic.elapsedText(.frozen(61.8), unpublished: false).visible, "1m 01s")
-        let spokenCases: [(OracleGroupTiming.Sample, Bool, String)] = [
-            (.running(0), true, "Elapsed 0 seconds"),
-            (.running(1.9), true, "Elapsed 1 second"),
-            (.frozen(2), false, "Elapsed 2 seconds"),
-            (.frozen(60), false, "Elapsed 1 minute, 0 seconds"),
-            (.frozen(61.8), false, "Elapsed 1 minute, 1 second"),
-            (.frozen(62), true, "Elapsed 1 minute, 2 seconds, result not published"),
-            (.frozen(121), false, "Elapsed 2 minutes, 1 second")
-        ]
-        for (sample, unpublished, expected) in spokenCases {
-            XCTAssertEqual(AgentOraclePillLogic.elapsedText(sample, unpublished: unpublished).spoken, expected)
-        }
-        XCTAssertEqual(AgentOraclePillLogic.elapsedText(.unavailable, unpublished: false).spoken, "Elapsed unavailable")
-        XCTAssertEqual(AgentOraclePillLogic.elapsedText(.frozen(.infinity), unpublished: false).visible, "Elapsed unavailable")
-        let staleTurn = OracleGroupTiming(
-            invocationID: invocationID,
-            group: prepared.group,
-            turnID: OracleTurnID(rawValue: UUID()),
-            laneIDs: prepared.members.map(\.laneID)
-        )
-        XCTAssertNil(OracleGroupPresentation(document: prepared, invocationID: invocationID, timing: staleTurn).timing)
-        XCTAssertNil(OracleGroupPresentation(document: prepared, invocationID: UUID(), timing: handle).timing)
-        presentation.endExecution()
-        XCTAssertFalse(AgentOraclePillLogic.elapsedNeedsRefresh(presentation.elapsedSample(.group)))
+        vm.recordOracleGroupPresentation(next, invocationID: UUID())
+        XCTAssertNil(vm.oracleMemberPresentation(for: sessions[0]).completedElapsedSeconds(for: reply), "Active next turn cannot reuse prior duration")
+        vm.recordOracleGroupPresentation(decoded)
+        XCTAssertNil(vm.oracleMemberPresentation(for: sessions[0]).completedElapsedSeconds(for: reply), "Older load cannot restore prior timing")
+        let ended = try terminalGroup(next, secondaryStatus: .completed, assistantReplyIDs: [0: replyID])
+        vm.recordOracleGroupPresentation(ended)
+        XCTAssertNil(vm.oracleMemberPresentation(for: sessions[0]).completedElapsedSeconds(for: reply), "Missing canonical measurement stays absent")
     }
 
     func testGroupedStatusUsesCurrentOutcomeIdentityAndMatchingLiveEvidence() async throws {
@@ -1765,7 +1692,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         _ prepared: OracleGroupDocument,
         secondaryStatus: OracleLaneResultStatus,
         capturedModelNames: [Int: String] = [:],
-        elapsedSeconds: Double? = nil
+        elapsedSeconds: Double? = nil,
+        assistantReplyIDs: [Int: UUID] = [:]
     ) throws -> OracleGroupDocument {
         let results = try prepared.members.map { member in
             let status: OracleLaneResultStatus = member.laneID.index == 0 ? .completed : secondaryStatus
@@ -1780,14 +1708,15 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 response: status == .completed ? "Completed sibling answer" : nil,
                 error: status == .completed ? nil : OracleLaneError(
                     code: "provider_failed", message: "Synthetic lane failure", partialResponse: "Unmarked partial answer"
-                )
+                ),
+                assistantReplyID: assistantReplyIDs[member.laneID.index]
             )
         }
         return try prepared.settling(OracleGroupResult(
             groupID: prepared.group.id,
             status: secondaryStatus == .completed ? .completed : .partialFailure,
             oracleResults: results
-        ), finishedAt: prepared.updatedAt.addingTimeInterval(10), elapsedSeconds: elapsedSeconds)
+        ), finishedAt: prepared.updatedAt.addingTimeInterval(10))
     }
 
     private func makeCanonicalOracleGroup(

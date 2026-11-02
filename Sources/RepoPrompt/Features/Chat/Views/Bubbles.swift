@@ -13,6 +13,19 @@ import SwiftUI
 // MARK: - Token Usage Indicator
 
 enum TokenUsagePresentation {
+    static func elapsedText(seconds value: Double?) -> (visible: String, spoken: String)? {
+        guard let value, value.isFinite, value >= 0,
+              let seconds = Int(exactly: value.rounded(.down)) else { return nil }
+        let duration = AgentRuntimeDurationFormatter.string(totalSeconds: seconds)
+        let minutes = seconds / 60
+        let remainder = seconds % 60
+        let spokenSeconds = "\(remainder) \(remainder == 1 ? "second" : "seconds")"
+        let spokenDuration = minutes == 0
+            ? spokenSeconds
+            : "\(minutes) \(minutes == 1 ? "minute" : "minutes"), \(spokenSeconds)"
+        return ("Elapsed: \(duration)", "Elapsed \(spokenDuration)")
+    }
+
     static func text(inputTokens: Int?, outputTokens: Int?) -> String {
         guard inputTokens != nil || outputTokens != nil else {
             return "Usage unavailable"
@@ -295,6 +308,7 @@ struct MessageBubble: View {
     @ObservedObject var viewModel: OracleViewModel
     let isLatestMessage: Bool
     let actionPolicy: ChatTranscriptActionPolicy
+    var oracleElapsedSeconds: Double?
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     // Flags for hover states
@@ -527,6 +541,12 @@ struct MessageBubble: View {
                         Text(modelName)
                             .font(fontPreset.captionFont)
                             .foregroundColor(.secondary.opacity(0.6))
+                    }
+                    if let elapsed = TokenUsagePresentation.elapsedText(seconds: oracleElapsedSeconds) {
+                        Text(elapsed.visible)
+                            .font(fontPreset.captionFont)
+                            .foregroundColor(.secondary.opacity(0.8))
+                            .accessibilityLabel(elapsed.spoken)
                     }
                 }
                 .padding(.vertical, 6)

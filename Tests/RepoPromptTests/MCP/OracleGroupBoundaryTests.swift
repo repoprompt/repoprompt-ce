@@ -295,7 +295,8 @@ import XCTest
                             modelID: "model-0",
                             status: .completed,
                             elapsedSeconds: elapsedSeconds,
-                            response: "response-0"
+                            response: "response-0",
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID.rawValue
                         ),
                         OracleLaneResult(
                             laneIndex: 1,
@@ -308,7 +309,8 @@ import XCTest
                                 code: "failed",
                                 message: "lane failed",
                                 partialResponse: "partial-1"
-                            )
+                            ),
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID.rawValue
                         )
                     ],
                     warnings: [OracleGroupWarning(code: "warning", message: "group warning")]
@@ -350,7 +352,8 @@ import XCTest
                                 modelID: "executed-primary-model",
                                 effectiveReasoningEffort: "high"
                             ),
-                            response: "Primary lane answer"
+                            response: "Primary lane answer",
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID
                         ),
                         OracleLaneResult(
                             laneIndex: 1,
@@ -363,7 +366,8 @@ import XCTest
                                 code: "provider_failed",
                                 message: "Secondary provider failed",
                                 partialResponse: "Secondary partial answer"
-                            )
+                            ),
+                            assistantReplyID: elapsedSeconds == nil ? nil : groupID
                         )
                     ],
                     warnings: [

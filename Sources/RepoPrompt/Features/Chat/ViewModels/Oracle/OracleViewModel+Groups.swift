@@ -365,9 +365,9 @@ extension OracleViewModel {
         let invocationID = UUID()
         let runID = tabContext?.agentModeRunID ?? invocationID
         let runtimeCallbacks = OracleGroupRuntime.Callbacks(
-            prepared: { [weak self] document, timing in
+            prepared: { [weak self] document in
                 guard let self else { throw CancellationError() }
-                await recordOracleGroupPresentation(document, invocationID: invocationID, timing: timing)
+                await recordOracleGroupPresentation(document, invocationID: invocationID)
                 try await restoreOracleGroupProjectionsIfNeeded(
                     document,
                     workspaceID: workspaceID,
@@ -378,11 +378,6 @@ extension OracleViewModel {
                 if let turn = document.turns.last {
                     try await callbacks?.prepared(document.group.id, turn.id, document.members)
                     await tabContext?.toolSettlement?.prepared(document.group.id, turn.id)
-                }
-            },
-            timingChanged: { [weak self] timing in
-                Task { @MainActor [weak self] in
-                    self?.receiveOracleGroupTiming(timing, owner: owner, invocationID: invocationID)
                 }
             },
             executeLane: { [weak self] invocation in
@@ -656,7 +651,8 @@ extension OracleViewModel {
             return OracleLaneExecutionResponse(
                 response: response.response,
                 executionProfile: response.executionProfile,
-                capturedModelName: capturedName()
+                capturedModelName: capturedName(),
+                assistantReplyID: queryID
             )
         } catch let cancellation as OracleLaneCancellation {
             throw OracleLaneCancellation(
@@ -1054,34 +1050,17 @@ extension OracleViewModel {
         return oracleGroupPresentations[key]?.member(session) ?? .unknown
     }
 
-    func oracleGroupPresentation(for session: ChatSession) -> OracleGroupPresentation? {
-        guard let key = OracleGroupPresentation.Key(session: session), isCurrentOracleProjection(session),
-              let presentation = oracleGroupPresentations[key],
-              presentation.matchingMember(session) != nil else { return nil }
-        return presentation
-    }
-
-    func recordOracleGroupPresentation(_ document: OracleGroupDocument, invocationID: UUID? = nil, timing: OracleGroupTiming? = nil) {
-        let next = OracleGroupPresentation(document: document, invocationID: invocationID, timing: timing)
-        if let timing, !next.isTerminal, next.timing !== timing { return }
+    func recordOracleGroupPresentation(_ document: OracleGroupDocument, invocationID: UUID? = nil) {
+        let next = OracleGroupPresentation(document: document, invocationID: invocationID)
         if let current = oracleGroupPresentations[next.key] {
             // A store read can win the race with the prepared callback for the same revision.
             let beginsKnownExecution = next.revision == current.revision && next.turnID == current.turnID
                 && next.members == current.members
                 && !current.isTerminal && current.invocationID == nil && invocationID != nil
-                && current.timing == nil
             guard next.revision > current.revision || beginsKnownExecution else { return }
         }
         oracleGroupPresentations[next.key] = next
         pruneOracleGroupPresentations()
-    }
-
-    func receiveOracleGroupTiming(_ timing: OracleGroupTiming, owner: OracleConversationOwner, invocationID: UUID) {
-        let key = OracleGroupPresentation.Key(groupID: timing.groupID, owner: owner)
-        guard var current = oracleGroupPresentations[key] else { return }
-        let previous = current
-        current.timingChanged(timing, invocationID: invocationID)
-        if current != previous { oracleGroupPresentations[key] = current }
     }
 
     func receiveOracleGroupProgress(_ event: OracleProgressEvent, owner: OracleConversationOwner, invocationID: UUID) {

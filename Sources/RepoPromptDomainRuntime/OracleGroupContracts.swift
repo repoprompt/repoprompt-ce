@@ -538,7 +538,16 @@ package struct OracleExecutionProfile: Codable, Equatable {
     }
 }
 
+/// Invalid optional timing never invalidates an otherwise valid canonical outcome.
+package func normalizedOracleElapsed(_ value: Double?) -> Double? {
+    guard let value, value.isFinite, value >= 0,
+          Int(exactly: value.rounded(.down)) != nil else { return nil }
+    return value == 0 ? 0 : value
+}
+
 package struct OracleLaneResult: Codable, Equatable {
+    /// Exact assistant reply captured at creation; never inferred from message content or dates.
+    package let assistantReplyID: UUID?
     package let elapsedSeconds: Double?
     package let laneIndex: Int
     package let role: OracleLaneRole
@@ -562,7 +571,8 @@ package struct OracleLaneResult: Codable, Equatable {
         executionProfile: OracleExecutionProfile? = nil,
         capturedModelName: String? = nil,
         response: String? = nil,
-        error: OracleLaneError? = nil
+        error: OracleLaneError? = nil,
+        assistantReplyID: UUID? = nil
     ) throws {
         let role: OracleLaneRole = laneIndex == 0 ? .primary : .additional
         try Self.validate(
@@ -584,6 +594,7 @@ package struct OracleLaneResult: Codable, Equatable {
         self.executionProfile = executionProfile
         self.capturedModelName = capturedModelName
         self.elapsedSeconds = normalizedOracleElapsed(elapsedSeconds)
+        self.assistantReplyID = assistantReplyID
         self.response = response
         self.error = error
     }
@@ -598,6 +609,7 @@ package struct OracleLaneResult: Codable, Equatable {
         case executionProfile = "execution_profile"
         case capturedModelName = "captured_model_name"
         case elapsedSeconds = "elapsed_seconds"
+        case assistantReplyID = "assistant_reply_id"
         case response
         case error
     }
@@ -613,6 +625,7 @@ package struct OracleLaneResult: Codable, Equatable {
         let executionProfile = try container.decodeIfPresent(OracleExecutionProfile.self, forKey: .executionProfile)
         let capturedModelName = try container.decodeIfPresent(String.self, forKey: .capturedModelName)
         let elapsedSeconds = try? container.decodeIfPresent(Double.self, forKey: .elapsedSeconds)
+        let assistantReplyID = try? container.decodeIfPresent(UUID.self, forKey: .assistantReplyID)
         let response = try container.decodeIfPresent(String.self, forKey: .response)
         let error = try container.decodeIfPresent(OracleLaneError.self, forKey: .error)
         try Self.validate(
@@ -634,6 +647,7 @@ package struct OracleLaneResult: Codable, Equatable {
         self.executionProfile = executionProfile
         self.capturedModelName = capturedModelName
         self.elapsedSeconds = normalizedOracleElapsed(elapsedSeconds)
+        self.assistantReplyID = assistantReplyID
         self.response = response
         self.error = error
     }
@@ -901,7 +915,6 @@ package enum OracleTurnState: String, Codable {
 }
 
 package struct OracleTurnRecord: Codable, Equatable {
-    package let elapsedSeconds: Double?
     package let id: OracleTurnID
     package let input: OracleInput
     package let state: OracleTurnState
@@ -919,8 +932,7 @@ package struct OracleTurnRecord: Codable, Equatable {
         finishedAt: Date? = nil,
         status: OracleGroupStatus? = nil,
         warnings: [OracleGroupWarning] = [],
-        results: [OracleLaneResult] = [],
-        elapsedSeconds: Double? = nil
+        results: [OracleLaneResult] = []
     ) {
         self.id = id
         self.input = input
@@ -930,7 +942,6 @@ package struct OracleTurnRecord: Codable, Equatable {
         self.status = status
         self.warnings = warnings
         self.results = results
-        self.elapsedSeconds = state == .terminal ? normalizedOracleElapsed(elapsedSeconds) : nil
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -942,7 +953,6 @@ package struct OracleTurnRecord: Codable, Equatable {
         case status
         case warnings
         case results
-        case elapsedSeconds
     }
 
     package init(from decoder: Decoder) throws {
@@ -955,8 +965,7 @@ package struct OracleTurnRecord: Codable, Equatable {
             finishedAt: container.decodeIfPresent(Date.self, forKey: .finishedAt),
             status: container.decodeIfPresent(OracleGroupStatus.self, forKey: .status),
             warnings: container.decodeIfPresent([OracleGroupWarning].self, forKey: .warnings) ?? [],
-            results: container.decode([OracleLaneResult].self, forKey: .results),
-            elapsedSeconds: try? container.decodeIfPresent(Double.self, forKey: .elapsedSeconds)
+            results: container.decode([OracleLaneResult].self, forKey: .results)
         )
     }
 }
@@ -1052,7 +1061,7 @@ package struct OracleMemberLookup: Codable, Equatable {
 }
 
 package extension OracleGroupDocument {
-    func settling(_ result: OracleGroupResult, finishedAt: Date = Date(), elapsedSeconds: Double? = nil) throws -> Self {
+    func settling(_ result: OracleGroupResult, finishedAt: Date = Date()) throws -> Self {
         guard result.groupID == group.id,
               let turn = turns.last,
               turn.state == .prepared
@@ -1067,8 +1076,7 @@ package extension OracleGroupDocument {
             finishedAt: finishedAt,
             status: result.status,
             warnings: result.warnings,
-            results: result.oracleResults,
-            elapsedSeconds: elapsedSeconds
+            results: result.oracleResults
         )
         return try Self(
             schemaVersion: schemaVersion,
@@ -1088,14 +1096,8 @@ package extension OracleGroupDocument {
         status: OracleLaneResultStatus,
         code: String,
         message: String,
-        finishedAt: Date = Date(),
-        timing: OracleGroupTiming? = nil
+        finishedAt: Date = Date()
     ) throws -> Self {
-        // Only an exact runtime association may contribute frozen measurements.
-        let matchingTiming = timing.flatMap { timing in
-            timing.group == group && timing.turnID == turns.last?.id
-                && timing.laneIDs == members.map(\.laneID) ? timing : nil
-        }
         let results = try members.map { member in
             try OracleLaneResult(
                 laneIndex: member.laneID.index,
@@ -1103,20 +1105,12 @@ package extension OracleGroupDocument {
                 providerID: member.model.providerID,
                 modelID: member.model.modelID,
                 status: status,
-                elapsedSeconds: matchingTiming.flatMap {
-                    if case let .frozen(value) = $0.read(.lane(member.laneID)).sample { return value }
-                    return nil
-                },
                 error: OracleLaneError(code: code, message: message)
             )
         }
         return try settling(
             OracleGroupResult(groupID: group.id, status: .failed, oracleResults: results),
-            finishedAt: finishedAt,
-            elapsedSeconds: matchingTiming.flatMap {
-                if case let .frozen(value) = $0.read(.group).sample { return value }
-                return nil
-            }
+            finishedAt: finishedAt
         )
     }
 }
