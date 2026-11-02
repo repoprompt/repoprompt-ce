@@ -631,6 +631,15 @@ architecture sets, executable/helper hashes, signing identifiers and teams,
 designated requirements, certificate fingerprints when present, and the
 canonical entitlement hash without recording secrets, host paths, or timestamps.
 
+Packaging, staged signing, archive validation, and promotion inspect every Mach-O
+slice of the app and `repoprompt-mcp` with
+`Scripts/validate_macos_runtime_symbols.py`. This rejects known Swift overlay
+imports that lack SDK availability annotations but are missing from supported
+macOS runtimes, including `os.Logger.isEnabled(type:)` and `os.Logger.disabled`
+(#1603). Use `OSLog.isEnabled(type:)` with a `Logger` created from the same handle
+instead. This bounded denylist is not a complete macOS 14 compatibility audit;
+launch validation on the oldest supported OS remains necessary.
+
 The direct fallback commands are `make release-preflight` and
 `make release-artifact`. The GitHub **Release Candidate** workflow runs the same
 path on `main` and on manual dispatch, then uploads the archive as a workflow
