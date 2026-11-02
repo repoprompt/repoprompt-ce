@@ -68,6 +68,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     package var scalarPreferences = GlobalScalarPreferences()
 
     private static let defaultAppearanceModeRaw = "System"
+    private static let defaultAppIconModeRaw = "System"
     private static let defaultFilePathDisplayOptionRaw = "Full"
     private static let defaultSelectedFilesSortMethodRaw = "nameAscending"
     private static let defaultFileEditFormatRaw = "Diff"
@@ -557,6 +558,16 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     package func setAppearanceModeRaw(_ raw: String, commit: Bool = true) {
         updateUIScalar(commit: commit) { settings in
             settings.appearanceMode = raw
+        }
+    }
+
+    package func appIconModeRaw() -> String {
+        scalarPreferences.ui?.appIconMode ?? Self.defaultAppIconModeRaw
+    }
+
+    package func setAppIconModeRaw(_ raw: String, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.appIconMode = raw
         }
     }
 
