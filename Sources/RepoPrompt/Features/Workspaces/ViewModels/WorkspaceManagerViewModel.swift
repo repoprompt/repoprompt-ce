@@ -10818,8 +10818,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         _ = updateComposeTabStoredOnly(tab, inWorkspaceID: workspaceID)
     }
 
-    /// Exact-identity stored update. This avoids duplicate-tab ambiguity and dirties the
-    /// workspace that was actually mutated rather than whichever workspace is active.
+    /// Workspace-qualified stored update. Preserve first-match lookup for duplicate IDs;
+    /// dirty the workspace that was actually mutated rather than whichever workspace is active.
     @MainActor
     @discardableResult
     func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {
@@ -10827,18 +10827,30 @@ class WorkspaceManagerViewModel: ObservableObject {
               let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
         else { return false }
 
-        let oldSelection = workspaces[workspaceIndex].composeTabs[tabIndex].selection
+        let previous = workspaces[workspaceIndex].composeTabs[tabIndex]
+        // Selection equality alone must not discard session-identity or other content edits.
+        guard previous != tab else { return true }
         var updatedTab = tab
         updatedTab.lastModified = Date()
-        workspaces[workspaceIndex].composeTabs[tabIndex] = updatedTab
+        var replacement = workspaces[workspaceIndex]
+        replacement.composeTabs[tabIndex] = updatedTab
+        replacement.dateModified = Date()
+        // The snapshot path's indexed identity proof is an optimization, not lookup authority:
+        // ambiguous/unresolvable IDs still mutate the first match through generic maintenance.
+        if workspaceIndexMap[workspaceID] == workspaceIndex,
+           modelRoutingTabIndexes[workspaceID]?[tab.id] == tabIndex,
+           previous.activeAgentSessionID == updatedTab.activeAgentSessionID
+        {
+            composeTabPresentationPublication = (workspaceID, [tab.id])
+        }
+        workspaces[workspaceIndex] = replacement
         recordSelectionRevisionIfChanged(
             workspaceIndex: workspaceIndex,
             tabIndex: tabIndex,
-            oldSelection: oldSelection,
+            oldSelection: previous.selection,
             newSelection: updatedTab.selection,
             reason: "updateComposeTabStoredOnly"
         )
-        workspaces[workspaceIndex].dateModified = Date()
 
         // Important: do NOT call promptViewModel.loadComposeTabsFromWorkspace(...)
         // and do NOT publish snapshots here. We only persist the stored tab data.

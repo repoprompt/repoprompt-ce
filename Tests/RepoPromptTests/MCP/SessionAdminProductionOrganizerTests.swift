@@ -1076,7 +1076,7 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
     }
 
     func testPublishedSubscriberReentryCannotBorrowCarrierPublicationProof() async {
-        for outerMutation in ["carriers", "presentation", "selection"] {
+        for outerMutation in ["carriers", "presentation", "selection", "storedOnly"] {
             let window = WindowState()
             await window.workspaceManager.awaitInitialized()
             let manager = window.workspaceManager
@@ -1113,6 +1113,10 @@ final class SessionAdminProductionOrganizerJourneyTests: XCTestCase {
                 XCTAssertEqual(manager.updateComposeTabPresentation(workspaceID: workspace.id, tabIDs: [target.id]) { _, value in
                     value.name = "Renamed"
                 }, [target.id])
+            case "storedOnly":
+                var updated = target
+                updated.selection = StoredSelection(selectedPaths: ["/nested-selection"])
+                XCTAssertTrue(manager.updateComposeTabStoredOnly(updated, inWorkspaceID: workspace.id))
             default:
                 XCTAssertTrue(manager.updateActiveComposeTabSelection(workspaceID: workspace.id, activeComposeTabID: sibling.id))
             }
