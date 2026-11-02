@@ -246,6 +246,10 @@ MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
 RELEASE_ARTIFACT_TIMEOUT_SECONDS = 4 * 60 * 60
 SMOKE_AGENT_WAIT_SECONDS = 120.0
+# Bounded wait for the app to finish restoring/hydrating workspaces after launch before the
+# smoke `workspace switch` stage gives up (issue #294 launch/restore race).
+SMOKE_WORKSPACE_READINESS_SECONDS = 90.0
+SMOKE_WORKSPACE_READINESS_POLL_SECONDS = 2.0
 
 IMPLEMENTED_OPERATIONS = {
     "doctor",
@@ -7628,6 +7632,65 @@ def is_already_on_workspace(stderr: str, workspace: str) -> bool:
     return expected in lines or f"Error: [-32600] Invalid Request: {expected}." in lines
 
 
+_WORKSPACE_SWITCH_BLOCKED_PATTERN = re.compile(
+    r'Workspace switch to ".*" is blocked by an? (?:active|stale) switch to ".*"',
+)
+
+
+def is_workspace_switch_blocked_by_active_switch(stderr: str) -> bool:
+    """True when `workspace switch` was refused because the app is still mid-switch.
+
+    Right after launch the app restores/hydrates its last workspace (reason `restore`,
+    phase `hydrating roots` / `restoring state`). That refusal is transient: the smoke flow
+    must wait and retry it instead of reporting a false failure.
+    """
+    return bool(_WORKSPACE_SWITCH_BLOCKED_PATTERN.search(stderr or ""))
+
+
+def run_workspace_switch_with_readiness_retry(
+    name: str,
+    argv: Sequence[str],
+    workspace: str,
+    repo_root: Path,
+    env: Optional[Dict[str, str]],
+    readiness_deadline: float,
+    poll_seconds: float = SMOKE_WORKSPACE_READINESS_POLL_SECONDS,
+) -> Tuple[int, str, str]:
+    """Run the smoke `workspace switch` stage, retrying while the app is still restoring.
+
+    Returns the final `(code, stdout, stderr)`; `code == 0` also covers the already-on-workspace
+    refusal, which is not a failure. Any other refusal is returned unchanged so the caller can
+    report it. The retry window is bounded by `readiness_deadline` (conductor `now()` clock).
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        code, stdout, stderr = run_operation_command(name, argv, repo_root, env=env, allow_exit_codes={0, 1})
+        if code == 0:
+            return code, stdout, stderr
+        if code == 1 and is_already_on_workspace(stderr, workspace):
+            print(f'Already on workspace "{workspace}"; continuing smoke flow.', flush=True)
+            return 0, stdout, stderr
+        if code == 1 and is_workspace_switch_blocked_by_active_switch(stderr):
+            if now() >= readiness_deadline:
+                print(
+                    f"ERROR: workspace switch to \"{workspace}\" stayed blocked by an active switch "
+                    f"after {attempt} attempt(s); the app did not finish restoring in time.",
+                    flush=True,
+                )
+                return code, stdout, stderr
+            print(
+                f'Workspace switch to "{workspace}" is blocked while the app restores (attempt {attempt}); '
+                f"retrying in {poll_seconds:g}s...",
+                flush=True,
+            )
+            time.sleep(poll_seconds)
+            continue
+        if code == 1:
+            print(f"FAILED stage '{name}' with status {code}", flush=True)
+        return code, stdout, stderr
+
+
 def routed_structured_cli_argv(cli: str, window_id: int, command: str, payload: Dict[str, Any]) -> List[str]:
     routed_payload = dict(payload)
     routed_payload["_windowID"] = window_id
@@ -8189,6 +8252,9 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
                 return code or 1
             time.sleep(2.0)
 
+    # `windows` can succeed while the app is still restoring its last workspace; the switch
+    # stage therefore waits (bounded) through a restore/hydration refusal instead of failing.
+    readiness_deadline = min(deadline, now() + SMOKE_WORKSPACE_READINESS_SECONDS)
     stages = [
         ("windows", [cli, "-e", "windows"]),
         ("workspace switch", [cli, "-w", str(window_id), "-e", f"workspace switch {workspace}"]),
@@ -8200,14 +8266,13 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
         ),
     ]
     for name, argv in stages:
-        allow_exit_codes = {0, 1} if name == "workspace switch" else None
-        code, _stdout, stderr = run_operation_command(name, argv, repo_root, env=env, allow_exit_codes=allow_exit_codes)
-        if name == "workspace switch" and code == 1 and is_already_on_workspace(stderr, workspace):
-            print(f'Already on workspace "{workspace}"; continuing smoke flow.', flush=True)
-            continue
+        if name == "workspace switch":
+            code, _stdout, _stderr = run_workspace_switch_with_readiness_retry(
+                name, argv, workspace, repo_root, env, readiness_deadline
+            )
+        else:
+            code, _stdout, _stderr = run_operation_command(name, argv, repo_root, env=env)
         if code != 0:
-            if name == "workspace switch" and code == 1:
-                print(f"FAILED stage '{name}' with status {code}", flush=True)
             return code
 
     if args.get("executionLocationUI"):

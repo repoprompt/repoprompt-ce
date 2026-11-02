@@ -429,6 +429,9 @@ enum SocketProxyError: Swift.Error, LocalizedError {
     case handshakeRejected(errorCode: String?, reason: String?)
     case protocolVersionMismatch
     case hostDisconnected // Host process closed stdin or stdout pipe broken
+    /// The host wrote a frame the newline-delimited stdio transport cannot carry (for example
+    /// LSP-style `Content-Length` headers). Permanent: the host must change its framing.
+    case unsupportedClientFraming(detail: String)
 
     var errorDescription: String? {
         switch self {
@@ -493,6 +496,8 @@ enum SocketProxyError: Swift.Error, LocalizedError {
             return "Protocol version mismatch. Update the CLI or RepoPrompt app."
         case .hostDisconnected:
             return "Host disconnected"
+        case let .unsupportedClientFraming(detail):
+            return "Unsupported stdio framing: \(detail)"
         }
     }
 }
@@ -542,7 +547,8 @@ enum CLIProxyRuntimePolicy {
                  .acceptFailed,
                  .stdoutWriteTimeout,
                  .stdoutBrokenPipe,
-                 .hostDisconnected:
+                 .hostDisconnected,
+                 .unsupportedClientFraming:
                 return false
 
             case let .handshakeRejected(errorCode, _):
@@ -616,6 +622,7 @@ enum CLIProxyRuntimePolicy {
                 case .handshakeRejected: return "handshake_rejected"
                 case .protocolVersionMismatch: return "protocol_version_mismatch"
                 case .hostDisconnected: return "host_disconnected"
+                case .unsupportedClientFraming: return "unsupported_stdio_framing"
                 }
             }
             return "transport_failure"
@@ -1533,6 +1540,13 @@ extension BootstrapSocketProxy {
             while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
                 let message = pending[..<newline]
                 pending = Data(pending[(newline + 1)...])
+
+                // Fail fast on framing this transport cannot carry instead of forwarding an
+                // unparseable frame whose eventual failure looks like an internal ledger error.
+                if let framingDetail = MCPStdioClientFraming.unsupportedFramingDetail(for: Data(message)) {
+                    debugLog("BootstrapSocketProxy: rejecting unsupported client framing")
+                    throw SocketProxyError.unsupportedClientFraming(detail: framingDetail)
+                }
 
                 // Parse MCP initialize to extract clientInfo.name (best-effort, once only)
                 if !hasCachedIdentity, let name = extractMCPClientName(from: Data(message)) {
