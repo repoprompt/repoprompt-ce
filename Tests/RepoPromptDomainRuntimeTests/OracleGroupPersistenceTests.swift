@@ -217,6 +217,8 @@ final class OracleGroupPersistenceTests: XCTestCase {
         let loaded = try XCTUnwrap(loadedDocument)
         XCTAssertEqual(loaded.schemaVersion, OracleGroupDocument.currentSchemaVersion)
         XCTAssertEqual(loaded.turns.last?.status, .completed)
+        XCTAssertEqual(loaded.turns.last?.elapsedSeconds, 1.25)
+        XCTAssertEqual(loaded.turns.last?.results.map(\.elapsedSeconds), [0.625, 1.625])
 
         try await fixture.store.rename(
             groupID: loaded.group.id,
@@ -384,21 +386,24 @@ final class OracleGroupPersistenceTests: XCTestCase {
         try await fixture.store.stageTerminalPublication(canonicalIntent)
         _ = try await fixture.store.reconcileTerminalPublication(canonicalIntent)
 
-        let conflicting = try prepared.settling(
-            try completedResult(for: prepared, responsePrefix: "conflicting"),
-            finishedAt: prepared.updatedAt.addingTimeInterval(2)
-        )
-        let conflictingIntent = try OracleTerminalPublicationIntent(
-            terminal: conflicting,
-            expectedRevision: prepared.revision
-        )
-        await XCTAssertOraclePersistenceThrowsErrorAsync {
-            try await fixture.store.stageTerminalPublication(conflictingIntent)
-        } verify: {
-            XCTAssertEqual($0 as? OraclePersistenceError, .terminalPublicationMismatch)
+        for (responsePrefix, elapsedSeconds) in [("conflicting", 1.25), ("response", 2.5)] {
+            let conflicting = try prepared.settling(
+                completedResult(for: prepared, responsePrefix: responsePrefix),
+                finishedAt: prepared.updatedAt.addingTimeInterval(1),
+                elapsedSeconds: elapsedSeconds
+            )
+            let conflictingIntent = try OracleTerminalPublicationIntent(
+                terminal: conflicting,
+                expectedRevision: prepared.revision
+            )
+            await XCTAssertOraclePersistenceThrowsErrorAsync {
+                try await fixture.store.stageTerminalPublication(conflictingIntent)
+            } verify: {
+                XCTAssertEqual($0 as? OraclePersistenceError, .terminalPublicationMismatch)
+            }
+            let persisted = try await fixture.store.load(groupID: prepared.group.id, owner: prepared.owner)
+            XCTAssertEqual(persisted, canonical)
         }
-        let persisted = try await fixture.store.load(groupID: prepared.group.id, owner: prepared.owner)
-        XCTAssertEqual(persisted, canonical)
     }
 
     func testRenameDeleteAndRetentionOperateOnLogicalGroupsAndArtifacts() async throws {
@@ -870,6 +875,7 @@ final class OracleGroupPersistenceTests: XCTestCase {
                 providerID: member.model.providerID,
                 modelID: member.model.modelID,
                 status: .completed,
+                elapsedSeconds: 0.625 + Double(member.laneID.index),
                 response: "\(responsePrefix)-\(member.laneID.index)"
             )
         }
@@ -891,7 +897,8 @@ final class OracleGroupPersistenceTests: XCTestCase {
             finishedAt: turn.startedAt.addingTimeInterval(1),
             status: .completed,
             warnings: [],
-            results: results
+            results: results,
+            elapsedSeconds: 1.25
         )
         return try OracleGroupDocument(
             group: prepared.group,

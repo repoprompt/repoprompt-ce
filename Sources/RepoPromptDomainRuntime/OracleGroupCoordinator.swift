@@ -115,9 +115,15 @@ package struct OracleGroupCoordinator: Sendable {
         turnID: OracleTurnID,
         input: OracleInput,
         plans: [OracleLanePlan],
+        timing: OracleGroupTiming,
         progress: @escaping ProgressHandler = { _ in }
     ) async throws -> OracleGroupResult {
         try Self.validate(group: group, plans: plans)
+        guard timing.group == group, timing.turnID == turnID,
+              timing.laneIDs == plans.map(\.lane.laneID)
+        else {
+            throw OracleGroupCoordinatorError.invalidLanePlan
+        }
         await progress(OracleProgressEvent(
             kind: .groupPrepared,
             groupID: group.id,
@@ -141,7 +147,8 @@ package struct OracleGroupCoordinator: Sendable {
                     let result = try await Self.executeLane(
                         plan,
                         input: input,
-                        gate: gate
+                        gate: gate,
+                        timing: timing
                     )
                     await gate.settle(status: result.status)
                     return (plan.lane.laneID.index, result)
@@ -209,11 +216,14 @@ package struct OracleGroupCoordinator: Sendable {
     private static func executeLane(
         _ plan: OracleLanePlan,
         input: OracleInput,
-        gate: OracleLaneProgressGate
+        gate: OracleLaneProgressGate,
+        timing: OracleGroupTiming
     ) async throws -> OracleLaneResult {
         let response: OracleLaneExecutionResponse
         do {
             try Task.checkCancellation()
+            timing.start(.lane(plan.lane.laneID))
+            defer { timing.freeze(.lane(plan.lane.laneID)) }
             response = try await plan.operation(OracleLaneExecutionContext(
                 input: input,
                 deltaHandler: { text in await gate.delta(text) }
@@ -225,6 +235,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .cancelled,
+                elapsedSeconds: timing.read(.lane(plan.lane.laneID)).sample.elapsedSeconds,
                 executionProfile: cancellation.executionProfile,
                 capturedModelName: cancellation.capturedModelName,
                 error: OracleLaneError(
@@ -240,6 +251,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .cancelled,
+                elapsedSeconds: timing.read(.lane(plan.lane.laneID)).sample.elapsedSeconds,
                 error: OracleLaneError(code: "cancelled", message: "Oracle lane was cancelled.")
             )
         } catch let failure as OracleLaneFailure {
@@ -249,6 +261,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .failed,
+                elapsedSeconds: timing.read(.lane(plan.lane.laneID)).sample.elapsedSeconds,
                 executionProfile: failure.executionProfile,
                 capturedModelName: failure.capturedModelName,
                 error: Self.structuralLaneError(
@@ -264,6 +277,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .failed,
+                elapsedSeconds: timing.read(.lane(plan.lane.laneID)).sample.elapsedSeconds,
                 error: Self.structuralLaneError(
                     code: "provider_error",
                     message: String(String(describing: error).prefix(512))
@@ -278,6 +292,7 @@ package struct OracleGroupCoordinator: Sendable {
                 providerID: plan.lane.model.providerID,
                 modelID: plan.lane.model.modelID,
                 status: .failed,
+                elapsedSeconds: timing.read(.lane(plan.lane.laneID)).sample.elapsedSeconds,
                 executionProfile: response.executionProfile,
                 capturedModelName: response.capturedModelName,
                 error: OracleLaneError(
@@ -292,6 +307,7 @@ package struct OracleGroupCoordinator: Sendable {
             providerID: plan.lane.model.providerID,
             modelID: plan.lane.model.modelID,
             status: .completed,
+            elapsedSeconds: timing.read(.lane(plan.lane.laneID)).sample.elapsedSeconds,
             executionProfile: response.executionProfile,
             capturedModelName: response.capturedModelName,
             response: response.response

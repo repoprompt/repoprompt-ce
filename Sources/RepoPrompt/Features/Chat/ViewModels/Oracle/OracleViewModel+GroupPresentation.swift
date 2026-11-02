@@ -15,6 +15,7 @@ struct OracleMemberPresentation: Equatable {
     var errorMessage: String?
     var providerID: String?
     var capturedModelName: String?
+    var elapsedSeconds: Double?
 
     static let unknown = Self(status: .unknown)
 }
@@ -47,15 +48,26 @@ struct OracleGroupPresentation: Equatable {
     private(set) var lanes: [OracleLaneID: OracleMemberPresentation]
     /// The existing app runtime invocation is evidence for live events, unlike a loaded prepared record.
     var invocationID: UUID?
+    private(set) var timing: OracleGroupTiming?
+    private(set) var timingRevision: UInt64 = 0
+    private let elapsedSeconds: Double?
     private var sequences: [OracleLaneID: UInt64] = [:]
 
-    init(document: OracleGroupDocument, invocationID: UUID? = nil) {
+    init(document: OracleGroupDocument, invocationID: UUID? = nil, timing: OracleGroupTiming? = nil) {
         key = Key(groupID: document.group.id, owner: document.owner)
         revision = document.revision
         turnID = document.turns.last?.id
         isTerminal = document.turns.last?.state == .terminal
         members = document.members
         self.invocationID = isTerminal ? nil : invocationID
+        elapsedSeconds = isTerminal ? document.turns.last?.elapsedSeconds : nil
+        if !isTerminal, let timing, timing.invocationID == invocationID,
+           timing.group == document.group, timing.turnID == turnID,
+           timing.laneIDs == document.members.map(\.laneID)
+        {
+            self.timing = timing
+            timingRevision = timing.read(.group).revision
+        }
         lanes = [:]
         if isTerminal, let turn = document.turns.last {
             for member in members {
@@ -71,21 +83,28 @@ struct OracleGroupPresentation: Equatable {
                     status: status,
                     errorMessage: result.error.map { "[\($0.code)] \($0.message)" },
                     providerID: result.executionProfile?.providerID ?? result.providerID ?? member.model.providerID,
-                    capturedModelName: result.capturedModelName
+                    capturedModelName: result.capturedModelName,
+                    elapsedSeconds: result.elapsedSeconds
                 )
             }
         }
     }
 
     @MainActor
-    func member(_ session: ChatSession) -> OracleMemberPresentation {
+    func matchingMember(_ session: ChatSession) -> OracleGroupMember? {
         guard Key(session: session) == key,
               let member = members.first(where: { $0.memberID.rawValue == session.id }),
               session.shortID == member.publicChatID,
               session.oracleLaneIndex == member.laneID.index,
               session.oracleGroupSize == members.count,
               session.oracleModelRaw == member.model.modelID
-        else { return .unknown }
+        else { return nil }
+        return member
+    }
+
+    @MainActor
+    func member(_ session: ChatSession) -> OracleMemberPresentation {
+        guard let member = matchingMember(session) else { return .unknown }
         var presentation = lanes[member.laneID] ?? .unknown
         presentation.providerID = presentation.providerID ?? member.model.providerID
         return presentation
@@ -124,6 +143,29 @@ struct OracleGroupPresentation: Equatable {
             providerID: providerID,
             capturedModelName: capturedModelName
         )
+    }
+
+    /// Reads the runtime authority, never a copied anchor. Ended invocations cannot tick.
+    func elapsedSample(_ slot: OracleGroupTiming.Slot) -> OracleGroupTiming.Sample {
+        if isTerminal {
+            let seconds: Double? = switch slot {
+            case .group: elapsedSeconds
+            case let .lane(id): lanes[id]?.elapsedSeconds
+            }
+            return seconds.map(OracleGroupTiming.Sample.frozen) ?? .unavailable
+        }
+        guard let timing else { return .unavailable }
+        let sample = timing.read(slot).sample
+        if case .running = sample, invocationID != timing.invocationID { return .unavailable }
+        return sample
+    }
+
+    mutating func timingChanged(_ handle: OracleGroupTiming, invocationID: UUID) {
+        guard !isTerminal, timing === handle, handle.invocationID == invocationID,
+              handle.groupID == key.groupID, handle.turnID == turnID,
+              handle.laneIDs == members.map(\.laneID),
+              self.invocationID == nil || self.invocationID == invocationID else { return }
+        timingRevision = handle.read(.group).revision
     }
 
     mutating func endExecution() {

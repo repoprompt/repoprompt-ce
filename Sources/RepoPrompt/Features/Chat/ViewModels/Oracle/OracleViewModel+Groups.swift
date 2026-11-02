@@ -365,9 +365,9 @@ extension OracleViewModel {
         let invocationID = UUID()
         let runID = tabContext?.agentModeRunID ?? invocationID
         let runtimeCallbacks = OracleGroupRuntime.Callbacks(
-            prepared: { [weak self] document in
+            prepared: { [weak self] document, timing in
                 guard let self else { throw CancellationError() }
-                await recordOracleGroupPresentation(document, invocationID: invocationID)
+                await recordOracleGroupPresentation(document, invocationID: invocationID, timing: timing)
                 try await restoreOracleGroupProjectionsIfNeeded(
                     document,
                     workspaceID: workspaceID,
@@ -378,6 +378,11 @@ extension OracleViewModel {
                 if let turn = document.turns.last {
                     try await callbacks?.prepared(document.group.id, turn.id, document.members)
                     await tabContext?.toolSettlement?.prepared(document.group.id, turn.id)
+                }
+            },
+            timingChanged: { [weak self] timing in
+                Task { @MainActor [weak self] in
+                    self?.receiveOracleGroupTiming(timing, owner: owner, invocationID: invocationID)
                 }
             },
             executeLane: { [weak self] invocation in
@@ -396,7 +401,7 @@ extension OracleViewModel {
                 )
             },
             progress: { [weak self] event in
-                await self?.receiveOracleGroupProgress(event, owner: owner)
+                await self?.receiveOracleGroupProgress(event, owner: owner, invocationID: invocationID)
                 await callbacks?.progress(event)
             }
         )
@@ -1049,22 +1054,41 @@ extension OracleViewModel {
         return oracleGroupPresentations[key]?.member(session) ?? .unknown
     }
 
-    func recordOracleGroupPresentation(_ document: OracleGroupDocument, invocationID: UUID? = nil) {
-        let next = OracleGroupPresentation(document: document, invocationID: invocationID)
+    func oracleGroupPresentation(for session: ChatSession) -> OracleGroupPresentation? {
+        guard let key = OracleGroupPresentation.Key(session: session), isCurrentOracleProjection(session),
+              let presentation = oracleGroupPresentations[key],
+              presentation.matchingMember(session) != nil else { return nil }
+        return presentation
+    }
+
+    func recordOracleGroupPresentation(_ document: OracleGroupDocument, invocationID: UUID? = nil, timing: OracleGroupTiming? = nil) {
+        let next = OracleGroupPresentation(document: document, invocationID: invocationID, timing: timing)
+        if let timing, !next.isTerminal, next.timing !== timing { return }
         if let current = oracleGroupPresentations[next.key] {
             // A store read can win the race with the prepared callback for the same revision.
             let beginsKnownExecution = next.revision == current.revision && next.turnID == current.turnID
+                && next.members == current.members
                 && !current.isTerminal && current.invocationID == nil && invocationID != nil
+                && current.timing == nil
             guard next.revision > current.revision || beginsKnownExecution else { return }
         }
         oracleGroupPresentations[next.key] = next
         pruneOracleGroupPresentations()
     }
 
-    func receiveOracleGroupProgress(_ event: OracleProgressEvent, owner: OracleConversationOwner) {
+    func receiveOracleGroupTiming(_ timing: OracleGroupTiming, owner: OracleConversationOwner, invocationID: UUID) {
+        let key = OracleGroupPresentation.Key(groupID: timing.groupID, owner: owner)
+        guard var current = oracleGroupPresentations[key] else { return }
+        let previous = current
+        current.timingChanged(timing, invocationID: invocationID)
+        if current != previous { oracleGroupPresentations[key] = current }
+    }
+
+    func receiveOracleGroupProgress(_ event: OracleProgressEvent, owner: OracleConversationOwner, invocationID: UUID) {
         let key = OracleGroupPresentation.Key(groupID: event.groupID, owner: owner)
         guard var current = oracleGroupPresentations[key] else { return }
         let previous = current
+        guard current.invocationID == invocationID else { return }
         current.receive(event)
         if current != previous { oracleGroupPresentations[key] = current }
     }

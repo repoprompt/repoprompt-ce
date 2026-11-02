@@ -5,15 +5,18 @@ package struct OracleGroupRuntime: Sendable {
     private let claimManager: OracleGroupClaimManager
     private let coordinator = OracleGroupCoordinator()
     private let now: @Sendable () -> Date
+    private let elapsedNow: @Sendable () -> ContinuousClock.Instant
 
     package init(
         store: any OracleGroupStore,
         claimManager: OracleGroupClaimManager,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        elapsedNow: @escaping @Sendable () -> ContinuousClock.Instant = { .now }
     ) {
         self.store = store
         self.claimManager = claimManager
         self.now = now
+        self.elapsedNow = elapsedNow
     }
 
     package func execute(
@@ -115,16 +118,19 @@ package extension OracleGroupRuntime {
     }
 
     struct Callbacks: Sendable {
-        package let prepared: @Sendable (OracleGroupDocument) async throws -> Void
+        package let prepared: @Sendable (OracleGroupDocument, OracleGroupTiming) async throws -> Void
+        package let timingChanged: @Sendable (OracleGroupTiming) -> Void
         package let executeLane: @Sendable (LaneInvocation) async throws -> OracleLaneExecutionResponse
         package let progress: OracleGroupCoordinator.ProgressHandler
 
         package init(
-            prepared: @escaping @Sendable (OracleGroupDocument) async throws -> Void = { _ in },
+            prepared: @escaping @Sendable (OracleGroupDocument, OracleGroupTiming) async throws -> Void = { _, _ in },
+            timingChanged: @escaping @Sendable (OracleGroupTiming) -> Void = { _ in },
             executeLane: @escaping @Sendable (LaneInvocation) async throws -> OracleLaneExecutionResponse,
             progress: @escaping OracleGroupCoordinator.ProgressHandler = { _ in }
         ) {
             self.prepared = prepared
+            self.timingChanged = timingChanged
             self.executeLane = executeLane
             self.progress = progress
         }
@@ -171,6 +177,17 @@ extension OracleGroupRuntime {
         try Task.checkCancellation()
         try validateStart(start)
         let timestamp = now()
+        let turnID = OracleTurnID()
+        let timing = OracleGroupTiming(
+            invocationID: request.invocationID,
+            group: start.group,
+            turnID: turnID,
+            laneIDs: start.members.map(\.laneID),
+            now: elapsedNow,
+            onChange: callbacks.timingChanged
+        )
+        timing.start(.group)
+        defer { timing.invalidateRunning() }
         let prepared = try OracleGroupDocument(
             group: start.group,
             owner: start.owner,
@@ -180,7 +197,7 @@ extension OracleGroupRuntime {
             updatedAt: timestamp,
             roster: start.roster,
             members: start.members,
-            turns: [OracleTurnRecord(input: request.input, state: .prepared, startedAt: timestamp)]
+            turns: [OracleTurnRecord(id: turnID, input: request.input, state: .prepared, startedAt: timestamp)]
         )
         let claim = try await claimManager.acquire(
             group: prepared,
@@ -192,7 +209,7 @@ extension OracleGroupRuntime {
         defer { claim.release() }
         try Task.checkCancellation()
         try await store.create(prepared)
-        return try await finishPrepared(prepared, callbacks: callbacks)
+        return try await finishPrepared(prepared, timing: timing, callbacks: callbacks)
     }
 
     private func executeContinuation(
@@ -232,6 +249,17 @@ extension OracleGroupRuntime {
             throw RuntimeError.invalidPreparedTurn
         }
         let timestamp = now()
+        let turnID = OracleTurnID()
+        let timing = OracleGroupTiming(
+            invocationID: request.invocationID,
+            group: current.group,
+            turnID: turnID,
+            laneIDs: current.members.map(\.laneID),
+            now: elapsedNow,
+            onChange: callbacks.timingChanged
+        )
+        timing.start(.group)
+        defer { timing.invalidateRunning() }
         let prepared = try OracleGroupDocument(
             schemaVersion: current.schemaVersion,
             group: current.group,
@@ -239,23 +267,25 @@ extension OracleGroupRuntime {
             name: current.name,
             revision: current.revision &+ 1,
             createdAt: current.createdAt,
-            updatedAt: timestamp,
+            updatedAt: max(current.updatedAt, timestamp),
             roster: current.roster,
             members: current.members,
-            turns: current.turns + [OracleTurnRecord(input: request.input, state: .prepared, startedAt: timestamp)]
+            turns: current.turns + [OracleTurnRecord(id: turnID, input: request.input, state: .prepared, startedAt: timestamp)]
         )
         try await store.save(prepared, expectedRevision: current.revision)
-        return try await finishPrepared(prepared, callbacks: callbacks)
+        return try await finishPrepared(prepared, timing: timing, callbacks: callbacks)
     }
 
     private func finishPrepared(
         _ prepared: OracleGroupDocument,
+        timing: OracleGroupTiming,
         callbacks: Callbacks
     ) async throws -> Completion {
         do {
-            try await callbacks.prepared(prepared)
+            try await callbacks.prepared(prepared, timing)
         } catch {
-            try await settlePrepared(prepared, error: error)
+            timing.freeze(.group)
+            try await settlePrepared(prepared, timing: timing, error: error)
             throw error
         }
         guard let turn = prepared.turns.last, turn.state == .prepared else {
@@ -288,13 +318,16 @@ extension OracleGroupRuntime {
                 turnID: turn.id,
                 input: turn.input,
                 plans: plans,
+                timing: timing,
                 progress: callbacks.progress
             )
         } catch {
-            try await settlePrepared(prepared, error: error)
+            timing.freeze(.group)
+            try await settlePrepared(prepared, timing: timing, error: error)
             throw error
         }
-        let terminal = try prepared.settling(result, finishedAt: now())
+        let elapsed = timing.freeze(.group)
+        let terminal = try prepared.settling(result, finishedAt: now(), elapsedSeconds: elapsed)
         let published = try await OracleGroupTerminalPublisher.publish(
             terminal: terminal,
             expectedRevision: prepared.revision,
@@ -319,6 +352,7 @@ extension OracleGroupRuntime {
 
     private func settlePrepared(
         _ prepared: OracleGroupDocument,
+        timing: OracleGroupTiming,
         error: Error
     ) async throws {
         let store = store
@@ -333,7 +367,12 @@ extension OracleGroupRuntime {
                 ),
                     current.revision == prepared.revision,
                     current.turns.last?.id == prepared.turns.last?.id,
-                    current.turns.last?.state == .prepared
+                    current.turns.last?.state == .prepared,
+                    current.group == prepared.group,
+                    current.members == prepared.members,
+                    timing.group == current.group,
+                    timing.turnID == current.turns.last?.id,
+                    timing.laneIDs == current.members.map(\.laneID)
                 else { return }
                 let rawMessage = String(executionDescription.prefix(512))
                 let message = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -343,7 +382,8 @@ extension OracleGroupRuntime {
                     status: cancelled ? .cancelled : .failed,
                     code: cancelled ? "cancelled" : "execution_failed",
                     message: cancelled ? "Oracle provider was cancelled." : message,
-                    finishedAt: finishedAt
+                    finishedAt: finishedAt,
+                    timing: timing
                 )
                 _ = try await OracleGroupTerminalPublisher.publish(
                     terminal: terminal,

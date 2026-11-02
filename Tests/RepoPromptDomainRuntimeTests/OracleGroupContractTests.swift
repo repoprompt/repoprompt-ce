@@ -4,6 +4,65 @@ import MCP
 import XCTest
 
 final class OracleGroupContractTests: XCTestCase {
+    func testOptionalElapsedNormalizationRoundTripAndStrictCoreDecoding() throws {
+        let input = try OracleInput(mode: .chat, userMessage: "ask")
+        let cases: [(Double, Double?)] = [
+            (0, 0), (-0.0, 0), (0.125, 0.125), (1234.56789, 1234.56789),
+            (-1, nil), (.infinity, nil), (-.infinity, nil), (.nan, nil), (Double(Int.max), nil)
+        ]
+        for (value, expected) in cases {
+            let lane = try OracleLaneResult(
+                laneIndex: 0,
+                chatID: "chat",
+                providerID: "fixture",
+                modelID: "model",
+                status: .completed,
+                elapsedSeconds: value,
+                response: "answer"
+            )
+            XCTAssertEqual(lane.elapsedSeconds, expected)
+            if lane.elapsedSeconds == 0 { XCTAssertEqual(lane.elapsedSeconds?.sign, .plus) }
+            XCTAssertEqual(try JSONDecoder().decode(OracleLaneResult.self, from: JSONEncoder().encode(lane)), lane)
+            let terminal = OracleTurnRecord(
+                input: input,
+                state: .terminal,
+                startedAt: Date(timeIntervalSince1970: 100),
+                finishedAt: Date(timeIntervalSince1970: 90),
+                status: .completed,
+                results: [lane],
+                elapsedSeconds: value
+            )
+            XCTAssertEqual(terminal.elapsedSeconds, expected)
+            XCTAssertEqual(try JSONDecoder().decode(OracleTurnRecord.self, from: JSONEncoder().encode(terminal)), terminal)
+            XCTAssertNil(OracleTurnRecord(input: input, state: .prepared, startedAt: Date(), elapsedSeconds: value).elapsedSeconds)
+        }
+        let lane = try OracleLaneResult(
+            laneIndex: 0,
+            chatID: "chat",
+            providerID: "fixture",
+            modelID: "model",
+            status: .completed,
+            response: "answer"
+        )
+        var laneObject = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(lane)) as? [String: Any])
+        XCTAssertNil(laneObject["elapsed_seconds"])
+        let turn = OracleTurnRecord(input: input, state: .terminal, startedAt: Date(), status: .completed, results: [lane])
+        var turnObject = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(turn)) as? [String: Any])
+        XCTAssertNil(turnObject["elapsedSeconds"])
+        for malformed in [NSNull(), "wrong", ["value": 1], -1, 1e30] as [Any] {
+            laneObject["elapsed_seconds"] = malformed
+            let decodedLane = try JSONDecoder().decode(OracleLaneResult.self, from: JSONSerialization.data(withJSONObject: laneObject))
+            XCTAssertEqual(decodedLane, lane)
+            turnObject["elapsedSeconds"] = malformed
+            let decodedTurn = try JSONDecoder().decode(OracleTurnRecord.self, from: JSONSerialization.data(withJSONObject: turnObject))
+            XCTAssertEqual(decodedTurn, turn)
+        }
+        laneObject["status"] = "unknown"
+        XCTAssertThrowsError(try JSONDecoder().decode(OracleLaneResult.self, from: JSONSerialization.data(withJSONObject: laneObject)))
+        turnObject.removeValue(forKey: "input")
+        XCTAssertThrowsError(try JSONDecoder().decode(OracleTurnRecord.self, from: JSONSerialization.data(withJSONObject: turnObject)))
+    }
+
     func testDisplayLabelUsesOracleAndNumberedLanes() {
         XCTAssertEqual(
             (0 ... 4).map(OracleRosterContract.displayLabel(laneIndex:)),

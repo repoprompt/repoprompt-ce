@@ -4,6 +4,145 @@ import os
 import XCTest
 
 final class OracleGroupRuntimeTests: XCTestCase {
+    func testTimingIncludesPreparationAndProgressButExcludesPublicationAcrossBackwardWallClock() async throws {
+        let origin = ContinuousClock.now
+        let clock = OSAllocatedUnfairLock(initialState: origin)
+        let wall = OSAllocatedUnfairLock(initialState: Date(timeIntervalSince1970: 1000))
+        let retained = OSAllocatedUnfairLock<OracleGroupTiming?>(initialState: nil)
+        let fixture = try makeRuntime(
+            now: { wall.withLock { $0 } },
+            elapsedNow: { clock.withLock { $0 } },
+            mutationObserver: { phase in
+                guard case .journalPersisted = phase else { return }
+                if let timing = retained.withLock({ $0 }) {
+                    let frozen = timing.read(.group)
+                    clock.withLock { $0 = $0.advanced(by: .seconds(100)) }
+                    XCTAssertEqual(timing.read(.group), frozen)
+                } else {
+                    clock.withLock { $0 = $0.advanced(by: .seconds(2)) }
+                }
+            }
+        )
+        defer { fixture.cleanup() }
+        let start = try makeStart(count: 2, seed: "timing-boundaries")
+        let input = try OracleInput(mode: .chat, userMessage: "ask")
+        let completion = try await fixture.runtime.execute(
+            Request(invocationID: UUID(), runID: UUID(), claimID: UUID(), input: input, intent: .start(start)),
+            callbacks: .init(
+                prepared: { document, timing in
+                    retained.withLock { $0 = timing }
+                    XCTAssertEqual(timing.read(.group).sample, .running(2))
+                    XCTAssertNil(document.turns.last?.elapsedSeconds)
+                    wall.withLock { $0 = Date(timeIntervalSince1970: 990) }
+                },
+                executeLane: { _ in OracleLaneExecutionResponse(response: "answer") },
+                progress: { event in
+                    if event.kind == .groupSettled {
+                        XCTAssertEqual(retained.withLock { $0 }?.read(.group).sample, .running(2))
+                        clock.withLock { $0 = $0.advanced(by: .seconds(3)) }
+                    }
+                }
+            )
+        )
+        XCTAssertEqual(completion.terminalDocument.turns.last?.elapsedSeconds, 5)
+        XCTAssertEqual(completion.result.oracleResults.map(\.elapsedSeconds), [0, 0])
+        XCTAssertEqual(completion.terminalDocument.updatedAt, Date(timeIntervalSince1970: 1000))
+        XCTAssertEqual(completion.terminalDocument.turns.last?.finishedAt, Date(timeIntervalSince1970: 990))
+        let oldTurn = try XCTUnwrap(completion.terminalDocument.turns.last)
+        // A new continuation excludes all old execution/publication time and keeps prior history exact.
+        retained.withLock { $0 = nil }
+        let continued = try await fixture.runtime.execute(
+            Request(
+                invocationID: UUID(),
+                runID: UUID(),
+                claimID: UUID(),
+                input: input,
+                intent: .continuation(Continuation(
+                    group: start.group,
+                    owner: start.owner,
+                    observedRevision: completion.terminalDocument.revision,
+                    expectedRoster: start.roster
+                ))
+            ),
+            callbacks: .init(
+                prepared: { document, timing in
+                    retained.withLock { $0 = timing }
+                    XCTAssertEqual(document.turns.first, oldTurn)
+                    XCTAssertEqual(timing.read(.group).sample, .running(2))
+                },
+                executeLane: { _ in OracleLaneExecutionResponse(response: "continued") }
+            )
+        )
+        XCTAssertEqual(continued.terminalDocument.turns.last?.elapsedSeconds, 2)
+        XCTAssertEqual(continued.terminalDocument.updatedAt, completion.terminalDocument.updatedAt)
+        XCTAssertEqual(continued.terminalDocument.turns.last?.startedAt, Date(timeIntervalSince1970: 990))
+    }
+
+    func testPreparePersistenceEscapeInvalidatesWithoutInventingSettlement() async throws {
+        let fixture = try makeRuntime()
+        defer { fixture.cleanup() }
+        await fixture.store.failNextSaves(1)
+        let retained = OSAllocatedUnfairLock<OracleGroupTiming?>(initialState: nil)
+        let start = try makeStart(count: 2, seed: "prepare-escape")
+        await XCTAssertOracleRuntimeThrowsErrorAsync {
+            try await fixture.runtime.execute(
+                Request(
+                    invocationID: UUID(),
+                    runID: UUID(),
+                    claimID: UUID(),
+                    input: OracleInput(mode: .chat, userMessage: "ask"),
+                    intent: .start(start)
+                ),
+                callbacks: .init(
+                    prepared: { _, _ in XCTFail("Prepare was not persisted") },
+                    timingChanged: { timing in retained.withLock { $0 = timing } },
+                    executeLane: { _ in
+                        XCTFail("No lane may enter")
+                        return OracleLaneExecutionResponse(response: "unexpected")
+                    }
+                )
+            )
+        } verify: {
+            XCTAssertEqual($0 as? OraclePersistenceError, .invalidDocument("debug_forced_save_failure"))
+        }
+        XCTAssertEqual(retained.withLock { $0 }?.read(.group).sample, .unavailable)
+        let stored = try await fixture.store.load(groupID: start.group.id, owner: start.owner)
+        XCTAssertNil(stored)
+    }
+
+    func testKnownPreparedFailureFreezesBeforeSettlementWithoutInventingLaneTime() async throws {
+        let origin = ContinuousClock.now
+        let clock = OSAllocatedUnfairLock(initialState: origin)
+        let retained = OSAllocatedUnfairLock<OracleGroupTiming?>(initialState: nil)
+        let fixture = try makeRuntime(elapsedNow: { clock.withLock { $0 } })
+        defer { fixture.cleanup() }
+        let start = try makeStart(count: 2, seed: "known-timing-error")
+        await XCTAssertOracleRuntimeThrowsErrorAsync {
+            try await fixture.runtime.execute(
+                Request(
+                    invocationID: UUID(),
+                    runID: UUID(),
+                    claimID: UUID(),
+                    input: OracleInput(mode: .chat, userMessage: "ask"),
+                    intent: .start(start)
+                ),
+                callbacks: .init(prepared: { _, timing in
+                    retained.withLock { $0 = timing }
+                    clock.withLock { $0 = $0.advanced(by: .milliseconds(1250)) }
+                    throw RuntimeFixtureError.execution
+                }, executeLane: { _ in
+                    XCTFail("Must not enter a lane")
+                    return OracleLaneExecutionResponse(response: "unexpected")
+                })
+            )
+        } verify: { XCTAssertEqual($0 as? RuntimeFixtureError, .execution) }
+        let document = try await fixture.store.load(groupID: start.group.id, owner: start.owner)
+        XCTAssertEqual(document?.turns.last?.elapsedSeconds, 1.25)
+        XCTAssertEqual(document?.turns.last?.results.map(\.elapsedSeconds), [nil, nil])
+        clock.withLock { $0 = $0.advanced(by: .seconds(10)) }
+        XCTAssertEqual(retained.withLock { $0 }?.read(.group).sample, .frozen(1.25))
+    }
+
     func testStartPersistsPrepareBeforeCallbacksAndReturnsExactWhitespace() async throws {
         let fixture = try makeRuntime()
         defer { fixture.cleanup() }
@@ -22,7 +161,7 @@ final class OracleGroupRuntimeTests: XCTestCase {
                 intent: .start(start)
             ),
             callbacks: .init(
-                prepared: { document in
+                prepared: { document, _ in
                     XCTAssertEqual(document.revision, 1)
                     XCTAssertEqual(document.turns.last?.state, .prepared)
                     let loaded = try await store.load(
@@ -104,7 +243,12 @@ final class OracleGroupRuntimeTests: XCTestCase {
     }
 
     func testContinuationRecoversInterruptedTurn() async throws {
-        let fixture = try makeRuntime()
+        let clock = OSAllocatedUnfairLock(initialState: ContinuousClock.now)
+        let fixture = try makeRuntime(elapsedNow: { clock.withLock { $0 } }, mutationObserver: { phase in
+            if case .journalPersisted = phase {
+                clock.withLock { $0 = $0.advanced(by: .seconds(10)) }
+            }
+        })
         defer { fixture.cleanup() }
         let owner = try OracleConversationOwner(kind: "runtime", identifier: "recover")
         let prepared = try makePreparedGroup(count: 2, seed: "recover", owner: owner)
@@ -129,11 +273,14 @@ final class OracleGroupRuntimeTests: XCTestCase {
                 executeLane: { invocation in
                     XCTAssertEqual(invocation.priorTerminalTurns.count, 1)
                     XCTAssertEqual(invocation.priorTerminalTurns[0].status, .failed)
+                    XCTAssertNil(invocation.priorTerminalTurns[0].elapsedSeconds)
+                    XCTAssertEqual(invocation.priorTerminalTurns[0].results.map(\.elapsedSeconds), [nil, nil])
                     return OracleLaneExecutionResponse(response: "continued-\(invocation.member.laneID.index)")
                 }
             )
         )
 
+        XCTAssertEqual(completion.terminalDocument.turns.last?.elapsedSeconds, 10)
         XCTAssertEqual(completion.terminalDocument.revision, 4)
         XCTAssertEqual(completion.terminalDocument.turns.count, 2)
         XCTAssertEqual(completion.terminalDocument.turns[0].state, .terminal)
@@ -161,7 +308,7 @@ final class OracleGroupRuntimeTests: XCTestCase {
                     intent: .start(start)
                 ),
                 callbacks: .init(
-                    prepared: { _ in throw CancellationError() },
+                    prepared: { _, _ in throw CancellationError() },
                     executeLane: { _ in
                         laneCalls.withLock { $0 += 1 }
                         return OracleLaneExecutionResponse(response: "should-not-run")
@@ -225,7 +372,7 @@ final class OracleGroupRuntimeTests: XCTestCase {
                     intent: .start(start)
                 ),
                 callbacks: .init(
-                    prepared: { _ in throw RuntimeFixtureError.execution },
+                    prepared: { _, _ in throw RuntimeFixtureError.execution },
                     executeLane: { _ in OracleLaneExecutionResponse(response: "unused") }
                 )
             )
@@ -262,7 +409,7 @@ final class OracleGroupRuntimeTests: XCTestCase {
                     intent: .start(start)
                 ),
                 callbacks: .init(
-                    prepared: { _ in throw RuntimeFixtureError.paddedExecution },
+                    prepared: { _, _ in throw RuntimeFixtureError.paddedExecution },
                     executeLane: { _ in OracleLaneExecutionResponse(response: "unused") }
                 )
             )
@@ -351,7 +498,7 @@ final class OracleGroupRuntimeTests: XCTestCase {
                 intent: .start(start)
             ),
             callbacks: .init(
-                prepared: { _ in
+                prepared: { _, _ in
                     await gate.markHeld()
                     await gate.waitForRelease()
                 },
@@ -574,7 +721,11 @@ private extension OracleGroupRuntimeTests {
     typealias Request = OracleGroupRuntime.Request
     typealias Continuation = OracleGroupRuntime.Continuation
 
-    func makeRuntime() throws -> (
+    func makeRuntime(
+        now: @escaping @Sendable () -> Date = Date.init,
+        elapsedNow: @escaping @Sendable () -> ContinuousClock.Instant = { .now },
+        mutationObserver: @escaping DomainOracleConversationStore.MutationObserver = { _ in }
+    ) throws -> (
         root: URL,
         store: DomainOracleConversationStore,
         claimManager: OracleGroupClaimManager,
@@ -601,9 +752,9 @@ private extension OracleGroupRuntimeTests {
             ),
             identity: identity
         )
-        let store = DomainOracleConversationStore(persistence: persistence, identity: identity)
+        let store = DomainOracleConversationStore(persistence: persistence, identity: identity, mutationObserver: mutationObserver)
         let claimManager = OracleGroupClaimManager(persistence: persistence, identity: identity)
-        let runtime = OracleGroupRuntime(store: store, claimManager: claimManager)
+        let runtime = OracleGroupRuntime(store: store, claimManager: claimManager, now: now, elapsedNow: elapsedNow)
         return (root, store, claimManager, runtime, { try? FileManager.default.removeItem(at: root) })
     }
 

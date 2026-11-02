@@ -1,11 +1,72 @@
 import AppKit
+import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
 import SwiftUI
 
+/// Only this visible leaf schedules ticks. The button and transcript keep stable identity.
+private struct OracleElapsedLabel: View {
+    let presentation: OracleGroupPresentation?
+    let slot: OracleGroupTiming.Slot
+    @State private var refresh = true
+
+    private var sample: OracleGroupTiming.Sample {
+        presentation?.elapsedSample(slot) ?? .unavailable
+    }
+
+    var body: some View {
+        Group {
+            if refresh, AgentOraclePillLogic.elapsedNeedsRefresh(sample) {
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    let latest = sample
+                    text(latest)
+                        .onChange(of: AgentOraclePillLogic.elapsedNeedsRefresh(latest), initial: true) { _, running in
+                            refresh = running
+                        }
+                }
+            } else {
+                text(sample)
+            }
+        }
+        .onChange(of: presentation) { _, _ in refresh = true }
+    }
+
+    private func text(_ sample: OracleGroupTiming.Sample) -> some View {
+        let label = AgentOraclePillLogic.elapsedText(sample, unpublished: presentation?.isTerminal == false)
+        return Text(label.visible)
+            .monospacedDigit()
+            .lineLimit(1)
+            .accessibilityLabel(label.spoken)
+    }
+}
+
 // MARK: - Oracle Pill
 
 enum AgentOraclePillLogic {
+    static func elapsedText(_ sample: OracleGroupTiming.Sample, unpublished: Bool) -> (visible: String, spoken: String) {
+        guard let value = sample.elapsedSeconds, value.isFinite, value >= 0,
+              let seconds = Int(exactly: value.rounded(.down))
+        else {
+            return ("Elapsed unavailable", "Elapsed unavailable")
+        }
+        let duration = AgentRuntimeDurationFormatter.string(totalSeconds: seconds)
+        let qualifier = if case .frozen = sample, unpublished { " · unpublished" } else { "" }
+        let text = "\(duration)\(qualifier)"
+        let minutes = seconds / 60
+        let remainingSeconds = seconds % 60
+        let spokenSeconds = "\(remainingSeconds) \(remainingSeconds == 1 ? "second" : "seconds")"
+        let spokenDuration = minutes == 0
+            ? spokenSeconds
+            : "\(minutes) \(minutes == 1 ? "minute" : "minutes"), \(spokenSeconds)"
+        let spokenQualifier = if case .frozen = sample, unpublished { ", result not published" } else { "" }
+        return (text, "Elapsed \(spokenDuration)\(spokenQualifier)")
+    }
+
+    static func elapsedNeedsRefresh(_ sample: OracleGroupTiming.Sample) -> Bool {
+        if case .running = sample { return true }
+        return false
+    }
+
     struct ExplicitOpenRequest: Equatable {
         let generation: UInt64
         let workspaceID: UUID
@@ -422,6 +483,11 @@ struct AgentOraclePill: View {
                         .controlSize(.mini)
                         .scaleEffect(0.7)
                 }
+                if let session = presentedSession(for: presentation), AgentOraclePillLogic.canCopyAll(session) {
+                    OracleElapsedLabel(presentation: oracleViewModel.oracleGroupPresentation(for: session), slot: .group)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Text(popoverSubtitle(presentation))
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -467,14 +533,21 @@ struct AgentOraclePill: View {
                                         Circle()
                                             .fill(laneDotColor(for: member))
                                             .frame(width: 6, height: 6)
+                                            .accessibilityHidden(true)
                                         Text("\(label) · \(provider) · \(status.status.rawValue)")
                                             .lineLimit(1)
+                                        if let laneID = try? OracleLaneID(index: laneIndex) {
+                                            OracleElapsedLabel(
+                                                presentation: oracleViewModel.oracleGroupPresentation(for: member),
+                                                slot: .lane(laneID)
+                                            )
+                                        }
                                     }
                                     .fixedSize(horizontal: true, vertical: false)
                                 }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .accessibilityLabel("\(label): \(provider), \(status.status.rawValue)")
+                                .accessibilityElement(children: .combine)
                                 .accessibilityAddTraits(isSelected ? .isSelected : [])
                                 .hoverTooltip(
                                     [provider, status.status.rawValue, status.errorMessage]

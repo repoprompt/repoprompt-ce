@@ -837,7 +837,8 @@ private struct OracleStorageFiles: @unchecked Sendable {
                 finishedAt: turn.finishedAt,
                 status: status,
                 warnings: turn.warnings,
-                results: turn.results
+                results: turn.results,
+                elapsedSeconds: turn.elapsedSeconds
             )
         }
         return try OracleGroupDocument(
