@@ -2883,8 +2883,11 @@ struct AgentRunMCPToolService {
         let worktreeBindings = try worktreeBindings(from: object)
         let activeWorktreeMerges = try activeWorktreeMerges(from: object)
         let modelParameterSelections = try modelParameterSelections(from: agent)
+        // An absent state key with no bindings means the producer did not publish binding
+        // knowledge (legacy or resident/expired payload); never infer `unbound` from it.
         let worktreeBindingState = object["worktree_binding_state"]?.stringValue
             .flatMap(AgentRunMCPSnapshot.WorktreeBindingState.init(rawValue:))
+            ?? (worktreeBindings.isEmpty ? .unknown : nil)
         let parentIsWorktreeBound = object["parent_worktree_bound"]?.boolValue
         return AgentRunMCPSnapshot(
             sessionID: sessionID,

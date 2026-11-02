@@ -502,8 +502,10 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
     /// Effective worktree binding of the session as published on the MCP wire.
     ///
     /// `unknown` is reserved for projections that intentionally do not publish bindings
-    /// (for example resident in-memory snapshots); it must never be inferred from an
-    /// empty binding list.
+    /// (resident in-memory snapshots, expired handles); it must never be inferred from an
+    /// empty binding list. On the wire `unknown` is represented by omitting
+    /// `worktree_binding_state` and the binding keys entirely, which keeps those legacy
+    /// payload shapes byte-identical; `bound`/`unbound` are always explicit.
     package enum WorktreeBindingState: String, Codable, Equatable, Sendable {
         case bound
         case unbound
@@ -681,7 +683,9 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             }
             object["agent"] = .object(agent)
         }
-        object["worktree_binding_state"] = .string(worktreeBindingState.rawValue)
+        if worktreeBindingState != .unknown {
+            object["worktree_binding_state"] = .string(worktreeBindingState.rawValue)
+        }
         if !worktreeBindings.isEmpty {
             let values = worktreeBindings.map { Value.object($0.asObject()) }
             object["worktree_bindings"] = .array(values)
@@ -733,7 +737,9 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             parentSessionID: nil,
             failureReason: nil,
             worktreeBindings: [],
-            activeWorktreeMerges: []
+            activeWorktreeMerges: [],
+            // An expired handle has no binding knowledge; it must not claim `unbound`.
+            worktreeBindingState: .unknown
         )
     }
 

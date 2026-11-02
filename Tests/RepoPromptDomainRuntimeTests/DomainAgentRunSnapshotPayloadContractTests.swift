@@ -94,18 +94,23 @@ final class DomainAgentRunSnapshotPayloadContractTests: XCTestCase {
         XCTAssertNil(unboundParent["worktree_binding_warning"])
     }
 
-    func testUnknownBindingStateIsExplicitAndNeverInferredFromEmptyBindings() {
-        let object = Self.makeSnapshot(worktreeBindings: [], worktreeBindingState: .unknown).asObject()
-        XCTAssertEqual(object["worktree_binding_state"], .string("unknown"))
+    func testUnknownBindingStateOmitsBindingKeysAndIsNeverInferredFromEmptyBindings() {
+        let snapshot = Self.makeSnapshot(worktreeBindings: [], worktreeBindingState: .unknown)
+        XCTAssertEqual(snapshot.worktreeBindingState, .unknown)
+        let object = snapshot.asObject()
+        XCTAssertNil(object["worktree_binding_state"], "unknown keeps the legacy shape: no state key")
         XCTAssertNil(object["worktree"], "unknown must not masquerade as an explicit unbound")
         XCTAssertNil(object["worktree_bindings"])
         XCTAssertNil(object["worktree_binding_warning"])
     }
 
-    func testExpiredSnapshotIsUnboundWithoutWarning() {
+    func testExpiredHandleKeepsLegacyShapeWithoutBindingClaims() {
         let object = DomainAgentRunSnapshot.expired(sessionID: UUID()).asObject()
-        XCTAssertEqual(object["worktree_binding_state"], .string("unbound"))
+        XCTAssertNil(object["worktree_binding_state"])
+        XCTAssertNil(object["worktree"])
+        XCTAssertNil(object["worktree_bindings"])
         XCTAssertNil(object["worktree_binding_warning"])
+        XCTAssertNil(object["parent_worktree_bound"])
     }
 
     // MARK: - Helpers
