@@ -1492,6 +1492,9 @@ final class AgentModeRunService {
                     for: revision.ownership,
                     lifecycle: session.runLifecycle
                 )
+                // A provider withdrawn by an earlier publication-only cancellation may still be
+                // retiring; teardown completion must include it.
+                await providerTeardown?()
             }
             return
         }

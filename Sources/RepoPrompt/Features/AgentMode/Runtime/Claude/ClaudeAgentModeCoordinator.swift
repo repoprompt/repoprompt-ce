@@ -246,6 +246,9 @@ final class ClaudeAgentModeCoordinator {
     private var pendingResumeTransferTasksByTabID: [UUID: Task<NativeAgentRuntimeSessionRef, Never>] = [:]
     private var pendingResumeTransferGenerationByTabID: [UUID: UUID] = [:]
     private var retiredResumeTransferTasksByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
+    /// Exact retirements of withdrawn pending providers, retained until they finish so a later
+    /// teardown-completed cancellation can still join them after the listener was detached.
+    private var withdrawnProviderRetirementsByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
     var toolTrackingHooks: AgentToolTrackingHooks = .noOp {
         didSet {
             for handler in toolHandlerByTabID.values {
@@ -403,18 +406,45 @@ final class ClaudeAgentModeCoordinator {
         return listener.isBusy || listener.adoptionTask != nil
     }
 
+    /// Withdraws a pending provider adoption, if any, and returns a join over every withdrawn
+    /// provider retirement for this tab that is still running — including ones withdrawn by an
+    /// earlier publication-only cancellation — or `nil` when there is nothing to join.
     @discardableResult
     func cancelPendingProviderAdoption(for session: AgentTabSession) -> (@MainActor () async -> Void)? {
-        guard hasPendingProviderAdoption(for: session) else { return nil }
-        if session.activeRunOwnership == nil {
-            session.mcpFollowUpRunPending = false
-            if !session.runLifecycle.terminalCommitInProgress { session.runState = .cancelled }
+        if hasPendingProviderAdoption(for: session) {
+            if session.activeRunOwnership == nil {
+                session.mcpFollowUpRunPending = false
+                if !session.runLifecycle.terminalCommitInProgress { session.runState = .cancelled }
+            }
+            let runID = session.runID
+            let detached = prepareClaudeCancelSync(session)
+            if let retirement = beginClaudeResumeTransferIfNeeded(for: session, oldController: detached) {
+                retainWithdrawnProviderRetirement(retirement, tabID: session.tabID)
+            }
+            if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
         }
-        let runID = session.runID
-        let detached = prepareClaudeCancelSync(session)
-        let retirement = beginClaudeResumeTransferIfNeeded(for: session, oldController: detached)
-        if let runID { Task { await self.cleanupAdoptedRun(session: session, runID: runID) } }
-        return retirement.map { task in { _ = await task.value } }
+        let retirements = withdrawnProviderRetirementsByTabID[session.tabID] ?? []
+        guard !retirements.isEmpty else { return nil }
+        return {
+            for task in retirements {
+                _ = await task.value
+            }
+        }
+    }
+
+    private func retainWithdrawnProviderRetirement(
+        _ retirement: Task<NativeAgentRuntimeSessionRef, Never>,
+        tabID: UUID
+    ) {
+        withdrawnProviderRetirementsByTabID[tabID, default: []].append(retirement)
+        Task { @MainActor [weak self] in
+            _ = await retirement.value
+            guard let self else { return }
+            withdrawnProviderRetirementsByTabID[tabID]?.removeAll { $0 == retirement }
+            if withdrawnProviderRetirementsByTabID[tabID]?.isEmpty == true {
+                withdrawnProviderRetirementsByTabID[tabID] = nil
+            }
+        }
     }
 
     func hasPendingProviderWork(for session: AgentTabSession) -> Bool {
