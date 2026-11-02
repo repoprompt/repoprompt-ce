@@ -28,6 +28,10 @@ struct WindowSessionEntry: Codable {
     var lastFocused: Bool
     /// Sticky instance number for this workspace in this window (for deterministic restore)
     var workspaceInstanceNumber: Int?
+    /// This window's "Enable MCP tools for this window" switch. `nil` (legacy snapshots) keeps
+    /// the new-window seeding from the global default; an explicit value is restored per window
+    /// and never written back to that default (#143).
+    var mcpToolsEnabled: Bool?
 }
 
 struct WindowSessionCaptureCandidate {
@@ -1391,6 +1395,11 @@ class WindowStatesManager: ObservableObject {
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            // Before any async teardown: `stopAllServers()` clears each window's MCP tools request,
+            // and the final session writes must still record the user's per-window switch (#143).
+            for window in self.terminationWindowSnapshot {
+                window.freezeMCPToolsPreferenceForTermination()
+            }
             self.preparedOversightCleanupTask?.cancel()
             self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates
