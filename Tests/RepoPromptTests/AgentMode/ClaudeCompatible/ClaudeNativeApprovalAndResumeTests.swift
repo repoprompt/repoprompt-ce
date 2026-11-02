@@ -3268,6 +3268,57 @@ final class ClaudeNativeProviderTurnLifecycleTests: XCTestCase {
         }
     }
 
+    func testRevisionlessSecondCancellationJoinsWithdrawnProviderWithoutSyntheticAttempt() async throws {
+        let (h, session, controller, listener) = try await spyFixture()
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        let reservation = try XCTUnwrap(h.host.claudeCoordinator.reserveEventsForHostPreparation(for: session))
+        let providerID = UUID()
+        await controller.emit(.providerTurnStarted(turnID: providerID))
+        await controller.emit(.approvalRequest(.init(
+            requestID: .claudeControl("revisionless-teardown-approval"), method: "control/can_use_tool",
+            kind: .commandExecution, threadID: "fixture", turnID: providerID.uuidString, itemID: "tool"
+        )))
+        await until("provider approval is parked in host preparation") {
+            listener.pendingApprovalIDs == ["revisionless-teardown-approval"] && listener.isBusy
+        }
+        let shutdownGate = Gate()
+        await controller.setShutdownSuspension { await shutdownGate.wait() }
+        let service = h.host.test_initializeRunService(expectedPIDPolicyArmer: { _ in true })
+
+        await service.cancelRun(
+            tabID: session.tabID, session: session, intent: .runtimeShutdown,
+            completion: .terminalPublished
+        )
+        await until("withdrawn controller shutdown is held") { shutdownGate.isWaiting }
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertTrue(reservation.subscription.isClosed)
+
+        var returned = false
+        let teardown = Task { @MainActor in
+            await service.cancelRun(
+                tabID: session.tabID, session: session, intent: .runtimeShutdown,
+                completion: .terminalTeardownCompleted
+            )
+            returned = true
+        }
+        for _ in 0 ..< 50 {
+            await Task.yield()
+        }
+        XCTAssertFalse(returned, "The second cancellation must join the held withdrawn provider")
+        XCTAssertNil(session.activeRunOwnership, "No attempt should be active while retirement is held")
+        XCTAssertNil(session.lastTerminalCommitRevision, "The second cancellation must not commit a synthetic attempt")
+
+        shutdownGate.open()
+        await teardown.value
+        XCTAssertTrue(returned)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.lastTerminalCommitRevision, "The second cancellation must not commit after retirement")
+        let shutdownCount = await controller.shutdownCount
+        XCTAssertEqual(shutdownCount, 1)
+        await h.host.claudeCoordinator.shutdownClaudeSession(session)
+    }
+
     func testSecondCancellationJoinsPreviouslyWithdrawnPendingProviderShutdown() async throws {
         let (h, session, controller, listener) = try await spyFixture()
         let predecessorID = UUID()

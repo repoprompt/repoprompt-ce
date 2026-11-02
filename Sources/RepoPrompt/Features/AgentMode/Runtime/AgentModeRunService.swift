@@ -1475,6 +1475,18 @@ final class AgentModeRunService {
             if completion == .terminalTeardownCompleted { await providerTeardown?() }
             return
         }
+        if session.runState == .cancelled,
+           session.activeRunOwnership == nil,
+           session.lastTerminalCommitRevision == nil
+        {
+            // A prior cancellation withdrew an unowned provider without creating an attempt.
+            // Repeated cancellation must join its retirement, not invent an attempt to commit.
+            if intent == .userStop, origin == .explicitStop {
+                withdrawQueuedWorkForManagedStop(tabID: tabID, session: session)
+            }
+            if completion == .terminalTeardownCompleted { await providerTeardown?() }
+            return
+        }
         if session.runState.isTerminalForCommit,
            let revision = session.lastTerminalCommitRevision
         {
