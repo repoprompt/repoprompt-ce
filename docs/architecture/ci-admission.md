@@ -22,8 +22,12 @@ no inherited secrets and read-only contents permission. They are prerequisites o
 Style. Signing identities, notarization, Sentry publication, releases, tags, and
 promotion remain independent credentialed workflows. This check does not establish
 notarization, Computer Use release compatibility, or a distributable artifact.
-Existing main-only Sentry/candidate workflows remain supplemental; their scheduling
-and recovery changes are intentionally outside this admission change.
+Standalone `CI (main)` and `Release Candidate` workflows are manual diagnostics
+(`workflow_dispatch`). They no longer repeat the mandatory product builds on each
+main push. `CI (main)` provides an isolated Sentry investigation; `Release Candidate`
+provides a downloadable ad-hoc archive when explicitly requested. Automatic main
+validation still runs both product obligations in `CI / Style`; `Publish Tip` still
+listens to successful main CI and builds its separately credentialed release.
 
 The universal packaging operation retains conductor's four-hour deadline. Its
 workflow step allows 245 minutes and the job allows 270 minutes, so the operation

@@ -2,16 +2,12 @@ name: Release Candidate
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
-# Finish a running automatic candidate; only its pending successor is replaced
-# by a newer main push. Explicit dispatches and reruns retain their own groups
-# so a later push or manual request cannot replace those exact-source builds.
+# Optional downloadable candidate. CI already gates every integration on an
+# equivalent release-mode package and MCP smoke; do not build it twice per push.
+# Each explicit request keeps its source and can finish independently.
 concurrency:
-  group: >-
-    release-candidate-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+  group: release-candidate-${{ github.run_id }}
   cancel-in-progress: false
 
 permissions:
