@@ -10844,13 +10844,19 @@ class WorkspaceManagerViewModel: ObservableObject {
             composeTabPresentationPublication = (workspaceID, [tab.id])
         }
         workspaces[workspaceIndex] = replacement
-        recordSelectionRevisionIfChanged(
-            workspaceIndex: workspaceIndex,
-            tabIndex: tabIndex,
-            oldSelection: previous.selection,
-            newSelection: updatedTab.selection,
-            reason: "updateComposeTabStoredOnly"
-        )
+        // Synchronous publication subscribers can reorder or remove either owner.
+        // Reacquire both identities; a removed target must not revise its former neighbor.
+        if let storedWorkspaceIndex = workspaces.firstIndex(where: { $0.id == workspaceID }),
+           let storedTabIndex = workspaces[storedWorkspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
+        {
+            recordSelectionRevisionIfChanged(
+                workspaceIndex: storedWorkspaceIndex,
+                tabIndex: storedTabIndex,
+                oldSelection: previous.selection,
+                newSelection: updatedTab.selection,
+                reason: "updateComposeTabStoredOnly"
+            )
+        }
 
         // Important: do NOT call promptViewModel.loadComposeTabsFromWorkspace(...)
         // and do NOT publish snapshots here. We only persist the stored tab data.
