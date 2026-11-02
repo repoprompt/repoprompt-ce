@@ -900,7 +900,12 @@ persisted checkout credentials. After remote-tag attestation it scrubs GitHub
 tokens before invoking SwiftPM-controlled commands. It resolves dependencies without lockfile
 drift, builds the approved source, verifies the trusted Sparkle payload, stages
 a universal ad-hoc app bundle plus its deterministic artifact manifest, and
-uploads that payload as a short-lived workflow artifact. The environment-scoped signing job starts on a fresh runner,
+uploads that payload as a short-lived workflow artifact. The staging job runs
+the phases of `release.sh stage-publish` as separate workflow steps (tag
+verification, dependency resolution and preflight, the universal build,
+packaged-app validation, and archiving), so `gh run watch` shows which phase is
+running; only the tag-verification step receives a GitHub token. The universal
+build step is still the long one. The environment-scoped signing job starts on a fresh runner,
 downloads and verifies the staged artifact, then imports the Developer ID
 certificate and notarization key. Before secrets are imported, trusted tooling
 extracts the untrusted staging archive with path-confinement checks and verifies
@@ -1054,6 +1059,56 @@ The promotion gate confirms:
   resources.
 - The reviewed external artifact manifest regenerates exactly from both ZIP and
   DMG app contents and is mirrored unchanged to the public updater release.
+
+## Post-promotion operator checklist
+
+The promotion workflow verifies the assets it published, but some release state
+is outside its control. After **Promote Release** succeeds, and before
+announcing the release, confirm each item for the promoted tag (`TAG=v<version>`):
+
+- [ ] **Both releases are published, latest, and immutable.**
+
+  ```bash
+  for repo in repoprompt/repoprompt-ce repoprompt/repoprompt-ce-updates; do
+    gh release view "$TAG" --repo "$repo" \
+      --json tagName,isDraft,isPrerelease,isImmutable,assets \
+      --jq '{tag: .tagName, draft: .isDraft, prerelease: .isPrerelease, immutable: .isImmutable, assets: [.assets[].name]}'
+    gh api "repos/$repo/releases/latest" --jq .tag_name
+  done
+  ```
+
+  Expect `draft: false`, `prerelease: false`, the reviewed asset list, and
+  `$TAG` as the latest release in both repositories. Expect `immutable: true`.
+  If it is `false`, GitHub **Release immutability** is not enabled for that
+  repository (see [Maintainer setup](#maintainer-setup)). Record that in the
+  release notes or tracking issue and fix the repository setting before the
+  next release. Do not delete or re-upload published assets to work around it.
+- [ ] **The public appcast reports the new version.**
+
+  ```bash
+  curl -fsSL https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml |
+    grep -E 'sparkle:(shortVersionString|version)>|<enclosure'
+  ```
+
+  `sparkle:shortVersionString` must equal `MARKETING_VERSION`,
+  `sparkle:version` must equal `BUILD_NUMBER`, and the enclosure URL must
+  point at `releases/download/$TAG/`, not `latest/download`.
+- [ ] **The Homebrew tap is updated.** Update the
+  [`repoprompt/homebrew-repoprompt-ce`](https://github.com/repoprompt/homebrew-repoprompt-ce)
+  cask version and ZIP checksum if needed, then run the
+  [Post-promote Homebrew tap checks](#post-promote-homebrew-tap-checks).
+- [ ] **Any temporary ruleset or branch-protection bypass is restored.** If a
+  bypass actor or relaxed rule was added for a specially permitted release (for
+  example, to merge release metadata into protected `main`), remove it and
+  compare the result with the backup taken before the change:
+
+  ```bash
+  gh api repos/repoprompt/repoprompt-ce/rulesets --jq '.[] | {id, name, enforcement}'
+  gh api repos/repoprompt/repoprompt-ce/rulesets/<id> --jq '{name, enforcement, bypass_actors}'
+  ```
+
+  `enforcement` must be `active` and `bypass_actors` must match the
+  pre-release backup.
 
 ## Post-promote Homebrew tap checks
 

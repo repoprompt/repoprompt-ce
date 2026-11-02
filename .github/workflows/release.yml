@@ -88,7 +88,10 @@ jobs:
             --github-env "$GITHUB_ENV" \
             --github-summary "$GITHUB_STEP_SUMMARY"
 
-      - name: Build and stage approved source
+      # The stage is split into the phases of `release.sh stage-publish` (same
+      # order, same checks) so `gh run watch` shows which phase is running.
+      # Only the first phase receives a GitHub token; later phases also unset it.
+      - name: Verify approved release tag
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
@@ -96,10 +99,46 @@ jobs:
           SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./trusted-control-plane/Scripts/release.sh stage-verify-source
+
+      - name: Resolve dependencies and run release preflight
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./trusted-control-plane/Scripts/release.sh stage-prepare
+
+      - name: Build universal release app
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
           # Link the Sentry SDK into the official release binary. The protected DSN is
           # injected later in the signing job, so the secret-free stage stays inert.
           REPOPROMPT_ENABLE_SENTRY: "1"
-        run: ./trusted-control-plane/Scripts/release.sh stage-publish
+        run: ./trusted-control-plane/Scripts/release.sh stage-package
+
+      - name: Validate staged release app
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./trusted-control-plane/Scripts/release.sh stage-validate
+
+      - name: Archive staged release source
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          REPOPROMPT_ENABLE_SENTRY: "1"
+        run: ./trusted-control-plane/Scripts/release.sh stage-archive
 
       - name: Upload staged release source
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
