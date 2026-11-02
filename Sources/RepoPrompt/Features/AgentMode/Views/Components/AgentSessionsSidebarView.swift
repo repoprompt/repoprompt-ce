@@ -52,6 +52,8 @@ struct AgentModeSessionsSidebarView: View {
     let currentTabID: UUID?
     let onManageWorkspaces: () -> Void
 
+    /// Remembered per window; mirrored into the sidebar store, which owns filtering.
+    @SceneStorage("agentModeSidebarTab") private var storedSidebarTab = AgentSidebarTab.all.rawValue
     @State private var isCollapseAllThreadsButtonHovered = false
     @State private var isCollapseAllThreadsButtonFlashing = false
     @State private var collapseAllThreadsButtonClickTick = 0
@@ -128,13 +130,18 @@ struct AgentModeSessionsSidebarView: View {
                 collapseAllThreadsButton
             }
             .padding(.horizontal, topBarHorizontalPadding)
-            .padding(.vertical, topBarVerticalPadding)
+            .padding(.top, topBarVerticalPadding)
+            .padding(.bottom, topBarSpacing)
             .animation(.easeInOut(duration: 0.15), value: agentModeVM.sidebarCollapseAllState(
                 for: promptManager.currentComposeTabs,
                 currentTabID: currentTabID,
                 searchText: sidebarUI.snapshot.searchText,
                 diagnosticSource: "sidebarTopBar.animation"
             ))
+
+            sidebarTabPicker
+                .padding(.horizontal, topBarHorizontalPadding)
+                .padding(.bottom, topBarVerticalPadding)
 
             AgentModeSessionsListView(
                 agentModeVM: agentModeVM,
@@ -245,6 +252,31 @@ struct AgentModeSessionsSidebarView: View {
             return Color(NSColor.labelColor).opacity(0.85)
         }
         return Color(NSColor.secondaryLabelColor).opacity(0.6)
+    }
+
+    /// All · Pinned · Active · Overseers. All is the unchanged sidebar; the others filter it.
+    private var sidebarTabPicker: some View {
+        Picker("Show", selection: Binding(
+            get: { sidebarUI.snapshot.sidebarTab },
+            set: { tab in
+                storedSidebarTab = tab.rawValue
+                agentModeVM.setSidebarTab(tab)
+            }
+        )) {
+            ForEach(AgentSidebarTab.allCases) { tab in
+                Text(tab.title).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(.small)
+        .accessibilityLabel("Show sessions")
+        .onAppear {
+            let tab = AgentSidebarTab(rawValue: storedSidebarTab) ?? .all
+            if tab != sidebarUI.snapshot.sidebarTab {
+                agentModeVM.setSidebarTab(tab)
+            }
+        }
     }
 
     /// Search box for filtering sessions.
@@ -462,7 +494,9 @@ struct AgentModeSessionsListView: View, Equatable {
     /// Expanded archived rows derive creator labels from the same projections and are not tracked
     /// as facts, so they keep the previous unconditional invalidation.
     private func reconcileSessionLinkProjection() {
-        guard archivedSessionsExpanded || rowActions.renderedOversightFactsChanged() else { return }
+        guard archivedSessionsExpanded || sidebarUI.snapshot.sidebarTab == .overseers
+            || rowActions.renderedOversightFactsChanged()
+        else { return }
         sessionLinkProjectionRevision &+= 1
     }
 
@@ -643,6 +677,15 @@ struct AgentModeSessionsListView: View, Equatable {
                         .padding(.horizontal, listHorizontalPadding)
                         .padding(.vertical, 6)
                         .accessibilityElement(children: .combine)
+                    }
+                    let isSearching = !sidebarSnapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    if !snapshot.isOwnerPending, renderedActiveRows.isEmpty, sidebarSnapshot.sidebarTab != .all {
+                        Text(isSearching ? "No matching sessions" : sidebarSnapshot.sidebarTab.emptyTitle)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, listHorizontalPadding)
+                            .padding(.vertical, 8)
                     }
                     AgentSidebarKeyedRowList(
                         items: renderedActiveRows,

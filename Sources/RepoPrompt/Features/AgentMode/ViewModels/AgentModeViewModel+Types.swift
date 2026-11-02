@@ -252,6 +252,11 @@ extension AgentModeViewModel {
         let archivedSessionsExpanded: Bool
         let showComposeTabsWithoutAgentSessions: Bool
         let restorePresentation: SidebarRestorePresentationKey
+        /// Live overseers; non-empty only while the Overseers tab is selected, so link changes
+        /// re-filter that tab without invalidating the others.
+        var liveOverseerSessionIDs: Set<UUID> = []
+        /// Live running/waiting tabs; non-empty only while the Active tab is selected.
+        var liveActiveTabIDs: Set<UUID> = []
     }
 
     struct SidebarListProjection {

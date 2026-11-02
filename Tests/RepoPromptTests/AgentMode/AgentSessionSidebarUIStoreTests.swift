@@ -674,3 +674,137 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
         return UUID(uuidString: "00000000-0000-0000-0000-\(suffix)")!
     }
 }
+
+
+/// Sidebar filter tabs: All is the unchanged sidebar; the others narrow it.
+@MainActor
+final class AgentSidebarTabFilterTests: XCTestCase {
+    private let base = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func id(_ value: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value))!
+    }
+
+    private func row(
+        _ number: Int,
+        parent: Int? = nil,
+        depth: Int = 0,
+        pinned: Bool = false,
+        runState: AgentSessionRunState = .idle,
+        laneCreator: Int? = nil
+    ) -> AgentModeViewModel.SidebarSession {
+        AgentModeViewModel.SidebarSession(
+            id: id(number), tabID: id(number), title: "Session \(number)", lastUserMessageAt: base,
+            activityDate: base, isPinned: pinned, sessionID: id(100 + number),
+            parentSessionID: parent.map { id(100 + $0) }, createdByOverseerSessionID: laneCreator.map { id(100 + $0) },
+            depth: depth, isMCPControlled: false,
+            searchFieldSource: AgentSessionSearchFieldSource(title: "Session \(number)", runState: runState)
+        )
+    }
+
+    func testAllTabReturnsRowsUnchanged() {
+        let rows = [row(1), row(2, parent: 1, depth: 1), row(3, pinned: true)]
+        let filtered = AgentModeViewModel.sidebarRows(rows, in: .all, attentionTabIDs: [], overseerSessionIDs: [])
+        XCTAssertEqual(filtered.map(\.id), rows.map(\.id))
+    }
+
+    func testPinnedTabKeepsPinnedRowsWithTheirParents() {
+        let rows = [row(1), row(2, parent: 1, depth: 1, pinned: true), row(3), row(4, pinned: true)]
+        let filtered = AgentModeViewModel.sidebarRows(rows, in: .pinned, attentionTabIDs: [], overseerSessionIDs: [])
+        XCTAssertEqual(filtered.map(\.id), [id(1), id(2), id(4)])
+    }
+
+    func testActiveTabKeepsRunningWaitingAndUnseenAttention() {
+        let rows = [
+            row(1, runState: .running), row(2, runState: .waitingForApproval), row(3, runState: .completed),
+            row(4), row(5, parent: 4, depth: 1, runState: .waitingForUser)
+        ]
+        let filtered = AgentModeViewModel.sidebarRows(rows, in: .active, attentionTabIDs: [id(3)], overseerSessionIDs: [])
+        // 3 is completed but carries unseen attention; idle 4 stays as the parent of waiting 5.
+        XCTAssertEqual(filtered.map(\.id), [id(1), id(2), id(3), id(4), id(5)])
+        XCTAssertTrue(AgentModeViewModel.sidebarRows([row(6)], in: .active, attentionTabIDs: [], overseerSessionIDs: []).isEmpty)
+    }
+
+    func testOverseersTabKeepsSessionsOverseeingOthers() {
+        let rows = [row(1), row(2, laneCreator: 1), row(3), row(4)]
+        let filtered = AgentModeViewModel.sidebarRows(rows, in: .overseers, attentionTabIDs: [], overseerSessionIDs: [id(101), id(103)])
+        XCTAssertEqual(filtered.map(\.id), [id(1), id(3)])
+    }
+
+    func testSelectingATabPublishesWithoutRebuildingRows() {
+        let store = AgentSessionSidebarUIStore()
+        let before = store.snapshot
+        store.setSidebarTab(.active)
+        XCTAssertEqual(store.snapshot.sidebarTab, .active)
+        XCTAssertEqual(store.snapshot.rowContentRevision, before.rowContentRevision)
+        XCTAssertGreaterThan(store.snapshot.revision, before.revision)
+    }
+
+    func testFilteredTabShowsMatchesInsideCollapsedThreadsAndAllTabKeepsCollapse() {
+        let viewModel = makeViewModel()
+        let tabs = [
+            ComposeTabState(id: id(1), name: "Parent", lastModified: base, activeAgentSessionID: id(101)),
+            ComposeTabState(id: id(2), name: "Pinned child", lastModified: base, isPinned: true, activeAgentSessionID: id(102))
+        ]
+        for (offset, tab) in tabs.enumerated() {
+            let session = AgentModeViewModel.TabSession(tabID: tab.id)
+            session.hasLoadedPersistedState = true
+            session.lastActivityAt = base.addingTimeInterval(TimeInterval(-offset * 60))
+            if offset == 1 { session.parentSessionID = id(101) }
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session))
+            viewModel.test_installLiveSession(session)
+        }
+        viewModel.ui.sessionSidebar.refresh()
+        viewModel.ui.sessionSidebar.setThreadCollapsed(true, for: .key(sessionID: id(101), tabID: id(1)))
+        XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1)], "All keeps the collapse")
+
+        viewModel.setSidebarTab(.pinned)
+        XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1), id(2)])
+        viewModel.setSidebarTab(.all)
+        XCTAssertEqual(projection(viewModel, tabs: tabs).filteredSessions.map(\.tabID), [id(1)])
+    }
+
+    func testActiveTabFollowsLiveRunStateWithoutARowRebuild() {
+        let viewModel = makeViewModel()
+        let tab = ComposeTabState(id: id(1), name: "Worker", lastModified: base, activeAgentSessionID: id(101))
+        let session = AgentModeViewModel.TabSession(tabID: tab.id)
+        session.hasLoadedPersistedState = true
+        XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session))
+        viewModel.test_installLiveSession(session)
+        viewModel.ui.sessionSidebar.refresh()
+        viewModel.setSidebarTab(.active)
+        XCTAssertTrue(projection(viewModel, tabs: [tab]).filteredSessions.isEmpty)
+
+        session.runState = .running
+        XCTAssertEqual(projection(viewModel, tabs: [tab]).filteredSessions.map(\.tabID), [id(1)])
+        session.runState = .completed
+        XCTAssertTrue(projection(viewModel, tabs: [tab]).filteredSessions.isEmpty)
+    }
+
+    private func projection(
+        _ viewModel: AgentModeViewModel,
+        tabs: [ComposeTabState]
+    ) -> AgentModeViewModel.SidebarListProjection {
+        viewModel.sidebarListProjection(
+            workspaceID: nil,
+            composeTabs: tabs,
+            stashedTabs: [],
+            currentTabID: nil,
+            sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot,
+            archivedSessionsExpanded: false,
+            showComposeTabsWithoutAgentSessions: true
+        )
+    }
+
+    private func makeViewModel() -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWindowID: -1408,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Sidebar tab tests must not start a Codex session")
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+    }
+}

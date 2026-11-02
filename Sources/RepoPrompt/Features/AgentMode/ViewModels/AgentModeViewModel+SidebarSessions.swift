@@ -614,7 +614,9 @@ extension AgentModeViewModel {
             stashedTabSignatures: makeSessionSidebarStashedTabSignatures(for: stashedTabs),
             archivedSessionsExpanded: archivedSessionsExpanded,
             showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions,
-            restorePresentation: sidebarRestorePresentationKey
+            restorePresentation: sidebarRestorePresentationKey,
+            liveOverseerSessionIDs: sidebarSnapshot.sidebarTab == .overseers ? sidebarOverseerSessionIDs(for: []) : [],
+            liveActiveTabIDs: sidebarSnapshot.sidebarTab == .active ? sidebarLiveActiveTabIDs() : []
         )
         if let cached = sidebarListProjectionCache, cached.key == key {
             return cached.projection
@@ -761,7 +763,7 @@ extension AgentModeViewModel {
     }
 
     private func filteredSidebarSessions(
-        _ sortedSessions: [SidebarSession],
+        _ canonicalSessions: [SidebarSession],
         inputTabCount: Int,
         currentTabID: UUID?,
         searchText: String,
@@ -770,6 +772,8 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
+        // The All tab passes rows through untouched; other tabs narrow them before search.
+        let sortedSessions = sidebarRows(canonicalSessions, in: ui.sessionSidebar.snapshot.sidebarTab)
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let effectiveSearchText = searchText
         let searchTrimmed = effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -843,6 +847,79 @@ extension AgentModeViewModel {
         return result
     }
 
+    func setSidebarTab(_ tab: AgentSidebarTab) {
+        ui.sessionSidebar.setSidebarTab(tab)
+    }
+
+    /// Sessions overseeing others: live outbound links in this window plus creators of lanes.
+    /// O(links); empty unless the Overseers tab needs it.
+    func sidebarOverseerSessionIDs(for rows: [SidebarSession]) -> Set<UUID> {
+        var ids = Set(rows.compactMap(\.createdByOverseerSessionID))
+        for props in monitorPillPropsByEndpoint.values {
+            if !props.outbound.isEmpty, let sessionID = props.endpoint?.sessionID ?? props.sessionID {
+                ids.insert(sessionID)
+            }
+            ids.formUnion(props.inbound.map(\.observerSessionID))
+        }
+        return ids
+    }
+
+    /// Narrows rows to one filter tab, keeping each match's parent chain for context (as search
+    /// does). `.all` returns `rows` unchanged.
+    func sidebarRows(_ rows: [SidebarSession], in tab: AgentSidebarTab) -> [SidebarSession] {
+        guard tab != .all else { return rows }
+        let attention = Set(ui.sessionSidebar.snapshot.attentionRunStateByTabID.keys)
+        let overseers = tab == .overseers ? sidebarOverseerSessionIDs(for: rows) : []
+        return Self.sidebarRows(
+            rows,
+            in: tab,
+            attentionTabIDs: attention,
+            overseerSessionIDs: overseers,
+            liveRunStateByTabID: tab == .active ? sessions.mapValues(\.runState) : [:]
+        )
+    }
+
+    /// Tabs whose live session is running or waiting. Rows are not rebuilt on run-state changes,
+    /// so the Active tab reads this (and the projection cache keys on it) instead of row snapshots.
+    func sidebarLiveActiveTabIDs() -> Set<UUID> {
+        Set(sessions.compactMap { tabID, session in session.runState.isActive ? tabID : nil })
+    }
+
+    static func sidebarRows(
+        _ rows: [SidebarSession],
+        in tab: AgentSidebarTab,
+        attentionTabIDs: Set<UUID>,
+        overseerSessionIDs: Set<UUID>,
+        liveRunStateByTabID: [UUID: AgentSessionRunState] = [:]
+    ) -> [SidebarSession] {
+        func matches(_ row: SidebarSession) -> Bool {
+            switch tab {
+            case .all: true
+            case .pinned: row.isPinned
+            case .active:
+                (liveRunStateByTabID[row.tabID] ?? row.searchFieldSource.runState)?.isActive == true
+                    || attentionTabIDs.contains(row.tabID)
+            case .overseers: row.sessionID.map(overseerSessionIDs.contains) ?? false
+            }
+        }
+        guard tab != .all else { return rows }
+        let sessionByID = Dictionary(
+            rows.compactMap { row in row.sessionID.map { ($0, row) } },
+            uniquingKeysWith: { _, new in new }
+        )
+        var kept = Set<UUID>()
+        for row in rows where matches(row) {
+            kept.insert(row.id)
+            var cursor = row.parentSessionID
+            var visited: Set<UUID> = []
+            while let parentID = cursor, visited.insert(parentID).inserted, let parent = sessionByID[parentID] {
+                kept.insert(parent.id)
+                cursor = parent.parentSessionID
+            }
+        }
+        return rows.filter { kept.contains($0.id) }
+    }
+
     /// Stored collapsed keys plus currently eligible default-collapse keys not yet handled (§5.6). The
     /// first released projection is therefore already collapsed; the view's later seeding task only
     /// persists the handled set and cannot move rows, paging or sections.
@@ -866,7 +943,9 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
+        // A filter tab, like search, shows matches in context: collapsed parents must not hide them.
         let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || ui.sessionSidebar.snapshot.sidebarTab != .all
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(in: rows, searchText: searchText)
         guard !rows.isEmpty else {
