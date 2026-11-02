@@ -81,6 +81,7 @@ extension DebugStateBootstrap.Builder {
                 plan.generated["windowSessions.json"] = try json(prior)
             }
         }
+        try preserveDebugOracleState(workspaceIDs: retained.retainedWorkspaceIDs)
         plan.generated["debugSeedRetainedContinuity.json"] = try json([
             "version": 1,
             "retainedWorkspaceIDs": retained.retainedWorkspaceIDs.sorted(),

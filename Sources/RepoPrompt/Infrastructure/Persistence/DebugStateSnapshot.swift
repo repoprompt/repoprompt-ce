@@ -252,8 +252,10 @@ struct DebugStateSnapshot {
 
     enum Failure: Error, LocalizedError {
         case sourceChanged, cancelled, unsafeFile, unsafeDestination, duplicateDestination, database(Int32), unsupportedWAL
+        case oracleRetention(String)
         var errorDescription: String? {
             switch self {
+            case let .oracleRetention(reason): "Retained Oracle state could not be combined: \(reason) Original state was preserved."
             case .sourceChanged: "Production state changed during capture. Retry when release is idle; no profile was replaced."
             case .cancelled: "Debug state preparation was cancelled before publication; no profile was replaced."
             case .unsafeFile: "A snapshot source is missing, aliased, or not a regular metadata file. Original state was preserved."
