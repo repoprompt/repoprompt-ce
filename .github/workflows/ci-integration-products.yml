@@ -92,6 +92,17 @@ jobs:
             "Admission release-mode package" \
             ".build/release/RepoPrompt-artifact-manifest.json"
 
+      - name: Transfer the same candidate to older macOS runners
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: compatibility-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/*-artifact-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Retain package manifest and failure diagnostics
         if: always()
         uses: actions/upload-artifact@v4
@@ -103,3 +114,12 @@ jobs:
             ${{ runner.temp }}/admission-conductor/jobs/*.log
           if-no-files-found: warn
           retention-days: 7
+
+  compatibility:
+    name: Older macOS Compatibility
+    needs: package
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: compatibility-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+      tooling-ref: ${{ github.sha }}
+      admission: ${{ inputs.admission }}

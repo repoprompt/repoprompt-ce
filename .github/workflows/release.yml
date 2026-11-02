@@ -384,6 +384,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  compatibility:
+    name: Older macOS Signed Artifact Compatibility
+    needs: [validate-ref, publish]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: RepoPrompt-CE-signed-release-zip
+      tooling-ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+
   smoke-signed-helper:
     name: Smoke Signed Helper Without Release Secrets
     needs:
