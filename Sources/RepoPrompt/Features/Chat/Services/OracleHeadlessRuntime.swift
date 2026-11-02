@@ -109,61 +109,71 @@ final class OracleHeadlessRuntime {
         }
 
         let timeout = timeout
-        let (finalText, _, finalTokenInfo, providerCleanupHandle, terminalOutcome) = try await withThrowingTaskGroup(
-            of: (String, String, ChatTokenInfo, ProviderConversationCleanupHandle?, ChatStreamTerminalOutcome?).self
-        ) { group in
-            group.addTask {
-                try await Task.sleep(for: timeout)
-                throw ChatToolError.internalError("Stream timed out before completion.")
-            }
-
-            group.addTask { [stream, onProgress, cleanupHandleBox] in
-                var accumulatedText = ""
-                var accumulatedReasoning = ""
-                var tokens = ChatTokenInfo()
-                var cleanupHandle: ProviderConversationCleanupHandle?
-                var terminalOutcome: ChatStreamTerminalOutcome?
-                var iterator = stream.makeAsyncIterator()
-
-                while let chunk = try await iterator.next() {
-                    accumulatedText += chunk.text
-                    if let reasoning = chunk.reasoning, !reasoning.isEmpty {
-                        accumulatedReasoning += reasoning
-                        accumulatedReasoning = ReasoningTextFormatter.normalize(accumulatedReasoning)
-                    }
-                    if chunk.tokens.promptTokens != nil ||
-                        chunk.tokens.completionTokens != nil ||
-                        chunk.tokens.cost != nil
-                    {
-                        tokens = chunk.tokens
-                    }
-                    if let handle = chunk.cleanupHandle {
-                        cleanupHandle = handle
-                        await cleanupHandleBox.update(handle)
-                    }
-                    if let onProgress {
-                        let text = accumulatedText
-                        let reasoning = accumulatedReasoning.isEmpty ? nil : accumulatedReasoning
-                        await MainActor.run { onProgress(text, reasoning) }
-                    }
-                    if let outcome = chunk.terminalOutcome {
-                        terminalOutcome = outcome
-                        break
-                    }
+        // An aborted owner (for example an Agent Mode thread stopped mid context_builder
+        // follow-up) must terminate the provider stream explicitly. Relying on the iterator
+        // being dropped leaves the upstream request running until the provider finishes (#26).
+        let (finalText, _, finalTokenInfo, providerCleanupHandle, terminalOutcome) = try await withTaskCancellationHandler {
+            try await withThrowingTaskGroup(
+                of: (String, String, ChatTokenInfo, ProviderConversationCleanupHandle?, ChatStreamTerminalOutcome?).self
+            ) { group in
+                group.addTask {
+                    try await Task.sleep(for: timeout)
+                    throw ChatToolError.internalError("Stream timed out before completion.")
                 }
-                return (
-                    accumulatedText,
-                    accumulatedReasoning,
-                    tokens,
-                    cleanupHandle,
-                    terminalOutcome
-                )
-            }
 
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+                group.addTask { [stream, onProgress, cleanupHandleBox] in
+                    var accumulatedText = ""
+                    var accumulatedReasoning = ""
+                    var tokens = ChatTokenInfo()
+                    var cleanupHandle: ProviderConversationCleanupHandle?
+                    var terminalOutcome: ChatStreamTerminalOutcome?
+                    var iterator = stream.makeAsyncIterator()
+
+                    while let chunk = try await iterator.next() {
+                        accumulatedText += chunk.text
+                        if let reasoning = chunk.reasoning, !reasoning.isEmpty {
+                            accumulatedReasoning += reasoning
+                            accumulatedReasoning = ReasoningTextFormatter.normalize(accumulatedReasoning)
+                        }
+                        if chunk.tokens.promptTokens != nil ||
+                            chunk.tokens.completionTokens != nil ||
+                            chunk.tokens.cost != nil
+                        {
+                            tokens = chunk.tokens
+                        }
+                        if let handle = chunk.cleanupHandle {
+                            cleanupHandle = handle
+                            await cleanupHandleBox.update(handle)
+                        }
+                        if let onProgress {
+                            let text = accumulatedText
+                            let reasoning = accumulatedReasoning.isEmpty ? nil : accumulatedReasoning
+                            await MainActor.run { onProgress(text, reasoning) }
+                        }
+                        if let outcome = chunk.terminalOutcome {
+                            terminalOutcome = outcome
+                            break
+                        }
+                    }
+                    return (
+                        accumulatedText,
+                        accumulatedReasoning,
+                        tokens,
+                        cleanupHandle,
+                        terminalOutcome
+                    )
+                }
+
+                let result = try await group.next()!
+                group.cancelAll()
+                return result
+            }
+        } onCancel: {
+            Task { @MainActor in await self.cancelUpstreamStream(streamID) }
         }
+        // `AsyncThrowingStream.next()` yields `nil` on cancellation, so an aborted run must
+        // surface as cancellation here rather than as a provider-incomplete failure.
+        try Task.checkCancellation()
 
         if completionPolicy == .contextBuilderStrict {
             switch terminalOutcome {
@@ -194,6 +204,10 @@ final class OracleHeadlessRuntime {
 
     func hasActiveStream(for tabID: UUID) -> Bool {
         streamIDsByTabID[tabID] != nil
+    }
+
+    private func cancelUpstreamStream(_ streamID: ChatStreamID) async {
+        await cancelStream(streamID)
     }
 
     func cancelStream(for tabID: UUID) async {

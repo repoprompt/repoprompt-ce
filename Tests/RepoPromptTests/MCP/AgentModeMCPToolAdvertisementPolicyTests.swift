@@ -358,3 +358,44 @@ final class AgentSessionLinkToolSchemaCacheTests: XCTestCase {
         }
     }
 #endif
+
+/// Issue #401: every command-running agent-mode prompt variant must steer providers away from
+/// exec/status polling loops and toward one bounded wait. RepoPrompt cannot change
+/// provider-internal `exec_command`/`write_stdin` tools, so the prompt is the lever.
+final class AgentModePromptLongRunningCommandGuidanceTests: XCTestCase {
+    private static let requiredPhrases = [
+        "**Long-running Commands**",
+        "do not loop on exec/status/poll calls",
+        "Never re-read output you already have",
+        "Prefer structured waits"
+    ]
+
+    func testEveryCommandRunningRolePromptCarriesLongRunningCommandGuidanceForEveryProvider() {
+        // Explore agents are read-only probes without command execution, so their lean prompt
+        // intentionally omits shell guidance; every role that can run commands must carry it.
+        let roles: [AgentModelCatalog.TaskLabelKind?] = [nil, .pair, .design, .engineer]
+        let providers: [AgentProviderKind?] = [nil, .claudeCode, .codexExec]
+        for role in roles {
+            for provider in providers {
+                let prompt = SystemPromptService.agentModePrompt(agentKind: provider, taskLabelKind: role)
+                for phrase in Self.requiredPhrases {
+                    XCTAssertTrue(
+                        prompt.contains(phrase),
+                        "role=\(String(describing: role)) provider=\(String(describing: provider)) lacks '\(phrase)'"
+                    )
+                }
+                XCTAssertEqual(
+                    prompt.components(separatedBy: "**Long-running Commands**").count, 2,
+                    "guidance must appear exactly once for role=\(String(describing: role)) provider=\(String(describing: provider))"
+                )
+            }
+        }
+    }
+
+    func testGuidanceDoesNotNameProviderInternalTools() {
+        // Provider tool names differ (exec_command, write_stdin, Bash...); the guidance stays generic.
+        let guidance = AgentModePrompts.Fragments.longRunningCommandGuidance
+        XCTAssertFalse(guidance.contains("exec_command"))
+        XCTAssertFalse(guidance.contains("write_stdin"))
+    }
+}

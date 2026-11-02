@@ -2295,7 +2295,10 @@ actor InteractiveMCPClientSession {
         if connectResult < 0 {
             let err = errno
             if err == ECONNREFUSED || err == ENOENT {
-                throw InteractiveSessionError.appNotRunning
+                // The bootstrap directory exists (MCP was enabled recently) but its socket is not
+                // accepting connections. That is the window right after the app restarts its
+                // MCP server; classify it as retryable rather than "app not running" (#294).
+                throw InteractiveSessionError.bootstrapSocketUnavailable(errno: err)
             }
             throw InteractiveSessionError.connectFailed(errno: err)
         }
@@ -2427,7 +2430,12 @@ package enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
     case descriptorConfigurationFailed(errno: Int32)
     case pathTooLong
     case connectFailed(errno: Int32)
+    /// No bootstrap directory: the app is not running or MCP is disabled. Permanent until the
+    /// user launches the app / enables MCP.
     case appNotRunning
+    /// Bootstrap directory present but the socket refused or is missing: the app is most likely
+    /// restarting its MCP server. Transient; retry (for example with `--connect-wait`).
+    case bootstrapSocketUnavailable(errno: Int32)
     case approvalDenied
     case handshakeFailed(reason: String)
     case bootstrapResponseTimeout
@@ -2459,6 +2467,11 @@ package enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
             return "Failed to connect: \(errno)"
         case .appNotRunning:
             return "RepoPrompt app is not running or MCP is disabled"
+        case let .bootstrapSocketUnavailable(errno):
+            let cause = errno == ENOENT ? "its socket is missing" : "its socket refused the connection"
+            return "RepoPrompt's MCP bootstrap directory exists but \(cause) (errno \(errno)). " +
+                "The app is probably restarting its MCP server; this is retryable. Retry shortly or pass " +
+                "--connect-wait <seconds>; if it persists, relaunch RepoPrompt."
         case .approvalDenied:
             return "Connection approval was denied"
         case let .handshakeFailed(reason):
@@ -2478,6 +2491,19 @@ package enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
             return "Poll failed: \(errno)"
         case .cancelled:
             return "Operation cancelled"
+        }
+    }
+
+    /// Connection failures that are part of a reconnect window (the app restarting its MCP
+    /// server or answering its bootstrap handshake late) rather than a permanent
+    /// "not running / MCP disabled / approval denied" state. Callers may retry these with
+    /// bounded backoff; `appNotRunning` stays permanent until the user acts.
+    package var isRetryableConnectionFailure: Bool {
+        switch self {
+        case .bootstrapSocketUnavailable, .bootstrapResponseTimeout:
+            true
+        default:
+            false
         }
     }
 }

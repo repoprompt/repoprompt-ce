@@ -63,7 +63,9 @@ extension DomainAgentRunSnapshot {
         parentSessionID: UUID?,
         failureReason: FailureReason?,
         worktreeBindings: [WorktreeBinding],
-        appActiveWorktreeMerges: [AgentSessionWorktreeMergeSummary]
+        appActiveWorktreeMerges: [AgentSessionWorktreeMergeSummary],
+        worktreeBindingState: WorktreeBindingState? = nil,
+        parentIsWorktreeBound: Bool? = nil
     ) {
         self.init(
             sessionID: sessionID,
@@ -102,7 +104,9 @@ extension DomainAgentRunSnapshot {
                     conflictFileCount: $0.conflictFileCount,
                     updatedAt: $0.updatedAt
                 )
-            }
+            },
+            worktreeBindingState: worktreeBindingState,
+            parentIsWorktreeBound: parentIsWorktreeBound
         )
     }
 }

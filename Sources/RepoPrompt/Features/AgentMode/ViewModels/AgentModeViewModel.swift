@@ -8746,7 +8746,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             parentSessionID: session.parentSessionID,
             failureReason: failureReason,
             worktreeBindings: session.worktreeBindings.map { AgentRunMCPSnapshot.WorktreeBinding(binding: $0) },
-            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+            appActiveWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            // Publishes whether the parent holds bindings so an unbound task-aware child can be
+            // flagged in start/poll responses (#400). Unresolvable parents stay `nil`.
+            parentIsWorktreeBound: session.parentSessionID.flatMap { parentSessionID in
+                worktreeBindingState(forAgentSessionID: parentSessionID).bindings.map { !$0.isEmpty }
+            }
         )
     }
 
