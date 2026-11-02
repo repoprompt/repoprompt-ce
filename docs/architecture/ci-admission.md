@@ -15,13 +15,18 @@ and main pushes. Every candidate runs all obligations (no path-based exemptions)
 - all four root shards with exact listing/target/assignment/union verification;
 - Sentry-enabled app build and serialized privacy tests;
 - universal ad-hoc **release-mode**, Sentry-enabled packaging and the exact packaged
-  MCP helper roundtrip via the existing release scripts.
+  MCP helper roundtrip via the existing release scripts;
+- transfer of that same archive and manifest to macOS 15 ARM64 and Intel, where
+  both must pass the isolated app/MCP roundtrip without recompiling or re-signing.
 
-The last two obligations live in `ci-integration-products.yml`, called by CI with
+The last three obligations live in `ci-integration-products.yml`, called by CI with
 no inherited secrets and read-only contents permission. They are prerequisites of
 Style. Signing identities, notarization, Sentry publication, releases, tags, and
 promotion remain independent credentialed workflows. This check does not establish
 notarization, Computer Use release compatibility, or a distributable artifact.
+The older-runtime matrix uses the oldest available hosted macOS generation.
+It does not claim macOS 14 coverage after that hosted image's retirement; see
+[the manual macOS 14 validation path](../releasing.md#older-macos-artifact-compatibility).
 Standalone `CI (main)` and `Release Candidate` workflows are manual diagnostics
 (`workflow_dispatch`). They no longer repeat the mandatory product builds on each
 main push. `CI (main)` provides an isolated Sentry investigation; `Release Candidate`

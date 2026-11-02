@@ -39,3 +39,11 @@ jobs:
           name: RepoPrompt-CE-release-candidate
           path: dist/*
           if-no-files-found: error
+
+  compatibility:
+    name: Older macOS Compatibility
+    needs: artifact
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: RepoPrompt-CE-release-candidate
+      tooling-ref: ${{ github.sha }}

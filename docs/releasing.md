@@ -640,6 +640,56 @@ macOS runtimes, including `os.Logger.isEnabled(type:)` and `os.Logger.disabled`
 instead. This bounded denylist is not a complete macOS 14 compatibility audit;
 launch validation on the oldest supported OS remains necessary.
 
+### Older macOS artifact compatibility
+
+The required integration products now transfer the **same ZIP and manifest**
+built on macOS 26 to macOS 15 ARM64 and Intel runners. Both run the existing
+isolated app/MCP roundtrip. Stable promotion and Tip publication also wait for
+these checks against their signed, checksum-bound artifacts; transition PKGs
+are expanded and checked without installation. Nothing is rebuilt or re-signed
+on the compatibility runners. The runtime and native architecture must match
+the selected matrix cell, and failures retain a JSON result plus smoke logs.
+Automated packaged smoke disables telemetry for the test process so CI activity
+does not contribute production Sentry events.
+
+This detects unknown missing-symbol and startup regressions beyond the bounded
+symbol denylist. It does **not** establish macOS 14 compatibility. GitHub retired
+its hosted macOS 14 images on [November 2, 2026](https://github.com/actions/runner-images/issues/13518),
+and the project currently has no macOS 14 CI runner. The advertised deployment
+minimum remains 14.0; changing it is a separate product decision.
+
+For a macOS 14 check, use a disposable Sonoma VM on compatible Apple silicon.
+[Tart's quick start](https://tart.run/quick-start/) lists prebuilt Sonoma images;
+for example, these commands create and start a local VM (a substantial download):
+
+```bash
+brew install cirruslabs/cli/tart
+tart clone ghcr.io/cirruslabs/macos-sonoma-base:latest rpce-sonoma
+tart run rpce-sonoma
+```
+
+Verify the guest with `sw_vers`; retain its exact OS/build and image digest for
+repeatability, and keep it on macOS 14. A Parallels VM installed from a compatible
+Sonoma IPSW is another option. In the guest, install Python 3.11+ and compatible
+Xcode command-line tools, check out the exact validation-tooling commit, and copy
+the already-built release ZIP (or transition PKG), `SHA256SUMS`, and artifact
+manifest into one directory. Then run:
+
+```bash
+python3 Scripts/smoke_macos_compatibility.py /path/to/release-artifacts \
+  --expected-major 14 --expected-arch arm64 --report /tmp/rpce-sonoma/result.json
+```
+
+Use `--expected-arch x86_64` on a native Intel macOS 14 runner. The helper refuses
+a newer host in place of the requested runtime. It verifies the transferred
+enclosure and manifest checksums, checks signatures and linked symbols, then
+launches the actual app until its embedded MCP helper completes the roundtrip.
+The result records the artifact digest and observed runtime. Run this only in a
+disposable test environment: it launches the app with isolated state and cleans
+up its owned process session. A successful newer-OS check must never be reported
+as macOS 14 evidence. A future macOS 14 CI runner should run this same helper;
+the current PR/merge gate has no dependency on unprovisioned self-hosted hardware.
+
 The direct fallback commands are `make release-preflight` and
 `make release-artifact`. The GitHub **Release Candidate** workflow runs the same
 path on `main` and on manual dispatch, then uploads the archive as a workflow
