@@ -675,7 +675,6 @@ final class AgentSessionSidebarUIStoreTests: XCTestCase {
     }
 }
 
-
 /// Sidebar filter tabs: All is the unchanged sidebar; the others narrow it.
 @MainActor
 final class AgentSidebarTabFilterTests: XCTestCase {
@@ -806,5 +805,153 @@ final class AgentSidebarTabFilterTests: XCTestCase {
             connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
             mcpServerEnabler: { true }
         )
+    }
+}
+
+/// Overseers tab: one-level overseer groups, duplicates allowed, no nested overseers.
+@MainActor
+final class AgentSidebarOverseerSectionBuilderTests: XCTestCase {
+    private let base = Date(timeIntervalSince1970: 1_800_000_000)
+
+    private func id(_ value: Int) -> UUID {
+        UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", value))!
+    }
+
+    /// Row `n`: tab `id(n)`, session `id(100 + n)`; larger `minutes` = older.
+    private func row(_ number: Int, minutes: Int = 0, pinned: Bool = false, lane: Int? = nil) -> AgentModeViewModel.SidebarSession {
+        AgentModeViewModel.SidebarSession(
+            id: id(number), tabID: id(number), title: "S\(number)",
+            lastUserMessageAt: base.addingTimeInterval(TimeInterval(-minutes * 60)),
+            activityDate: base, isPinned: pinned, sessionID: id(100 + number), parentSessionID: nil,
+            createdByOverseerSessionID: lane.map { id(100 + $0) }, depth: 0, isMCPControlled: false,
+            searchFieldSource: AgentSessionSearchFieldSource(title: "S\(number)")
+        )
+    }
+
+    private func links(_ pairs: [(Int, Int)]) -> Set<AgentSidebarOverseerRelation> {
+        Set(pairs.map { AgentSidebarOverseerRelation(overseerSessionID: id(100 + $0.0), overseenSessionID: id(100 + $0.1)) })
+    }
+
+    private func layout(
+        _ rows: [AgentModeViewModel.SidebarSession],
+        _ relations: Set<AgentSidebarOverseerRelation>,
+        search: Set<Int>? = nil,
+        collapsed: Set<AgentSidebarThreadKey> = [],
+        current: Int? = nil
+    ) -> (rows: [String], unique: [Int], presentation: AgentSidebarOverseerPresentation) {
+        let presentation = AgentSidebarOverseerSectionBuilder.build(
+            rows: rows,
+            relations: relations,
+            matchesSearch: search.map { numbers in { row in numbers.contains { self.id($0) == row.tabID } } },
+            collapsedKeys: collapsed,
+            currentTabID: current.map(id),
+            attentionTabIDs: []
+        )
+        let number: (UUID) -> Int = { tabID in (0 ... 99).first { self.id($0) == tabID } ?? -1 }
+        let rendered = presentation.renderedRows.map { item in
+            (item.showsHeader ? "[\(item.headerTitle)]" : "") + "\(number(item.session.tabID)):\(item.session.depth)"
+        }
+        return (rendered, presentation.orderedUniqueSessions.map { number($0.tabID) }, presentation)
+    }
+
+    func testOneToManyAndManyToOneRepeatSharedSessionsUnderEachOverseer() {
+        // 1 oversees 3 and 4; 2 oversees 4. Newest first: 1, 2, 3, 4.
+        let rows = [row(1, minutes: 0), row(2, minutes: 1), row(3, minutes: 2), row(4, minutes: 3)]
+        let result = layout(rows, links([(1, 3), (1, 4), (2, 4)]))
+        XCTAssertEqual(result.rows, ["[Overseers]1:0", "3:1", "4:1", "2:0", "4:1"])
+        XCTAssertEqual(result.unique, [1, 3, 4, 2], "each session counts once for selection and navigation")
+        let ids = result.presentation.renderedRows.map(\.id)
+        XCTAssertEqual(Set(ids).count, ids.count, "every occurrence has its own identity")
+    }
+
+    func testOverseerOfAnOverseerDoesNotNestDeeper() {
+        // 1 oversees 2; 2 oversees 3. 2 gets its own group and is a plain child under 1.
+        let result = layout([row(1), row(2, minutes: 1), row(3, minutes: 2)], links([(1, 2), (2, 3)]))
+        XCTAssertEqual(result.rows, ["[Overseers]1:0", "2:1", "2:0", "3:1"])
+    }
+
+    func testMutualLinksShowEachUnderTheOther() {
+        let result = layout([row(1), row(2, minutes: 1)], links([(1, 2), (2, 1)]))
+        XCTAssertEqual(result.rows, ["[Overseers]1:0", "2:1", "2:0", "1:1"])
+    }
+
+    func testLaneAndLiveLinkToTheSameCreatorListTheChildOnce() {
+        let rows = [row(1), row(2, minutes: 1, lane: 1)]
+        let relations = links([(1, 2)]).union(links([(1, 2)]))
+        XCTAssertEqual(layout(rows, relations).rows, ["[Overseers]1:0", "2:1"])
+    }
+
+    func testOverseenWithoutVisibleOverseerTrailsInElsewhere() {
+        // 9 is not a row (other workspace / archived). 5 has no relationship and is excluded.
+        let rows = [row(1), row(2, minutes: 1), row(3, minutes: 2), row(5, minutes: 3)]
+        let result = layout(rows, links([(1, 2), (9, 3), (9, 2)]))
+        XCTAssertEqual(result.rows, ["[Overseers]1:0", "2:1", "[Overseen elsewhere]3:0"])
+    }
+
+    func testPinnedOverseersLeadAndChildrenAreNewestFirst() {
+        let rows = [row(1), row(2, minutes: 5, pinned: true), row(3, minutes: 10), row(4, minutes: 1)]
+        let result = layout(rows, links([(1, 3), (1, 4), (2, 3)]))
+        XCTAssertEqual(result.rows, ["[Overseers]2:0", "3:1", "1:0", "4:1", "3:1"])
+    }
+
+    func testSearchShowsMatchingOverseerWithAllChildrenOrOnlyMatchingChildren() {
+        let rows = [row(1), row(2, minutes: 1), row(3, minutes: 2), row(4, minutes: 3)]
+        let relations = links([(1, 3), (1, 4), (2, 4)])
+        XCTAssertEqual(layout(rows, relations, search: [1]).rows, ["[Overseers]1:0", "3:1", "4:1"])
+        XCTAssertEqual(layout(rows, relations, search: [4]).rows, ["[Overseers]1:0", "4:1", "2:0", "4:1"])
+    }
+
+    func testFoldedGroupHidesChildrenUnlessItHoldsTheCurrentSession() {
+        let rows = [row(1), row(2, minutes: 1), row(3, minutes: 2)]
+        let folded: Set<AgentSidebarThreadKey> = [.overseerGroup(id(1))]
+        let result = layout(rows, links([(1, 2), (1, 3)]), collapsed: folded)
+        XCTAssertEqual(result.rows, ["[Overseers]1:0"])
+        XCTAssertEqual(result.presentation.renderedRows.first?.session.hiddenThreadDescendantCount, 2)
+        XCTAssertEqual(layout(rows, links([(1, 2), (1, 3)]), collapsed: folded, current: 3).rows.count, 3)
+        XCTAssertEqual(layout(rows, links([(1, 2), (1, 3)]), search: [2], collapsed: folded).rows, ["[Overseers]1:0", "2:1"])
+    }
+
+    func testOverseersTabProjectionUsesOccurrencesAndAllTabIsUntouched() {
+        let viewModel = AgentModeViewModel(
+            testWindowID: -1409,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("no provider") },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+        let tabs = (1 ... 3).map { ComposeTabState(id: id($0), name: "Session \($0)", lastModified: base, activeAgentSessionID: id(100 + $0)) }
+        for (offset, tab) in tabs.enumerated() {
+            let session = AgentModeViewModel.TabSession(tabID: tab.id)
+            session.hasLoadedPersistedState = true
+            session.lastActivityAt = base.addingTimeInterval(TimeInterval(-offset * 60))
+            if offset > 0 { session.createdByOverseerSessionID = id(101) }
+            XCTAssertNotNil(viewModel.test_installPersistentSessionBinding(sessionID: tab.activeAgentSessionID, on: session))
+            viewModel.test_installLiveSession(session)
+        }
+        viewModel.ui.sessionSidebar.refresh()
+        func project() -> AgentModeViewModel.SidebarListProjection {
+            viewModel.sidebarListProjection(
+                workspaceID: nil, composeTabs: tabs, stashedTabs: [], currentTabID: nil,
+                sidebarSnapshot: viewModel.ui.sessionSidebar.snapshot, archivedSessionsExpanded: false,
+                showComposeTabsWithoutAgentSessions: true
+            )
+        }
+        let all = project()
+        XCTAssertNil(all.overseerRenderedRows)
+        XCTAssertTrue(all.filteredSessions.allSatisfy { $0.depth == 0 }, "All keeps the ordinary sidebar")
+
+        viewModel.setSidebarTab(.overseers)
+        let overseers = project()
+        XCTAssertEqual(overseers.overseerRenderedRows?.map(\.session.depth), [0, 1, 1])
+        XCTAssertEqual(overseers.renderedSelectionOrder, [id(1), id(2), id(3)].map { .active(tabID: $0) })
+        XCTAssertEqual(
+            viewModel.adjacentSidebarSessionTabID(from: id(1), forward: true, in: tabs, currentTabID: nil),
+            id(2)
+        )
+        viewModel.toggleSidebarOverseerGroup(id(1))
+        XCTAssertEqual(project().overseerRenderedRows?.count, 1)
+        viewModel.setSidebarTab(.all)
+        XCTAssertNil(project().overseerRenderedRows)
+        XCTAssertFalse(viewModel.ui.sessionSidebar.snapshot.collapsedThreadKeys.contains(.session(id(101))))
     }
 }

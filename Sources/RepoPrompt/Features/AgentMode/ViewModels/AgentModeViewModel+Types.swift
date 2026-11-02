@@ -68,6 +68,9 @@ struct AgentSessionPresentationRecord: Equatable {
 enum AgentSidebarThreadKey: Hashable, Equatable {
     case session(UUID)
     case tab(UUID)
+    /// An overseer's group in the Overseers tab, by tab ID. A separate namespace, so folding a group
+    /// there never folds anything in the other tabs.
+    case overseerGroup(UUID)
 
     static func key(sessionID: UUID?, tabID: UUID) -> AgentSidebarThreadKey {
         if let sessionID {
@@ -252,9 +255,9 @@ extension AgentModeViewModel {
         let archivedSessionsExpanded: Bool
         let showComposeTabsWithoutAgentSessions: Bool
         let restorePresentation: SidebarRestorePresentationKey
-        /// Live overseers; non-empty only while the Overseers tab is selected, so link changes
-        /// re-filter that tab without invalidating the others.
-        var liveOverseerSessionIDs: Set<UUID> = []
+        /// Live oversight pairs; non-empty only while the Overseers tab is selected, so link changes
+        /// (including a retarget that keeps the same overseers) rebuild that tab and no other.
+        var liveOverseerRelations: Set<AgentSidebarOverseerRelation> = []
         /// Live running/waiting tabs; non-empty only while the Active tab is selected.
         var liveActiveTabIDs: Set<UUID> = []
     }
@@ -273,6 +276,9 @@ extension AgentModeViewModel {
         let defaultCollapseSeedKeys: [AgentSidebarThreadKey]
         let existingSelectionIdentities: Set<AgentSidebarSelectionIdentity>
         let renderedSelectionOrder: [AgentSidebarSelectionIdentity]
+        /// Overseers tab only: prebuilt occurrences (a session may appear under several overseers).
+        /// Nil for every other tab, which renders through the ordinary group/date sections.
+        var overseerRenderedRows: [AgentSidebarRenderedActiveRow]?
 
         var hasMoreSessions: Bool {
             filteredSessions.count > effectiveVisibleSessionCount

@@ -196,7 +196,7 @@ struct AgentModeSessionsSidebarView: View {
             searchText: search,
             diagnosticSource: "collapseAllButton.body"
         )
-        if state != .hidden {
+        if state != .hidden, sidebarUI.snapshot.sidebarTab != .overseers {
             let tooltip = state == .canCollapse ? "Collapse all sub-agent threads" : "Expand all sub-agent threads"
             Button {
                 collapseAllThreadsButtonClickTick &+= 1
@@ -500,6 +500,11 @@ struct AgentModeSessionsListView: View, Equatable {
         sessionLinkProjectionRevision &+= 1
     }
 
+    static func uniqueVisibleSessions(_ rows: [AgentSidebarRenderedActiveRow]) -> [AgentModeViewModel.SidebarSession] {
+        var seen = Set<UUID>()
+        return rows.filter { !$0.hidesRow }.map(\.session).filter { seen.insert($0.tabID).inserted }
+    }
+
     private func groupSectionHeader(_ item: AgentSidebarRenderedActiveRow) -> AnyView? {
         guard let name = item.groupName else { return nil }
         return AnyView(
@@ -599,13 +604,16 @@ struct AgentModeSessionsListView: View, Equatable {
             renderedOrder: snapshot.renderedSelectionOrder
         )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
-        let renderedActiveRows = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
-            for: snapshot.pagedSessions,
-            collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
-            searchText: sidebarUI.snapshot.searchText,
-            now: dateSectionNow,
-            perfRecorder: perfRecorder
-        )
+        // The Overseers tab arrives prebuilt (one-level groups, possibly repeating a session);
+        // every other tab renders through the unchanged group/date sections.
+        let renderedActiveRows = snapshot.overseerRenderedRows
+            ?? AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
+                for: snapshot.pagedSessions,
+                collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
+                searchText: sidebarUI.snapshot.searchText,
+                now: dateSectionNow,
+                perfRecorder: perfRecorder
+            )
         #if DEBUG
             let _ = AgentSidebarRowRenderProbe.onActiveRowsRendered?(renderedActiveRows)
         #endif
@@ -629,7 +637,8 @@ struct AgentModeSessionsListView: View, Equatable {
         // Bind before resolving any facts: an unbound owner resolves `.none`, and a first render
         // recorded with `.none` facts would stay stale behind row equality and the notification filter.
         let _ = rowActions.bind(agentModeVM: agentModeVM, promptManager: promptManager)
-        let renderedRowSessions = renderedActiveRows.filter { !$0.hidesRow }.map(\.session)
+        // One entry per session: an occurrence repeated under several overseers shares its facts.
+        let renderedRowSessions = Self.uniqueVisibleSessions(renderedActiveRows)
         let oversightFactsByTabID = Dictionary(
             renderedRowSessions.map { ($0.tabID, rowActions.oversightFacts(for: $0)) },
             uniquingKeysWith: { first, _ in first }
@@ -1202,9 +1211,11 @@ struct AgentSidebarRenderedActiveRow: Identifiable {
     var groupRowCount = 0
     /// A collapsed group's first row carries only the header.
     var hidesRow = false
+    /// Set only when a session can render more than once (Overseers tab).
+    var occurrenceID: AgentSidebarActiveOccurrenceID?
 
-    var id: UUID {
-        session.id
+    var id: AgentSidebarActiveOccurrenceID {
+        occurrenceID ?? .canonical(session.id)
     }
 }
 
