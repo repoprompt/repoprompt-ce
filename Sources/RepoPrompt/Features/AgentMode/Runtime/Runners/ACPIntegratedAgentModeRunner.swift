@@ -1711,19 +1711,21 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID,
         controller: ACPAgentSessionController,
-        lease _: MCPBootstrapLease,
+        lease: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
         guard let ownership = session.activeRunOwnership,
               ownership.attemptID == runAttemptID
         else { return }
+        let outcome = await lease.acquireFailureOutcome
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
-            terminalState: .cancelled,
+            terminalState: outcome.terminalState,
             source: "acp.acquireFailure",
+            errorText: outcome.errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,

@@ -1,5 +1,30 @@
 import Foundation
 import OSLog
+import RepoPromptShared
+
+/// Outcome of a bounded wait on the headless agent connection gate.
+enum HeadlessAgentConnectionWaitOutcome {
+    case resumed
+    case timedOut
+}
+
+/// Acquiring the gate exceeded its deadline (see #419).
+///
+/// Deliberately distinct from `CancellationError` so a provisioning timeout is not
+/// misclassified as an intentional cancel by `catch is CancellationError` branches
+/// (e.g. the `agent_run` start path). Callers that fail fast on cancellation should
+/// keep treating `CancellationError` as a cancel and surface this as a retryable error.
+struct HeadlessAgentConnectionAcquireTimeoutError: Error, CustomStringConvertible, LocalizedError {
+    private static let message = "Timed out waiting to acquire the headless agent connection gate. Another agent start may still be in progress; please retry."
+    var description: String {
+        Self.message
+    }
+
+    /// Surfaced via `error.localizedDescription` by callers that finalize the run as failed.
+    var errorDescription: String? {
+        Self.message
+    }
+}
 
 /// Global gate to serialize headless agent connections and prevent racing.
 /// This ensures that only one headless agent (discovery, delegate-edit, or future types)
@@ -18,6 +43,26 @@ actor HeadlessAgentConnectionGate {
         let queueDepthAtStart: Int
         let queueDepthAtAcquire: Int
         let waitDurationMS: Double
+        /// True when acquisition failed specifically because the deadline elapsed
+        /// (vs. task cancellation), so callers can tell a provisioning timeout from
+        /// an intentional cancel. See #419.
+        let timedOut: Bool
+
+        init(
+            acquired: Bool,
+            activeConnectionIDAtStart: UUID?,
+            queueDepthAtStart: Int,
+            queueDepthAtAcquire: Int,
+            waitDurationMS: Double,
+            timedOut: Bool = false
+        ) {
+            self.acquired = acquired
+            self.activeConnectionIDAtStart = activeConnectionIDAtStart
+            self.queueDepthAtStart = queueDepthAtStart
+            self.queueDepthAtAcquire = queueDepthAtAcquire
+            self.waitDurationMS = waitDurationMS
+            self.timedOut = timedOut
+        }
     }
 
     struct ReleaseResult {
@@ -30,38 +75,92 @@ actor HeadlessAgentConnectionGate {
     private var activeConnectionID: UUID?
     private struct WaitingContinuation {
         let id: UUID
-        let continuation: CheckedContinuation<Void, Never>
+        let continuation: CheckedContinuation<HeadlessAgentConnectionWaitOutcome, Never>
     }
 
     private var waitingContinuations: [WaitingContinuation] = []
+    private var deadlineTasks: [UUID: Task<Void, Never>] = [:]
 
     private let log = Logger(subsystem: "com.repoprompt.agents", category: "ConnectionGate")
 
-    /// Wait for any currently connecting agent to finish before proceeding
-    func waitForClearConnection() async {
-        if let currentConnectionID = activeConnectionID {
-            log.info("Gate busy; waiting (current=\(currentConnectionID.uuidString))")
-            let waiterID = UUID()
-            await withTaskCancellationHandler(
-                operation: {
-                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                        waitingContinuations.append(WaitingContinuation(id: waiterID, continuation: continuation))
+    /// Wait for any currently connecting agent to finish before proceeding.
+    ///
+    /// - Note: This method and its static wrapper currently have no production
+    ///   callers — production bootstraps route through `acquireWithDiagnostics`,
+    ///   which atomically waits and acquires. This is most likely dead code,
+    ///   retained for symmetry/future use. If you call it, wire it through the
+    ///   same fail-fast contract as `acquireWithDiagnostics`. See #419.
+    ///
+    /// A bounded `deadline` keeps a stalled peer connection from blocking this
+    /// wait indefinitely; on expiry the wait simply returns so the caller can
+    /// proceed to acquire (which queues with its own deadline). See #419.
+    func waitForClearConnection(
+        deadline: Duration? = MCPTimeoutPolicy.headlessAgentConnectionAcquireDeadline
+    ) async {
+        guard let currentConnectionID = activeConnectionID else { return }
+        log.info("Gate busy; waiting (current=\(currentConnectionID.uuidString))")
+        let waiterID = UUID()
+        _ = await withTaskCancellationHandler(
+            operation: {
+                await withCheckedContinuation { (continuation: CheckedContinuation<HeadlessAgentConnectionWaitOutcome, Never>) in
+                    if Task.isCancelled {
+                        continuation.resume(returning: .resumed)
+                        return
                     }
-                },
-                onCancel: {
-                    Task { await self.cancelWaitingContinuation(with: waiterID) }
+                    waitingContinuations.append(WaitingContinuation(id: waiterID, continuation: continuation))
+                    if let deadline {
+                        scheduleDeadline(for: waiterID, deadline: deadline)
+                    }
                 }
-            )
-        }
+            },
+            onCancel: {
+                Task { await self.cancelWaitingContinuation(with: waiterID) }
+            }
+        )
     }
 
     /// Note: Intentionally no logging here to avoid actor hop complexity during cancellation
     /// which can cause resource starvation/deadlock.
     private func cancelWaitingContinuation(with id: UUID) {
+        cancelDeadlineTask(for: id)
         if let index = waitingContinuations.firstIndex(where: { $0.id == id }) {
             let waiter = waitingContinuations.remove(at: index)
-            waiter.continuation.resume()
+            waiter.continuation.resume(returning: .resumed)
         }
+        _ = resumeNextWaiterIfIdle()
+    }
+
+    /// A resumed waiter can cancel or expire before claiming the free gate.
+    /// Pass that unclaimed wakeup onward rather than leaving the queue asleep.
+    @discardableResult
+    private func resumeNextWaiterIfIdle() -> Bool {
+        guard activeConnectionID == nil, !waitingContinuations.isEmpty else { return false }
+        let next = waitingContinuations.removeFirst()
+        cancelDeadlineTask(for: next.id)
+        next.continuation.resume(returning: .resumed)
+        return true
+    }
+
+    /// Schedule a deadline after which `waiterID` is resumed with `.timedOut`.
+    private func scheduleDeadline(for waiterID: UUID, deadline: Duration) {
+        deadlineTasks[waiterID] = Task { [weak self] in
+            try? await Task.sleep(for: deadline)
+            guard !Task.isCancelled else { return }
+            await self?.timeoutWaiter(waiterID)
+        }
+    }
+
+    private func timeoutWaiter(_ waiterID: UUID) {
+        cancelDeadlineTask(for: waiterID)
+        guard let index = waitingContinuations.firstIndex(where: { $0.id == waiterID }) else { return }
+        let waiter = waitingContinuations.remove(at: index)
+        log.info("Gate waiter timed out (id=\(waiterID.uuidString))")
+        waiter.continuation.resume(returning: .timedOut)
+        _ = resumeNextWaiterIfIdle()
+    }
+
+    private func cancelDeadlineTask(for waiterID: UUID) {
+        deadlineTasks.removeValue(forKey: waiterID)?.cancel()
     }
 
     /// Atomically waits until the gate is free, then marks it owned by `gateID`.
@@ -69,25 +168,40 @@ actor HeadlessAgentConnectionGate {
     /// IMPORTANT: This method re-checks ownership after every suspension so that a resumed waiter
     /// cannot overwrite a gate acquisition by a task that arrived between resume and re-entry.
     /// Returns diagnostics used by the MCP bootstrap history/perf surfaces.
-    func acquireWithDiagnostics(_ gateID: UUID) async -> AcquisitionResult {
+    func acquireWithDiagnostics(
+        _ gateID: UUID,
+        deadline: Duration? = MCPTimeoutPolicy.headlessAgentConnectionAcquireDeadline
+    ) async -> AcquisitionResult {
         let startUptime = ProcessInfo.processInfo.systemUptime
         let activeConnectionIDAtStart = activeConnectionID
         let queueDepthAtStart = waitingContinuations.count
+        let clock = ContinuousClock()
+        let expiresAt = deadline.map { clock.now.advanced(by: $0) }
 
         while let currentConnectionID = activeConnectionID {
             log.info("Gate busy; waiting to acquire (gateID=\(gateID.uuidString), current=\(currentConnectionID.uuidString))")
             let waiterID = UUID()
-            await withTaskCancellationHandler(
+            let outcome = await withTaskCancellationHandler(
                 operation: {
-                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    await withCheckedContinuation { (continuation: CheckedContinuation<HeadlessAgentConnectionWaitOutcome, Never>) in
+                        if Task.isCancelled {
+                            continuation.resume(returning: .resumed)
+                            return
+                        }
                         waitingContinuations.append(WaitingContinuation(id: waiterID, continuation: continuation))
+                        if let expiresAt {
+                            // Keep one absolute budget across wake/requeue cycles.
+                            scheduleDeadline(for: waiterID, deadline: clock.now.duration(to: expiresAt))
+                        }
                     }
                 },
                 onCancel: {
                     Task { await self.cancelWaitingContinuation(with: waiterID) }
                 }
             )
+            cancelDeadlineTask(for: waiterID)
             if Task.isCancelled {
+                _ = resumeNextWaiterIfIdle()
                 return AcquisitionResult(
                     acquired: false,
                     activeConnectionIDAtStart: activeConnectionIDAtStart,
@@ -96,8 +210,21 @@ actor HeadlessAgentConnectionGate {
                     waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000
                 )
             }
+            if outcome == .timedOut || (activeConnectionID != nil && expiresAt.map { clock.now >= $0 } == true) {
+                _ = resumeNextWaiterIfIdle()
+                log.info("Gate acquire timed out before acquisition (gateID=\(gateID.uuidString))")
+                return AcquisitionResult(
+                    acquired: false,
+                    activeConnectionIDAtStart: activeConnectionIDAtStart,
+                    queueDepthAtStart: queueDepthAtStart,
+                    queueDepthAtAcquire: waitingContinuations.count,
+                    waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000,
+                    timedOut: true
+                )
+            }
         }
         if Task.isCancelled {
+            _ = resumeNextWaiterIfIdle()
             return AcquisitionResult(
                 acquired: false,
                 activeConnectionIDAtStart: activeConnectionIDAtStart,
@@ -143,16 +270,8 @@ actor HeadlessAgentConnectionGate {
         activeConnectionID = nil
         log.info("Gate released (gateID=\(gateID.uuidString))")
 
-        // Resume ONE waiting agent (FIFO)
-        let resumedWaiter: Bool
-        if !waitingContinuations.isEmpty {
-            let next = waitingContinuations.removeFirst()
-            log.info("Resuming waiting gate permit (id=\(next.id.uuidString))")
-            next.continuation.resume()
-            resumedWaiter = true
-        } else {
-            resumedWaiter = false
-        }
+        // Resume ONE waiting agent (FIFO).
+        let resumedWaiter = resumeNextWaiterIfIdle()
         return ReleaseResult(
             released: true,
             activeConnectionIDBeforeRelease: activeConnectionIDBeforeRelease,
@@ -195,8 +314,11 @@ actor HeadlessAgentConnectionGate {
         } else {
             log.info("Gate clear (gateID=\(gateID.uuidString))")
         }
-        let acquired = await acquire(gateID)
-        guard acquired else { throw CancellationError() }
+        let acquisition = await acquireWithDiagnostics(gateID)
+        guard acquisition.acquired else {
+            if acquisition.timedOut { throw HeadlessAgentConnectionAcquireTimeoutError() }
+            throw CancellationError()
+        }
         do {
             let value = try await body()
             if let cb = onBeforeRelease {
@@ -216,6 +338,14 @@ actor HeadlessAgentConnectionGate {
     }
 
     #if DEBUG
+        func debugCompleteConnectionAndCancelWaiter(
+            _ ownerID: UUID,
+            waiter: Task<AcquisitionResult, Never>
+        ) {
+            completeConnection(ownerID)
+            waiter.cancel()
+        }
+
         func debugWaitingCount() -> Int {
             waitingContinuations.count
         }
@@ -228,8 +358,9 @@ actor HeadlessAgentConnectionGate {
     /// Cancel all waiting agents (e.g., on app shutdown)
     func cancelAll() {
         activeConnectionID = nil
-        for continuation in waitingContinuations {
-            continuation.continuation.resume()
+        for waiter in waitingContinuations {
+            cancelDeadlineTask(for: waiter.id)
+            waiter.continuation.resume(returning: .resumed)
         }
         waitingContinuations.removeAll()
     }
@@ -238,7 +369,8 @@ actor HeadlessAgentConnectionGate {
 // MARK: - Static Convenience Methods
 
 extension HeadlessAgentConnectionGate {
-    /// Wait for any in-progress agent connection to complete before proceeding
+    /// Wait for any in-progress agent connection to complete before proceeding.
+    /// - Note: Most likely dead code — no production callers (see instance method).
     static func waitForClearConnection() async {
         await HeadlessAgentConnectionGate.shared.waitForClearConnection()
     }

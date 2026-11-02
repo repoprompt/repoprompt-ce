@@ -82,6 +82,7 @@ enum WindowStateCompositionFactory {
         keyManager injectedKeyManager: KeyManager? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        workspaceSearchService injectedWorkspaceSearchService: WorkspaceSearchService? = nil,
         storedPromptPersistence: (any StoredPromptPersistenceServing)? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
@@ -120,7 +121,7 @@ enum WindowStateCompositionFactory {
             )
         #endif
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
-        let workspaceSearchService = WorkspaceSearchService()
+        let workspaceSearchService = injectedWorkspaceSearchService ?? WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(
             workspaceFileContextStore: workspaceFileContextStore,
             restorePerfRecorder: AppWorkspaceRestorePerfRecorder()
