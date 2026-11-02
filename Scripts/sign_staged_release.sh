@@ -76,6 +76,7 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$TRUSTED_ROOT" \
     "$APP_BUNDLE" \
     "arm64,x86_64" \
     "Trusted Sparkle replacement pre-sign app"
+python3 "$SCRIPT_DIR/validate_macos_runtime_symbols.py" "$APP_BUNDLE"
 
 profile_plist="$(mktemp)"
 app_entitlements="$(mktemp)"
