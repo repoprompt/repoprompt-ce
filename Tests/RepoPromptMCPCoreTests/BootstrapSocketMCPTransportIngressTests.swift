@@ -1,4 +1,9 @@
-import Darwin
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
 @testable import RepoPromptMCPCore
 import XCTest
@@ -6,12 +11,12 @@ import XCTest
 final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
     func testWithheldConsumerReportsOverflowInsteadOfDroppingTerminalResponse() async throws {
         let pair = try makeSocketPair()
-        defer { Darwin.close(pair[1]) }
+        defer { POSIXSystem.close(pair[1]) }
         let transport = try BootstrapSocketMCPTransport(connectedFD: pair[0])
         try await transport.connect()
         let frames = numberedFrames(count: 1025)
         try writeFrames(frames, to: pair[1])
-        XCTAssertEqual(shutdown(pair[1], SHUT_WR), 0)
+        XCTAssertEqual(shutdown(pair[1], POSIXSystem.shutdownWrite), 0)
         try waitForPeerShutdown(pair[1])
 
         let stream = await transport.receive()
@@ -32,12 +37,12 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
 
     func testAtCapacityPreservesEveryFrameBeforeCleanEOF() async throws {
         let pair = try makeSocketPair()
-        defer { Darwin.close(pair[1]) }
+        defer { POSIXSystem.close(pair[1]) }
         let transport = try BootstrapSocketMCPTransport(connectedFD: pair[0])
         try await transport.connect()
         let frames = numberedFrames(count: 1024)
         try writeFrames(frames, to: pair[1])
-        XCTAssertEqual(shutdown(pair[1], SHUT_WR), 0)
+        XCTAssertEqual(shutdown(pair[1], POSIXSystem.shutdownWrite), 0)
         try waitForPeerShutdown(pair[1])
         var observed: [Data] = []
         for try await frame in await transport.receive() {
@@ -49,7 +54,7 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
 
     func testInjectedOverflowUsesConfiguredCapacityAndIgnoresStaleToken() async throws {
         let pair = try makeSocketPair()
-        defer { Darwin.close(pair[1]) }
+        defer { POSIXSystem.close(pair[1]) }
         let transport = try BootstrapSocketMCPTransport(connectedFD: pair[0], receiveBufferCapacity: 3)
         await transport.debugHoldReaderTerminalCallback()
         await transport.debugHoldReaderCancellationCallback()
@@ -60,7 +65,7 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
         try await transport.connect()
         let frames = numberedFrames(count: 3)
         try writeFrames(frames, to: pair[1])
-        XCTAssertEqual(shutdown(pair[1], SHUT_WR), 0)
+        XCTAssertEqual(shutdown(pair[1], POSIXSystem.shutdownWrite), 0)
         await transport.debugWaitForHeldReaderTerminalCallback()
         let pending = await transport.debugIngressTeardownCounts()
         XCTAssertEqual(pending.finalized, 0)
@@ -102,7 +107,7 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
 
     private func assertDelayedTeardown(overflowFirst: Bool) async throws {
         let pair = try makeSocketPair()
-        defer { Darwin.close(pair[1]) }
+        defer { POSIXSystem.close(pair[1]) }
         let transport = try BootstrapSocketMCPTransport(connectedFD: pair[0], receiveBufferCapacity: 2)
         await transport.debugHoldReaderTerminalCallback()
         await transport.debugHoldReceiveOverflowCallback()
@@ -114,7 +119,7 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
         await transport.debugDeliverReaderEOF(token: 2)
         let frames = numberedFrames(count: 5)
         try writeFrames(frames, to: pair[1])
-        XCTAssertEqual(shutdown(pair[1], SHUT_WR), 0)
+        XCTAssertEqual(shutdown(pair[1], POSIXSystem.shutdownWrite), 0)
         // This observes the real EOF callback after all five numbered reader
         // callbacks. Overflow and actor teardown remain held independently.
         await transport.debugWaitForHeldReaderTerminalCallback()
@@ -172,7 +177,7 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
 
     private func makeSocketPair() throws -> [Int32] {
         var descriptors: [Int32] = [-1, -1]
-        guard socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
+        guard socketpair(AF_UNIX, POSIXSystem.streamSocketType, 0, &descriptors) == 0 else {
             throw POSIXError(.init(rawValue: errno) ?? .EIO)
         }
         return descriptors
@@ -187,7 +192,7 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
         try data.withUnsafeBytes { bytes in
             var offset = 0
             while offset < bytes.count {
-                let result = Darwin.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+                let result = POSIXSystem.write(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
                 guard result > 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
                 offset += result
             }
@@ -203,6 +208,6 @@ final class BootstrapSocketMCPTransportIngressTests: XCTestCase {
             throw POSIXError(.ETIMEDOUT)
         }
         var byte: UInt8 = 0
-        XCTAssertEqual(Darwin.read(descriptor, &byte, 1), 0)
+        XCTAssertEqual(POSIXSystem.read(descriptor, &byte, 1), 0)
     }
 }

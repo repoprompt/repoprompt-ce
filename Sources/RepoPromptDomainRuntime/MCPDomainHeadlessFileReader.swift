@@ -1,5 +1,10 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
+import RepoPromptC
 
 /// Bounded physical reads for standalone hosts. Permits stay owned by the worker until it
 /// settles; cancellation never frees capacity while a filesystem call is still running.
@@ -150,12 +155,23 @@ package enum MCPDomainHeadlessFileReader {
         try cancellation.check()
         var after = stat()
         var pathMetadata = stat()
-        guard fstat(fd, &after) == 0, stat(path, &pathMetadata) == 0,
-              before.st_size == after.st_size,
-              before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
-              before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
-              before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
-              before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec,
+        guard fstat(fd, &after) == 0, stat(path, &pathMetadata) == 0 else { throw ReadError.changedDuringRead }
+        #if os(Linux)
+            let beforeModification = before.st_mtim
+            let afterModification = after.st_mtim
+            let beforeChange = before.st_ctim
+            let afterChange = after.st_ctim
+        #else
+            let beforeModification = before.st_mtimespec
+            let afterModification = after.st_mtimespec
+            let beforeChange = before.st_ctimespec
+            let afterChange = after.st_ctimespec
+        #endif
+        guard before.st_size == after.st_size,
+              beforeModification.tv_sec == afterModification.tv_sec,
+              beforeModification.tv_nsec == afterModification.tv_nsec,
+              beforeChange.tv_sec == afterChange.tv_sec,
+              beforeChange.tv_nsec == afterChange.tv_nsec,
               before.st_ino == pathMetadata.st_ino, before.st_dev == pathMetadata.st_dev
         else { throw ReadError.changedDuringRead }
         return selection.result
@@ -180,12 +196,12 @@ package enum MCPDomainHeadlessFileReader {
     /// without following any new symlink, including parent components replaced during admission.
     private static func openWithoutSymlinks(_ path: String) throws -> Int32 {
         let parts = path.split(separator: "/").map(String.init)
-        var directory = open("/", O_SEARCH | O_NOFOLLOW | O_CLOEXEC)
+        var directory = open("/", repo_directory_search_flags() | O_NOFOLLOW | O_CLOEXEC)
         guard directory >= 0 else { throw POSIXError(.EIO) }
         defer { close(directory) }
         for (index, part) in parts.enumerated() {
             let isLeaf = index == parts.count - 1
-            let flags = O_NOFOLLOW | O_CLOEXEC | (isLeaf ? O_RDONLY | O_NONBLOCK : O_SEARCH)
+            let flags = O_NOFOLLOW | O_CLOEXEC | (isLeaf ? O_RDONLY | O_NONBLOCK : repo_directory_search_flags())
             let next = openat(directory, part, flags)
             guard next >= 0 else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO, userInfo: [NSFilePathErrorKey: path, "component": part])

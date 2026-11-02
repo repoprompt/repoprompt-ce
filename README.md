@@ -3,8 +3,9 @@
 [![CI](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Platform: macOS 26+](https://img.shields.io/badge/platform-macOS%2026%2B-black)
+![Platform: Linux](https://img.shields.io/badge/platform-Linux-307a63)
 
-**A free, open-source native macOS app and agent orchestrator for context engineering.**
+**A free, open-source context engineering app with native macOS and Linux desktops.**
 
 RepoPrompt CE helps coding agents understand your codebase before they act. It
 assembles focused, reviewable context from files, CodeMaps, repository
@@ -36,7 +37,31 @@ tap. The cask consumes the promoted public updater ZIP from
 it does not build from source. Source-build paths remain below for contributors
 and local development.
 
-### Build and launch locally
+### Linux and Omarchy
+
+Build and install the headless context engine and MCP server on Linux:
+
+```bash
+./Scripts/build_linux.sh release
+./Scripts/install_linux.sh
+```
+
+See [Linux setup](docs/linux.md) for Omarchy/Arch, Ubuntu/Debian and Fedora
+prerequisites, MCP client configuration, profile storage and supported features.
+An optional native Qt desktop app provides repository browsing, source and CodeMap
+previews, search, selection, prompt editing, and context copying:
+
+```bash
+python3 Scripts/install_linux_gui.py
+repoprompt-gui ~/src/project
+```
+
+The GUI installer downloads its pinned Qt for Python dependency. See the
+[native desktop setup](docs/linux.md#native-linux-desktop) for system libraries,
+installation options, and feature boundaries. The SwiftUI/AppKit interface remains
+macOS-only; native x86_64 and aarch64 engine and Qt frontend checks run in Linux CI.
+
+### Build and launch locally on macOS
 
 For development and quick evaluation, double-click
 [`Launch RepoPrompt CE.command`](Launch%20RepoPrompt%20CE.command) in Finder.

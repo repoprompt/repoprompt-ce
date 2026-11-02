@@ -6,7 +6,7 @@ import Foundation
 /// The `readabilityHandler` on `FileHandle` fires on an arbitrary dispatch queue. Wrapping
 /// each callback in a standalone `Task` can reorder chunks because actor task scheduling is
 /// not guaranteed FIFO. This channel instead feeds chunks into an `AsyncStream.Continuation`
-/// protected by `os_unfair_lock`, preserving the order in which the OS delivers data.
+/// protected by `NSLock`, preserving the order in which the OS delivers data.
 ///
 /// A single consumer task iterates `stream` to process chunks in the exact order they arrived.
 ///
@@ -17,7 +17,7 @@ import Foundation
 package final class FileHandleChunkChannel: @unchecked Sendable {
     package let stream: AsyncStream<Data>
     private let continuation: AsyncStream<Data>.Continuation
-    private var lock = os_unfair_lock()
+    private let lock = NSLock()
 
     package init(bufferingPolicy: AsyncStream<Data>.Continuation.BufferingPolicy = .unbounded) {
         var captured: AsyncStream<Data>.Continuation?
@@ -32,15 +32,15 @@ package final class FileHandleChunkChannel: @unchecked Sendable {
 
     /// Enqueue a data chunk. Safe to call from any thread (including `readabilityHandler` dispatch queues).
     package func yield(_ data: Data) {
-        os_unfair_lock_lock(&lock)
+        lock.lock()
         _ = continuation.yield(data)
-        os_unfair_lock_unlock(&lock)
+        lock.unlock()
     }
 
     /// Signal that no more chunks will be produced (e.g. EOF or shutdown).
     package func finish() {
-        os_unfair_lock_lock(&lock)
+        lock.lock()
         continuation.finish()
-        os_unfair_lock_unlock(&lock)
+        lock.unlock()
     }
 }

@@ -1,4 +1,10 @@
-import Darwin
+import RepoPromptC
+import RepoPromptShared
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Dispatch
 import Foundation
 
@@ -76,14 +82,14 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
 
     private final class Entry {
         let token: UUID
-        let source: any DispatchSourceProcess
+        let source: (any DispatchSourceProtocol)?
         let fallbackProbeTimer: any DispatchSourceTimer
         let beforeReap: @Sendable () -> Void
         let completion: @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
 
         init(
             token: UUID,
-            source: any DispatchSourceProcess,
+            source: (any DispatchSourceProtocol)?,
             fallbackProbeTimer: any DispatchSourceTimer,
             beforeReap: @escaping @Sendable () -> Void,
             completion: @escaping @Sendable (Result<ProcessExitStatus, ProcessTerminationError>) -> Void
@@ -96,13 +102,17 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
         }
     }
 
-    /// kevent exit delivery is not contractual under load: a process source
-    /// can rarely miss NOTE_EXIT even though it registered while the child was
-    /// alive, which would strand the observer and the child's zombie forever.
-    /// Each registration therefore keeps a low-frequency non-destructive probe
-    /// that self-heals a missed notification through the same token-guarded
-    /// sole-reap path.
-    private static let fallbackProbeInterval: TimeInterval = 0.5
+    // kevent exit delivery is not contractual under load: a process source
+    // can rarely miss NOTE_EXIT even though it registered while the child was
+    // alive, which would strand the observer and the child's zombie forever.
+    // Each registration therefore keeps a low-frequency non-destructive probe
+    // that self-heals a missed notification through the same token-guarded
+    // sole-reap path.
+    #if canImport(Darwin)
+        private static let fallbackProbeInterval: TimeInterval = 0.5
+    #else
+        private static let fallbackProbeInterval: TimeInterval = 0.025
+    #endif
 
     private let queue = DispatchQueue(
         label: "com.repoprompt.process-termination.child-status-registry",
@@ -123,11 +133,11 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
             }
 
             let token = UUID()
-            let source = DispatchSource.makeProcessSource(
-                identifier: pid,
-                eventMask: .exit,
-                queue: queue
-            )
+            #if canImport(Darwin)
+                let source = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: queue)
+            #else
+                let source: (any DispatchSourceProtocol)? = nil
+            #endif
             let fallbackProbeTimer = DispatchSource.makeTimerSource(queue: queue)
             let entry = Entry(
                 token: token,
@@ -138,18 +148,20 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
             )
             entries[pid] = entry
 
-            source.setRegistrationHandler { [weak self] in
-                self?.probeWithoutBlocking(pid: pid, token: token)
-            }
-            source.setEventHandler { [weak self] in
-                self?.reapAfterExitNotification(pid: pid, token: token)
-            }
-            source.activate()
+            #if canImport(Darwin)
+                source.setRegistrationHandler { [weak self] in
+                    self?.probeWithoutBlocking(pid: pid, token: token)
+                }
+                source.setEventHandler { [weak self] in
+                    self?.reapAfterExitNotification(pid: pid, token: token)
+                }
+                source.activate()
 
+            #endif
             fallbackProbeTimer.schedule(
                 deadline: .now() + Self.fallbackProbeInterval,
                 repeating: Self.fallbackProbeInterval,
-                leeway: .milliseconds(100)
+                leeway: .milliseconds(5)
             )
             fallbackProbeTimer.setEventHandler { [weak self] in
                 self?.probeWithoutBlocking(pid: pid, token: token)
@@ -176,9 +188,9 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
 
         while true {
             var info = siginfo_t()
-            let probeResult = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+            let probeResult = POSIXSystem.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
             if probeResult == 0 {
-                guard info.si_pid == pid else { return }
+                guard repo_siginfo_pid(&info) == pid else { return }
                 break
             }
             if errno == EINTR {
@@ -246,7 +258,7 @@ private final class ChildStatusReaperRegistry: @unchecked Sendable {
         entry.completion(result)
         guard entries[pid]?.token == token else { return }
         entries.removeValue(forKey: pid)
-        entry.source.cancel()
+        entry.source?.cancel()
         entry.fallbackProbeTimer.cancel()
     }
 }
@@ -565,11 +577,11 @@ package enum ProcessTermination {
     package static func childIsTerminalOrAlreadyReaped(_ pid: pid_t) -> Bool {
         while true {
             var info = siginfo_t()
-            let result = Darwin.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
+            let result = POSIXSystem.waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT)
             if result == 0 {
-                guard info.si_pid == pid else { return false }
+                guard repo_siginfo_pid(&info) == pid else { return false }
                 switch info.si_code {
-                case CLD_EXITED, CLD_KILLED, CLD_DUMPED:
+                case Int32(CLD_EXITED), Int32(CLD_KILLED), Int32(CLD_DUMPED):
                     return true
                 default:
                     return false

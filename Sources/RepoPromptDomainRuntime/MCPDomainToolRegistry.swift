@@ -1,7 +1,11 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
-package enum MCPDomainToolRegistryError: Error, Equatable, Sendable {
+package enum MCPDomainToolRegistryError: Error, Equatable {
     case emptyRegistration
     case invalidWindowID(Int)
     case duplicateToolName(String)
@@ -11,7 +15,7 @@ package enum MCPDomainToolRegistryError: Error, Equatable, Sendable {
     case conflictingDefinition(toolName: String)
 }
 
-package struct MCPDomainToolScopePresence: Equatable, Sendable {
+package struct MCPDomainToolScopePresence: Equatable {
     package let revision: UInt64
     package let isComplete: Bool
 
@@ -21,33 +25,35 @@ package struct MCPDomainToolScopePresence: Equatable, Sendable {
     }
 }
 
-package struct MCPDomainToolCatalogSnapshot: Sendable {
+package struct MCPDomainToolCatalogSnapshot {
     package let revision: UInt64
     package let definitions: [MCPDomainToolDefinition]
     package let fingerprintsByToolName: [String: MCPDomainToolFingerprint]
     package let activeScopesByToolName: [String: Set<MCPDomainToolRegistrationScope>]
     package let catalogFingerprint: String
 
-    package var toolNames: [String] { definitions.map(\.name) }
+    package var toolNames: [String] {
+        definitions.map(\.name)
+    }
 }
 
-package enum MCPDomainRegistryRemoval: Equatable, Sendable {
+package enum MCPDomainRegistryRemoval: Equatable {
     case removed
     case unchanged
 }
 
-package enum MCPDomainToolRegistrationDisposition: Equatable, Sendable {
+package enum MCPDomainToolRegistrationDisposition: Equatable {
     case inserted
     case replaced
     case unchanged
 }
 
-package struct MCPDomainToolRegistrationResult: Equatable, Sendable {
+package struct MCPDomainToolRegistrationResult: Equatable {
     package let handle: MCPDomainToolRegistrationHandle
     package let disposition: MCPDomainToolRegistrationDisposition
 }
 
-package struct MCPDomainToolRegistryDiagnostics: Equatable, Sendable {
+package struct MCPDomainToolRegistryDiagnostics: Equatable {
     package let registrationCount: Int
     package let exactScopedToolCount: Int
     package let canonicalToolCount: Int
@@ -57,7 +63,7 @@ package struct MCPDomainToolRegistryDiagnostics: Equatable, Sendable {
     package let scopePresenceCount: Int
 }
 
-package struct MCPDomainToolRegistrationRequest: Sendable {
+package struct MCPDomainToolRegistrationRequest {
     package let registrationID: MCPDomainToolRegistrationID
     package let scope: MCPDomainToolRegistrationScope
     package let bindings: [MCPDomainToolBinding]
@@ -74,17 +80,17 @@ package struct MCPDomainToolRegistrationRequest: Sendable {
 }
 
 package actor MCPDomainToolRegistry {
-    private struct ScopedToolKey: Hashable, Sendable {
+    private struct ScopedToolKey: Hashable {
         let scope: MCPDomainToolRegistrationScope
         let toolName: String
     }
 
-    private struct CanonicalDefinitionIndex: Sendable {
+    private struct CanonicalDefinitionIndex {
         let fingerprint: MCPDomainToolFingerprint
         var registrationIDs: Set<MCPDomainToolRegistrationID>
     }
 
-    private struct Registration: Sendable {
+    private struct Registration {
         let handle: MCPDomainToolRegistrationHandle
         let scope: MCPDomainToolRegistrationScope
         let bindingsByName: [String: MCPDomainToolBinding]

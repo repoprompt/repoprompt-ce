@@ -44,6 +44,7 @@ docs/plans/*
 # Python cache artifacts
 __pycache__/
 *.pyc
+.venv-linux-gui/
 
 # macOS metadata
 .DS_Store

@@ -1,8 +1,12 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 import MCP
 
-package struct MCPDomainToolFingerprint: Hashable, Sendable {
+package struct MCPDomainToolFingerprint: Hashable {
     package let name: String
     package let descriptionDigest: String
     package let schemaDigest: String
@@ -13,15 +17,15 @@ package struct MCPDomainToolFingerprint: Hashable, Sendable {
     package init(definition: MCPDomainToolDefinition) throws {
         name = definition.name
         descriptionDigest = Self.sha256(definition.description)
-        schemaDigest = Self.sha256(try Self.canonicalJSONString(definition.inputSchema))
+        schemaDigest = try Self.sha256(Self.canonicalJSONString(definition.inputSchema))
         annotationSignature = Self.annotationSignature(definition.annotations)
         isEnabledByDefault = definition.isEnabledByDefault
-        digest = Self.sha256([
+        digest = try Self.sha256([
             definition.name,
             definition.description,
-            try Self.canonicalJSONString(definition.inputSchema),
+            Self.canonicalJSONString(definition.inputSchema),
             annotationSignature,
-            String(definition.isEnabledByDefault),
+            String(definition.isEnabledByDefault)
         ].joined(separator: "\u{1f}"))
     }
 
@@ -32,7 +36,7 @@ package struct MCPDomainToolFingerprint: Hashable, Sendable {
     package static func canonicalJSONString(_ value: Value) throws -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return String(decoding: try encoder.encode(value), as: UTF8.self)
+        return try String(decoding: encoder.encode(value), as: UTF8.self)
     }
 
     private static func annotationSignature(_ annotations: MCPDomainToolAnnotations) -> String {
@@ -41,7 +45,7 @@ package struct MCPDomainToolFingerprint: Hashable, Sendable {
             "readOnly=\(optionalBool(annotations.readOnlyHint))",
             "destructive=\(optionalBool(annotations.destructiveHint))",
             "idempotent=\(optionalBool(annotations.idempotentHint))",
-            "openWorld=\(optionalBool(annotations.openWorldHint))",
+            "openWorld=\(optionalBool(annotations.openWorldHint))"
         ].joined(separator: ",")
     }
 

@@ -1,7 +1,11 @@
-import CryptoKit
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
 import Foundation
 
-package struct AgentAttachmentStore: Sendable {
+package struct AgentAttachmentStore {
     private static let attachmentsDirectoryName = "agent_attachments"
 
     package struct ImportResult {
@@ -12,7 +16,7 @@ package struct AgentAttachmentStore: Sendable {
     /// What makes two attached files the same file: the name the user attached it under, its size, and
     /// its content. Name is part of it so `config.dev.json` and `config.prod.json` with identical bytes
     /// stay distinct, as do two empty `__init__.py` files.
-    package struct Identity: Hashable, Sendable {
+    package struct Identity: Hashable {
         package let fileName: String
         package let byteCount: Int
         package let digestHex: String

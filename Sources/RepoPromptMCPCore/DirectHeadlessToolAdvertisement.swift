@@ -5,6 +5,15 @@ import RepoPromptDomainRuntime
 /// Direct-headless advertises only capabilities its actual adapter can honor.
 enum DirectHeadlessToolAdvertisement {
     static func project(_ definition: MCPDomainToolDefinition) -> (description: String, inputSchema: Value) {
+        if definition.name == "agent_run" || definition.name == "agent_explore" {
+            return (
+                definition.description + " Direct-headless agent processes belong to this runtime: " +
+                    "keep its MCP connection or interactive REPL open until they finish. " +
+                    "They stop when it exits and cannot be resumed by another CLI invocation. " +
+                    "Linux --exec and --call reject detached starts.",
+                definition.inputSchema
+            )
+        }
         guard definition.name == "context_builder",
               case var .object(schema) = definition.inputSchema,
               case let .object(canonicalProperties)? = schema["properties"]

@@ -1,6 +1,12 @@
-import Darwin
+#if canImport(Darwin)
+    import Darwin
+#else
+    import Glibc
+#endif
 import Foundation
+import RepoPromptC
 import RepoPromptDomainRuntime
+import RepoPromptShared
 import XCTest
 
 final class MCPDomainHeadlessFileReaderTests: XCTestCase {
@@ -123,13 +129,13 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
             }
         }
         XCTAssertGreaterThanOrEqual(fd, 0)
-        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), -1, "Cancellation must not release an executing worker's slot")
+        XCTAssertEqual(repo_flock(fd, LOCK_EX | LOCK_NB), -1, "Cancellation must not release an executing worker's slot")
         gate.signal()
         do {
             _ = try await task.value
             XCTFail("Expected cancellation")
         } catch is CancellationError {} catch { XCTFail("Unexpected error: \(error)") }
-        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0, "Worker completion must release the slot")
+        XCTAssertEqual(repo_flock(fd, LOCK_EX | LOCK_NB), 0, "Worker completion must release the slot")
     }
 
     func testOtherProcessSharesAggregateSlotAndCrashReleasesIt() async throws {
@@ -236,7 +242,7 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
         let fd = open(fixture.slots.appendingPathComponent("slot-0").path, O_RDWR | O_CREAT, 0o600)
         XCTAssertGreaterThanOrEqual(fd, 0)
         defer { close(fd) }
-        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0)
+        XCTAssertEqual(repo_flock(fd, LOCK_EX | LOCK_NB), 0)
         let time = Counter()
         let deadline = MCPDomainAdmissionDeadline(instant: .seconds(1), now: { .seconds(time.value) }, sleep: { _ in })
         do {
@@ -248,7 +254,7 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
         } catch { XCTAssertEqual(error as? MCPDomainHeadlessFileReader.ReadError, .admissionTimedOut) }
         let names = try FileManager.default.contentsOfDirectory(atPath: fixture.slots.path)
         XCTAssertFalse(names.contains { $0.hasPrefix("wait-") })
-        flock(fd, LOCK_UN)
+        repo_flock(fd, LOCK_UN)
         let recovered = try await read(fixture)
         XCTAssertEqual(recovered, "content")
     }
@@ -264,7 +270,7 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
         let fd = open(fixture.slots.appendingPathComponent("slot-0").path, O_RDWR | O_CREAT, 0o600)
         XCTAssertGreaterThanOrEqual(fd, 0)
         defer { close(fd) }
-        XCTAssertEqual(flock(fd, LOCK_EX | LOCK_NB), 0)
+        XCTAssertEqual(repo_flock(fd, LOCK_EX | LOCK_NB), 0)
         let firstQueued = expectation(description: "first registered")
         let secondQueued = expectation(description: "second registered")
         firstQueued.assertForOverFulfill = false
@@ -284,7 +290,7 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
             )
         }
         await fulfillment(of: [secondQueued], timeout: 5)
-        flock(fd, LOCK_UN)
+        repo_flock(fd, LOCK_UN)
         _ = try await first.value
         _ = try await second.value
         XCTAssertEqual(order.values, [1, 2])
@@ -455,7 +461,7 @@ final class MCPDomainHeadlessFileReaderTests: XCTestCase {
                 }
                 guard status > 0 else { break }
                 var byte: UInt8 = 0
-                let count = Darwin.read(fd, &byte, 1)
+                let count = POSIXSystem.read(fd, &byte, 1)
                 if count < 0, errno == EINTR {
                     continue
                 }

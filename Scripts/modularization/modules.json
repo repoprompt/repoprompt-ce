@@ -1,18 +1,20 @@
 {
   "version": 1,
-  "description": "First-party SwiftPM target ownership and permitted direct target dependencies. External package products are checked by SwiftPM.",
+  "description": "First-party SwiftPM target ownership and permitted direct target dependencies. Optional platforms lists select host targets; omitted platforms means macos and linux. External package products are checked by SwiftPM.",
   "modules": {
     "CSwiftPCRE2": {
       "source_root": "Sources/CSwiftPCRE2",
       "allowed_dependencies": []
     },
     "RepoPrompt": {
+      "platforms": ["macos"],
       "source_root": "Sources/RepoPromptExecutable",
       "allowed_dependencies": [
         "RepoPromptApp"
       ]
     },
     "RepoPromptApp": {
+      "platforms": ["macos"],
       "source_root": "Sources/RepoPrompt",
       "allowed_dependencies": [
         "CSwiftPCRE2",
@@ -78,7 +80,9 @@
     "RepoPromptDomainRuntimeTests": {
       "source_root": "Tests/RepoPromptDomainRuntimeTests",
       "allowed_dependencies": [
-        "RepoPromptDomainRuntime"
+        "RepoPromptDomainRuntime",
+        "RepoPromptC",
+        "RepoPromptShared"
       ]
     },
     "RepoPromptFoundation": {
@@ -146,6 +150,7 @@
     "RepoPromptProcess": {
       "source_root": "Sources/RepoPromptProcess",
       "allowed_dependencies": [
+        "RepoPromptC",
         "RepoPromptFoundation",
         "RepoPromptShared"
       ],
@@ -155,7 +160,8 @@
     "RepoPromptProcessTests": {
       "source_root": "Tests/RepoPromptProcessTests",
       "allowed_dependencies": [
-        "RepoPromptProcess"
+        "RepoPromptProcess",
+        "RepoPromptShared"
       ]
     },
     "RepoPromptRegexCore": {
@@ -173,6 +179,7 @@
       ]
     },
     "RepoPromptFileSystem": {
+      "platforms": ["macos"],
       "source_root": "Sources/RepoPromptFileSystem",
       "allowed_dependencies": [
         "RepoPromptFoundation",
@@ -186,17 +193,19 @@
     "RepoPromptVCS": {
       "source_root": "Sources/RepoPromptVCS",
       "allowed_dependencies": [
+        "RepoPromptC",
         "RepoPromptFoundation",
         "RepoPromptProcess",
         "RepoPromptInstrumentation",
         "RepoPromptDomainRuntime",
-        "RepoPromptFileSystem",
+        "RepoPromptShared",
         "RepoPromptWorkspaceCore"
       ],
       "test_target": "RepoPromptVCSTests",
       "app_free_tests": true
     },
     "RepoPromptPersistence": {
+      "platforms": ["macos"],
       "source_root": "Sources/RepoPromptPersistence",
       "allowed_dependencies": [
         "RepoPromptC",
@@ -209,6 +218,7 @@
       "app_free_tests": true
     },
     "RepoPromptPersistenceTests": {
+      "platforms": ["macos"],
       "source_root": "Tests/RepoPromptPersistenceTests",
       "allowed_dependencies": [
         "RepoPromptPersistence",
@@ -219,6 +229,7 @@
       ]
     },
     "RepoPromptSettingsCore": {
+      "platforms": ["macos"],
       "source_root": "Sources/RepoPromptSettingsCore",
       "allowed_dependencies": [
         "RepoPromptFoundation",
@@ -230,12 +241,14 @@
       "app_free_tests": true
     },
     "RepoPromptSecureStorage": {
+      "platforms": ["macos"],
       "source_root": "Sources/RepoPromptSecureStorage",
       "allowed_dependencies": [],
       "test_target": "RepoPromptSecureStorageTests",
       "app_free_tests": true
     },
     "RepoPromptSecureStorageTests": {
+      "platforms": ["macos"],
       "source_root": "Tests/RepoPromptSecureStorageTests",
       "allowed_dependencies": [
         "RepoPromptSecureStorage",
@@ -244,13 +257,14 @@
     },
     "RepoPromptShared": {
       "source_root": "Sources/RepoPromptShared",
-      "allowed_dependencies": []
+      "allowed_dependencies": ["RepoPromptC"]
     },
     "RepoPromptTestSupport": {
       "source_root": "Tests/RepoPromptTestSupport",
       "allowed_dependencies": []
     },
     "RepoPromptTests": {
+      "platforms": ["macos"],
       "source_root": "Tests/RepoPromptTests",
       "allowed_dependencies": [
         "RepoPromptApp",
@@ -284,6 +298,7 @@
       ]
     },
     "Sparkle": {
+      "platforms": ["macos"],
       "source_root": "Vendor/Sparkle/Sparkle.xcframework",
       "allowed_dependencies": []
     },
@@ -292,6 +307,7 @@
       "allowed_dependencies": []
     },
     "RepoPromptFileSystemTests": {
+      "platforms": ["macos"],
       "source_root": "Tests/RepoPromptFileSystemTests",
       "allowed_dependencies": [
         "RepoPromptFileSystem"
@@ -304,6 +320,7 @@
       ]
     },
     "RepoPromptSettingsCoreTests": {
+      "platforms": ["macos"],
       "source_root": "Tests/RepoPromptSettingsCoreTests",
       "allowed_dependencies": [
         "RepoPromptSettingsCore",

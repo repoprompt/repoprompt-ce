@@ -23,7 +23,7 @@ enum OutputSink {
                 try handle.write(contentsOf: data)
             } catch {
                 // Fallback to stdout on write failure
-                fputs("Error writing to \(path): \(error)\n", Darwin.stderr)
+                FileHandle.standardError.write(Data("Error writing to \(path): \(error)\n".utf8))
                 print(text)
             }
         }
@@ -34,7 +34,7 @@ enum OutputSink {
         switch self {
         case .stdout:
             print(text, terminator: "")
-            fflush(Darwin.stdout)
+            fflush(nil)
         case let .file(_, handle):
             if let data = text.data(using: .utf8) {
                 handle.write(data)
