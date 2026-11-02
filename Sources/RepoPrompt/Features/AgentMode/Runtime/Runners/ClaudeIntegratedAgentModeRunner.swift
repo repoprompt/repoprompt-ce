@@ -471,6 +471,17 @@ final class ClaudeIntegratedAgentModeRunner {
                     session.isDirty = true
                     hooks.persistence.scheduleSave(session)
                 }
+                if session.claudeAutoCompactWindowTokens != status.autoCompactWindowTokens {
+                    session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
+                    // Re-resolve the displayed window through the ordinary usage path so a
+                    // configured auto-compact window applies before the first response.
+                    await hooks.transcript.handleHeadlessStreamResult(
+                        AIStreamResult(type: "usage", text: nil),
+                        session,
+                        runID,
+                        runAttemptID
+                    )
+                }
                 if status.isRepoPromptServerFailed {
                     return .failed(
                         errorText: "RepoPrompt MCP failed to initialize for Claude (session \(status.sessionID ?? "unknown")).",

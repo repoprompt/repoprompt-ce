@@ -62,6 +62,8 @@ final actor ClaudeNativeProcessSessionController {
         let tools: [String]
         let mcpServerStatuses: [String: String]
         let initializeResponse: InitializeResponseSnapshot?
+        /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from the running process's final launch environment.
+        var autoCompactWindowTokens: Int?
 
         var repoPromptServerStatus: String? {
             mcpServerStatuses.first {
@@ -199,6 +201,7 @@ final actor ClaudeNativeProcessSessionController {
         private var configurationTestBeforeProofSend: (@Sendable () async -> Void)?
     #endif
     private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
+    private var launchAutoCompactWindowTokens: Int?
     private var flagSettingsRequestGeneration: UInt64 = 0
     private var hasCompletedInitialFlagSettings = false
     private var isInitialized = false
@@ -793,6 +796,7 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
+        launchAutoCompactWindowTokens = ClaudeAutoCompactWindow.tokens(in: environment)
         var arguments = buildArguments(
             existingSessionID: existingSessionID,
             model: nil
@@ -1880,7 +1884,8 @@ final actor ClaudeNativeProcessSessionController {
             sessionID: sessionID,
             tools: latestRuntimeInitTools,
             mcpServerStatuses: latestRuntimeInitMcpServerStatuses,
-            initializeResponse: initializeResponseSnapshot
+            initializeResponse: initializeResponseSnapshot,
+            autoCompactWindowTokens: launchAutoCompactWindowTokens
         )
         guard status != lastEmittedRuntimeInitStatus else { return }
         lastEmittedRuntimeInitStatus = status

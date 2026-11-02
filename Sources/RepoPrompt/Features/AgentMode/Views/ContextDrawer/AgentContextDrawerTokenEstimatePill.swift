@@ -11,7 +11,7 @@ struct AgentContextDrawerTokenEstimatePill: View {
         return !snapshot.isComplete || snapshot.isStale || snapshot.refreshPending
     }
 
-    private var contextWindowTokens: Int {
+    private var contextWindowTokens: Int? {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 
@@ -38,17 +38,14 @@ struct AgentContextDrawerTokenEstimatePill: View {
                     )
 
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(
-                            "\(AgentContextIndicator.formatTokens(usedTokens)) / "
-                                + "\(AgentContextIndicator.formatTokens(contextWindowTokenBudget))"
-                        )
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
+                        Text(Self.tokenSummaryText(usedTokens: usedTokens, contextWindowTokens: contextWindowTokenBudget))
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
 
                         HStack(spacing: 4) {
-                            Text("\(formattedPercent(usedPercent))% of budget")
+                            Text(Self.budgetText(usedPercent: usedPercent))
                             if snapshot.refreshPending {
                                 Text("· Updating token estimate…")
                             }
@@ -99,26 +96,41 @@ struct AgentContextDrawerTokenEstimatePill: View {
         }
     }
 
-    private func contextUsedPercent(usedTokens: Int, contextWindowTokens: Int) -> Double {
-        guard contextWindowTokens > 0 else { return 0 }
+    private func contextUsedPercent(usedTokens: Int, contextWindowTokens: Int?) -> Double? {
+        guard let contextWindowTokens, contextWindowTokens > 0 else { return nil }
         return min(max((Double(usedTokens) / Double(contextWindowTokens)) * 100, 0), 100)
     }
 
-    private func formattedPercent(_ usedPercent: Double) -> String {
+    private static func formattedPercent(_ usedPercent: Double) -> String {
         "\(Int(usedPercent.rounded()))"
+    }
+
+    /// An unknown window shows the token count alone rather than a guessed denominator.
+    static func tokenSummaryText(usedTokens: Int, contextWindowTokens: Int?) -> String {
+        guard let contextWindowTokens, contextWindowTokens > 0 else {
+            return "\(AgentContextIndicator.formatTokens(usedTokens)) tokens"
+        }
+        return "\(AgentContextIndicator.formatTokens(usedTokens)) / \(AgentContextIndicator.formatTokens(contextWindowTokens))"
+    }
+
+    static func budgetText(usedPercent: Double?) -> String {
+        guard let usedPercent else { return "Context window unknown" }
+        return "\(formattedPercent(usedPercent))% of budget"
     }
 
     private func tokenWarningHelp(
         _ snapshot: TokenCountingViewModel.PublishedTokenSnapshot,
-        contextWindowTokens: Int,
-        usedPercent: Double
+        contextWindowTokens: Int?,
+        usedPercent: Double?
     ) -> String {
         var lines: [String] = []
-        lines.append("Prompt context used: \(formattedPercent(usedPercent))%")
-        lines.append(
-            "\(AgentContextIndicator.formatTokens(snapshot.breakdown.total)) / "
-                + "\(AgentContextIndicator.formatTokens(contextWindowTokens)) tokens"
-        )
+        if let usedPercent {
+            lines.append("Prompt context used: \(Self.formattedPercent(usedPercent))%")
+            lines.append(Self.tokenSummaryText(usedTokens: snapshot.breakdown.total, contextWindowTokens: contextWindowTokens) + " tokens")
+        } else {
+            lines.append("Prompt context: " + Self.tokenSummaryText(usedTokens: snapshot.breakdown.total, contextWindowTokens: nil))
+            lines.append(AgentContextIndicator.unknownWindowText)
+        }
 
         if !snapshot.isComplete {
             lines.append("Token estimate is not complete yet.")

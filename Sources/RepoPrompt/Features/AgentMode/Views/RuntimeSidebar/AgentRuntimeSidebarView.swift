@@ -300,7 +300,7 @@ struct AgentRuntimeSidebarView: View {
         runtimeVM.snapshot.displayUsedTokens
     }
 
-    private var contextWindowTokens: Int {
+    private var contextWindowTokens: Int? {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 

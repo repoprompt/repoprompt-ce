@@ -1188,6 +1188,15 @@ final class AgentTabSession: ObservableObject {
         }
     }
 
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from the running Claude-native process's launch
+    /// environment, as reported by its runtime init. Not persisted: each launch reports it again.
+    var claudeAutoCompactWindowTokens: Int?
+
+    /// The auto-compact window, only while a Claude-native provider is selected.
+    var activeClaudeAutoCompactWindowTokens: Int? {
+        selectedAgent.usesClaudeNativeRuntime ? claudeAutoCompactWindowTokens : nil
+    }
+
     var contextCompactedAt: Date? {
         didSet {
             // A compaction invalidates the count; the window is unchanged.
