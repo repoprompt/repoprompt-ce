@@ -63,13 +63,51 @@ final class OracleGroupContractTests: XCTestCase {
         XCTAssertNil(DomainSettingValue(mcpValue: .array([.string("ok"), .int(1)])))
     }
 
+    func testAdditionalOracleArgumentsAndStartOnlyRoute() throws {
+        guard case let .object(schema) = OracleAdditionalOraclesContract.schemaProperty(),
+              case let .array(alternatives)? = schema["anyOf"],
+              alternatives.count == 2,
+              case let .object(arraySchema) = alternatives[0]
+        else { return XCTFail("Expected nullable additional_oracles schema") }
+        XCTAssertNotNil(schema["description"])
+        XCTAssertNil(arraySchema["description"])
+        XCTAssertEqual(arraySchema["type"], .string("array"))
+        XCTAssertEqual(arraySchema["maxItems"], .int(OracleRosterContract.maximumAdditionalCount))
+        XCTAssertEqual(alternatives[1], .object(["type": .string("null")]))
+        XCTAssertNil(try OracleAdditionalOraclesContract.parseArguments([:]))
+        XCTAssertNil(try OracleAdditionalOraclesContract.parseArguments(["additional_oracles": .null]))
+        XCTAssertEqual(try OracleAdditionalOraclesContract.parseArguments(["additional_oracles": .array([])]), [])
+        XCTAssertEqual(try OracleAdditionalOraclesContract.parseArguments(["additional_oracles": .array([.string(" model-a ")])]), ["model-a"])
+        let invalid: [Value] = [
+            .string("model-a"), .array([.int(1)]), .array([.string(" ")]),
+            .array([.string("model-a"), .string(" model-a ")]),
+            .array((0 ..< 5).map { .string("model-\($0)") }),
+            .array([.string(String(repeating: "a", count: 513))])
+        ]
+        for value in invalid {
+            XCTAssertThrowsError(try OracleAdditionalOraclesContract.parseArguments(["additional_oracles": value])) { error in
+                guard case MCPError.invalidParams = error else { return XCTFail("Unexpected error: \(error)") }
+            }
+        }
+        for identifiers in [[], ["model-a"]] {
+            XCTAssertEqual(try OracleConversationRoute.resolve(chatID: nil, newChat: false, modelOverride: nil, whenMissingChatID: .startNew, additionalOracles: identifiers), .start(primaryModelOverride: nil))
+            XCTAssertEqual(try OracleConversationRoute.resolve(chatID: "old", newChat: true, modelOverride: nil, whenMissingChatID: .continueCurrent, additionalOracles: identifiers), .start(primaryModelOverride: nil))
+            for chatID in [nil, "old"] as [String?] {
+                XCTAssertThrowsError(try OracleConversationRoute.resolve(chatID: chatID, newChat: false, modelOverride: nil, whenMissingChatID: .continueCurrent, additionalOracles: identifiers)) { error in
+                    XCTAssertEqual(error as? OracleGroupContractError, .additionalOraclesOnContinuation)
+                }
+            }
+        }
+    }
+
     func testConversationRouteRequiresToolSpecificMissingChatIDBehavior() throws {
         XCTAssertEqual(
             try OracleConversationRoute.resolve(
                 chatID: nil,
                 newChat: false,
                 modelOverride: nil,
-                whenMissingChatID: .startNew
+                whenMissingChatID: .startNew,
+                additionalOracles: nil
             ),
             .start(primaryModelOverride: nil)
         )
@@ -78,7 +116,8 @@ final class OracleGroupContractTests: XCTestCase {
                 chatID: nil,
                 newChat: false,
                 modelOverride: nil,
-                whenMissingChatID: .continueCurrent
+                whenMissingChatID: .continueCurrent,
+                additionalOracles: nil
             ),
             .implicitContinuation
         )
@@ -89,7 +128,8 @@ final class OracleGroupContractTests: XCTestCase {
                     chatID: "ignored-existing-chat",
                     newChat: true,
                     modelOverride: " primary-override ",
-                    whenMissingChatID: behavior
+                    whenMissingChatID: behavior,
+                    additionalOracles: nil
                 ),
                 .start(primaryModelOverride: "primary-override")
             )
@@ -98,7 +138,8 @@ final class OracleGroupContractTests: XCTestCase {
                     chatID: " existing-chat ",
                     newChat: false,
                     modelOverride: nil,
-                    whenMissingChatID: behavior
+                    whenMissingChatID: behavior,
+                    additionalOracles: nil
                 ),
                 .continuation(chatID: "existing-chat")
             )
@@ -111,7 +152,8 @@ final class OracleGroupContractTests: XCTestCase {
                 chatID: "existing-chat",
                 newChat: false,
                 modelOverride: "different-model",
-                whenMissingChatID: .continueCurrent
+                whenMissingChatID: .continueCurrent,
+                additionalOracles: nil
             )
         )
         XCTAssertThrowsError(
@@ -119,7 +161,8 @@ final class OracleGroupContractTests: XCTestCase {
                 chatID: nil,
                 newChat: false,
                 modelOverride: "different-model",
-                whenMissingChatID: .continueCurrent
+                whenMissingChatID: .continueCurrent,
+                additionalOracles: nil
             )
         )
         XCTAssertThrowsError(
@@ -127,7 +170,8 @@ final class OracleGroupContractTests: XCTestCase {
                 chatID: "  ",
                 newChat: false,
                 modelOverride: nil,
-                whenMissingChatID: .continueCurrent
+                whenMissingChatID: .continueCurrent,
+                additionalOracles: nil
             )
         )
     }

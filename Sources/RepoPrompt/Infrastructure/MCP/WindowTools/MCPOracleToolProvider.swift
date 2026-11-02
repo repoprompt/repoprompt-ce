@@ -19,6 +19,20 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
         }
     }
 
+    static let additionalOraclesSchema = OracleAdditionalOraclesContract.schemaProperty()
+
+    /// JSONSchema drops outer anyOf metadata; publication retains the canonical raw schema.
+    private static let additionalOraclesInputSchema: JSONSchema = {
+        do {
+            return try JSONDecoder().decode(
+                JSONSchema.self,
+                from: JSONEncoder().encode(additionalOraclesSchema)
+            )
+        } catch {
+            preconditionFailure("OracleAdditionalOraclesContract schema must decode as JSONSchema: \(error)")
+        }
+    }()
+
     private let runtime: MCPAppToolBinder
     private let dependencies: MCPAppPhysicalCapabilityAdapters.Execution
 
@@ -99,6 +113,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Optional primary-model override for a new conversation; rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
+                    OracleAdditionalOraclesContract.argumentName: Self.additionalOraclesInputSchema,
                     OracleAttachmentContract.argumentName: Self.oracleAttachmentsSchema,
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
@@ -149,6 +164,7 @@ final class MCPOracleToolProvider: MCPAppToolProviding {
                         description: "Optional exposed Model Preset name/UUID or available raw primary-model override for an explicit new_chat=true start. Exact preset identity wins a collision; a raw model retains configured additional Oracles. Rejected on continuation.",
                         maxLength: OracleRosterContract.maximumModelIdentifierLength
                     ),
+                    OracleAdditionalOraclesContract.argumentName: Self.additionalOraclesInputSchema,
                     OracleAttachmentContract.argumentName: Self.oracleAttachmentsSchema,
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."

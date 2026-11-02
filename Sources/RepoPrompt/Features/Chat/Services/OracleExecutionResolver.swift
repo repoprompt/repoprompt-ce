@@ -273,17 +273,18 @@ struct OracleExecutionResolver {
     func resolve(
         choice: OracleStartChoice,
         mode rawMode: String,
-        snapshot: OracleSelectionSnapshot
+        snapshot: OracleSelectionSnapshot,
+        additionalOracles: [String]? = nil
     ) throws -> ResolvedOracleExecution {
         let mode = try normalizedMode(rawMode)
         if snapshot.origin == .contextBuilderUI {
-            return try resolveContextBuilderUI(mode: mode, snapshot: snapshot)
+            return try resolveContextBuilderUI(mode: mode, snapshot: snapshot, additionalOracles: additionalOracles)
         }
 
         let presetsExposed = snapshot.modelPresetsExposed && !snapshot.modelPresetsTemporarilyDisabled
         switch choice {
         case .automatic:
-            return try resolveAutomatic(mode: mode, snapshot: snapshot, presetsExposed: presetsExposed)
+            return try resolveAutomatic(mode: mode, snapshot: snapshot, presetsExposed: presetsExposed, additionalOracles: additionalOracles)
         case let .contextBuilderPreset(identifier):
             guard presetsExposed else {
                 throw OracleExecutionResolutionError.presetsUnavailable(identifier)
@@ -291,13 +292,14 @@ struct OracleExecutionResolver {
             guard let preset = matchingPreset(identifier, in: snapshot.modelPresets) else {
                 throw OracleExecutionResolutionError.presetNotFound(identifier)
             }
-            return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: false)
+            return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: false, additionalOracles: additionalOracles)
         case let .oracleSend(identifier):
             return try resolveOracleSendChoice(
                 identifier,
                 mode: mode,
                 snapshot: snapshot,
-                presetsExposed: presetsExposed
+                presetsExposed: presetsExposed,
+                additionalOracles: additionalOracles
             )
         }
     }
@@ -334,14 +336,15 @@ struct OracleExecutionResolver {
         _ identifier: String,
         mode: OracleMode,
         snapshot: OracleSelectionSnapshot,
-        presetsExposed: Bool
+        presetsExposed: Bool,
+        additionalOracles: [String]?
     ) throws -> ResolvedOracleExecution {
         let normalized = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
         if presetsExposed, let preset = exactMatchingPreset(normalized, in: snapshot.modelPresets) {
-            return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: false)
+            return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: false, additionalOracles: additionalOracles)
         }
         if normalized.caseInsensitiveCompare("current_chat_model") == .orderedSame {
-            return try resolveAgentModels(mode: mode, snapshot: snapshot)
+            return try resolveAgentModels(mode: mode, snapshot: snapshot, additionalOracles: additionalOracles)
         }
         if resolveModel(normalized) != nil {
             let roster = [normalized] + snapshot.agentModelsProfile.additionalOracleModelRaws
@@ -351,11 +354,12 @@ struct OracleExecutionResolver {
                 chatPreset: defaultChatPreset(mode: mode, snapshot: snapshot),
                 mode: mode,
                 selection: .rawPrimaryOverride(normalized),
-                profile: snapshot.agentModelsProfile
+                profile: snapshot.agentModelsProfile,
+                additionalOracles: additionalOracles
             )
         }
         if presetsExposed, let preset = fuzzyMatchingPreset(normalized, in: snapshot.modelPresets) {
-            return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: false)
+            return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: false, additionalOracles: additionalOracles)
         }
         if !presetsExposed, matchingPreset(normalized, in: snapshot.modelPresets) != nil {
             throw OracleExecutionResolutionError.presetsUnavailable(identifier)
@@ -366,10 +370,11 @@ struct OracleExecutionResolver {
     private func resolveAutomatic(
         mode: OracleMode,
         snapshot: OracleSelectionSnapshot,
-        presetsExposed: Bool
+        presetsExposed: Bool,
+        additionalOracles: [String]?
     ) throws -> ResolvedOracleExecution {
         guard presetsExposed, !snapshot.modelPresets.isEmpty else {
-            return try resolveAgentModels(mode: mode, snapshot: snapshot)
+            return try resolveAgentModels(mode: mode, snapshot: snapshot, additionalOracles: additionalOracles)
         }
         let supporting = snapshot.modelPresets.filter { $0.supports(mode: mode.rawValue) }
         guard !supporting.isEmpty else {
@@ -380,11 +385,16 @@ struct OracleExecutionResolver {
         }
         var failures: [String] = []
         for preset in supporting {
+            // Preserve whole-roster eligibility; subset errors must not trigger preset fallback.
+            let execution: ResolvedOracleExecution
             do {
-                return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: true)
+                execution = try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: true)
             } catch {
                 failures.append(error.localizedDescription)
+                continue
             }
+            if additionalOracles == nil { return execution }
+            return try resolvePreset(preset, mode: mode, snapshot: snapshot, automatic: true, additionalOracles: additionalOracles)
         }
         throw OracleExecutionResolutionError.noUsablePreset(
             mode: mode.rawValue,
@@ -396,7 +406,8 @@ struct OracleExecutionResolver {
         _ preset: ModelPreset,
         mode: OracleMode,
         snapshot: OracleSelectionSnapshot,
-        automatic: Bool
+        automatic: Bool,
+        additionalOracles: [String]? = nil
     ) throws -> ResolvedOracleExecution {
         guard preset.supports(mode: mode.rawValue) else {
             throw OracleExecutionResolutionError.presetModeUnsupported(name: preset.name, mode: mode.rawValue)
@@ -421,13 +432,15 @@ struct OracleExecutionResolver {
             selection: automatic
                 ? .automaticPreset(id: preset.id, name: preset.name)
                 : .explicitPreset(id: preset.id, name: preset.name),
-            profile: snapshot.agentModelsProfile
+            profile: snapshot.agentModelsProfile,
+            additionalOracles: additionalOracles
         )
     }
 
     private func resolveAgentModels(
         mode: OracleMode,
-        snapshot: OracleSelectionSnapshot
+        snapshot: OracleSelectionSnapshot,
+        additionalOracles: [String]?
     ) throws -> ResolvedOracleExecution {
         guard let primary = snapshot.agentModelsProfile.planningModelRaw else {
             throw OracleExecutionResolutionError.invalidRoster("Choose an Oracle model before starting a conversation.")
@@ -438,13 +451,15 @@ struct OracleExecutionResolver {
             chatPreset: defaultChatPreset(mode: mode, snapshot: snapshot),
             mode: mode,
             selection: .agentModels,
-            profile: snapshot.agentModelsProfile
+            profile: snapshot.agentModelsProfile,
+            additionalOracles: additionalOracles
         )
     }
 
     private func resolveContextBuilderUI(
         mode: OracleMode,
-        snapshot: OracleSelectionSnapshot
+        snapshot: OracleSelectionSnapshot,
+        additionalOracles: [String]?
     ) throws -> ResolvedOracleExecution {
         guard let modelStrings = snapshot.contextBuilderUIModelStrings,
               let chatPreset = snapshot.contextBuilderUIChatPreset
@@ -457,7 +472,8 @@ struct OracleExecutionResolver {
             chatPreset: chatPreset,
             mode: mode,
             selection: .contextBuilderUI,
-            profile: snapshot.agentModelsProfile
+            profile: snapshot.agentModelsProfile,
+            additionalOracles: additionalOracles
         )
     }
 
@@ -467,7 +483,8 @@ struct OracleExecutionResolver {
         chatPreset: ChatPreset,
         mode: OracleMode,
         selection: OracleExecutionSelection,
-        profile: AgentModelsSettingsProfile
+        profile: AgentModelsSettingsProfile,
+        additionalOracles: [String]? = nil
     ) throws -> ResolvedOracleExecution {
         let roster: OracleRoster
         do {
@@ -475,6 +492,7 @@ struct OracleExecutionResolver {
                 throw OracleExecutionResolutionError.invalidRoster("Oracle rosters require 1...5 models; received 0.")
             }
             roster = try OracleRoster(primaryModelID: primary, additionalModelIDs: Array(modelStrings.dropFirst()))
+                .selectingAdditional(additionalOracles)
         } catch let error as OracleExecutionResolutionError {
             throw error
         } catch {

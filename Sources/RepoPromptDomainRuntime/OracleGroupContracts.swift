@@ -11,6 +11,9 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable {
     case invalidConversationOwner
     case invalidPublicChatID
     case modelOverrideOnContinuation
+    case additionalOraclesOnContinuation
+    case duplicateAdditionalOracles
+    case unmatchedAdditionalOracles(unmatched: [String], selectable: [String], primaryOnly: Bool)
     case invalidLaneResult(Int)
     case invalidExecutionProfile
     case invalidGroupResult
@@ -39,6 +42,12 @@ package enum OracleGroupContractError: Error, LocalizedError, Equatable {
             "Oracle public chat identifiers must be non-empty."
         case .modelOverrideOnContinuation:
             "Oracle model overrides are valid only when starting a new conversation."
+        case .additionalOraclesOnContinuation:
+            "additional_oracles is valid only when starting a new conversation."
+        case .duplicateAdditionalOracles:
+            "additional_oracles must not contain duplicate identifiers."
+        case let .unmatchedAdditionalOracles(unmatched, selectable, primaryOnly):
+            "Unmatched additional_oracles: \(unmatched.joined(separator: ", ")). Selectable identifiers: [\(selectable.joined(separator: ", "))].\(primaryOnly ? " The primary is always included; set it with model." : "")"
         case let .invalidLaneResult(index):
             "Oracle lane \(index) has an invalid role, status, or payload."
         case .invalidExecutionProfile:
@@ -89,6 +98,51 @@ package enum OracleRosterContract {
     /// User-facing lane title. Index 0 is "Oracle"; later lanes are "Oracle 2"…"Oracle 5".
     package static func displayLabel(laneIndex: Int) -> String {
         laneIndex <= 0 ? "Oracle" : "Oracle \(laneIndex + 1)"
+    }
+}
+
+package enum OracleAdditionalOraclesContract {
+    package static let argumentName = "additional_oracles"
+
+    package static func schemaProperty() -> Value {
+        .object([
+            "description": .string("Subset of configured additional Oracle model identifiers for a new conversation. Omitted runs all; empty runs primary only."),
+            "anyOf": .array([
+                .object([
+                    "type": .string("array"),
+                    "items": .object(["type": .string("string"), "maxLength": .int(OracleRosterContract.maximumModelIdentifierLength)]),
+                    "maxItems": .int(OracleRosterContract.maximumAdditionalCount),
+                    "uniqueItems": .bool(true)
+                ]),
+                .object(["type": .string("null")])
+            ])
+        ])
+    }
+
+    package static func normalizedIdentifiers(_ identifiers: [String]) throws -> [String] {
+        let normalized = try OracleRosterContract.normalizedAdditionalModelIDs(identifiers)
+        guard Set(normalized).count == normalized.count else {
+            throw OracleGroupContractError.duplicateAdditionalOracles
+        }
+        return normalized
+    }
+
+    package static func parseArguments(_ arguments: [String: Value]) throws -> [String]? {
+        guard let value = arguments[argumentName], value != .null else { return nil }
+        guard case let .array(values) = value else {
+            throw MCPError.invalidParams("additional_oracles must be an array of model identifiers.")
+        }
+        let identifiers = try values.map { value in
+            guard case let .string(identifier) = value else {
+                throw MCPError.invalidParams("additional_oracles entries must be strings.")
+            }
+            return identifier
+        }
+        do {
+            return try normalizedIdentifiers(identifiers)
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
     }
 }
 
@@ -192,6 +246,23 @@ package struct OracleRoster: Codable, Equatable {
             primary: OracleModelReference(providerID: providerID, modelID: primaryModelID),
             additional: additional
         )
+    }
+
+    package func selectingAdditional(_ identifiers: [String]?) throws -> Self {
+        guard let identifiers else { return self }
+        let requested = try OracleAdditionalOraclesContract.normalizedIdentifiers(identifiers)
+        var seen = Set<String>()
+        let selectable = additional.map(\.modelID).filter { seen.insert($0).inserted }
+        let unmatched = requested.filter { !selectable.contains($0) }
+        if !unmatched.isEmpty {
+            throw OracleGroupContractError.unmatchedAdditionalOracles(
+                unmatched: unmatched,
+                selectable: selectable,
+                primaryOnly: unmatched.contains(primary.modelID)
+            )
+        }
+        let selected = Set(requested)
+        return try Self(primary: primary, additional: additional.filter { selected.contains($0.modelID) })
     }
 
     package var orderedModels: [OracleModelReference] {
@@ -1159,7 +1230,8 @@ package enum OracleConversationRoute: Equatable {
         chatID: String?,
         newChat: Bool,
         modelOverride: String?,
-        whenMissingChatID: OracleMissingConversationBehavior
+        whenMissingChatID: OracleMissingConversationBehavior,
+        additionalOracles: [String]?
     ) throws -> Self {
         let chatID = chatID?.trimmingCharacters(in: .whitespacesAndNewlines)
         if chatID?.isEmpty == true { throw OracleGroupContractError.invalidPublicChatID }
@@ -1168,6 +1240,9 @@ package enum OracleConversationRoute: Equatable {
         if let chatID {
             guard modelOverride == nil else {
                 throw OracleGroupContractError.modelOverrideOnContinuation
+            }
+            guard additionalOracles == nil else {
+                throw OracleGroupContractError.additionalOraclesOnContinuation
             }
             return .continuation(chatID: chatID)
         }
@@ -1178,6 +1253,9 @@ package enum OracleConversationRoute: Equatable {
             guard modelOverride == nil else {
                 throw OracleGroupContractError.modelOverrideOnContinuation
             }
+            guard additionalOracles == nil else {
+                throw OracleGroupContractError.additionalOraclesOnContinuation
+            }
             return .implicitContinuation
         }
     }
@@ -1186,10 +1264,12 @@ package enum OracleConversationRoute: Equatable {
 package struct OracleRosterResolutionRequest: Codable, Equatable {
     package let primaryModelOverride: String?
     package let newChat: Bool
+    package let additionalOracles: [String]?
 
-    package init(primaryModelOverride: String? = nil, newChat: Bool) {
+    package init(primaryModelOverride: String? = nil, newChat: Bool, additionalOracles: [String]? = nil) {
         self.primaryModelOverride = primaryModelOverride
         self.newChat = newChat
+        self.additionalOracles = additionalOracles
     }
 }
 

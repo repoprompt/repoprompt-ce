@@ -123,11 +123,13 @@ extension OracleViewModel {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
         let profile = capturedProfile
             ?? GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
+        let additionalOracles = try OracleAdditionalOraclesContract.parseArguments(args)
         let route = try OracleConversationRoute.resolve(
             chatID: args["chat_id"]?.stringValue,
             newChat: args["new_chat"]?.boolValue == true,
             modelOverride: args["model"]?.stringValue,
-            whenMissingChatID: .continueCurrent
+            whenMissingChatID: .continueCurrent,
+            additionalOracles: additionalOracles
         )
         let selection = try await resolveConfiguredRosterSelection(
             route: route,
@@ -149,7 +151,8 @@ extension OracleViewModel {
                 modelParam: args["model"]?.stringValue,
                 profile: profile,
                 promptVM: promptVM,
-                snapshotOverride: selectionSnapshotOverride
+                snapshotOverride: selectionSnapshotOverride,
+                additionalOracles: additionalOracles
             )
             : nil
         // An execution with no override owns the built-in policy; it must not fall
