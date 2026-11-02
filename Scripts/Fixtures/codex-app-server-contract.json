@@ -13,6 +13,9 @@
         "clientInfo.version",
         "capabilities",
         "capabilities.experimentalApi"
+      ],
+      "maySend": [
+        "capabilities.optOutNotificationMethods"
       ]
     },
     {
@@ -431,6 +434,7 @@
         "baseInstructions",
         "config",
         "cwd",
+        "experimentalRawEvents",
         "model",
         "serviceTier"
       ],

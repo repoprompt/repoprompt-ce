@@ -475,6 +475,9 @@ final class CodexCLIProvider: AIProvider {
             requestTimeout: requestTimeout
         )
 
+        var responseUsageByID: [String: CodexNativeSessionController.ResponseUsage] = [:]
+        var exactUsage: CodexNativeSessionController.ResponseUsage?
+        var usageUnavailable = false
         var emittedOutput = false
         var canonicalAssistantTextByScope: [CodexNativeSessionController.ItemScope: String] = [:]
         let timeoutMonitor = startTurnTimeoutMonitor(timeout: requestTimeout, controller: controller)
@@ -557,6 +560,33 @@ final class CodexCLIProvider: AIProvider {
                         }
                         canonicalAssistantTextByScope[payload.scope] = payload.text
 
+                    case let .responseUsage(threadID, turnID, responseID, usage):
+                        guard threadID == sessionRef.conversationID,
+                              turnID == turnReceipt.provisionalSubmissionID,
+                              !usageUnavailable
+                        else { continue }
+                        guard let responseID, let usage else {
+                            usageUnavailable = true
+                            exactUsage = nil
+                            continue
+                        }
+                        if let previous = responseUsageByID[responseID] {
+                            if previous != usage {
+                                usageUnavailable = true
+                                exactUsage = nil
+                            }
+                            continue
+                        }
+                        let input = (exactUsage?.inputTokens ?? 0).addingReportingOverflow(usage.inputTokens)
+                        let output = (exactUsage?.outputTokens ?? 0).addingReportingOverflow(usage.outputTokens)
+                        guard !input.overflow, !output.overflow else {
+                            usageUnavailable = true
+                            exactUsage = nil
+                            continue
+                        }
+                        responseUsageByID[responseID] = usage
+                        exactUsage = .init(inputTokens: input.partialValue, outputTokens: output.partialValue)
+
                     case let .reasoningDelta(payload):
                         guard !payload.text.isEmpty else { continue }
                         emittedOutput = true
@@ -566,7 +596,7 @@ final class CodexCLIProvider: AIProvider {
                         switch status {
                         case .completed:
                             sawCompletion = true
-                            continuation.yield(Self.messageStopEvent(sessionRef: sessionRef))
+                            continuation.yield(Self.messageStopEvent(sessionRef: sessionRef, usage: exactUsage))
                             break eventLoop
                         case .interrupted:
                             throw CancellationError()
@@ -630,6 +660,8 @@ final class CodexCLIProvider: AIProvider {
                     switch reconciledTerminal.status {
                     case .completed:
                         sawCompletion = true
+                        // A terminal snapshot proves text completion, not exhaustive raw-response delivery.
+                        // Even the final response usage may arrive after its item/completed notification.
                         continuation.yield(Self.messageStopEvent(sessionRef: sessionRef))
                     case .interrupted:
                         throw CancellationError()
@@ -795,7 +827,7 @@ final class CodexCLIProvider: AIProvider {
                     case .toolCall, .toolResult, .commandExecutionRunning:
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server emitted tool events while interactive chat tools are disabled.")
 
-                    case .reasoningDelta, .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:
+                    case .responseUsage, .reasoningDelta, .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:
                         continue
                     }
                 }
@@ -963,9 +995,14 @@ final class CodexCLIProvider: AIProvider {
         )
     }
 
-    private func makeRequestAppServerClient() -> CodexAppServerClient? {
+    func makeRequestAppServerClient() -> CodexAppServerClient? {
         guard sessionControllerFactory == nil else { return nil }
-        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(launchSnapshot: launchSnapshot)
+        // Raw item mirrors can include original image bytes and exceed the transport frame limit.
+        // Keep response-completed usage, but suppress the unused item mirror before server framing.
+        return CodexProviderHelpers.makeOwnedNonAgentAppServerClient(
+            launchSnapshot: launchSnapshot,
+            optOutNotificationMethods: ["rawResponseItem/completed"]
+        )
     }
 
     private func withActiveRequestAppServerClient<T>(
@@ -1027,6 +1064,7 @@ final class CodexCLIProvider: AIProvider {
         let configOverrides = interactiveConfigOverrides(excludeServers: excludeServers)
         return CodexNativeSessionController.Options(
             requestTimeout: requestTimeout,
+            exactResponseUsageEnabled: true,
             configOverridesProvider: { configOverrides },
             approvalPolicyProvider: { .never },
             sandboxModeProvider: { .readOnly },
@@ -1213,7 +1251,8 @@ final class CodexCLIProvider: AIProvider {
     }
 
     private static func messageStopEvent(
-        sessionRef: CodexNativeSessionController.SessionRef? = nil
+        sessionRef: CodexNativeSessionController.SessionRef? = nil,
+        usage: CodexNativeSessionController.ResponseUsage? = nil
     ) -> AIStreamResult {
         let cleanupHandle = sessionRef.map {
             ProviderConversationCleanupHandle(
@@ -1226,8 +1265,8 @@ final class CodexCLIProvider: AIProvider {
             type: "message_stop",
             text: nil,
             reasoning: nil,
-            promptTokens: nil,
-            completionTokens: nil,
+            promptTokens: usage?.inputTokens,
+            completionTokens: usage?.outputTokens,
             cost: nil,
             cleanupHandle: cleanupHandle
         )
