@@ -1290,6 +1290,31 @@ final class OracleGroupDeliveryContractTests: XCTestCase {
         XCTAssertFalse(text.localizedCaseInsensitiveContains("synthesis"))
     }
 
+    func testGroupedOutputsDistinguishProFromStandardWithTheSameAPIModel() throws {
+        let models: [AIModel] = [.gpt6AstraProMax, .gpt6AstraMax]
+        let lanes = try models.enumerated().map { index, model in
+            try OracleLaneResult(
+                laneIndex: index, chatID: "chat-\(index)", providerID: "openAI",
+                modelID: model.rawValue, status: .completed,
+                executionProfile: OracleExecutionProfile(
+                    providerID: "openAI", modelID: "gpt-6-astra", effectiveReasoningEffort: "max"
+                ),
+                response: "answer-\(index)"
+            )
+        }
+        let value = try Value.object(groupFields(lanes: lanes))
+        for blocks in [
+            ToolOutputFormatter.formatAskOracle(args: [:], value: value, emitResources: false),
+            ToolOutputFormatter.formatChatSend(args: [:], value: value, emitResources: false)
+        ] {
+            let text = joinedText(blocks)
+            XCTAssertTrue(text.contains("- Model: `gpt-6-astra-pro-max`"), text)
+            XCTAssertTrue(text.contains("- Model: `gpt-6-astra`"), text)
+            XCTAssertTrue(text.contains("- Effective effort: `max`"), text)
+            XCTAssertFalse(text.contains("- Model: `gpt-6-astra-max`"), text)
+        }
+    }
+
     func testGroupedAskOracleEndMarkerStaysOnItsOwnLineWhenBlocksAreConcatenated() throws {
         var fields = try groupFields(lanes: [
             lane(index: 0, response: "primary answer"),

@@ -158,6 +158,7 @@ conductor-selftest:
 	python3 Scripts/test_security_inventory.py
 
 ci-app-test-runner-selftest:
+	python3 Scripts/test_ci_admission.py
 	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_ci_test_coverage.py
 	python3 Scripts/test_ci_resolve_packages.py

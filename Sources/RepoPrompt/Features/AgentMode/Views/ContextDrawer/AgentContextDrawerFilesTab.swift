@@ -204,7 +204,8 @@ struct AgentContextDrawerFilesTab: View {
         )
     }
 
-    var body: some View {
+    /// Keep the observer chain in opaque segments so type checking stays bounded.
+    private var lifecycleContent: some View {
         VStack(alignment: .leading, spacing: 14) {
             if browseModel.isActive {
                 AgentContextFileBrowseView(model: browseModel)
@@ -228,65 +229,75 @@ struct AgentContextDrawerFilesTab: View {
                 modelCoordinator.cancelLoading(keepLoadedModel: true)
             }
         }
-        .onReceive(exportContext.selectionChangesPublisher) { change in
-            guard !isSwitchBlankingRows else { return }
-            guard !exportContext.promptManager.isSwitchingComposeTab else { return }
-            browseModel.applySelectionChange(change, exportRows: modelCoordinator.rowSplit.rows)
-            handleSelectionChange(change, isVisible: true)
-        }
-        .onChange(of: renderSnapshot.modelRequestIdentity) { previousIdentity, currentIdentity in
-            guard !isSwitchBlankingRows else { return }
-            guard !exportContext.promptManager.isSwitchingComposeTab else { return }
-            guard agentContextFilesShouldResetModel(
-                previousIdentity: previousIdentity,
-                currentIdentity: currentIdentity
-            ) else { return }
-            resetOrRefresh(isVisible: true)
-        }
-        .onChange(of: currentMutationRouteProof) { _, proof in
-            browseModel.updateMutationRouteProof(proof)
-        }
-        .onChange(of: isSwitchBlankingRows) { _, isBlanking in
-            if isBlanking { terminateBrowseSession() }
-        }
-        .onChange(of: modelCoordinator.model) { _, newModel in
-            guard browseModel.isActive, let newModel else { return }
-            let routeProof = agentContextFileBrowseRouteProof(
-                activeIdentity: exportContext.selectionCoordinator?.activeSelectionIdentity(),
-                sourceTabID: newModel.source.tabID,
-                lookupContext: newModel.lookupContext
-            )
-            let sessionMatchesTarget = routeProof.map {
-                browseModel.sessionMatches(identity: $0.identity, lookupContext: $0.lookupContext)
-            } ?? false
-            if agentContextFileBrowseShouldTerminateForTargetChange(
-                isBrowseActive: browseModel.isActive,
-                hasMutationTarget: routeProof != nil,
-                sessionMatchesTarget: sessionMatchesTarget
-            ) {
-                terminateBrowseSession()
-                return
+    }
+
+    private var modelObservedContent: some View {
+        lifecycleContent
+            .onReceive(exportContext.selectionChangesPublisher) { change in
+                guard !isSwitchBlankingRows else { return }
+                guard !exportContext.promptManager.isSwitchingComposeTab else { return }
+                browseModel.applySelectionChange(change, exportRows: modelCoordinator.rowSplit.rows)
+                handleSelectionChange(change, isVisible: true)
             }
-            browseModel.updateAuthoritativeSelection(newModel.source.selection, exportRows: newModel.rows)
-        }
-        .onChange(of: browseModel.isActive) { _, isActive in
-            previewCoordinator.reconcileVisibleRows(isActive ? [] : previewVisibleRows)
-        }
-        .onReceive(exportContext.promptManager.$codeMapsGloballyDisabled) { disabled in
-            browseModel.setCodeMapsGloballyDisabled(disabled)
-        }
-        .onChange(of: fileRows.count) { _, _ in adjustActiveSubtab() }
-        .onChange(of: codemapRows.count) { _, _ in adjustActiveSubtab() }
-        .onChange(of: isAwaitingCodemapRows) { _, _ in adjustActiveSubtab() }
-        .onChange(of: detailStore.filesSubtab) { _, _ in
-            previewCoordinator.reconcileVisibleRows(previewVisibleRows)
-        }
-        .onChange(of: sortedRows.map(\.id)) { _, _ in
-            previewCoordinator.reconcileVisibleRows(previewVisibleRows)
-        }
-        .onChange(of: isSwitchHidingRows) { _, _ in
-            previewCoordinator.reconcileVisibleRows(previewVisibleRows)
-        }
+            .onChange(of: renderSnapshot.modelRequestIdentity) { previousIdentity, currentIdentity in
+                guard !isSwitchBlankingRows else { return }
+                guard !exportContext.promptManager.isSwitchingComposeTab else { return }
+                guard agentContextFilesShouldResetModel(
+                    previousIdentity: previousIdentity,
+                    currentIdentity: currentIdentity
+                ) else { return }
+                resetOrRefresh(isVisible: true)
+            }
+            .onChange(of: currentMutationRouteProof) { _, proof in
+                browseModel.updateMutationRouteProof(proof)
+            }
+            .onChange(of: isSwitchBlankingRows) { _, isBlanking in
+                if isBlanking {
+                    terminateBrowseSession()
+                }
+            }
+            .onChange(of: modelCoordinator.model) { _, newModel in
+                guard browseModel.isActive, let newModel else { return }
+                let routeProof = agentContextFileBrowseRouteProof(
+                    activeIdentity: exportContext.selectionCoordinator?.activeSelectionIdentity(),
+                    sourceTabID: newModel.source.tabID,
+                    lookupContext: newModel.lookupContext
+                )
+                let sessionMatchesTarget = routeProof.map {
+                    browseModel.sessionMatches(identity: $0.identity, lookupContext: $0.lookupContext)
+                } ?? false
+                if agentContextFileBrowseShouldTerminateForTargetChange(
+                    isBrowseActive: browseModel.isActive,
+                    hasMutationTarget: routeProof != nil,
+                    sessionMatchesTarget: sessionMatchesTarget
+                ) {
+                    terminateBrowseSession()
+                    return
+                }
+                browseModel.updateAuthoritativeSelection(newModel.source.selection, exportRows: newModel.rows)
+            }
+    }
+
+    var body: some View {
+        modelObservedContent
+            .onChange(of: browseModel.isActive) { _, isActive in
+                previewCoordinator.reconcileVisibleRows(isActive ? [] : previewVisibleRows)
+            }
+            .onReceive(exportContext.promptManager.$codeMapsGloballyDisabled) { disabled in
+                browseModel.setCodeMapsGloballyDisabled(disabled)
+            }
+            .onChange(of: fileRows.count) { _, _ in adjustActiveSubtab() }
+            .onChange(of: codemapRows.count) { _, _ in adjustActiveSubtab() }
+            .onChange(of: isAwaitingCodemapRows) { _, _ in adjustActiveSubtab() }
+            .onChange(of: detailStore.filesSubtab) { _, _ in
+                previewCoordinator.reconcileVisibleRows(previewVisibleRows)
+            }
+            .onChange(of: sortedRows.map(\.id)) { _, _ in
+                previewCoordinator.reconcileVisibleRows(previewVisibleRows)
+            }
+            .onChange(of: isSwitchHidingRows) { _, _ in
+                previewCoordinator.reconcileVisibleRows(previewVisibleRows)
+            }
     }
 
     private var controls: some View {

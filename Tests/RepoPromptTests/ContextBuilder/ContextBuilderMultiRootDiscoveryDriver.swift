@@ -228,10 +228,10 @@ import XCTest
             return connection
         }
 
-        func invoke(using connection: RoutedConnection) async throws -> (content: [MCP.Tool.Content], isError: Bool?) {
+        func invoke(using connection: RoutedConnection, responseType: String = "clarify") async throws -> (content: [MCP.Tool.Content], isError: Bool?) {
             defer { runSettlementCount += 1 }
             return try await connection.client.callTool(name: "context_builder", arguments: [
-                "instructions": .string("SENSITIVE_DISCOVERY_PROMPT"), "response_type": .string("clarify"), "_rawJSON": .bool(true)
+                "instructions": .string("SENSITIVE_DISCOVERY_PROMPT"), "response_type": .string(responseType), "_rawJSON": .bool(true)
             ])
         }
 

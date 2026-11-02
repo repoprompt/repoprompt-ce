@@ -768,6 +768,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private let workflowStore = AgentWorkflowStore.shared
     let attachmentStore = AgentAttachmentStore()
     let attachmentWorkspaceDirectoryProvider: () -> URL?
+    /// App composition owns launch policy and the live window registry; standalone tests inject both.
+    let attachmentPersistenceIsSuppressed: () -> Bool
+    let attachmentSweepViewModels: () -> [AgentModeViewModel]
+    /// Overrides `<workspace>/AgentSessions/attachments` (tests); `nil` uses the active workspace.
+    var sessionAttachmentsRootOverride: (() -> URL?)?
+    var sessionAttachmentLimits: AgentSessionAttachmentStore.Limits = .standard
+    /// Latest blocked-attach notice surfaced in the composer instead of a mid-run transcript row.
+    var imageAttachmentNotice: AgentImageAttachmentNoticeProps?
+    /// Off-main moves of finished turns' images into session storage, keyed by a per-move token.
+    var attachmentRetentionTasks: [UUID: Task<Void, Never>] = [:]
+    /// Attachment roots already swept this process (`AgentModeViewModel+DraftsAttachments`).
+    static var sweptSessionAttachmentRoots: Set<String> = []
+    /// Delay before the startup sweep runs, so it never competes with workspace restore.
+    var sessionAttachmentSweepDelayNanoseconds: UInt64 = 20_000_000_000
+    /// The most recently scheduled sweep; its value is `nil` when the view model went away first.
+    var sessionAttachmentSweepTask: Task<AgentSessionAttachmentStore.SweepResult?, Never>?
     let workspacePathProvider: () -> String?
     /// Source of demand-scoped OpenCode model-parameter observations for the composer. Defaults
     /// to the shared polling service; the DEBUG test init can inject a scripted provider so
@@ -821,6 +837,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     var freshTaskRoutingByTabID: [UUID: FreshTaskRoutingOwnership] = [:]
+    var autoWorkflowJudgments: [UUID: Task<DecisionOutcome, Never>] = [:]
+    #if DEBUG
+        var test_autoWorkflowCatalog: [AgentWorkflowDefinition]?
+    #endif
 
     var isRestoringState = false
     private var activeUISyncSuppressionDepth = 0
@@ -2482,7 +2502,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     private weak var oracleViewModel: OracleViewModel?
     var repromptService: AgentRepromptService?
     let repromptUIStore = AgentRepromptUIStore()
-    var repromptEnabled = false
+    /// Unsaved tabs without a workspace keep activation only for this window.
+    var unscopedRepromptEnabled = false
     var repromptDispatchTexts: [UUID: String] = [:]
     var repromptDispatchOriginals: [UUID: String] = [:]
     var repromptOperation: AgentRepromptOperation?
@@ -2635,6 +2656,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         promptManager: PromptViewModel,
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
+        attachmentPersistenceIsSuppressed: @escaping () -> Bool,
+        attachmentSweepViewModels: @escaping () -> [AgentModeViewModel],
         oracleViewModel: OracleViewModel? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
@@ -2651,6 +2674,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         workspaceFileContextStore = promptManager.workspaceFileContextStore
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
+        self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
+        self.attachmentSweepViewModels = attachmentSweepViewModels
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.modelRouterSettingsStore = modelRouterSettingsStore
@@ -2863,6 +2888,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             testWindowID: Int = 1,
             testWorkspacePath: String? = nil,
             testWorkspaceDirectory: URL? = nil,
+            attachmentPersistenceIsSuppressed: @escaping () -> Bool = { false },
+            attachmentSweepViewModels: @escaping () -> [AgentModeViewModel] = { [] },
             applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
             clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
             shouldManageCodexTooling: Bool = false,
@@ -2938,6 +2965,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             workspaceFileContextStore = testWorkspaceFileContextStore
             workspaceManager = nil
             mcpServer = testMCPServer
+            self.attachmentPersistenceIsSuppressed = attachmentPersistenceIsSuppressed
+            self.attachmentSweepViewModels = attachmentSweepViewModels
             modelRouterSettingsStore = testModelRouterSettingsStore
             self.applyEditsApprovalStore = applyEditsApprovalStore
             catalogDiagnosticsSink = testCatalogDiagnosticsSink
@@ -5002,6 +5031,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     }
 
     func prepareForWindowClose() async {
+        autoWorkflowJudgments.values.forEach { $0.cancel() }
+        autoWorkflowJudgments.removeAll()
         cancelReprompt()
         repromptUIStore.recoveries.removeAll()
         if let task = windowClosePreparationTask {
@@ -7540,6 +7571,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             isColdLoad: true,
             builtPresentation: payload.builtPresentation
         )
+        repairRetainedAttachmentPathsAfterHydration(session, sessionID: payload.sessionID)
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.createdByOverseerSessionID = agentSession.createdByOverseerSessionID
@@ -16696,6 +16728,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // activation is still the owner) or leaves it to the successor that superseded it; a stale
         // owner can never settle a level it does not own.
         let discoveryEpoch = beginAgentSessionLinkDiscoveryEpoch(workspaceID: workspace?.id)
+        // Synchronous: only schedules the delayed, low-priority sweep for this workspace's storage.
+        scheduleSessionAttachmentSweepIfNeeded(for: workspace)
         #if DEBUG
             let workspaceSwitchStartMS = restorePerfRecorder.timestampMSIfEnabled()
             let workspaceSwitchInitialSessions = sessions.count
@@ -18849,11 +18883,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
         }
+        let original = repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot
+        let autoWorkflow = original.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("/")
+            ? nil
+            : await chooseAutoWorkflow(
+                text: Self.automationJudgingText(original: original, reprompted: repromptedText),
+                claim: claim, session: session
+            )
+        guard !Task.isCancelled, composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
         return await submitUserTurnAfterFreshTaskRouting(
             text: text,
             claim: claim,
             session: session,
             destinationTabID: destinationTabID,
+            autoWorkflow: autoWorkflow,
             repromptedText: repromptedText,
             precomputedRouting: repromptSpeculations[claim.attempt.id]
         )
@@ -19183,6 +19228,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         autoEffortSelection: AutoEffortTurnSelection? = nil,
         autoEffortAudit: AgentAutomationTurnAudit.Feature? = nil,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        autoWorkflow: AutoWorkflowTurnSelection? = nil,
         repromptedText: String? = nil,
         repromptAudit: AgentAutomationTurnAudit.Reprompt? = nil,
         isLocalComposerInput: Bool = true
@@ -19238,7 +19284,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
         scheduleSkillCatalogRefresh()
 
-        let activeWorkflow = session.selectedWorkflow
+        let restorationSelectedWorkflow = session.selectedWorkflow
+        let activeWorkflow = effectiveWorkflow(session: session, autoWorkflow: autoWorkflow)
         let restorationSelectedWorkflowMutationGeneration = session.userWorkflowSelectionMutationGeneration
         let nativePreparedTurn: NativeSlashPreparedUserTurn?
         if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session) {
@@ -19350,7 +19397,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     routerAudit: routerAudit,
                     repromptedText: repromptedText,
                     repromptAudit: repromptAudit,
-                    restorationSelectedWorkflow: activeWorkflow,
+                    restorationSelectedWorkflow: restorationSelectedWorkflow,
                     restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
                     stopFence: stopFence,
                     isLocalComposerInput: isLocalComposerInput
@@ -19375,7 +19422,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             routerAudit: routerAudit,
             repromptedText: repromptedText,
             repromptAudit: repromptAudit,
-            restorationSelectedWorkflow: activeWorkflow,
+            restorationSelectedWorkflow: restorationSelectedWorkflow,
             restorationSelectedWorkflowMutationGeneration: restorationSelectedWorkflowMutationGeneration,
             isLocalComposerInput: isLocalComposerInput
         )
@@ -25456,6 +25503,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             sourceTabID: sourceTabID,
             sourceSession: sourceSession
         )
+        // Pin attachment authority alongside the transcript before payload/tab preparation can
+        // suspend or the window can switch workspaces.
+        let handoffAttachmentStore = sessionAttachmentsRootURL().map {
+            AgentSessionAttachmentStore(rootURL: $0, limits: sessionAttachmentLimits)
+        }
+        let handoffTemporaryRoot = attachmentWorkspaceDirectoryProvider().map {
+            AgentAttachmentStore.managedStorageRootURL(for: $0)
+        }
 
         // 1) Build the handoff payload from the same transcript universe used for migration.
         let payload = await buildHandoffPayload(
@@ -25466,10 +25521,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         )
 
         // 2) Build migrated transcript items (prefix copy up to cutoff, no thinking, no streaming)
-        let migratedItems = buildHandoffTranscriptItems(
+        var migratedItems = buildHandoffTranscriptItems(
             sourceTranscript: sourceTranscript,
             upToItemID: upToItemID
         )
+        let localAttachments = migratedItems.flatMap(\.attachments).filter {
+            if case .localFile = $0.source { true } else { false }
+        }
 
         // Capture the destination through the actual creation owner, before a visible tab can
         // suspend in Oracle cloning or activation. Never claim its later occupant by tab UUID.
@@ -25522,7 +25580,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         func destinationIsCurrent() -> Bool {
+            // Storage placement can change without rebinding the tab. Copied paths must still
+            // belong to the destination's current root at every later preparation boundary.
             freshSessionCreationIsCurrent(destinationCreation)
+                && (localAttachments.isEmpty || sessionAttachmentsRootURL() == handoffAttachmentStore?.rootURL)
         }
         #if DEBUG
             await test_afterHandoffDestinationCreation?(destSession)
@@ -25554,6 +25615,56 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 sessionID: destinationClaim.sessionID, code: "target_changed",
                 detail: "The fork was created, but its destination changed during chat cloning."
             )
+        }
+        if !localAttachments.isEmpty {
+            guard let handoffAttachmentStore else {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "attachment_copy_failed",
+                    detail: "The fork could not keep its images because conversation attachment storage is unavailable."
+                )
+            }
+            do {
+                let copied = try await AgentSessionDataService.shared.copyHandoffAttachments(
+                    localAttachments,
+                    sourceSessionID: sourceWorktreeSnapshot.sourceSessionID,
+                    destinationSessionID: destinationClaim.sessionID,
+                    store: handoffAttachmentStore,
+                    temporaryRoot: handoffTemporaryRoot
+                )
+                guard destinationIsCurrent() else {
+                    throw PersistentBindingMutationError.staleTransition
+                }
+                if Task.isCancelled {
+                    // Nothing has published these paths or saved this payload yet. Only this
+                    // still-current fresh generation may roll back its completed copy. A changed
+                    // binding keeps its files, just as the existing failed-creation owner does.
+                    handoffAttachmentStore.removeSessionFolder(sessionID: destinationClaim.sessionID)
+                    throw CancellationError()
+                }
+                migratedItems = migratedItems.map { item in
+                    var item = item
+                    item.attachments = item.attachments.map { attachment in
+                        guard case .localFile = attachment.source, let copy = copied[attachment.id] else { return attachment }
+                        return AgentFileAttachment(
+                            id: attachment.id, source: copy.source,
+                            title: attachment.title, createdAt: attachment.createdAt,
+                            kind: attachment.kind, fileName: attachment.fileName, byteCount: attachment.byteCount
+                        )
+                    }
+                    return item
+                }
+            } catch PersistentBindingMutationError.staleTransition {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID, code: "target_changed",
+                    detail: "The fork was created, but its destination changed during image copying."
+                )
+            } catch {
+                throw SessionAdminPartialForkError(
+                    sessionID: destinationClaim.sessionID,
+                    code: error is CancellationError ? "cancelled" : "attachment_copy_failed",
+                    detail: "The fork could not keep its images: \(error.localizedDescription)"
+                )
+            }
         }
         // 5) Populate only the captured fresh destination.
         destSession.selectedAgent = destinationAgent
@@ -25593,7 +25704,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             let stagedSave = await saveSessionCore(for: destTabID, creationSave: .recovery(destinationCreation))
             guard case let .durablySaved(token) = stagedSave,
                   token == expectedChildBindingToken,
-                  destSession.currentRestorationBindingToken == expectedChildBindingToken
+                  destSession.currentRestorationBindingToken == expectedChildBindingToken,
+                  destinationIsCurrent()
             else {
                 throw SessionAdminPartialForkError(
                     sessionID: expectedChildBindingToken.bindingIdentity.sessionID, code: "persist_failed",
@@ -25665,6 +25777,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             throw SessionAdminPartialForkError(
                 sessionID: expectedChildBindingToken.bindingIdentity.sessionID, code: "persist_failed",
                 detail: "The fork exists, but its configured first save did not complete: \(reason)"
+            )
+        }
+        guard destinationIsCurrent() else {
+            throw SessionAdminPartialForkError(
+                sessionID: destinationClaim.sessionID, code: "target_changed",
+                detail: "The fork was saved, but its destination changed during its first save."
             )
         }
         // Acknowledged configured durability cannot be undone by late cancellation. Keep the

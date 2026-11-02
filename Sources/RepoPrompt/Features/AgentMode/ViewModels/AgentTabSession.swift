@@ -1164,6 +1164,9 @@ final class AgentTabSession: ObservableObject {
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     var attachmentsPendingProviderConsumptionCleanup: [AgentFileAttachment] = []
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
+    /// `AgentSessions/attachments` of the workspace this turn was sent from, captured when its
+    /// images are reserved so a mid-turn workspace switch cannot retain them elsewhere.
+    var attachmentRetentionRoot: URL?
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     var providerSessionID: String?
@@ -1212,6 +1215,15 @@ final class AgentTabSession: ObservableObject {
                 vouchedContextCount = nil
             }
         }
+    }
+
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from the running Claude-native process's launch
+    /// environment, as reported by its runtime init. Not persisted: each launch reports it again.
+    var claudeAutoCompactWindowTokens: Int?
+
+    /// The auto-compact window, only while a Claude-native provider is selected.
+    var activeClaudeAutoCompactWindowTokens: Int? {
+        selectedAgent.usesClaudeNativeRuntime ? claudeAutoCompactWindowTokens : nil
     }
 
     var contextCompactedAt: Date? {

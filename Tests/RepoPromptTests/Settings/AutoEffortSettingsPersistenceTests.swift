@@ -91,3 +91,93 @@ final class AutoEffortSettingsPersistenceTests: XCTestCase {
         return Fixture(store: GlobalSettingsStore(defaults: defaults, fileStore: file), file: file)
     }
 }
+
+// MARK: - Auto Workflow regressions
+
+@MainActor
+final class AutoWorkflowSettingsPersistenceTests: XCTestCase {
+    func testDefaultOffAndToggleRoundTrip() throws {
+        let (store, file) = try makeStore()
+        XCTAssertFalse(store.autoWorkflowEnabled())
+        let initial = store.autoWorkflowSettingsRevision
+        store.setAutoWorkflowEnabled(true)
+        XCTAssertTrue(try file.load().scalarPreferences?.agentMode?.autoWorkflowEnabled == true)
+        XCTAssertEqual(store.autoWorkflowSettingsRevision, initial + 1)
+        store.setAutoWorkflowEnabled(true)
+        XCTAssertEqual(store.autoWorkflowSettingsRevision, initial + 1)
+        store.setAutoWorkflowEnabled(false)
+        XCTAssertNil(try file.load().scalarPreferences?.agentMode?.autoWorkflowEnabled)
+        XCTAssertEqual(store.autoWorkflowSettingsRevision, initial + 2)
+    }
+
+    func testEnabledAndDisabledIntentSurviveFreshStoreInstances() throws {
+        let (store, file) = try makeStore()
+        store.setModelRouterBackend(.openAIDecisions)
+        store.setModelRouterEnabled(false)
+        store.setAutoWorkflowEnabled(true)
+        let suite = "AutoWorkflowRelaunch.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let relaunched = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: file.fileURL))
+        XCTAssertTrue(relaunched.autoWorkflowEnabled())
+        XCTAssertTrue(relaunched.routingSettingsSnapshot().autoWorkflowEnabled)
+        XCTAssertEqual(relaunched.autoWorkflowConfiguration().selectedBackendID, .openAIDecisions)
+        XCTAssertEqual(relaunched.routerDemandSnapshot().requiredBackendIDs, [.openAIDecisions])
+        relaunched.setAutoWorkflowEnabled(false)
+        let relaunchedAgain = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: file.fileURL))
+        XCTAssertFalse(relaunchedAgain.autoWorkflowEnabled())
+        XCTAssertFalse(relaunchedAgain.routingSettingsSnapshot().autoWorkflowEnabled)
+        XCTAssertTrue(relaunchedAgain.routerDemandSnapshot().requiredBackendIDs.isEmpty)
+    }
+
+    func testIndependentDemandAndSharedBackendRevision() throws {
+        let (store, _) = try makeStore()
+        store.setModelRouterBackend(.jev)
+        store.setAutoWorkflowEnabled(true)
+        XCTAssertFalse(store.modelRouterConfiguration().enabled)
+        XCTAssertEqual(store.routerDemandSnapshot().requiredBackendIDs, [.jev])
+        let revision = store.autoWorkflowSettingsRevision
+        store.setModelRouterCustomInstructions("Unrelated guidance")
+        store.setModelRouterEnabled(true)
+        store.setAutoEffortEnabled(true)
+        XCTAssertEqual(store.autoWorkflowSettingsRevision, revision)
+        store.setModelRouterBackend(.openAIDecisions)
+        XCTAssertEqual(store.autoWorkflowSettingsRevision, revision + 1)
+        XCTAssertEqual(store.autoWorkflowConfiguration().selectedBackendID, .openAIDecisions)
+        store.setAutoEffortEnabled(false)
+        store.setModelRouterEnabled(false)
+        XCTAssertEqual(store.routerDemandSnapshot().requiredBackendIDs, [.openAIDecisions])
+        store.setAutoWorkflowEnabled(false)
+        XCTAssertTrue(store.routerDemandSnapshot().requiredBackendIDs.isEmpty)
+    }
+
+    func testReloadChangesRevisionAndPreservesUnknownPreferences() throws {
+        let (store, file) = try makeStore()
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file.fileURL)) as? [String: Any])
+        json["scalarPreferences"] = ["agentMode": ["autoWorkflowEnabled": true, "futureWorkflowPreference": "keep"]]
+        try JSONSerialization.data(withJSONObject: json).write(to: file.fileURL)
+        let initial = store.autoWorkflowSettingsRevision
+        XCTAssertTrue(store.reloadFromDisk())
+        XCTAssertTrue(store.autoWorkflowEnabled())
+        XCTAssertEqual(store.autoWorkflowSettingsRevision, initial + 1)
+        XCTAssertTrue(store.reloadFromDisk())
+        XCTAssertEqual(store.autoWorkflowSettingsRevision, initial + 1)
+        store.setAutoWorkflowEnabled(false)
+        let saved = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file.fileURL)) as? [String: Any])
+        let scalars = try XCTUnwrap(saved["scalarPreferences"] as? [String: Any])
+        let agent = try XCTUnwrap(scalars["agentMode"] as? [String: Any])
+        XCTAssertEqual(agent["futureWorkflowPreference"] as? String, "keep")
+    }
+
+    private func makeStore() throws -> (GlobalSettingsStore, GlobalSettingsFileStore) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let file = GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json"))
+        try file.save(GlobalSettingsDocument())
+        let suite = "AutoWorkflowPersistence.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return (GlobalSettingsStore(defaults: defaults, fileStore: file), file)
+    }
+}

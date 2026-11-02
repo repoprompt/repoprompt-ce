@@ -4,6 +4,7 @@ import RepoPromptDomainRuntime
 struct OracleMemberPresentation: Equatable {
     enum Status: String {
         case streaming = "In progress"
+        case settled = "Settled · awaiting group"
         case completed = "Completed"
         case failed = "Failed"
         case cancelled = "Cancelled"
@@ -12,6 +13,8 @@ struct OracleMemberPresentation: Equatable {
 
     let status: Status
     var errorMessage: String?
+    var providerID: String?
+    var capturedModelName: String?
 
     static let unknown = Self(status: .unknown)
 }
@@ -66,7 +69,9 @@ struct OracleGroupPresentation: Equatable {
                 }
                 lanes[member.laneID] = OracleMemberPresentation(
                     status: status,
-                    errorMessage: result.error.map { "[\($0.code)] \($0.message)" }
+                    errorMessage: result.error.map { "[\($0.code)] \($0.message)" },
+                    providerID: result.executionProfile?.providerID ?? result.providerID ?? member.model.providerID,
+                    capturedModelName: result.capturedModelName
                 )
             }
         }
@@ -81,7 +86,25 @@ struct OracleGroupPresentation: Equatable {
               session.oracleGroupSize == members.count,
               session.oracleModelRaw == member.model.modelID
         else { return .unknown }
-        return lanes[member.laneID] ?? .unknown
+        var presentation = lanes[member.laneID] ?? .unknown
+        presentation.providerID = presentation.providerID ?? member.model.providerID
+        return presentation
+    }
+
+    mutating func captureModelName(
+        _ name: String?,
+        providerID: String? = nil,
+        member: OracleGroupMember,
+        turnID: OracleTurnID,
+        invocationID: UUID
+    ) {
+        guard !isTerminal, self.invocationID == invocationID, self.turnID == turnID,
+              members.contains(member)
+        else { return }
+        var presentation = lanes[member.laneID] ?? .unknown
+        presentation.capturedModelName = name
+        presentation.providerID = providerID ?? presentation.providerID
+        lanes[member.laneID] = presentation
     }
 
     mutating func receive(_ event: OracleProgressEvent) {
@@ -93,8 +116,14 @@ struct OracleGroupPresentation: Equatable {
               sequences[laneID].map({ sequence > $0 }) ?? true
         else { return }
         sequences[laneID] = sequence
-        // Settled progress precedes durable publication; it cannot establish terminal success.
-        lanes[laneID] = event.kind == .laneStarted ? .init(status: .streaming) : .unknown
+        // Settlement is live, nonterminal evidence; only durable results establish an outcome.
+        let capturedModelName = lanes[laneID]?.capturedModelName
+        let providerID = lanes[laneID]?.providerID
+        lanes[laneID] = .init(
+            status: event.kind == .laneStarted ? .streaming : .settled,
+            providerID: providerID,
+            capturedModelName: capturedModelName
+        )
     }
 
     mutating func endExecution() {

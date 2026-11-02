@@ -3254,6 +3254,7 @@ class OracleViewModel: ObservableObject {
         oracleAttachments: [OracleAttachment] = [],
         completionPolicy: OracleResponseCompletionPolicy = .interactive,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
+        onQueryCreated: ((UUID) -> Void)? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async -> UUID? {
         guard !newUserMessage.isEmpty, contextBuilderScope?.isLive != false else { return nil }
@@ -3401,6 +3402,7 @@ class OracleViewModel: ObservableObject {
             oracleControlledResponseIDs.insert(aiResponseId)
         }
         setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: nil)
+        onQueryCreated?(aiResponseId)
 
         if currentSessionID == targetSessionID {
             updateLatestTokenCounts()

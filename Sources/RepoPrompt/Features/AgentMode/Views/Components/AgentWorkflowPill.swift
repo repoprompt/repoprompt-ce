@@ -1,4 +1,5 @@
 import RepoPromptInstrumentation
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - Workflow Pill
@@ -10,6 +11,7 @@ struct AgentWorkflowPill: View {
     @Environment(\.agentModePerfRecorder) private var perfRecorder
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
     @ObservedObject var workflowStore: AgentWorkflowStore = .shared
+    @ObservedObject var settingsStore: GlobalSettingsStore = .shared
     let windowID: Int
     let selectWorkflow: (AgentWorkflowDefinition?) -> Void
     @State private var showPopover = false
@@ -93,6 +95,7 @@ struct AgentWorkflowPill: View {
             AgentWorkflowsPopoverView(
                 statusPillsUI: statusPillsUI,
                 workflowStore: workflowStore,
+                settingsStore: settingsStore,
                 isPresented: $showPopover,
                 showConfigureSheet: $showConfigureSheet,
                 selectWorkflow: selectWorkflow

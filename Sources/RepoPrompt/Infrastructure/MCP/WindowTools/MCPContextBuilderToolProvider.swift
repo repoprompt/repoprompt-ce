@@ -367,6 +367,8 @@ final class MCPContextBuilderToolProvider: MCPAppToolProviding {
                 return result.toMCPValue()
             } catch let error as ContextBuilderWorkspaceContextError {
                 throw MCPError.invalidParams(error.localizedDescription)
+            } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+                throw MCPError.invalidParams(reason.localizedDescription)
             }
         }
     }

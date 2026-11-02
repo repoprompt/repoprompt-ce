@@ -6,6 +6,51 @@ import XCTest
 
 @MainActor
 final class OracleExecutionResolverTests: XCTestCase {
+    func testDirectAstraProSelectionRemainsProForOracleExecution() throws {
+        let model = AIModel.gpt6AstraProMax
+        let snapshot = makeSnapshot(presets: [], profile: AgentModelsSettingsProfile(planningModelRaw: model.rawValue))
+        let resolver = makeResolver(available: [model])
+
+        let execution = try resolver.resolve(choice: .oracleSend("current_chat_model"), mode: "review", snapshot: snapshot)
+
+        XCTAssertEqual(execution.models, [model])
+        XCTAssertEqual(execution.roster.orderedModels.map(\.modelID), [model.rawValue])
+        XCTAssertEqual(execution.models.first?.openAIReasoningMode, "pro")
+        XCTAssertEqual(execution.models.first?.modelName, "gpt-6-astra")
+    }
+
+    func testMixedProviderResolverCapturesOrderedProviderIdentityWithoutDeduplicating() throws {
+        let models: [AIModel] = [
+            .claudeCodeOpus,
+            .codexCustom(name: "gpt-6.1-sol-high"),
+            .grokBuildCustom(name: "grok-build-test"),
+            .gpt54,
+            .claudeCodeOpus
+        ]
+        let modelStrings = models.map(\.rawValue)
+        let preset = try ModelPreset(name: "Mixed providers", modelStrings: modelStrings)
+        let snapshot = makeSnapshot(
+            presets: [preset],
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: modelStrings[0],
+                additionalOracleModelRaws: Array(modelStrings.dropFirst())
+            )
+        )
+        let resolver = makeResolver(available: Set(models))
+        let choices: [OracleStartChoice] = [.oracleSend("current_chat_model"), .oracleSend(preset.id.uuidString)]
+
+        for choice in choices {
+            let execution = try resolver.resolve(choice: choice, mode: "review", snapshot: snapshot)
+            XCTAssertEqual(execution.models, models, "\(choice)")
+            XCTAssertEqual(execution.roster.orderedModels.map(\.modelID), modelStrings, "\(choice)")
+            XCTAssertEqual(
+                execution.roster.orderedModels.map(\.providerID),
+                ["claudeCode", "codex", "grokBuild", "openAI", "claudeCode"],
+                "Provider identity must be captured by the resolver, not supplied by a group fixture: \(choice)"
+            )
+        }
+    }
+
     func testExplicitPresetOwnsOrderedRosterAndMappingIncludingDuplicates() throws {
         let customReview = ChatPreset(name: "Custom Review", mode: .review)
         let preset = try ModelPreset(

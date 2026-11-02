@@ -4610,7 +4610,7 @@ extension ToolOutputFormatter {
                 laneIndex: lane.laneIndex,
                 chatID: lane.chatID,
                 providerID: lane.executionProfile?.providerID ?? lane.providerID,
-                modelID: lane.executionProfile?.modelID ?? lane.modelID,
+                modelID: AIModel.readableModelID(selectedID: lane.modelID, executionID: lane.executionProfile?.modelID),
                 effectiveReasoningEffort: lane.executionProfile?.effectiveReasoningEffort,
                 status: status,
                 response: lane.response,

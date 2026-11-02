@@ -492,10 +492,16 @@ final class ClaudeAgentModeCoordinator {
         eventListener(for: session).install(controller: controller, handle: handle)
     }
 
-    func observeRuntimeInit(_ status: NativeAgentRuntimeRuntimeInitStatus, session: AgentTabSession) {
+    /// Records runtime-init state for both host-run and self-started (idle) events.
+    /// Returns `true` when the auto-compact window changed, so an active run can re-resolve usage.
+    @discardableResult
+    func observeRuntimeInit(_ status: NativeAgentRuntimeRuntimeInitStatus, session: AgentTabSession) -> Bool {
         if let id = status.sessionID, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             updateProviderSessionIDIfNeeded(id, for: session)
         }
+        guard session.claudeAutoCompactWindowTokens != status.autoCompactWindowTokens else { return false }
+        session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
+        return true
     }
 
     private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {

@@ -54,7 +54,8 @@ def listing_digest(tests: list[str]) -> str:
     return hashlib.sha256(('\n'.join(tests) + '\n').encode()).hexdigest()
 
 
-def verify_shards(tests: list[str], targets: list[str], receipts: list[dict], shard_count: int) -> None:
+def verify_shards(tests: list[str], targets: list[str], receipts: list[dict], shard_count: int,
+                  admission: dict | None = None) -> None:
     from ci_app_test_runner import assign_suites_to_shards, parse_suite_methods
     validate_targets(tests, targets)
     suites = parse_suite_methods('\n'.join(tests))
@@ -63,6 +64,10 @@ def verify_shards(tests: list[str], targets: list[str], receipts: list[dict], sh
         raise ValueError('missing or duplicate shard receipts')
     union: list[str] = []
     for receipt in receipts:
+        if admission is not None and (
+                receipt.get('admission') != admission
+                or receipt.get('producer') != f'build-and-test-{receipt["shard_index"]}'):
+            raise ValueError('shard candidate/run/attempt/producer identity mismatch')
         if receipt['schema'] != 1 or receipt['shard_count'] != shard_count or receipt['listing_sha256'] != listing_digest(tests):
             raise ValueError('stale or incompatible shard receipt')
         assigned = sorted(test for suite in shards[receipt['shard_index'] - 1] for test in suites[suite])
@@ -79,12 +84,20 @@ def main() -> int:
     parser.add_argument('--metadata', type=Path, required=True)
     parser.add_argument('--receipts', type=Path, required=True)
     parser.add_argument('--shard-count', type=int, required=True)
+    parser.add_argument('--admission-context', help='require hosted candidate/run/attempt identity')
     args = parser.parse_args()
     try:
         tests = listed_tests((args.metadata / 'ci-test-list.txt').read_text())
         manifest = json.loads((args.metadata / 'test-targets.json').read_text())
         receipts = [json.loads(path.read_text()) for path in sorted(args.receipts.glob('shard-*.json'))]
-        verify_shards(tests, manifest['targets'], receipts, args.shard_count)
+        admission = json.loads(args.admission_context) if args.admission_context is not None else None
+        if args.admission_context is not None:
+            if not isinstance(admission, dict):
+                raise ValueError('hosted admission context must be an object')
+            from ci_admission import verify_build_identity
+            identity = json.loads((args.metadata / 'admission.json').read_text())
+            verify_build_identity(identity, admission)
+        verify_shards(tests, manifest['targets'], receipts, args.shard_count, admission)
     except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
         parser.exit(1, f'Coverage verification failed: {error}\n')
     return 0

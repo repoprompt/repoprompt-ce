@@ -398,7 +398,8 @@ struct MessageBubble: View {
                         if !message.fileAttachments.isEmpty {
                             FileAttachmentStrip(attachments: message.fileAttachments)
                         }
-                        CollapsibleUserMessage(text: message.content)
+                        MarkdownTextView(text: message.content, isMarkdown: true, allowInteraction: true)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }

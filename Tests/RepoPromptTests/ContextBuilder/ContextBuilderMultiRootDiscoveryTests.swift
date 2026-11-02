@@ -8,6 +8,131 @@ import XCTest
 #if DEBUG
     @MainActor
     final class ContextBuilderMultiRootDiscoveryTests: XCTestCase {
+        func testActualContextBuilderReviewPackagesSiblingRootsOrReturnsLocalizedOwnershipRefusal() async throws {
+            for isGit in [true, false] {
+                try await ContextBuilderMultiRootDiscoveryDriver.withDriver(routedRuntime: true) { driver in
+                    let git = try ReviewGitRepositoryFixture(parentDirectory: driver.fixture.base)
+                    if isGit {
+                        try git.initializeRepository(at: driver.fixture.base)
+                        try git.stage("A/README.md", at: driver.fixture.base)
+                        try git.stage("B/README.md", at: driver.fixture.base)
+                        try git.write("original", to: "A/other.md", at: driver.fixture.base)
+                        try git.stage("A/other.md", at: driver.fixture.base)
+                        try git.commit("Initial review fixture", at: driver.fixture.base)
+                        try git.write("fixture SELECTED_A_REVIEW", to: "A/README.md", at: driver.fixture.base)
+                        try git.write("fixture SELECTED_B_REVIEW", to: "B/README.md", at: driver.fixture.base)
+                        try git.write("UNSELECTED_REVIEW_SENTINEL", to: "A/other.md", at: driver.fixture.base)
+                    }
+                    let settings = GlobalSettingsStore.shared
+                    settings.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                        planningModelRaw: AIModel.gpt54Mini.rawValue
+                    ))
+                    driver.window.apiSettingsViewModel.openAIApiKey = "test-key"
+                    driver.window.apiSettingsViewModel.isOpenAIKeyValid = true
+                    var packages: [String] = []
+                    let oracle = driver.window.oracleViewModel
+                    oracle.setOraclePostPackagingTransportOverrideForTesting { message, _ in
+                        packages.append(ContextBuilderFrozenOraclePack.render(message))
+                        return (UUID(), AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                            continuation.yield(ChatStreamOutput(text: "REVIEW_COMPLETE", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+                            continuation.finish()
+                        })
+                    }
+                    defer { oracle.setOraclePostPackagingTransportOverrideForTesting(nil) }
+                    let context = try await driver.resolve()
+                    let parent = try await driver.connectInvokingAgent(context)
+                    driver.streamBody = { runID in
+                        let child = try await driver.connectChild(runID: runID)
+                        try await driver.discover(using: child, loadUnrelatedRoot: false)
+                    }
+                    let reply = try await driver.fixture.perform("registered review outcome") {
+                        try await driver.invoke(using: parent, responseType: "review")
+                    }
+                    let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
+                    if isGit {
+                        XCTAssertNotEqual(reply.isError, true, text)
+                        XCTAssertEqual(packages.count, 1, text)
+                        let package = try XCTUnwrap(packages.first)
+                        XCTAssertTrue(package.contains("diff --git a/A/README.md b/A/README.md"), package)
+                        XCTAssertTrue(package.contains("diff --git a/B/README.md b/B/README.md"), package)
+                        XCTAssertTrue(package.contains("+fixture SELECTED_A_REVIEW"), package)
+                        XCTAssertTrue(package.contains("+fixture SELECTED_B_REVIEW"), package)
+                        XCTAssertFalse(package.contains("UNSELECTED_REVIEW_SENTINEL"))
+                    } else {
+                        XCTAssertEqual(reply.isError, true, text)
+                        XCTAssertTrue(text.contains("[-32602] Invalid params:"), text)
+                        XCTAssertTrue(text.contains(ContextBuilderReviewTargetUnavailableReason.nonGitSelection(count: 2).localizedDescription), text)
+                        XCTAssertFalse(text.contains("nonGitSelection("), text)
+                        XCTAssertFalse(text.contains(driver.fixture.base.path), text)
+                        XCTAssertTrue(packages.isEmpty)
+                    }
+                    let committed = try XCTUnwrap(driver.committed)
+                    try await driver.assertReleased(runID: committed.nestedRunID)
+                }
+            }
+        }
+
+        func testActualContextBuilderReviewRefusesAutomaticDiffAuthorizationFailureBeforeTransport() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(routedRuntime: true) { driver in
+                let git = try ReviewGitRepositoryFixture(parentDirectory: driver.fixture.base)
+                try git.initializeRepository(at: driver.fixture.base)
+                try git.stage("A/README.md", at: driver.fixture.base)
+                try git.stage("B/README.md", at: driver.fixture.base)
+                try git.commit("Initial authorization fixture", at: driver.fixture.base)
+                try git.write("fixture SELECTED_REVIEW_CHANGE", to: "A/README.md", at: driver.fixture.base)
+                GlobalSettingsStore.shared.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                    planningModelRaw: AIModel.gpt54Mini.rawValue
+                ))
+                driver.window.apiSettingsViewModel.openAIApiKey = "test-key"
+                driver.window.apiSettingsViewModel.isOpenAIKeyValid = true
+                let oracle = driver.window.oracleViewModel
+                let store = driver.files.workspaceFileContextStore
+                var diffRequestCount = 0
+                var transportCount = 0
+                oracle.promptViewModel.setAutomaticReviewGitDiffProviderOverrideForTesting { request in
+                    diffRequestCount += 1
+                    if case let .finalized(authorization) = request.source {
+                        let reason = await ContextBuilderReviewTargetResolver().revalidate(authorization.target, store: store)
+                        XCTAssertNil(reason, "The injected diff failure must not depend on stale root authority")
+                    } else {
+                        XCTFail("Expected finalized review authorization")
+                    }
+                    return AutomaticReviewGitDiffResult(
+                        text: nil, completeness: .failed, outcomes: [], pathIssues: [],
+                        authorizationFailure: .staleWorkspaceRoot
+                    )
+                }
+                oracle.setOraclePostPackagingTransportOverrideForTesting { _, _ in
+                    transportCount += 1
+                    return (UUID(), AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                        continuation.yield(ChatStreamOutput(text: "UNEXPECTED_REVIEW", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+                        continuation.finish()
+                    })
+                }
+                defer {
+                    oracle.promptViewModel.setAutomaticReviewGitDiffProviderOverrideForTesting(nil)
+                    oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+                }
+                let context = try await driver.resolve()
+                let parent = try await driver.connectInvokingAgent(context)
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child, loadUnrelatedRoot: false)
+                }
+                let reply = try await driver.fixture.perform("registered diff authorization refusal") {
+                    try await driver.invoke(using: parent, responseType: "review")
+                }
+                let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
+                XCTAssertEqual(diffRequestCount, 1)
+                XCTAssertEqual(reply.isError, true, text)
+                XCTAssertTrue(text.contains("[-32602] Invalid params:"), text)
+                XCTAssertTrue(text.contains(ContextBuilderReviewTargetUnavailableReason.staleWorkspaceRoot.localizedDescription), text)
+                XCTAssertEqual(transportCount, 0, "A refused diff must never reach Oracle transport")
+                let committed = try XCTUnwrap(driver.committed)
+                try await driver.assertReleased(runID: committed.nestedRunID)
+            }
+        }
+
         func testActualSocketMultiRootDiscoveryCommitsRoutedSelectionAndPrompt() async throws {
             try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A", "B", "Unrelated"], routedRuntime: true) { driver in
                 let context = try await driver.resolve()

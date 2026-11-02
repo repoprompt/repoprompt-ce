@@ -39,60 +39,6 @@ private enum AppOracleConfiguredRosterSingleFallback {
     case rejectTypedCompletion
 }
 
-enum AppOracleGroupRouting {
-    static func usesGroup(additionalModelRaws: [String]) -> Bool {
-        !additionalModelRaws.isEmpty
-    }
-
-    static func executionProfile(for model: AIModel) -> OracleExecutionProfile? {
-        let effort: String?
-        if model.providerType == .grokBuild {
-            let snapshot = AgentACPModelRegistry.shared.resolvedSnapshotIncludingStandardStore(for: .grokBuild)
-            effort = GrokBuildModelSpecifier.decompose(
-                raw: model.modelName,
-                options: snapshot?.options ?? []
-            )?.explicitEffort?.rawValue
-        } else {
-            effort = model.defaultReasoningEffort
-        }
-        return try? OracleExecutionProfile(
-            providerID: providerID(for: model),
-            modelID: model.modelName,
-            effectiveReasoningEffort: effort
-        )
-    }
-
-    private static func providerID(for model: AIModel) -> String {
-        if case let .customProvider(_, provider, _) = model {
-            return provider
-        }
-        return providerID(for: model.providerType)
-    }
-
-    private static func providerID(for provider: AIProviderType) -> String {
-        switch provider {
-        case .anthropic: "anthropic"
-        case .openAI: "openAI"
-        case .ollama: "ollama"
-        case .azure: "azure"
-        case .openRouter: "openRouter"
-        case .gemini: "gemini"
-        case .deepseek: "deepseek"
-        case .customProvider: "customProvider"
-        case .fireworks: "fireworks"
-        case .grok: "grok"
-        case .groq: "groq"
-        case .zAI: "zAI"
-        case .claudeCode: "claudeCode"
-        case .codex: "codex"
-        case .openCode: "openCode"
-        case .cursor: "cursor"
-        case .grokBuild: "grokBuild"
-        case .devin: "devin"
-        }
-    }
-}
-
 extension OracleViewModel {
     /// N=1 calls the existing single-Oracle path and bypasses all group state.
     @MainActor
@@ -438,6 +384,7 @@ extension OracleViewModel {
                 guard let self else { throw CancellationError() }
                 return try await executeOracleLane(
                     member: invocation.member,
+                    invocationID: invocationID,
                     args: args,
                     promptVM: promptVM,
                     tabContext: tabContext,
@@ -647,6 +594,7 @@ extension OracleViewModel {
     @MainActor
     private func executeOracleLane(
         member: OracleGroupMember,
+        invocationID: UUID,
         args: [String: Value],
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext?,
@@ -657,15 +605,71 @@ extension OracleViewModel {
         supervision: ContextBuilderOracleGroupSupervision?
     ) async throws -> OracleLaneExecutionResponse {
         let scope = supervision?.makeLane(sessionID: member.memberID.rawValue)
+        let sessionID = member.memberID.rawValue
+        // Keep the exact reply loaded through post-cleanup identity capture.
+        pinSession(sessionID)
+        defer { unpinSession(sessionID) }
+        let presentationKey = sessions.first(where: { $0.id == sessionID }).flatMap(OracleGroupPresentation.Key.init(session:))
+        let turnID = presentationKey.flatMap { key in
+            oracleGroupPresentations[key].flatMap { $0.invocationID == invocationID ? $0.turnID : nil }
+        }
+        var queryID: UUID?
+        var capturedProviderID: String?
+        let capturedName = { () -> String? in
+            guard let queryID,
+                  let message = self.messagesSnapshot(for: sessionID).first(where: { $0.id == queryID && !$0.isUser }),
+                  let name = message.modelName,
+                  !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            return name
+        }
+        let publishCapturedName = {
+            guard let presentationKey, let turnID,
+                  let session = self.sessions.first(where: { $0.id == sessionID }),
+                  OracleGroupPresentation.Key(session: session) == presentationKey,
+                  var presentation = self.oracleGroupPresentations[presentationKey]
+            else { return }
+            presentation.captureModelName(capturedName(), providerID: capturedProviderID, member: member, turnID: turnID, invocationID: invocationID)
+            self.oracleGroupPresentations[presentationKey] = presentation
+        }
+        defer { publishCapturedName() }
         let operation = {
             try await self.executeOracleLaneBody(
                 member: member, args: args, promptVM: promptVM, tabContext: tabContext,
                 startExecution: startExecution, selectionSnapshotOverride: selectionSnapshotOverride,
-                executionContext: executionContext, callbacks: callbacks, scope: scope
+                executionContext: executionContext, callbacks: callbacks, scope: scope,
+                onQueryCreated: { id, providerID in
+                    queryID = id
+                    capturedProviderID = providerID
+                    publishCapturedName()
+                }
             )
         }
-        if let scope { return try await scope.run(oracle: self, operation: operation) }
-        return try await operation()
+        do {
+            let response: OracleLaneExecutionResponse = if let scope { try await scope.run(oracle: self, operation: operation) }
+            else { try await operation() }
+            return OracleLaneExecutionResponse(
+                response: response.response,
+                executionProfile: response.executionProfile,
+                capturedModelName: capturedName()
+            )
+        } catch let cancellation as OracleLaneCancellation {
+            throw OracleLaneCancellation(
+                partialResponse: cancellation.partialResponse,
+                executionProfile: cancellation.executionProfile,
+                capturedModelName: capturedName()
+            )
+        } catch is CancellationError {
+            throw OracleLaneCancellation(executionProfile: scope?.executionProfile, capturedModelName: capturedName())
+        } catch let failure as OracleLaneFailure {
+            throw OracleLaneFailure(
+                code: failure.code, message: failure.message,
+                partialResponse: failure.partialResponse, executionProfile: failure.executionProfile,
+                capturedModelName: capturedName()
+            )
+        } catch {
+            throw OracleLaneFailure(message: error.localizedDescription, executionProfile: scope?.executionProfile, capturedModelName: capturedName())
+        }
     }
 
     @MainActor
@@ -678,7 +682,8 @@ extension OracleViewModel {
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         executionContext: OracleLaneExecutionContext,
         callbacks: AppOracleGroupExecutionCallbacks?,
-        scope: ContextBuilderOracleLaneScope?
+        scope: ContextBuilderOracleLaneScope?,
+        onQueryCreated: @escaping (UUID, String?) -> Void
     ) async throws -> OracleLaneExecutionResponse {
         var laneArgs = args
         laneArgs["chat_id"] = .string(member.publicChatID)
@@ -729,6 +734,7 @@ extension OracleViewModel {
                     resolvedExecution: laneExecution,
                     resolvedLaneIndex: resolvedLaneIndex,
                     contextBuilderScope: scope,
+                    onQueryCreated: { onQueryCreated($0, executionProfile?.providerID) },
                     onProgress: { text, reasoning in
                         partialResponse = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
                         scope?.partialResponse = partialResponse

@@ -16,6 +16,188 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
         GlobalSettingsStore.installApplicationModelIdentityPolicy()
     }
 
+    func testHandoffOwnsItsImagesBeforeFirstSaveAndKeepsThemAfterParentDeletion() async throws {
+        for isImage in [true, false] {
+            try await withFixture(bindSource: false) { fixture in
+                let (store, attachment, parentImage) = try await installHandoffImage(fixture, isImage: isImage)
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+                let originalBytes = try Data(contentsOf: parentImage)
+                var childSaves = 0
+                fixture.viewModel.test_setAgentSessionSaver { session, workspace, count in
+                    if session.id != fixture.sourceSessionID {
+                        childSaves += 1
+                        let transcript = try XCTUnwrap(session.transcript)
+                        let image = try XCTUnwrap(AgentTranscriptIO.workingSourceItems(from: transcript).flatMap(\.attachments).first)
+                        guard case let .localFile(path) = image.source else { throw AgentSessionError.emptySession }
+                        XCTAssertNotEqual(path, parentImage.path)
+                        XCTAssertTrue(store.isRetainedPath(path, sessionID: session.id))
+                        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), originalBytes)
+                        XCTAssertEqual(image.kind, attachment.kind)
+                        XCTAssertEqual(image.fileName, attachment.fileName)
+                        XCTAssertEqual(image.byteCount, attachment.byteCount)
+                        if childSaves == 1 {
+                            XCTAssertEqual(try Data(contentsOf: parentImage), originalBytes)
+                        }
+                    }
+                    return try await AgentSessionDataService.shared.saveAgentSession(
+                        session, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                    )
+                }
+                let childTabID = try await fixture.viewModel.prepareHandoffToNewTab(
+                    upToItemID: cutoff,
+                    destinationAgent: fixture.sourceSession.selectedAgent,
+                    destinationModelRaw: fixture.sourceSession.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw,
+                    activateDestination: false,
+                    inheritOversightLinks: false
+                )
+                let child = try XCTUnwrap(fixture.viewModel.sessions[childTabID])
+                let childID = try XCTUnwrap(child.activeAgentSessionID)
+                let childImage = try XCTUnwrap(child.items.flatMap(\.attachments).first)
+                guard case let .localFile(childPath) = childImage.source else { return XCTFail("Child must keep a local image") }
+                XCTAssertGreaterThan(childSaves, 0)
+                XCTAssertEqual(childImage.id, attachment.id)
+                XCTAssertEqual(childImage.title, attachment.title)
+                XCTAssertEqual(childImage.createdAt, attachment.createdAt)
+                XCTAssertEqual(childImage.kind, attachment.kind)
+                XCTAssertEqual(childImage.fileName, attachment.fileName)
+                XCTAssertEqual(childImage.byteCount, attachment.byteCount)
+                XCTAssertEqual(fixture.sourceSession.items.flatMap(\.attachments), [attachment])
+                XCTAssertEqual(
+                    fixture.viewModel.oracleAuthorizedAttachmentPaths(tabID: childTabID, agentSessionID: childID),
+                    [childPath]
+                )
+                XCTAssertFalse(store.isRetainedPath(parentImage.path, sessionID: childID))
+
+                try await AgentSessionDataService.shared.deleteAgentSession(id: fixture.sourceSessionID, for: workspace)
+                XCTAssertFalse(FileManager.default.fileExists(atPath: parentImage.path))
+                XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: childPath)), originalBytes)
+                XCTAssertEqual(
+                    fixture.viewModel.oracleAuthorizedAttachmentPaths(tabID: childTabID, agentSessionID: childID),
+                    [childPath]
+                )
+                let loaded = try await AgentSessionDataService.shared.loadAgentSession(id: childID, for: workspace)
+                XCTAssertEqual(try XCTUnwrap(loaded).items.flatMap(\.attachments), [childImage])
+            }
+        }
+    }
+
+    func testHandoffWithMissingImageFailsBeforePublishingOrSavingChildTranscript() async throws {
+        try await withFixture(bindSource: false) { fixture in
+            let (store, attachment, parentImage) = try await installHandoffImage(fixture)
+            try FileManager.default.removeItem(at: parentImage)
+            let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+            var child: AgentModeViewModel.TabSession?
+            var childSaves = 0
+            fixture.viewModel.test_afterHandoffDestinationCreation = { child = $0 }
+            fixture.viewModel.test_setAgentSessionSaver { session, _, _ in
+                if session.id != fixture.sourceSessionID { childSaves += 1 }
+                return fixture.git.sandbox.appendingPathComponent("unexpected-save-\(session.id).json")
+            }
+            do {
+                _ = try await fixture.viewModel.prepareHandoffToNewTab(
+                    upToItemID: cutoff,
+                    destinationAgent: fixture.sourceSession.selectedAgent,
+                    destinationModelRaw: fixture.sourceSession.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw,
+                    activateDestination: false,
+                    inheritOversightLinks: false
+                )
+                XCTFail("A handoff must report an unavailable image instead of aliasing or dropping it")
+            } catch let error as SessionAdminPartialForkError {
+                XCTAssertEqual(error.code, "attachment_copy_failed")
+                XCTAssertTrue(error.detail.contains(attachment.id.uuidString))
+                XCTAssertEqual(error.localizedDescription, error.detail, "The Handoff UI must show the actionable failure")
+            }
+            let destination = try XCTUnwrap(child)
+            let childID = try XCTUnwrap(destination.activeAgentSessionID)
+            XCTAssertEqual(childSaves, 0)
+            XCTAssertTrue(destination.items.isEmpty)
+            XCTAssertNil(destination.pendingHandoff.payload)
+            XCTAssertNotNil(destination.operationAdmissionFailureMessage)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: store.sessionFolderURL(sessionID: childID).path))
+            XCTAssertEqual(fixture.sourceSession.items.flatMap(\.attachments), [attachment])
+        }
+    }
+
+    func testHandoffRejectsStorageRootChangeDuringImageCopyWithoutRebindingTheChild() async throws {
+        try await withFixture(bindSource: false) { fixture in
+            let (store, attachment, parentImage) = try await installHandoffImage(fixture)
+            let manager = fixture.window.workspaceManager
+            // Keep the test persistence override, but resolve it from the live workspace just as
+            // production does. A custom storage update does not replace the session binding.
+            fixture.viewModel.sessionAttachmentsRootOverride = { [weak manager] in
+                guard let workspace = manager?.activeWorkspace else { return nil }
+                let folder = WorkspaceSessionSidecarMigration.workspaceDirectory(
+                    for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
+                ).appendingPathComponent("AgentSessions", isDirectory: true)
+                return AgentSessionAttachmentStore.rootURL(forAgentSessionsFolder: folder)
+            }
+            let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+            var child: AgentModeViewModel.TabSession?
+            var childSaves = 0
+            fixture.viewModel.test_afterHandoffDestinationCreation = { child = $0 }
+            fixture.viewModel.test_setAgentSessionSaver { session, workspace, count in
+                if session.id != fixture.sourceSessionID { childSaves += 1 }
+                return try await AgentSessionDataService.shared.saveAgentSession(
+                    session, for: workspace, preparation: .alreadyCanonicalTranscript, trustedCanonicalItemCount: count
+                )
+            }
+            let gate = TestReleaseFence(name: "handoff image copy before storage root change")
+            defer { gate.release() }
+            await AgentSessionDataService.shared.test_setBeforeHandoffAttachmentCopyHook { _ in await gate.enterAndWait() }
+            let handoff = Task { @MainActor in
+                try await fixture.viewModel.prepareHandoffToNewTab(
+                    upToItemID: cutoff,
+                    destinationAgent: fixture.sourceSession.selectedAgent,
+                    destinationModelRaw: fixture.sourceSession.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sourceSession.selectedReasoningEffortRaw,
+                    activateDestination: false,
+                    inheritOversightLinks: false
+                )
+            }
+            do {
+                guard await gate.waitUntilEntered() else {
+                    gate.release()
+                    _ = await handoff.result
+                    await AgentSessionDataService.shared.test_setBeforeHandoffAttachmentCopyHook(nil)
+                    return
+                }
+                let destination = try XCTUnwrap(child)
+                let token = try XCTUnwrap(destination.currentRestorationBindingToken)
+                let childID = try XCTUnwrap(destination.activeAgentSessionID)
+                let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == manager.activeWorkspaceID })
+                manager.workspaces[workspaceIndex].customStoragePath = fixture.git.sandbox
+                    .appendingPathComponent("changed-attachment-storage", isDirectory: true)
+                XCTAssertEqual(destination.currentRestorationBindingToken, token)
+                XCTAssertTrue(fixture.viewModel.sessions[destination.tabID] === destination)
+                XCTAssertNotEqual(fixture.viewModel.sessionAttachmentsRootURL(), store.rootURL)
+                gate.release()
+                let result = await handoff.result
+                await AgentSessionDataService.shared.test_setBeforeHandoffAttachmentCopyHook(nil)
+                switch result {
+                case .success:
+                    XCTFail("The old root cannot authorize attachment paths under the new storage placement")
+                case let .failure(error):
+                    let partial = try XCTUnwrap(error as? SessionAdminPartialForkError)
+                    XCTAssertEqual(partial.code, "target_changed")
+                }
+                XCTAssertEqual(childSaves, 0)
+                XCTAssertTrue(destination.items.isEmpty)
+                XCTAssertNil(destination.pendingHandoff.payload)
+                XCTAssertNotNil(destination.operationAdmissionFailureMessage)
+                let copied = try XCTUnwrap(store.locateRetainedFile(attachmentID: attachment.id, sessionID: childID))
+                XCTAssertEqual(try Data(contentsOf: copied), try Data(contentsOf: parentImage))
+            } catch {
+                gate.release()
+                _ = await handoff.result
+                await AgentSessionDataService.shared.test_setBeforeHandoffAttachmentCopyHook(nil)
+                throw error
+            }
+        }
+    }
+
     func testBoundSourceHandoffInstallsSourceMappingsBeforeFirstSaveAndActivation() async throws {
         try await withFixture(bindSource: true) { fixture in
             let sourceBindings = fixture.sourceSession.worktreeBindings
@@ -1034,6 +1216,38 @@ final class AgentSessionHandoffWorktreeBindingTests: XCTestCase {
 
     private func composeTabIDs(_ fixture: Fixture) -> Set<UUID> {
         Set(fixture.window.workspaceManager.activeWorkspace?.composeTabs.map(\.id) ?? [])
+    }
+
+    private func installHandoffImage(_ fixture: Fixture, isImage: Bool = true) async throws -> (AgentSessionAttachmentStore, AgentFileAttachment, URL) {
+        let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+        let folder = WorkspaceSessionSidecarMigration.workspaceDirectory(
+            for: workspace, root: AgentSessionDataService.defaultWorkspaceRootURL()
+        ).appendingPathComponent("AgentSessions", isDirectory: true)
+        let store = AgentSessionAttachmentStore(agentSessionsFolder: folder)
+        fixture.viewModel.sessionAttachmentsRootOverride = { store.rootURL }
+        let sourceFolder = store.sessionFolderURL(sessionID: fixture.sourceSessionID)
+        try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+        let attachmentID = UUID()
+        let fileName = isImage ? "image.png" : "document.pdf"
+        let image = sourceFolder.appendingPathComponent(attachmentID.uuidString).appendingPathExtension(isImage ? "png" : "pdf")
+        let bytes = Data("handoff attachment bytes".utf8)
+        try bytes.write(to: image)
+        let attachment = AgentFileAttachment(
+            id: attachmentID, source: .localFile(path: image.path), title: "Handoff attachment",
+            kind: isImage ? .image : .pdf, fileName: fileName, byteCount: bytes.count
+        )
+        fixture.sourceSession.appendItem(.user("Look at this image", attachments: [attachment]))
+        fixture.sourceSession.appendItem(.assistant("Image received"))
+        // A hydrated source hands off from its structured transcript; appended live items reach it
+        // through the scheduled derived-transcript refresh. Own that refresh so the appended rows
+        // are valid Handoff cutoffs before any test selects one.
+        await fixture.viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: fixture.sourceTabID)
+        let cutoff = try XCTUnwrap(fixture.sourceSession.items.last?.id)
+        XCTAssertNotNil(
+            fixture.viewModel.resolvedHandoffSourceTranscript(for: fixture.sourceSession, upToItemID: cutoff),
+            "precondition: the appended image turn must be a valid Handoff cutoff"
+        )
+        return (store, attachment, image)
     }
 
     private func assertRecoveryBlocksSubmission(

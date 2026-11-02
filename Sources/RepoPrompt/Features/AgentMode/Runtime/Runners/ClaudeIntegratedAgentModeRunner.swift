@@ -627,7 +627,16 @@ final class ClaudeIntegratedAgentModeRunner {
                     await quotaService.observe(ClaudeCompatibleProviderRuntimeBridge.quotaObservation(from: info), lease: quotaLease, observedAt: Date())
                 }
             case let .runtimeInit(status):
-                claudeCoordinator.observeRuntimeInit(status, session: session)
+                if claudeCoordinator.observeRuntimeInit(status, session: session) {
+                    // Re-resolve the displayed window through the ordinary usage path so a
+                    // configured auto-compact window applies before the first response.
+                    await hooks.transcript.handleHeadlessStreamResult(
+                        AIStreamResult(type: "usage", text: nil),
+                        session,
+                        runID,
+                        runAttemptID
+                    )
+                }
                 if status.isRepoPromptServerFailed {
                     return .failed(
                         errorText: ClaudeAgentModeCoordinator.mcpInitializationFailureMessage(sessionID: status.sessionID),

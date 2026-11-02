@@ -961,6 +961,7 @@ final class AzureOpenAIProvider: AIProvider {
 extension AzureOpenAIProvider {
     static let defaultModelDescriptors: [AzureOpenAIConfiguration.ModelDescriptor] = {
         let openAIModels = AIModel.modelsForProvider(.openAI)
+            .filter { $0.openAIReasoningMode == nil }
             .sorted { lhs, rhs in lhs.displayName.lowercased() < rhs.displayName.lowercased() }
 
         let descriptors = openAIModels.map { model in

@@ -187,6 +187,7 @@ struct AgentComposerPendingSubmission: Equatable, Identifiable {
     let text: String
     let repromptDraft: AgentRepromptUIStore.SubmittedDraft
     let originalDraft: String?
+    var isChoosingWorkflow = false
 }
 
 struct AgentComposerSubmissionLatch {
@@ -326,6 +327,13 @@ struct AgentComputerUseComposerProps: Equatable {
     static let hidden = Self(isVisible: false, isOn: false, isBusy: false)
 }
 
+/// A one-shot composer notice explaining why an image paste or drop was not attached.
+struct AgentImageAttachmentNoticeProps: Equatable {
+    let id: UUID
+    let tabID: UUID
+    let message: String
+}
+
 struct AgentComposerProps: Equatable {
     enum ManualEffortControl: Equatable {
         case codex
@@ -341,6 +349,7 @@ struct AgentComposerProps: Equatable {
     }
 
     var computerUse: AgentComputerUseComposerProps = .hidden
+    var imageAttachmentNotice: AgentImageAttachmentNoticeProps?
     let currentTabID: UUID?
     let submitTarget: AgentComposerSubmitTarget?
     let attachments: AgentAttachmentStripSnapshot

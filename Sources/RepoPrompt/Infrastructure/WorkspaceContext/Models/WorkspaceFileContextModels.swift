@@ -479,6 +479,16 @@ struct WorkspaceRootRecord: Identifiable, Equatable, Hashable {
 }
 
 struct WorkspaceFolderRecord: Identifiable, Equatable, Hashable {
+    func isByteIdentical(to other: Self) -> Bool {
+        id == other.id && rootID == other.rootID && parentFolderID == other.parentFolderID
+            && modificationDate == other.modificationDate
+            && name.utf8.elementsEqual(other.name.utf8)
+            && relativePath.utf8.elementsEqual(other.relativePath.utf8)
+            && standardizedRelativePath.utf8.elementsEqual(other.standardizedRelativePath.utf8)
+            && fullPath.utf8.elementsEqual(other.fullPath.utf8)
+            && standardizedFullPath.utf8.elementsEqual(other.standardizedFullPath.utf8)
+    }
+
     let id: UUID
     let rootID: UUID
     let name: String
@@ -511,6 +521,16 @@ struct WorkspaceFolderRecord: Identifiable, Equatable, Hashable {
 }
 
 struct WorkspaceFileRecord: Identifiable, Equatable, Hashable {
+    func isByteIdentical(to other: Self) -> Bool {
+        id == other.id && rootID == other.rootID && parentFolderID == other.parentFolderID
+            && modificationDate == other.modificationDate
+            && name.utf8.elementsEqual(other.name.utf8)
+            && relativePath.utf8.elementsEqual(other.relativePath.utf8)
+            && standardizedRelativePath.utf8.elementsEqual(other.standardizedRelativePath.utf8)
+            && fullPath.utf8.elementsEqual(other.fullPath.utf8)
+            && standardizedFullPath.utf8.elementsEqual(other.standardizedFullPath.utf8)
+    }
+
     let id: UUID
     let rootID: UUID
     let name: String

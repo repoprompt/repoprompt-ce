@@ -168,6 +168,7 @@ extension AgentModeViewModel {
         claim: AgentComposerSubmitClaim,
         session: TabSession,
         destinationTabID: UUID,
+        autoWorkflow: AutoWorkflowTurnSelection? = nil,
         repromptedText: String? = nil,
         precomputedRouting: RepromptSpeculation? = nil
     ) async -> UserTurnSubmissionResult {
@@ -179,7 +180,7 @@ extension AgentModeViewModel {
               freshTaskRoutingEligibility(session: session, text: text)
         else {
             return await submitUserTurnAfterUsageBalancing(
-                text: text, claim: claim, session: session, destinationTabID: destinationTabID, repromptedText: repromptedText
+                text: text, claim: claim, session: session, destinationTabID: destinationTabID, autoWorkflow: autoWorkflow, repromptedText: repromptedText
             )
         }
         guard let runtime = modelRouterRuntime,
@@ -189,7 +190,7 @@ extension AgentModeViewModel {
         else {
             return await submitUserTurnAfterUsageBalancing(
                 text: text, claim: claim, session: session, destinationTabID: destinationTabID,
-                routerAudit: .init(configured: true, eligible: true, judgmentRequested: false, decision: .unavailable), repromptedText: repromptedText
+                routerAudit: .init(configured: true, eligible: true, judgmentRequested: false, decision: .unavailable), autoWorkflow: autoWorkflow, repromptedText: repromptedText
             )
         }
 
@@ -234,7 +235,7 @@ extension AgentModeViewModel {
             clearFreshTaskRoutingOwnership(ownership)
         }
         if let reusable, reusableRepromptRouting(reusable, approved: repromptedText, configuration: configuration, backendID: backendID, runtime: runtime) == nil {
-            return await submitUserTurnAfterFreshTaskRouting(text: text, claim: claim, session: session, destinationTabID: destinationTabID, repromptedText: repromptedText)
+            return await submitUserTurnAfterFreshTaskRouting(text: text, claim: claim, session: session, destinationTabID: destinationTabID, autoWorkflow: autoWorkflow, repromptedText: repromptedText)
         }
         let candidates = stagedResult.candidates
         let outcome = stagedResult.outcome
@@ -269,14 +270,14 @@ extension AgentModeViewModel {
             guard let selected = candidates.only(where: { $0.opaqueKey == opaqueKey }) else {
                 return await submitUserTurnAfterAutoEffort(
                     text: text, claim: claim, session: session, destinationTabID: destinationTabID,
-                    routerAudit: fallbackAudit, repromptedText: repromptedText
+                    routerAudit: fallbackAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText
                 )
             }
             let baseline = RoutedSelectionRollback(target: executableTarget(for: session))
             guard applyRoutingTarget(selected, to: session) else {
                 return await submitUserTurnAfterAutoEffort(
                     text: text, claim: claim, session: session, destinationTabID: destinationTabID,
-                    routerAudit: fallbackAudit, repromptedText: repromptedText
+                    routerAudit: fallbackAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText
                 )
             }
             routedAudit.chosenModelRaw = selected.target.modelRaw
@@ -294,7 +295,7 @@ extension AgentModeViewModel {
                 tabID: destinationTabID,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
                 composerOrigin: .localComposer,
-                routerAudit: routedAudit, repromptedText: repromptedText,
+                routerAudit: routedAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
                 repromptAudit: repromptAuditForClaim(claim, judgedText: stagedResult.judgmentRequested ? (repromptedText == nil ? .originalFallback : .approved) : nil)
             )
             if result != .submitted {
@@ -310,7 +311,7 @@ extension AgentModeViewModel {
         case .abstained, .failed:
             return await submitUserTurnAfterUsageBalancing(
                 text: text, claim: claim, session: session, destinationTabID: destinationTabID,
-                routerAudit: fallbackAudit, repromptedText: repromptedText
+                routerAudit: fallbackAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText
             )
         case .cancelled:
             return .blocked(message: "Model routing was cancelled.")
@@ -325,6 +326,7 @@ extension AgentModeViewModel {
         session: TabSession,
         destinationTabID: UUID,
         routerAudit: AgentAutomationTurnAudit.Feature? = nil,
+        autoWorkflow: AutoWorkflowTurnSelection? = nil,
         repromptedText: String? = nil
     ) async -> UserTurnSubmissionResult {
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session else {
@@ -336,23 +338,34 @@ extension AgentModeViewModel {
                 tabID: destinationTabID,
                 rawDraftText: claim.attempt.rawDraftSnapshot,
                 composerOrigin: .localComposer,
-                routerAudit: routerAudit, repromptedText: repromptedText,
+                routerAudit: routerAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
                 repromptAudit: repromptAuditForClaim(claim, judgedText: routerAudit?.judgmentRequested == true ? (repromptedText == nil ? .originalFallback : .approved) : nil)
             )
         }
         let judgingText = Self.automationJudgingText(original: repromptDispatchOriginals[claim.attempt.id] ?? claim.attempt.rawDraftSnapshot, reprompted: repromptedText)
+        let judgedWorkflow = effectiveWorkflow(session: session, autoWorkflow: autoWorkflow)
         let choice: (selection: AutoEffortTurnSelection?, audit: AgentAutomationTurnAudit.Feature)
-        if let speculation = reusableRepromptEffort(claim: claim, approved: repromptedText, session: session), let task = speculation.effortTask {
+        if let speculation = reusableRepromptEffort(claim: claim, approved: repromptedText, session: session, autoWorkflow: autoWorkflow),
+           let task = speculation.effortTask
+        {
             let staged = await task.value
-            if reusableRepromptEffort(claim: claim, approved: repromptedText, session: session) != nil {
+            if reusableRepromptEffort(claim: claim, approved: repromptedText, session: session, autoWorkflow: autoWorkflow) != nil {
                 choice = staged
             } else {
-                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil)
+                choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil)
             }
         } else {
-            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: session.selectedWorkflow, isRepromptReplacement: repromptedText != nil)
+            choice = await chooseAutoEffortForUserTurn(text: judgingText, session: session, workflow: judgedWorkflow, isRepromptReplacement: repromptedText != nil)
         }
-        let selection = choice.selection
+        var selection = choice.selection
+        var effortAudit = choice.audit
+        if judgedWorkflow != effectiveWorkflow(session: session, autoWorkflow: autoWorkflow) {
+            selection = nil
+            if effortAudit.judgmentRequested {
+                effortAudit.decision = .fallback
+                effortAudit.fallbackApplied = true
+            }
+        }
         guard composerSubmitClaimIsCurrent(claim), sessions[destinationTabID] === session
         else { return .blocked(message: Self.staleComposerSubmitTargetMessage) }
         if let routerAudit, routerAudit.usageBalancingReason != nil {
@@ -370,8 +383,8 @@ extension AgentModeViewModel {
             rawDraftText: claim.attempt.rawDraftSnapshot,
             composerOrigin: .localComposer,
             autoEffortSelection: selection,
-            autoEffortAudit: choice.audit,
-            routerAudit: routerAudit, repromptedText: repromptedText,
+            autoEffortAudit: effortAudit,
+            routerAudit: routerAudit, autoWorkflow: autoWorkflow, repromptedText: repromptedText,
             repromptAudit: repromptAuditForClaim(
                 claim,
                 judgedText: choice.audit.judgmentRequested

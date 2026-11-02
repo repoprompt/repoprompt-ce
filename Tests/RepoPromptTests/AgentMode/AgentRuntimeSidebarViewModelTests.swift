@@ -299,7 +299,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             selectedAgent: .kimiCode,
             selectedModelRaw: "kimi-code:xhigh"
         )
-        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
+        XCTAssertNil(store.runtimeVM.snapshot.effectiveContextWindowTokens, "An unknown backend window stays unknown")
     }
 
     func testProviderReportedContextWindowWinsOverModelFallback() {
@@ -331,12 +331,12 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
 
         // Encoded selections need the agent to disambiguate the specifier
-        // grammar; without one they pin to the conservative default.
+        // grammar; without one the window stays unknown rather than guessed.
         viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-fable-5:xhigh")
-        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 200_000)
+        XCTAssertNil(viewModel.snapshot.effectiveContextWindowTokens)
 
         viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-sonnet-5:xhigh")
-        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 200_000)
+        XCTAssertNil(viewModel.snapshot.effectiveContextWindowTokens)
 
         // Supplying the agent unlocks encoded-raw resolution on the items path.
         viewModel.update(
@@ -453,5 +453,191 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
                 copyPreset: nil
             )
         }
+    }
+}
+
+/// Issue #506: an unknown Claude window must not act as a 200K ceiling, and a user-set
+/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is the effective denominator.
+@MainActor
+final class ClaudeContextWindowResolutionTests: XCTestCase {
+    private func makeEstimator() -> ClaudeContextUsageEstimator {
+        ClaudeContextUsageEstimator(tokenEstimator: { _ in 0 }, contextUsageBuilder: { usage, window in
+            AgentModeViewModel.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: window)
+        })
+    }
+
+    private func makeSession(model: String = "claude-fable-5", autoCompactWindow: Int? = nil) -> AgentTabSession {
+        let session = AgentTabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = model
+        session.claudeAutoCompactWindowTokens = autoCompactWindow
+        return session
+    }
+
+    private func makeViewModel() -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Context-window tests must not start a Codex session")
+            }
+        )
+    }
+
+    // MARK: - Environment parsing
+
+    func testAutoCompactWindowParsesOnlyPositiveIntegers() {
+        let key = ClaudeAutoCompactWindow.environmentKey
+        XCTAssertEqual(key, "CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+        XCTAssertEqual(ClaudeAutoCompactWindow.tokens(in: [key: "400000"]), 400_000)
+        XCTAssertEqual(ClaudeAutoCompactWindow.tokens(in: [key: " 400000\n"]), 400_000)
+        for invalid in ["", "0", "-1", "400k", "4e5"] {
+            XCTAssertNil(ClaudeAutoCompactWindow.tokens(in: [key: invalid]), invalid)
+        }
+        XCTAssertNil(ClaudeAutoCompactWindow.tokens(in: [:]))
+    }
+
+    func testEffectiveWindowIsTheSmallerKnownWindow() {
+        XCTAssertEqual(ClaudeAutoCompactWindow.effectiveWindow(modelWindow: 1_000_000, autoCompactWindow: 400_000), 400_000)
+        XCTAssertEqual(ClaudeAutoCompactWindow.effectiveWindow(modelWindow: 200_000, autoCompactWindow: 400_000), 200_000, "Claude Code caps the setting at the model window")
+        XCTAssertEqual(ClaudeAutoCompactWindow.effectiveWindow(modelWindow: nil, autoCompactWindow: 400_000), 400_000)
+        XCTAssertEqual(ClaudeAutoCompactWindow.effectiveWindow(modelWindow: 1_000_000, autoCompactWindow: nil), 1_000_000)
+        XCTAssertNil(ClaudeAutoCompactWindow.effectiveWindow(modelWindow: nil, autoCompactWindow: nil))
+
+        XCTAssertNil(ClaudeAutoCompactWindow.cappedReportedWindow(nil, autoCompactWindow: 400_000), "No report invents no window")
+        XCTAssertEqual(ClaudeAutoCompactWindow.cappedReportedWindow(0, autoCompactWindow: 400_000), 0, "A withdrawal signal passes through")
+        XCTAssertEqual(ClaudeAutoCompactWindow.cappedReportedWindow(1_000_000, autoCompactWindow: 400_000), 400_000)
+    }
+
+    // MARK: - Unknown windows
+
+    func testUnknownWindowKeepsReadingsAboveTwoHundredThousand() {
+        let estimator = makeEstimator()
+        let session = makeSession(model: "claude-unlisted-model")
+
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+        XCTAssertNil(session.codexContextUsage?.modelContextWindow)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 250_000)
+
+        XCTAssertTrue(estimator.finalizeTurn(promptTokens: nil, completionTokens: nil, contextUsedTokens: 260_000, session: session))
+        XCTAssertEqual(session.providerTokenUsageByTurn.last?.contextUsedTokens, 260_000)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 260_000)
+    }
+
+    func testKnownWindowStillRejectsImpossibleReadings() {
+        let estimator = makeEstimator()
+        let session = makeSession(model: "claude-unlisted-model")
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000, modelContextWindow: 200_000, session: session)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 250_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 150_000)
+    }
+
+    func testRestoredRowsAboveTwoHundredThousandSurviveAnUnknownWindow() {
+        let rows = [AgentTokenUsagePersist(runID: nil, turnID: nil, promptTokens: 0, completionTokens: 0, contextUsedTokens: 350_000)]
+        let restored = AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: nil)
+        XCTAssertEqual(restored?.lastTotalTokens, 350_000)
+        XCTAssertNil(restored?.modelContextWindow)
+
+        XCTAssertNil(
+            AgentModeViewModel.contextUsageFromClaudeProviderTokens(rows, modelContextWindow: 200_000)?.lastTotalTokens,
+            "A known window still bounds restored rows"
+        )
+    }
+
+    // MARK: - Auto-compact window
+
+    func testAutoCompactWindowIsTheDenominatorBeforeAndAfterTheFirstResponse() {
+        let estimator = makeEstimator()
+        let session = makeSession(autoCompactWindow: 400_000)
+
+        // Runtime init re-resolves through an empty usage report.
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: nil, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 400_000)
+
+        // Claude reports the model's full 1M window at turn end.
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: 120_000, modelContextWindow: 1_000_000, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 400_000)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 120_000)
+    }
+
+    func testAutoCompactWindowNeverRejectsReadings() {
+        let estimator = makeEstimator()
+        let session = makeSession(autoCompactWindow: 400_000)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 450_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 400_000)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 450_000)
+        XCTAssertTrue(estimator.finalizeTurn(promptTokens: nil, completionTokens: nil, contextUsedTokens: 460_000, session: session))
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 460_000)
+    }
+
+    func testAutoCompactWindowAboveTheModelWindowUsesTheModelWindow() {
+        let estimator = makeEstimator()
+        let session = makeSession(model: "sonnet", autoCompactWindow: 1_000_000)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: nil, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 200_000)
+    }
+
+    func testRestoredUncappedWindowIsCappedOnTheNextReport() {
+        let estimator = makeEstimator()
+        let session = makeSession()
+        session.codexContextUsage = AgentContextUsage(modelContextWindow: 1_000_000, lastTotalTokens: 90000, totalTotalTokens: 90000)
+        session.claudeAutoCompactWindowTokens = 400_000
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: nil, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 400_000)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 90000)
+    }
+
+    func testAutoCompactWindowAppliesOnlyWhileAClaudeNativeProviderIsSelected() {
+        let session = makeSession(autoCompactWindow: 400_000)
+        XCTAssertEqual(session.activeClaudeAutoCompactWindowTokens, 400_000)
+        session.selectedAgent = .claudeCodeGLM
+        XCTAssertEqual(session.activeClaudeAutoCompactWindowTokens, 400_000)
+        session.selectedAgent = .openCode
+        XCTAssertNil(session.activeClaudeAutoCompactWindowTokens)
+        session.selectedAgent = .codexExec
+        XCTAssertNil(session.activeClaudeAutoCompactWindowTokens)
+    }
+
+    func testCappedReportedWindowKeepsTheWindowVouch() {
+        let viewModel = makeViewModel()
+        let session = makeSession(autoCompactWindow: 400_000)
+        XCTAssertTrue(viewModel.ingestNonCodexUsageReport(
+            promptTokens: nil, completionTokens: nil, contextUsedTokens: 150_000,
+            modelContextWindow: 1_000_000, session: session
+        ))
+        XCTAssertEqual(session.contextUsageSnapshot?.window, 400_000)
+        XCTAssertEqual(session.vouchedContextWindow?.tokens, 400_000, "The capped window is the provider's effective window")
+        XCTAssertEqual(session.vouchedContextCount?.tokens, 150_000)
+    }
+
+    // MARK: - Presentation
+
+    func testSidebarLeavesUnknownWindowsUnknown() {
+        for (agent, model) in [
+            (AgentProviderKind.claudeCode, "claude-unlisted-model"),
+            (.codexExec, "gpt-unlisted-model"),
+            (.openCode, "anything"),
+            (.cursor, "anything"),
+            (.devin, "anything")
+        ] {
+            let snapshot = AgentRuntimeSidebarViewModel.ContextSnapshot(selectedAgent: agent, selectedModelRaw: model)
+            XCTAssertNil(snapshot.effectiveContextWindowTokens, "\(agent) \(model)")
+        }
+        XCTAssertNil(AgentRuntimeSidebarViewModel.ContextSnapshot(selectedModelRaw: "claude-fable-5:xhigh").effectiveContextWindowTokens)
+
+        XCTAssertEqual(
+            AgentRuntimeSidebarViewModel.ContextSnapshot(selectedAgent: .claudeCode, selectedModelRaw: "claude-fable-5").effectiveContextWindowTokens,
+            1_000_000,
+            "Known model windows still resolve"
+        )
+        var reported = AgentRuntimeSidebarViewModel.ContextSnapshot(selectedAgent: .claudeCode, selectedModelRaw: "claude-unlisted-model")
+        reported.contextWindowTokens = 400_000
+        XCTAssertEqual(reported.effectiveContextWindowTokens, 400_000)
+    }
+
+    func testDrawerTokenPillShowsCountWithoutAGuessedDenominator() {
+        XCTAssertEqual(AgentContextDrawerTokenEstimatePill.tokenSummaryText(usedTokens: 12300, contextWindowTokens: nil), "12.3K tokens")
+        XCTAssertEqual(AgentContextDrawerTokenEstimatePill.tokenSummaryText(usedTokens: 12300, contextWindowTokens: 400_000), "12.3K / 400.0K")
+        XCTAssertEqual(AgentContextDrawerTokenEstimatePill.budgetText(usedPercent: nil), "Context window unknown")
+        XCTAssertEqual(AgentContextDrawerTokenEstimatePill.budgetText(usedPercent: 3.1), "3% of budget")
     }
 }
