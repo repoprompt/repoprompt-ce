@@ -196,6 +196,31 @@ final class WindowSessionMCPToolsPreferenceTests: XCTestCase {
         XCTAssertFalse(GlobalSettingsStore.shared.mcpAutoStart())
     }
 
+    func testTerminationTeardownDoesNotOverwriteCapturedPreference() async throws {
+        let window = try await makeWindow(globalDefault: false)
+        let workspace = WorkspaceModel(name: "Captured", repoPaths: [NSTemporaryDirectory()])
+        await window.workspaceManager.awaitInitialized()
+        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.activeWorkspace = workspace
+        window.setWorkspaceInstanceAssignment(.init(workspaceID: workspace.id, number: 1))
+        _ = await window.mcpServer.setWindowToolsEnabled(true)
+
+        // Same order as quit: the synchronous termination fence pins the preference, then
+        // `stopAllServers()` disables every window's tools during async teardown.
+        window.freezeMCPToolsPreferenceForTermination()
+        await window.mcpServer.stopServer()
+        XCTAssertFalse(window.mcpServer.windowToolsAreRequested)
+        XCTAssertEqual(
+            window.sessionCaptureCandidate().entry?.mcpToolsEnabled,
+            true,
+            "Quit teardown must not be persisted as the window's MCP tools choice"
+        )
+
+        // The `applicationWillTerminate` fallback re-signals termination; it must not re-pin.
+        window.freezeMCPToolsPreferenceForTermination()
+        XCTAssertEqual(window.sessionCaptureCandidate().entry?.mcpToolsEnabled, true)
+    }
+
     // MARK: - Helpers
 
     private func makeWindow(globalDefault: Bool) async throws -> WindowState {

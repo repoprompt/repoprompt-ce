@@ -1395,6 +1395,11 @@ class WindowStatesManager: ObservableObject {
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            // Before any async teardown: `stopAllServers()` clears each window's MCP tools request,
+            // and the final session writes must still record the user's per-window switch (#143).
+            for window in self.terminationWindowSnapshot {
+                window.freezeMCPToolsPreferenceForTermination()
+            }
             self.preparedOversightCleanupTask?.cancel()
             self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates

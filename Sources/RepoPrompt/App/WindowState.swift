@@ -329,6 +329,11 @@ class WindowState: ObservableObject {
     /// an incoming workspace's metadata with an outgoing assignment during publication/listener gaps.
     private var lastCoherentSessionEntry: WindowSessionEntry?
 
+    /// This window's MCP tools request as it stood when the app began terminating (#143). Quit
+    /// teardown (`stopAllServers`) clears the live request, which is not the user's choice, so
+    /// every capture after the termination fence records this value instead.
+    private var terminationMCPToolsPreference: Bool?
+
     /// The instance number for the current workspace; nil while the assignment belongs to another.
     var workspaceInstanceNumber: Int? {
         workspaceManager.activeWorkspaceID.flatMap { workspaceInstanceNumber(for: $0) }
@@ -863,14 +868,15 @@ class WindowState: ObservableObject {
 
         // The per-window MCP tools switch is part of the saved window session (#143), so a change
         // re-captures the session like a workspace switch does. Persistence stays gated during
-        // restore, so the auto-start seeding at launch cannot overwrite the saved snapshot.
+        // restore, so the auto-start seeding at launch cannot overwrite the saved snapshot, and
+        // quit teardown disabling every window's tools is not a user change worth persisting.
         mcpServer.$windowToolsEnabled
             .dropFirst()
             .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
-                guard let self, !isClosing else { return }
-                windowStatesManager?.persistWindowSession(reason: "mcpToolsEnabled:\(windowID)")
+                guard let self, !isClosing, let manager = windowStatesManager, !manager.isTerminating else { return }
+                manager.persistWindowSession(reason: "mcpToolsEnabled:\(windowID)")
             }
             .store(in: &cancellables)
 
@@ -2049,8 +2055,16 @@ class WindowState: ObservableObject {
             primaryRepoPath: workspace.repoPaths.first.map { ($0 as NSString).expandingTildeInPath },
             lastFocused: isCurrentlyFocused,
             workspaceInstanceNumber: workspaceInstanceNumber(for: workspace.id),
-            mcpToolsEnabled: mcpServer.windowToolsAreRequested
+            mcpToolsEnabled: terminationMCPToolsPreference ?? mcpServer.windowToolsAreRequested
         )
+    }
+
+    /// Pins the MCP tools request for every session capture from here on. Called synchronously by
+    /// `WindowStatesManager.signalTermination()` before `stopAllServers()` clears the live request;
+    /// idempotent, so the `applicationWillTerminate` fallback cannot re-pin a torn-down value.
+    func freezeMCPToolsPreferenceForTermination() {
+        guard terminationMCPToolsPreference == nil else { return }
+        terminationMCPToolsPreference = mcpServer.windowToolsAreRequested
     }
 
     /// Assignment installation captures immediately, even if no ordinary persist happened before
