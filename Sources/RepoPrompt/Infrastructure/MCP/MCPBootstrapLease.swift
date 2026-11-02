@@ -161,6 +161,25 @@ extension MCPBootstrapReadinessError: LocalizedError {
 /// ## Additional operations (agent-mode specific)
 /// - `releaseWithoutRoutingWait()` — releases gate immediately (when no fresh connection is expected)
 /// - `releaseGateForDeferredRouting()` — releases the gate while retaining pending routing/policy state
+/// Terminal outcome an Agent Mode runner commits when `MCPBootstrapLease.acquire()` returns `false`.
+///
+/// A gate deadline is a retryable failure the user must see; every other acquire failure
+/// (cancellation, release, enabler or routing failure) remains an intentional cancel.
+struct MCPBootstrapLeaseAcquireFailureOutcome: Equatable {
+    let terminalState: AgentSessionRunState
+    let errorText: String?
+
+    init(timedOut: Bool) {
+        if timedOut {
+            terminalState = .failed
+            errorText = HeadlessAgentConnectionAcquireTimeoutError().localizedDescription
+        } else {
+            terminalState = .cancelled
+            errorText = nil
+        }
+    }
+}
+
 actor MCPBootstrapLease {
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
@@ -174,6 +193,11 @@ actor MCPBootstrapLease {
     private let routeAuthorityResolver: (MCPBootstrapLeaseSpec) async -> MCPRunRouteAuthorityDecision
 
     private(set) var lastAcquireWasTimeout = false
+    /// How a runner should finalize after `acquire()` returned `false`.
+    var acquireFailureOutcome: MCPBootstrapLeaseAcquireFailureOutcome {
+        MCPBootstrapLeaseAcquireFailureOutcome(timedOut: lastAcquireWasTimeout)
+    }
+
     private var hasAcquired = false
     private var hasReleased = false
     private var cleanupRequested = false

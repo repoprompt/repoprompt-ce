@@ -174,6 +174,16 @@ final class AgentRunLifecycleContractsTests: XCTestCase {
 }
 
 final class HeadlessAgentConnectionGateDeadlineTests: XCTestCase {
+    func testLeaseAcquireTimeoutFinalizesAsVisibleFailureNotCancel() {
+        let timeout = MCPBootstrapLeaseAcquireFailureOutcome(timedOut: true)
+        XCTAssertEqual(timeout.terminalState, .failed)
+        XCTAssertEqual(timeout.errorText, HeadlessAgentConnectionAcquireTimeoutError().localizedDescription)
+
+        let cancel = MCPBootstrapLeaseAcquireFailureOutcome(timedOut: false)
+        XCTAssertEqual(cancel.terminalState, .cancelled)
+        XCTAssertNil(cancel.errorText)
+    }
+
     func testExpiredWaitRemovesOnlyWaiterAndPreservesOwner() async {
         let gate = HeadlessAgentConnectionGate()
         let owner = UUID()

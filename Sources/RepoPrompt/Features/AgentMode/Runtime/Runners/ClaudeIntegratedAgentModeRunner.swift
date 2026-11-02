@@ -184,6 +184,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     await self.handleAcquireFailure(
                         tabID: tabID,
                         session: session,
+                        lease: lease,
                         runID: runID,
                         ownership: ownership,
                         attachmentReservationID: attachmentReservationID
@@ -592,17 +593,20 @@ final class ClaudeIntegratedAgentModeRunner {
     private func handleAcquireFailure(
         tabID _: UUID,
         session: AgentTabSession,
+        lease: MCPBootstrapLease,
         runID: UUID,
         ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
+        let outcome = await lease.acquireFailureOutcome
         hooks.providerInput.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(
             binding: hooks.bindTerminalSession(session),
             ownership: ownership,
             expectedRunID: runID,
-            terminalState: .cancelled,
+            terminalState: outcome.terminalState,
             source: "claudeNative.acquireFailure",
+            errorText: outcome.errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
             finalizeNonCodexUsage: true,
