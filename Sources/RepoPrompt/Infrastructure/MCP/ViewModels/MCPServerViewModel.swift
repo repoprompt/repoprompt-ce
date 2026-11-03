@@ -1354,7 +1354,8 @@ final class MCPServerViewModel: ObservableObject {
     /// on the main actor each time the requested intent actually changes, synchronously inside
     /// `setWindowToolsEnabled` before registration starts. Registration outcomes
     /// (`windowToolsEnabled`) never emit here, and repeating an unchanged intent does not emit
-    /// even though it still retries registration. Session persistence observes this (#143).
+    /// even though it still retries registration. Seeding from the global auto-start default does
+    /// not emit either: it is not a per-window choice. Session persistence observes this (#143).
     var windowToolsRequestChanges: AnyPublisher<Bool, Never> {
         windowToolsRequestSubject.eraseToAnyPublisher()
     }
@@ -3212,7 +3213,8 @@ final class MCPServerViewModel: ObservableObject {
         // after the domain registry owns the complete catalog.
         if GlobalSettingsStore.shared.mcpAutoStart() {
             Task { [weak self] in
-                _ = await self?.setWindowToolsEnabled(true)
+                // Seeding from the global default is not a per-window choice to persist (#143).
+                _ = await self?.setWindowToolsEnabled(true, publishesRequestChange: false)
             }
         }
     }
@@ -3406,7 +3408,8 @@ final class MCPServerViewModel: ObservableObject {
     @discardableResult
     func setWindowToolsEnabled(
         _ enabled: Bool,
-        invalidateCatalogBeforeUpdate: Bool = true
+        invalidateCatalogBeforeUpdate: Bool = true,
+        publishesRequestChange: Bool = true
     ) async -> Bool {
         toolRegistrationIntentGeneration &+= 1
         let intentGeneration = toolRegistrationIntentGeneration
@@ -3418,7 +3421,7 @@ final class MCPServerViewModel: ObservableObject {
         }
         // Before the first await, so observers see the intent even if registration stays pending
         // or fails; an unchanged intent still re-runs the transition below.
-        if requestChanged {
+        if requestChanged, publishesRequestChange {
             windowToolsRequestSubject.send(enabled)
         }
 
