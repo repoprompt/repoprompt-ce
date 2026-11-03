@@ -1078,10 +1078,13 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 kind: .laneStarted, groupID: prepared.group.id, turnID: turnID,
                 laneID: prepared.members[0].laneID, sequence: 0
             ), owner: prepared.owner, invocationID: invocationID)
-            vm.receiveOracleGroupProgress(OracleProgressEvent(
+            let settled = OracleProgressEvent(
                 kind: .laneSettled, groupID: prepared.group.id, turnID: turnID,
                 laneID: prepared.members[1].laneID, sequence: 1, text: canonicalStatus.rawValue
-            ), owner: prepared.owner, invocationID: invocationID)
+            )
+            vm.receiveOracleGroupProgress(settled, owner: prepared.owner, invocationID: UUID())
+            XCTAssertEqual(pill.memberDotState(for: member), .streaming, "Another invocation cannot settle this lane")
+            vm.receiveOracleGroupProgress(settled, owner: prepared.owner, invocationID: invocationID)
             vm.receiveOracleGroupProgress(started, owner: prepared.owner, invocationID: invocationID)
             XCTAssertEqual(pill.memberDotState(for: member), .settled, "settled progress is not publication")
             XCTAssertEqual(pill.memberDotState(for: member).rawValue, "Settled · awaiting group")
