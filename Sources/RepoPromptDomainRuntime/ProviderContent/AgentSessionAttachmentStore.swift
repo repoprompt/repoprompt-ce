@@ -1,6 +1,8 @@
 import Foundation
-import ImageIO
-import UniformTypeIdentifiers
+#if canImport(ImageIO)
+    import ImageIO
+    import UniformTypeIdentifiers
+#endif
 
 /// Session-lifetime storage for images sent in Agent Mode turns.
 ///
@@ -449,38 +451,45 @@ package struct AgentSessionAttachmentStore {
         return destination
     }
 
+    /// Returns `nil` when no downscaled copy can be produced; the caller then keeps the original bytes.
     private func writeDownscaledCopy(of source: URL, attachmentID: UUID, in folder: URL) -> URL? {
-        let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
-        guard let imageSource = CGImageSourceCreateWithURL(source as CFURL, sourceOptions) else { return nil }
-        let thumbnailOptions = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(1, limits.downscaledLongEdgePixels)
-        ] as CFDictionary
-        guard let image = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, thumbnailOptions) else { return nil }
+        #if canImport(ImageIO)
+            let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
+            guard let imageSource = CGImageSourceCreateWithURL(source as CFURL, sourceOptions) else { return nil }
+            let thumbnailOptions = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: max(1, limits.downscaledLongEdgePixels)
+            ] as CFDictionary
+            guard let image = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, thumbnailOptions) else { return nil }
 
-        let opaqueAlphaInfos: [CGImageAlphaInfo] = [.none, .noneSkipFirst, .noneSkipLast]
-        let hasAlpha = !opaqueAlphaInfos.contains(image.alphaInfo)
-        let type: UTType = hasAlpha ? .png : .jpeg
-        let destination = folder
-            .appendingPathComponent(attachmentID.uuidString)
-            .appendingPathExtension(hasAlpha ? "png" : "jpg")
-        try? FileManager.default.removeItem(at: destination)
-        guard let imageDestination = CGImageDestinationCreateWithURL(
-            destination as CFURL,
-            type.identifier as CFString,
-            1,
-            nil
-        ) else { return nil }
-        let properties: CFDictionary? = hasAlpha
-            ? nil
-            : [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary
-        CGImageDestinationAddImage(imageDestination, image, properties)
-        guard CGImageDestinationFinalize(imageDestination) else {
+            let opaqueAlphaInfos: [CGImageAlphaInfo] = [.none, .noneSkipFirst, .noneSkipLast]
+            let hasAlpha = !opaqueAlphaInfos.contains(image.alphaInfo)
+            let type: UTType = hasAlpha ? .png : .jpeg
+            let destination = folder
+                .appendingPathComponent(attachmentID.uuidString)
+                .appendingPathExtension(hasAlpha ? "png" : "jpg")
             try? FileManager.default.removeItem(at: destination)
+            guard let imageDestination = CGImageDestinationCreateWithURL(
+                destination as CFURL,
+                type.identifier as CFString,
+                1,
+                nil
+            ) else { return nil }
+            let properties: CFDictionary? = hasAlpha
+                ? nil
+                : [kCGImageDestinationLossyCompressionQuality: 0.9] as CFDictionary
+            CGImageDestinationAddImage(imageDestination, image, properties)
+            guard CGImageDestinationFinalize(imageDestination) else {
+                try? FileManager.default.removeItem(at: destination)
+                return nil
+            }
+            return destination
+        #else
+            // Without ImageIO there is no in-process decoder; an oversized image takes the same
+            // keep-the-original path as an image ImageIO cannot decode.
             return nil
-        }
-        return destination
+        #endif
     }
 }

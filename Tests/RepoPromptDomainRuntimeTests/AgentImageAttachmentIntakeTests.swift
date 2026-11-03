@@ -1,29 +1,33 @@
 import Foundation
 import RepoPromptDomainRuntime
-import UniformTypeIdentifiers
+#if canImport(UniformTypeIdentifiers)
+    import UniformTypeIdentifiers
+#endif
 import XCTest
 
-final class AgentAttachmentDropClassifierTests: XCTestCase {
-    func testFileURLsAreAcceptedWithoutAnExtensionAllowlistOrHoverRead() {
-        for identifier in [UTType.pdf.identifier, UTType.swiftSource.identifier, UTType.data.identifier] {
-            XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [UTType.fileURL.identifier, identifier]))
+#if canImport(UniformTypeIdentifiers)
+    final class AgentAttachmentDropClassifierTests: XCTestCase {
+        func testFileURLsAreAcceptedWithoutAnExtensionAllowlistOrHoverRead() {
+            for identifier in [UTType.pdf.identifier, UTType.swiftSource.identifier, UTType.data.identifier] {
+                XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [UTType.fileURL.identifier, identifier]))
+            }
+            XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [UTType.fileURL.identifier]))
         }
-        XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [UTType.fileURL.identifier]))
-    }
 
-    func testRawImagesIncludingLegacyPasteboardTypesAreAccepted() {
-        for identifier in [UTType.png.identifier, UTType.jpeg.identifier, UTType.tiff.identifier,
-                           UTType.image.identifier, "Apple PNG pasteboard type", "NeXT TIFF v4.0 pasteboard type"] {
-            XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [identifier]), identifier)
+        func testRawImagesIncludingLegacyPasteboardTypesAreAccepted() {
+            for identifier in [UTType.png.identifier, UTType.jpeg.identifier, UTType.tiff.identifier,
+                               UTType.image.identifier, "Apple PNG pasteboard type", "NeXT TIFF v4.0 pasteboard type"] {
+                XCTAssertTrue(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [identifier]), identifier)
+            }
         }
-    }
 
-    func testTextWebLinksAndUnaddressableBinaryDataRemainUnclaimed() {
-        for identifier in [UTType.utf8PlainText.identifier, UTType.rtf.identifier, UTType.url.identifier, UTType.data.identifier] {
-            XCTAssertFalse(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [identifier]), identifier)
+        func testTextWebLinksAndUnaddressableBinaryDataRemainUnclaimed() {
+            for identifier in [UTType.utf8PlainText.identifier, UTType.rtf.identifier, UTType.url.identifier, UTType.data.identifier] {
+                XCTAssertFalse(AgentAttachmentDropClassifier.accepts(typeIdentifiers: [identifier]), identifier)
+            }
         }
     }
-}
+#endif
 
 final class AgentAttachmentDropTrackerTests: XCTestCase {
     func testDropRoutesToTabCapturedAtDragStart() {

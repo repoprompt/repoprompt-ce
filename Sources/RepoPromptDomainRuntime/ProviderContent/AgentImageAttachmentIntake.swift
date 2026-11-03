@@ -1,19 +1,26 @@
 import Foundation
-import UniformTypeIdentifiers
+#if canImport(UniformTypeIdentifiers)
+    import UniformTypeIdentifiers
+#endif
 
 // MARK: - Drop classification
 
-/// Advertised file URLs and raw images share the attachment intake. Plain text and web links
-/// remain editor content. File validity is checked by the loader, which reports per-item failures.
-package enum AgentAttachmentDropClassifier {
-    package static func accepts(typeIdentifiers: [String]) -> Bool {
-        typeIdentifiers.contains { identifier in
-            if identifier == "Apple PNG pasteboard type" || identifier == "NeXT TIFF v4.0 pasteboard type" { return true }
-            guard let type = UTType(identifier) else { return false }
-            return type.conforms(to: .fileURL) || type.conforms(to: .image)
+#if canImport(UniformTypeIdentifiers)
+    /// Advertised file URLs and raw images share the attachment intake. Plain text and web links
+    /// remain editor content. File validity is checked by the loader, which reports per-item failures.
+    ///
+    /// Classifies AppKit pasteboard type identifiers, so it exists only where Uniform Type
+    /// Identifiers do; the Linux headless build has no drag-and-drop composer.
+    package enum AgentAttachmentDropClassifier {
+        package static func accepts(typeIdentifiers: [String]) -> Bool {
+            typeIdentifiers.contains { identifier in
+                if identifier == "Apple PNG pasteboard type" || identifier == "NeXT TIFF v4.0 pasteboard type" { return true }
+                guard let type = UTType(identifier) else { return false }
+                return type.conforms(to: .fileURL) || type.conforms(to: .image)
+            }
         }
     }
-}
+#endif
 
 // MARK: - Drop tracking
 
