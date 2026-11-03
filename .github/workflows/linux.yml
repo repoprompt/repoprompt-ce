@@ -124,11 +124,17 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install Qt system libraries
+        # Qt's xcb platform plugin links every X11/xcb library below; Debian and
+        # Ubuntu ship each xcb extension separately and the runner image does not
+        # preinstall all of them, so the complete set must be explicit.
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            libegl1 libgl1 libxkbcommon-x11-0 libdbus-1-3 \
-            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 xvfb xauth
+            libegl1 libgl1 libdbus-1-3 libxkbcommon0 libxkbcommon-x11-0 \
+            libx11-6 libx11-xcb1 libxcb1 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1 \
+            libxcb-util1 libxcb-xfixes0 libxcb-xkb1 xvfb xauth
       - uses: actions/download-artifact@v4
         with:
           name: repoprompt-ce-linux-${{ matrix.arch }}
@@ -138,6 +144,16 @@ jobs:
           mkdir -p "$RUNNER_TEMP/engine"
           tar --no-same-owner -C "$RUNNER_TEMP/engine" -xzf "$RUNNER_TEMP/engine-download/repoprompt-ce-linux-${{ matrix.arch }}.tar.gz"
           python -m pip install ./Apps/RepoPromptLinux
+      - name: Verify Qt xcb platform plugin linkage
+        run: |
+          plugin="$(python -c 'import pathlib, PySide6; print(pathlib.Path(PySide6.__file__).parent / "Qt/plugins/platforms/libqxcb.so")')"
+          linkage="$(ldd "$plugin")"
+          printf '%s\n' "$linkage"
+          if grep -q 'not found' <<<"$linkage"; then
+            printf '%s\n' 'Qt xcb platform plugin has missing system libraries:' >&2
+            grep 'not found' <<<"$linkage" >&2
+            exit 1
+          fi
       - name: Test desktop workflows against the release engine without a display
         env:
           QT_QPA_PLATFORM: offscreen

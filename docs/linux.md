@@ -201,7 +201,9 @@ Install the additional desktop prerequisites:
 sudo pacman -S --needed python-pip libglvnd libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms
 
 # Ubuntu / Debian
-sudo apt-get install python3-pip libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1
+sudo apt-get install python3-pip libegl1 libgl1 libxkbcommon-x11-0 libx11-xcb1 \
+  libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+  libxcb-render-util0 libxcb-shape0 libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxcb-xkb1
 
 # Fedora
 sudo dnf install python3-pip libglvnd-egl libglvnd-glx libxkbcommon-x11 xcb-util-cursor xcb-util-wm xcb-util-keysyms
