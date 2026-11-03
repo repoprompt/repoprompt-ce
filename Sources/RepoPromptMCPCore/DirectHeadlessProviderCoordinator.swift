@@ -522,6 +522,13 @@ actor DirectHeadlessProviderCoordinator {
     /// Concise terminal `status_text`. The final reply travels only in the bounded
     /// `assistant_text`; a failure keeps its first diagnostic line here, and the failure
     /// reason is carried explicitly by the outcome rather than re-derived from this label.
+    ///
+    /// Contract for every snapshot producer, including any new headless or start-expiry
+    /// snapshot: publish a short `status_text`, carry the reply only in `assistant_text`, and
+    /// when rebuilding a snapshot from another one copy `latestAssistantPreviewTotalCharacters`
+    /// (plus `worktreeBindingState` / `parentIsWorktreeBound`) along with the preview.
+    /// Dropping the truncation state misreports `assistant_text_characters` for any truncated
+    /// preview (ASCII included) and loses the flag entirely after byte-only truncation.
     nonisolated static func terminalStatusText(for outcome: DomainAgentRunTerminalOutcome) -> String {
         switch outcome.kind {
         case .completed:

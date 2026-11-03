@@ -512,7 +512,8 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         case unknown
     }
 
-    /// Upper bound on the `assistant_text` characters published by `asObject()`.
+    /// Upper bound on the `assistant_text` content characters (extended grapheme clusters)
+    /// published by `asObject()`; a truncated preview carries the marker in addition.
     ///
     /// Wait/poll/steer responses carry the child's last assistant reply only — never raw tool
     /// output — and this cap keeps that report bounded for the supervising session. Longer
@@ -525,13 +526,16 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
 
     /// UTF-8 ceiling on the published `assistant_text`, truncation marker included. Characters
     /// are grapheme clusters of unbounded byte length, so a character cap alone is not a size cap.
+    /// `assistant_text_characters` reports the original length in grapheme clusters, so it can
+    /// be smaller than the published text (an oversized single grapheme reports `1`).
     package static let assistantTextUTF8ByteLimit = 64 * 1024
 
     package static let assistantTextTruncationMarker = "\n… [assistant_text truncated; read the full transcript with agent_manage get_log]"
 
-    /// Upper bounds on the published `status_text`, marker included in the byte ceiling. Status
-    /// text is a short label; producers keep full diagnostics in their own logs and classify
-    /// failures from the untruncated text before publishing.
+    /// Upper bounds on the published `status_text`: up to `statusTextCharacterLimit` content
+    /// characters plus the marker, with the byte ceiling covering both. Status text is a short
+    /// label; producers keep full diagnostics in their own logs and classify failures from the
+    /// untruncated text before publishing.
     package static let statusTextCharacterLimit = 2000
     package static let statusTextUTF8ByteLimit = 8 * 1024
     package static let statusTextTruncationMarker = " … [status_text truncated]"
@@ -650,7 +654,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         if let knownTotalCharacters {
             return (bounded.text, true, knownTotalCharacters)
         }
-        return (bounded.text, bounded.truncated, text.count)
+        return (bounded.text, bounded.truncated, bounded.characterCount)
     }
 
     /// Bounded `status_text`: capped at `statusTextCharacterLimit` characters and
@@ -664,9 +668,10 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         ).text
     }
 
-    /// Caps `text` at `characterLimit` characters and `utf8ByteLimit` UTF-8 bytes, appending
-    /// `marker` when it truncates. The byte ceiling includes the marker, and truncation stops
-    /// before a grapheme that would cross it, even when that leaves an empty prefix.
+    /// Keeps up to `characterLimit` content characters (extended grapheme clusters) plus
+    /// `marker` when it truncates; the `utf8ByteLimit` ceiling covers content and marker
+    /// together. Truncation stops before a grapheme that would cross either limit, even when
+    /// that leaves an empty prefix. `characterCount` is the input's grapheme count.
     ///
     /// Idempotent: text that is already `<bounded head> + marker` is returned verbatim with
     /// `truncated == false`, so decode-and-republish round-trips never re-truncate or stack
@@ -677,10 +682,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         characterLimit: Int,
         utf8ByteLimit: Int,
         marker: String
-    ) -> (text: String, truncated: Bool) {
+    ) -> (text: String, truncated: Bool, characterCount: Int) {
+        // Grapheme counting is O(n); count once and hand it back to callers.
+        let characterCount = text.count
         let utf8Count = text.utf8.count
-        if utf8Count <= utf8ByteLimit, text.count <= characterLimit {
-            return (text, false)
+        if utf8Count <= utf8ByteLimit, characterCount <= characterLimit {
+            return (text, false, characterCount)
         }
         let markerBytes = marker.utf8.count
         let headByteBudget = max(0, utf8ByteLimit - markerBytes)
@@ -689,7 +696,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             if headBytes <= headByteBudget,
                String(decoding: text.utf8.prefix(headBytes), as: UTF8.self).count <= characterLimit
             {
-                return (text, false)
+                return (text, false, characterCount)
             }
         }
         var head = ""
@@ -702,7 +709,7 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             headBytes += characterBytes
             headCharacters += 1
         }
-        return (head + marker, true)
+        return (head + marker, true, characterCount)
     }
 
     /// Removes `assistant_text` together with its truncation metadata from a published object,

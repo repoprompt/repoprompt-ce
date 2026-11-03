@@ -69,7 +69,7 @@ final class MCPCLIConnectionFailureClassificationTests: XCTestCase {
         XCTAssertFalse(refused.contains("not running"), refused)
 
         let missing = InteractiveSessionError.bootstrapSocketUnavailable(errno: ENOENT).description
-        XCTAssertTrue(missing.contains("socket is missing"), missing)
+        XCTAssertTrue(missing.contains("disappeared while connecting"), missing)
 
         let notRunning = InteractiveSessionError.appNotRunning.description
         XCTAssertTrue(notRunning.contains("not running or MCP is disabled"), notRunning)
@@ -86,13 +86,37 @@ final class MCPCLIConnectionFailureClassificationTests: XCTestCase {
         }
     }
 
-    func testHandshakeWithDirectoryButMissingSocketIsRetryableSocketUnavailable() async throws {
+    func testHandshakeWithDirectoryButMissingSocketIsAppNotRunning() async throws {
+        // The app never removes the bootstrap directory, so a present directory alone does not
+        // mean a listener is coming back; a socket missing before connect stays permanent.
         let directory = try makePrivateDirectory()
         let error = await Self.handshakeError(socketURL: directory.appendingPathComponent("s.sock"))
-        guard case let .bootstrapSocketUnavailable(code) = error else {
-            return XCTFail("missing socket under a present directory must be retryable, got \(String(describing: error))")
+        guard case .appNotRunning = error else {
+            return XCTFail("socket missing before connect must stay permanent, got \(String(describing: error))")
         }
-        XCTAssertEqual(code, ENOENT)
+    }
+
+    func testHandshakeAfterCleanAppQuitIsAppNotRunning() async throws {
+        // What a clean quit or MCP disable leaves behind: the private directory and the
+        // released ownership lock file, with the socket pathname unlinked.
+        let directory = try makePrivateDirectory()
+        let socketURL = directory.appendingPathComponent("s.sock")
+        let listener = try Self.bindSocket(at: socketURL, listen: true)
+        let lockPath = socketURL.appendingPathExtension("lock").path
+        let lockFD = open(lockPath, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
+        XCTAssertGreaterThanOrEqual(lockFD, 0)
+        XCTAssertEqual(flock(lockFD, LOCK_EX | LOCK_NB), 0)
+        // Teardown order of BootstrapSocketServer.stop(): close, unlink owned socket, unlock.
+        Darwin.close(listener)
+        XCTAssertEqual(unlink(socketURL.path), 0)
+        XCTAssertEqual(flock(lockFD, LOCK_UN), 0)
+        Darwin.close(lockFD)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: lockPath))
+
+        let error = await Self.handshakeError(socketURL: socketURL)
+        guard case .appNotRunning = error else {
+            return XCTFail("a quit app must be reported as not running, got \(String(describing: error))")
+        }
     }
 
     func testHandshakeWithStaleSocketIsRetryableConnectionRefused() async throws {
@@ -191,7 +215,7 @@ final class MCPCLIConnectionFailureClassificationTests: XCTestCase {
     ) async -> InteractiveSessionError? {
         let session = InteractiveMCPClientSession(sessionToken: "test", clientName: "handshake-classification")
         do {
-            let fd = try await session.performBootstrapHandshake(socketURL: socketURL, afterConnectForTesting: afterConnect)
+            let fd = try await session.test_performBootstrapHandshake(socketURL: socketURL, afterConnect: afterConnect)
             Darwin.close(fd)
             return nil
         } catch let error as InteractiveSessionError {
@@ -205,7 +229,7 @@ final class MCPCLIConnectionFailureClassificationTests: XCTestCase {
     private static func assertHardValidationFailure(socketURL: URL, _ label: String) async throws {
         let session = InteractiveMCPClientSession(sessionToken: "test", clientName: "handshake-classification")
         do {
-            let fd = try await session.performBootstrapHandshake(socketURL: socketURL)
+            let fd = try await session.test_performBootstrapHandshake(socketURL: socketURL)
             Darwin.close(fd)
             XCTFail("\(label) must be rejected")
         } catch let error as MCPBootstrapDirectory.DirectoryError {

@@ -55,8 +55,7 @@ final class DirectHeadlessAgentRunPayloadBoundTests: XCTestCase {
         XCTAssertEqual(object["status"] as? String, "completed", "\(label): \(String(decoding: data.prefix(600), as: UTF8.self))")
         let limit = DomainAgentRunSnapshot.assistantTextCharacterLimit
         XCTAssertLessThan(data.count, 2 * limit, "\(label) serialized response must stay bounded")
-        let statusText = try XCTUnwrap(object["status_text"] as? String, label)
-        XCTAssertLessThanOrEqual(statusText.count, 512, "\(label) status_text must be concise")
+        XCTAssertEqual(object["status_text"] as? String, "Completed", "\(label) status_text must be the concise label")
         XCTAssertEqual(object["assistant_text_truncated"] as? Bool, true, label)
         XCTAssertEqual(object["assistant_text_characters"] as? Int, Self.replyCharacters, label)
         return object

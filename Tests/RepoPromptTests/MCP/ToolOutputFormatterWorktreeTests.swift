@@ -992,21 +992,24 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
 /// the original character count stable, and suppressing the preview must drop all three.
 @MainActor
 final class AgentRunMCPSnapshotTruncationRoundTripTests: XCTestCase {
-    func testOversizedSingleWaitRedecorationKeepsTruncationMetadataAcrossRepeatedRoundTrips() throws {
+    func testOversizedSingleWaitRedecorationKeepsTruncationMetadataAcrossRepeatedRoundTrips() async throws {
         let service = Self.makeService()
+        let agentModeVM = Self.makeAgentModeViewModel()
         let cases: [(label: String, text: String, characters: Int)] = [
             ("ascii", String(repeating: "x", count: 160_000), 160_000),
             ("byte-only", String(repeating: "👍🏽", count: 10000), 10000),
             ("single grapheme", "e" + String(repeating: "\u{0301}", count: 40000), 1)
         ]
         for (label, text, characters) in cases {
-            let published = Value.object(Self.snapshot(status: .completed, preview: text).asObject())
-            let first = try XCTUnwrap(published.objectValue)
-            var current = published
+            var published = Self.snapshot(status: .completed, preview: text).asObject()
+            published["_meta"] = .object(["wait_result": .string("completed")])
+            let first = published
+            var current = Value.object(published)
             for round in 1 ... 3 {
-                current = try service.test_redecoratedSingleWaitValue(from: current)
+                current = try await service.test_finalDecoratedSingleWaitValue(from: current, agentModeVM: agentModeVM)
                 let object = try XCTUnwrap(current.objectValue)
                 let context = "\(label) round \(round)"
+                XCTAssertEqual(object["_meta"]?.objectValue?["wait_result"], .string("completed"), context)
                 XCTAssertEqual(object["assistant_text"], first["assistant_text"], context)
                 XCTAssertTrue(
                     object["assistant_text"]?.stringValue?.hasSuffix(AgentRunMCPSnapshot.assistantTextTruncationMarker) == true,
@@ -1036,14 +1039,21 @@ final class AgentRunMCPSnapshotTruncationRoundTripTests: XCTestCase {
         XCTAssertNil(verbatim.latestAssistantPreviewTotalCharacters)
     }
 
-    func testSuppressedPreviewDropsTruncationMetadata() throws {
+    func testSuppressedPreviewDropsTruncationMetadata() async throws {
         let service = Self.makeService()
         let running = Self.snapshot(status: .running, preview: String(repeating: "r", count: 40000))
-        let redecorated = try XCTUnwrap(
-            service.test_redecoratedSingleWaitValue(from: .object(running.asObject()), wakeReason: .instructionDelivered)
-                .objectValue
+        var delivered = running.asObject()
+        delivered["_meta"] = .object([
+            "wake_reason": .string(AgentRunSessionStore.WakeReason.instructionDelivered.rawValue),
+            "wait_result": .string("woken")
+        ])
+        let finalized = try await service.test_finalDecoratedSingleWaitValue(
+            from: .object(delivered),
+            agentModeVM: Self.makeAgentModeViewModel()
         )
+        let redecorated = try XCTUnwrap(finalized.objectValue)
         Self.assertNoAssistantText(redecorated, "single wait suppression")
+        XCTAssertEqual(redecorated["_meta"]?.objectValue?["wait_result"], .string("woken"))
 
         let interrupt = try XCTUnwrap(AgentRunMCPToolService.test_decoratedMultiWaitInterruptValue(
             sessionIDs: [running.sessionID],
@@ -1085,6 +1095,18 @@ final class AgentRunMCPSnapshotTruncationRoundTripTests: XCTestCase {
             failureReason: nil,
             worktreeBindings: [],
             activeWorktreeMerges: []
+        )
+    }
+
+    private static func makeAgentModeViewModel() -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWindowID: -991,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Truncation round-trip tests must not start a Codex session")
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
         )
     }
 

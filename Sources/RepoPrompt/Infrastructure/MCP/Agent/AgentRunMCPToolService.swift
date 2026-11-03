@@ -2447,13 +2447,20 @@ struct AgentRunMCPToolService {
             return try snapshot(from: object)
         }
 
-        /// Mirrors the object path of `finalDecoratedSingleWaitValue`: decode an already
-        /// published snapshot, then decorate and republish it.
-        func test_redecoratedSingleWaitValue(
-            from value: Value,
-            wakeReason: AgentRunSessionStore.WakeReason? = nil
-        ) throws -> Value {
-            try decoratedRunValue(snapshot: test_decodeSnapshot(from: value), wakeReason: wakeReason)
+        /// Runs the real single-wait finalization (decode, decorate, `_meta` merge) over an
+        /// already published wait value.
+        func test_finalDecoratedSingleWaitValue(
+            from rawValue: Value,
+            agentModeVM: AgentModeViewModel
+        ) async throws -> Value {
+            let sessionID = rawValue.objectValue?["session_id"]?.stringValue.flatMap(UUID.init(uuidString:)) ?? UUID()
+            return try await finalDecoratedSingleWaitValue(
+                from: rawValue,
+                sessionID: sessionID,
+                agentModeVM: agentModeVM,
+                workflow: nil,
+                initialDelivery: nil
+            )
         }
 
         static func test_decoratedMultiWaitInterruptValue(
