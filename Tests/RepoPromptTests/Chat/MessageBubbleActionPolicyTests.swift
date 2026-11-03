@@ -42,7 +42,7 @@ final class MessageBubbleActionPolicyTests: XCTestCase {
         ]
         for (seconds, visible, spoken) in cases {
             let label = try XCTUnwrap(TokenUsagePresentation.elapsedText(seconds: seconds))
-            XCTAssertEqual(label.visible, "Elapsed: \(visible)")
+            XCTAssertEqual(label.visible, visible)
             XCTAssertEqual(label.spoken, "Elapsed \(spoken)")
         }
         let invalid: [Double?] = [nil, -1, .infinity, .nan, Double.greatestFiniteMagnitude]

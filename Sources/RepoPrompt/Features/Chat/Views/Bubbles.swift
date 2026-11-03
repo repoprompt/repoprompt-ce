@@ -23,7 +23,7 @@ enum TokenUsagePresentation {
         let spokenDuration = minutes == 0
             ? spokenSeconds
             : "\(minutes) \(minutes == 1 ? "minute" : "minutes"), \(spokenSeconds)"
-        return ("Elapsed: \(duration)", "Elapsed \(spokenDuration)")
+        return (duration, "Elapsed \(spokenDuration)")
     }
 
     static func text(inputTokens: Int?, outputTokens: Int?) -> String {
@@ -543,10 +543,14 @@ struct MessageBubble: View {
                             .foregroundColor(.secondary.opacity(0.6))
                     }
                     if let elapsed = TokenUsagePresentation.elapsedText(seconds: oracleElapsedSeconds) {
-                        Text(elapsed.visible)
-                            .font(fontPreset.captionFont)
-                            .foregroundColor(.secondary.opacity(0.8))
-                            .accessibilityLabel(elapsed.spoken)
+                        HStack(spacing: 3) {
+                            Image(systemName: "clock")
+                            Text(elapsed.visible)
+                        }
+                        .font(fontPreset.captionFont)
+                        .foregroundColor(.secondary.opacity(0.8))
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(elapsed.spoken)
                     }
                 }
                 .padding(.vertical, 6)
