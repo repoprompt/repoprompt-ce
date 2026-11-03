@@ -76,11 +76,37 @@ jobs:
       - name: Configure retained package diagnostics
         run: echo "REPOPROMPT_DEV_DAEMON_STATE_DIR=$RUNNER_TEMP/admission-conductor" >> "$GITHUB_ENV"
 
+      - name: Identify release build cache compatibility
+        id: release-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            xcodebuild -version
+            xcrun swift --version
+            xcrun --sdk macosx --show-sdk-path
+            xcrun --sdk macosx --show-sdk-version
+            printf '%s\n' "${ImageOS:-}" "${ImageVersion:-}" "$GITHUB_WORKSPACE"
+          } > "$RUNNER_TEMP/admission-release-toolchain.txt"
+          toolchain="$(shasum -a 256 "$RUNNER_TEMP/admission-release-toolchain.txt" | awk '{print $1}')"
+          echo "key=$toolchain" >> "$GITHUB_OUTPUT"
+
+      # Cache only SwiftPM intermediates, never packaged apps or admission evidence.
+      # One immutable main seed per compatible toolchain/policy avoids per-PR churn.
+      - name: Restore universal release build intermediates
+        id: release-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .build/public-release-swiftpm
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-admission-release-v1-${{ steps.release-toolchain.outputs.key }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/**/Package.swift', 'Packages/**/Package.resolved', 'Scripts/build_swiftpm_release_products.sh', 'Scripts/patch_keyboard_shortcuts_resource_lookup.sh', 'Scripts/patches/*.patch', 'Scripts/run_without_github_tokens.sh', 'Scripts/compare_swiftpm_release_resources.py', 'Scripts/conductor.py', 'Scripts/package_app.sh', 'Scripts/release.sh', 'Scripts/release_sentry_symbols.sh', 'Vendor/Sparkle/SHA256SUMS', '.github/workflows/ci-integration-products.yml') }}
+
       - name: Run release preflight
         run: ./conductor release preflight --full-log
 
       - name: Package secret-free universal ad-hoc release candidate
         timeout-minutes: 245
+        env:
+          REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS: "0"
         run: ./conductor release artifact --full-log
 
       - name: Smoke exact release-mode packaged MCP helper
@@ -91,6 +117,13 @@ jobs:
             ".build/release/RepoPrompt.app" \
             "Admission release-mode package" \
             ".build/release/RepoPrompt-artifact-manifest.json"
+
+      - name: Seed universal release build cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.release-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .build/public-release-swiftpm
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
 
       - name: Transfer the same candidate to older macOS runners
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f

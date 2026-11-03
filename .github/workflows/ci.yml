@@ -40,7 +40,9 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
 
   integration-products:
-    needs: candidate
+    # Reserve scarce macOS runners for candidates that passed the root gates.
+    # Style still fails closed when these products are skipped after a failure.
+    needs: [candidate, build-test-bundles, build-and-test, secret-scan]
     uses: ./.github/workflows/ci-integration-products.yml
     with:
       admission: ${{ needs.candidate.outputs.context }}
