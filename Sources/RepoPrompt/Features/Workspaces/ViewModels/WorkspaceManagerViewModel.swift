@@ -8168,7 +8168,8 @@ class WorkspaceManagerViewModel: ObservableObject {
                     after: outcome,
                     workspaceID: workspaceID,
                     draft: workspace,
-                    stateVersion: publishedStateVersion
+                    stateVersion: publishedStateVersion,
+                    committedPhase: .working
                 )
                 guard !abandonAfterOutcome, !Task.isCancelled, outcome.errorCode != .cancelled else { return }
                 if !Self.isSuccessfulDomainOutcome(outcome) {
@@ -8518,20 +8519,24 @@ class WorkspaceManagerViewModel: ObservableObject {
     // MARK: - Recovery-backup blocks (#335)
 
     /// Records or clears the recovery-backup block a working commit or save outcome implies.
+    /// `committedPhase` is the durability point a success reached.
     private func updateRecoveryBackupBlock(
         after outcome: DomainCommandOutcome,
         workspaceID: UUID,
         draft: WorkspaceModel,
-        stateVersion: Int
+        stateVersion: Int,
+        committedPhase: WorkspaceRecoveryBackupBlock.Phase
     ) {
         if Self.isSuccessfulDomainOutcome(outcome) {
-            clearRecoveryBackupBlock(workspaceID: workspaceID, durableStateVersion: stateVersion)
+            clearRecoveryBackupBlock(workspaceID: workspaceID, durableStateVersion: stateVersion, committedPhase: committedPhase)
         } else if outcome.errorCode == .recoveryBackupRequired {
+            let diagnostic = outcome.diagnostic ?? "recovery_backup_unavailable"
             recordRecoveryBackupBlock(
                 workspaceID: workspaceID,
                 draft: draft,
                 stateVersion: stateVersion,
-                reason: outcome.diagnostic ?? "recovery backup unavailable"
+                reason: diagnostic,
+                phase: diagnostic.contains(DomainDurableReplacement.Location.savedDocument.rawValue) ? .saved : .working
             )
         }
     }
@@ -8540,93 +8545,183 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspaceID: UUID,
         draft: WorkspaceModel,
         stateVersion: Int,
-        reason: String
+        reason: String,
+        phase: WorkspaceRecoveryBackupBlock.Phase
     ) {
         // The window's current model is the newest draft; the refused payload is the fallback.
         let latest = workspace(withID: workspaceID) ?? draft
         if var block = recoveryBackupBlocks[workspaceID] {
-            block.reason = reason
+            if !block.isConflicted {
+                block.reason = reason
+            }
+            block.phase = block.phase == .saved || phase == .saved ? .saved : .working
             block.draft = latest
             block.draftStateVersion = max(block.draftStateVersion, stateVersion)
             recoveryBackupBlocks[workspaceID] = block
         } else {
-            recoveryBackupBlocks[workspaceID] = WorkspaceRecoveryBackupBlock(
+            let block = WorkspaceRecoveryBackupBlock(
                 workspaceID: workspaceID,
                 reason: reason,
+                phase: phase,
                 draft: latest,
-                draftStateVersion: stateVersion
+                draftStateVersion: stateVersion,
+                baseDigest: fullDocumentWriteBaselines[workspaceID]?.contentDigest
             )
+            recoveryBackupBlocks[workspaceID] = block
+            captureRecoveryBackupBase(workspaceID: workspaceID, blockID: block.id)
         }
         Self.logger.error(
             "Workspace saves blocked until a recovery backup succeeds workspace=\(workspaceID.uuidString, privacy: .public) reason=\(reason, privacy: .public)"
         )
     }
 
-    /// Clears a block only when a save that captured at least the blocked draft became durable.
-    private func clearRecoveryBackupBlock(workspaceID: UUID, durableStateVersion: Int) {
+    /// Captures the canonical contents the draft descends from, so newer canonical contents can
+    /// be merged rather than overwritten. Left nil (and therefore conflicting) if the authority
+    /// already moved past the draft's baseline.
+    private func captureRecoveryBackupBase(workspaceID: UUID, blockID: UUID) {
+        guard let domainWorkspaceAuthorityClient else { return }
+        Task { @MainActor [weak self] in
+            guard let snapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID),
+                  let self,
+                  var block = recoveryBackupBlocks[workspaceID],
+                  block.id == blockID,
+                  block.base == nil,
+                  snapshot.document.contentDigest == block.baseDigest,
+                  let base = try? Self.decodeDomainWorkspaceProjection(
+                      documentBytes: snapshot.document.documentBytes,
+                      fileURL: snapshot.document.fileURL
+                  )
+            else { return }
+            block.base = base
+            recoveryBackupBlocks[workspaceID] = block
+        }
+    }
+
+    /// Clears a block only when a save that captured at least the blocked draft reached the
+    /// blocked phase's durability point (a working-copy commit never clears a saved block).
+    private func clearRecoveryBackupBlock(
+        workspaceID: UUID,
+        durableStateVersion: Int,
+        committedPhase: WorkspaceRecoveryBackupBlock.Phase
+    ) {
         guard let block = recoveryBackupBlocks[workspaceID],
-              durableStateVersion >= block.draftStateVersion
+              !block.isConflicted,
+              durableStateVersion >= block.draftStateVersion,
+              block.phase == .working || committedPhase == .saved
         else { return }
         recoveryBackupBlocks.removeValue(forKey: workspaceID)
     }
 
+    private struct RecoveryBackupOverlay {
+        var workspaces: [WorkspaceModel]
+        /// Blocked workspaces whose local draft (or merge) replaces the projection.
+        var heldWorkspaceIDs: Set<UUID> = []
+        /// Merged drafts that now descend from the projected canonical contents.
+        var adoptedWorkspaceIDs: Set<UUID> = []
+    }
+
     /// Catalog reconciliation would replace a blocked workspace's unsaved draft with canonical
-    /// bytes. Scoped to blocked workspaces only, the draft is kept instead. When the canonical
-    /// bytes moved on (peer publication, external change), the draft no longer descends from its
-    /// write baseline, so the CAS witness is dropped; Retry re-adopts the current authority state.
+    /// bytes. Scoped to blocked workspaces only:
+    /// - unchanged canonical contents keep the draft and its write baseline;
+    /// - newer canonical contents are merged onto the draft at compose-tab level and the merged
+    ///   draft adopts the newer baseline, so working commits keep journaling it;
+    /// - a conflicting change fails closed: the draft stays visible, saving is refused, and the
+    ///   CAS witness is dropped so nothing can overwrite the newer contents.
     private func applyingRecoveryBackupDraftOverlay(
         to projection: [WorkspaceModel],
         decodedWorkspaceIDs: Set<UUID>,
         projectedDigestsByWorkspaceID: [UUID: String]
-    ) -> [WorkspaceModel] {
-        guard !recoveryBackupBlocks.isEmpty else { return projection }
-        var overlaid = projection
+    ) -> RecoveryBackupOverlay {
+        var overlay = RecoveryBackupOverlay(workspaces: projection)
+        guard !recoveryBackupBlocks.isEmpty else { return overlay }
         var retainedBlocks: [UUID: WorkspaceRecoveryBackupBlock] = [:]
-        for index in overlaid.indices {
-            let workspaceID = overlaid[index].id
+        for index in overlay.workspaces.indices {
+            let workspaceID = overlay.workspaces[index].id
             guard var block = recoveryBackupBlocks[workspaceID] else { continue }
+            let canonical = overlay.workspaces[index]
             let draft = workspace(withID: workspaceID) ?? block.draft
-            if overlaid[index] != draft,
-               decodedWorkspaceIDs.contains(workspaceID),
-               fullDocumentWriteBaselines[workspaceID]?.contentDigest != projectedDigestsByWorkspaceID[workspaceID]
-            {
-                invalidateFullDocumentAdoption(workspaceID: workspaceID)
+            let canonicalDigest = projectedDigestsByWorkspaceID[workspaceID]
+            if !decodedWorkspaceIDs.contains(workspaceID) || block.isConflicted || canonicalDigest == block.baseDigest {
+                if canonicalDigest == block.baseDigest, block.base == nil {
+                    block.base = canonical
+                }
+                overlay.workspaces[index] = draft
+                overlay.heldWorkspaceIDs.insert(workspaceID)
+                block.draft = draft
+                retainedBlocks[workspaceID] = block
+                continue
             }
-            overlaid[index] = draft
-            block.draft = draft
-            retainedBlocks[workspaceID] = block
+            let result: WorkspaceRecoveryDraftMerge.Result = if let base = block.base {
+                WorkspaceRecoveryDraftMerge.merge(base: base, draft: draft, canonical: canonical)
+            } else {
+                .conflict([workspaceID])
+            }
+            switch result {
+            case let .merged(merged) where merged == canonical && block.phase == .working:
+                // Nothing of the draft remains uncommitted; the canonical contents win normally.
+                continue
+            case let .merged(merged):
+                // The merged draft is journaled from the newer baseline, but saving stays blocked
+                // until a saved commit succeeds; holding it also keeps a later, staler projection
+                // from replacing it. Once the canonical contents catch up, the block simply rebases.
+                overlay.workspaces[index] = merged
+                overlay.heldWorkspaceIDs.insert(workspaceID)
+                if merged != canonical {
+                    overlay.adoptedWorkspaceIDs.insert(workspaceID)
+                }
+                block.draft = merged
+                block.base = canonical
+                block.baseDigest = canonicalDigest
+                block.phase = .saved
+                retainedBlocks[workspaceID] = block
+            case let .conflict(tabIDs):
+                overlay.workspaces[index] = draft
+                overlay.heldWorkspaceIDs.insert(workspaceID)
+                invalidateFullDocumentAdoption(workspaceID: workspaceID)
+                block.draft = draft
+                block.conflictingTabIDs = tabIDs
+                block.reason = "conflicting_changes"
+                retainedBlocks[workspaceID] = block
+            }
         }
         // A workspace that left the catalog (explicit deletion) takes its block with it.
         if retainedBlocks != recoveryBackupBlocks {
             recoveryBackupBlocks = retainedBlocks
         }
-        return overlaid
+        return overlay
     }
 
-    /// One bounded save attempt for a blocked workspace, saving what this window shows. If the
-    /// authority moved on since the block, the draft is saved against the authority's current
-    /// revision and digest (the explicit user action re-adopts that baseline).
-    @discardableResult
-    func retryRecoveryBackupBlockedSave(workspaceID: UUID) async -> Bool {
-        guard recoveryBackupBlocks[workspaceID] != nil,
-              let index = workspaceIndex(for: workspaceID)
-        else { return false }
-        let fileURL = workspaceFileURL(for: workspaces[index])
-        if domainWorkspaceAuthorityClient != nil,
-           fullDocumentWriteBaseline(workspaceID: workspaceID) == nil,
-           let revisions = domainWorkspaceRevisionsByID[workspaceID],
-           let digest = domainWorkspaceDigestsByID[workspaceID]
-        {
+    /// After a merged draft is installed, it descends from the projected canonical contents:
+    /// adopt that baseline and journal the merged draft as working state.
+    private func adoptRecoveryBackupMerges(_ workspaceIDs: Set<UUID>) {
+        for workspaceID in workspaceIDs {
+            guard let revisions = domainWorkspaceRevisionsByID[workspaceID],
+                  let digest = domainWorkspaceDigestsByID[workspaceID],
+                  let merged = workspace(withID: workspaceID)
+            else { continue }
             adoptFullDocumentBaseline(
                 workspaceID: workspaceID,
                 revisions: revisions,
                 digest: digest,
-                fileURL: domainWorkspaceFileURLsByID[workspaceID] ?? fileURL
+                fileURL: domainWorkspaceFileURLsByID[workspaceID] ?? workspaceFileURL(for: merged)
             )
+            Task { @MainActor [weak self] in
+                self?.publishWorkingDocumentToDomainAuthority(merged)
+            }
         }
+    }
+
+    /// One bounded save attempt for a blocked workspace. A conflicted draft is never saved: newer
+    /// contents from another writer are not overwritten.
+    @discardableResult
+    func retryRecoveryBackupBlockedSave(workspaceID: UUID) async -> Bool {
+        guard let block = recoveryBackupBlocks[workspaceID],
+              !block.isConflicted,
+              let index = workspaceIndex(for: workspaceID)
+        else { return false }
         let result = await saveWorkspaceAsync(
             workspaceID: workspaceID,
-            fileURL: fileURL,
+            fileURL: workspaceFileURL(for: workspaces[index]),
             source: "recoveryBackupRetry",
             remainingRetryCount: 0
         )
@@ -8634,6 +8729,38 @@ class WorkspaceManagerViewModel: ObservableObject {
             return recoveryBackupBlocks[workspaceID] == nil
         }
         return false
+    }
+
+    #if DEBUG
+        func recordRecoveryBackupBlockForTesting(
+            workspaceID: UUID,
+            draft: WorkspaceModel,
+            stateVersion: Int,
+            phase: WorkspaceRecoveryBackupBlock.Phase
+        ) {
+            recordRecoveryBackupBlock(
+                workspaceID: workspaceID,
+                draft: draft,
+                stateVersion: stateVersion,
+                reason: "injected",
+                phase: phase
+            )
+        }
+
+        func applyRecoveryBackupCommitForTesting(
+            workspaceID: UUID,
+            stateVersion: Int,
+            committedPhase: WorkspaceRecoveryBackupBlock.Phase
+        ) {
+            clearRecoveryBackupBlock(workspaceID: workspaceID, durableStateVersion: stateVersion, committedPhase: committedPhase)
+        }
+    #endif
+
+    /// Explicitly drops a blocked draft and reloads the authority's current contents.
+    func discardRecoveryBlockedDraft(workspaceID: UUID) {
+        guard recoveryBackupBlocks.removeValue(forKey: workspaceID) != nil else { return }
+        invalidateFullDocumentAdoption(workspaceID: workspaceID)
+        requestFullDocumentAdoption(workspaceID: workspaceID)
     }
 
     func reportDomainAuthorityIssue(_ outcome: DomainCommandOutcome, operation: String) {
@@ -9767,13 +9894,15 @@ class WorkspaceManagerViewModel: ObservableObject {
             workspaces,
             repairBaselines
         )
-        let reconciledWorkspaces = applyingRecoveryBackupDraftOverlay(
+        let recoveryOverlay = applyingRecoveryBackupDraftOverlay(
             to: lifecycleProjection?.workspaces ?? localProjection,
             decodedWorkspaceIDs: decodedWorkspaceIDs,
             projectedDigestsByWorkspaceID: digestsByWorkspaceID
         )
+        let reconciledWorkspaces = recoveryOverlay.workspaces
         for projected in reconciledWorkspaces
             where decodedWorkspaceIDs.contains(projected.id) && !staleWorkspaceIDs.contains(projected.id)
+            && !recoveryOverlay.heldWorkspaceIDs.contains(projected.id)
             && workspace(withID: projected.id) != projected
         {
             // An unrelated catalog row or unchanged cached overlay is not a new local lineage.
@@ -9781,6 +9910,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             invalidateFullDocumentAdoption(workspaceID: projected.id)
         }
         workspaces = reconciledWorkspaces
+        adoptRecoveryBackupMerges(recoveryOverlay.adoptedWorkspaceIDs)
         scheduleAuthorityIncompleteRestoreClassification(
             workspaces: reconciledWorkspaces,
             fileURLsByWorkspaceID: domainWorkspaceFileURLsByID,
@@ -16648,20 +16778,30 @@ class WorkspaceManagerViewModel: ObservableObject {
             let metadata = workspaceSaveMetadata(for: merged, source: source)
             WorkspaceFileDecodeCache.shared.invalidate(url: fileURL)
             let receipt = await workspaceDiskWriter.enqueueWorkspaceAwaitingReceipt(data: data, url: fileURL, metadata: metadata)
-            if let blocked = Self.recoveryBackupBlock(in: receipt) {
-                recordRecoveryBackupBlock(
-                    workspaceID: workspaceID,
-                    draft: merged,
-                    stateVersion: capturedStateVersion,
-                    reason: blocked.reason
-                )
+            switch receipt {
+            case .written:
+                clearRecoveryBackupBlock(workspaceID: workspaceID, durableStateVersion: capturedStateVersion, committedPhase: .saved)
+            case .skipped:
+                break
+            case let .failed(failure):
+                if let blocked = failure.error as? WorkspaceRecoveryBackupBlockedError {
+                    recordRecoveryBackupBlock(
+                        workspaceID: workspaceID,
+                        draft: merged,
+                        stateVersion: capturedStateVersion,
+                        reason: blocked.reason,
+                        phase: .saved
+                    )
+                    return .failure(WorkspacePersistenceFailure(
+                        category: .recoveryBackupBlocked,
+                        domainDiagnostic: blocked.reason
+                    ))
+                }
+                // Any other write failure (ENOSPC, EACCES, ...) is a failed save, not a success.
                 return .failure(WorkspacePersistenceFailure(
-                    category: .recoveryBackupBlocked,
-                    domainDiagnostic: blocked.reason
+                    category: .persistenceFailure,
+                    domainDiagnostic: String(describing: failure.error)
                 ))
-            }
-            if case .written = receipt {
-                clearRecoveryBackupBlock(workspaceID: workspaceID, durableStateVersion: capturedStateVersion)
             }
 
             if indexFieldsChanged, workspaceIndex(for: workspaceID) != nil {
@@ -17232,7 +17372,8 @@ class WorkspaceManagerViewModel: ObservableObject {
             after: outcome,
             workspaceID: workspaceToSave.id,
             draft: capture.localWorkspace,
-            stateVersion: capturedStateVersion
+            stateVersion: capturedStateVersion,
+            committedPhase: .saved
         )
         guard Self.isSuccessfulDomainOutcome(outcome) else {
             await refreshCanonicalRootState(workspaceID: workspaceToSave.id)
@@ -17498,14 +17639,18 @@ class WorkspaceManagerViewModel: ObservableObject {
             url: finalURL,
             metadata: metadata
         )
-        if let blocked = Self.recoveryBackupBlock(in: receipt) {
-            recordRecoveryBackupBlock(
-                workspaceID: workspace.id,
-                draft: workspace,
-                stateVersion: stateVersionByWorkspaceID[workspace.id, default: 0],
-                reason: blocked.reason
-            )
-            throw blocked
+        if case let .failed(failure) = receipt {
+            if let blocked = failure.error as? WorkspaceRecoveryBackupBlockedError {
+                recordRecoveryBackupBlock(
+                    workspaceID: workspace.id,
+                    draft: workspace,
+                    stateVersion: stateVersionByWorkspaceID[workspace.id, default: 0],
+                    reason: blocked.reason,
+                    phase: .saved
+                )
+                throw blocked
+            }
+            throw failure.error
         }
 
         return finalURL

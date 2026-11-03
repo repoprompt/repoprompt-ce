@@ -724,17 +724,202 @@ import XCTest
     }
 
     /// Task 0 of the #335 follow-up: a save refused for a missing recovery backup keeps the latest
-    /// draft through catalog reconciliation and a peer publication, and an explicit Retry saves it
-    /// against the authority's current baseline.
+    /// draft through reconciliation; newer canonical contents merge at compose-tab level, and a
+    /// conflicting change fails closed instead of being overwritten.
     @MainActor
     final class WorkspaceRecoveryBackupBlockTests: XCTestCase {
         static let draftMarker = "RECOVERY-BLOCKED-DRAFT"
 
-        func testBlockedDraftSurvivesReconciliationAndPeerPublicationThenRetrySavesIt() async throws {
+        func testPeerEditOnAnotherTabMergesAndRetrySavesBoth() async throws {
+            let fixture = try await BlockedWindowFixture.make(testCase: self, probe: DraftRefusalProbe())
+            let manager = fixture.manager
+            try await fixture.blockDraft(promptText: Self.draftMarker)
+
+            fixture.probe.setRefusing(false)
+            try await fixture.publishPeer { peer in
+                peer.composeTabs.append(ComposeTabState(id: UUID(), name: "Peer tab", lastModified: Date(), promptText: "peer"))
+            }
+
+            let local = try XCTUnwrap(manager.workspace(withID: fixture.workspaceID))
+            XCTAssertEqual(local.composeTabs.first?.name, Self.draftMarker, "The draft's tab is kept")
+            XCTAssertTrue(local.composeTabs.contains { $0.name == "Peer tab" }, "The peer's new tab is merged in")
+            XCTAssertNotNil(manager.recoveryBackupBlocks[fixture.workspaceID], "Saving stays blocked until a save succeeds")
+            // The merged draft descends from the newer canonical contents, so it is journaled as
+            // working state instead of failing every commit with a stale baseline.
+            let deadline = Date().addingTimeInterval(10)
+            var journaled: WorkspaceModel?
+            while Date() < deadline {
+                let snapshot = await fixture.runtime.workspaceStore.canonicalWorkspaceSnapshot(fixture.workspaceID)
+                journaled = try snapshot.map { try JSONDecoder().decode(WorkspaceModel.self, from: $0.document.documentBytes) }
+                if journaled?.composeTabs.first?.name == Self.draftMarker { break }
+                try await Task.sleep(nanoseconds: 50_000_000)
+            }
+            XCTAssertEqual(journaled?.composeTabs.first?.name, Self.draftMarker)
+            XCTAssertTrue(journaled?.composeTabs.contains { $0.name == "Peer tab" } ?? false)
+            try await Task.sleep(nanoseconds: 1_000_000_000)
+            XCTAssertEqual(
+                manager.workspace(withID: fixture.workspaceID)?.composeTabs.first?.name, Self.draftMarker,
+                "A later projection never replaces the held draft"
+            )
+
+            let retried = await manager.retryRecoveryBackupBlockedSave(workspaceID: fixture.workspaceID)
+            XCTAssertTrue(retried)
+            XCTAssertNil(manager.recoveryBackupBlocks[fixture.workspaceID])
+            let saved = try fixture.savedModel()
+            XCTAssertEqual(saved.composeTabs.first?.name, Self.draftMarker)
+            XCTAssertTrue(saved.composeTabs.contains { $0.name == "Peer tab" }, "Retry never drops the peer's edit")
+        }
+
+        func testConflictingPeerEditFailsClosedUntilTheDraftIsDiscarded() async throws {
+            let fixture = try await BlockedWindowFixture.make(testCase: self, probe: DraftRefusalProbe())
+            let manager = fixture.manager
+            try await fixture.blockDraft(promptText: Self.draftMarker)
+
+            let peerDocument = try await fixture.publishPeer { peer in
+                peer.composeTabs[0].name = "peer publication"
+            }
+
+            let block = try XCTUnwrap(manager.recoveryBackupBlocks[fixture.workspaceID])
+            XCTAssertTrue(block.isConflicted)
+            XCTAssertEqual(manager.workspace(withID: fixture.workspaceID)?.composeTabs.first?.name, Self.draftMarker)
+            XCTAssertTrue(WorkspaceRecoveryBackupBlockBanner.message(for: block).contains("won't overwrite"))
+
+            fixture.probe.setRefusing(false)
+            let retried = await manager.retryRecoveryBackupBlockedSave(workspaceID: fixture.workspaceID)
+            XCTAssertFalse(retried, "A conflicted draft is never saved over the newer contents")
+            XCTAssertEqual(try Data(contentsOf: peerDocument.fileURL), peerDocument.documentBytes)
+
+            manager.discardRecoveryBlockedDraft(workspaceID: fixture.workspaceID)
+            let refreshed = await fixture.bridge.refreshForAgentAdmission()
+            XCTAssertTrue(refreshed)
+            XCTAssertNil(manager.recoveryBackupBlocks[fixture.workspaceID])
+            XCTAssertEqual(manager.workspace(withID: fixture.workspaceID)?.composeTabs.first?.name, "peer publication")
+        }
+
+        func testWorkingCommitDoesNotClearASavedPhaseBlock() {
+            let window = WindowState()
+            addTeardownBlock { @MainActor in
+                window.beginClose()
+                await window.tearDown()
+            }
+            let manager = window.workspaceManager
+            let workspaceID = UUID()
+            let draft = WorkspaceModel(name: "Phases", repoPaths: [NSTemporaryDirectory()])
+            manager.recordRecoveryBackupBlockForTesting(workspaceID: workspaceID, draft: draft, stateVersion: 3, phase: .saved)
+            manager.applyRecoveryBackupCommitForTesting(workspaceID: workspaceID, stateVersion: 3, committedPhase: .working)
+            XCTAssertNotNil(manager.recoveryBackupBlocks[workspaceID], "A journaled working copy is not the saved document")
+            manager.applyRecoveryBackupCommitForTesting(workspaceID: workspaceID, stateVersion: 2, committedPhase: .saved)
+            XCTAssertNotNil(manager.recoveryBackupBlocks[workspaceID], "An older save does not cover the blocked draft")
+            manager.applyRecoveryBackupCommitForTesting(workspaceID: workspaceID, stateVersion: 3, committedPhase: .saved)
+            XCTAssertNil(manager.recoveryBackupBlocks[workspaceID])
+
+            manager.recordRecoveryBackupBlockForTesting(workspaceID: workspaceID, draft: draft, stateVersion: 4, phase: .working)
+            manager.applyRecoveryBackupCommitForTesting(workspaceID: workspaceID, stateVersion: 4, committedPhase: .working)
+            XCTAssertNil(manager.recoveryBackupBlocks[workspaceID])
+        }
+
+        /// End to end with the real app guard and a really corrupted tab (no probe).
+        func testRealGuardRefusesDiscardingCorruptedTabUntilBackupSucceeds() async throws {
+            let root = FileManager.default.temporaryDirectory
+                .resolvingSymlinksInPath()
+                .appendingPathComponent("real-guard-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let storage = root.appendingPathComponent("storage", isDirectory: true)
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app,
+                profileIdentifier: "real-guard",
+                storageDirectory: root.appendingPathComponent("authority", isDirectory: true),
+                workspaceStorageDirectory: storage,
+                eventDirectory: root.appendingPathComponent("events", isDirectory: true),
+                temporaryDirectory: root.appendingPathComponent("tmp", isDirectory: true),
+                externalReloadInterval: nil,
+                durableReplacementGuard: WorkspaceUnreadableDocumentBackup.durableReplacementGuard
+            ))
+            try await runtime.start()
+            addTeardownBlock {
+                _ = await runtime.shutdown()
+                try? FileManager.default.removeItem(at: root)
+            }
+            let date = Date(timeIntervalSince1970: 100)
+            let model = WorkspaceModel(
+                id: UUID(),
+                dateModified: date,
+                name: "Corrupted",
+                repoPaths: [root.path],
+                lastUsed: date,
+                composeTabs: ["Alpha", "Beta"].map { ComposeTabState(id: UUID(), name: $0, lastModified: date, promptText: $0) },
+                activeComposeTabID: nil
+            )
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(model)) as? [String: Any])
+            var tabs = try XCTUnwrap(object["composeTabs"] as? [[String: Any]])
+            tabs[1]["promptText"] = 42
+            object["composeTabs"] = tabs
+            let original = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            let fileURL = storage.appendingPathComponent("Corrupted-\(model.id.uuidString)/workspace.json")
+            let originalDocument = try DomainWorkspaceDocument.decode(documentBytes: original, fileURL: fileURL)
+            func run(_ command: DomainWorkspaceCommand) async -> DomainCommandOutcome {
+                await runtime.workspaceStore.execute(.init(operationID: UUID(), origin: .appPresentation(windowID: 1), command: command))
+            }
+            let created = await run(.createWorkspace(originalDocument))
+            XCTAssertEqual(created.disposition, .applied)
+            let reduced = try JSONEncoder().encode(JSONDecoder().decode(WorkspaceModel.self, from: original))
+            let reducedDocument = try DomainWorkspaceDocument.decode(documentBytes: reduced, fileURL: fileURL)
+            let replaced = await run(.replaceWorkingDocument(reducedDocument))
+            XCTAssertEqual(replaced.disposition, .applied)
+
+            let locator = WorkspaceUnreadableDocumentBackup.backupURL(for: fileURL, documentBytes: original)
+            try FileManager.default.createDirectory(at: locator, withIntermediateDirectories: false)
+            let refused = await run(.saveWorkspaceDocument(workspaceID: model.id))
+            XCTAssertEqual(refused.errorCode, .recoveryBackupRequired)
+            XCTAssertEqual(try Data(contentsOf: fileURL), original)
+
+            try FileManager.default.removeItem(at: locator)
+            let saved = await run(.saveWorkspaceDocument(workspaceID: model.id))
+            XCTAssertEqual(saved.disposition, .applied)
+            XCTAssertEqual(try Data(contentsOf: fileURL), reduced)
+            XCTAssertEqual(try Data(contentsOf: locator), original)
+        }
+    }
+
+    /// Simulates "this window's saves are blocked": refuses every durable replacement carrying the
+    /// draft marker. The real discarded-bytes policy is covered end to end above.
+    private final class DraftRefusalProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var refusing = true
+
+        func setRefusing(_ value: Bool) {
+            lock.withLock { refusing = value }
+        }
+
+        func protect(_ replacement: DomainDurableReplacement) throws {
+            guard lock.withLock({ refusing }),
+                  String(decoding: replacement.replacementBytes, as: UTF8.self)
+                  .contains(WorkspaceRecoveryBackupBlockTests.draftMarker)
+            else { return }
+            throw WorkspaceRecoveryBackupBlockedError(reason: "writeFailed(\"temp_open_failed_28\")")
+        }
+    }
+
+    @MainActor
+    private struct BlockedWindowFixture {
+        let window: WindowState
+        let runtime: MCPDomainRuntime
+        let bridge: DomainWorkspacePresentationBridge
+        let probe: DraftRefusalProbe
+        let workspaceID: UUID
+        let fileURL: URL
+        let before: WorkspaceModel
+        let beforeRevision: UInt64
+        let beforeDigest: String
+
+        var manager: WorkspaceManagerViewModel {
+            window.workspaceManager
+        }
+
+        static func make(testCase: XCTestCase, probe: DraftRefusalProbe) async throws -> Self {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("recovery-blocked-draft-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            let probe = DraftRefusalProbe()
             let runtime = MCPDomainRuntime(configuration: .init(
                 mode: .app,
                 profileIdentifier: "recovery-blocked-draft",
@@ -753,66 +938,85 @@ import XCTest
             let window = WindowState(domainRuntime: runtime)
             WindowStatesManager.shared.registerWindowState(window)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-            defer {
-                if let previousStoragePath {
-                    UserDefaults.standard.set(previousStoragePath, forKey: "GlobalCustomStorageURL")
-                } else {
-                    UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
-                }
-            }
-            addTeardownBlock { @MainActor in
+            testCase.addTeardownBlock { @MainActor in
                 window.beginClose()
                 await window.domainWorkspacePresentationBridgeForTesting?.stopAndJoinForTesting()
                 await window.tearDown()
                 WindowStatesManager.shared.unregisterWindowState(window)
                 _ = await runtime.shutdown()
                 await WorkspaceDiskWriterComposition.processWriter.removeAllForTesting()
+                if let previousStoragePath {
+                    UserDefaults.standard.set(previousStoragePath, forKey: "GlobalCustomStorageURL")
+                } else {
+                    UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+                }
                 try? FileManager.default.removeItem(at: root)
             }
-
             let manager = window.workspaceManager
             await manager.awaitInitialized()
             let creation = try manager.createPersistentWorkspace(name: "Recovery Blocked", repoPaths: [root.path])
             let created = try await creation.publishedWorkspace()
             let switched = await manager.switchWorkspace(to: created, saveState: false, reason: "recoveryBackupBlockTest")
             XCTAssertTrue(switched.didSwitch)
-            let workspaceID = created.id
             let bridge = try XCTUnwrap(window.domainWorkspacePresentationBridgeForTesting)
-            let refreshedValue = await bridge.refreshForAgentAdmission()
-            XCTAssertTrue(refreshedValue)
-            let beforeValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
-            let before = try XCTUnwrap(beforeValue)
-            let canonicalBefore = try Data(contentsOf: before.document.fileURL)
+            let refreshed = await bridge.refreshForAgentAdmission()
+            XCTAssertTrue(refreshed)
+            // A peer journals a benign working edit, so the window's draft commit discards durable
+            // working bytes and the probe can refuse it (a clean journal discards nothing).
+            let cleanValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(created.id)
+            let clean = try XCTUnwrap(cleanValue)
+            var benign = try JSONDecoder().decode(WorkspaceModel.self, from: clean.document.documentBytes)
+            benign.composeTabs[0].name = "benign working edit"
+            let benignOutcome = try await DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -990)
+                .replaceWorkingFailClosed(benign, fileURL: clean.document.fileURL, expectedWorkspaceRevision: clean.revisions.workingRevision)
+            XCTAssertEqual(benignOutcome.disposition, .applied)
+            let benignRefresh = await bridge.refreshForAgentAdmission()
+            XCTAssertTrue(benignRefresh)
+            XCTAssertEqual(manager.workspace(withID: created.id)?.composeTabs.first?.name, "benign working edit")
+            let snapshotValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(created.id)
+            let snapshot = try XCTUnwrap(snapshotValue)
+            return try Self(
+                window: window,
+                runtime: runtime,
+                bridge: bridge,
+                probe: probe,
+                workspaceID: created.id,
+                fileURL: snapshot.document.fileURL,
+                before: JSONDecoder().decode(WorkspaceModel.self, from: snapshot.document.documentBytes),
+                beforeRevision: snapshot.revisions.workingRevision,
+                beforeDigest: snapshot.document.contentDigest
+            )
+        }
 
-            // 1. The draft's save is refused: nothing durable changes and the block is visible.
+        /// Renames the first tab (a field no view model mirrors back) and saves; the probe
+        /// refuses it, so nothing durable changes.
+        func blockDraft(promptText: String) async throws {
             var draft = try XCTUnwrap(manager.workspace(withID: workspaceID))
-            draft.composeTabs[0].promptText = Self.draftMarker
+            draft.composeTabs[0].name = promptText
             let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
             manager.workspaces[index] = draft
+            let canonicalBefore = try Data(contentsOf: fileURL)
             do {
                 _ = try await manager.saveWorkspaceToFileAsync(draft, source: "recoveryBackupBlockTest")
                 XCTFail("The save must be refused while the recovery backup cannot be made")
             } catch {}
             XCTAssertNotNil(manager.recoveryBackupBlocks[workspaceID])
-            XCTAssertEqual(try Data(contentsOf: before.document.fileURL), canonicalBefore)
-            XCTAssertTrue(
-                WorkspaceRecoveryBackupBlockBanner.message(reason: "x").contains("kept only in this window"),
-                "The banner must not imply the draft is durable"
-            )
+            XCTAssertEqual(try Data(contentsOf: fileURL), canonicalBefore)
+            let deadline = Date().addingTimeInterval(10)
+            while manager.recoveryBackupBlocks[workspaceID]?.base == nil, Date() < deadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertNotNil(manager.recoveryBackupBlocks[workspaceID]?.base, "The draft's base is captured")
+        }
 
-            // 2. A same-revision catalog refresh keeps the draft.
-            let sameRevisionRefresh = await bridge.refreshForAgentAdmission()
-            XCTAssertTrue(sameRevisionRefresh)
-            XCTAssertEqual(manager.workspace(withID: workspaceID)?.composeTabs[0].promptText, Self.draftMarker)
-
-            // 3. A peer publication advances the canonical document; the draft still survives. The
-            // refused save may already have journaled the draft as working state, so the peer
-            // publishes against the authority's current snapshot.
+        /// Another writer edits the authority's current contents and saves them.
+        @discardableResult
+        func publishPeer(_ mutate: (inout WorkspaceModel) -> Void) async throws -> DomainWorkspaceDocument {
             let currentValue = await runtime.workspaceStore.canonicalWorkspaceSnapshot(workspaceID)
             let current = try XCTUnwrap(currentValue)
-            var peer = try JSONDecoder().decode(WorkspaceModel.self, from: before.document.documentBytes)
-            peer.composeTabs[0].promptText = "peer publication"
-            let peerDocument = try DomainWorkspaceAuthorityClient.document(for: peer, fileURL: before.document.fileURL)
+            var peer = try JSONDecoder().decode(WorkspaceModel.self, from: current.document.documentBytes)
+            mutate(&peer)
+            let peerDocument = try DomainWorkspaceAuthorityClient.document(for: peer, fileURL: fileURL)
             let peerClient = DomainWorkspaceAuthorityClient(store: runtime.workspaceStore, windowID: -991)
             let peerSave = try await peerClient.saveFailClosed(
                 peerDocument,
@@ -820,39 +1024,142 @@ import XCTest
                 expectedContentDigest: current.document.contentDigest
             )
             XCTAssertEqual(peerSave.saved?.disposition, .applied)
-            let peerRefresh = await bridge.refreshForAgentAdmission()
-            XCTAssertTrue(peerRefresh)
-            XCTAssertEqual(manager.workspace(withID: workspaceID)?.composeTabs[0].promptText, Self.draftMarker)
-            XCTAssertNotNil(manager.recoveryBackupBlocks[workspaceID])
-            XCTAssertEqual(try Data(contentsOf: before.document.fileURL), peerDocument.documentBytes)
+            let refreshed = await bridge.refreshForAgentAdmission()
+            XCTAssertTrue(refreshed)
+            return peerDocument
+        }
 
-            // 4. Once the backup can be made, one explicit Retry saves the latest draft against the
-            // authority's current baseline and clears the block.
-            probe.setRefusing(false)
-            let retried = await manager.retryRecoveryBackupBlockedSave(workspaceID: workspaceID)
-            XCTAssertTrue(retried)
-            XCTAssertNil(manager.recoveryBackupBlocks[workspaceID])
-            let saved = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: before.document.fileURL))
-            XCTAssertEqual(saved.composeTabs[0].promptText, Self.draftMarker)
+        func savedModel() throws -> WorkspaceModel {
+            try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: fileURL))
         }
     }
 
-    /// Refuses every durable replacement whose new bytes carry this window's draft marker, as a
-    /// missing recovery backup would; peer writes are admitted.
-    private final class DraftRefusalProbe: @unchecked Sendable {
-        private let lock = NSLock()
-        private var refusing = true
+    /// App-side policy edges from the #1619 review.
+    final class WorkspaceRecoveryBackupPolicyTests: XCTestCase {
+        private var root: URL!
 
-        func setRefusing(_ value: Bool) {
-            lock.withLock { refusing = value }
+        override func setUp() async throws {
+            WorkspaceFileDecodeCache.shared.removeAllForTesting()
+            root = FileManager.default.temporaryDirectory
+                .resolvingSymlinksInPath()
+                .appendingPathComponent("recovery-policy-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         }
 
-        func protect(_ replacement: DomainDurableReplacement) throws {
-            guard lock.withLock({ refusing }),
-                  String(decoding: replacement.replacementBytes, as: UTF8.self)
-                  .contains(WorkspaceRecoveryBackupBlockTests.draftMarker)
-            else { return }
-            throw WorkspaceRecoveryBackupBlockedError(reason: "injected backup failure")
+        override func tearDown() async throws {
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        func testWorkspaceIndexIsNotRoutedThroughThePreservationPolicy() throws {
+            let indexURL = root.appendingPathComponent("workspacesIndex.json")
+            try Data("[not a workspace]".utf8).write(to: indexURL)
+            try WorkspaceUnreadableDocumentBackup.replaceDocument(Data("[]".utf8), at: indexURL)
+            XCTAssertEqual(try Data(contentsOf: indexURL), Data("[]".utf8))
+            XCTAssertTrue(try backups().isEmpty)
+        }
+
+        func testUnreadableOriginalIsNeverRenamedOver() throws {
+            let fileURL = root.appendingPathComponent("workspace.json")
+            let original = try corruptedDocument()
+            try original.write(to: fileURL)
+            XCTAssertEqual(chmod(fileURL.path, 0), 0)
+            defer { chmod(fileURL.path, 0o600) }
+            XCTAssertThrowsError(try WorkspaceUnreadableDocumentBackup.replaceDocument(Data("{}".utf8), at: fileURL)) {
+                XCTAssertEqual(WorkspaceRecoveryBackupReason(raw: ($0 as? WorkspaceRecoveryBackupBlockedError)?.reason ?? "").kind, .unreadableOriginal)
+            }
+            XCTAssertEqual(chmod(fileURL.path, 0o600), 0)
+            XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        }
+
+        func testSameIDStashedCopyDoesNotHideAnUnreadableComposedTab() throws {
+            let tabID = UUID()
+            let date = Date(timeIntervalSince1970: 100)
+            let olderValid = ComposeTabState(id: tabID, name: "Alpha", lastModified: date, promptText: "old")
+            var model = WorkspaceModel(
+                id: UUID(), dateModified: date, name: "Stash", repoPaths: ["/r"], lastUsed: date,
+                composeTabs: [olderValid, ComposeTabState(id: UUID(), name: "Beta", lastModified: date, promptText: "b")],
+                activeComposeTabID: nil
+            )
+            model.stashedTabs = [StashedTab(tab: olderValid, stashedAt: date)]
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(model)) as? [String: Any])
+            var tabs = try XCTUnwrap(object["composeTabs"] as? [[String: Any]])
+            tabs[0]["promptText"] = 42
+            object["composeTabs"] = tabs
+            let original = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            let reduced = try JSONEncoder().encode(JSONDecoder().decode(WorkspaceModel.self, from: original))
+            let fileURL = root.appendingPathComponent("workspace.json")
+            try original.write(to: fileURL)
+            let locator = WorkspaceUnreadableDocumentBackup.backupURL(for: fileURL, documentBytes: original)
+            try FileManager.default.createDirectory(at: locator, withIntermediateDirectories: false)
+
+            XCTAssertThrowsError(try WorkspaceUnreadableDocumentBackup.replaceDocument(reduced, at: fileURL))
+            XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        }
+
+        func testUnreadableStashCountsAsALossyDecode() throws {
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(
+                WorkspaceModel(name: "Stash", repoPaths: ["/r"])
+            )) as? [String: Any])
+            object["stashedTabs"] = "not-an-array"
+            let bytes = try JSONSerialization.data(withJSONObject: object)
+            XCTAssertTrue(try JSONDecoder().decode(WorkspaceModel.self, from: bytes).composeTabsDecodeWasLossy)
+            XCTAssertTrue(WorkspaceUnreadableDocumentBackup.documentRequiresPreservation(bytes))
+        }
+
+        func testBannerReasonsAreReadableAndGuidanceMatchesTheCause() {
+            let diskFull = WorkspaceRecoveryBackupReason(raw: #"recoveryBackupRequired(location: "saved_document", reason: "writeFailed(\"temp_open_failed_28\")")"#)
+            XCTAssertEqual(diskFull.kind, .diskFull)
+            XCTAssertTrue(diskFull.guidance.contains("disk space"))
+            let conflict = WorkspaceRecoveryBackupReason(raw: "conflictingEntry(\"workspace.unreadable-x.json\")")
+            XCTAssertEqual(conflict.kind, .conflictingEntry)
+            XCTAssertFalse(conflict.guidance.contains("disk space"))
+            let block = WorkspaceRecoveryBackupBlock(
+                workspaceID: UUID(), reason: #"writeFailed("temp_open_failed_13")"#, phase: .saved,
+                draft: WorkspaceModel(name: "W", repoPaths: []), draftStateVersion: 0, baseDigest: nil
+            )
+            let message = WorkspaceRecoveryBackupBlockBanner.message(for: block)
+            XCTAssertTrue(message.contains("permission"))
+            XCTAssertFalse(message.contains("writeFailed"), "Raw diagnostics are not shown")
+            XCTAssertTrue(message.contains("kept only in this window"))
+        }
+
+        @MainActor
+        func testLegacySaveReportsNonRecoveryWriteFailures() async throws {
+            let window = WindowState()
+            addTeardownBlock { @MainActor in
+                window.beginClose()
+                await window.tearDown()
+            }
+            let manager = window.workspaceManager
+            await manager.awaitInitialized()
+            let workspace = WorkspaceModel(name: "Legacy Save", repoPaths: [root.path])
+            let fileURL = try await manager.saveWorkspaceToFileAsync(workspace, baseRoot: root, metadata: nil)
+            let directory = fileURL.deletingLastPathComponent()
+            XCTAssertEqual(chmod(directory.path, 0o555), 0)
+            defer { chmod(directory.path, 0o755) }
+            do {
+                _ = try await manager.saveWorkspaceToFileAsync(workspace, baseRoot: root, metadata: nil)
+                XCTFail("A failed write must not be reported as a successful save")
+            } catch {}
+        }
+
+        private func corruptedDocument() throws -> Data {
+            let date = Date(timeIntervalSince1970: 100)
+            let model = WorkspaceModel(
+                id: UUID(), dateModified: date, name: "C", repoPaths: ["/r"], lastUsed: date,
+                composeTabs: [ComposeTabState(id: UUID(), name: "A", lastModified: date, promptText: "a")],
+                activeComposeTabID: nil
+            )
+            var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(model)) as? [String: Any])
+            var tabs = try XCTUnwrap(object["composeTabs"] as? [[String: Any]])
+            tabs[0]["promptText"] = 42
+            object["composeTabs"] = tabs
+            return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        }
+
+        private func backups() throws -> [URL] {
+            try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+                .filter { $0.lastPathComponent.hasPrefix(WorkspaceUnreadableDocumentBackup.fileNamePrefix) }
         }
     }
 #endif

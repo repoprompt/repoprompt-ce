@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import os
 
 /// One durable replacement that would discard `discardedBytes` (#335).
 ///
@@ -59,7 +60,8 @@ package struct DomainDurableReplacementGuard: Sendable {
         Self { replacement in
             guard DomainRecoveryBackup.replacementDropsComposeTabs(
                 discarded: replacement.discardedBytes,
-                replacement: replacement.replacementBytes
+                replacement: replacement.replacementBytes,
+                intentionallyClosed: DomainIntentionalTabClosures.shared.closures(for: replacement.workspaceID)
             ) else { return }
             try DomainRecoveryBackup.preserve(
                 documentBytes: replacement.discardedBytes,
@@ -117,6 +119,9 @@ package enum DomainRecoveryBackup {
         validatePath: (URL) throws -> Void = { _ in }
     ) throws -> URL {
         if let existing = verifiedBackupURL(documentURL: documentURL, documentBytes: documentBytes) {
+            // An existing copy (possibly written by a crashed process) is only a receipt once its
+            // data and directory entry are durable.
+            try syncExisting(existing)
             return existing
         }
         let url = backupURL(documentURL: documentURL, documentBytes: documentBytes)
@@ -141,19 +146,63 @@ package enum DomainRecoveryBackup {
         return url
     }
 
-    /// True when the discarded bytes cannot be reasoned about as raw JSON, or when any of their
-    /// compose-tab identities is absent from the replacement (composed or stashed).
-    package static func replacementDropsComposeTabs(discarded: Data, replacement: Data) -> Bool {
-        guard let discardedIDs = composeTabIDs(in: discarded) else { return true }
-        guard !discardedIDs.isEmpty else { return false }
-        guard let object = jsonObject(replacement) else { return true }
-        var surviving = composeTabIDs(in: object) ?? []
-        for raw in object["stashedTabs"] as? [Any] ?? [] {
-            if let tab = (raw as? [String: Any])?["tab"] as? [String: Any], let id = tab["id"] as? String {
-                surviving.insert(id)
+    /// Bytes at `url`; nil only when nothing exists there (ENOENT). Any other read failure
+    /// (EACCES, EIO, ...) throws, so an unreadable original is never mistaken for a missing one.
+    package static func existingBytes(at url: URL) throws -> Data? {
+        do {
+            return try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            return nil
+        } catch let error as NSError where error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT) {
+            return nil
+        }
+    }
+
+    /// Codec-free loss check. True when the discarded bytes cannot be reasoned about as raw JSON,
+    /// or when a discarded tab's content does not survive into the replacement:
+    /// - a composed tab survives only as a composed tab with the same identity (raw editors keep
+    ///   unknown fields in place), or as a stashed tab with an identical payload; a same-ID stashed
+    ///   copy with different content is not evidence that the composed payload survived;
+    /// - a stashed tab survives as a stashed or composed tab with the same identity;
+    /// - `intentionallyClosed` (tab ID to payload digest) exempts tabs a user closed on purpose,
+    ///   only while their payload is unchanged.
+    package static func replacementDropsComposeTabs(
+        discarded: Data,
+        replacement: Data,
+        intentionallyClosed: [String: String] = [:]
+    ) -> Bool {
+        guard let discardedObject = jsonObject(discarded),
+              let discardedComposed = tabObjects(discardedObject["composeTabs"]),
+              let discardedStashed = stashedTabObjects(discardedObject["stashedTabs"])
+        else { return true }
+        guard !discardedComposed.isEmpty || !discardedStashed.isEmpty else { return false }
+        guard let replacementObject = jsonObject(replacement) else { return true }
+        let replacementComposedIDs = Set((tabObjects(replacementObject["composeTabs"]) ?? []).compactMap { $0["id"] as? String })
+        var replacementStashedPayloads: [String: Set<String>] = [:]
+        for tab in stashedTabObjects(replacementObject["stashedTabs"]) ?? [] {
+            if let id = tab["id"] as? String, let digest = payloadDigest(tab) {
+                replacementStashedPayloads[id, default: []].insert(digest)
             }
         }
-        return !discardedIDs.isSubset(of: surviving)
+        for tab in discardedComposed {
+            guard let id = tab["id"] as? String else { return true }
+            if replacementComposedIDs.contains(id) { continue }
+            guard let digest = payloadDigest(tab) else { return true }
+            if replacementStashedPayloads[id]?.contains(digest) == true || intentionallyClosed[id] == digest { continue }
+            return true
+        }
+        for tab in discardedStashed {
+            guard let id = tab["id"] as? String else { return true }
+            if replacementStashedPayloads[id] != nil || replacementComposedIDs.contains(id) { continue }
+            return true
+        }
+        return false
+    }
+
+    /// Digest of a raw tab object, stable across key order.
+    package static func payloadDigest(_ tab: [String: Any]) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: tab, options: [.sortedKeys]) else { return nil }
+        return DomainContentDigest.sha256(data)
     }
 
     // MARK: - Private
@@ -173,21 +222,59 @@ package enum DomainRecoveryBackup {
         (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
-    private static func composeTabIDs(in data: Data) -> Set<String>? {
-        jsonObject(data).flatMap(composeTabIDs(in:))
+    /// Nil when the value is present but not an array of objects.
+    private static func tabObjects(_ raw: Any?) -> [[String: Any]]? {
+        guard let raw, !(raw is NSNull) else { return [] }
+        return raw as? [[String: Any]]
     }
 
-    /// Nil when `composeTabs` is present but not an array of objects that all carry a string ID.
-    private static func composeTabIDs(in object: [String: Any]) -> Set<String>? {
-        guard let raw = object["composeTabs"] else { return [] }
-        guard let tabs = raw as? [Any] else { return nil }
-        var ids = Set<String>()
-        for tab in tabs {
-            guard let id = (tab as? [String: Any])?["id"] as? String else { return nil }
-            ids.insert(id)
+    /// The `tab` objects of a stashed-tabs array; nil when the array is malformed.
+    private static func stashedTabObjects(_ raw: Any?) -> [[String: Any]]? {
+        guard let entries = tabObjects(raw) else { return nil }
+        var tabs: [[String: Any]] = []
+        for entry in entries {
+            guard let tab = entry["tab"] as? [String: Any] else { return nil }
+            tabs.append(tab)
         }
-        return ids
+        return tabs
     }
+
+    private static func syncExisting(_ url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw DomainRecoveryBackupError.writeFailed("existing_open_failed_\(errno)")
+        }
+        defer { close(descriptor) }
+        guard fsync(descriptor) == 0 else {
+            throw DomainRecoveryBackupError.writeFailed("existing_fsync_failed_\(errno)")
+        }
+        try syncDirectory(url.deletingLastPathComponent())
+    }
+
+    private static func syncDirectory(_ directory: URL) throws {
+        #if DEBUG
+            if let injected = directorySyncFailureForTesting.withLock({ $0 }) {
+                throw DomainRecoveryBackupError.writeFailed("directory_fsync_failed_\(injected)")
+            }
+        #endif
+        let directoryDescriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard directoryDescriptor >= 0 else {
+            throw DomainRecoveryBackupError.writeFailed("directory_open_failed_\(errno)")
+        }
+        defer { close(directoryDescriptor) }
+        guard fsync(directoryDescriptor) == 0 else {
+            throw DomainRecoveryBackupError.writeFailed("directory_fsync_failed_\(errno)")
+        }
+    }
+
+    #if DEBUG
+        private static let directorySyncFailureForTesting = OSAllocatedUnfairLock<Int32?>(initialState: nil)
+
+        /// Makes every directory sync fail with `errno` (nil restores real syncing).
+        package static func setDirectorySyncFailureForTesting(_ errno: Int32?) {
+            directorySyncFailureForTesting.withLock { $0 = errno }
+        }
+    #endif
 
     private static func publishDurably(_ data: Data, to destination: URL, in directory: URL) throws {
         let temporary = directory.appendingPathComponent(".\(destination.lastPathComponent).\(UUID().uuidString).tmp")
@@ -217,14 +304,7 @@ package enum DomainRecoveryBackup {
             guard rename(temporary.path, destination.path) == 0 else {
                 throw DomainRecoveryBackupError.writeFailed("rename_failed_\(errno)")
             }
-            let directoryDescriptor = open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-            guard directoryDescriptor >= 0 else {
-                throw DomainRecoveryBackupError.writeFailed("directory_open_failed_\(errno)")
-            }
-            defer { close(directoryDescriptor) }
-            guard fsync(directoryDescriptor) == 0 else {
-                throw DomainRecoveryBackupError.writeFailed("directory_fsync_failed_\(errno)")
-            }
+            try syncDirectory(directory)
         } catch {
             if descriptorIsOpen {
                 close(descriptor)
@@ -232,5 +312,24 @@ package enum DomainRecoveryBackup {
             unlink(temporary.path)
             throw error
         }
+    }
+}
+
+/// Tabs a user closed on purpose through a raw-JSON editor (headless `close_tab`), keyed by
+/// workspace and tab identity with the closed payload's digest. The headless guard exempts them
+/// from the loss check only while the discarded payload is identical. Process-local: after a
+/// restart an unchanged close is treated conservatively (a backup is made).
+package final class DomainIntentionalTabClosures: Sendable {
+    package static let shared = DomainIntentionalTabClosures()
+
+    private let state = OSAllocatedUnfairLock<[UUID: [String: String]]>(initialState: [:])
+
+    package func record(workspaceID: UUID, closedTab tab: [String: Any]) {
+        guard let id = tab["id"] as? String, let digest = DomainRecoveryBackup.payloadDigest(tab) else { return }
+        state.withLock { $0[workspaceID, default: [:]][id] = digest }
+    }
+
+    package func closures(for workspaceID: UUID) -> [String: String] {
+        state.withLock { $0[workspaceID] ?? [:] }
     }
 }

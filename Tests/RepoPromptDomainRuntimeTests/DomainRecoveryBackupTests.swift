@@ -30,7 +30,7 @@ final class DomainRecoveryBackupTests: XCTestCase {
 
         fixture.probe.setFailing(false)
         let retried = await fixture.authority().execute(fixture.command(.replaceWorkingDocument(reduced)))
-        XCTAssertNotEqual(retried.errorCode, .recoveryBackupRequired)
+        XCTAssertEqual(retried.disposition, .applied)
         XCTAssertEqual(fixture.verifiedBackup(of: unreadable).flatMap { try? Data(contentsOf: $0) }, unreadable.documentBytes)
     }
 
@@ -66,53 +66,125 @@ final class DomainRecoveryBackupTests: XCTestCase {
         let fixture = try Fixture()
         defer { fixture.remove() }
         let authority = fixture.authority()
-        let result6 = await authority.execute(fixture.command(.createWorkspace(try fixture.document(tabs: ["A"]))))
-        XCTAssertEqual(result6.disposition, .applied)
+        let created = await authority.execute(fixture.command(.createWorkspace(try fixture.document(tabs: ["A"]))))
+        XCTAssertEqual(created.disposition, .applied)
         let unreadable = try fixture.document(tabs: ["A", Fixture.unreadableTab])
-        let result7 = await authority.execute(fixture.command(.replaceWorkingDocument(unreadable)))
-        XCTAssertEqual(result7.disposition, .applied)
+        let edited = await authority.execute(fixture.command(.replaceWorkingDocument(unreadable)))
+        XCTAssertEqual(edited.disposition, .applied)
 
         let external = try fixture.document(tabs: ["A"], name: "External")
         try external.documentBytes.write(to: external.fileURL, options: .atomic)
         _ = await authority.reloadExternalChanges()
 
-        // Whichever path the reload takes (rebase or clean reload), the unreadable working copy is
-        // either kept durably or was preserved before being discarded.
-        let restored = await fixture.authority().readySnapshot().workspaces.first?.document.contentDigest
-        XCTAssertTrue(
-            restored == unreadable.contentDigest || fixture.verifiedBackup(of: unreadable) != nil,
-            "The unreadable working copy must stay recoverable"
-        )
-        for replacement in fixture.probe.replacements where replacement.discardedBytes == unreadable.documentBytes {
-            XCTAssertEqual(replacement.location, .workingDocument)
-        }
+        // The dirty working copy is rebased, not discarded: the journal still restores it, and no
+        // replacement ever discarded it, so no backup was needed.
+        let restored = await fixture.authority().readySnapshot()
+        XCTAssertEqual(restored.workspaces.first?.document.contentDigest, unreadable.contentDigest)
+        XCTAssertFalse(fixture.probe.replacements.contains { $0.discardedBytes == unreadable.documentBytes })
+        XCTAssertEqual(try Data(contentsOf: external.fileURL), external.documentBytes)
     }
 
-    func testMissingCanonicalDocumentStillProtectsJournalBytes() async throws {
+    func testUnreadableSavedOriginalIsNeverRenamedOver() async throws {
         let fixture = try Fixture()
         defer { fixture.remove() }
         fixture.probe.setFailing(false)
         let authority = fixture.authority()
-        let result8 = await authority.execute(fixture.command(.createWorkspace(try fixture.document(tabs: ["A"]))))
-        XCTAssertEqual(result8.disposition, .applied)
-        let unreadable = try fixture.document(tabs: ["A", Fixture.unreadableTab])
-        let result9 = await authority.execute(fixture.command(.replaceWorkingDocument(unreadable)))
-        XCTAssertEqual(result9.disposition, .applied)
-        try FileManager.default.removeItem(at: unreadable.fileURL)
+        let original = try fixture.document(tabs: ["A", Fixture.unreadableTab])
+        let created = await authority.execute(fixture.command(.createWorkspace(original)))
+        XCTAssertEqual(created.disposition, .applied)
+        let edited = await authority.execute(fixture.command(.replaceWorkingDocument(try fixture.document(tabs: ["A"], name: "Edit"))))
+        XCTAssertEqual(edited.disposition, .applied)
 
-        let reduced = try fixture.document(tabs: ["A"], name: "Reduced")
-        let outcome = await authority.execute(fixture.command(.replaceWorkingDocument(reduced)))
-        // Either the replacement is refused for another reason (nothing discarded), or it applied
-        // and the journal bytes were preserved first even though workspace.json is missing.
-        if outcome.disposition == .applied {
-            XCTAssertEqual(
-                fixture.verifiedBackup(of: unreadable).flatMap { try? Data(contentsOf: $0) },
-                unreadable.documentBytes,
-                "A missing workspace.json must not skip preservation of journal bytes"
-            )
-        } else {
-            XCTAssertNotEqual(outcome.errorCode, .recoveryBackupRequired, "Preservation itself must not need the canonical file")
+        // EACCES on the canonical file must not be mistaken for "nothing to protect".
+        XCTAssertEqual(chmod(original.fileURL.path, 0), 0)
+        defer { chmod(original.fileURL.path, 0o600) }
+        let save = await authority.execute(fixture.command(.saveWorkspaceDocument(workspaceID: fixture.workspaceID)))
+        XCTAssertEqual(save.errorCode, .recoveryBackupRequired)
+        XCTAssertEqual(chmod(original.fileURL.path, 0o600), 0)
+        XCTAssertEqual(try Data(contentsOf: original.fileURL), original.documentBytes)
+        XCTAssertNil(fixture.verifiedBackup(of: original))
+    }
+
+    func testExistingBackupIsOnlyAReceiptOnceDurablySynced() throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        let documentURL = fixture.workspaceDirectory.appendingPathComponent("workspace.json")
+        let bytes = Data("original".utf8)
+        let published = try DomainRecoveryBackup.preserve(documentBytes: bytes, documentURL: documentURL)
+
+        DomainRecoveryBackup.setDirectorySyncFailureForTesting(EIO)
+        defer { DomainRecoveryBackup.setDirectorySyncFailureForTesting(nil) }
+        XCTAssertThrowsError(try DomainRecoveryBackup.preserve(documentBytes: bytes, documentURL: documentURL))
+        DomainRecoveryBackup.setDirectorySyncFailureForTesting(nil)
+        XCTAssertEqual(try DomainRecoveryBackup.preserve(documentBytes: bytes, documentURL: documentURL), published)
+    }
+
+    // MARK: - Refusals on recovery sub-paths keep the workspace writable
+
+    func testRefusalDuringSaveReplayKeepsWorkspaceWritableWithTypedCode() async throws {
+        let fixture = try Fixture()
+        defer {
+            DomainPersistenceRecoveryFaultsForTesting.arm([])
+            fixture.remove()
         }
+        let stale = fixture.authority()
+        let created = await stale.execute(fixture.command(.createWorkspace(try fixture.document(tabs: ["A"]))))
+        XCTAssertEqual(created.disposition, .applied)
+        let local = await stale.execute(fixture.command(.replaceWorkingDocument(try fixture.document(tabs: ["A"], name: "Local"))))
+        XCTAssertEqual(local.disposition, .applied)
+        let current = fixture.authority()
+        _ = await current.readySnapshot()
+        let newer = await current.execute(fixture.command(.replaceWorkingDocument(try fixture.document(tabs: ["A"], name: "Newer"))))
+        XCTAssertEqual(newer.disposition, .applied)
+
+        DomainPersistenceRecoveryFaultsForTesting.arm([.working])
+        let save = await stale.execute(fixture.command(.saveWorkspaceDocument(workspaceID: fixture.workspaceID)))
+        DomainPersistenceRecoveryFaultsForTesting.arm([])
+        XCTAssertEqual(save.errorCode, .recoveryBackupRequired)
+        let health = await stale.readySnapshot().workspaces.first?.health
+        XCTAssertEqual(health?.acceptsMutations, true, "A refusal is not a read-only degradation")
+    }
+
+    func testRefusalDuringDirtyExternalRebaseKeepsWorkspaceWritable() async throws {
+        let fixture = try Fixture()
+        defer {
+            DomainPersistenceRecoveryFaultsForTesting.arm([])
+            fixture.remove()
+        }
+        let authority = fixture.authority()
+        let created = await authority.execute(fixture.command(.createWorkspace(try fixture.document(tabs: ["A"]))))
+        XCTAssertEqual(created.disposition, .applied)
+        let edited = await authority.execute(fixture.command(.replaceWorkingDocument(try fixture.document(tabs: ["A"], name: "Dirty"))))
+        XCTAssertEqual(edited.disposition, .applied)
+        let external = try fixture.document(tabs: ["A"], name: "External")
+        try external.documentBytes.write(to: external.fileURL, options: .atomic)
+
+        DomainPersistenceRecoveryFaultsForTesting.arm([.conflictRebase])
+        let activity = await authority.reloadExternalChanges()
+        DomainPersistenceRecoveryFaultsForTesting.arm([])
+        XCTAssertEqual(activity, .recoveryPending)
+        let health = await authority.readySnapshot().workspaces.first?.health
+        XCTAssertEqual(health?.acceptsMutations, true)
+    }
+
+    func testRefusalDuringCleanExternalReloadKeepsWorkspaceWritable() async throws {
+        let fixture = try Fixture()
+        defer {
+            DomainPersistenceRecoveryFaultsForTesting.arm([])
+            fixture.remove()
+        }
+        let authority = fixture.authority()
+        let created = await authority.execute(fixture.command(.createWorkspace(try fixture.document(tabs: ["A"]))))
+        XCTAssertEqual(created.disposition, .applied)
+        let external = try fixture.document(tabs: ["A"], name: "External")
+        try external.documentBytes.write(to: external.fileURL, options: .atomic)
+
+        DomainPersistenceRecoveryFaultsForTesting.arm([.externalReload])
+        let activity = await authority.reloadExternalChanges()
+        DomainPersistenceRecoveryFaultsForTesting.arm([])
+        XCTAssertEqual(activity, .recoveryPending)
+        let health = await authority.readySnapshot().workspaces.first?.health
+        XCTAssertEqual(health?.acceptsMutations, true)
     }
 
     func testPreserveCreatesMissingWorkspaceDirectory() throws {
@@ -251,6 +323,37 @@ final class DomainRecoveryBackupTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: locator), bytes)
     }
 
+    func testSameIDStashedCopyIsNotEvidenceThatComposedPayloadSurvived() throws {
+        func doc(composed: [[String: Any]], stashed: [[String: Any]]) throws -> Data {
+            try JSONSerialization.data(withJSONObject: [
+                "id": UUID().uuidString,
+                "composeTabs": composed,
+                "stashedTabs": stashed.map { ["id": UUID().uuidString, "tab": $0] }
+            ])
+        }
+        let current: [String: Any] = ["id": "a", "promptText": 42]
+        let olderValid: [String: Any] = ["id": "a", "promptText": "old"]
+        let discarded = try doc(composed: [current, ["id": "b"]], stashed: [olderValid])
+        let reduced = try doc(composed: [["id": "b"]], stashed: [olderValid])
+        XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: discarded, replacement: reduced))
+        // Stashing the exact payload is a move, not a loss.
+        let stashedExact = try doc(composed: [["id": "b"]], stashed: [current, olderValid])
+        XCTAssertFalse(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: discarded, replacement: stashedExact))
+    }
+
+    func testIntentionalCloseIsExemptOnlyForTheUnchangedPayload() throws {
+        let closed: [String: Any] = ["id": "a", "name": "Closed on purpose"]
+        let discarded = try JSONSerialization.data(withJSONObject: ["id": "w", "composeTabs": [closed, ["id": "b"]]])
+        let replacement = try JSONSerialization.data(withJSONObject: ["id": "w", "composeTabs": [["id": "b"]]])
+        let digest = try XCTUnwrap(DomainRecoveryBackup.payloadDigest(closed))
+        XCTAssertFalse(DomainRecoveryBackup.replacementDropsComposeTabs(
+            discarded: discarded, replacement: replacement, intentionallyClosed: ["a": digest]
+        ))
+        XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(
+            discarded: discarded, replacement: replacement, intentionallyClosed: ["a": "other-digest"]
+        ))
+    }
+
     func testComposeTabLossDetection() throws {
         func doc(_ tabs: Any?, stashed: [String] = []) throws -> Data {
             var object: [String: Any] = ["id": UUID().uuidString]
@@ -261,6 +364,7 @@ final class DomainRecoveryBackupTests: XCTestCase {
         let ab = try doc([["id": "a"], ["id": "b"]])
         XCTAssertFalse(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: ab, replacement: try doc([["id": "b"], ["id": "a"]])))
         XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: ab, replacement: try doc([["id": "a"]])))
+        // A stashed copy only counts when its payload is identical to the composed one.
         XCTAssertFalse(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: ab, replacement: try doc([["id": "a"]], stashed: ["b"])))
         XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: try doc("not-an-array"), replacement: ab))
         XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: Data("{".utf8), replacement: ab))

@@ -1449,6 +1449,9 @@ package struct DomainPersistenceCoordinator {
     ) throws -> DomainPersistenceWorkingCommit {
         try ensureLazyMigration(now: now)
         return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
+            #if DEBUG
+                try DomainPersistenceRecoveryFaultsForTesting.check(.working)
+            #endif
             let durable = try readCurrentJournalOrSeed(document: document)
             guard durable.revisions.workingRevision == expectedRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -1540,7 +1543,21 @@ package struct DomainPersistenceCoordinator {
                     actual: durable.revisions.workingRevision
                 )
             }
-            let diskBytes = try? Data(contentsOf: document.fileURL)
+            // With a recovery guard, only a missing file counts as absent: an unreadable original
+            // (EACCES, EIO) must never be renamed over unprotected.
+            let diskBytes: Data?
+            if configuration.durableReplacementGuard != nil {
+                do {
+                    diskBytes = try DomainRecoveryBackup.existingBytes(at: document.fileURL)
+                } catch {
+                    throw DomainPersistenceError.recoveryBackupRequired(
+                        location: DomainDurableReplacement.Location.savedDocument.rawValue,
+                        reason: "saved_document_unreadable: \(error.localizedDescription)"
+                    )
+                }
+            } else {
+                diskBytes = try? Data(contentsOf: document.fileURL)
+            }
             if let diskBytes {
                 let diskDigest = DomainContentDigest.sha256(diskBytes)
                 guard diskDigest == durable.savedDigest || diskDigest == document.contentDigest else {
@@ -1644,6 +1661,9 @@ package struct DomainPersistenceCoordinator {
     ) throws -> DomainPersistenceSavedCommit {
         try ensureLazyMigration(now: now)
         return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
+            #if DEBUG
+                try DomainPersistenceRecoveryFaultsForTesting.check(.externalReload)
+            #endif
             let current = try readCurrentJournalOrSeed(document: document)
             guard current.revisions.workingRevision == expectedRevision else {
                 throw DomainPersistenceError.stateConflict(
@@ -1713,6 +1733,9 @@ package struct DomainPersistenceCoordinator {
     ) throws -> DomainPersistenceWorkingCommit {
         try ensureLazyMigration(now: now)
         return try withExistingWorkspaceLocks(document: document, now: now) { catalogRevision in
+            #if DEBUG
+                try DomainPersistenceRecoveryFaultsForTesting.check(.conflictRebase)
+            #endif
             let current = try readCurrentJournalOrSeed(document: document)
             guard current.revisions == expectedRevisions else {
                 throw DomainPersistenceError.stateConflict(
@@ -2331,3 +2354,29 @@ package enum DomainPersistenceLock {
         }
     }
 }
+
+#if DEBUG
+    /// Injects a recovery-backup refusal at a persistence entry point, so tests can exercise the
+    /// authority's handling on recovery sub-paths that rarely discard bytes in practice.
+    package enum DomainPersistenceRecoveryFaultsForTesting {
+        package enum Site: String, Sendable {
+            case working
+            case conflictRebase
+            case externalReload
+        }
+
+        private static let armed = OSAllocatedUnfairLock<Set<Site>>(initialState: [])
+
+        package static func arm(_ sites: Set<Site>) {
+            armed.withLock { $0 = sites }
+        }
+
+        static func check(_ site: Site) throws {
+            guard armed.withLock({ $0.contains(site) }) else { return }
+            throw DomainPersistenceError.recoveryBackupRequired(
+                location: DomainDurableReplacement.Location.workingDocument.rawValue,
+                reason: "injected_\(site.rawValue)"
+            )
+        }
+    }
+#endif
