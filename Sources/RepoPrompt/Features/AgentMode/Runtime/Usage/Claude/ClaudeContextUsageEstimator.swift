@@ -89,8 +89,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let prompt = max(0, promptTokens ?? 0)
         let existing = session.codexContextUsage
         recordReportedCapacity(modelContextWindow, session: session)
-        let resolvedWindow = resolvedContextWindow(reported: modelContextWindow, session: session)
-        let ceiling = verifiedCapacity(reported: modelContextWindow, session: session)
+        let resolvedWindow = Self.resolvedContextWindow(reported: modelContextWindow, session: session)
+        let ceiling = Self.verifiedCapacity(reported: modelContextWindow, session: session)
         let contextUsed = normalizedContextUsedTokens(contextUsedTokens, modelContextWindow: ceiling) ?? 0
         // A report whose occupancy was rejected as impossible cannot vouch for its prompt count either.
         let occupancyRejected = (contextUsedTokens ?? 0) > 0 && contextUsed == 0
@@ -116,13 +116,14 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
             }
             return nil
         }()
-        let resolvedUsed = usedSignal ?? existing?.lastTotalTokens
+        let carried = carriedUsage(existing, ceiling: ceiling)
+        let resolvedUsed = usedSignal ?? carried.last
         guard resolvedUsed != nil || resolvedWindow != nil else { return nil }
 
         session.codexContextUsage = AgentContextUsage(
             modelContextWindow: resolvedWindow,
             lastTotalTokens: resolvedUsed,
-            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens,
+            totalTotalTokens: resolvedUsed ?? carried.total,
             awaitingPostCompactionUsage: contextUsed > 0 ? nil : existing?.awaitingPostCompactionUsage
         )
         return updateSnapshot(
@@ -141,18 +142,18 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
     ) -> ContextUsageSnapshot? {
         let existing = session.codexContextUsage
         recordReportedCapacity(modelContextWindow, session: session)
-        let resolvedWindow = resolvedContextWindow(reported: modelContextWindow, session: session)
-        let resolvedContextUsed = normalizedContextUsedTokens(
-            contextUsedTokens,
-            modelContextWindow: verifiedCapacity(reported: modelContextWindow, session: session)
-        ) ?? 0
-        let resolvedUsed = resolvedContextUsed > 0 ? resolvedContextUsed : existing?.lastTotalTokens
+        let resolvedWindow = Self.resolvedContextWindow(reported: modelContextWindow, session: session)
+        let ceiling = Self.verifiedCapacity(reported: modelContextWindow, session: session)
+        let resolvedContextUsed = normalizedContextUsedTokens(contextUsedTokens, modelContextWindow: ceiling) ?? 0
+        // A count streamed before this report established the capacity may exceed it.
+        let carried = carriedUsage(existing, ceiling: ceiling)
+        let resolvedUsed = resolvedContextUsed > 0 ? resolvedContextUsed : carried.last
         guard resolvedUsed != nil || resolvedWindow != nil else { return nil }
 
         session.codexContextUsage = AgentContextUsage(
             modelContextWindow: resolvedWindow,
             lastTotalTokens: resolvedUsed,
-            totalTotalTokens: resolvedUsed ?? existing?.totalTotalTokens,
+            totalTotalTokens: resolvedUsed ?? carried.total,
             awaitingPostCompactionUsage: resolvedContextUsed > 0 ? nil : existing?.awaitingPostCompactionUsage
         )
         return updateSnapshot(
@@ -225,8 +226,8 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         let estimatedUser = accumulator?.estimatedUserInputTokens ?? 0
         let estimatedToolInput = accumulator?.estimatedToolInputTokens ?? 0
         let estimatedToolOutput = accumulator?.estimatedToolOutputTokens ?? 0
-        let finalizedWindow = resolvedContextWindow(reported: nil, session: session)
-        let finalizedCeiling = verifiedCapacity(reported: nil, session: session)
+        let finalizedWindow = Self.resolvedContextWindow(reported: nil, session: session)
+        let finalizedCeiling = Self.verifiedCapacity(reported: nil, session: session)
         let resolvedContextUsed = normalizedContextUsedTokens(
             contextUsedTokens,
             modelContextWindow: finalizedCeiling
@@ -260,7 +261,11 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         // Prefer the exact stream-observed context for this turn over any session-wide
         // display value. The previous fallback to session.codexContextUsage?.lastTotalTokens
         // caused previous-turn context leakage into later persisted rows.
-        let accumulatorContextUsed = accumulator?.observedContextUsedTokens ?? 0
+        // The turn may have streamed this before its result established the capacity.
+        let accumulatorContextUsed = normalizedContextUsedTokens(
+            accumulator?.observedContextUsedTokens,
+            modelContextWindow: finalizedCeiling
+        ) ?? 0
         let persistedContextUsed = resolvedContextUsed > 0 ? resolvedContextUsed : (accumulatorContextUsed > 0 ? accumulatorContextUsed : 0)
         let usage = AgentTokenUsagePersist(
             runID: session.runID,
@@ -303,11 +308,26 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         return true
     }
 
+    /// Whether this estimator owns the provider's usage, and so its context window.
+    static func estimatesUsage(for agent: AgentProviderKind) -> Bool {
+        switch agent {
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: true
+        case .openCode, .cursor, .grokBuild, .antigravity, .devin, .codexExec: false
+        }
+    }
+
     /// Recomputes only the effective window, for example when runtime init reports a process's
     /// auto-compact window. Occupancy, compaction state, and snapshot provenance are kept, and no
     /// provider vouch is created: a changed window simply stops matching an earlier window vouch.
     @discardableResult
     func reconcileContextWindow(session: AgentTabSession) -> Bool {
+        Self.reconcileContextWindow(session: session, createsUsage: true)
+    }
+
+    /// The shared window recompute. `createsUsage` is false for a provider or model switch, which
+    /// only resizes usage that already exists rather than inventing a usage record.
+    @discardableResult
+    static func reconcileContextWindow(session: AgentTabSession, createsUsage: Bool) -> Bool {
         let window = resolvedContextWindow(reported: nil, session: session)
         var changed = false
         if var usage = session.codexContextUsage {
@@ -316,7 +336,7 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
                 session.codexContextUsage = usage
                 changed = true
             }
-        } else if let window {
+        } else if createsUsage, let window {
             session.codexContextUsage = AgentContextUsage(modelContextWindow: window, lastTotalTokens: nil, totalTotalTokens: nil)
             changed = true
         }
@@ -329,10 +349,14 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
         return changed
     }
 
+    func verifiedCapacity(reported: Int?, session: AgentTabSession) -> Int? {
+        Self.verifiedCapacity(reported: reported, session: session)
+    }
+
     /// The model's own capacity from verified sources: this report, the capacity stored for the
     /// selected provider and model, or the configured compatible backend. A stored effective window
     /// may be an auto-compact cap, so it is never treated as capacity. Unknown stays nil.
-    func verifiedCapacity(reported: Int?, session: AgentTabSession) -> Int? {
+    static func verifiedCapacity(reported: Int?, session: AgentTabSession) -> Int? {
         if let reported, reported > 0 { return reported }
         return session.identityValidContextWindowCapacity ?? ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
             forRequestedModelRaw: session.selectedModelRaw,
@@ -342,19 +366,27 @@ final class ClaudeContextUsageEstimator: ContextUsageEstimating {
 
     /// The effective window: the model's capacity capped by the process's auto-compact window. With
     /// a cap but no verified capacity, the model catalog sizes the window (never the ceiling).
-    func resolvedContextWindow(reported: Int?, session: AgentTabSession) -> Int? {
+    static func resolvedContextWindow(reported: Int?, session: AgentTabSession) -> Int? {
         let capacity = verifiedCapacity(reported: reported, session: session)
         guard let autoCompactWindow = session.activeClaudeAutoCompactWindowTokens else { return capacity }
         let modelWindow = capacity ?? AgentModel.resolvedModel(
             forRaw: session.selectedModelRaw,
             agentKind: session.selectedAgent
         )?.contextWindowTokens
-        return ClaudeAutoCompactWindow.effectiveWindow(modelWindow: modelWindow, autoCompactWindow: autoCompactWindow)
+        return ClaudeCompatiblePluginAutoCompactWindow.effectiveWindow(modelWindow: modelWindow, autoCompactWindow: autoCompactWindow)
     }
 
     private func recordReportedCapacity(_ reported: Int?, session: AgentTabSession) {
         guard let reported, reported > 0 else { return }
         session.recordContextWindowCapacity(reported)
+    }
+
+    /// Stored figures carried into a new record, dropped when they exceed a now-known capacity.
+    private func carriedUsage(_ usage: AgentContextUsage?, ceiling: Int?) -> (last: Int?, total: Int?) {
+        (
+            normalizedContextUsedTokens(usage?.lastTotalTokens, modelContextWindow: ceiling),
+            normalizedContextUsedTokens(usage?.totalTotalTokens, modelContextWindow: ceiling)
+        )
     }
 
     private func awaitsPostCompactionUsage(session: AgentTabSession) -> Bool {

@@ -1048,6 +1048,7 @@ final class AgentTabSession: ObservableObject {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
                 }
+                reconcileContextWindowAfterIdentityChange()
             }
         }
     }
@@ -1065,8 +1066,16 @@ final class AgentTabSession: ObservableObject {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
                 }
+                reconcileContextWindowAfterIdentityChange()
             }
         }
+    }
+
+    /// The effective window belongs to a provider and model, so a switch recomputes it at once
+    /// rather than leaving the previous identity's window in place until the next usage event.
+    private func reconcileContextWindowAfterIdentityChange() {
+        guard ClaudeContextUsageEstimator.estimatesUsage(for: selectedAgent) else { return }
+        ClaudeContextUsageEstimator.reconcileContextWindow(session: self, createsUsage: false)
     }
 
     var selectedReasoningEffortRaw: String?
@@ -1200,18 +1209,23 @@ final class AgentTabSession: ObservableObject {
     /// cap. Persisted with the provider and model it describes.
     var contextWindowCapacity: AgentContextWindowCapacity?
 
-    /// The stored capacity, only while the provider and model it was reported for stay selected.
+    /// The stored capacity, only while the provider and base model it was reported for stay selected.
     var identityValidContextWindowCapacity: Int? {
         guard let contextWindowCapacity,
+              contextWindowCapacity.tokens > 0,
               contextWindowCapacity.agentRaw == selectedAgent.rawValue,
-              contextWindowCapacity.modelRaw == selectedModelRaw
+              contextWindowCapacity.modelRaw == AgentContextWindowCapacity.modelKey(forRaw: selectedModelRaw)
         else { return nil }
         return contextWindowCapacity.tokens
     }
 
     func recordContextWindowCapacity(_ tokens: Int) {
         guard tokens > 0 else { return }
-        let next = AgentContextWindowCapacity(tokens: tokens, agentRaw: selectedAgent.rawValue, modelRaw: selectedModelRaw)
+        let next = AgentContextWindowCapacity(
+            tokens: tokens,
+            agentRaw: selectedAgent.rawValue,
+            modelRaw: AgentContextWindowCapacity.modelKey(forRaw: selectedModelRaw)
+        )
         guard contextWindowCapacity != next else { return }
         contextWindowCapacity = next
         isDirty = true

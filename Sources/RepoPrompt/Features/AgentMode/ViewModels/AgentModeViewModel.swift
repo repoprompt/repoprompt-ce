@@ -25,7 +25,13 @@ struct AgentContextUsage: Codable, Equatable {
 struct AgentContextWindowCapacity: Codable, Equatable {
     var tokens: Int
     var agentRaw: String
+    /// The base model without its effort suffix (see `modelKey(forRaw:)`): effort does not change capacity.
     var modelRaw: String
+
+    /// The identity a capacity is stored under: the base model, or the default model when none is named.
+    static func modelKey(forRaw raw: String?) -> String {
+        ClaudeModelSpecifier(raw: raw).baseModel ?? AgentModel.defaultModel.rawValue
+    }
 }
 
 // MARK: - Agent Mode View Model

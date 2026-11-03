@@ -343,8 +343,15 @@ final class AgentSessionLinkContextLoadTests: XCTestCase {
         XCTAssertNil(reported())
         XCTAssertFalse(viewModel.ingestNonCodexUsageReport(
             promptTokens: 150_000, completionTokens: nil, contextUsedTokens: nil,
-            modelContextWindow: 200_000, session: session
+            modelContextWindow: nil, session: session
         ), "Precondition: the snapshot is unchanged")
+        XCTAssertEqual(reported()?.usedTokens, 150_000)
+
+        // Kimi reports its own window, which then bounds its readings.
+        _ = viewModel.ingestNonCodexUsageReport(
+            promptTokens: 150_000, completionTokens: nil, contextUsedTokens: nil,
+            modelContextWindow: 200_000, session: session
+        )
         XCTAssertEqual(reported()?.usedTokens, 150_000)
 
         // An over-window context count is rejected, and the estimator does not backfill it with the

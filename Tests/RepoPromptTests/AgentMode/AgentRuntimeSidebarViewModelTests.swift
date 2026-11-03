@@ -747,6 +747,87 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
         XCTAssertNil(session.identityValidContextWindowCapacity, "Another provider's capacity is not this provider's")
     }
 
+    private func sidebarWindow(_ session: AgentTabSession) -> Int? {
+        var snapshot = AgentRuntimeSidebarViewModel.ContextSnapshot(selectedAgent: session.selectedAgent, selectedModelRaw: session.selectedModelRaw)
+        snapshot.contextWindowTokens = session.codexContextUsage?.modelContextWindow
+        return snapshot.effectiveContextWindowTokens
+    }
+
+    func testModelAndProviderSwitchesRecomputeTheWindowBeforeAnyUsageEvent() {
+        let estimator = makeEstimator()
+        let session = makeSession(model: "claude-fable-5", cap: 400_000)
+        completeCappedTurn(estimator, session, used: 150_000)
+        XCTAssertEqual(sidebarWindow(session), 400_000)
+
+        // A 1M model capped at 400K switches to a 200K model: 150K is 75% of it, not 38% of 400K.
+        session.selectedModelRaw = "sonnet"
+        XCTAssertEqual(sidebarWindow(session), 200_000)
+        XCTAssertEqual(session.contextUsageSnapshot?.window, 200_000)
+
+        session.selectedModelRaw = "claude-fable-5"
+        XCTAssertEqual(sidebarWindow(session), 400_000, "The model's stored capacity applies again")
+
+        session.selectedAgent = .kimiCode
+        XCTAssertEqual(
+            session.codexContextUsage?.modelContextWindow,
+            ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(forRequestedModelRaw: session.selectedModelRaw, agentKind: .kimiCode),
+            "Neither Claude's capacity nor its process's cap sizes Kimi's window"
+        )
+    }
+
+    func testFinalizationRejectsStreamedOccupancyAboveANewlyReportedCapacity() {
+        let estimator = makeEstimator()
+        let session = makeSession(cap: nil)
+        // Turn 1 streams 1.2M while the capacity is still unknown.
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 1_200_000, modelContextWindow: nil, session: session)
+        // The result then establishes a 1M capacity without its own occupancy.
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: nil, modelContextWindow: 1_000_000, session: session)
+        XCTAssertNil(session.codexContextUsage?.lastTotalTokens, "The carried reading exceeds the new capacity")
+        XCTAssertTrue(estimator.finalizeTurn(promptTokens: 1000, completionTokens: 10, contextUsedTokens: nil, session: session))
+        XCTAssertNil(session.providerTokenUsageByTurn.last?.contextUsedTokens, "The streamed reading is not persisted")
+        XCTAssertNil(session.codexContextUsage?.lastTotalTokens)
+        XCTAssertNil(session.codexContextUsage?.totalTotalTokens)
+    }
+
+    func testAnEffortOnlySwitchKeepsTheCapacity() {
+        let estimator = makeEstimator()
+        let session = makeSession(model: "claude-unlisted-model:high", cap: nil)
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: nil, modelContextWindow: 1_000_000, session: session)
+        session.selectedModelRaw = "claude-unlisted-model:xhigh"
+        XCTAssertEqual(session.identityValidContextWindowCapacity, 1_000_000)
+        session.selectedModelRaw = "claude-unlisted-model"
+        XCTAssertEqual(session.identityValidContextWindowCapacity, 1_000_000)
+        session.selectedModelRaw = "claude-other-unlisted-model:high"
+        XCTAssertNil(session.identityValidContextWindowCapacity)
+    }
+
+    func testANonPositiveStoredCapacityIsNotACapacity() {
+        let session = makeSession(cap: nil)
+        session.contextWindowCapacity = AgentContextWindowCapacity(
+            tokens: 0,
+            agentRaw: session.selectedAgent.rawValue,
+            modelRaw: AgentContextWindowCapacity.modelKey(forRaw: session.selectedModelRaw)
+        )
+        XCTAssertNil(session.identityValidContextWindowCapacity)
+    }
+
+    /// Records saved before capacities were stored have none: their window and ceiling stay unknown
+    /// until the next turn reports the model window, and that turn's readings are not bounded.
+    func testPreCapacityRecordsLoseTheirWindowAndCeilingForOneTurn() {
+        let estimator = makeEstimator()
+        let session = makeSession(cap: nil)
+        session.codexContextUsage = AgentContextUsage(modelContextWindow: 1_000_000, lastTotalTokens: 90000, totalTotalTokens: 90000)
+        estimator.reconcileContextWindow(session: session)
+        XCTAssertNil(session.codexContextUsage?.modelContextWindow)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 1_200_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 1_200_000, "No ceiling until the model window is reported")
+        _ = estimator.ingestTurnFinalizationSignal(contextUsedTokens: 95000, modelContextWindow: 1_000_000, session: session)
+        XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 1_000_000)
+        XCTAssertEqual(session.contextWindowCapacity?.tokens, 1_000_000)
+        _ = estimator.ingestUsageSignal(promptTokens: nil, completionTokens: nil, contextUsedTokens: 1_200_000, modelContextWindow: nil, session: session)
+        XCTAssertEqual(session.codexContextUsage?.lastTotalTokens, 95000, "The reported window bounds later readings")
+    }
+
     func testCapacityRoundTripsAndLegacyRecordsDecodeWithoutIt() throws {
         let capacity = AgentContextWindowCapacity(tokens: 1_000_000, agentRaw: "claudeCode", modelRaw: "claude-fable-5")
         let session = AgentSession(id: UUID(), name: "Capacity", items: [], codexContextWindow: 400_000, contextWindowCapacity: capacity)
@@ -760,6 +841,12 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
         let legacyDecoded = try JSONDecoder().decode(AgentSession.self, from: JSONSerialization.data(withJSONObject: legacy))
         XCTAssertNil(legacyDecoded.contextWindowCapacity)
         XCTAssertEqual(legacyDecoded.codexContextWindow, 400_000)
+
+        // The fast metadata header tolerates a malformed capacity instead of failing the file.
+        let malformed = try JSONDecoder().decode(AgentSessionDataService.LenientContextWindowCapacity.self, from: Data(#""bogus""#.utf8))
+        XCTAssertNil(malformed.value)
+        let wellFormed = try JSONDecoder().decode(AgentSessionDataService.LenientContextWindowCapacity.self, from: JSONEncoder().encode(capacity))
+        XCTAssertEqual(wellFormed.value, capacity)
     }
 
     // MARK: - Runtime init
@@ -778,6 +865,8 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
             _ = await runner.testConsumeTurnStatus([runtimeInit(cap: cap)], session: session, runID: runID, owner: owner)
         }
 
+        // A fresh synthetic stream per init stands in for each new process: the controller dedupes
+        // repeated init statuses per process, and Clear Chat replaces the process.
         await consumeInit(cap: 400_000)
         XCTAssertEqual(session.codexContextUsage?.modelContextWindow, 400_000)
 
@@ -889,7 +978,7 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
             XCTAssertEqual(sidebarWindow(legacy), 200_000, "The sidebar falls back to the model's catalog window")
 
             // Current: the stored capacity bounds restored rows, and each init re-derives the window.
-            let capacity = AgentContextWindowCapacity(tokens: 200_000, agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: model)
+            let capacity = AgentContextWindowCapacity(tokens: 200_000, agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: AgentContextWindowCapacity.modelKey(forRaw: model))
             let currentID = try await save([
                 AgentTokenUsagePersist(promptTokens: 190_000, completionTokens: 10, contextUsedTokens: 190_000),
                 AgentTokenUsagePersist(promptTokens: 250_000, completionTokens: 10, contextUsedTokens: 250_000)
