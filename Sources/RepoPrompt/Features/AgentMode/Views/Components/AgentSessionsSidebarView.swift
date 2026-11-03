@@ -1194,31 +1194,6 @@ struct AgentSidebarArchivedDateRow: Identifiable {
     }
 }
 
-/// One visible active row.
-///
-/// `id` is `SidebarSession.id`. The builder sets that to `ComposeTabState.id`
-/// and copies it when a snapshot rebuilds depth or thread metadata. It has to
-/// stay the same across those rebuilds, re-parenting, and metadata refreshes.
-/// A new id destroys the SwiftUI row and cancels an in-flight tap.
-struct AgentSidebarRenderedActiveRow: Identifiable {
-    let session: AgentModeViewModel.SidebarSession
-    let showsHeader: Bool
-    let isFirstHeader: Bool
-    let headerTitle: String
-    /// Set on the first row of a sidebar group section; its header is collapsible.
-    var groupName: String?
-    var isGroupCollapsed = false
-    var groupRowCount = 0
-    /// A collapsed group's first row carries only the header.
-    var hidesRow = false
-    /// Set only when a session can render more than once (Overseers tab).
-    var occurrenceID: AgentSidebarActiveOccurrenceID?
-
-    var id: AgentSidebarActiveOccurrenceID {
-        occurrenceID ?? .canonical(session.id)
-    }
-}
-
 /// One visible archived row.
 ///
 /// `id` is `StashedTab.id`, assigned once when the tab is stashed and kept on
