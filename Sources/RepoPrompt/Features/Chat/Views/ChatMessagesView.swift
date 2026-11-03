@@ -36,6 +36,9 @@ struct ChatMessagesView: View {
     /// Controls which message actions this transcript presentation exposes.
     let actionPolicy: ChatTranscriptActionPolicy
 
+    /// Supplied only by the multi-Oracle result popover; exact reply identity gates its footer.
+    let oracleResult: OracleMemberPresentation?
+
     private let contentAnimationDuration: Double = 0.2
 
     /// Tracks if we're near the bottom of the scrollable area.
@@ -67,7 +70,8 @@ struct ChatMessagesView: View {
         showsScrollControls: Bool = true,
         autoScrollOnAppear: Bool = true,
         sessionIDOverride: UUID? = nil,
-        actionPolicy: ChatTranscriptActionPolicy = .standard
+        actionPolicy: ChatTranscriptActionPolicy = .standard,
+        oracleResult: OracleMemberPresentation? = nil
     ) {
         self.viewModel = viewModel
         _autoScrollEnabled = autoScrollEnabled
@@ -76,6 +80,7 @@ struct ChatMessagesView: View {
         self.autoScrollOnAppear = autoScrollOnAppear
         self.sessionIDOverride = sessionIDOverride
         self.actionPolicy = actionPolicy
+        self.oracleResult = oracleResult
     }
 
     private var renderedSessionID: UUID? {
@@ -236,7 +241,8 @@ struct ChatMessagesView: View {
                         message: message,
                         viewModel: viewModel,
                         isLatestMessage: message.id == latestMessageID,
-                        actionPolicy: actionPolicy
+                        actionPolicy: actionPolicy,
+                        oracleElapsedSeconds: oracleResult?.completedElapsedSeconds(for: message)
                     )
                     .id(message.id)
                     .animation(.default, value: message.revisionCount)
