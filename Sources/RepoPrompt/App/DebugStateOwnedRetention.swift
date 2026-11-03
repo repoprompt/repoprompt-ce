@@ -27,9 +27,9 @@ extension DebugStateBootstrap.Builder {
 
     /// Capture both stores through the existing snapshot verifier. Recovery is allowed
     /// only on these disposable copies; no release-side lock or live-store mutation.
-    mutating func preserveDebugOracleState(workspaceIDs: Set<String>) throws {
+    mutating func preserveDebugOracleState(workspaceIDs: Set<String>) throws -> [OracleDebugRetention.Omission] {
         let retained = Set(workspaceIDs.compactMap(UUID.init(uuidString:)))
-        guard !retained.isEmpty else { return }
+        guard !retained.isEmpty else { return [] }
         let fm = FileManager.default
         let staging = fm.temporaryDirectory.appendingPathComponent("rpce-oracle-retention-" + UUID().uuidString)
         try fm.createDirectory(at: staging, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -43,8 +43,14 @@ extension DebugStateBootstrap.Builder {
         try captureOracleTree(locations.applicationSupportRoot.appendingPathComponent(debugRelative), to: debugCopy)
         try plan.verify()
         let cancellation = plan.cancellation
+        let omissions: [OracleDebugRetention.Omission]
         do {
-            try OracleDebugRetention.combine(releaseRoot: releaseCopy, debugRoot: debugCopy, destination: merged, retainedWorkspaceIDs: retained) {
+            omissions = try OracleDebugRetention.combine(releaseRoot: releaseCopy, debugRoot: debugCopy, destination: merged, isRetained: { owner in
+                let parts = owner.identifier.split(separator: ":", omittingEmptySubsequences: false)
+                guard owner.kind == "app-tab", parts.count == 4, parts[0] == "workspace", parts[2] == "tab",
+                      let workspace = UUID(uuidString: String(parts[1])), UUID(uuidString: String(parts[3])) != nil else { return false }
+                return retained.contains(workspace)
+            }) {
                 try cancellation?.check()
             }
         } catch let failure as DebugStateSnapshot.Failure {
@@ -71,6 +77,7 @@ extension DebugStateBootstrap.Builder {
         }
         let generated = try collect(merged, relative: debugRelative)
         plan.generated.merge(generated) { _, new in new }
+        return omissions
     }
 
     private mutating func captureOracleTree(_ directory: URL, to destination: URL) throws {

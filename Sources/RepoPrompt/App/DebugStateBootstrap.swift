@@ -197,6 +197,8 @@ enum DebugStateBootstrap {
             let windows = root.appendingPathComponent("windowSessions.json")
             if fm.fileExists(atPath: windows.path) { try plan.add(windows, as: "windowSessions.json") }
             try addWorkspaces()
+            // Baseline-only seeds copy journals verbatim for normal store recovery.
+            // Continuity retention below instead recovers captured stores before merging.
             try addTree(root.appendingPathComponent(runtimePath + "/oracle"), relative: DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: locations.profileIdentifier) + "/oracle")
             // Cross-profile grants are evidence, not authority. Preserve their
             // exact snapshot separately; #1376 opens only its new debug-owned DB.

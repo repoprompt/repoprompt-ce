@@ -81,10 +81,11 @@ extension DebugStateBootstrap.Builder {
                 plan.generated["windowSessions.json"] = try json(prior)
             }
         }
-        try preserveDebugOracleState(workspaceIDs: retained.retainedWorkspaceIDs)
+        let oracleOmissions = try preserveDebugOracleState(workspaceIDs: retained.retainedWorkspaceIDs)
         plan.generated["debugSeedRetainedContinuity.json"] = try json([
             "version": 1,
             "retainedWorkspaceIDs": retained.retainedWorkspaceIDs.sorted(),
+            "oracleReleaseOmissions": oracleOmissions.map { ["path": $0.path, "reason": $0.reason] },
             "policy": "Same-profile approvals and their intact workspace/session backing survive ordinary refresh. Missing endpoints remain recorded for runtime revalidation, never manufactured."
         ])
     }

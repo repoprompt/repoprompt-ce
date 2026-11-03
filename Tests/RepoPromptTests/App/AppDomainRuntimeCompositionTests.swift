@@ -551,7 +551,7 @@ extension DebugStateBootstrapTests {
             if captures == 1 { try f.write(Data("future".utf8), releaseRoot.appendingPathComponent("future-metadata")) }
         }
         XCTAssertEqual(captures, 2)
-        XCTAssertEqual(try Data(contentsOf: debugRoot.appendingPathComponent("future-metadata")), Data("future".utf8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: debugRoot.appendingPathComponent("future-metadata").path))
         captures = 0
         _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { _ in
             captures += 1
@@ -562,7 +562,7 @@ extension DebugStateBootstrapTests {
         XCTAssertFalse(FileManager.default.fileExists(atPath: debugRoot.appendingPathComponent(".DS_Store").path))
     }
 
-    func testOracleRetentionConflictPreservesActiveProfile() async throws {
+    func testOracleRetentionOmitsOpaqueReleaseFilesAndPreservesDebugBytes() async throws {
         let f = Fixture()
         defer { f.cleanup() }
         let workspace = UUID()
@@ -573,11 +573,11 @@ extension DebugStateBootstrapTests {
         try await debug.create(oracleGroup(workspace: workspace, seed: "debug"))
         try f.write(Data("release".utf8), releaseRoot.appendingPathComponent("future-metadata"))
         try f.write(Data("debug".utf8), debugRoot.appendingPathComponent("future-metadata"))
-        let index = try Data(contentsOf: debugRoot.appendingPathComponent("index.json"))
-        XCTAssertThrowsError(try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])) { error in
-            guard case DebugStateSnapshot.Failure.oracleRetention = error else { return XCTFail("Unexpected: \(error)") }
-        }
-        XCTAssertEqual(try Data(contentsOf: debugRoot.appendingPathComponent("index.json")), index)
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let receipt = try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("debugSeedRetainedContinuity.json"))
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(with: receipt) as? [String: Any])
+        XCTAssertEqual(report["oracleReleaseOmissions"] as? [[String: String]], [["path": "future-metadata", "reason": "opaque_release_file"]])
+        XCTAssertEqual(try Data(contentsOf: releaseRoot.appendingPathComponent("future-metadata")), Data("release".utf8))
         XCTAssertEqual(try Data(contentsOf: debugRoot.appendingPathComponent("future-metadata")), Data("debug".utf8))
     }
 
