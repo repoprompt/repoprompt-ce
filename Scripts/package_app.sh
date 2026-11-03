@@ -376,6 +376,16 @@ if [[ -d AppResources ]]; then
     fi
 fi
 if (( ! IS_RELEASE )); then
+    phase "Checking packaged GEPA worker before signing (no model calls)"
+    run python3 "$PROMPT_EXPERIMENT_RUNTIME_TOOL" --manifest "$PROMPT_EXPERIMENT_RUNTIME_MANIFEST" verify-worker \
+        --arch "$PROMPT_EXPERIMENT_RUNTIME_ARCH" \
+        --source-worker "$ROOT_DIR/AppResources/PromptExperiments/gepa_worker.py" \
+        --worker "$APP_BUNDLE/Contents/Resources/PromptExperiments/gepa_worker.py" \
+        --source-program-runner "$ROOT_DIR/AppResources/PromptExperiments/prompt_program_runner.py" \
+        --program-runner "$APP_BUNDLE/Contents/Resources/PromptExperiments/prompt_program_runner.py" \
+        --runtime-bundle "$PROMPT_EXPERIMENT_RUNTIME_APP_DIR"
+fi
+if (( ! IS_RELEASE )); then
     run cp "$ROOT_DIR/AppBundle/AppIconDebug.icns" "$APP_BUNDLE/Contents/Resources/AppIconDebug.icns"
 fi
 shopt -s nullglob

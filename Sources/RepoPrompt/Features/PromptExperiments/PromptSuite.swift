@@ -10,11 +10,10 @@ enum PromptSuiteSplit: String, CaseIterable, Codable {
     case hiddenTest = "hidden_test"
 }
 
-/// Which prompt text a suite exercises. Version 1 suites only target the built-in
-/// baseline resource; a user-edited `StoredPrompt` or custom planning prompt is never an
-/// optimization target.
+/// Whether the suite comes from a bundled prompt resource or a frozen lab definition.
 enum PromptSuitePromptVariant: String, CaseIterable {
     case builtIn = "built_in"
+    case project
 }
 
 enum PromptSuiteGraderKind: String, CaseIterable {
@@ -22,6 +21,7 @@ enum PromptSuiteGraderKind: String, CaseIterable {
     case exactMatch = "exact_match"
     /// A judge model scores the output against the suite rubric within `score_range`.
     case modelJudge = "model_judge"
+    case external
 }
 
 struct PromptSuiteScoreRange: Equatable {
@@ -54,19 +54,19 @@ struct PromptSuiteGrader: Equatable {
 }
 
 /// One file of a case's frozen context, packaged like a selected file in production.
-struct PromptSuiteContextFile: Equatable {
+struct PromptSuiteContextFile: Codable, Equatable {
     let path: String
     let content: String
 }
 
 /// Frozen workspace context for a case. Evaluation packages it with the case input exactly
 /// like a production Oracle request (file map, file contents, `<user_instructions>`).
-struct PromptSuiteCaseContext: Equatable {
+struct PromptSuiteCaseContext: Codable, Equatable {
     let fileTree: String?
     let files: [PromptSuiteContextFile]
 }
 
-struct PromptSuiteCase: Equatable {
+struct PromptSuiteCase: Codable, Equatable {
     let id: String
     let split: PromptSuiteSplit
     /// The user's instructions for this case (the `<user_instructions>` body).
@@ -75,15 +75,35 @@ struct PromptSuiteCase: Equatable {
     let expectedOutput: String?
     /// Optional frozen file tree and file contents sent alongside `input`.
     var context: PromptSuiteCaseContext?
+    var variables: [String: String] = [:]
+    var payload: [String: PromptExperimentExampleValue]?
 }
 
-/// A validated, checked-in evaluation suite for one built-in prompt.
+extension PromptSuiteCase {
+    private enum CodingKeys: String, CodingKey { case id, split, input, expectedOutput, context, variables, payload }
+    private enum LegacyCodingKeys: String, CodingKey { case expectedOutput = "expected_output" }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        split = try values.decode(PromptSuiteSplit.self, forKey: .split)
+        input = try values.decode(String.self, forKey: .input)
+        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        expectedOutput = try values.decodeIfPresent(String.self, forKey: .expectedOutput)
+            ?? legacy.decodeIfPresent(String.self, forKey: .expectedOutput)
+        context = try values.decodeIfPresent(PromptSuiteCaseContext.self, forKey: .context)
+        variables = try values.decodeIfPresent([String: String].self, forKey: .variables) ?? [:]
+        payload = try values.decodeIfPresent([String: PromptExperimentExampleValue].self, forKey: .payload)
+    }
+}
+
+/// A validated evaluation suite for a built-in prompt or project task.
 struct PromptSuite: Equatable {
     static let schemaVersion = 1
     static let fileName = "suite.json"
 
     let suiteID: String
-    let promptID: BuiltInPromptID
+    let promptID: BuiltInPromptID?
     let promptVariant: PromptSuitePromptVariant
     let grader: PromptSuiteGrader
     let cases: [PromptSuiteCase]
@@ -216,7 +236,7 @@ enum PromptSuiteLoader {
         }
         let rubric: PromptSuiteRubric?
         switch kind {
-        case .exactMatch:
+        case .exactMatch, .external:
             guard grader.rubric == nil else { throw PromptSuiteValidationError.unexpectedRubric }
             rubric = nil
         case .modelJudge:

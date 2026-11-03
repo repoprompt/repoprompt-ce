@@ -6,6 +6,9 @@
         let output: String
         let promptTokens: Int?
         let completionTokens: Int?
+        var cachedInputTokens: Int?
+        var cacheCreationInputTokens: Int?
+        var cost: Double?
     }
 
     enum PromptExperimentProviderFailureCode: String, CaseIterable {
@@ -64,6 +67,10 @@
         private var finalOutput: String?
         private(set) var promptTokens: Int?
         private(set) var completionTokens: Int?
+        private(set) var totalInputTokens: Int?
+        private(set) var cachedInputTokens: Int?
+        private(set) var cacheCreationInputTokens: Int?
+        private(set) var cost: Double?
 
         var output: String {
             (finalOutput ?? streamedOutput).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -73,6 +80,10 @@
             // Codex reports usage on message_stop; other providers may use a separate usage event.
             promptTokens = event.promptTokens ?? promptTokens
             completionTokens = event.completionTokens ?? completionTokens
+            totalInputTokens = event.totalInputTokens ?? totalInputTokens
+            cachedInputTokens = event.cachedInputTokens ?? cachedInputTokens
+            cacheCreationInputTokens = event.cacheCreationInputTokens ?? cacheCreationInputTokens
+            cost = event.cost ?? cost
             switch event.type {
             case "content":
                 if let messageID = event.contentMessageID, !messageID.isEmpty, messageID != lastMessageID {
@@ -306,8 +317,11 @@
                     await provider.dispose()
                     return PromptExperimentConnectedModelCompletion(
                         output: effective,
-                        promptTokens: accumulator.promptTokens,
-                        completionTokens: accumulator.completionTokens
+                        promptTokens: accumulator.totalInputTokens,
+                        completionTokens: accumulator.completionTokens,
+                        cachedInputTokens: accumulator.cachedInputTokens,
+                        cacheCreationInputTokens: accumulator.cacheCreationInputTokens,
+                        cost: accumulator.cost
                     )
                 } catch is CancellationError {
                     await lease.failAndCleanup()

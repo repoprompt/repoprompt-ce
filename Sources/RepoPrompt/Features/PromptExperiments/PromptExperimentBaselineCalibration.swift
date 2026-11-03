@@ -114,8 +114,9 @@
             guard measured else {
                 return "Noise floor not measured (one seed sample per case); the validation Δ \(signed(meanDelta)) is unqualified."
             }
-            var text = "Validation vs seed: Δ \(signed(meanDelta)) mean over \(validation.count) case\(validation.count == 1 ? "" : "s"); seed noise spread \(spread) (\(samplesPerCase) samples per case); \(improvedBeyondNoise) better and \(regressedBeyondNoise) worse beyond noise → "
-            text += withinNoise ? "within noise: not a demonstrated improvement." : "beyond noise."
+            var text = "Validation vs seed: Δ \(signed(meanDelta)) mean over \(validation.count) case\(validation.count == 1 ? "" : "s"); observed seed spread \(spread) (\(samplesPerCase) samples per case); \(improvedBeyondNoise) better and \(regressedBeyondNoise) worse beyond that spread → "
+            text += withinNoise ? "within observed spread: not a demonstrated improvement." : "exceeds observed baseline spread."
+            text += " This is an exploratory range comparison, not a statistical confidence test."
             if let heldOutMeanDelta {
                 let beyond = heldOut.count(where: \.improvedBeyondNoise)
                 text += " Held-out Δ \(signed(heldOutMeanDelta)) (\(beyond) of \(heldOut.count) case\(heldOut.count == 1 ? "" : "s") beyond the spread)."

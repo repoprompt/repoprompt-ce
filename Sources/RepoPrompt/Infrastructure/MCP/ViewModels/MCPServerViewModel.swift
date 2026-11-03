@@ -1447,6 +1447,16 @@ final class MCPServerViewModel: ObservableObject {
             }
             return try await agentSelfToolService.execute(args: args)
         },
+        executePromptExperiment: { args in
+            #if DEBUG
+                try await PromptExperimentMCPControl.execute(
+                    args: args,
+                    service: WindowStatesManager.shared.promptExperimentService
+                )
+            #else
+                throw MCPError.invalidParams("Prompt experiments are available in debug builds only.")
+            #endif
+        },
         executeSessionAdmin: { [weak self] args in
             guard let self else { throw MCPError.internalError("Window deallocated while executing session_admin") }
             return try await sessionAdminToolService(requireTargetWindow: { [weak self] in

@@ -211,6 +211,7 @@ final class ClaudeAgentModeCoordinator {
     private weak var providerBindingService: AgentModeProviderBindingService?
     private var hostCapabilities: HostCapabilities = .noOp
     private let windowID: Int
+    private let builtInPromptRegistry: BuiltInPromptRegistry
     private let workspacePathProvider: (AgentTabSession) throws -> String?
     private let claudeControllerFactory: ClaudeControllerFactory
     private let awaitNoActiveMCPTools: MCPToolIdleWaiter?
@@ -245,6 +246,7 @@ final class ClaudeAgentModeCoordinator {
 
     init(
         windowID: Int,
+        builtInPromptRegistry: BuiltInPromptRegistry,
         workspacePathProvider: @escaping (AgentTabSession) throws -> String?,
         claudeControllerFactory: ClaudeControllerFactory? = nil,
         awaitNoActiveMCPTools: MCPToolIdleWaiter? = nil,
@@ -257,6 +259,7 @@ final class ClaudeAgentModeCoordinator {
         providerInputRouteTotalWaitBudgetSeconds: TimeInterval = 15
     ) {
         self.windowID = windowID
+        self.builtInPromptRegistry = builtInPromptRegistry
         self.workspacePathProvider = workspacePathProvider
         self.claudeControllerFactory = claudeControllerFactory ?? Self.makeDefaultController
         self.awaitNoActiveMCPTools = awaitNoActiveMCPTools
@@ -2372,6 +2375,7 @@ final class ClaudeAgentModeCoordinator {
 
     private func agentModeInstructionInjection(for session: AgentTabSession) -> String {
         SystemPromptService.agentModePrompt(
+            registry: builtInPromptRegistry,
             agentKind: session.selectedAgent,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()

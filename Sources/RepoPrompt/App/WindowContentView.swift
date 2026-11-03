@@ -11,8 +11,7 @@ import SwiftUI
 /// each new Window/Scene gets its own WindowState.
 struct WindowContentView: View {
     @EnvironmentObject var versionManager: VersionManager
-    /// Not observed: only the lifecycle callbacks below use it, and observing it re-evaluated every
-    /// window root whenever any window opened or closed.
+    /// Not observed: opening or closing an unrelated window should not re-evaluate this root.
     private var windowStatesManager: WindowStatesManager {
         WindowStatesManager.shared
     }
@@ -34,6 +33,9 @@ struct WindowContentView: View {
             .environment(\.agentModePerfRecorder, windowState.agentModeViewModel.perfRecorder)
             .environmentObject(sparkleManager)
             .environmentObject(versionManager) // Pass versionManager to ContentView
+        #if DEBUG
+            .environmentObject(windowStatesManager.promptExperimentService)
+        #endif
             // Let SwiftUI own the window title. Without this, the scene re-applies the
             // default app-name title over the workspace name whenever it refreshes the
             // window chrome (visible in both window titles and native tab names).

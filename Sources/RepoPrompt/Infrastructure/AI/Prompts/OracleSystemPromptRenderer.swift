@@ -25,6 +25,8 @@ enum OracleSystemPromptRenderer {
             appendingResponseFormat(to: body)
         case .oracleChat, .oracleChatNoRoots:
             body
+        case .engineer:
+            preconditionFailure("Engineer prompts require the Agent Mode renderer and tool-using harness.")
         }
     }
 }

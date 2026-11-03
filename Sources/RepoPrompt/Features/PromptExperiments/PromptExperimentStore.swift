@@ -205,7 +205,7 @@
                 "",
                 "- Experiment: `\(experiment.id.uuidString.lowercased())`",
                 "- Status: `\(experiment.status.rawValue)`",
-                "- Built-in prompt: `\(authority.promptID.rawValue)` (resource `\(authority.promptResourceSHA256)`)",
+                "- Built-in prompt: `\(authority.promptIdentifier)` (resource `\(authority.promptResourceSHA256)`)",
                 "- Suite: `\(authority.suiteID)` (`\(authority.suiteSHA256)`)",
                 "- Targets: execution \(authority.targets.execution.displayName); reflection \(authority.targets.reflection.displayName); judge \(authority.targets.judge?.displayName ?? "not used")",
                 "- Approved cap: \(authority.maxEvaluations) evaluations; used \(experiment.admissionsUsed); remaining \(experiment.remainingEvaluations)",

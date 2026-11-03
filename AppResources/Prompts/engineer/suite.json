@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "suite_id": "engineer-tasks-v1",
+  "prompt_id": "engineer",
+  "prompt_variant": "built_in",
+  "grader": {
+    "kind": "external",
+    "score_range": {
+      "min": 0,
+      "max": 1
+    }
+  },
+  "cases": [
+    {
+      "id": "inclusive-clamp",
+      "split": "training",
+      "input": "Fix clamp(value, low, high) to bound values inclusively. If low exceeds high, raise ValueError. Edit task.py; preserve GUIDE.md. Use only the supplied file tools.",
+      "expected_output": "{\"schema_version\":1,\"checks\":[{\"id\":\"inside\",\"path\":\"task.py\",\"function\":\"clamp\",\"arguments\":[4,0,9],\"expected\":4},{\"id\":\"below\",\"path\":\"task.py\",\"function\":\"clamp\",\"arguments\":[-2,0,9],\"expected\":0},{\"id\":\"above\",\"path\":\"task.py\",\"function\":\"clamp\",\"arguments\":[20,0,9],\"expected\":9},{\"id\":\"invalid\",\"path\":\"task.py\",\"function\":\"clamp\",\"arguments\":[1,9,0],\"expected\":null,\"expected_error\":\"ValueError\"}],\"preserve_files\":[\"GUIDE.md\"],\"max_turns\":16,\"timeout_seconds\":180}",
+      "files": [
+        {
+          "path": "task.py",
+          "content": "def clamp(value, low, high):\n    return min(low, max(value, high))\n"
+        },
+        {
+          "path": "GUIDE.md",
+          "content": "This fixture has no dependencies. Keep this guide unchanged.\n"
+        }
+      ]
+    },
+    {
+      "id": "stable-unique",
+      "split": "training",
+      "input": "Make unique(items) remove duplicates while preserving the order of the first occurrence. Support an empty list and hashable values. Edit task.py; preserve GUIDE.md. Use only the supplied file tools.",
+      "expected_output": "{\"schema_version\":1,\"checks\":[{\"id\":\"order\",\"path\":\"task.py\",\"function\":\"unique\",\"arguments\":[[3,1,3,2,1]],\"expected\":[3,1,2]},{\"id\":\"empty\",\"path\":\"task.py\",\"function\":\"unique\",\"arguments\":[[]],\"expected\":[]},{\"id\":\"strings\",\"path\":\"task.py\",\"function\":\"unique\",\"arguments\":[[\"b\",\"a\",\"b\"]],\"expected\":[\"b\",\"a\"]}],\"preserve_files\":[\"GUIDE.md\"],\"max_turns\":16,\"timeout_seconds\":180}",
+      "files": [
+        {
+          "path": "task.py",
+          "content": "def unique(items):\n    return sorted(set(items))\n"
+        },
+        {
+          "path": "GUIDE.md",
+          "content": "This fixture has no dependencies. Keep this guide unchanged.\n"
+        }
+      ]
+    },
+    {
+      "id": "whitespace-slug",
+      "split": "training",
+      "input": "Implement slug(text): trim whitespace, lowercase, and join whitespace-separated words with single hyphens. Do not strip punctuation inside words. Edit task.py; preserve GUIDE.md. Use only the supplied file tools.",
+      "expected_output": "{\"schema_version\":1,\"checks\":[{\"id\":\"spacing\",\"path\":\"task.py\",\"function\":\"slug\",\"arguments\":[\"  Hello   WORLD\\n\"],\"expected\":\"hello-world\"},{\"id\":\"punctuation\",\"path\":\"task.py\",\"function\":\"slug\",\"arguments\":[\"Use C++\"],\"expected\":\"use-c++\"},{\"id\":\"blank\",\"path\":\"task.py\",\"function\":\"slug\",\"arguments\":[\" \\t \"],\"expected\":\"\"}],\"preserve_files\":[\"GUIDE.md\"],\"max_turns\":16,\"timeout_seconds\":180}",
+      "files": [
+        {
+          "path": "task.py",
+          "content": "def slug(text):\n    return text.lower()\n"
+        },
+        {
+          "path": "GUIDE.md",
+          "content": "This fixture has no dependencies. Keep this guide unchanged.\n"
+        }
+      ]
+    },
+    {
+      "id": "one-based-page",
+      "split": "validation",
+      "input": "Fix page(items, number, size) to use one-based pages. Return an empty list past the end. Reject number < 1 or size < 1 with ValueError. Edit task.py; preserve GUIDE.md. Use only the supplied file tools.",
+      "expected_output": "{\"schema_version\":1,\"checks\":[{\"id\":\"first\",\"path\":\"task.py\",\"function\":\"page\",\"arguments\":[[1,2,3,4,5],1,2],\"expected\":[1,2]},{\"id\":\"last\",\"path\":\"task.py\",\"function\":\"page\",\"arguments\":[[1,2,3,4,5],3,2],\"expected\":[5]},{\"id\":\"past\",\"path\":\"task.py\",\"function\":\"page\",\"arguments\":[[1],9,2],\"expected\":[]},{\"id\":\"invalid\",\"path\":\"task.py\",\"function\":\"page\",\"arguments\":[[1],0,2],\"expected\":null,\"expected_error\":\"ValueError\"}],\"preserve_files\":[\"GUIDE.md\"],\"max_turns\":16,\"timeout_seconds\":180}",
+      "files": [
+        {
+          "path": "task.py",
+          "content": "def page(items, number, size):\n    return items[number * size:(number + 1) * size]\n"
+        },
+        {
+          "path": "GUIDE.md",
+          "content": "This fixture has no dependencies. Keep this guide unchanged.\n"
+        }
+      ]
+    },
+    {
+      "id": "first-equals-parser",
+      "split": "validation",
+      "input": "Implement parse_settings(text): skip blank lines and lines beginning with # after trimming. Split each other line at its first =; trim key/value, keep later duplicate values, and reject missing = or empty keys with ValueError. Edit task.py; preserve GUIDE.md. Use only the supplied file tools.",
+      "expected_output": "{\"schema_version\":1,\"checks\":[{\"id\":\"comments\",\"path\":\"task.py\",\"function\":\"parse_settings\",\"arguments\":[\" # example\\n A = 1 \\n\\n\"],\"expected\":{\"A\":\"1\"}},{\"id\":\"equals\",\"path\":\"task.py\",\"function\":\"parse_settings\",\"arguments\":[\"TOKEN=a=b\\nA=old\\nA=new\"],\"expected\":{\"TOKEN\":\"a=b\",\"A\":\"new\"}},{\"id\":\"invalid\",\"path\":\"task.py\",\"function\":\"parse_settings\",\"arguments\":[\"bad\"],\"expected\":null,\"expected_error\":\"ValueError\"},{\"id\":\"empty-key\",\"path\":\"task.py\",\"function\":\"parse_settings\",\"arguments\":[\" =1\"],\"expected\":null,\"expected_error\":\"ValueError\"}],\"preserve_files\":[\"GUIDE.md\"],\"max_turns\":16,\"timeout_seconds\":180}",
+      "files": [
+        {
+          "path": "task.py",
+          "content": "def parse_settings(text):\n    return dict(line.split(\"=\") for line in text.splitlines())\n"
+        },
+        {
+          "path": "GUIDE.md",
+          "content": "This fixture has no dependencies. Keep this guide unchanged.\n"
+        }
+      ]
+    },
+    {
+      "id": "complete-rolling-windows",
+      "split": "hidden_test",
+      "input": "Fix rolling_sums(values, width) to return the sum for each complete contiguous window of positive width. Return [] when width is larger than the list; reject width <= 0 with ValueError. Edit task.py; preserve GUIDE.md. Use only the supplied file tools.",
+      "expected_output": "{\"schema_version\":1,\"checks\":[{\"id\":\"windows\",\"path\":\"task.py\",\"function\":\"rolling_sums\",\"arguments\":[[1,2,3,4],2],\"expected\":[3,5,7]},{\"id\":\"wide\",\"path\":\"task.py\",\"function\":\"rolling_sums\",\"arguments\":[[1,2],3],\"expected\":[]},{\"id\":\"empty\",\"path\":\"task.py\",\"function\":\"rolling_sums\",\"arguments\":[[],1],\"expected\":[]},{\"id\":\"invalid\",\"path\":\"task.py\",\"function\":\"rolling_sums\",\"arguments\":[[1],0],\"expected\":null,\"expected_error\":\"ValueError\"}],\"preserve_files\":[\"GUIDE.md\"],\"max_turns\":16,\"timeout_seconds\":180}",
+      "files": [
+        {
+          "path": "task.py",
+          "content": "def rolling_sums(values, width):\n    return [sum(values[i:i+width]) for i in range(len(values))]\n"
+        },
+        {
+          "path": "GUIDE.md",
+          "content": "This fixture has no dependencies. Keep this guide unchanged.\n"
+        }
+      ]
+    },
+    {
+      "id": "merge-signed-counts",
+      "split": "hidden_test",
+      "input": "Fix merge_counts(left, right) to return a new dictionary summing values of shared keys, preserving keys from either input including zero and negative totals. Do not modify either input. Edit task.py; preserve GUIDE.md. Use only the supplied file tools.",
+      "expected_output": "{\"schema_version\":1,\"checks\":[{\"id\":\"shared\",\"path\":\"task.py\",\"function\":\"merge_counts\",\"arguments\":[{\"a\":2,\"b\":1},{\"a\":3,\"c\":4}],\"expected\":{\"a\":5,\"b\":1,\"c\":4},\"preserve_arguments\":true},{\"id\":\"signed\",\"path\":\"task.py\",\"function\":\"merge_counts\",\"arguments\":[{\"a\":2,\"b\":-2},{\"a\":-2,\"c\":-1}],\"expected\":{\"a\":0,\"b\":-2,\"c\":-1},\"preserve_arguments\":true},{\"id\":\"empty\",\"path\":\"task.py\",\"function\":\"merge_counts\",\"arguments\":[{},{}],\"expected\":{},\"preserve_arguments\":true}],\"preserve_files\":[\"GUIDE.md\"],\"max_turns\":16,\"timeout_seconds\":180}",
+      "files": [
+        {
+          "path": "task.py",
+          "content": "def merge_counts(left, right):\n    result = dict(left)\n    result.update(right)\n    return result\n"
+        },
+        {
+          "path": "GUIDE.md",
+          "content": "This fixture has no dependencies. Keep this guide unchanged.\n"
+        }
+      ]
+    }
+  ]
+}

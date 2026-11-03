@@ -159,46 +159,18 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
 
     #if DEBUG
         private func promptExperimentTool() -> Tool {
-            runtime.tool(
-                name: MCPWindowToolName.promptExperiment,
+            guard let definition = MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.promptExperiment) else {
+                preconditionFailure("Missing canonical prompt_experiment definition")
+            }
+            let schema = try! JSONDecoder().decode(JSONSchema.self, from: JSONEncoder().encode(definition.inputSchema))
+            return runtime.tool(
+                name: definition.name,
                 freshnessPolicy: .none,
-                description: """
-                Optimize one of RepoPrompt's built-in prompts with upstream GEPA against its checked-in evaluation suite.
-
-                Lifecycle: `targets` (prompts, suites, prompt-only models, defaults) → `create_or_update` (typed fields; all
-                invalid fields are reported together) → `request_approval` (shows a native card; only the user can approve,
-                and approval starts the first run) → `status_or_wait` → `run` to resume within the remaining approved cap →
-                `cancel`. After a completed run, `propose_patch` creates a reviewed source diff for a retained candidate.
-                Changing any authority field of an approved experiment creates a new experiment that needs its own
-                approval. This tool cannot approve or apply a candidate.
-                """,
-                annotations: .repoPromptLocalEphemeralState,
-                inputSchema: .object(
-                    properties: [
-                        "op": .string(description: "targets | create_or_update | request_approval | run | status_or_wait | cancel | propose_patch"),
-                        "experiment_id": .string(description: "Experiment UUID. Optional for create_or_update (update) and status_or_wait (omit to list)."),
-                        "expected_authority_digest": .string(description: "request_approval: the authority_digest you reviewed; refused if it changed."),
-                        "title": .string(description: "create_or_update: display title."),
-                        "prompt_id": .string(description: "create_or_update: built-in prompt ID from targets, e.g. oracle-plan."),
-                        "suite_id": .string(description: "create_or_update: suite ID from targets; defaults to the prompt's checked-in suite."),
-                        "execution_target": .string(description: "create_or_update: prompt-only target selector for the evaluated model; defaults from targets."),
-                        "reflection_target": .string(description: "create_or_update: prompt-only target selector for GEPA reflection; defaults from targets."),
-                        "judge_target": .string(description: "create_or_update: judge target selector, only for model-judged suites; defaults from targets."),
-                        "max_evaluations": .integer(description: "create_or_update: total evaluation cap the user approves (at least the suite minimum from targets)."),
-                        "reflection_minibatch_size": .integer(description: "create_or_update: GEPA reflection minibatch size, 1-100. Default 2."),
-                        "max_provider_retries": .integer(description: "create_or_update: retries per provider call for transient failures, 0-3. Default 2."),
-                        "random_seed": .integer(description: "create_or_update: GEPA random seed. Default 0."),
-                        "prompt_character_ceiling_ratio": .number(description: "create_or_update: hard ceiling for a proposed prompt as a multiple of the prompt being edited, 0.25-4.0. Default 1.0 (proposals never grow the prompt)."),
-                        "max_prompt_characters": .integer(description: "create_or_update: optional absolute prompt-length ceiling in characters, 200-200000."),
-                        "noise_floor_replicates": .integer(description: "create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; cached across experiments."),
-                        "timeout_seconds": .number(description: "status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60."),
-                        "run_id": .string(description: "propose_patch: completed run UUID."),
-                        "candidate_index": .integer(description: "propose_patch: retained GEPA candidate index.")
-                    ],
-                    required: ["op"]
-                )
-            ) { _, args in
-                try await PromptExperimentMCPControl.execute(args: args)
+                description: definition.description,
+                annotations: definition.annotations.mcpAnnotations,
+                inputSchema: schema
+            ) { [dependencies] _, args in
+                try await dependencies.executePromptExperiment(args)
             }
         }
     #endif

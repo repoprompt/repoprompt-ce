@@ -3,6 +3,21 @@ import Foundation
 import XCTest
 
 final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
+    func testTerminalUsageIncludesCachedInputWithoutChangingLiveContext() throws {
+        var translator = ClaudeSDKNDJSONTranslator()
+        let result = try XCTUnwrap(translator.parseNDJSONLine(jsonLine([
+            "type": "result", "result": "answer", "total_cost_usd": 0.01,
+            "usage": ["input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 80, "cache_creation_input_tokens": 5]
+        ])).last)
+        XCTAssertEqual(result.type, "message_stop")
+        XCTAssertEqual(result.promptTokens, 10)
+        XCTAssertEqual(result.totalInputTokens, 95)
+        XCTAssertEqual(result.cachedInputTokens, 80)
+        XCTAssertEqual(result.cacheCreationInputTokens, 5)
+        XCTAssertEqual(result.completionTokens, 20)
+        XCTAssertNil(result.contextUsedTokens, "Aggregate experiment usage is not a live context-window estimate.")
+    }
+
     func testAssistantToolAndResultSmokePreservesUsageArgsAndStableInvocationID() throws {
         var translator = ClaudeSDKNDJSONTranslator(
             treatsToolResultErrorsAsHostOwned: { $0 == "mcp__RepoPromptCE__read_file" }

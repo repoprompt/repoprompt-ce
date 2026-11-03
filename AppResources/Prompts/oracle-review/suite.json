@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "suite_id": "oracle-review-v1",
+  "prompt_id": "oracle-review",
+  "prompt_variant": "built_in",
+  "grader": {
+    "kind": "model_judge",
+    "score_range": {
+      "min": 0,
+      "max": 1
+    },
+    "rubric": "rubric.md"
+  },
+  "cases": [
+    {
+      "id": "expiry-boundary",
+      "split": "training",
+      "input": "Review this change. A token is valid strictly before its expiresAt timestamp. The diff is:\n```diff\n--- a/src/token.ts\n+++ b/src/token.ts\n@@ -2,1 +2,1 @@\n-  return now < expiresAt;\n+  return now <= expiresAt;\n```\nDo not run tests; review the supplied evidence.",
+      "expected_output": "The inclusive comparison accepts a token at its expiry instant, contrary to the stated contract. Locate src/token.ts:isValid, describe now == expiresAt, and restore <. A boundary regression test may be suggested but must not be described as run.",
+      "file_tree": "example-project\nsrc/token.ts",
+      "files": [
+        {
+          "path": "src/token.ts",
+          "content": "export function isValid(now: number, expiresAt: number): boolean {\n  return now <= expiresAt;\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "owner-authorization",
+      "split": "training",
+      "input": "Review this simplification. User IDs are arbitrary strings. The route passes the authenticated user's ID and the stored document into canEdit. The diff is:\n```diff\n--- a/src/permissions.ts\n+++ b/src/permissions.ts\n@@ -2,1 +2,1 @@\n-  return userID === document.ownerID;\n+  return Boolean(userID);\n```",
+      "expected_output": "The new check allows every authenticated user to edit any document. Identify src/permissions.ts:canEdit, the non-owner trigger and the missing owner equality; restore the comparison. Do not invent an additional missing authentication bug because the request states authentication occurs in the route.",
+      "file_tree": "example-project\nsrc/permissions.ts",
+      "files": [
+        {
+          "path": "src/permissions.ts",
+          "content": "export function canEdit(userID: string, document: { ownerID: string }): boolean {\n  return Boolean(userID);\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "clean-empty-sum",
+      "split": "training",
+      "input": "Review this implementation of total. Contract: sum all numbers, returning zero for an empty input. The diff is:\n```diff\n--- a/src/total.ts\n+++ b/src/total.ts\n@@ -2,3 +2,1 @@\n-  let result = 0;\n-  for (const value of values) result += value;\n-  return result;\n+  return values.reduce((result, value) => result + value, 0);\n```\nAvoid optional style changes.",
+      "expected_output": "There is no demonstrated defect. The initial accumulator 0 preserves the empty-array behavior and addition order. Give a brief summary and a no-findings verdict, without inventing an empty-input exception or presenting personal style preferences as bugs.",
+      "file_tree": "example-project\nsrc/total.ts",
+      "files": [
+        {
+          "path": "src/total.ts",
+          "content": "export function total(values: number[]): number {\n  return values.reduce((result, value) => result + value, 0);\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "abort-retry",
+      "split": "validation",
+      "input": "Review this retry change. send may reject with an Error whose name is AbortError when the user cancels. Cancellation must not send a second request. The diff is:\n```diff\n--- a/src/retry.ts\n+++ b/src/retry.ts\n@@ -5,1 +5,0 @@\n-    if (error instanceof Error && error.name === \"AbortError\") throw error;\n```",
+      "expected_output": "The removed guard makes a cancelled request call send a second time. Identify src/retry.ts:sendWithRetry, explain the AbortError path, and restore the cancellation guard. A focused test should reject first send with AbortError and assert one invocation. Do not infer unshown idempotency or authentication behavior.",
+      "file_tree": "example-project\nsrc/retry.ts",
+      "files": [
+        {
+          "path": "src/retry.ts",
+          "content": "export async function sendWithRetry(send: () => Promise<string>): Promise<string> {\n  try {\n    return await send();\n  } catch (error) {\n    return await send();\n  }\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "normalized-lookup",
+      "split": "validation",
+      "input": "Review this change. Product policy explicitly says email lookup is case-insensitive and ignores surrounding whitespace. getByEmail expects the normalized value. The diff is:\n```diff\n--- a/src/userLookup.ts\n+++ b/src/userLookup.ts\n@@ -2,1 +2,1 @@\n-  return getByEmail(email);\n+  return getByEmail(email.trim().toLowerCase());\n```",
+      "expected_output": "The change implements the stated normalization policy. No demonstrated defect; do not flag case folding as a bug based on a different email policy. A concise no-findings verdict is appropriate, without claiming tests ran.",
+      "file_tree": "example-project\nsrc/userLookup.ts",
+      "files": [
+        {
+          "path": "src/userLookup.ts",
+          "content": "export function lookup(email: string, getByEmail: (email: string) => string | undefined) {\n  return getByEmail(email.trim().toLowerCase());\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "save-before-success",
+      "split": "hidden_test",
+      "input": "Review this latency optimization. The caller treats resolution of saveSettings as confirmation that storage has durably saved the settings; persist can reject. The diff is:\n```diff\n--- a/src/settings.ts\n+++ b/src/settings.ts\n@@ -2,1 +2,1 @@\n-  await persist(settings);\n+  void persist(settings);\n```",
+      "expected_output": "The change resolves saveSettings before persistence completes and loses rejection propagation, violating the stated success contract. These are effects of one removed await, so group them as one root-cause finding in src/settings.ts:saveSettings. Restore await; suggest delayed and rejecting persist tests without claiming execution.",
+      "file_tree": "example-project\nsrc/settings.ts",
+      "files": [
+        {
+          "path": "src/settings.ts",
+          "content": "export async function saveSettings(settings: Record<string, string>, persist: (settings: Record<string, string>) => Promise<void>): Promise<void> {\n  void persist(settings);\n}\n"
+        }
+      ]
+    }
+  ]
+}

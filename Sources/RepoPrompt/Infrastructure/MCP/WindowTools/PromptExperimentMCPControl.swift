@@ -5,22 +5,41 @@
 
     enum PromptExperimentOperation: String, CaseIterable {
         case targets
+        case prepare
+        case describeProgram = "describe_program"
         case createOrUpdate = "create_or_update"
         case requestApproval = "request_approval"
         case run
         case statusOrWait = "status_or_wait"
         case cancel
         case proposePatch = "propose_patch"
+        case exportResult = "export"
+    }
+
+    struct PromptExperimentPrepareRequest: Equatable {
+        let promptID: String?
+        let promptText: String?
+        let promptFile: String?
+        let sourceTitle: String?
+        let selection: String?
+        let goal: String
+        let exampleInputs: String
+        let criteria: String
+        let targetSelector: String?
     }
 
     enum PromptExperimentCommand: Equatable {
         case targets
+        case prepare(PromptExperimentPrepareRequest)
+        case describeProgram(PromptLabProgram, runner: PromptLabRunnerKind)
         case createOrUpdate(PromptExperimentCreateRequest)
         case requestApproval(experimentID: UUID, expectedAuthorityDigest: String?)
         case run(experimentID: UUID)
         case statusOrWait(experimentID: UUID?, timeoutSeconds: TimeInterval)
+        case preparationStatusOrWait(preparationID: UUID, timeoutSeconds: TimeInterval)
         case cancel(experimentID: UUID)
         case proposePatch(experimentID: UUID, runID: UUID, candidateIndex: Int)
+        case exportResult(experimentID: UUID, runID: UUID, outputPath: String)
     }
 
     /// The one structured error the tool returns: a stable code, a message, and every
@@ -49,7 +68,7 @@
                 case .baselineConflict: "baseline_conflict"
                 case .sourceRootUnavailable: "source_root_unavailable"
                 case .unsafeSourcePath, .archiveConflict: "unsafe_source_path"
-                case .invalidCandidate, .unchangedCandidate: "invalid_candidate"
+                case .invalidCandidate, .invalidEngineerTemplate, .unchangedCandidate: "invalid_candidate"
                 }
                 return Self(code: code, message: patch.localizedDescription, fields: [])
             }
@@ -86,19 +105,22 @@
         private static let createArguments: Set<String> = [
             "experiment_id", "title", "prompt_id", "suite_id", "execution_target", "reflection_target",
             "judge_target", "max_evaluations", "reflection_minibatch_size", "max_provider_retries",
-            "random_seed", "prompt_character_ceiling_ratio", "max_prompt_characters", "noise_floor_replicates"
+            "random_seed", "prompt_character_ceiling_ratio", "max_prompt_characters", "noise_floor_replicates", "definition"
         ]
         static let acceptedArguments: [PromptExperimentOperation: Set<String>] = [
             .targets: [],
+            .prepare: ["prompt_id", "prompt_text", "prompt_file", "source_title", "selection", "goal", "example_inputs", "criteria", "reflection_target"],
+            .describeProgram: ["program", "runner"],
             .createOrUpdate: createArguments,
             .requestApproval: ["experiment_id", "expected_authority_digest"],
             .run: ["experiment_id"],
-            .statusOrWait: ["experiment_id", "timeout_seconds"],
+            .statusOrWait: ["experiment_id", "preparation_id", "timeout_seconds"],
             .cancel: ["experiment_id"],
-            .proposePatch: ["experiment_id", "run_id", "candidate_index"]
+            .proposePatch: ["experiment_id", "run_id", "candidate_index"],
+            .exportResult: ["experiment_id", "run_id", "output_path"]
         ]
 
-        static func execute(args: [String: Value]) async throws -> Value {
+        static func execute(args: [String: Value], service: PromptExperimentService) async throws -> Value {
             if let connectionID = ServerNetworkManager.currentConnectionID,
                await ServerNetworkManager.shared.runPurpose(for: connectionID) == .discoverRun
             {
@@ -109,7 +131,7 @@
                 ).jsonText)
             }
             do {
-                return try await handle(args: args, service: WindowStatesManager.shared.promptExperimentService)
+                return try await handle(args: args, service: service)
             } catch let error as PromptExperimentMCPError {
                 throw MCPError.invalidParams(error.jsonText)
             }
@@ -122,6 +144,34 @@
                 switch command {
                 case .targets:
                     return await targetsValue(service: service)
+                case let .prepare(request):
+                    if let path = request.promptFile {
+                        let pending = try service.preparationApprovals.submit(.file(.init(
+                            path: path, selection: request.selection, sourceTitle: request.sourceTitle,
+                            goal: request.goal, exampleInputs: request.exampleInputs, criteria: request.criteria,
+                            target: service.preparationTarget(request.targetSelector)
+                        )))
+                        return try preparationValue(pending)
+                    }
+                    let source: PromptLabSource
+                    if let rawID = request.promptID {
+                        guard let id = BuiltInPromptID(rawValue: rawID) else {
+                            throw PromptExperimentAuthorityError.invalidRequest("Unknown built-in prompt. Call targets to list the available prompts.")
+                        }
+                        source = try service.source(for: id)
+                    } else {
+                        source = PromptLabSource(kind: .pasted, title: request.sourceTitle ?? "Pasted prompt", prompt: request.promptText ?? "")
+                    }
+                    let definition = try await service.prepareDefinition(
+                        source: source, goal: request.goal, exampleInputs: request.exampleInputs,
+                        criteria: request.criteria, targetSelector: request.targetSelector
+                    )
+                    return try .object([
+                        "definition": encodedValue(definition),
+                        "next_action": .string("Review the generated examples and criteria with the user; then pass definition to create_or_update. This preparation made one model call and did not approve or start optimization.")
+                    ])
+                case let .describeProgram(program, runner):
+                    return try preparationValue(service.preparationApprovals.submit(.program(program, runner)))
                 case let .createOrUpdate(request):
                     return try await experimentValue(service.createOrUpdate(request))
                 case let .requestApproval(experimentID, digest):
@@ -131,9 +181,14 @@
                 case let .statusOrWait(experimentID, timeout):
                     guard let experimentID else {
                         await service.load()
-                        return .object(["experiments": .array(service.experiments.map(summaryValue))])
+                        return .object([
+                            "experiments": .array(service.experiments.map(summaryValue)),
+                            "preparation_requests": .array(service.preparationApprovals.requests.map(preparationSummaryValue))
+                        ])
                     }
                     return try await experimentValue(service.statusOrWait(experimentID: experimentID, timeoutSeconds: timeout))
+                case let .preparationStatusOrWait(preparationID, timeout):
+                    return try await preparationValue(service.preparationApprovals.statusOrWait(id: preparationID, timeoutSeconds: timeout))
                 case let .cancel(experimentID):
                     return try await experimentValue(service.cancel(experimentID: experimentID))
                 case let .proposePatch(experimentID, runID, candidateIndex):
@@ -146,6 +201,12 @@
                         "state": .string(proposal.state.rawValue),
                         "diff_sha256": proposal.diffEvidence.map { .string($0.sha256) } ?? .null,
                         "next_action": .string("Review the full diff and run evidence in the native card or Prompt Experiments Studio; only native controls can apply or reject.")
+                    ])
+                case let .exportResult(experimentID, runID, outputPath):
+                    try await service.exportResult(experimentID: experimentID, runID: runID, to: URL(fileURLWithPath: outputPath))
+                    return .object([
+                        "experiment_id": .string(experimentID.uuidString), "run_id": .string(runID.uuidString),
+                        "output_path": .string(outputPath), "status": .string("exported")
                     ])
                 }
             } catch {
@@ -205,7 +266,7 @@
                     return nil
                 }
                 guard let id = UUID(uuidString: text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
-                    errors.append(.init(field: key, message: "Must be an experiment UUID."))
+                    errors.append(.init(field: key, message: "Must be a UUID."))
                     return nil
                 }
                 return id
@@ -215,8 +276,40 @@
             switch operation {
             case .targets:
                 command = .targets
+            case .prepare:
+                let promptID = string("prompt_id")
+                let promptText = string("prompt_text")
+                let promptFile = string("prompt_file")
+                if [promptID, promptText, promptFile].compactMap(\.self).count != 1 {
+                    errors.append(.init(field: "source", message: "Provide exactly one of prompt_id, prompt_text or prompt_file."))
+                }
+                let selection = string("selection")
+                if selection != nil, promptFile == nil {
+                    errors.append(.init(field: "selection", message: "A selection requires prompt_file."))
+                }
+                if let promptFile, !promptFile.hasPrefix("/") {
+                    errors.append(.init(field: "prompt_file", message: "Use an absolute file path."))
+                }
+                let goal = string("goal") ?? ""
+                if goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    errors.append(.init(field: "goal", message: "Describe what should improve."))
+                }
+                command = .prepare(.init(
+                    promptID: promptID, promptText: promptText, promptFile: promptFile,
+                    sourceTitle: string("source_title"), selection: selection, goal: goal,
+                    exampleInputs: string("example_inputs") ?? "", criteria: string("criteria") ?? "",
+                    targetSelector: string("reflection_target")
+                ))
+            case .describeProgram:
+                let runnerName = string("runner") ?? PromptLabRunnerKind.program.rawValue
+                let runner = PromptLabRunnerKind(rawValue: runnerName)
+                if runner != .program, runner != .dspy {
+                    errors.append(.init(field: "runner", message: "Must be program or dspy."))
+                }
+                let program: PromptLabProgram? = decodeProgram(args["program"], errors: &errors)
+                command = if let program, let runner { .describeProgram(program, runner: runner) } else { nil }
             case .createOrUpdate:
-                command = .createOrUpdate(PromptExperimentCreateRequest(
+                var request = PromptExperimentCreateRequest(
                     experimentID: uuid("experiment_id", required: false),
                     title: string("title"),
                     promptID: string("prompt_id"),
@@ -231,7 +324,9 @@
                     promptCharacterCeilingRatio: number("prompt_character_ceiling_ratio"),
                     maxPromptCharacters: integer("max_prompt_characters"),
                     noiseFloorReplicates: integer("noise_floor_replicates")
-                ))
+                )
+                request.definition = decodeDefinition(args["definition"], errors: &errors)
+                command = .createOrUpdate(request)
             case .requestApproval:
                 let id = uuid("experiment_id", required: true)
                 let digest = string("expected_authority_digest")
@@ -240,6 +335,12 @@
                 command = uuid("experiment_id", required: true).map { .run(experimentID: $0) }
             case .statusOrWait:
                 let id = uuid("experiment_id", required: false)
+                let preparationID = uuid("preparation_id", required: false)
+                if args["experiment_id"] != nil, args["experiment_id"] != .null,
+                   args["preparation_id"] != nil, args["preparation_id"] != .null
+                {
+                    errors.append(.init(field: "preparation_id", message: "Use either preparation_id or experiment_id, not both."))
+                }
                 var timeout = defaultWaitSeconds
                 if let value = args["timeout_seconds"], value != .null {
                     let seconds: Double? = switch value {
@@ -253,7 +354,11 @@
                         errors.append(.init(field: "timeout_seconds", message: "Must be a number between 0 and 3600."))
                     }
                 }
-                command = .statusOrWait(experimentID: id, timeoutSeconds: id == nil ? 0 : timeout)
+                command = if let preparationID {
+                    .preparationStatusOrWait(preparationID: preparationID, timeoutSeconds: timeout)
+                } else {
+                    .statusOrWait(experimentID: id, timeoutSeconds: id == nil ? 0 : timeout)
+                }
             case .cancel:
                 command = uuid("experiment_id", required: true).map { .cancel(experimentID: $0) }
             case .proposePatch:
@@ -271,6 +376,16 @@
                 } else {
                     nil
                 }
+            case .exportResult:
+                let experimentID = uuid("experiment_id", required: true)
+                let runID = uuid("run_id", required: true)
+                let path = string("output_path")
+                if path?.hasPrefix("/") != true {
+                    errors.append(.init(field: "output_path", message: "An absolute destination file path is required."))
+                }
+                command = if let experimentID, let runID, let path {
+                    .exportResult(experimentID: experimentID, runID: runID, outputPath: path)
+                } else { nil }
             }
             guard errors.isEmpty, let command else {
                 throw PromptExperimentMCPError(
@@ -284,16 +399,105 @@
 
         // MARK: - Encoding
 
+        /// Fill documented defaults before Codable decoding. Nested property names are the
+        /// same camelCase names returned by prepare, so that response can be reviewed and
+        /// submitted without a lossy conversion or a second schema.
+        static func decodeDefinition(_ value: Value?, errors: inout [PromptExperimentFieldError]) -> PromptLabDefinition? {
+            guard let value, value != .null else { return nil }
+            guard var object = value.objectValue else {
+                errors.append(.init(field: "definition", message: "Must be an experiment definition object."))
+                return nil
+            }
+            rejectUnknown(object, allowed: ["source", "goal", "objective", "runner", "examples", "criteria", "program", "contractVersion", "relativePromptLimit"], path: "definition", errors: &errors)
+            object["runner"] = object["runner"] ?? .string(PromptLabRunnerKind.plainPrompt.rawValue)
+            object["contractVersion"] = object["contractVersion"] ?? .int(PromptLabDefinition.contractVersion)
+            if let source = object["source"]?.objectValue {
+                rejectUnknown(source, allowed: ["kind", "title", "prompt", "builtInPromptID", "filePath", "originalFileSHA256", "selection", "literal"], path: "definition.source", errors: &errors)
+                if let literal = source["literal"]?.objectValue {
+                    rejectUnknown(literal, allowed: ["language", "token"], path: "definition.source.literal", errors: &errors)
+                }
+            }
+            var objective = object["objective"]?.objectValue ?? [:]
+            if let supplied = object["objective"], supplied.objectValue == nil {
+                errors.append(.init(field: "definition.objective", message: "Must be an objective object."))
+            }
+            rejectUnknown(objective, allowed: ["mode", "qualityTolerance", "inputWeight", "outputWeight"], path: "definition.objective", errors: &errors)
+            objective["mode"] = objective["mode"] ?? .string("quality")
+            objective["qualityTolerance"] = objective["qualityTolerance"] ?? .double(0)
+            objective["inputWeight"] = objective["inputWeight"] ?? .double(1)
+            objective["outputWeight"] = objective["outputWeight"] ?? .double(1)
+            object["objective"] = .object(objective)
+            if let examples = object["examples"]?.arrayValue {
+                object["examples"] = .array(examples.enumerated().map { index, item in
+                    guard var example = item.objectValue else { return item }
+                    let path = "definition.examples[\(index)]"
+                    rejectUnknown(example, allowed: ["id", "split", "input", "expectedOutput", "context", "variables", "payload"], path: path, errors: &errors)
+                    example["variables"] = example["variables"] ?? .object([:])
+                    if let context = example["context"]?.objectValue {
+                        rejectUnknown(context, allowed: ["fileTree", "files"], path: "\(path).context", errors: &errors)
+                        for (fileIndex, file) in (context["files"]?.arrayValue ?? []).enumerated() {
+                            if let file = file.objectValue {
+                                rejectUnknown(file, allowed: ["path", "content"], path: "\(path).context.files[\(fileIndex)]", errors: &errors)
+                            }
+                        }
+                    }
+                    return .object(example)
+                })
+            }
+            if let supplied = object["program"], supplied != .null,
+               let program = decodeProgram(supplied, field: "definition.program", errors: &errors)
+            {
+                object["program"] = try? encodedValue(program)
+            }
+            return decode(.object(object), as: PromptLabDefinition.self, field: "definition", errors: &errors)
+        }
+
+        static func decodeProgram(_ value: Value?, field: String = "program", errors: inout [PromptExperimentFieldError]) -> PromptLabProgram? {
+            guard var object = value?.objectValue else {
+                errors.append(.init(field: field, message: "Provide the Python interpreter, project root and evaluation module in a program object."))
+                return nil
+            }
+            rejectUnknown(object, allowed: ["pythonExecutable", "projectRoot", "modulePath", "callable", "timeoutSeconds", "moduleSHA256", "environmentKeys", "modelRouting", "dependencySHA256"], path: field, errors: &errors)
+            object["callable"] = object["callable"] ?? .string("evaluate")
+            object["timeoutSeconds"] = object["timeoutSeconds"] ?? .double(120)
+            object["environmentKeys"] = object["environmentKeys"] ?? .array([])
+            return decode(.object(object), as: PromptLabProgram.self, field: field, errors: &errors)
+        }
+
+        private static func rejectUnknown(_ object: [String: Value], allowed: Set<String>, path: String, errors: inout [PromptExperimentFieldError]) {
+            for key in object.keys.sorted() where !allowed.contains(key) {
+                errors.append(.init(field: "\(path).\(key)", message: "Unknown field."))
+            }
+        }
+
+        private static func decode<T: Decodable>(_ value: Value, as type: T.Type, field: String, errors: inout [PromptExperimentFieldError]) -> T? {
+            do { return try JSONDecoder().decode(type, from: JSONEncoder().encode(value)) }
+            catch {
+                let detail: String = switch error {
+                case let DecodingError.keyNotFound(key, context):
+                    "Missing \((context.codingPath.map(\.stringValue) + [key.stringValue]).joined(separator: "."))."
+                case let DecodingError.typeMismatch(_, context), let DecodingError.valueNotFound(_, context), let DecodingError.dataCorrupted(context):
+                    "\(context.codingPath.map(\.stringValue).joined(separator: ".")): \(context.debugDescription)"
+                default: error.localizedDescription
+                }
+                errors.append(.init(field: field, message: detail))
+                return nil
+            }
+        }
+
+        static func encodedValue(_ value: some Encodable) throws -> Value {
+            try JSONDecoder().decode(Value.self, from: JSONEncoder().encode(value))
+        }
+
         static func targetsValue(service: PromptExperimentService) async -> Value {
             await service.load()
             let defaults = service.targetDefaults()
-            let prompts: [Value] = BuiltInPromptID.allCases.map { id in
-                var value: [String: Value] = ["prompt_id": .string(id.rawValue)]
-                if let resource = try? AppDomainRuntimeComposition.shared.builtInPromptRegistry.resource(id) {
-                    value["resource_sha256"] = .string(resource.sha256)
+            let prompts: [Value] = service.promptOptions().map { option in
+                var value: [String: Value] = ["prompt_id": .string(option.id)]
+                if let resourceSHA256 = option.resourceSHA256 {
+                    value["resource_sha256"] = .string(resourceSHA256)
                 }
-                do {
-                    let suite = try PromptSuiteLoader.load(promptID: id)
+                if let suite = option.suite {
                     value["suite"] = .object([
                         "suite_id": .string(suite.suiteID),
                         "suite_sha256": .string(suite.suiteSHA256),
@@ -307,14 +511,22 @@
                         )),
                         "budget_guide": budgetGuide(cases: suite.cases, minibatch: PromptExperimentGEPASettings().reflectionMinibatchSize)
                     ])
-                } catch {
+                } else {
                     value["suite"] = .null
-                    value["suite_unavailable"] = .string(error.localizedDescription)
+                    value["suite_unavailable"] = .string(option.unavailableReason ?? "The prompt suite is unavailable.")
                 }
                 return .object(value)
             }
             return .object([
                 "operations": .array(PromptExperimentOperation.allCases.map { .string($0.rawValue) }),
+                "scope": .object([
+                    "built_in_prompts": .bool(true),
+                    "project_prompts": .bool(true),
+                    "pasted_prompts": .bool(true),
+                    "tool_using_agents": .bool(true),
+                    "dspy_programs": .bool(true)
+                ]),
+                "runners": .array(PromptLabRunnerKind.allCases.map { .string($0.rawValue) }),
                 "prompts": .array(prompts),
                 "targets": .array(service.availableTargets().map(targetValue)),
                 "defaults": .object([
@@ -330,11 +542,14 @@
                     "status": .string(PromptExperimentGEPAWorker.runtimeStatus)
                 ]),
                 "notes": .array([
-                    "Experiments optimize a built-in prompt against its checked-in suite. Targets must be prompt-only (no tools).",
-                    "request_approval shows a native card (in Agent Mode) and a pending entry in Window ▸ Prompt Experiments… (⌥⌘E); only the user can approve. Approval covers the whole max_evaluations cap and starts the first run.",
+                    "One lab optimizes RPCE prompts, project prompt files or selected source passages, pasted templates, and Python/DSPy programs. A frozen definition records the goal, examples, criteria and actual task runner.",
+                    "prepare drafts examples and checks with one bounded model call. With prompt_file it first returns a preparation_id for native approval to read the file and send its prompt to the selected model. describe_program also returns a preparation_id; native approval is required before importing project Python. Poll status_or_wait with that ID to receive the prepared definition, then review it before create_or_update. Preparation approval does not authorize optimization.",
+                    "New Experiment in Window ▸ Prompt Experiments… (⌥⌘E) creates a draft without an agent. request_approval shows a native review; only the user can approve. Approval covers max_evaluations plus the separate calibration_evaluations and starts the first run. Evaluation counts are not model-call or dollar caps.",
+                    "Oracle uses production prompt packaging. Engineer evaluates real file tasks in separate fixtures with read/edit tools and private acceptance checks; shell, web and delegation are disabled. Python/DSPy programs execute the selected project evaluator and its dependencies.",
                     "run resumes an approved experiment within its remaining cap. Changing any authority field creates a new experiment that needs its own approval.",
-                    "status_or_wait with experiment_id blocks until the approval or run state changes, or timeout_seconds elapses.",
-                    "propose_patch selects a retained candidate from a completed run; only native UI can apply or reject its source diff."
+                    "status_or_wait accepts either experiment_id or preparation_id and blocks until its state changes or timeout_seconds elapses. A preparation request can only be approved, declined or cancelled in native UI; a completed request cannot execute again.",
+                    "propose_patch selects a retained candidate from a completed run; only native UI can apply or reject its source diff. Pasted prompts can be copied or saved in Studio. export writes a JSON evidence file with the frozen definition and result artifacts.",
+                    "Token reductions require reported usage on matching examples. Inspect comparison coverage, final-check quality and baseline variability before claiming an improvement."
                 ].map(Value.string))
             ])
         }
@@ -353,7 +568,7 @@
                 "expected_proposals_at_25": .int(PromptExperimentBudgetLedger.expectedProposals(
                     cap: 25, cases: cases, reflectionMinibatchSize: minibatch
                 )),
-                "note": .string("Calibration is a separate approved line, spent only when the cross-experiment baseline cache misses. The worker never starts an iteration the remaining cap cannot finish.")
+                "note": .string("Calibration is a separate approved line. Definition-backed labs use a fresh baseline for each experiment; legacy built-in requests may reuse a matching cache. The worker never starts an iteration the remaining cap cannot finish.")
             ])
         }
 
@@ -395,6 +610,20 @@
             ])
         }
 
+        static func usageComparisonValue(_ comparison: PromptLabUsageComparison) -> Value {
+            .object([
+                "split": .string(comparison.split.rawValue), "case_count": .int(comparison.caseCount),
+                "paired_input_cases": .int(comparison.pairedInputCases), "paired_output_cases": .int(comparison.pairedOutputCases),
+                "baseline_input_tokens": comparison.baselineInputTokens.map(Value.int) ?? .null,
+                "candidate_input_tokens": comparison.candidateInputTokens.map(Value.int) ?? .null,
+                "baseline_output_tokens": comparison.baselineOutputTokens.map(Value.int) ?? .null,
+                "candidate_output_tokens": comparison.candidateOutputTokens.map(Value.int) ?? .null,
+                "input_reduction": comparison.inputReduction.map(Value.double) ?? .null,
+                "output_reduction": comparison.outputReduction.map(Value.double) ?? .null,
+                "summary": .string(comparison.summary)
+            ])
+        }
+
         static func targetValue(_ target: PromptExperimentResolvedTarget) -> Value {
             .object([
                 "selector": .string(target.selector),
@@ -403,6 +632,42 @@
                 "model": .string(target.modelRaw),
                 "prompt_only": .bool(PromptExperimentConnectedModelRunner.supportsPromptOnlyCallbacks(target))
             ])
+        }
+
+        /// Pending responses contain only caller-supplied metadata. Local content is returned
+        /// only after the user has explicitly authorized preparation in native UI.
+        static func preparationSummaryValue(_ request: PromptLabPreparationRequest) -> Value {
+            .object([
+                "preparation_id": .string(request.id.uuidString),
+                "title": .string(request.title),
+                "status": .string(request.status.rawValue)
+            ])
+        }
+
+        static func preparationValue(_ request: PromptLabPreparationRequest) throws -> Value {
+            let nextAction = switch request.status {
+            case .awaitingApproval:
+                "Ask the user to review this preparation in the native card or Window ▸ Prompt Experiments… (⌥⌘E). Only native controls can approve reading the prompt file or importing project Python. Poll status_or_wait with preparation_id; do not resubmit the request."
+            case .running:
+                "Poll status_or_wait with preparation_id for the prepared definition. The native review can cancel preparation."
+            case .completed:
+                "Review the returned prompt, examples, checks and model routing with the user, then pass definition to create_or_update. Supply the starting prompt if source.prompt is empty. Preparation did not approve or start optimization."
+            case .failed:
+                "Review the preparation error. Correct the inputs and submit a new request if needed; new file access or program inspection requires its own native approval."
+            case .rejected, .cancelled:
+                "The user declined or cancelled this preparation. Do not retry without a new user request."
+            }
+            var value: [String: Value] = [
+                "preparation_id": .string(request.id.uuidString),
+                "title": .string(request.title),
+                "status": .string(request.status.rawValue),
+                "next_action": .string(nextAction)
+            ]
+            if request.status == .completed, let definition = request.definition {
+                value["definition"] = try encodedValue(definition)
+            }
+            if let error = request.error { value["error"] = .string(error) }
+            return .object(value)
         }
 
         static func nextAction(_ experiment: PromptExperiment) -> String {
@@ -424,7 +689,8 @@
                 "experiment_id": .string(experiment.id.uuidString),
                 "title": .string(experiment.title),
                 "status": .string(experiment.status.rawValue),
-                "prompt_id": .string(experiment.authority.promptID.rawValue),
+                "prompt_id": .string(experiment.authority.promptIdentifier),
+                "source": .string(experiment.authority.sourceDescription),
                 "suite_id": .string(experiment.authority.suiteID),
                 "remaining_evaluations": .int(experiment.remainingEvaluations)
             ])
@@ -433,48 +699,57 @@
         static func experimentValue(_ experiment: PromptExperiment) -> Value {
             let authority = experiment.authority
             let settings = authority.settings
-            return .object([
+            let definition: Value = authority.definition.flatMap { try? encodedValue($0) } ?? .null
+            let authorityValue: [String: Value] = [
+                "prompt_id": .string(authority.promptIdentifier),
+                "source": .string(authority.sourceDescription),
+                "definition": definition,
+                "prompt_resource_sha256": .string(authority.promptResourceSHA256),
+                "suite_id": .string(authority.suiteID),
+                "suite_sha256": .string(authority.suiteSHA256),
+                "rubric_sha256": authority.rubricSHA256.map(Value.string) ?? .null,
+                "execution_target": targetValue(authority.targets.execution),
+                "reflection_target": targetValue(authority.targets.reflection),
+                "judge_target": authority.targets.judge.map(targetValue) ?? .null,
+                "max_evaluations": .int(authority.maxEvaluations),
+                "calibration_evaluations": .int(authority.calibrationEvaluations),
+                "maximum_total_evaluations": .int(authority.maximumTotalEvaluations),
+                "max_provider_invocations": authority.maxProviderInvocations.map(Value.int) ?? .null,
+                "reflection_minibatch_size": .int(settings.reflectionMinibatchSize),
+                "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
+                "prompt_character_ceiling_ratio": .double(settings.promptCharacterCeilingRatio),
+                "max_prompt_characters": settings.maxPromptCharacters.map(Value.int) ?? .null,
+                "noise_floor_replicates": .int(settings.noiseFloorReplicates),
+                "max_provider_retries": .int(settings.maxProviderRetries),
+                "random_seed": .int(settings.randomSeed),
+                "gepa_revision": .string(authority.gepaRevision)
+            ]
+            let proposals: [Value] = experiment.proposals.map { proposal in
+                let value: [String: Value] = [
+                    "proposal_id": .string(proposal.id.uuidString),
+                    "run_id": .string(proposal.runID.uuidString),
+                    "candidate_index": .int(proposal.candidateIndex),
+                    "state": .string(proposal.state.rawValue)
+                ]
+                return .object(value)
+            }
+            let value: [String: Value] = [
                 "experiment_id": .string(experiment.id.uuidString),
                 "title": .string(experiment.title),
                 "status": .string(experiment.status.rawValue),
                 "next_action": .string(nextAction(experiment)),
                 "authority_digest": .string(experiment.authorityDigest),
                 "supersedes": experiment.supersedes.map { .string($0.uuidString) } ?? .null,
-                "authority": .object([
-                    "prompt_id": .string(authority.promptID.rawValue),
-                    "prompt_resource_sha256": .string(authority.promptResourceSHA256),
-                    "suite_id": .string(authority.suiteID),
-                    "suite_sha256": .string(authority.suiteSHA256),
-                    "rubric_sha256": authority.rubricSHA256.map(Value.string) ?? .null,
-                    "execution_target": targetValue(authority.targets.execution),
-                    "reflection_target": targetValue(authority.targets.reflection),
-                    "judge_target": authority.targets.judge.map(targetValue) ?? .null,
-                    "max_evaluations": .int(authority.maxEvaluations),
-                    "calibration_evaluations": .int(authority.calibrationEvaluations),
-                    "reflection_minibatch_size": .int(settings.reflectionMinibatchSize),
-                    "candidate_selection_strategy": .string(settings.candidateSelectionStrategy),
-                    "prompt_character_ceiling_ratio": .double(settings.promptCharacterCeilingRatio),
-                    "max_prompt_characters": settings.maxPromptCharacters.map(Value.int) ?? .null,
-                    "noise_floor_replicates": .int(settings.noiseFloorReplicates),
-                    "max_provider_retries": .int(settings.maxProviderRetries),
-                    "random_seed": .int(settings.randomSeed),
-                    "gepa_revision": .string(authority.gepaRevision)
-                ]),
+                "authority": .object(authorityValue),
                 "admissions_used": .int(experiment.admissionsUsed),
                 "remaining_evaluations": .int(experiment.remainingEvaluations),
                 "calibration_admissions_used": .int(experiment.calibrationAdmissionsUsed),
                 "approval_requested_at": experiment.approvalRequest.map { .string(iso8601.string(from: $0.requestedAt)) } ?? .null,
                 "approved_at": experiment.approval.map { .string(iso8601.string(from: $0.approvedAt)) } ?? .null,
                 "runs": .array(experiment.runs.map(runValue)),
-                "proposals": .array(experiment.proposals.map { proposal in
-                    .object([
-                        "proposal_id": .string(proposal.id.uuidString),
-                        "run_id": .string(proposal.runID.uuidString),
-                        "candidate_index": .int(proposal.candidateIndex),
-                        "state": .string(proposal.state.rawValue)
-                    ])
-                })
-            ])
+                "proposals": .array(proposals)
+            ]
+            return .object(value)
         }
 
         static func runValue(_ run: PromptExperimentRun) -> Value {
@@ -542,6 +817,7 @@
                     "best_candidate_index": bestIndex,
                     "held_out": heldOut,
                     "noise_floor": noise,
+                    "usage_comparison": result.usageComparison.map(usageComparisonValue) ?? .null,
                     "evaluations": .int(result.totalEvaluations),
                     "candidates": .array(candidates)
                 ])

@@ -520,7 +520,10 @@ public struct ClaudeSDKNDJSONTranslator {
                 cost: cost,
                 providerSessionID: cliSessionID,
                 stopReason: stopReason,
-                modelContextWindow: modelContextWindow
+                modelContextWindow: modelContextWindow,
+                totalInputTokens: usage?.contextUsedTokens,
+                cachedInputTokens: usage?.cacheReadTokens,
+                cacheCreationInputTokens: usage?.cacheCreationTokens
             )
         )
         return results
@@ -994,7 +997,9 @@ public struct ClaudeSDKNDJSONTranslator {
         return TokenUsage(
             inputTokens: normalizedInput,
             outputTokens: normalizedOutput,
-            contextUsedTokens: contextUsedTokens
+            contextUsedTokens: contextUsedTokens,
+            cacheReadTokens: cacheRead,
+            cacheCreationTokens: cacheCreation
         )
     }
 

@@ -2444,12 +2444,291 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Optimize a RepoPrompt built-in prompt with upstream GEPA against its checked-in suite: targets, create_or_update (typed fields, aggregated field errors), request_approval (native card; only the user approves, which covers the whole cap and starts the first run), run (resume within the remaining approved cap), status_or_wait, cancel, propose_patch (reviewed source diff for a retained candidate). Changing an approved experiment's authority creates a new experiment. The tool cannot approve or apply a candidate.",
+      "description" : "Improve a RepoPrompt prompt, a project's prompt file or source passage, a pasted template, or a Python/DSPy program through one experiment lab. targets discovers prompts and models. prepare drafts examples/checks in one bounded model call. For prompt_file, prepare first queues native approval to read the file and make that call. describe_program queues native approval to execute the selected local Python module. Poll status_or_wait with the returned preparation_id; the definition is available only after native approval and completion. Review it, then create_or_update and request_approval. Only the user can approve the full budget in native UI, which starts the first run. run resumes, status_or_wait observes, cancel stops, propose_patch prepares a reviewed source diff, export saves complete evidence. Built-in Engineer tasks run with file read/edit tools in isolated fixtures. Changes to approved authority require new approval. This tool cannot approve preparation or optimization, or apply a source patch.",
       "inputSchema" : {
         "properties" : {
           "candidate_index" : {
             "description" : "propose_patch: retained GEPA candidate index.",
             "type" : "integer"
+          },
+          "criteria" : {
+            "description" : "prepare: optional success requirements, one per line.",
+            "type" : "string"
+          },
+          "definition" : {
+            "additionalProperties" : false,
+            "description" : "create_or_update: frozen task definition. Review/edit the object returned by prepare or describe_program, then submit it here. Nested fields use camelCase. Include at least one training, validation and hidden_test example.",
+            "properties" : {
+              "contractVersion" : {
+                "default" : 1,
+                "type" : "integer"
+              },
+              "criteria" : {
+                "description" : "Success requirements, one per line; saved weighted checklists are also accepted.",
+                "type" : "string"
+              },
+              "examples" : {
+                "items" : {
+                  "additionalProperties" : false,
+                  "properties" : {
+                    "context" : {
+                      "additionalProperties" : false,
+                      "properties" : {
+                        "fileTree" : {
+                          "description" : "Optional frozen file map.",
+                          "type" : "string"
+                        },
+                        "files" : {
+                          "items" : {
+                            "additionalProperties" : false,
+                            "properties" : {
+                              "content" : {
+                                "description" : "",
+                                "type" : "string"
+                              },
+                              "path" : {
+                                "description" : "",
+                                "type" : "string"
+                              }
+                            },
+                            "required" : [
+                              "path",
+                              "content"
+                            ],
+                            "type" : "object"
+                          },
+                          "type" : "array"
+                        }
+                      },
+                      "required" : [
+                        "files"
+                      ],
+                      "type" : "object"
+                    },
+                    "expectedOutput" : {
+                      "description" : "Optional private reference answer or agent acceptance specification. Never sent as task input.",
+                      "type" : "string"
+                    },
+                    "id" : {
+                      "description" : "Unique example identifier.",
+                      "type" : "string"
+                    },
+                    "input" : {
+                      "description" : "Actual user request sent to the task runner.",
+                      "type" : "string"
+                    },
+                    "payload" : {
+                      "additionalProperties" : true,
+                      "description" : "Original project/DSPy dataset fields, including nested JSON, preserved for the evaluator.",
+                      "type" : "object"
+                    },
+                    "split" : {
+                      "enum" : [
+                        "training",
+                        "validation",
+                        "hidden_test"
+                      ],
+                      "type" : "string"
+                    },
+                    "variables" : {
+                      "additionalProperties" : {
+                        "type" : "string"
+                      },
+                      "description" : "Values for {{name}} placeholders in a plain prompt template.",
+                      "type" : "object"
+                    }
+                  },
+                  "required" : [
+                    "id",
+                    "split",
+                    "input"
+                  ],
+                  "type" : "object"
+                },
+                "type" : "array"
+              },
+              "goal" : {
+                "description" : "The improvement the user wants.",
+                "type" : "string"
+              },
+              "objective" : {
+                "additionalProperties" : false,
+                "properties" : {
+                  "inputWeight" : {
+                    "default" : 1,
+                    "type" : "number"
+                  },
+                  "mode" : {
+                    "default" : "quality",
+                    "enum" : [
+                      "quality",
+                      "efficiency"
+                    ],
+                    "type" : "string"
+                  },
+                  "outputWeight" : {
+                    "default" : 1,
+                    "type" : "number"
+                  },
+                  "qualityTolerance" : {
+                    "default" : 0,
+                    "type" : "number"
+                  }
+                },
+                "type" : "object"
+              },
+              "program" : {
+                "additionalProperties" : false,
+                "description" : "Project evaluator configuration. Inspection requires native approval and executes this module with the selected interpreter's normal project access, including any code it runs during import. Nested names use camelCase, matching the completed preparation definition.",
+                "properties" : {
+                  "callable" : {
+                    "default" : "evaluate",
+                    "type" : "string"
+                  },
+                  "dependencySHA256" : {
+                    "additionalProperties" : {
+                      "type" : "string"
+                    },
+                    "description" : "Hashes of project Python sources and dependency declarations, returned by discovery and preserved for admission and resume checks.",
+                    "type" : "object"
+                  },
+                  "environmentKeys" : {
+                    "description" : "Names of additional environment variables the evaluator may inherit. Secret values are never stored in the definition. Defaults to none.",
+                    "items" : {
+                      "type" : "string"
+                    },
+                    "type" : "array"
+                  },
+                  "modelRouting" : {
+                    "description" : "Routing returned by program discovery. Project routing preserves the program's own model client; its calls are outside the RPCE provider-session limit.",
+                    "enum" : [
+                      "connected",
+                      "project"
+                    ],
+                    "type" : "string"
+                  },
+                  "modulePath" : {
+                    "description" : "Evaluation .py file inside the project; relative to projectRoot or absolute.",
+                    "type" : "string"
+                  },
+                  "moduleSHA256" : {
+                    "description" : "Evaluator hash returned by discovery; preserves the reviewed evaluator on resume.",
+                    "type" : "string"
+                  },
+                  "projectRoot" : {
+                    "description" : "Absolute project directory.",
+                    "type" : "string"
+                  },
+                  "pythonExecutable" : {
+                    "description" : "Absolute path to the project's Python executable, with its dependencies installed.",
+                    "type" : "string"
+                  },
+                  "timeoutSeconds" : {
+                    "default" : 120,
+                    "type" : "number"
+                  }
+                },
+                "required" : [
+                  "pythonExecutable",
+                  "projectRoot",
+                  "modulePath"
+                ],
+                "type" : "object"
+              },
+              "relativePromptLimit" : {
+                "description" : "Optional prompt-length ceiling relative to a parent; omitted means no relative ceiling. An explicit 1.0 forbids growth.",
+                "type" : "number"
+              },
+              "runner" : {
+                "default" : "plainPrompt",
+                "enum" : [
+                  "plainPrompt",
+                  "oracle",
+                  "engineer",
+                  "program",
+                  "dspy"
+                ],
+                "type" : "string"
+              },
+              "source" : {
+                "additionalProperties" : false,
+                "properties" : {
+                  "builtInPromptID" : {
+                    "description" : "",
+                    "type" : "string"
+                  },
+                  "filePath" : {
+                    "description" : "",
+                    "type" : "string"
+                  },
+                  "kind" : {
+                    "enum" : [
+                      "builtIn",
+                      "file",
+                      "pasted"
+                    ],
+                    "type" : "string"
+                  },
+                  "literal" : {
+                    "additionalProperties" : false,
+                    "description" : "Encoding metadata returned by source import; preserve it unchanged so source application can re-encode the decoded prompt safely.",
+                    "properties" : {
+                      "language" : {
+                        "enum" : [
+                          "json",
+                          "python",
+                          "javascript",
+                          "swift"
+                        ],
+                        "type" : "string"
+                      },
+                      "token" : {
+                        "description" : "The complete original quoted literal, including its delimiters.",
+                        "type" : "string"
+                      }
+                    },
+                    "required" : [
+                      "language",
+                      "token"
+                    ],
+                    "type" : "object"
+                  },
+                  "originalFileSHA256" : {
+                    "description" : "",
+                    "type" : "string"
+                  },
+                  "prompt" : {
+                    "description" : "Starting prompt or template.",
+                    "type" : "string"
+                  },
+                  "selection" : {
+                    "description" : "",
+                    "type" : "string"
+                  },
+                  "title" : {
+                    "description" : "",
+                    "type" : "string"
+                  }
+                },
+                "required" : [
+                  "kind",
+                  "title",
+                  "prompt"
+                ],
+                "type" : "object"
+              }
+            },
+            "required" : [
+              "source",
+              "goal",
+              "examples",
+              "criteria"
+            ],
+            "type" : "object"
+          },
+          "example_inputs" : {
+            "description" : "prepare: optional example requests or topics, one per line, to guide the generated cases.",
+            "type" : "string"
           },
           "execution_target" : {
             "description" : "create_or_update: prompt-only target selector for the evaluated model.",
@@ -2460,7 +2739,11 @@
             "type" : "string"
           },
           "experiment_id" : {
-            "description" : "Experiment UUID. Optional for create_or_update (update) and status_or_wait (omit to list).",
+            "description" : "Experiment UUID. Optional for create_or_update (update) and status_or_wait. In status_or_wait, mutually exclusive with preparation_id; omit both IDs to list.",
+            "type" : "string"
+          },
+          "goal" : {
+            "description" : "prepare: plain-language description of the desired improvement.",
             "type" : "string"
           },
           "judge_target" : {
@@ -2468,7 +2751,7 @@
             "type" : "string"
           },
           "max_evaluations" : {
-            "description" : "create_or_update: total evaluation cap the user approves.",
+            "description" : "create_or_update: search evaluation cap. Approval also includes the separate baseline calibration allowance; these are not model-call or dollar caps.",
             "type" : "integer"
           },
           "max_prompt_characters" : {
@@ -2480,27 +2763,104 @@
             "type" : "integer"
           },
           "noise_floor_replicates" : {
-            "description" : "create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; cached across experiments.",
+            "description" : "create_or_update: extra seed passes over the validation cases before search to measure judge/target noise, 0-5. Default 2. Part of the separate calibration line; definition-backed labs use a fresh baseline for each experiment.",
             "type" : "integer"
           },
           "op" : {
             "enum" : [
               "targets",
+              "prepare",
+              "describe_program",
               "create_or_update",
               "request_approval",
               "run",
               "status_or_wait",
               "cancel",
-              "propose_patch"
+              "propose_patch",
+              "export"
             ],
             "type" : "string"
           },
+          "output_path" : {
+            "description" : "export: absolute destination for a JSON file containing the frozen definition, results and inline evidence artifacts.",
+            "type" : "string"
+          },
+          "preparation_id" : {
+            "description" : "status_or_wait: UUID returned by file preparation or program inspection. Mutually exclusive with experiment_id. A definition is returned only after native approval and completion.",
+            "type" : "string"
+          },
+          "program" : {
+            "additionalProperties" : false,
+            "description" : "Project evaluator configuration. Inspection requires native approval and executes this module with the selected interpreter's normal project access, including any code it runs during import. Nested names use camelCase, matching the completed preparation definition.",
+            "properties" : {
+              "callable" : {
+                "default" : "evaluate",
+                "type" : "string"
+              },
+              "dependencySHA256" : {
+                "additionalProperties" : {
+                  "type" : "string"
+                },
+                "description" : "Hashes of project Python sources and dependency declarations, returned by discovery and preserved for admission and resume checks.",
+                "type" : "object"
+              },
+              "environmentKeys" : {
+                "description" : "Names of additional environment variables the evaluator may inherit. Secret values are never stored in the definition. Defaults to none.",
+                "items" : {
+                  "type" : "string"
+                },
+                "type" : "array"
+              },
+              "modelRouting" : {
+                "description" : "Routing returned by program discovery. Project routing preserves the program's own model client; its calls are outside the RPCE provider-session limit.",
+                "enum" : [
+                  "connected",
+                  "project"
+                ],
+                "type" : "string"
+              },
+              "modulePath" : {
+                "description" : "Evaluation .py file inside the project; relative to projectRoot or absolute.",
+                "type" : "string"
+              },
+              "moduleSHA256" : {
+                "description" : "Evaluator hash returned by discovery; preserves the reviewed evaluator on resume.",
+                "type" : "string"
+              },
+              "projectRoot" : {
+                "description" : "Absolute project directory.",
+                "type" : "string"
+              },
+              "pythonExecutable" : {
+                "description" : "Absolute path to the project's Python executable, with its dependencies installed.",
+                "type" : "string"
+              },
+              "timeoutSeconds" : {
+                "default" : 120,
+                "type" : "number"
+              }
+            },
+            "required" : [
+              "pythonExecutable",
+              "projectRoot",
+              "modulePath"
+            ],
+            "type" : "object"
+          },
           "prompt_character_ceiling_ratio" : {
-            "description" : "create_or_update: hard ceiling for a proposed prompt as a multiple of the prompt being edited, 0.25-4.0. Default 1.0 (proposals never grow the prompt).",
+            "description" : "create_or_update: optional hard ceiling for a proposed prompt as a multiple of its parent, 0.25-4.0. Generic definitions have no relative ceiling unless selected; legacy built-in requests default to 1.0.",
             "type" : "number"
           },
+          "prompt_file" : {
+            "description" : "prepare: absolute path to a UTF-8 prompt/source file. Queues native approval before reading the file or sending its contents to the preparation model. Its original bytes are checked before applying a result.",
+            "type" : "string"
+          },
           "prompt_id" : {
-            "description" : "create_or_update: built-in prompt ID from targets.",
+            "description" : "prepare or create_or_update: built-in prompt ID from targets. For a custom task, use definition instead of prompt_id in create_or_update.",
+            "type" : "string"
+          },
+          "prompt_text" : {
+            "description" : "prepare: prompt text or template; choose exactly one of prompt_id, prompt_text and prompt_file.",
             "type" : "string"
           },
           "random_seed" : {
@@ -2512,11 +2872,27 @@
             "type" : "integer"
           },
           "reflection_target" : {
-            "description" : "create_or_update: prompt-only target selector for GEPA reflection.",
+            "description" : "prepare or create_or_update: model selector for drafting experiments or proposing prompt changes.",
             "type" : "string"
           },
           "run_id" : {
-            "description" : "propose_patch: completed run UUID.",
+            "description" : "propose_patch or export: completed run UUID.",
+            "type" : "string"
+          },
+          "runner" : {
+            "description" : "describe_program: which kind of project evaluator to inspect after native approval; defaults to program.",
+            "enum" : [
+              "program",
+              "dspy"
+            ],
+            "type" : "string"
+          },
+          "selection" : {
+            "description" : "prepare with prompt_file: exact, unique prompt passage to optimize; omit to use the complete file.",
+            "type" : "string"
+          },
+          "source_title" : {
+            "description" : "prepare: display name for a pasted or project prompt.",
             "type" : "string"
           },
           "suite_id" : {
@@ -2524,7 +2900,7 @@
             "type" : "string"
           },
           "timeout_seconds" : {
-            "description" : "status_or_wait: seconds to wait for an approval or run change, 0-3600. Default 60.",
+            "description" : "status_or_wait: seconds to wait for a preparation, approval or run change, 0-3600. Default 60. Completed preparations return immediately.",
             "type" : "number"
           },
           "title" : {

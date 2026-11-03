@@ -20,6 +20,7 @@ package actor DirectHeadlessMCPService {
         let providerCoordinator: DirectHeadlessProviderCoordinator
         let oracleAdapter: DirectHeadlessOracleAdapter
         let oracleStore: DomainOracleConversationStore
+        let isPromptExperiment: Bool
         let settingsStore: DomainDirectSettingsStore
     }
 
@@ -84,15 +85,7 @@ package actor DirectHeadlessMCPService {
         await installHandlers(
             server: server,
             prepared: prepared,
-            connection: ConnectionContext(
-                connectionID: prepared.connectionID,
-                connectionGeneration: prepared.connectionGeneration,
-                principal: prepared.principal,
-                policyProfile: .direct,
-                restrictedToolNames: [],
-                additionalToolNames: [],
-                ephemeralGrantedOperations: Self.topLevelDefaultMutationOperations
-            )
+            connection: topLevelConnection(prepared)
         )
         let transport = MCPStdioServerTransport(
             writeStallTimeout: .seconds(5),
@@ -131,11 +124,26 @@ package actor DirectHeadlessMCPService {
         }
     }
 
+    func topLevelConnection(_ prepared: PreparedRuntime) -> ConnectionContext {
+        ConnectionContext(
+            connectionID: prepared.connectionID,
+            connectionGeneration: prepared.connectionGeneration,
+            principal: prepared.principal,
+            policyProfile: .direct,
+            restrictedToolNames: prepared.isPromptExperiment ? DirectHeadlessExperimentProfile.restrictedToolNames : [],
+            additionalToolNames: [],
+            ephemeralGrantedOperations: prepared.isPromptExperiment
+                ? PromptExperimentAgentProfile.mutationOperations
+                : Self.topLevelDefaultMutationOperations
+        )
+    }
+
     func prepareRuntime() async throws -> PreparedRuntime {
         let locations = try DirectHeadlessRuntimeLocationResolver.resolve(
             environment: environment,
             currentDirectory: currentDirectory
         )
+        let isPromptExperiment = try DirectHeadlessExperimentProfile.isEnabled(environment: environment, locations: locations)
         let profile = AppProfileLocations(identity: .current, profileName: locations.profileIdentifier)
         let pathPolicy = profile.identity.buildFlavor == .debug
             ? AppMetadataPathPolicy(locations: profile, roots: [locations.storageDirectory, locations.workspaceStorageDirectory]) : nil
@@ -294,6 +302,7 @@ package actor DirectHeadlessMCPService {
                 providerCoordinator: providerCoordinator,
                 oracleAdapter: oracleAdapter,
                 oracleStore: oracleStore,
+                isPromptExperiment: isPromptExperiment,
                 settingsStore: settingsStore
             )
         } catch {

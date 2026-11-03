@@ -285,7 +285,10 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             stopReason: providerResult.stopReason,
             modelContextWindow: providerResult.modelContextWindow,
             contextUsedTokens: providerResult.contextUsedTokens,
-            contentMessageID: providerResult.contentMessageID
+            contentMessageID: providerResult.contentMessageID,
+            totalInputTokens: providerResult.totalInputTokens,
+            cachedInputTokens: providerResult.cachedInputTokens,
+            cacheCreationInputTokens: providerResult.cacheCreationInputTokens
         )
     }
 
@@ -308,7 +311,10 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             stopReason: streamResult.stopReason,
             modelContextWindow: streamResult.modelContextWindow,
             contextUsedTokens: streamResult.contextUsedTokens,
-            contentMessageID: streamResult.contentMessageID
+            contentMessageID: streamResult.contentMessageID,
+            totalInputTokens: streamResult.totalInputTokens,
+            cachedInputTokens: streamResult.cachedInputTokens,
+            cacheCreationInputTokens: streamResult.cacheCreationInputTokens
         )
     }
 
