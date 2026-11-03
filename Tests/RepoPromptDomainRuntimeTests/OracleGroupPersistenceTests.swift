@@ -771,6 +771,7 @@ final class OracleGroupPersistenceTests: XCTestCase {
         try await release.store.create(bad)
         try await debug.store.create(retained)
         let badURL = releaseRoot.appendingPathComponent("groups/\(bad.group.id.rawValue.uuidString).json")
+        let badBytes = try Data(contentsOf: badURL)
         try Data("invalid".utf8).write(to: badURL)
         let goodURL = releaseRoot.appendingPathComponent("groups/\(good.group.id.rawValue.uuidString).json")
         let bytes = try Data(contentsOf: goodURL)
@@ -784,12 +785,84 @@ final class OracleGroupPersistenceTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: output.appendingPathComponent("artifacts/\(artifactID).blob")), artifact)
         XCTAssertFalse(FileManager.default.fileExists(atPath: output.appendingPathComponent("artifacts/\(orphanID).blob").path))
         XCTAssertEqual(try Data(contentsOf: badURL), Data("invalid".utf8))
-        // On a later seed, a release group deleted upstream must not leave its blob behind.
-        try FileManager.default.removeItem(at: lowerURL)
+        // Restore a healthy release store before deleting through its normal transaction.
+        // Otherwise stale index entries reject the whole import and mask artifact retention.
+        try badBytes.write(to: badURL)
+        try FileManager.default.moveItem(at: lowerURL, to: goodURL)
+        try await release.store.delete(groupID: good.group.id, owner: good.owner, expectedRevision: good.revision)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: goodURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: releaseRoot.appendingPathComponent("artifacts/\(artifactID).blob").path))
         let next = debug.root.appendingPathComponent("next")
-        _ = try OracleDebugRetention.combine(releaseRoot: releaseRoot, debugRoot: output, destination: next,
-                                             isRetained: { $0 == retained.owner }, checkCancellation: {})
+        let nextOmissions = try OracleDebugRetention.combine(releaseRoot: releaseRoot, debugRoot: output, destination: next,
+                                                             isRetained: { $0 == retained.owner }, checkCancellation: {})
+        XCTAssertTrue(nextOmissions.isEmpty, "Whole-release rejection must not mask the deletion case")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: next.appendingPathComponent("groups/\(good.group.id.rawValue.uuidString).json").path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: next.appendingPathComponent("artifacts/\(artifactID).blob").path))
+        XCTAssertEqual(try Data(contentsOf: next.appendingPathComponent("groups/\(bad.group.id.rawValue.uuidString).json")), badBytes)
+        let retainedRelative = "groups/\(retained.group.id.rawValue.uuidString).json"
+        XCTAssertEqual(try Data(contentsOf: next.appendingPathComponent(retainedRelative)), try Data(contentsOf: debugRoot.appendingPathComponent(retainedRelative)))
+    }
+
+    func testDebugRetentionRecoversCapturedReleaseJournalBeforeRebuildingMemberIndex() async throws {
+        let release = makeStore(profile: "release"), debug = makeStore(profile: "debug"), merged = makeStore(profile: "merged")
+        defer {
+            try? FileManager.default.removeItem(at: release.root)
+            try? FileManager.default.removeItem(at: debug.root)
+            try? FileManager.default.removeItem(at: merged.root)
+        }
+        let retained = try makeGroup(count: 2, seed: "retained-debug")
+        let excluded = try makeGroup(count: 2, seed: "replaced-release", owner: retained.owner)
+        let imported = try makeGroup(count: 2, seed: "pending-release")
+        try await debug.store.create(retained)
+        try await release.store.create(excluded)
+        let interrupter = OneShotPersistenceInterrupter()
+        let interrupted = DomainOracleConversationStore(
+            persistence: release.persistence,
+            identity: makeIdentity(),
+            mutationObserver: { phase in try interrupter.observe(phase) }
+        )
+        await XCTAssertOraclePersistenceThrowsErrorAsync {
+            try await interrupted.create(imported)
+        } verify: {
+            XCTAssertEqual(($0 as? CocoaError)?.code, .fileWriteUnknown)
+        }
+        let releaseRoot = release.persistence.oracleStorageRoot
+        let indexURL = releaseRoot.appendingPathComponent("index.json")
+        let indexBytes = try Data(contentsOf: indexURL)
+        let journalURL = try XCTUnwrap(FileManager.default.contentsOfDirectory(
+            at: releaseRoot.appendingPathComponent("transactions"), includingPropertiesForKeys: nil
+        ).first)
+        let journalBytes = try Data(contentsOf: journalURL)
+        let importedRelative = "groups/\(imported.group.id.rawValue.uuidString).json"
+        XCTAssertFalse(FileManager.default.fileExists(atPath: releaseRoot.appendingPathComponent(importedRelative).path))
+        let capturedRelease = release.root.appendingPathComponent("captured-oracle")
+        try FileManager.default.copyItem(at: releaseRoot, to: capturedRelease)
+        let destination = merged.persistence.oracleStorageRoot
+        let omissions = try OracleDebugRetention.combine(
+            releaseRoot: capturedRelease, debugRoot: debug.persistence.oracleStorageRoot, destination: destination,
+            isRetained: { $0 == retained.owner }, checkCancellation: {}
+        )
+        XCTAssertTrue(omissions.isEmpty)
+        let journalRelative = "transactions/" + journalURL.lastPathComponent
+        XCTAssertFalse(FileManager.default.fileExists(atPath: capturedRelease.appendingPathComponent(journalRelative).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.appendingPathComponent(journalRelative).path))
+        let cold = DomainOracleConversationStore(persistence: merged.persistence, identity: makeIdentity())
+        for group in [retained, imported] {
+            for member in group.members {
+                let loaded = try await cold.load(member: OracleMemberLookup(publicChatID: member.publicChatID), owner: group.owner)
+                XCTAssertEqual(loaded, group)
+            }
+        }
+        let absent = try await cold.load(groupID: excluded.group.id, owner: excluded.owner)
+        XCTAssertNil(absent)
+        for member in excluded.members {
+            let absentMember = try await cold.load(member: OracleMemberLookup(publicChatID: member.publicChatID), owner: excluded.owner)
+            XCTAssertNil(absentMember)
+        }
+        // Recovery changed only the disposable capture, not the original release input.
+        XCTAssertEqual(try Data(contentsOf: indexURL), indexBytes)
+        XCTAssertEqual(try Data(contentsOf: journalURL), journalBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: releaseRoot.appendingPathComponent(importedRelative).path))
     }
 
     func testDebugRetentionOmitsUnusableReleaseStoreButRejectsDebugDamageAndCancellation() async throws {
