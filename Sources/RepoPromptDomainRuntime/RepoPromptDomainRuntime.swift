@@ -19,6 +19,9 @@ package struct DomainRuntimeConfiguration: Sendable {
     package let externalReloadMaximumInterval: Duration
     package let metrics: DomainRuntimeMetricsSink
     package let hostDrainTimeout: Duration
+    /// Refuses durable replacements that would discard workspace bytes without a verified recovery
+    /// backup (#335). Nil disables the obligation (tests and hosts with no lossy decoder).
+    package let durableReplacementGuard: DomainDurableReplacementGuard?
 
     package init(
         mode: DomainRuntimeMode,
@@ -32,9 +35,11 @@ package struct DomainRuntimeConfiguration: Sendable {
         externalReloadMaximumInterval: Duration = .seconds(30),
         metrics: DomainRuntimeMetricsSink = .disabled,
         hostDrainTimeout: Duration = .seconds(5),
-        metadataPathPolicy: AppMetadataPathPolicy? = nil
+        metadataPathPolicy: AppMetadataPathPolicy? = nil,
+        durableReplacementGuard: DomainDurableReplacementGuard? = nil
     ) {
         self.metadataPathPolicy = metadataPathPolicy
+        self.durableReplacementGuard = durableReplacementGuard
         self.mode = mode
         self.profileIdentifier = profileIdentifier
         self.storageDirectory = storageDirectory

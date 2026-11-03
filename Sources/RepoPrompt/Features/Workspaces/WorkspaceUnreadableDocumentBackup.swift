@@ -1,59 +1,159 @@
-import CryptoKit
 import Foundation
+import os
 import OSLog
+import RepoPromptDomainRuntime
 import RepoPromptShared
 
-/// Preserves the original bytes of a `workspace.json` whose compose tabs could not all be decoded.
+/// The app's recovery-backup policy for workspace documents whose compose tabs it cannot all
+/// decode (#335).
 ///
-/// `WorkspaceModel` decoding is deliberately lossy at the smallest unit (a single unreadable tab is
-/// dropped; an unreadable array becomes a fresh `T1`), and nothing downstream distinguishes that
-/// lossy value from a clean one once it is saved back. Writing a content-addressed sibling copy at
-/// decode time keeps the user's original data recoverable no matter which writer later replaces
-/// the file (#335). The copy is idempotent per document content, so repeated loads of the same
-/// bytes never pile up backups.
+/// `WorkspaceModel` decoding is deliberately lossy at the smallest unit (an unreadable tab is
+/// dropped; an unreadable array becomes a fresh `T1`), so a lossy value saved back would replace
+/// tabs this build could not read. The invariant enforced here and in the domain runtime is
+/// stateless: durable bytes that decode lossily are never replaced (working journal or
+/// `workspace.json`) until a verified, fsynced, content-addressed copy of them exists. The backup
+/// file is the only record that the obligation was met, so it survives restarts.
+///
+/// Nothing here requires the main actor or AppKit: the guard runs inside domain persistence locks.
 enum WorkspaceUnreadableDocumentBackup {
-    static let fileNamePrefix = "workspace.unreadable-"
+    static let fileNamePrefix = DomainRecoveryBackup.fileNamePrefix
     private static let logger = Logger(subsystem: "com.repoprompt.workspace", category: "decode")
 
-    /// `workspace.unreadable-<16 hex digest chars>.json` next to `documentURL`.
+    /// Full-digest `workspace.unreadable-<sha256>.json` next to `documentURL`.
     static func backupURL(for documentURL: URL, documentBytes: Data) -> URL {
-        let digest = Data(SHA256.hash(data: documentBytes)).prefix(8)
-            .map { String(format: "%02x", $0) }
-            .joined()
-        return documentURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("\(fileNamePrefix)\(digest).json", isDirectory: false)
+        DomainRecoveryBackup.backupURL(documentURL: documentURL, documentBytes: documentBytes)
     }
 
-    /// Writes the backup when `droppedComposeTabCount` is positive and the original document still
-    /// exists at `documentURL`. Returns the backup location when one exists afterwards (newly
-    /// written or already present); failures are logged and never surface to the loader.
-    @discardableResult
-    static func preserveIfNeeded(
-        documentBytes: Data,
-        documentURL: URL,
-        droppedComposeTabCount: Int
-    ) -> URL? {
-        guard droppedComposeTabCount > 0 else { return nil }
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: documentURL.path) else { return nil }
-        let backupURL = backupURL(for: documentURL, documentBytes: documentBytes)
-        if fileManager.fileExists(atPath: backupURL.path) {
-            return backupURL
-        }
+    /// The app-side guard installed in the app's domain runtime configuration.
+    static let durableReplacementGuard = DomainDurableReplacementGuard { replacement in
+        try WorkspaceUnreadableDocumentBackup.protectReplacement(
+            discarding: replacement.discardedBytes,
+            replacement: replacement.replacementBytes,
+            documentURL: replacement.documentURL
+        )
+    }
+
+    /// Ensures `discarded` is recoverable before it is replaced by `replacement`. Throws
+    /// `WorkspaceRecoveryBackupBlockedError` when a required backup cannot be made durable.
+    static func protectReplacement(discarding discarded: Data, replacement: Data, documentURL: URL) throws {
+        // Cheap structural prefilter: a replacement that keeps every compose-tab identity cannot
+        // lose an unreadable tab. Only otherwise is the exact (model) decode consulted, so closing
+        // a tab never produces a backup.
+        guard discarded != replacement,
+              DomainRecoveryBackup.replacementDropsComposeTabs(discarded: discarded, replacement: replacement),
+              documentRequiresPreservation(discarded)
+        else { return }
         do {
-            try AppProfileLocations.current.validateMetadataFile(backupURL)
-            // Content-addressed name: a concurrent writer can only produce identical bytes.
-            try documentBytes.write(to: backupURL, options: .atomic)
-            logger.notice(
-                "Preserved unreadable workspace document (\(droppedComposeTabCount, privacy: .public) compose tab(s) dropped) at \(backupURL.path, privacy: .private)"
+            try DomainRecoveryBackup.preserve(
+                documentBytes: discarded,
+                documentURL: documentURL,
+                validatePath: AppProfileLocations.current.validateMetadataFile
             )
-            return backupURL
         } catch {
             logger.error(
-                "Failed to preserve unreadable workspace document: \(String(describing: error), privacy: .public)"
+                "Refusing to replace unreadable workspace document without a recovery backup: \(String(describing: error), privacy: .public)"
+            )
+            throw WorkspaceRecoveryBackupBlockedError(reason: String(describing: error))
+        }
+    }
+
+    /// Eager, best-effort preservation at decode time. Enforcement happens at replacement time, so
+    /// a failure here is only logged. The canonical document need not exist (journal bytes), but
+    /// the workspace directory must: synthetic or deleted projections never create directories.
+    @discardableResult
+    static func preserveIfNeeded(documentBytes: Data, documentURL: URL, droppedComposeTabCount: Int) -> URL? {
+        guard droppedComposeTabCount > 0,
+              FileManager.default.fileExists(atPath: documentURL.deletingLastPathComponent().path)
+        else { return nil }
+        do {
+            let url = try DomainRecoveryBackup.preserve(
+                documentBytes: documentBytes,
+                documentURL: documentURL,
+                validatePath: AppProfileLocations.current.validateMetadataFile
+            )
+            logger.notice(
+                "Preserved unreadable workspace document (\(droppedComposeTabCount, privacy: .public) compose tab(s) dropped) at \(url.path, privacy: .private)"
+            )
+            return url
+        } catch {
+            logger.error(
+                "Failed to preserve unreadable workspace document; replacements stay blocked until it succeeds: \(String(describing: error), privacy: .public)"
             )
             return nil
         }
+    }
+
+    /// Whether this build cannot represent every compose tab in `bytes` (or cannot decode them at
+    /// all). The verdict is a pure function of the bytes, so it is memoized by digest.
+    static func documentRequiresPreservation(_ bytes: Data) -> Bool {
+        let digest = DomainContentDigest.sha256(bytes)
+        if let cached = verdicts.withLock({ $0.value(for: digest) }) {
+            return cached
+        }
+        let verdict = WorkspaceManagerViewModel.workspaceDocumentDecodesLossily(documentBytes: bytes)
+        verdicts.withLock { $0.store(verdict, for: digest) }
+        return verdict
+    }
+
+    /// Replacement for the app's non-domain writers (`WorkspaceDiskWriter` backends and direct
+    /// saves), which only run when no domain authority owns the document. Check, preserve, and the
+    /// atomic replacement happen under one per-document lock, so in-process writers cannot race
+    /// between the check and the write. The lock never covers more than one document.
+    static func replaceDocument(_ data: Data, at url: URL) throws {
+        let documentLock = lock(for: url)
+        documentLock.lock()
+        defer { documentLock.unlock() }
+        try AppProfileLocations.current.validateMetadataFile(url)
+        if let current = try? Data(contentsOf: url) {
+            try protectReplacement(discarding: current, replacement: data, documentURL: url)
+        }
+        try data.write(to: url, options: .atomic)
+    }
+
+    // MARK: - Private
+
+    private struct VerdictCache {
+        private var entries: [String: Bool] = [:]
+        private var order: [String] = []
+        private let limit = 256
+
+        func value(for digest: String) -> Bool? {
+            entries[digest]
+        }
+
+        mutating func store(_ verdict: Bool, for digest: String) {
+            if entries.updateValue(verdict, forKey: digest) == nil {
+                order.append(digest)
+            }
+            while order.count > limit {
+                entries.removeValue(forKey: order.removeFirst())
+            }
+        }
+    }
+
+    private static let verdicts = OSAllocatedUnfairLock(initialState: VerdictCache())
+    /// Held only to look up a document's lock, never across disk I/O.
+    private static let documentLocks = OSAllocatedUnfairLock(initialState: [String: NSLock]())
+
+    private static func lock(for url: URL) -> NSLock {
+        let key = url.standardizedFileURL.path
+        return documentLocks.withLock { locks in
+            if let existing = locks[key] {
+                return existing
+            }
+            let created = NSLock()
+            locks[key] = created
+            return created
+        }
+    }
+}
+
+/// A save was refused because the bytes it would replace need a recovery backup that could not be
+/// made durable. Nothing on disk changed; the in-memory draft is retained and a later save retries.
+struct WorkspaceRecoveryBackupBlockedError: Error, Equatable, LocalizedError {
+    let reason: String
+
+    var errorDescription: String? {
+        "RepoPrompt couldn't save a recovery copy of workspace tabs it couldn't read (\(reason))."
     }
 }

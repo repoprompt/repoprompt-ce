@@ -3025,6 +3025,7 @@ actor DomainWorkspaceContextAuthority {
         let code: DomainCommandErrorCode = switch error {
         case DomainPersistenceError.lockTimedOut: .lockTimedOut
         case DomainPersistenceError.cancelled: .cancelled
+        case DomainPersistenceError.recoveryBackupRequired(_, _): .recoveryBackupRequired
         default: .persistenceFailure
         }
         return DomainCommandOutcome(
