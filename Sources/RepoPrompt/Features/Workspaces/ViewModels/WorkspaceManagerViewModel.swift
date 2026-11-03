@@ -16581,6 +16581,32 @@ class WorkspaceManagerViewModel: ObservableObject {
             && workspaceFileURL(for: capture.localWorkspace) == capture.fileURL
     }
 
+    #if DEBUG
+        /// Value-only conflict evidence: names of differing stored properties, never their contents.
+        static func workspaceModelDiffLabelsForTesting(_ current: WorkspaceModel?, _ captured: WorkspaceModel) -> String {
+            guard let current else { return "missing" }
+            func differing(_ lhs: Any, _ rhs: Any) -> [(String, Any, Any)] {
+                zip(Mirror(reflecting: lhs).children, Mirror(reflecting: rhs).children).compactMap { left, right in
+                    String(reflecting: left.value) == String(reflecting: right.value)
+                        ? nil : (left.label ?? "?", left.value, right.value)
+                }
+            }
+            var labels: [String] = []
+            for (label, left, right) in differing(current, captured) {
+                if let leftTabs = left as? [ComposeTabState], let rightTabs = right as? [ComposeTabState],
+                   leftTabs.count == rightTabs.count
+                {
+                    for (index, pair) in zip(leftTabs, rightTabs).enumerated() {
+                        labels += differing(pair.0, pair.1).map { "\(label)[\(index)].\($0.0)" }
+                    }
+                } else {
+                    labels.append(label)
+                }
+            }
+            return labels.isEmpty ? "none" : labels.joined(separator: ",")
+        }
+    #endif
+
     private func retryStaleDomainAuthoritySave(
         proposal: WorkspaceModel,
         capture: DomainAuthoritySaveCapture,
@@ -16607,6 +16633,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "capturedState": String(capture.stateVersion),
                 "currentState": String(stateVersionByWorkspaceID[proposal.id, default: 0]),
                 "modelEqual": String(workspace(withID: proposal.id) == capture.localWorkspace),
+                "modelDiff": Self.workspaceModelDiffLabelsForTesting(workspace(withID: proposal.id), capture.localWorkspace),
                 "capturedWorking": capture.revisions.map { String($0.workingRevision) } ?? "none",
                 "currentWorking": domainWorkspaceRevisionsByID[proposal.id].map { String($0.workingRevision) } ?? "none",
                 "capturedSaved": capture.revisions.map { String($0.savedRevision) } ?? "none",
@@ -16615,7 +16642,13 @@ class WorkspaceManagerViewModel: ObservableObject {
                 "currentAdoption": String(fullDocumentAdoptionGenerations[proposal.id, default: 0]),
                 "capturedRoot": String(capture.rootEditGeneration),
                 "currentRoot": String(rootEditGenerationByWorkspaceID[proposal.id, default: 0]),
-                "remainingRetries": String(remainingRetryCount)
+                "remainingRetries": String(remainingRetryCount),
+                "recaptureActivation": recaptureActivationGeneration.map(String.init) ?? "none",
+                "currentActivation": String(rootActivationGeneration),
+                "activeOwner": String(activeWorkspaceID == proposal.id),
+                "switching": String(isSwitchingWorkspace),
+                "refreshing": String(isRefreshing),
+                "closing": String(isPreparingForWindowClose)
             ])
         #endif
         guard var current = workspace(withID: proposal.id) else { throw WorkspaceDirectWriteError.workspaceUnavailable }
