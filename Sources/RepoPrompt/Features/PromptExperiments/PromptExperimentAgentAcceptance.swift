@@ -137,7 +137,13 @@
             guard result.status == 0, !result.timedOut,
                   let record = try? JSONDecoder().decode([String: Value].self, from: result.stdout),
                   record["value"] == .string("RPCE_ENGINEER_SANDBOX_READY")
-            else { throw PromptExperimentAuthorityError.runtimeUnavailable("The isolated Engineer acceptance runtime failed its sandbox launch check. No agent task was started.") }
+            else {
+                let detail = result.timedOut ? "timed out" : "exit status \(result.status)"
+                let stderr = String(decoding: result.stderr.suffix(400), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                throw PromptExperimentAuthorityError.runtimeUnavailable(
+                    "The isolated Engineer acceptance runtime failed its sandbox launch check (\(detail)\(stderr.isEmpty ? "" : ": \(stderr)")). No agent task was started."
+                )
+            }
             preflightSucceeded = true
         }
 
@@ -184,27 +190,44 @@
             ))
         }
 
+        /// Sandbox path filters match the kernel's canonical vnode path. Foundation's
+        /// `resolvingSymlinksInPath()` rewrites `/private/var` and `/private/tmp` back to their
+        /// `/var` and `/tmp` aliases, which the kernel never matches, so profiles use realpath(3).
+        static func kernelPath(_ path: String) -> String {
+            guard let resolved = realpath(path, nil) else { return path }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+
         static func sandboxProfile(workspace: URL, python: URL) -> String {
             func quoted(_ path: String) -> String {
                 "\"" + path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
             }
-            var pythonRoot = python.deletingLastPathComponent().deletingLastPathComponent().path
-            // Apple's framework launcher lives below Resources/Python.app rather than bin.
-            // Permit its own versioned runtime; arbitrary project files remain outside it.
-            let components = python.pathComponents
+            let interpreter = URL(fileURLWithPath: kernelPath(python.path))
+            var pythonRoot = interpreter.deletingLastPathComponent().deletingLastPathComponent().path
+            var executables = [interpreter.path]
+            // Framework builds (python.org, Homebrew) install a pythonw-style stub at bin/python3.x
+            // that spawns the real interpreter below Resources/Python.app. Permit exactly that
+            // binary plus the versioned runtime; arbitrary project files remain outside it.
+            let components = interpreter.pathComponents
             if let framework = components.firstIndex(where: { $0.hasSuffix(".framework") }),
                components.count > framework + 2, components[framework + 1] == "Versions"
             {
                 pythonRoot = NSString.path(withComponents: Array(components.prefix(framework + 3)))
+                let launcher = pythonRoot + "/Resources/Python.app/Contents/MacOS/Python"
+                if FileManager.default.isExecutableFile(atPath: launcher) { executables.append(kernelPath(launcher)) }
             }
+            // macOS 26's dyld opens the root directory while locating the shared cache in the OS
+            // cryptex; without `(literal "/")` every launch aborts before main. It exposes only
+            // the top-level directory listing, not any file beneath it.
             return """
             (version 1)
             (deny default)
-            (allow process-exec (literal \(quoted(python.path))))
+            (allow process-exec \(executables.map { "(literal \(quoted($0)))" }.joined(separator: " ")))
             (allow process-info* sysctl-read)
             (allow file-read-metadata)
-            (allow file-read* (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share")
-                (subpath \(quoted(pythonRoot))) (subpath \(quoted(workspace.resolvingSymlinksInPath().path)))
+            (allow file-read* (literal "/") (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share")
+                (subpath \(quoted(pythonRoot))) (subpath \(quoted(kernelPath(workspace.path))))
                 (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random"))
             """
         }

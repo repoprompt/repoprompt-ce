@@ -269,6 +269,44 @@ import XCTest
             XCTAssertEqual(try String(contentsOf: privateFile, encoding: .utf8), "sealed")
         }
 
+        /// The kernel matches sandbox filters against canonical vnode paths, so aliases such as
+        /// /tmp and /var (and Foundation's /private-stripped forms) must never reach the profile.
+        func testSandboxProfileUsesKernelPathsAndPermitsOnlyTheInterpreterAndItsFrameworkLauncher() throws {
+            let root = try temporaryRoot()
+            let real = root.appendingPathComponent("real", isDirectory: true)
+            let alias = root.appendingPathComponent("alias", isDirectory: true)
+            try FileManager.default.createDirectory(at: real, withIntermediateDirectories: true)
+            try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: real)
+            func executable(_ url: URL) throws {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try Data("#!/bin/sh\n".utf8).write(to: url)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            }
+            let kernel = PromptExperimentPythonAcceptanceRunner.kernelPath
+            XCTAssertEqual(kernel("/tmp"), "/private/tmp")
+            XCTAssertEqual(kernel(alias.path), kernel(real.path))
+
+            let framework = root.appendingPathComponent("Python.framework/Versions/3.15", isDirectory: true)
+            let stub = framework.appendingPathComponent("bin/python3.15")
+            let launcher = framework.appendingPathComponent("Resources/Python.app/Contents/MacOS/Python")
+            try executable(stub)
+            try executable(launcher)
+            let profile = PromptExperimentPythonAcceptanceRunner.sandboxProfile(workspace: alias, python: stub)
+            XCTAssertTrue(profile.contains("(allow process-exec (literal \"\(kernel(stub.path))\") (literal \"\(kernel(launcher.path))\"))"), profile)
+            XCTAssertTrue(profile.contains("(subpath \"\(kernel(framework.path))\")"), profile)
+            XCTAssertTrue(profile.contains("(subpath \"\(kernel(real.path))\")"), profile)
+            XCTAssertFalse(profile.contains("\"\(alias.path)\""), profile)
+            XCTAssertTrue(profile.contains("(allow file-read* (literal \"/\")"), "macOS 26 dyld reads the root directory at launch")
+            XCTAssertFalse(profile.contains("file-write"), profile)
+
+            let plain = root.appendingPathComponent("python/bin/python3.11")
+            try executable(plain)
+            let plainProfile = PromptExperimentPythonAcceptanceRunner.sandboxProfile(workspace: real, python: plain)
+            XCTAssertTrue(plainProfile.contains("(allow process-exec (literal \"\(kernel(plain.path))\"))"), plainProfile)
+            XCTAssertTrue(plainProfile.contains("(subpath \"\(kernel(root.appendingPathComponent("python").path))\")"), plainProfile)
+            XCTAssertFalse(plainProfile.contains("Python.app"), plainProfile)
+        }
+
         func testAcceptanceMemoryLimitAccountsForDarwinReservationsAndPreservesInheritedBounds() async throws {
             let python = try await availableAcceptancePython()
             let program = PromptExperimentPythonAcceptanceRunner.addressSpaceLimitProgram + "\n" + """

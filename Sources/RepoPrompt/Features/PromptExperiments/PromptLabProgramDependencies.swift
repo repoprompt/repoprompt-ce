@@ -14,8 +14,12 @@
 
         static func snapshot(root: URL) throws -> [String: String] {
             var enumerationError: Error?
+            // The enumerator reports each entry relative to `root`. Slicing the absolute path by the
+            // root's length is not reliable: the enumerator may canonicalize the root (for example
+            // /var/... to /private/var/...) while the caller's root keeps its alias.
             guard let files = FileManager.default.enumerator(
                 at: root, includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey],
+                options: [.producesRelativePathURLs],
                 errorHandler: { _, error in enumerationError = error
                     return false
                 }
@@ -37,7 +41,7 @@
                 guard result.count < 10000, totalBytes <= 50_000_000 else {
                     throw PromptExperimentAuthorityError.invalidRequest("Choose the evaluator's project folder with at most 10,000 Python/dependency files and 50 MB of source.")
                 }
-                result[String(file.path.dropFirst(root.path.count + 1))] = PromptExperimentDigest.sha256(data)
+                result[file.relativePath] = PromptExperimentDigest.sha256(data)
             }
             if let enumerationError { throw enumerationError }
             return result

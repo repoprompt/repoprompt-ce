@@ -177,7 +177,7 @@
                 if let promptID = authority.promptID {
                     let resource = try registry.resource(promptID)
                     guard resource.sha256 == authority.promptResourceSHA256, resource.text == baseline else {
-                        throw PromptExperimentAuthorityError.runtimeUnavailable("The built-in prompt changed. Create a new experiment against the current baseline.")
+                        throw PromptExperimentAuthorityError.runtimeUnavailable("The built-in '\(promptID.rawValue)' resource changed after approval (now \(resource.sha256.prefix(12))). Create a new experiment against the current baseline.")
                     }
                 } else {
                     guard PromptExperimentDigest.sha256(Data(baseline.utf8)) == authority.promptResourceSHA256 else {
@@ -189,7 +189,7 @@
                 guard let promptID = authority.promptID else { throw PromptExperimentAuthorityError.invalidRequest("The experiment has no prompt source.") }
                 let resource = try registry.resource(promptID)
                 guard resource.sha256 == authority.promptResourceSHA256 else {
-                    throw PromptExperimentAuthorityError.runtimeUnavailable("The built-in prompt changed. Create a new experiment against the current baseline.")
+                    throw PromptExperimentAuthorityError.runtimeUnavailable("The built-in '\(promptID.rawValue)' resource changed after approval (now \(resource.sha256.prefix(12))). Create a new experiment against the current baseline.")
                 }
                 baseline = resource.text
                 suite = try PromptSuiteLoader.load(promptID: promptID, registry: registry)
