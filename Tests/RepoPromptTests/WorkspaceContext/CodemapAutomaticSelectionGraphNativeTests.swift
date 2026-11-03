@@ -56,6 +56,40 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         XCTAssertFalse(WorkspaceCodemapRootPausePolicy(defaults: defaults).isPaused(rootPath: workspace.rootURL.path))
     }
 
+    func testPausePreferenceIsKeyedByStandardizedPathAndNotMigratedAcrossPaths() throws {
+        let suite = "CodemapPausePathIdentityTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let policy = WorkspaceCodemapRootPausePolicy(defaults: defaults)
+        let base = "/rpce-pause-identity-\(UUID().uuidString)"
+        let original = base + "/original"
+        let moved = base + "/moved"
+        let pausedDestination = base + "/paused-destination"
+
+        policy.setPaused(true, rootPath: original)
+        policy.setPaused(true, rootPath: pausedDestination)
+
+        // A different spelling of the same path resolves to the same preference.
+        XCTAssertTrue(policy.isPaused(rootPath: base + "/./original/"))
+        // A renamed/moved directory is a new path with its own (default unpaused) preference.
+        XCTAssertFalse(policy.isPaused(rootPath: moved))
+        // A destination that was already paused stays paused.
+        XCTAssertTrue(policy.isPaused(rootPath: pausedDestination))
+
+        // Changing the new path's preference never touches the retained entries of other paths.
+        policy.setPaused(true, rootPath: moved)
+        policy.setPaused(false, rootPath: moved)
+        let reloaded = WorkspaceCodemapRootPausePolicy(defaults: defaults)
+        XCTAssertFalse(reloaded.isPaused(rootPath: moved))
+        XCTAssertTrue(reloaded.isPaused(rootPath: original))
+        XCTAssertTrue(reloaded.isPaused(rootPath: pausedDestination))
+
+        // Resume on the original path clears only its own entry.
+        policy.setPaused(false, rootPath: original)
+        XCTAssertFalse(policy.isPaused(rootPath: original))
+        XCTAssertTrue(policy.isPaused(rootPath: pausedDestination))
+    }
+
     func testUnsupportedSeedsAreNonRetryableAndDoNotHideSupportedResults() async throws {
         let workspace = try PlainWorkspaceFixture(name: #function)
         try workspace.write("struct Feature {}\n", to: "Feature.swift")
