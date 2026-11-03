@@ -413,14 +413,14 @@ extension DebugStateBootstrapTests {
         }), persistence.oracleStorageRoot)
     }
 
-    private func oracleGroup(workspace: UUID, seed: String) async throws -> OracleGroupDocument {
+    private func oracleGroup(workspace: UUID, seed: String, context: OracleContextEnvelope? = nil) async throws -> OracleGroupDocument {
         let model = try OracleModelReference(providerID: "fixture", modelID: "model")
         let owner = try await OracleViewModel.oracleGroupOwner(workspaceID: workspace, tabID: UUID())
         let second = try OracleModelReference(providerID: "fixture", modelID: "second")
         let members = try [model, second].enumerated().map { index, model in
             try OracleGroupMember(laneID: OracleLaneID(index: index), publicChatID: index == 0 ? seed : seed + "-second", model: model)
         }
-        let turn = try OracleTurnRecord(input: OracleInput(mode: .chat, userMessage: seed, context: nil), state: .prepared, startedAt: Date(timeIntervalSince1970: 1000))
+        let turn = try OracleTurnRecord(input: OracleInput(mode: .chat, userMessage: seed, context: context), state: .prepared, startedAt: Date(timeIntervalSince1970: 1000))
         return try OracleGroupDocument(
             group: OracleGroupDescriptor(size: 2),
             owner: owner,
@@ -498,6 +498,44 @@ extension DebugStateBootstrapTests {
         let (cold, _) = oracleStore(f.debug)
         let absent = try await cold.load(member: .init(publicChatID: "release-deleted"), owner: deleted.owner)
         XCTAssertNil(absent, "An empty retained debug set must not fall back to release")
+        let deletedGroup = try await cold.load(groupID: retained.group.id, owner: retained.owner)
+        XCTAssertNil(deletedGroup)
+        for member in retained.members {
+            let deletedMember = try await cold.load(member: .init(publicChatID: member.publicChatID), owner: retained.owner)
+            XCTAssertNil(deletedMember)
+        }
+        let survivingRelease = try await cold.load(member: .init(publicChatID: "release-member"), owner: unrelated.owner)
+        XCTAssertEqual(survivingRelease, unrelated)
+    }
+
+    func testOracleRetentionPreservesUnknownGroupFieldsAndReferencedArtifactBytes() async throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspace = UUID()
+        try retainOracleWorkspace(f, id: workspace)
+        let (debug, debugRoot) = oracleStore(f.debug)
+        let artifactBytes = Data("retained frozen context\n".utf8)
+        let artifactID = try await debug.storeArtifact(artifactBytes)
+        let context = OracleContextEnvelope(content: .durableArtifact(id: artifactID), sha256: artifactID)
+        let retained = try await oracleGroup(workspace: workspace, seed: "byte-preservation", context: context)
+        try await debug.create(retained)
+        let groupURL = debugRoot.appendingPathComponent("groups/" + retained.group.id.rawValue.uuidString + ".json")
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: groupURL)) as? [String: Any])
+        json["future_retention_fixture"] = "unknown field must survive"
+        let groupBytes = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys, .prettyPrinted])
+        try groupBytes.write(to: groupURL)
+        let artifactURL = debugRoot.appendingPathComponent("artifacts/" + artifactID + ".blob")
+
+        for _ in 0 ..< 2 {
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+            XCTAssertEqual(try Data(contentsOf: groupURL), groupBytes)
+            XCTAssertEqual(try Data(contentsOf: artifactURL), artifactBytes)
+            let (cold, _) = oracleStore(f.debug)
+            for member in retained.members {
+                let loaded = try await cold.load(member: .init(publicChatID: member.publicChatID), owner: retained.owner)
+                XCTAssertEqual(loaded, retained)
+            }
+        }
     }
 
     func testOracleRetentionRetriesOptionalStoreAppearanceButIgnoresTemporaryChurn() throws {
