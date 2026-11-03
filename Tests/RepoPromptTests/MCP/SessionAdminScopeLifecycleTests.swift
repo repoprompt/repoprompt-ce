@@ -8315,8 +8315,19 @@ final class SessionAdminInventoryReadTests: XCTestCase {
 
         /// These carriers belong to a live window. Capture through its save owner so a
         /// deferred UI publication is recaptured instead of racing a caller-local proposal.
+        ///
+        /// Activation also schedules a post-switch Git-data root load. Its root expansion marks
+        /// the workspace dirty and reaches the stored tab (`expandedFolders`) only on a later
+        /// publication, without another version bump. If it lands during save preparation it
+        /// is a second pending edit, and a fixture that deliberately spends the save's single
+        /// retry on its own edit then exhausts it. Join the activation's load, and the main-queue
+        /// work it scheduled, so this capture starts from a settled foreground.
         func persistActiveCarriers() async throws -> URL {
             let manager = window.workspaceManager
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
             let workspace = try XCTUnwrap(manager.activeWorkspace)
             manager.markWorkspaceDirty()
             let outcome = await manager.pollAndSaveStateWithOutcomeAsync(
