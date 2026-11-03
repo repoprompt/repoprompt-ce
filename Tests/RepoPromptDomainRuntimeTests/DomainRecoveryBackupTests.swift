@@ -22,6 +22,7 @@ final class DomainRecoveryBackupTests: XCTestCase {
         let reduced = try fixture.document(tabs: ["A", "B"], name: "Reduced")
         let refused = await authority.execute(fixture.command(.replaceWorkingDocument(reduced)))
         XCTAssertEqual(refused.errorCode, .recoveryBackupRequired)
+        XCTAssertEqual(refused.recoveryBackupLocation, .workingDocument)
         XCTAssertNil(fixture.verifiedBackup(of: unreadable))
         // Restart-safe: a fresh authority still restores the unreadable working copy.
         let restarted = await fixture.authority().readySnapshot()
@@ -336,22 +337,67 @@ final class DomainRecoveryBackupTests: XCTestCase {
         let discarded = try doc(composed: [current, ["id": "b"]], stashed: [olderValid])
         let reduced = try doc(composed: [["id": "b"]], stashed: [olderValid])
         XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: discarded, replacement: reduced))
+        // Reverse collision: a stashed original whose ID survives only as a different composed
+        // payload is a loss too.
+        let stashedOriginal = try doc(composed: [olderValid], stashed: [current])
+        let stashDropped = try doc(composed: [olderValid], stashed: [])
+        XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: stashedOriginal, replacement: stashDropped))
         // Stashing the exact payload is a move, not a loss.
         let stashedExact = try doc(composed: [["id": "b"]], stashed: [current, olderValid])
         XCTAssertFalse(DomainRecoveryBackup.replacementDropsComposeTabs(discarded: discarded, replacement: stashedExact))
     }
 
-    func testIntentionalCloseIsExemptOnlyForTheUnchangedPayload() throws {
+    func testStashedOriginalNeedsPayloadEvidenceThroughTheHeadlessSavedDocumentGuard() async throws {
+        let fixture = try Fixture()
+        defer { fixture.remove() }
+        // The saved original holds a valid composed tab A and a malformed stashed copy of A; a
+        // reduced journal keeps composed A but drops the stash. Composed A's survival is not
+        // evidence that the stashed payload survived.
+        let tabA = UUID().uuidString
+        let object: [String: Any] = [
+            "id": fixture.workspaceID.uuidString, "name": "Stash", "schemaVersion": 1,
+            "repoPaths": ["/private-repository"], "isSystemWorkspace": false,
+            "composeTabs": [["id": tabA, "name": "A", "promptText": "valid"]],
+            "stashedTabs": [["id": UUID().uuidString, "tab": ["id": tabA, "name": "A", "promptText": 42]]],
+            "activeComposeTabID": tabA
+        ]
+        let fileURL = fixture.workspaceDirectory.appendingPathComponent("workspace.json")
+        let original = try DomainWorkspaceDocument.decode(
+            documentBytes: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]), fileURL: fileURL
+        )
+        var reducedObject = object
+        reducedObject["stashedTabs"] = []
+        reducedObject["name"] = "Reduced"
+        let reduced = try DomainWorkspaceDocument.decode(
+            documentBytes: JSONSerialization.data(withJSONObject: reducedObject, options: [.sortedKeys]), fileURL: fileURL
+        )
+        let authority = fixture.authority(guard: .composeTabLoss())
+        let created = await authority.execute(fixture.command(.createWorkspace(original)))
+        XCTAssertEqual(created.disposition, .applied)
+        let replaced = await authority.execute(fixture.command(.replaceWorkingDocument(reduced)))
+        XCTAssertEqual(replaced.disposition, .applied)
+
+        let locator = DomainRecoveryBackup.backupURL(documentURL: fileURL, documentBytes: original.documentBytes)
+        try FileManager.default.createDirectory(at: locator, withIntermediateDirectories: false)
+        let refused = await authority.execute(fixture.command(.saveWorkspaceDocument(workspaceID: fixture.workspaceID)))
+        XCTAssertEqual(refused.errorCode, .recoveryBackupRequired)
+        XCTAssertEqual(refused.recoveryBackupLocation, .savedDocument, "The refusal names the protected copy")
+        XCTAssertEqual(try Data(contentsOf: fileURL), original.documentBytes)
+
+        try FileManager.default.removeItem(at: locator)
+        let saved = await authority.execute(fixture.command(.saveWorkspaceDocument(workspaceID: fixture.workspaceID)))
+        XCTAssertEqual(saved.disposition, .applied)
+        XCTAssertEqual(try Data(contentsOf: locator), original.documentBytes)
+    }
+
+    func testIntentionalTabRemovalIsBackedUpConservatively() throws {
         let closed: [String: Any] = ["id": "a", "name": "Closed on purpose"]
         let discarded = try JSONSerialization.data(withJSONObject: ["id": "w", "composeTabs": [closed, ["id": "b"]]])
         let replacement = try JSONSerialization.data(withJSONObject: ["id": "w", "composeTabs": [["id": "b"]]])
-        let digest = try XCTUnwrap(DomainRecoveryBackup.payloadDigest(closed))
-        XCTAssertFalse(DomainRecoveryBackup.replacementDropsComposeTabs(
-            discarded: discarded, replacement: replacement, intentionallyClosed: ["a": digest]
-        ))
-        XCTAssertTrue(DomainRecoveryBackup.replacementDropsComposeTabs(
-            discarded: discarded, replacement: replacement, intentionallyClosed: ["a": "other-digest"]
-        ))
+        XCTAssertTrue(
+            DomainRecoveryBackup.replacementDropsComposeTabs(discarded: discarded, replacement: replacement),
+            "Without per-operation intent, a close cannot be told apart from a reduction"
+        )
     }
 
     func testComposeTabLossDetection() throws {

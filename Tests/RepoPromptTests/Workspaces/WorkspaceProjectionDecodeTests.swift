@@ -818,6 +818,78 @@ import XCTest
             XCTAssertNil(manager.recoveryBackupBlocks[workspaceID])
         }
 
+        func testUnknownBaseNeverComesFromTheProjectedDraftAndFailsClosed() async throws {
+            let fixture = try await BlockedWindowFixture.make(testCase: self, probe: DraftRefusalProbe())
+            let manager = fixture.manager
+            let gate = CaptureGate()
+            manager.recoveryBackupBaseCaptureGateForTesting = { [gate] in await gate.hold() }
+            defer {
+                manager.recoveryBackupBaseCaptureGateForTesting = nil
+                gate.release()
+            }
+            try await fixture.blockDraft(promptText: Self.draftMarker, waitForBase: false)
+            XCTAssertEqual(manager.recoveryBackupBlocks[fixture.workspaceID]?.phase, .working)
+            let deadline = Date().addingTimeInterval(10)
+            while !gate.isHolding, Date() < deadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            // A reconciliation while the write baseline still matches may project the window's own
+            // draft; it must not become the merge base.
+            let refreshed = await fixture.bridge.refreshForAgentAdmission()
+            XCTAssertTrue(refreshed)
+            XCTAssertNil(manager.recoveryBackupBlocks[fixture.workspaceID]?.base)
+
+            try await fixture.publishPeer { peer in
+                peer.composeTabs[0].name = "peer rename"
+            }
+            let block = try XCTUnwrap(manager.recoveryBackupBlocks[fixture.workspaceID])
+            XCTAssertTrue(block.isConflicted, "An unknown base never lets newer contents silently win")
+            XCTAssertEqual(manager.workspace(withID: fixture.workspaceID)?.composeTabs.first?.name, Self.draftMarker)
+            gate.release()
+            try await Task.sleep(nanoseconds: 200_000_000)
+            XCTAssertTrue(manager.recoveryBackupBlocks[fixture.workspaceID]?.isConflicted ?? false)
+        }
+
+        func testSavedDocumentRefusalRecordsTheSavedPhaseFromTheTypedLocation() async throws {
+            let fixture = try await BlockedWindowFixture.make(testCase: self, probe: DraftRefusalProbe(savedDocumentOnly: true))
+            try await fixture.blockDraft(promptText: Self.draftMarker)
+            XCTAssertEqual(fixture.manager.recoveryBackupBlocks[fixture.workspaceID]?.phase, .saved)
+        }
+
+        func testMergeKeepsAnUnambiguousLocalReorderAndFailsClosedOnConflictingOrders() {
+            let a = UUID(), b = UUID(), c = UUID()
+            XCTAssertEqual(WorkspaceRecoveryDraftMerge.mergedTabOrder(base: [a, b], draft: [b, a], canonical: [a, b, c]), [b, a, c])
+            XCTAssertEqual(WorkspaceRecoveryDraftMerge.mergedTabOrder(base: [a, b], draft: [a, b], canonical: [b, a, c]), [b, a, c])
+            XCTAssertNil(WorkspaceRecoveryDraftMerge.mergedTabOrder(base: [a, b, c], draft: [b, a, c], canonical: [a, c, b]))
+
+            let date = Date(timeIntervalSince1970: 1)
+            func tab(_ id: UUID, _ name: String) -> ComposeTabState {
+                ComposeTabState(id: id, name: name, lastModified: date, promptText: "")
+            }
+            let id = UUID()
+            func model(_ tabs: [ComposeTabState]) -> WorkspaceModel {
+                WorkspaceModel(id: id, dateModified: date, name: "W", repoPaths: [], lastUsed: date, composeTabs: tabs, activeComposeTabID: nil)
+            }
+            let result = WorkspaceRecoveryDraftMerge.merge(
+                base: model([tab(a, "A"), tab(b, "B")]),
+                draft: model([tab(b, "B"), tab(a, "A")]),
+                canonical: model([tab(a, "A"), tab(b, "B"), tab(c, "C")])
+            )
+            guard case let .merged(merged) = result else { return XCTFail("Expected a merge, got \(result)") }
+            XCTAssertEqual(merged.composeTabs.map(\.id), [b, a, c], "The local reorder survives the peer's new tab")
+        }
+
+        func testAppEncodedDocumentsSkipTheGuardDecode() throws {
+            let model = WorkspaceModel(name: "Encoded \(UUID().uuidString)", repoPaths: ["/r"])
+            let document = try DomainWorkspaceAuthorityClient.document(
+                for: model,
+                fileURL: URL(fileURLWithPath: "/tmp/encoded-\(UUID().uuidString)/workspace.json")
+            )
+            let before = WorkspaceUnreadableDocumentBackup.lossyDecodeCountForTesting.withLock { $0 }
+            XCTAssertFalse(WorkspaceUnreadableDocumentBackup.documentRequiresPreservation(document.documentBytes))
+            XCTAssertEqual(WorkspaceUnreadableDocumentBackup.lossyDecodeCountForTesting.withLock { $0 }, before)
+        }
+
         /// End to end with the real app guard and a really corrupted tab (no probe).
         func testRealGuardRefusesDiscardingCorruptedTabUntilBackupSucceeds() async throws {
             let root = FileManager.default.temporaryDirectory
@@ -881,11 +953,35 @@ import XCTest
         }
     }
 
+    @MainActor
+    private final class CaptureGate {
+        private var continuation: CheckedContinuation<Void, Never>?
+        private var released = false
+        private(set) var isHolding = false
+
+        func hold() async {
+            guard !released else { return }
+            isHolding = true
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func release() {
+            released = true
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
     /// Simulates "this window's saves are blocked": refuses every durable replacement carrying the
     /// draft marker. The real discarded-bytes policy is covered end to end above.
     private final class DraftRefusalProbe: @unchecked Sendable {
         private let lock = NSLock()
         private var refusing = true
+        private let savedDocumentOnly: Bool
+
+        init(savedDocumentOnly: Bool = false) {
+            self.savedDocumentOnly = savedDocumentOnly
+        }
 
         func setRefusing(_ value: Bool) {
             lock.withLock { refusing = value }
@@ -893,6 +989,7 @@ import XCTest
 
         func protect(_ replacement: DomainDurableReplacement) throws {
             guard lock.withLock({ refusing }),
+                  !savedDocumentOnly || replacement.location == .savedDocument,
                   String(decoding: replacement.replacementBytes, as: UTF8.self)
                   .contains(WorkspaceRecoveryBackupBlockTests.draftMarker)
             else { return }
@@ -990,7 +1087,7 @@ import XCTest
 
         /// Renames the first tab (a field no view model mirrors back) and saves; the probe
         /// refuses it, so nothing durable changes.
-        func blockDraft(promptText: String) async throws {
+        func blockDraft(promptText: String, waitForBase: Bool = true) async throws {
             var draft = try XCTUnwrap(manager.workspace(withID: workspaceID))
             draft.composeTabs[0].name = promptText
             let index = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == workspaceID })
@@ -1002,6 +1099,7 @@ import XCTest
             } catch {}
             XCTAssertNotNil(manager.recoveryBackupBlocks[workspaceID])
             XCTAssertEqual(try Data(contentsOf: fileURL), canonicalBefore)
+            guard waitForBase else { return }
             let deadline = Date().addingTimeInterval(10)
             while manager.recoveryBackupBlocks[workspaceID]?.base == nil, Date() < deadline {
                 try await Task.sleep(nanoseconds: 20_000_000)

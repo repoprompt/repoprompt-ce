@@ -8530,13 +8530,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         if Self.isSuccessfulDomainOutcome(outcome) {
             clearRecoveryBackupBlock(workspaceID: workspaceID, durableStateVersion: stateVersion, committedPhase: committedPhase)
         } else if outcome.errorCode == .recoveryBackupRequired {
-            let diagnostic = outcome.diagnostic ?? "recovery_backup_unavailable"
             recordRecoveryBackupBlock(
                 workspaceID: workspaceID,
                 draft: draft,
                 stateVersion: stateVersion,
-                reason: diagnostic,
-                phase: diagnostic.contains(DomainDurableReplacement.Location.savedDocument.rawValue) ? .saved : .working
+                reason: outcome.diagnostic ?? "recovery_backup_unavailable",
+                phase: outcome.recoveryBackupLocation == .savedDocument ? .saved : .working
             )
         }
     }
@@ -8581,6 +8580,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func captureRecoveryBackupBase(workspaceID: UUID, blockID: UUID) {
         guard let domainWorkspaceAuthorityClient else { return }
         Task { @MainActor [weak self] in
+            #if DEBUG
+                await self?.recoveryBackupBaseCaptureGateForTesting?()
+            #endif
             guard let snapshot = await domainWorkspaceAuthorityClient.canonicalWorkspaceSnapshot(workspaceID),
                   let self,
                   var block = recoveryBackupBlocks[workspaceID],
@@ -8641,10 +8643,10 @@ class WorkspaceManagerViewModel: ObservableObject {
             let canonical = overlay.workspaces[index]
             let draft = workspace(withID: workspaceID) ?? block.draft
             let canonicalDigest = projectedDigestsByWorkspaceID[workspaceID]
+            // The base comes only from decoded authority bytes (`captureRecoveryBackupBase`), never
+            // from this projected row: while the write baseline matches, the projection may be the
+            // window's own draft. An unknown base keeps holding the draft.
             if !decodedWorkspaceIDs.contains(workspaceID) || block.isConflicted || canonicalDigest == block.baseDigest {
-                if canonicalDigest == block.baseDigest, block.base == nil {
-                    block.base = canonical
-                }
                 overlay.workspaces[index] = draft
                 overlay.heldWorkspaceIDs.insert(workspaceID)
                 block.draft = draft
@@ -8670,10 +8672,12 @@ class WorkspaceManagerViewModel: ObservableObject {
                     overlay.adoptedWorkspaceIDs.insert(workspaceID)
                 }
                 block.draft = merged
-                block.base = canonical
+                // Re-captured from decoded authority bytes for the new digest (never this row).
+                block.base = nil
                 block.baseDigest = canonicalDigest
                 block.phase = .saved
                 retainedBlocks[workspaceID] = block
+                captureRecoveryBackupBase(workspaceID: workspaceID, blockID: block.id)
             case let .conflict(tabIDs):
                 overlay.workspaces[index] = draft
                 overlay.heldWorkspaceIDs.insert(workspaceID)
@@ -8732,6 +8736,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     #if DEBUG
+        /// Awaited before the base capture reads the authority, so tests can order it.
+        var recoveryBackupBaseCaptureGateForTesting: (@MainActor () async -> Void)?
+
         func recordRecoveryBackupBlockForTesting(
             workspaceID: UUID,
             draft: WorkspaceModel,

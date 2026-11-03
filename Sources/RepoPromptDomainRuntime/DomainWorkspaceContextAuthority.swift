@@ -3040,6 +3040,10 @@ actor DomainWorkspaceContextAuthority {
         case DomainPersistenceError.recoveryBackupRequired(_, _): .recoveryBackupRequired
         default: .persistenceFailure
         }
+        var location: DomainDurableReplacement.Location?
+        if case let DomainPersistenceError.recoveryBackupRequired(rawLocation, _) = error {
+            location = DomainDurableReplacement.Location(rawValue: rawLocation)
+        }
         return DomainCommandOutcome(
             operationID: envelope.operationID,
             disposition: .failed,
@@ -3049,7 +3053,8 @@ actor DomainWorkspaceContextAuthority {
             resultingDigest: record?.document.contentDigest,
             errorCode: code,
             diagnostic: String(describing: error),
-            workspace: record.map(makeSnapshot)
+            workspace: record.map(makeSnapshot),
+            recoveryBackupLocation: location
         )
     }
 

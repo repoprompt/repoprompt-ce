@@ -335,7 +335,12 @@ struct DomainWorkspaceAuthorityClient {
 
     static func document(for workspace: WorkspaceModel, fileURL: URL) throws -> DomainWorkspaceDocument {
         let bytes = try DomainWorkspaceModelEncoder.encode(workspace)
-        return try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
+        let document = try DomainWorkspaceDocument.decode(documentBytes: bytes, fileURL: fileURL)
+        // Bytes the app encodes from a model always decode back without loss; recording that here,
+        // outside every domain lock, spares the recovery guard a full decode when they are later
+        // discarded (#335).
+        WorkspaceUnreadableDocumentBackup.recordAppEncodedDocument(bytes)
+        return document
     }
 
     /// Retries only the exact same envelope. A changed CAS expectation or payload is a new

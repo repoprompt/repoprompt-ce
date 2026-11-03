@@ -89,9 +89,12 @@ enum WorkspaceRecoveryDraftMerge {
         let baseTabs = Dictionary(base.composeTabs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let draftTabs = Dictionary(draft.composeTabs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let canonicalTabs = Dictionary(canonical.composeTabs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        var order = canonical.composeTabs.map(\.id)
-        for id in draft.composeTabs.map(\.id) where !order.contains(id) {
-            order.append(id)
+        guard let order = mergedTabOrder(
+            base: base.composeTabs.map(\.id),
+            draft: draft.composeTabs.map(\.id),
+            canonical: canonical.composeTabs.map(\.id)
+        ) else {
+            return .conflict([draft.id])
         }
         var tabs: [ComposeTabState] = []
         for id in order {
@@ -121,6 +124,28 @@ enum WorkspaceRecoveryDraftMerge {
             merged.activeComposeTabID = tabs.first?.id
         }
         return .merged(merged)
+    }
+
+    /// Tab order merged against the base: a side that reordered the tabs it shares with the base
+    /// keeps its order, and the other side's new tabs follow. Both sides reordering the tabs they
+    /// all share differently is a conflict (nil).
+    static func mergedTabOrder(base: [UUID], draft: [UUID], canonical: [UUID]) -> [UUID]? {
+        func relative(_ order: [UUID], to other: [UUID]) -> [UUID] {
+            let members = Set(other)
+            return order.filter { members.contains($0) }
+        }
+        let draftReordered = relative(draft, to: base) != relative(base, to: draft)
+        let canonicalReordered = relative(canonical, to: base) != relative(base, to: canonical)
+        if draftReordered, canonicalReordered {
+            let shared = Set(base).intersection(draft).intersection(canonical)
+            let draftShared = draft.filter { shared.contains($0) }
+            let canonicalShared = canonical.filter { shared.contains($0) }
+            guard draftShared == canonicalShared else { return nil }
+        }
+        if draftReordered {
+            return draft + canonical.filter { !draft.contains($0) }
+        }
+        return canonical + draft.filter { !canonical.contains($0) }
     }
 
     /// Everything except compose tabs, the active tab, the stash, and modification timestamps.

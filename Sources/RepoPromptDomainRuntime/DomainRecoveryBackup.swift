@@ -10,7 +10,7 @@ import os
 /// that the obligation was met, so the check is recomputed from the bytes on every replacement and
 /// survives restarts and process boundaries.
 package struct DomainDurableReplacement: Sendable {
-    package enum Location: String, Sendable {
+    package enum Location: String, Codable, Sendable {
         /// The canonical `workspace.json` bytes on disk.
         case savedDocument = "saved_document"
         /// The working-journal document bytes (the dirty working copy startup would restore).
@@ -52,16 +52,17 @@ package struct DomainDurableReplacementGuard: Sendable {
     /// Codec-free policy for processes that cannot decode the app's workspace model (the headless
     /// MCP runtime). They edit compose tabs as raw JSON, so they never reduce a document
     /// themselves, but they can save a working copy reduced by another process over an original
-    /// whose tabs that process could not read. Discarding bytes whose compose-tab identities do
-    /// not all survive into the replacement therefore requires a verified backup first.
+    /// whose tabs that process could not read. Discarding bytes whose tab payloads do not all
+    /// survive into the replacement therefore requires a verified backup first. Intentional closes
+    /// are backed up too: without per-operation plumbing, a close cannot be told apart from a
+    /// reduction, so the conservative choice is an extra content-addressed copy.
     package static func composeTabLoss(
         validatePath: @escaping @Sendable (URL) throws -> Void = { _ in }
     ) -> Self {
         Self { replacement in
             guard DomainRecoveryBackup.replacementDropsComposeTabs(
                 discarded: replacement.discardedBytes,
-                replacement: replacement.replacementBytes,
-                intentionallyClosed: DomainIntentionalTabClosures.shared.closures(for: replacement.workspaceID)
+                replacement: replacement.replacementBytes
             ) else { return }
             try DomainRecoveryBackup.preserve(
                 documentBytes: replacement.discardedBytes,
@@ -163,21 +164,23 @@ package enum DomainRecoveryBackup {
     /// - a composed tab survives only as a composed tab with the same identity (raw editors keep
     ///   unknown fields in place), or as a stashed tab with an identical payload; a same-ID stashed
     ///   copy with different content is not evidence that the composed payload survived;
-    /// - a stashed tab survives as a stashed or composed tab with the same identity;
-    /// - `intentionallyClosed` (tab ID to payload digest) exempts tabs a user closed on purpose,
-    ///   only while their payload is unchanged.
-    package static func replacementDropsComposeTabs(
-        discarded: Data,
-        replacement: Data,
-        intentionallyClosed: [String: String] = [:]
-    ) -> Bool {
+    /// - a stashed tab survives only as a stashed or composed tab with an identical payload (a
+    ///   same-ID tab elsewhere with different content is not evidence).
+    package static func replacementDropsComposeTabs(discarded: Data, replacement: Data) -> Bool {
         guard let discardedObject = jsonObject(discarded),
               let discardedComposed = tabObjects(discardedObject["composeTabs"]),
               let discardedStashed = stashedTabObjects(discardedObject["stashedTabs"])
         else { return true }
         guard !discardedComposed.isEmpty || !discardedStashed.isEmpty else { return false }
         guard let replacementObject = jsonObject(replacement) else { return true }
-        let replacementComposedIDs = Set((tabObjects(replacementObject["composeTabs"]) ?? []).compactMap { $0["id"] as? String })
+        let replacementComposed = tabObjects(replacementObject["composeTabs"]) ?? []
+        let replacementComposedIDs = Set(replacementComposed.compactMap { $0["id"] as? String })
+        var replacementComposedPayloads: [String: Set<String>] = [:]
+        for tab in replacementComposed {
+            if let id = tab["id"] as? String, let digest = payloadDigest(tab) {
+                replacementComposedPayloads[id, default: []].insert(digest)
+            }
+        }
         var replacementStashedPayloads: [String: Set<String>] = [:]
         for tab in stashedTabObjects(replacementObject["stashedTabs"]) ?? [] {
             if let id = tab["id"] as? String, let digest = payloadDigest(tab) {
@@ -188,12 +191,14 @@ package enum DomainRecoveryBackup {
             guard let id = tab["id"] as? String else { return true }
             if replacementComposedIDs.contains(id) { continue }
             guard let digest = payloadDigest(tab) else { return true }
-            if replacementStashedPayloads[id]?.contains(digest) == true || intentionallyClosed[id] == digest { continue }
+            if replacementStashedPayloads[id]?.contains(digest) == true { continue }
             return true
         }
         for tab in discardedStashed {
-            guard let id = tab["id"] as? String else { return true }
-            if replacementStashedPayloads[id] != nil || replacementComposedIDs.contains(id) { continue }
+            guard let id = tab["id"] as? String, let digest = payloadDigest(tab) else { return true }
+            if replacementStashedPayloads[id]?.contains(digest) == true
+                || replacementComposedPayloads[id]?.contains(digest) == true
+            { continue }
             return true
         }
         return false
@@ -312,24 +317,5 @@ package enum DomainRecoveryBackup {
             unlink(temporary.path)
             throw error
         }
-    }
-}
-
-/// Tabs a user closed on purpose through a raw-JSON editor (headless `close_tab`), keyed by
-/// workspace and tab identity with the closed payload's digest. The headless guard exempts them
-/// from the loss check only while the discarded payload is identical. Process-local: after a
-/// restart an unchanged close is treated conservatively (a backup is made).
-package final class DomainIntentionalTabClosures: Sendable {
-    package static let shared = DomainIntentionalTabClosures()
-
-    private let state = OSAllocatedUnfairLock<[UUID: [String: String]]>(initialState: [:])
-
-    package func record(workspaceID: UUID, closedTab tab: [String: Any]) {
-        guard let id = tab["id"] as? String, let digest = DomainRecoveryBackup.payloadDigest(tab) else { return }
-        state.withLock { $0[workspaceID, default: [:]][id] = digest }
-    }
-
-    package func closures(for workspaceID: UUID) -> [String: String] {
-        state.withLock { $0[workspaceID] ?? [:] }
     }
 }

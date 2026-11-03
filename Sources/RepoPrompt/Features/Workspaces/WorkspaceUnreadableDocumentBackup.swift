@@ -95,10 +95,23 @@ enum WorkspaceUnreadableDocumentBackup {
         if let cached = verdicts.withLock({ $0.value(for: digest) }) {
             return cached
         }
+        #if DEBUG
+            lossyDecodeCountForTesting.withLock { $0 += 1 }
+        #endif
         let verdict = WorkspaceManagerViewModel.workspaceDocumentDecodesLossily(documentBytes: bytes)
         verdicts.withLock { $0.store(verdict, for: digest) }
         return verdict
     }
+
+    /// Records that `bytes` were produced by the app's own encoder, so they are not lossy.
+    static func recordAppEncodedDocument(_ bytes: Data) {
+        let digest = DomainContentDigest.sha256(bytes)
+        verdicts.withLock { $0.store(false, for: digest) }
+    }
+
+    #if DEBUG
+        static let lossyDecodeCountForTesting = OSAllocatedUnfairLock(initialState: 0)
+    #endif
 
     /// Replacement for the app's non-domain writers (`WorkspaceDiskWriter` backends and direct
     /// saves), which only run when no domain authority owns the document. Check, preserve, and the

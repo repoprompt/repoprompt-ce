@@ -172,6 +172,8 @@ package struct DomainCommandOutcome: Codable, Equatable, Sendable {
     package let diagnostic: String?
     package let workspace: DomainWorkspaceSnapshot?
     package let exactRootResolution: DomainExactRootResolution?
+    /// Which durable copy a `recoveryBackupRequired` refusal protected (#335).
+    package let recoveryBackupLocation: DomainDurableReplacement.Location?
 
     package init(
         operationID: UUID,
@@ -183,8 +185,10 @@ package struct DomainCommandOutcome: Codable, Equatable, Sendable {
         errorCode: DomainCommandErrorCode? = nil,
         diagnostic: String? = nil,
         workspace: DomainWorkspaceSnapshot? = nil,
-        exactRootResolution: DomainExactRootResolution? = nil
+        exactRootResolution: DomainExactRootResolution? = nil,
+        recoveryBackupLocation: DomainDurableReplacement.Location? = nil
     ) {
+        self.recoveryBackupLocation = recoveryBackupLocation
         self.operationID = operationID
         self.disposition = disposition
         self.before = before

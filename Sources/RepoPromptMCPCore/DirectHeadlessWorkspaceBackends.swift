@@ -359,9 +359,6 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
                 throw MCPError.invalidParams("close_tab requires an existing tab and refuses to close the last tab")
             }
             closedContextID = targetID
-            // An intentional close is not a lossy reduction: exempt this exact payload from the
-            // recovery-backup loss check (#335).
-            DomainIntentionalTabClosures.shared.record(workspaceID: workspace.document.workspaceID, closedTab: target)
             let activeID = (object["activeComposeTabID"] as? String).flatMap(UUID.init(uuidString:))
             if activeID == targetID, args["allow_active"]?.boolValue != true {
                 throw MCPError.invalidRequest("close_tab refuses to close the active tab unless allow_active=true")
