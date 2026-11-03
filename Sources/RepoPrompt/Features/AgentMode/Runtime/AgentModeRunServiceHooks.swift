@@ -28,6 +28,9 @@ extension AgentModeRunService {
         let addUserInputTokensToActiveNonCodexTurn: (Int, AgentTabSession) -> Void
         let startNonCodexTurnAccountingIfNeeded: (AgentTabSession, String) -> Void
         let finalizeNonCodexTurnUsage: (AgentTabSession, Int?, Int?, Int?) -> Void
+        /// Records the auto-compact window a Claude-native process reported in its runtime init and
+        /// recomputes only the effective window. Returns whether the displayed window changed.
+        let applyClaudeRuntimeAutoCompactWindow: (Int?, AgentTabSession) -> Bool
     }
 
     /// Attachment file lifecycle for one turn (reserve → consume → finalize).

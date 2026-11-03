@@ -156,7 +156,10 @@ final class AgentSessionLinkRunnerHarness {
                 estimateRuntimeTokens: { $0.count },
                 addUserInputTokensToActiveNonCodexTurn: { _, _ in },
                 startNonCodexTurnAccountingIfNeeded: { _, _ in },
-                finalizeNonCodexTurnUsage: { _, _, _, _ in }
+                finalizeNonCodexTurnUsage: { _, _, _, _ in },
+                applyClaudeRuntimeAutoCompactWindow: { tokens, session in
+                    harnessBox?.host.applyClaudeRuntimeAutoCompactWindow(tokens, to: session) ?? false
+                }
             ),
             attachments: .init(
                 reserveAttachmentsForTurn: { _, _ in nil },

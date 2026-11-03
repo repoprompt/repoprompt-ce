@@ -145,6 +145,7 @@ actor AgentSessionDataService {
         let codexLastTotalTokens: Int?
         let codexTotalTotalTokens: Int?
         let codexMcpSessionKey: String?
+        let contextWindowCapacity: AgentContextWindowCapacity?
         let parentSessionID: UUID?
         let createdByOverseerSessionID: UUID?
         let organizationalParentID: UUID?
@@ -1416,6 +1417,7 @@ actor AgentSessionDataService {
                 codexLastTotalTokens: header.codexLastTotalTokens,
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
+                contextWindowCapacity: header.contextWindowCapacity,
                 parentSessionID: header.parentSessionID,
                 createdByOverseerSessionID: header.createdByOverseerSessionID,
                 organizationalParentID: header.organizationalParentID,

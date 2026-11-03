@@ -57,6 +57,15 @@ extension AgentModeViewModel {
         return changed
     }
 
+    /// Records a Claude-native process's reported auto-compact window and recomputes only the
+    /// effective window; every runtime init calls this, including one that repeats the last value.
+    @discardableResult
+    func applyClaudeRuntimeAutoCompactWindow(_ tokens: Int?, to session: TabSession) -> Bool {
+        session.claudeAutoCompactWindowTokens = tokens
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
+        return claudeContextUsageEstimator.reconcileContextWindow(session: session)
+    }
+
     func refreshCodexContextUsageSnapshot(for session: TabSession) {
         _ = codexContextUsageEstimator.ingestNativeContextUsage(session.codexContextUsage, session: session)
     }

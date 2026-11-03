@@ -1042,6 +1042,8 @@ final class AgentTabSession: ObservableObject {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
                 selectedClaudeEffortRaw = nil
+                // The cap came from the previous provider's process; the next process reports its own.
+                claudeAutoCompactWindowTokens = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
@@ -1190,7 +1192,30 @@ final class AgentTabSession: ObservableObject {
 
     /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from the running Claude-native process's launch
     /// environment, as reported by its runtime init. Not persisted: each launch reports it again.
+    /// Cleared when the provider changes or the conversation resets, because it describes one process.
+    /// A model switch keeps it: the process and its launch environment stay the same.
     var claudeAutoCompactWindowTokens: Int?
+
+    /// The model's own context capacity as the provider last reported it, before any auto-compact
+    /// cap. Persisted with the provider and model it describes.
+    var contextWindowCapacity: AgentContextWindowCapacity?
+
+    /// The stored capacity, only while the provider and model it was reported for stay selected.
+    var identityValidContextWindowCapacity: Int? {
+        guard let contextWindowCapacity,
+              contextWindowCapacity.agentRaw == selectedAgent.rawValue,
+              contextWindowCapacity.modelRaw == selectedModelRaw
+        else { return nil }
+        return contextWindowCapacity.tokens
+    }
+
+    func recordContextWindowCapacity(_ tokens: Int) {
+        guard tokens > 0 else { return }
+        let next = AgentContextWindowCapacity(tokens: tokens, agentRaw: selectedAgent.rawValue, modelRaw: selectedModelRaw)
+        guard contextWindowCapacity != next else { return }
+        contextWindowCapacity = next
+        isDirty = true
+    }
 
     /// The auto-compact window, only while a Claude-native provider is selected.
     var activeClaudeAutoCompactWindowTokens: Int? {
