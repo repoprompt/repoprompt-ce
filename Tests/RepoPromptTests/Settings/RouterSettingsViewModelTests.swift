@@ -1778,7 +1778,10 @@ final class SettingsWindowScrollingFixture {
                 }
                 .environment(\.repoPromptFontScalePreset, preset)
                 .environment(\.font, preset.font)
-                .environment(\.accessibilityReduceMotion, true)
+                .transaction { transaction in
+                    transaction.animation = nil
+                    transaction.disablesAnimations = true
+                }
             )
         )
         window = NSWindow(contentViewController: hostingController)

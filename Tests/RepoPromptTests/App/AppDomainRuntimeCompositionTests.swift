@@ -1107,8 +1107,9 @@ final class DebugProfileInitializationTests: XCTestCase {
         for hasExistingPreferences in [false, true] {
             try withProfile { fixture, defaults, domain in
                 if hasExistingPreferences { defaults.set(true, forKey: "CursorCLIConnected") }
-                let writer = try DebugProfileAccessLease.acquire(locations: fixture.debug, exclusive: false)
-                withExtendedLifetime(writer) {
+                do {
+                    let writer = try DebugProfileAccessLease.acquire(locations: fixture.debug, exclusive: false)
+                    defer { withExtendedLifetime(writer) {} }
                     if hasExistingPreferences {
                         XCTAssertEqual(try prepare(fixture, defaults: defaults, domain: domain), .reused)
                     } else {
