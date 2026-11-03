@@ -235,7 +235,11 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
                 // A handler refusal after its own re-checks (state changed since the card) applied
                 // nothing: the card returns to `approved` rather than being consumed.
                 if let claimedCard {
-                    let applied = value.objectValue?["result"]?.stringValue != "denied"
+                    let result = value.objectValue?["result"]?.stringValue
+                    // Retire retains its existing single-use no-op/partial receipt contract.
+                    // A wholly refused worktree release, however, has no effect to consume.
+                    let applied = result != "denied"
+                        && (batch.request.operation != .adminWorktreeRelease || result != "not_applied")
                     scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: applied)
                 }
                 return .completed(value)

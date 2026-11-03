@@ -8,6 +8,131 @@ import XCTest
 #if DEBUG
     @MainActor
     final class ContextBuilderMultiRootDiscoveryTests: XCTestCase {
+        func testActualContextBuilderReviewPackagesSiblingRootsOrReturnsLocalizedOwnershipRefusal() async throws {
+            for isGit in [true, false] {
+                try await ContextBuilderMultiRootDiscoveryDriver.withDriver(routedRuntime: true) { driver in
+                    let git = try ReviewGitRepositoryFixture(parentDirectory: driver.fixture.base)
+                    if isGit {
+                        try git.initializeRepository(at: driver.fixture.base)
+                        try git.stage("A/README.md", at: driver.fixture.base)
+                        try git.stage("B/README.md", at: driver.fixture.base)
+                        try git.write("original", to: "A/other.md", at: driver.fixture.base)
+                        try git.stage("A/other.md", at: driver.fixture.base)
+                        try git.commit("Initial review fixture", at: driver.fixture.base)
+                        try git.write("fixture SELECTED_A_REVIEW", to: "A/README.md", at: driver.fixture.base)
+                        try git.write("fixture SELECTED_B_REVIEW", to: "B/README.md", at: driver.fixture.base)
+                        try git.write("UNSELECTED_REVIEW_SENTINEL", to: "A/other.md", at: driver.fixture.base)
+                    }
+                    let settings = GlobalSettingsStore.shared
+                    settings.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                        planningModelRaw: AIModel.gpt54Mini.rawValue
+                    ))
+                    driver.window.apiSettingsViewModel.openAIApiKey = "test-key"
+                    driver.window.apiSettingsViewModel.isOpenAIKeyValid = true
+                    var packages: [String] = []
+                    let oracle = driver.window.oracleViewModel
+                    oracle.setOraclePostPackagingTransportOverrideForTesting { message, _ in
+                        packages.append(ContextBuilderFrozenOraclePack.render(message))
+                        return (UUID(), AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                            continuation.yield(ChatStreamOutput(text: "REVIEW_COMPLETE", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+                            continuation.finish()
+                        })
+                    }
+                    defer { oracle.setOraclePostPackagingTransportOverrideForTesting(nil) }
+                    let context = try await driver.resolve()
+                    let parent = try await driver.connectInvokingAgent(context)
+                    driver.streamBody = { runID in
+                        let child = try await driver.connectChild(runID: runID)
+                        try await driver.discover(using: child, loadUnrelatedRoot: false)
+                    }
+                    let reply = try await driver.fixture.perform("registered review outcome") {
+                        try await driver.invoke(using: parent, responseType: "review")
+                    }
+                    let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
+                    if isGit {
+                        XCTAssertNotEqual(reply.isError, true, text)
+                        XCTAssertEqual(packages.count, 1, text)
+                        let package = try XCTUnwrap(packages.first)
+                        XCTAssertTrue(package.contains("diff --git a/A/README.md b/A/README.md"), package)
+                        XCTAssertTrue(package.contains("diff --git a/B/README.md b/B/README.md"), package)
+                        XCTAssertTrue(package.contains("+fixture SELECTED_A_REVIEW"), package)
+                        XCTAssertTrue(package.contains("+fixture SELECTED_B_REVIEW"), package)
+                        XCTAssertFalse(package.contains("UNSELECTED_REVIEW_SENTINEL"))
+                    } else {
+                        XCTAssertEqual(reply.isError, true, text)
+                        XCTAssertTrue(text.contains("[-32602] Invalid params:"), text)
+                        XCTAssertTrue(text.contains(ContextBuilderReviewTargetUnavailableReason.nonGitSelection(count: 2).localizedDescription), text)
+                        XCTAssertFalse(text.contains("nonGitSelection("), text)
+                        XCTAssertFalse(text.contains(driver.fixture.base.path), text)
+                        XCTAssertTrue(packages.isEmpty)
+                    }
+                    let committed = try XCTUnwrap(driver.committed)
+                    try await driver.assertReleased(runID: committed.nestedRunID)
+                }
+            }
+        }
+
+        func testActualContextBuilderReviewRefusesAutomaticDiffAuthorizationFailureBeforeTransport() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(routedRuntime: true) { driver in
+                let git = try ReviewGitRepositoryFixture(parentDirectory: driver.fixture.base)
+                try git.initializeRepository(at: driver.fixture.base)
+                try git.stage("A/README.md", at: driver.fixture.base)
+                try git.stage("B/README.md", at: driver.fixture.base)
+                try git.commit("Initial authorization fixture", at: driver.fixture.base)
+                try git.write("fixture SELECTED_REVIEW_CHANGE", to: "A/README.md", at: driver.fixture.base)
+                GlobalSettingsStore.shared.setWorkspaceAgentModelsProfile(workspaceID: driver.fixture.workspace.id, profile: .init(
+                    planningModelRaw: AIModel.gpt54Mini.rawValue
+                ))
+                driver.window.apiSettingsViewModel.openAIApiKey = "test-key"
+                driver.window.apiSettingsViewModel.isOpenAIKeyValid = true
+                let oracle = driver.window.oracleViewModel
+                let store = driver.files.workspaceFileContextStore
+                var diffRequestCount = 0
+                var transportCount = 0
+                oracle.promptViewModel.setAutomaticReviewGitDiffProviderOverrideForTesting { request in
+                    diffRequestCount += 1
+                    if case let .finalized(authorization) = request.source {
+                        let reason = await ContextBuilderReviewTargetResolver().revalidate(authorization.target, store: store)
+                        XCTAssertNil(reason, "The injected diff failure must not depend on stale root authority")
+                    } else {
+                        XCTFail("Expected finalized review authorization")
+                    }
+                    return AutomaticReviewGitDiffResult(
+                        text: nil, completeness: .failed, outcomes: [], pathIssues: [],
+                        authorizationFailure: .staleWorkspaceRoot
+                    )
+                }
+                oracle.setOraclePostPackagingTransportOverrideForTesting { _, _ in
+                    transportCount += 1
+                    return (UUID(), AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                        continuation.yield(ChatStreamOutput(text: "UNEXPECTED_REVIEW", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+                        continuation.finish()
+                    })
+                }
+                defer {
+                    oracle.promptViewModel.setAutomaticReviewGitDiffProviderOverrideForTesting(nil)
+                    oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+                }
+                let context = try await driver.resolve()
+                let parent = try await driver.connectInvokingAgent(context)
+                driver.streamBody = { runID in
+                    let child = try await driver.connectChild(runID: runID)
+                    try await driver.discover(using: child, loadUnrelatedRoot: false)
+                }
+                let reply = try await driver.fixture.perform("registered diff authorization refusal") {
+                    try await driver.invoke(using: parent, responseType: "review")
+                }
+                let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
+                XCTAssertEqual(diffRequestCount, 1)
+                XCTAssertEqual(reply.isError, true, text)
+                XCTAssertTrue(text.contains("[-32602] Invalid params:"), text)
+                XCTAssertTrue(text.contains(ContextBuilderReviewTargetUnavailableReason.staleWorkspaceRoot.localizedDescription), text)
+                XCTAssertEqual(transportCount, 0, "A refused diff must never reach Oracle transport")
+                let committed = try XCTUnwrap(driver.committed)
+                try await driver.assertReleased(runID: committed.nestedRunID)
+            }
+        }
+
         func testActualSocketMultiRootDiscoveryCommitsRoutedSelectionAndPrompt() async throws {
             try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A", "B", "Unrelated"], routedRuntime: true) { driver in
                 let context = try await driver.resolve()
@@ -2381,6 +2506,92 @@ import XCTest
             let text = ContextBuilderMultiRootDiscoveryDriver.text(reply)
             XCTAssertNotEqual(reply.isError, true, "\(tool): \(text)")
             return text
+        }
+    }
+
+    /// Issue #26: aborting the invoking Agent Mode thread must propagate into Context Builder work
+    /// it owns. This drives the real routed `context_builder` tool from a connection bound to the
+    /// invoking run and aborts through `cancelActiveToolsForRun(runID:)` — the exact entry
+    /// `AgentModeRunService.cancelRun` uses (`cancelMCPToolsForRun`) before stopping the provider.
+    @MainActor
+    final class ContextBuilderAgentRunAbortTests: XCTestCase {
+        func testAbortingInvokingRunDuringDiscoveryDisposesProviderAndLeavesNoSpinnerOrExecution() async throws {
+            try await ContextBuilderMultiRootDiscoveryDriver.withDriver(rootNames: ["A", "B", "Unrelated"], routedRuntime: true) { driver in
+                let context = try await driver.resolve()
+                let parent = try await driver.fixture.perform("actual invoking Agent Mode socket") {
+                    try await driver.connectInvokingAgent(context)
+                }
+                let invokingRunID = try XCTUnwrap(context.frozenTabContext.runID)
+                let observer = try XCTUnwrap(driver.vm.armStartupObservationForTesting(
+                    windowID: driver.window.windowID, workspaceID: driver.fixture.workspace.id,
+                    tabID: driver.tabID, invokingRunID: invokingRunID
+                ))
+
+                // Hold the discovery provider mid-stream: the thread is aborted *during* discovery.
+                let streaming = XCTestExpectation(description: "discovery provider stream held")
+                let gate = driver.fixture.makeGate()
+                driver.streamBody = { _ in
+                    streaming.fulfill()
+                    await gate.wait()
+                }
+
+                let settled = XCTestExpectation(description: "aborted context_builder request settled")
+                var outcome = "pending"
+                let request = driver.fixture.startOwnedTask {
+                    do {
+                        let reply = try await driver.invoke(using: parent)
+                        outcome = reply.isError == true ? "error" : "completed"
+                    } catch {
+                        outcome = "thrown"
+                    }
+                    settled.fulfill()
+                }
+                try await driver.fixture.awaitGateEvent(streaming)
+                let nestedRunID = try XCTUnwrap(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+                XCTAssertEqual(driver.streamStarts, 1)
+                XCTAssertEqual(driver.disposed, 0)
+                let session = try XCTUnwrap(driver.vm.sessions[driver.tabID])
+                XCTAssertTrue(session.agentRunState.isRunning, "discovery must be live before the abort")
+
+                // Abort the owning Agent Mode run. The routed tool execution is registered under the
+                // invoking run, so this is the same cancellation `AgentModeRunService.cancelRun` issues.
+                let cancelledExecutions = driver.window.mcpServer.cancelActiveToolsForRun(runID: invokingRunID, reason: "thread aborted")
+                XCTAssertEqual(cancelledExecutions, 1, "the live context_builder execution must be owned by the invoking run")
+
+                try await driver.fixture.awaitGateEvent(settled)
+                XCTAssertNotEqual(outcome, "completed", "an aborted request must not return a completion")
+                XCTAssertNotEqual(outcome, "pending")
+
+                // No leaked process: the discovery provider is disposed exactly once even though its
+                // stream body is still parked behind the gate.
+                XCTAssertEqual(driver.disposed, 1)
+                XCTAssertEqual(observer.runTerminalCount, 1)
+                XCTAssertNil(driver.vm.activeRunIDForTesting(tabID: driver.tabID))
+
+                // No stale spinner: the tab's run/cancel/plan indicators are all clear.
+                XCTAssertFalse(session.agentRunState.isRunning)
+                XCTAssertFalse(session.isAgentBusy)
+                XCTAssertFalse(session.isCancelling)
+                XCTAssertFalse(session.isBackgroundPlanGenerating)
+
+                // No orphaned tool execution remains registered for the aborted run.
+                try await driver.fixture.perform("invoking run has no active MCP tool executions") {
+                    try await driver.window.mcpServer.awaitNoActiveToolExecutions(runID: invokingRunID)
+                }
+                XCTAssertEqual(driver.window.mcpServer.cancelActiveToolsForRun(runID: invokingRunID, reason: "idempotent"), 0)
+
+                // Late provider progress after the abort cannot resurrect anything.
+                gate.release()
+                await request.value
+                try await driver.assertReleased(runID: nestedRunID)
+                try await driver.assertLeaseFailedExactlyOnce(runID: nestedRunID)
+                // Teardown joins asynchronously after the aborted reply settles; it must complete exactly once.
+                XCTAssertEqual(observer.teardownCount, 1)
+                XCTAssertEqual(driver.streamStarts, 1)
+                XCTAssertEqual(driver.disposed, 1)
+                XCTAssertNil(driver.committed, "an aborted discovery must not commit a routed result")
+                XCTAssertFalse(observer.description.contains("SENSITIVE_DISCOVERY_PROMPT"))
+            }
         }
     }
 #endif

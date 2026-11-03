@@ -388,14 +388,73 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
     /// compose-tab invariant normalization once. Excluded from CodingKeys/Equatable.
     var normalizationRequiresSave: Bool
 
+    /// Transient decode-time count of compose tabs that could not be decoded and were dropped
+    /// (at least 1 when the whole `composeTabs` value was unreadable). Excluded from
+    /// CodingKeys/Equatable. Loaders use it to preserve the original document bytes before any
+    /// writer can replace them with this lossy value, and to skip automatic write-backs (#335).
+    var composeTabsDroppedDuringDecode: Int
+
+    var composeTabsDecodeWasLossy: Bool {
+        composeTabsDroppedDuringDecode > 0
+    }
+
     private static let decodeLogger = Logger(subsystem: "com.repoprompt.workspace", category: "decode")
     private static var composeTabsDecodeWarningEmitted = false
 
-    private static func logComposeTabsDecodeFailure(error: Error, workspaceID: UUID) {
+    private static func logComposeTabsDecodeFailure(error: Error, workspaceID: UUID, droppedCount: Int, keptCount: Int) {
         guard !composeTabsDecodeWarningEmitted else { return }
         composeTabsDecodeWarningEmitted = true
-        let message = "Failed to decode composeTabs for workspace \(workspaceID.uuidString); falling back to empty array. Error: \(error.localizedDescription)"
+        let message = "Failed to decode \(droppedCount) composeTabs entr\(droppedCount == 1 ? "y" : "ies") for workspace \(workspaceID.uuidString); kept \(keptCount). Error: \(error.localizedDescription)"
         decodeLogger.error("\(message, privacy: .public)")
+    }
+
+    /// Consumes one unkeyed element without interpreting it, so an unreadable tab can be skipped.
+    private struct SkippedComposeTabPayload: Decodable {
+        init(from decoder: Decoder) throws {}
+    }
+
+    /// Decodes compose tabs one at a time so a single stale or malformed tab cannot collapse the
+    /// whole array (and, through normalization, the workspace into a fresh `T1`).
+    private static func decodeComposeTabs(
+        from c: KeyedDecodingContainer<CodingKeys>,
+        workspaceID: UUID
+    ) -> (tabs: [ComposeTabState], droppedCount: Int) {
+        guard c.contains(.composeTabs), (try? c.decodeNil(forKey: .composeTabs)) == false else {
+            return ([], 0)
+        }
+        var container: UnkeyedDecodingContainer
+        do {
+            container = try c.nestedUnkeyedContainer(forKey: .composeTabs)
+        } catch {
+            logComposeTabsDecodeFailure(error: error, workspaceID: workspaceID, droppedCount: 1, keptCount: 0)
+            return ([], 1)
+        }
+
+        var tabs: [ComposeTabState] = []
+        var droppedCount = 0
+        var firstError: Error?
+        while !container.isAtEnd {
+            do {
+                try tabs.append(container.decode(ComposeTabState.self))
+            } catch {
+                droppedCount += 1
+                if firstError == nil { firstError = error }
+                // A failed decode leaves the cursor on the element; consume it to move on. If the
+                // cursor still cannot advance, stop rather than loop forever.
+                let indexBeforeSkip = container.currentIndex
+                _ = try? container.decode(SkippedComposeTabPayload.self)
+                if container.currentIndex == indexBeforeSkip { break }
+            }
+        }
+        if let firstError {
+            logComposeTabsDecodeFailure(
+                error: firstError,
+                workspaceID: workspaceID,
+                droppedCount: droppedCount,
+                keptCount: tabs.count
+            )
+        }
+        return (tabs, droppedCount)
     }
 
     /// Default init used by code
@@ -450,6 +509,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         self.activeComposeTabID = activeComposeTabID
         self.stashedTabs = stashedTabs
         normalizationRequiresSave = false
+        composeTabsDroppedDuringDecode = 0
         normalizeComposeTabInvariants()
         normalizationRequiresSave = false
     }
@@ -482,12 +542,9 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         copyPresetId = (try? c.decode(UUID.self, forKey: .copyPresetId))
         copyCustomizations = (try? c.decode(CopyCustomizations.self, forKey: .copyCustomizations))
         chatPresetId = (try? c.decode(UUID.self, forKey: .chatPresetId))
-        do {
-            composeTabs = try c.decodeIfPresent([ComposeTabState].self, forKey: .composeTabs) ?? []
-        } catch {
-            Self.logComposeTabsDecodeFailure(error: error, workspaceID: id)
-            composeTabs = []
-        }
+        let decodedComposeTabs = Self.decodeComposeTabs(from: c, workspaceID: id)
+        composeTabs = decodedComposeTabs.tabs
+        composeTabsDroppedDuringDecode = decodedComposeTabs.droppedCount
         activeComposeTabID = (try? c.decode(UUID.self, forKey: .activeComposeTabID))
         stashedTabs = (try? c.decode([StashedTab].self, forKey: .stashedTabs)) ?? []
         normalizationRequiresSave = false

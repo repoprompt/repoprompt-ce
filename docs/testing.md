@@ -87,6 +87,15 @@ Search existing direct and outcome-level coverage first. Prefer a test that fail
 
 Do not use smoke as the only protection for deterministic logic. Without a predeclared acceptance threshold, a benchmark is diagnostics rather than executable contract coverage.
 
+Shared hosted runners do not provide a controlled latency environment. The bulk
+catalog-add and Overseer scale fixtures gate root ownership, ancestry/index/sort work and
+candidate visits/publications, alongside their exact state/event/menu assertions.
+They retain wall-clock samples in the execution log for performance investigation;
+those samples do not gate ordinary CI. The work bounds catch whole-root scanning,
+per-file root-state copies, repeated indexing/sorting, and excessive discovery or publication. They do not
+measure allocator cost or end-to-end UI latency; latency claims require a separate
+controlled measurement with a declared workload, threshold and sample protocol.
+
 ## Add and run root or provider XCTest coverage
 
 - **Root target:** place app-integrated and root-package tests under `Tests/RepoPromptTests` and validate with `make dev-test`.

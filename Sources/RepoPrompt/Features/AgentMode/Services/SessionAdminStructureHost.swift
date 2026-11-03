@@ -26,10 +26,14 @@ enum SessionAdminLinkOutcome: Equatable {
 
 /// A fork crossed its creation boundary but a later required step failed. Its identity must be
 /// returned and retained for idempotent retries; a delegated caller must never delete it as rollback.
-struct SessionAdminPartialForkError: Error {
+struct SessionAdminPartialForkError: LocalizedError {
     let sessionID: UUID
     let code: String
     let detail: String
+
+    var errorDescription: String? {
+        detail
+    }
 }
 
 enum SessionAdminLifecycleOutcome: Equatable {

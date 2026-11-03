@@ -16,7 +16,7 @@ struct AgentPendingComposerSubmissionView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
-                    Text(composerUI.props.isRoutingFreshTask ? "Sending… Choosing model and effort" : "Sending… Preparing agent")
+                    Text(pending.isChoosingWorkflow ? "Sending… Choosing workflow" : composerUI.props.isRoutingFreshTask ? "Sending… Choosing model and effort" : "Sending… Preparing agent")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()

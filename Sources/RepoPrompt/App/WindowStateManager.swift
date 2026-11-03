@@ -28,6 +28,10 @@ struct WindowSessionEntry: Codable {
     var lastFocused: Bool
     /// Sticky instance number for this workspace in this window (for deterministic restore)
     var workspaceInstanceNumber: Int?
+    /// This window's "Enable MCP tools for this window" switch. `nil` (legacy snapshots) keeps
+    /// the new-window seeding from the global default; an explicit value is restored per window
+    /// and never written back to that default (#143).
+    var mcpToolsEnabled: Bool?
 }
 
 struct WindowSessionCaptureCandidate {
@@ -74,6 +78,14 @@ struct WindowSessionRestorePersistenceGate {
 
     var isRestoreInProgress: Bool {
         isRestoreSessionLoadPending || pendingRestoreEntryCount > 0 || !restoringWindowIDs.isEmpty
+    }
+
+    /// A failed catalog can release persistence before its accepted restore entry executes.
+    /// Absence requires both the persistence gate and every accepted restore execution to finish.
+    func oversightTopologyState(hasPendingWindowExecution: Bool, abandonedEntryCount: Int) -> AgentSessionOversightRestoreTopologyState {
+        guard !isRestoreInProgress, !hasPendingWindowExecution else { return .pending }
+        guard abandonedEntryCount == 0 else { return .incompleteLeftoversAbandoned(count: abandonedEntryCount) }
+        return .completeAllEntriesConsumed
     }
 
     mutating func beginRestoreSessionLoad() {
@@ -748,11 +760,16 @@ class WindowStatesManager: ObservableObject {
     private func computeAgentSessionOversightTopologyState() -> AgentSessionOversightRestoreTopologyState {
         if AppLaunchConfiguration.current.suppressesAgentSessionOversightPersistence { return .suppressed }
         guard autoRestoreWorkspacesEnabled else { return .dormantAutoRestoreDisabled }
-        guard hasLoadedRestoreSession, !restorePersistenceGate.isRestoreInProgress else { return .pending }
-        guard abandonedRestoreEntryCount == 0 else {
-            return .incompleteLeftoversAbandoned(count: abandonedRestoreEntryCount)
-        }
-        return .completeAllEntriesConsumed
+        guard hasLoadedRestoreSession else { return .pending }
+        let restoringWindows = allWindows.filter { !$0.isClosing }
+        return restorePersistenceGate.oversightTopologyState(
+            hasPendingWindowExecution: restoringWindows.contains { $0.hasUnfinishedRestoreExecution },
+            abandonedEntryCount: abandonedRestoreEntryCount + restoringWindows.reduce(0) { $0 + $1.abandonedRestoreCount }
+        )
+    }
+
+    func windowRestoreExecutionDidChange() {
+        updateAgentSessionOversightTopologyState()
     }
 
     func claimInitialRefreshDeferralForNewWindow() -> WindowInitialRefreshDeferral? {
@@ -1378,6 +1395,11 @@ class WindowStatesManager: ObservableObject {
                     self.closingWindowReferences.compactMap(\.value)
             )
             self.isTerminating = true
+            // Before any async teardown: `stopAllServers()` clears each window's MCP tools request,
+            // and the final session writes must still record the user's per-window switch (#143).
+            for window in self.terminationWindowSnapshot {
+                window.freezeMCPToolsPreferenceForTermination()
+            }
             self.preparedOversightCleanupTask?.cancel()
             self.modelRouterRuntime.cancelAll()
             // Cancel any pending focus/workspace change notifications that might trigger updates

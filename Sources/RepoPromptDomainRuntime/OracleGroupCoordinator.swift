@@ -3,10 +3,12 @@ import Foundation
 package struct OracleLaneExecutionResponse: Equatable, Sendable {
     package let response: String
     package let executionProfile: OracleExecutionProfile?
+    package let capturedModelName: String?
 
-    package init(response: String, executionProfile: OracleExecutionProfile? = nil) {
+    package init(response: String, executionProfile: OracleExecutionProfile? = nil, capturedModelName: String? = nil) {
         self.response = response
         self.executionProfile = executionProfile
+        self.capturedModelName = capturedModelName
     }
 }
 
@@ -15,17 +17,20 @@ package struct OracleLaneFailure: Error, LocalizedError, Equatable, Sendable {
     package let message: String
     package let partialResponse: String?
     package let executionProfile: OracleExecutionProfile?
+    package let capturedModelName: String?
 
     package init(
         code: String = "provider_error",
         message: String,
         partialResponse: String? = nil,
-        executionProfile: OracleExecutionProfile? = nil
+        executionProfile: OracleExecutionProfile? = nil,
+        capturedModelName: String? = nil
     ) {
         self.code = code
         self.message = message
         self.partialResponse = partialResponse
         self.executionProfile = executionProfile
+        self.capturedModelName = capturedModelName
     }
 
     package var errorDescription: String? { message }
@@ -34,13 +39,16 @@ package struct OracleLaneFailure: Error, LocalizedError, Equatable, Sendable {
 package struct OracleLaneCancellation: Error, Equatable, Sendable {
     package let partialResponse: String?
     package let executionProfile: OracleExecutionProfile?
+    package let capturedModelName: String?
 
     package init(
         partialResponse: String? = nil,
-        executionProfile: OracleExecutionProfile? = nil
+        executionProfile: OracleExecutionProfile? = nil,
+        capturedModelName: String? = nil
     ) {
         self.partialResponse = partialResponse
         self.executionProfile = executionProfile
+        self.capturedModelName = capturedModelName
     }
 }
 
@@ -218,6 +226,7 @@ package struct OracleGroupCoordinator: Sendable {
                 modelID: plan.lane.model.modelID,
                 status: .cancelled,
                 executionProfile: cancellation.executionProfile,
+                capturedModelName: cancellation.capturedModelName,
                 error: OracleLaneError(
                     code: "cancelled",
                     message: "Oracle lane was cancelled.",
@@ -241,6 +250,7 @@ package struct OracleGroupCoordinator: Sendable {
                 modelID: plan.lane.model.modelID,
                 status: .failed,
                 executionProfile: failure.executionProfile,
+                capturedModelName: failure.capturedModelName,
                 error: Self.structuralLaneError(
                     code: failure.code,
                     message: failure.message,
@@ -269,6 +279,7 @@ package struct OracleGroupCoordinator: Sendable {
                 modelID: plan.lane.model.modelID,
                 status: .failed,
                 executionProfile: response.executionProfile,
+                capturedModelName: response.capturedModelName,
                 error: OracleLaneError(
                     code: "empty_response",
                     message: "Oracle lane returned an empty response."
@@ -282,6 +293,7 @@ package struct OracleGroupCoordinator: Sendable {
             modelID: plan.lane.model.modelID,
             status: .completed,
             executionProfile: response.executionProfile,
+            capturedModelName: response.capturedModelName,
             response: response.response
         )
     }

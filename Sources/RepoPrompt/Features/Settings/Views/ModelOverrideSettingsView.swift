@@ -253,14 +253,17 @@ private struct ModelOverrideRow: View {
     }
 
     private var streamToggle: some View {
-        LabeledToggle(
+        let usesProPolling = model.openAIReasoningMode != nil
+        return LabeledToggle(
             label: "Use Streaming",
             isOn: Binding(
-                get: { overrides.streamOverride(for: model.rawValue) ?? (model == .o1Preview ? false : true) },
+                get: { usesProPolling ? false : overrides.streamOverride(for: model.rawValue) ?? (model == .o1Preview ? false : true) },
                 set: { overrides.setStreamOverride(for: model.rawValue, value: $0) }
             ),
             fontPreset: fontPreset
         )
+        .disabled(usesProPolling)
+        .hoverTooltip(usesProPolling ? "Pro uses background polling and returns output when the response finishes." : "Stream output as it is generated.")
     }
 
     @ViewBuilder

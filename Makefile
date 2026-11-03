@@ -158,6 +158,7 @@ conductor-selftest:
 	python3 Scripts/test_security_inventory.py
 
 ci-app-test-runner-selftest:
+	python3 Scripts/test_ci_admission.py
 	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_ci_test_coverage.py
 	python3 Scripts/test_ci_resolve_packages.py
@@ -169,6 +170,8 @@ release-selftest:
 	python3 -B Scripts/test_tip_release_history_hooks.py
 	python3 -B Scripts/tip_history.py lint-fragments --root .
 	python3 Scripts/test_release_tooling.py
+	python3 Scripts/test_macos_runtime_symbols.py
+	python3 Scripts/test_macos_compatibility.py
 	python3 Scripts/test_publish_tip_release.py
 	python3 Scripts/test_codex_runtime_artifact.py
 	python3 Scripts/test_codex_update_candidate.py

@@ -122,6 +122,19 @@ extension AgentModeViewModel {
 
     // MARK: - Discovery epochs and lazy binding descriptors
 
+    /// Stages: queued (0), entered (1), installed (2), and asynchronous cleanup finished (3).
+    func logAgentSessionDiscoveryAdoption(owner: SessionIndexOwner, workspace: WorkspaceModel?, stage: Int) {
+        restorePerfRecorder.startupPhase(.oversightDiscoveryAdoption, debug: true, window: windowID, fields: [
+            "stage": stage,
+            "activation": Int(clamping: owner.activationEpoch),
+            "epoch": Int(clamping: agentSessionLinkDiscoveryGeneration),
+            "latest_owner_matches": sessionIndexStore.latestSessionIndexOwner == owner ? 1 : 0,
+            "installed_owner_matches": sessionIndexOwner == owner ? 1 : 0,
+            "activation_current": sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) ? 1 : 0,
+            "owner_current": sessionIndexStore.isOwnerCurrent(owner) ? 1 : 0
+        ])
+    }
+
     /// Starts a new discovery level for one workspace activation.
     ///
     /// Called at the start of every activation this window still owns. A superseded activation that
@@ -131,6 +144,9 @@ extension AgentModeViewModel {
     func beginAgentSessionLinkDiscoveryEpoch(workspaceID: UUID?) -> AgentSessionLinkDiscoveryEpoch {
         agentSessionLinkDiscoveryGeneration &+= 1
         agentSessionLinkDiscoveryWorkspaceID = workspaceID
+        restorePerfRecorder.startupPhase(.oversightDiscoveryCompletion, debug: true, window: windowID, fields: [
+            "epoch": Int(clamping: agentSessionLinkDiscoveryGeneration), "completed": 0
+        ])
         // Discovery state is pane presentation input (§4.2); it grants no session-link authority.
         syncTranscriptUIState()
         return AgentSessionLinkDiscoveryEpoch(
@@ -165,7 +181,15 @@ extension AgentModeViewModel {
             #endif
             return
         }
+        let didComplete = agentSessionLinkDiscoveryCompletedGeneration != epoch.generation
         agentSessionLinkDiscoveryCompletedGeneration = epoch.generation
+        if didComplete {
+            restorePerfRecorder.startupPhase(
+                .oversightDiscoveryCompletion, debug: true,
+                window: epoch.windowID,
+                fields: ["epoch": Int(clamping: epoch.generation), "completed": 1]
+            )
+        }
         syncTranscriptUIState()
         #if DEBUG
             restorePerfRecorder.event(

@@ -457,6 +457,7 @@ actor CodexAppServerClient {
     private let processEnvironmentBuilder: @Sendable (ProcessEnvironmentRequest) async -> ProcessEnvironmentResult
     private let runtimeStatePreparer: @Sendable (CodexRuntimeAuthority.Runtime) throws -> Void
     private let launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot
+    let optOutNotificationMethods: [String]
     private let provisionsRepoPromptMCPOnStart: Bool
     private let processExitObserverFactory: @Sendable (pid_t) -> ChildProcessExitObserver
     private let expectedAgentPIDRegistrar: ExpectedAgentPIDRegistrar
@@ -486,6 +487,7 @@ actor CodexAppServerClient {
         },
         launchSnapshot: CodexRuntimeAuthority.LaunchSnapshot = CodexRuntimeAuthority.currentLaunchSnapshot(),
         provisionsRepoPromptMCPOnStart: Bool = true,
+        optOutNotificationMethods: [String] = [],
         processExitObserverFactory: @escaping @Sendable (pid_t) -> ChildProcessExitObserver = {
             ChildProcessExitObserver.observe(pid: $0)
         },
@@ -500,6 +502,7 @@ actor CodexAppServerClient {
         self.runtimeStatePreparer = runtimeStatePreparer
         self.launchSnapshot = launchSnapshot
         self.provisionsRepoPromptMCPOnStart = provisionsRepoPromptMCPOnStart
+        self.optOutNotificationMethods = optOutNotificationMethods
         self.processExitObserverFactory = processExitObserverFactory
         self.expectedAgentPIDRegistrar = expectedAgentPIDRegistrar
         self.faultInjection = faultInjection
@@ -1527,9 +1530,12 @@ actor CodexAppServerClient {
             "title": "RepoPrompt",
             "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
         ]
-        let capabilities: [String: Any] = [
+        var capabilities: [String: Any] = [
             "experimentalApi": true
         ]
+        if !optOutNotificationMethods.isEmpty {
+            capabilities["optOutNotificationMethods"] = optOutNotificationMethods
+        }
         _ = try await request(
             method: "initialize",
             params: [
@@ -2435,7 +2441,7 @@ actor CodexAppServerClient {
             timeoutTasks.count
         }
 
-        func debugInstallTestTransport() {
+        func debugInstallTestTransport(initialized: Bool = true) {
             let stdinPipe = Pipe()
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()
@@ -2453,7 +2459,7 @@ actor CodexAppServerClient {
                 exitObservation: nil
             )
             stdoutFramer = LineFramer(limits: Self.stdoutFrameLimits)
-            isInitialized = true
+            isInitialized = initialized
             didTerminateTransport = false
             lastTransportTerminationReason = nil
             lastTransportFailure = nil

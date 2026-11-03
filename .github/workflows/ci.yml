@@ -2,19 +2,53 @@ name: CI
 
 on:
   pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
   push:
     branches:
       - main
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Supersede obsolete PR previews only. Queue candidates, main evidence, and
+  # explicitly rerun full profiles retain their own run-scoped groups.
+  group: ci-${{ github.event_name == 'pull_request' && github.run_attempt == '1' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == '1' }}
 
 permissions:
   contents: read
 
 jobs:
+  candidate:
+    name: Declare Integration Candidate
+    runs-on: ubuntu-latest
+    outputs:
+      context: ${{ steps.candidate.outputs.context }}
+      range: ${{ steps.candidate.outputs.range }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Normalize candidate, base, tree and profile
+        id: candidate
+        run: |
+          python3 Scripts/ci_admission.py prepare --event-path "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" --sha "$GITHUB_SHA" --ref "$GITHUB_REF" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
+
+  integration-products:
+    needs: candidate
+    uses: ./.github/workflows/ci-integration-products.yml
+    with:
+      admission: ${{ needs.candidate.outputs.context }}
+
   build-test-bundles:
+    needs: candidate
+    env:
+      ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Build and Static Gates
     runs-on: macos-26
     timeout-minutes: 75
@@ -22,8 +56,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Verify exact candidate and full-profile attempt
+        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Restore SwiftPM build cache
         id: rootbundles-cache
@@ -37,6 +75,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-
             ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-
+
+      - name: Invalidate cached admission evidence before any build or selftest
+        if: always()
+        run: python3 Scripts/ci_admission.py invalidate --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Restore checksum-verified SwiftPM binary artifacts
         id: binaries-cache
@@ -57,6 +99,9 @@ jobs:
 
       - name: Run repository guardrails
         run: make guardrails
+
+      - name: Run hosted runner and admission selftests
+        run: make ci-app-test-runner-selftest
 
       - name: Install Swift style tools
         run: ./Scripts/install_format_tools.sh install
@@ -87,7 +132,8 @@ jobs:
       - name: Build root test bundles with import and type-check gates
         shell: bash
         env:
-          TYPECHECK_RATCHET_ENFORCE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
+          # One measurement protocol and unchanged budget on PR, queue and main.
+          TYPECHECK_RATCHET_ENFORCE: "1"
         run: |
           set -uo pipefail
           set +e
@@ -106,12 +152,21 @@ jobs:
           fi
           exit "$build_status"
 
+      - name: Retain type-check measurements on success and failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: typecheck-timing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .build/modularization/typecheck-timing.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Upload failed root test build log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
-          name: root-build-tests-failure-${{ github.run_id }}
+          name: root-build-tests-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/ci-build-tests.log
             ${{ runner.temp }}/ci-build-tests-conductor.txt
@@ -154,22 +209,26 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
-          name: module-execution-${{ github.run_id }}
+          name: module-execution-${{ github.run_id }}-${{ github.run_attempt }}
           path: .build/ci-test-results/module-*.log
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Bind root producer to the immutable candidate
+        run: python3 Scripts/ci_admission.py bind --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
       - name: Archive only runnable test products and gate attestations
-        run: python3 Scripts/modularization_ci_artifact.py pack --output root-build.tar.gz
+        run: python3 Scripts/modularization_ci_artifact.py pack --output root-build.tar.gz --admission-context "$ADMISSION_CONTEXT"
 
       - name: Share expected coverage independently of the runnable products
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
-          name: expected-coverage-${{ github.run_id }}
+          name: expected-coverage-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             .build/modularization/ci-test-list.txt
             .build/modularization/test-targets.json
+            .build/modularization/admission.json
           if-no-files-found: error
           retention-days: 7
 
@@ -177,7 +236,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
-          name: root-build-${{ github.run_id }}
+          name: root-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: root-build.tar.gz
           retention-days: 7
 
@@ -206,7 +265,9 @@ jobs:
 
   build-and-test:
     name: Test Root Shard (No Build)
-    needs: build-test-bundles
+    needs: [candidate, build-test-bundles]
+    env:
+      ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     runs-on: macos-26
     timeout-minutes: 30
     strategy:
@@ -217,16 +278,23 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+
+      - name: Verify exact candidate and full-profile attempt
+        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Download the single root build
         uses: actions/download-artifact@v4
         with:
-          name: root-build-${{ github.run_id }}
+          name: root-build-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Restore build bundle and SwiftPM state
         shell: bash
         run: gzip -dc root-build.tar.gz | tar -xf -
+
+      - name: Verify transferred build candidate and producer
+        run: python3 Scripts/modularization_ci_artifact.py verify --admission-context "$ADMISSION_CONTEXT"
 
       - name: Run root test shard without compiling
         run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --full-log
@@ -236,7 +304,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
-          name: shard-execution-${{ matrix.shard }}-${{ github.run_id }}
+          name: shard-execution-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: .build/ci-test-results/shard-*
           if-no-files-found: error
           retention-days: 7
@@ -244,17 +312,22 @@ jobs:
   style:
     # Protect main requires exactly Style: it must be the FINAL gate, not an early green row.
     name: Style
-    needs: [build-test-bundles, build-and-test, secret-scan]
+    needs: [candidate, build-test-bundles, build-and-test, secret-scan, integration-products]
     if: always()
+    env:
+      ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Fail if a prerequisite failed or was skipped
         env:
+          CANDIDATE_RESULT: ${{ needs.candidate.result }}
+          PRODUCTS_RESULT: ${{ needs.integration-products.result }}
           BUILD_RESULT: ${{ needs.build-test-bundles.result }}
           SECRET_RESULT: ${{ needs.secret-scan.result }}
           SHARD_RESULT: ${{ needs.build-and-test.result }}
@@ -262,40 +335,52 @@ jobs:
         run: |
           {
             echo '## CI prerequisite results'
+            echo "- Candidate declaration: $CANDIDATE_RESULT"
+            echo "- Sentry/privacy and release-mode packaged smoke: $PRODUCTS_RESULT"
             echo "- Build and Static Gates: $BUILD_RESULT"
             echo "- Root test shards: $SHARD_RESULT"
             echo "- Secret Scan: $SECRET_RESULT"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-          if [[ "$BUILD_RESULT" != success || "$SHARD_RESULT" != success || "$SECRET_RESULT" != success ]]; then
+          if [[ "$CANDIDATE_RESULT" != success || "$PRODUCTS_RESULT" != success || "$BUILD_RESULT" != success || "$SHARD_RESULT" != success || "$SECRET_RESULT" != success ]]; then
             echo '::error::CI prerequisite failed, was cancelled, or was skipped. Inspect the failing job; Style is the aggregate gate.'
             exit 1
           fi
 
+      - name: Require one full-profile attempt
+        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
       - name: Download expected coverage
         uses: actions/download-artifact@v4
         with:
-          name: expected-coverage-${{ github.run_id }}
+          name: expected-coverage-${{ github.run_id }}-${{ github.run_attempt }}
           path: expected-coverage
 
       - name: Download all shard execution receipts
         uses: actions/download-artifact@v4
         with:
-          pattern: shard-execution-*-${{ github.run_id }}
+          pattern: shard-execution-*-${{ github.run_id }}-${{ github.run_attempt }}
           path: shard-execution
           merge-multiple: true
 
       - name: Prove exact union and every test target
-        run: python3 Scripts/ci_test_coverage.py --metadata expected-coverage --receipts shard-execution --shard-count 4
+        run: python3 Scripts/ci_test_coverage.py --metadata expected-coverage --receipts shard-execution --shard-count 4 --admission-context "$ADMISSION_CONTEXT"
 
   secret-scan:
+    needs: candidate
+    env:
+      ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Secret Scan
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
           fetch-depth: 0
+
+      - name: Verify exact candidate and full-profile attempt
+        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Install pinned gitleaks
         shell: bash
@@ -309,21 +394,10 @@ jobs:
 
       - name: Scan introduced commit range
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-          CURRENT_SHA: ${{ github.sha }}
+          ADMISSION_RANGE: ${{ needs.candidate.outputs.range }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            range="$PR_BASE_SHA..$PR_HEAD_SHA"
-          elif [[ -n "$PUSH_BEFORE_SHA" && ! "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
-            range="$PUSH_BEFORE_SHA..$CURRENT_SHA"
-          else
-            range="$CURRENT_SHA"
-          fi
-          gitleaks git --redact --log-opts="$range" .
+          gitleaks git --redact --log-opts="$ADMISSION_RANGE" .
 
       - name: Scan checked-in source tree
         run: gitleaks dir --redact .

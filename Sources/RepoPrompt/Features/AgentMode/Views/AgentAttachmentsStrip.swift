@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import RepoPromptDomainRuntime
 import SwiftUI
 
@@ -30,9 +31,20 @@ struct AgentAttachmentStripSnapshot: Equatable {
     }
 
     static func == (lhs: AgentAttachmentStripSnapshot, rhs: AgentAttachmentStripSnapshot) -> Bool {
+        // Compare sources, not just IDs: a finished turn rewrites an image's path to its kept copy.
         lhs.scopeTabID == rhs.scopeTabID
-            && lhs.attachments.map(\.id) == rhs.attachments.map(\.id)
+            && lhs.attachments.map(ImageRenderKey.init) == rhs.attachments.map(ImageRenderKey.init)
             && lhs.taggedFileAttachments.map { TaggedFileRenderKey($0) } == rhs.taggedFileAttachments.map { TaggedFileRenderKey($0) }
+    }
+
+    private struct ImageRenderKey: Equatable {
+        let id: UUID
+        let source: AgentAttachmentSource
+
+        init(_ attachment: AgentFileAttachment) {
+            id = attachment.id
+            source = attachment.source
+        }
     }
 
     private struct TaggedFileRenderKey: Equatable {
@@ -59,6 +71,9 @@ enum AgentAttachmentStripLayout {
 
     static let composerVerticalSpacingWhenPresent: CGFloat = 8
 
+    /// Fixed thumbnail frame so loading, missing, and loaded cards never change row height.
+    static let thumbnailSize = CGSize(width: 76, height: 52)
+
     static func reservedHeight(hasAttachments: Bool, hasTaggedFiles: Bool) -> CGFloat {
         if hasAttachments {
             return imageStripHeight + composerVerticalSpacingWhenPresent
@@ -77,6 +92,7 @@ struct AgentAttachmentsStrip: View, Equatable {
     var onRemoveAttachment: ((UUID) -> Void)?
     var onRemoveTaggedFile: ((UUID) -> Void)?
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var previewAttachment: AgentFileAttachment?
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -166,10 +182,38 @@ struct AgentAttachmentsStrip: View, Equatable {
                 }
                 .padding(.vertical, 2)
             }
+            .sheet(item: $previewAttachment) { attachment in
+                AgentImagePreviewSheet(attachment: attachment, title: attachment.title ?? attachment.facts.fileName)
+            }
         }
     }
 
+    private func imageAttachmentCard(_ attachment: AgentFileAttachment) -> some View {
+        var onRemove: (() -> Void)?
+        if allowsRemoval, let onRemoveAttachment {
+            onRemove = { onRemoveAttachment(attachment.id) }
+        }
+        return AgentImageAttachmentCard(
+            attachment: attachment,
+            title: attachment.title ?? attachment.facts.fileName,
+            disabled: disabled,
+            fontPreset: fontPreset,
+            onRemove: onRemove,
+            onOpen: { previewAttachment = attachment }
+        )
+        .id(attachment.id)
+    }
+
+    @ViewBuilder
     private func attachmentCard(_ attachment: AgentFileAttachment) -> some View {
+        if attachment.kind == .image {
+            imageAttachmentCard(attachment)
+        } else {
+            genericAttachmentCard(attachment)
+        }
+    }
+
+    private func genericAttachmentCard(_ attachment: AgentFileAttachment) -> some View {
         AttachmentTile(
             facts: attachment.facts,
             preview: preview(for: attachment),
@@ -220,6 +264,181 @@ struct AgentAttachmentsStrip: View, Equatable {
         switch attachment.source {
         case let .localFile(path): .file(URL(fileURLWithPath: path))
         case .url: .none
+        }
+    }
+}
+
+// MARK: - Image card
+
+/// A fixed-size, clickable image card. Missing files render a placeholder that cannot be opened.
+private struct AgentImageAttachmentCard: View {
+    let attachment: AgentFileAttachment
+    let title: String
+    let disabled: Bool
+    let fontPreset: FontScalePreset
+    let onRemove: (() -> Void)?
+    let onOpen: () -> Void
+
+    @State private var phase: AgentAttachmentThumbnailPhase = .loading
+    @State private var activeKey: AgentAttachmentImageKey?
+    @State private var loadToken: AgentAttachmentImageLoadToken?
+
+    private static let missingCaption = "Image no longer available"
+
+    private var isMissing: Bool {
+        phase == .missing
+    }
+
+    private var canOpen: Bool {
+        if case .loaded = phase { return true }
+        return false
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ZStack(alignment: .topTrailing) {
+                Button(action: onOpen) {
+                    thumbnailContent
+                        .frame(
+                            width: AgentAttachmentStripLayout.thumbnailSize.width,
+                            height: AgentAttachmentStripLayout.thumbnailSize.height
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!canOpen)
+                .accessibilityLabel(isMissing ? "\(title), \(Self.missingCaption.lowercased())" : "Open \(title)")
+
+                if let onRemove {
+                    Button(action: onRemove) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 13))
+                            .foregroundColor(disabled ? .gray : .secondary)
+                            .background(Color(NSColor.windowBackgroundColor).clipShape(Circle()))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(disabled)
+                    .offset(x: 4, y: -4)
+                    .accessibilityLabel("Remove \(title)")
+                }
+            }
+
+            Text(isMissing ? Self.missingCaption : title)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(isMissing ? 0.7 : 1)
+                .frame(width: fontPreset.scaledMetric(AgentAttachmentStripLayout.thumbnailSize.width), alignment: .leading)
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.08))
+        .cornerRadius(10)
+        .hoverTooltip(isMissing ? "\(title) is no longer available" : title)
+        .onAppear(perform: loadThumbnail)
+        .onReceive(AttachmentTilePreviewCache.shared.retainedImages.invalidatedPaths.receive(on: DispatchQueue.main)) { paths in
+            guard let path = AgentImageAttachmentAvailabilityResolver.path(for: attachment),
+                  paths.contains(URL(fileURLWithPath: path).standardizedFileURL.path)
+            else { return }
+            loadThumbnail()
+        }
+        .onChange(of: attachment.source) { _, _ in
+            loadThumbnail()
+        }
+        .onDisappear {
+            loadToken?.cancel()
+            loadToken = nil
+        }
+    }
+
+    @ViewBuilder
+    private var thumbnailContent: some View {
+        switch phase {
+        case let .loaded(image):
+            Image(nsImage: image)
+                .resizable()
+                .scaledToFill()
+        case .missing:
+            AgentImageMissingPlaceholder()
+        case .loading, .unavailable:
+            ZStack {
+                Rectangle().fill(Color.secondary.opacity(0.15))
+                Image(systemName: "photo")
+                    .font(.system(size: 16))
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private func loadThumbnail() {
+        loadToken?.cancel()
+        loadToken = nil
+
+        guard let path = AgentImageAttachmentAvailabilityResolver.path(for: attachment) else {
+            activeKey = nil
+            phase = .unavailable
+            return
+        }
+        let key = AgentAttachmentImageKey.thumbnail(
+            path: path,
+            pointSize: AgentAttachmentStripLayout.thumbnailSize,
+            backingScale: NSScreen.main?.backingScaleFactor ?? 2
+        )
+        if activeKey != key {
+            activeKey = key
+            phase = .loading
+        }
+
+        let cache = AttachmentTilePreviewCache.shared.retainedImages
+        if cache.availability.cachedAvailability(forPath: path) == .missing {
+            phase = .missing
+            return
+        }
+        if let cached = cache.cachedImage(for: key) {
+            phase = .loaded(cached.image)
+            return
+        }
+        loadToken = cache.loadImage(for: key) { result in
+            guard activeKey == key else { return }
+            phase = AgentAttachmentThumbnailPhase(result)
+        }
+    }
+}
+
+/// Fixed-size "no longer available" artwork: a slashed photo glyph.
+struct AgentImageMissingPlaceholder: View {
+    var body: some View {
+        ZStack {
+            Rectangle().fill(Color.secondary.opacity(0.10))
+            Image(systemName: "photo")
+                .font(.system(size: 16))
+                .foregroundColor(.secondary.opacity(0.7))
+            Image(systemName: "line.diagonal")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(.secondary)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+enum AgentAttachmentThumbnailPhase: Equatable {
+    case loading
+    case loaded(NSImage)
+    case missing
+    case unavailable
+
+    init(_ result: AgentAttachmentImageLoadResult) {
+        switch result {
+        case let .image(decoded):
+            self = .loaded(decoded.image)
+        case .missing:
+            self = .missing
+        case .undecodable:
+            self = .unavailable
         }
     }
 }

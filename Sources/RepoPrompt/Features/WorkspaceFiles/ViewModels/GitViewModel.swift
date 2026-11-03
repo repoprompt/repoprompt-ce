@@ -68,7 +68,12 @@ final class GitViewModel: ObservableObject {
             .eraseToAnyPublisher()
     }
 
-    @Published var isPopoverVisible = false
+    @Published var isPopoverVisible = false {
+        didSet {
+            if isPopoverVisible, !oldValue { resetGitContextRefreshBackoff() }
+        }
+    }
+
     @Published var availableBranches: [VCSBranch] = []
     @Published var availableRemoteBranches: [VCSBranch] = []
     @Published var availableTags: [VCSTag] = []
@@ -99,6 +104,8 @@ final class GitViewModel: ObservableObject {
     private var lastVisibleRootRawPaths: [String] = []
     private var gitContextRefreshTask: Task<Void, Never>?
     private let gitContextRefreshIntervalNanoseconds: UInt64
+    private var gitContextRefreshDelayNanoseconds: UInt64
+    private var gitContextRefreshActivityGeneration: UInt64 = 0
     private let refreshGitContexts: @Sendable ([String]) async -> [GitStatusActor.RepoDetection]
     private var isRefreshingGitContexts = false
     private var isPreparingForWindowClose = false
@@ -131,6 +138,7 @@ final class GitViewModel: ObservableObject {
         self.fileManager = fileManager
         self.statusActor = statusActor
         self.gitContextRefreshIntervalNanoseconds = gitContextRefreshIntervalNanoseconds
+        gitContextRefreshDelayNanoseconds = gitContextRefreshIntervalNanoseconds
         self.refreshGitContexts = refreshGitContexts ?? { roots in
             await statusActor.updateRoots(roots)
         }
@@ -407,6 +415,9 @@ final class GitViewModel: ObservableObject {
         let rootPaths = rootFolders.map(\.fullPath)
         let standardizedRootPaths = rootFolders.map { CheckoutPathIdentity.canonicalPathOrOriginal($0.standardizedFullPath) }
         let standardizedPathByRootPath = Self.standardizedPathByRootPath(for: rootFolders)
+        if lastVisibleRootRawPaths != rootPaths || lastVisibleRootPaths != standardizedRootPaths {
+            resetGitContextRefreshBackoff()
+        }
         lastVisibleRootPaths = standardizedRootPaths
         lastVisibleRootRawPaths = rootPaths
         updateGitContextRefreshLoop()
@@ -453,10 +464,11 @@ final class GitViewModel: ObservableObject {
         })
     }
 
+    @discardableResult
     private func applyRootDetections(
         _ detections: [GitStatusActor.RepoDetection],
         standardizedPathByRootPath: [String: String]
-    ) {
+    ) -> Bool {
         var map: [String: Bool] = [:]
         var contexts: [String: GitWorktreeContextSummary] = [:]
         for detection in detections {
@@ -467,10 +479,17 @@ final class GitViewModel: ObservableObject {
                 contexts[standardizedPath] = context
             }
         }
+        let changed = gitEnabledStatus != map || gitWorktreeContextsByRootPath != contexts
         if gitEnabledStatus != map {
             gitEnabledStatus = map
         }
         setGitWorktreeContextsByRootPath(contexts)
+        return changed
+    }
+
+    private func resetGitContextRefreshBackoff() {
+        gitContextRefreshActivityGeneration &+= 1
+        gitContextRefreshDelayNanoseconds = gitContextRefreshIntervalNanoseconds
     }
 
     private func updateGitContextRefreshLoop() {
@@ -481,10 +500,10 @@ final class GitViewModel: ObservableObject {
             return
         }
         guard gitContextRefreshTask == nil else { return }
-        let intervalNanoseconds = gitContextRefreshIntervalNanoseconds
         let refreshGitContexts = refreshGitContexts
         gitContextRefreshTask = Task { [weak self, refreshGitContexts] in
             while !Task.isCancelled {
+                guard let intervalNanoseconds = self?.gitContextRefreshDelayNanoseconds else { break }
                 if intervalNanoseconds > 0 {
                     try? await Task.sleep(nanoseconds: intervalNanoseconds)
                 }
@@ -545,6 +564,17 @@ final class GitViewModel: ObservableObject {
     }
 
     #if DEBUG
+        var test_gitContextRefreshDelayNanoseconds: UInt64 {
+            gitContextRefreshDelayNanoseconds
+        }
+
+        func test_beginPeriodicGitContextRefresh() -> (([GitStatusActor.RepoDetection], Bool) -> Void)? {
+            guard let request = beginPeriodicGitContextRefresh() else { return nil }
+            return { [weak self] detections, shouldApply in
+                self?.finishPeriodicGitContextRefresh(request, detections: detections, shouldApply: shouldApply)
+            }
+        }
+
         var test_hasGitContextRefreshTask: Bool {
             gitContextRefreshTask != nil
         }
@@ -601,6 +631,7 @@ final class GitViewModel: ObservableObject {
     #endif
 
     private struct PeriodicGitContextRefreshRequest {
+        let activityGeneration: UInt64
         let rootPaths: [String]
         let standardizedRootPaths: [String]
         let standardizedPathByRootPath: [String: String]
@@ -612,6 +643,7 @@ final class GitViewModel: ObservableObject {
         guard !rootPaths.isEmpty else { return nil }
         isRefreshingGitContexts = true
         return PeriodicGitContextRefreshRequest(
+            activityGeneration: gitContextRefreshActivityGeneration,
             rootPaths: rootPaths,
             standardizedRootPaths: lastVisibleRootPaths,
             standardizedPathByRootPath: Self.standardizedPathByRootPath(for: availableRootFolders)
@@ -628,10 +660,21 @@ final class GitViewModel: ObservableObject {
               request.rootPaths == lastVisibleRootRawPaths,
               request.standardizedRootPaths == lastVisibleRootPaths
         else { return }
-        applyRootDetections(
+        let changed = applyRootDetections(
             detections,
             standardizedPathByRootPath: request.standardizedPathByRootPath
         )
+        // Activity during a suspended refresh must not be undone by its old completion.
+        guard request.activityGeneration == gitContextRefreshActivityGeneration else { return }
+        if changed || isPopoverVisible {
+            resetGitContextRefreshBackoff()
+        } else {
+            // Keep external worktree discovery bounded while suppressing idle Git processes.
+            // Never shorten an explicitly injected base interval, or overflow the delay.
+            let maximum = max(gitContextRefreshIntervalNanoseconds, 30_000_000_000)
+            let doubled = gitContextRefreshDelayNanoseconds.multipliedReportingOverflow(by: 2)
+            gitContextRefreshDelayNanoseconds = doubled.overflow ? maximum : min(doubled.partialValue, maximum)
+        }
     }
 
     // MARK: - Fetch API (delegates to actor)
@@ -647,6 +690,7 @@ final class GitViewModel: ObservableObject {
     }
 
     func fetchUnstagedFiles(trigger: GitStatusActor.Trigger) async {
+        if trigger == .explicitRefresh || trigger == .popoverOpen { resetGitContextRefreshBackoff() }
         guard selectedRootFolder != nil else {
             unstagedFiles = []
             errorMessage = "No root folder selected"
@@ -947,6 +991,7 @@ final class GitViewModel: ObservableObject {
 
     /// Clears all git-related UI state without performing any git operations.
     private func resetGitState() {
+        resetGitContextRefreshBackoff()
         rootUpdateTask?.cancel()
         unstagedFiles = []
         fileSelectionStates = [:]

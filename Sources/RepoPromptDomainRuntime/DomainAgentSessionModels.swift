@@ -499,6 +499,34 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         }
     }
 
+    /// Effective worktree binding of the session as published on the MCP wire.
+    ///
+    /// `unknown` is reserved for projections that intentionally do not publish bindings
+    /// (resident in-memory snapshots, expired handles); it must never be inferred from an
+    /// empty binding list. On the wire `unknown` is represented by omitting
+    /// `worktree_binding_state` and the binding keys entirely, which keeps those legacy
+    /// payload shapes byte-identical; `bound`/`unbound` are always explicit.
+    package enum WorktreeBindingState: String, Codable, Equatable, Sendable {
+        case bound
+        case unbound
+        case unknown
+    }
+
+    /// Upper bound on the `assistant_text` characters published by `asObject()`.
+    ///
+    /// Wait/poll/steer responses carry the child's last assistant reply only — never raw tool
+    /// output — and this cap keeps that report bounded for the supervising session. Longer
+    /// replies are truncated and flagged with `assistant_text_truncated`; the full transcript
+    /// stays reachable through explicit log operations (`agent_manage get_log`).
+    package static let assistantTextCharacterLimit = 16_000
+
+    package static let assistantTextTruncationMarker = "\n… [assistant_text truncated; read the full transcript with agent_manage get_log]"
+
+    package static let unboundChildOfBoundParentWarning =
+        "This child session is not bound to a worktree although its parent session is. It reads the logical root checkout, " +
+        "not the parent's task worktree, so task-aware inspection may observe base/stale state. Start it with explicit " +
+        "`worktree`/`worktree_id` arguments, or omit `inherit_worktree=false`, to bind it."
+
     package let sessionID: UUID
     package let runID: UUID?
     package let tabID: UUID?
@@ -519,6 +547,10 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
     package let failureReason: FailureReason?
     package let worktreeBindings: [WorktreeBinding]
     package let activeWorktreeMerges: [WorktreeMergeSummary]
+    package let worktreeBindingState: WorktreeBindingState
+    /// Whether the parent session (when any) holds worktree bindings. `nil` when there is no
+    /// parent or the parent's bindings were not resolved.
+    package let parentIsWorktreeBound: Bool?
 
     package init(
         sessionID: UUID,
@@ -540,7 +572,9 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         parentSessionID: UUID?,
         failureReason: FailureReason?,
         worktreeBindings: [WorktreeBinding],
-        activeWorktreeMerges: [WorktreeMergeSummary]
+        activeWorktreeMerges: [WorktreeMergeSummary],
+        worktreeBindingState: WorktreeBindingState? = nil,
+        parentIsWorktreeBound: Bool? = nil
     ) {
         self.sessionID = sessionID
         self.runID = runID
@@ -562,6 +596,27 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
         self.failureReason = failureReason
         self.worktreeBindings = worktreeBindings
         self.activeWorktreeMerges = activeWorktreeMerges
+        self.worktreeBindingState = worktreeBindingState ?? (worktreeBindings.isEmpty ? .unbound : .bound)
+        self.parentIsWorktreeBound = parentIsWorktreeBound
+    }
+
+    /// A child started under a worktree-bound parent that itself ended up unbound. Such a
+    /// child inspects the logical root rather than the parent's task worktree.
+    package var isUnboundChildOfBoundParent: Bool {
+        parentSessionID != nil && worktreeBindingState == .unbound && parentIsWorktreeBound == true
+    }
+
+    /// Bounded `assistant_text` payload: the preview capped at `assistantTextCharacterLimit`
+    /// characters plus whether truncation happened and the original length.
+    package static func boundedAssistantText(
+        _ text: String
+    ) -> (text: String, truncated: Bool, totalCharacters: Int) {
+        let totalCharacters = text.count
+        guard totalCharacters > assistantTextCharacterLimit else {
+            return (text, false, totalCharacters)
+        }
+        let head = String(text.prefix(assistantTextCharacterLimit))
+        return (head + assistantTextTruncationMarker, true, totalCharacters)
     }
 
     package var isActionableForMCPWait: Bool {
@@ -586,7 +641,12 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             object["status_text"] = .string(statusText)
         }
         if let latestAssistantPreview, !latestAssistantPreview.isEmpty {
-            object["assistant_text"] = .string(latestAssistantPreview)
+            let bounded = Self.boundedAssistantText(latestAssistantPreview)
+            object["assistant_text"] = .string(bounded.text)
+            if bounded.truncated {
+                object["assistant_text_truncated"] = .bool(true)
+                object["assistant_text_characters"] = .int(bounded.totalCharacters)
+            }
         }
         if let interaction {
             object["interaction"] = .object(interaction.asObject())
@@ -623,10 +683,24 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             }
             object["agent"] = .object(agent)
         }
+        if worktreeBindingState != .unknown {
+            object["worktree_binding_state"] = .string(worktreeBindingState.rawValue)
+        }
         if !worktreeBindings.isEmpty {
             let values = worktreeBindings.map { Value.object($0.asObject()) }
             object["worktree_bindings"] = .array(values)
             object["worktree"] = values[0]
+        } else if worktreeBindingState == .unbound {
+            // An unbound session says so explicitly instead of omitting the keys, so a
+            // supervisor cannot mistake "no binding fields" for "binding unknown".
+            object["worktree_bindings"] = .array([])
+            object["worktree"] = .null
+        }
+        if let parentIsWorktreeBound {
+            object["parent_worktree_bound"] = .bool(parentIsWorktreeBound)
+        }
+        if isUnboundChildOfBoundParent {
+            object["worktree_binding_warning"] = .string(Self.unboundChildOfBoundParentWarning)
         }
         if !activeWorktreeMerges.isEmpty {
             object["active_worktree_merges"] = .array(activeWorktreeMerges.map { .object(Self.mergeSummaryObject($0)) })
@@ -663,7 +737,9 @@ package struct DomainAgentRunSnapshot: Equatable, Sendable {
             parentSessionID: nil,
             failureReason: nil,
             worktreeBindings: [],
-            activeWorktreeMerges: []
+            activeWorktreeMerges: [],
+            // An expired handle has no binding knowledge; it must not claim `unbound`.
+            worktreeBindingState: .unknown
         )
     }
 

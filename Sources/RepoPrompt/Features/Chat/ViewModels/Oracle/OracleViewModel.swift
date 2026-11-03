@@ -3254,6 +3254,7 @@ class OracleViewModel: ObservableObject {
         oracleAttachments: [OracleAttachment] = [],
         completionPolicy: OracleResponseCompletionPolicy = .interactive,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
+        onQueryCreated: ((UUID) -> Void)? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async -> UUID? {
         guard !newUserMessage.isEmpty, contextBuilderScope?.isLive != false else { return nil }
@@ -3401,6 +3402,7 @@ class OracleViewModel: ObservableObject {
             oracleControlledResponseIDs.insert(aiResponseId)
         }
         setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: nil)
+        onQueryCreated?(aiResponseId)
 
         if currentSessionID == targetSessionID {
             updateLatestTokenCounts()
@@ -3841,7 +3843,12 @@ class OracleViewModel: ObservableObject {
         // 4️⃣ Persist the fully‑processed session state
         // When finalizing after a delegate‑edit retry, force autosave so XML results persist
         // even if the assistant message text hasn't changed (avoids "no meaningful changes" skip).
-        let shouldForceAutosave = (activeRetryTask != nil)
+        let finalizedResponse = messageStore[sessionID]?.first { $0.id == aiResponseId }
+        let storedResponse = sessions.first { $0.id == sessionID }?.messages.first { $0.id == aiResponseId }
+        let usageChanged = finalizedResponse?.promptTokens != storedResponse?.promptTokens
+            || finalizedResponse?.completionTokens != storedResponse?.completionTokens
+            || finalizedResponse?.cost != storedResponse?.cost
+        let shouldForceAutosave = activeRetryTask != nil || usageChanged
         autosaveChatHistory(for: sessionID, force: shouldForceAutosave)
 
         // 5️⃣ Notify observers and any waiters that this message is finalised

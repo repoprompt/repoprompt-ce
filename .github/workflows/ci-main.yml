@@ -1,16 +1,14 @@
 name: CI (main)
 
-# Main-only checks, kept out of the PR workflow so PRs show no skipped rows:
-# Sentry-enabled build/privacy checks. All module parity tests now gate PRs in CI/Style.
+# Optional standalone Sentry diagnostic. CI already requires the same build and
+# privacy tests for every PR, merge-group candidate, and main push.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
+# Each explicit diagnostic keeps its requested source and can finish independently.
 concurrency:
-  group: ci-main-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-main-${{ github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

@@ -326,12 +326,17 @@ final class DelegationScopeRuntime: ObservableObject {
     private var deletedSessionIDs: Set<UUID> = []
     private let windows: @MainActor () -> [WindowState]
     private let now: () -> Date
+    private let sleepForExpiry: @MainActor (TimeInterval) async throws -> Void
+    private var expiryTask: Task<Void, Never>?
+    private var expiryDeadline: Date?
+    private var expiryGeneration: UUID?
     private let makeUUID: () -> UUID
     private let notifyCatalogChanged: (UUID) -> Void
 
     init(
         persistenceMode: PersistenceMode,
         now: @escaping () -> Date = Date.init,
+        sleepForExpiry: @escaping @MainActor (TimeInterval) async throws -> Void = { try await Task.sleep(for: .seconds($0)) },
         makeUUID: @escaping () -> UUID = UUID.init,
         confirmations: BatchConfirmationCoordinator? = nil,
         windows: @escaping @MainActor () -> [WindowState] = { WindowStatesManager.shared.allWindows },
@@ -345,9 +350,14 @@ final class DelegationScopeRuntime: ObservableObject {
         availability = persistenceMode == .ephemeral ? .ephemeral : .awaitingStore
         self.windows = windows
         self.now = now
+        self.sleepForExpiry = sleepForExpiry
         self.makeUUID = makeUUID
         self.confirmations = confirmations ?? BatchConfirmationCoordinator(now: now, makeUUID: makeUUID)
         self.notifyCatalogChanged = notifyCatalogChanged
+    }
+
+    deinit {
+        expiryTask?.cancel()
     }
 
     // MARK: - Launch
@@ -466,6 +476,10 @@ final class DelegationScopeRuntime: ObservableObject {
         retryTask?.cancel()
         retryTask = nil
         availability = .terminating
+        expiryTask?.cancel()
+        expiryTask = nil
+        expiryDeadline = nil
+        expiryGeneration = nil
         linkConsent.replace([])
         overseeContinuations.removeAll()
         overseeInitialRequests.removeAll()
@@ -1223,7 +1237,39 @@ final class DelegationScopeRuntime: ObservableObject {
             let origin = Self.expiryOrigin(chain.map(\.grant), at: date) ?? record.id
             captureEndings([record], reason: .expired, origin: origin, at: date)
         }
+        let notices = expired.map { record in
+            (record: record, tabID: requests.values.first { $0.state == .granted(scopeID: record.id) }?.requesterTabID)
+        }
         didChange(grantees: Set(expired.map(\.grant.granteeSessionID)), invalidated: expired.map(\.id))
+        for notice in notices {
+            enqueueDecision(sessionID: notice.record.grant.granteeSessionID, tabID: notice.tabID, result: "expired", identifier: notice.record.id)
+        }
+    }
+
+    /// One deadline for the earliest live grant. Expiry stays with the scope owner, not the passive
+    /// notice reducer or Auto-wake coordinator. Delayed execution sweeps every overdue descendant.
+    private func scheduleExpiry() {
+        let deadline = canUseAuthority ? authority.activeGrants.compactMap(\.guardrails.expiresAt).min() : nil
+        guard deadline != expiryDeadline else { return }
+        expiryTask?.cancel()
+        expiryTask = nil
+        expiryDeadline = deadline
+        expiryGeneration = nil
+        guard let deadline else { return }
+        let generation = UUID()
+        expiryGeneration = generation
+        let delay = max(0, deadline.timeIntervalSince(now()))
+        let sleep = sleepForExpiry
+        expiryTask = Task { @MainActor [weak self] in
+            do { try await sleep(delay) } catch { return }
+            guard !Task.isCancelled, let self, expiryGeneration == generation, canUseAuthority else { return }
+            expiryTask = nil
+            expiryDeadline = nil
+            expiryGeneration = nil
+            expireDueScopes()
+            // Wall-clock changes or an early sleeper must not silently lose the deadline.
+            scheduleExpiry()
+        }
     }
 
     /// A committed deletion is a proven-permanent fact, so it is recorded even while quitting: the
@@ -1373,6 +1419,7 @@ final class DelegationScopeRuntime: ObservableObject {
     }
 
     private func didChange(grantees: Set<UUID>, invalidated: [UUID]) {
+        scheduleExpiry()
         linkConsent.replace(authority.liveRecords(now: now()).map(\.grant))
         if !invalidated.isEmpty { scopesDidInvalidate?(Set(invalidated)) }
         liveScopesDidChange?()

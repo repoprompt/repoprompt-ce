@@ -52,7 +52,7 @@ private enum WorkspaceExitPerf {
     #endif
 }
 
-private struct RemovedFolderPathMatcher {
+struct RemovedFolderPathMatcher {
     let removedFolderPaths: Set<String>
 
     func containsPathEqualToOrInsideRemovedFolder(_ standardizedPath: String) -> Bool {
@@ -61,17 +61,19 @@ private struct RemovedFolderPathMatcher {
             return true
         }
 
-        var current = standardizedPath
-        while true {
-            let parent = (current as NSString).deletingLastPathComponent
-            guard !parent.isEmpty, parent != current else {
-                return false
+        // Standardized paths have no trailing slash except for the root itself.
+        // Search UTF-8 separators so combining characters after a slash cannot hide it.
+        var current = standardizedPath[...]
+        while let separator = current.utf8.lastIndex(of: 0x2F) {
+            if separator == current.startIndex {
+                return removedFolderPaths.contains("/")
             }
-            if removedFolderPaths.contains(parent) {
+            current = current[..<separator]
+            if removedFolderPaths.contains(String(current)) {
                 return true
             }
-            current = parent
         }
+        return false
     }
 }
 
@@ -215,6 +217,23 @@ struct FileHierarchyIndex {
             {
                 filesByID.removeValue(forKey: removed.id)
             }
+        }
+    }
+
+    /// The removed paths are standardized full paths absent from the materialized tree.
+    func hasIndexedPaths(inRemovedFolders removedFolderPaths: Set<String>, rootKey: String) -> Bool {
+        guard !removedFolderPaths.isEmpty else { return false }
+        if removedFolderPaths.contains(where: { foldersByFullPath[$0] != nil }) {
+            return true
+        }
+        let matcher = RemovedFolderPathMatcher(removedFolderPaths: removedFolderPaths)
+        let standardizedRootKey = StandardizedPath.absolute(rootKey)
+        if let ownedFilePaths = filePathsByRoot[standardizedRootKey] {
+            return ownedFilePaths.contains { matcher.containsPathEqualToOrInsideRemovedFolder($0) }
+        }
+        return filesByFullPath.values.contains { file in
+            file.standardizedRootFolderPath == standardizedRootKey
+                && matcher.containsPathEqualToOrInsideRemovedFolder(file.standardizedFullPath)
         }
     }
 
@@ -2488,6 +2507,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 removedFolderRelativePaths.insert(folder.relativePath)
             }
         }
+        var unmatchedRemovedFolderFullPaths = Set<String>()
         for path in removedFolderRelativePaths.sorted(by: { $0.count > $1.count }) where !path.isEmpty {
             if let removed = removeFolderRecursive(in: targetRootVM, relativePath: path) {
                 removedSubtrees.append(removed)
@@ -2500,22 +2520,13 @@ class WorkspaceFilesViewModel: ObservableObject {
                     standardizedRoot: rootKey,
                     standardizedRelativePath: path
                 )
-                let matcher = RemovedFolderPathMatcher(removedFolderPaths: [fullPath])
-                let standardizedRootKey = StandardizedPath.absolute(rootKey)
-                let hasIndexedDescendantFiles = if let ownedFilePaths = fileHierarchyIndex.filePathsByRoot[standardizedRootKey] {
-                    ownedFilePaths.contains {
-                        matcher.containsPathEqualToOrInsideRemovedFolder($0)
-                    }
-                } else {
-                    fileHierarchyIndex.filesByFullPath.values.contains { file in
-                        file.standardizedRootFolderPath == standardizedRootKey
-                            && matcher.containsPathEqualToOrInsideRemovedFolder(file.standardizedFullPath)
-                    }
-                }
-                if fileHierarchyIndex.foldersByFullPath[fullPath] != nil || hasIndexedDescendantFiles {
-                    needsIndexRebuild = true
-                }
+                unmatchedRemovedFolderFullPaths.insert(fullPath)
             }
+        }
+        if !needsIndexRebuild,
+           fileHierarchyIndex.hasIndexedPaths(inRemovedFolders: unmatchedRemovedFolderFullPaths, rootKey: rootKey)
+        {
+            needsIndexRebuild = true
         }
         if !removedSubtrees.isEmpty {
             let cleanupOutcome = performBatchedIncrementalRemovedSubtreeCleanup(removedSubtrees, rootKey: rootKey)

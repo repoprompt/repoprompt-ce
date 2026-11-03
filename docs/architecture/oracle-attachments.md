@@ -57,6 +57,33 @@ images where the transport advertises image input, and every other attachment re
 delivery claim and show no capability refusal. A refusal is real only where `AttachmentPlanner.plan`
 runs: Oracle sends and the one-shot providers.
 
+### Pane-wide drop and provider contracts
+
+Agent Mode has one pane-wide attachment drop destination. The native text editor forwards file/image
+drags to that same owner; it does not have a composer-band drop target or a separate attachment drop
+fallback. Clipboard paste remains a separate editor action. Plain text and web-link drags remain
+ordinary editor content. File URLs are not filtered by extension: the intake validates regular files
+and reports individual read/size/folder failures rather than silently discarding non-images.
+
+This policy follows the interactive CLI contracts, not the web apps' upload menus:
+
+- [Claude Code Read](https://code.claude.com/docs/en/tools-reference#read-tool-behavior) documents text,
+  PNG/JPEG/GIF/WebP, PDF, and Jupyter notebook reads. For binary formats such as spreadsheets and
+  archives, an `@` reference supplies the path; Claude can use a skill or shell tool instead of Read.
+- [Codex app-server turns](https://learn.chatgpt.com/docs/app-server#turns) document text, remote images,
+  and `localImage` input. The current app encoder sends only classified images through native image
+  inputs. Other attachments are named by owned local path in the prompt for the agent's file tools;
+  they are not falsely encoded as image or native document payloads.
+- [OpenAI Responses file inputs](https://developers.openai.com/api/docs/guides/file-inputs) support a
+  different, broader document-upload contract. That table is not an app-server capability table and
+  must not be copied into an Agent Mode extension allowlist.
+
+Neither interactive contract defines an exhaustive extension allowlist for local file references.
+Accepting a reference is not a promise that the model natively decodes every format: filesystem
+permissions, available tools/skills, and actual provider refusals still apply. Do not claim native
+support based only on a suffix, and do not impose an invented short suffix list on files the agents
+can inspect with tools. Oracle's tool-less route admission remains deliberately stricter.
+
 Agent Mode intake has its own limits, enforced before anything is read: a file larger than
 `OracleAttachmentLimits.maxBytesPerFile` is refused by its directory-entry size, a folder is refused
 by name, and both refusals appear in the transcript. Copy, content probe and identity hash run off the

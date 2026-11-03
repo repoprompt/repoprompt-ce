@@ -335,7 +335,37 @@ final class OracleGroupContractTests: XCTestCase {
         XCTAssertEqual(result.primary.role, .primary)
         XCTAssertEqual(result.oracleResults[1].role, .additional)
         XCTAssertTrue(result.oracleResults.allSatisfy { $0.executionProfile == nil })
+        XCTAssertTrue(result.oracleResults.allSatisfy { $0.capturedModelName == nil })
         XCTAssertEqual(try JSONDecoder().decode(OracleGroupResult.self, from: JSONEncoder().encode(result)), result)
+    }
+
+    func testCapturedModelNameRoundTripsVerbatimAndMissingHistoricalFieldRemainsNil() throws {
+        let capturedName = "  CLI·Captured model (High)\n"
+        let result = try OracleLaneResult(
+            laneIndex: 0,
+            chatID: "chat",
+            providerID: "codex",
+            modelID: "configured-raw",
+            status: .completed,
+            capturedModelName: capturedName,
+            response: "answer"
+        )
+        let encoded = try JSONEncoder().encode(result)
+        let decoded = try JSONDecoder().decode(OracleLaneResult.self, from: encoded)
+        XCTAssertEqual(decoded, result)
+        XCTAssertEqual(decoded.capturedModelName, capturedName)
+
+        var historicalObject = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        historicalObject.removeValue(forKey: "captured_model_name")
+        let historical = try JSONDecoder().decode(
+            OracleLaneResult.self,
+            from: JSONSerialization.data(withJSONObject: historicalObject)
+        )
+        XCTAssertNil(historical.capturedModelName)
+        XCTAssertEqual(historical.modelID, result.modelID)
+        XCTAssertEqual(historical.response, result.response)
+        XCTAssertNotEqual(historical, result, "Captured identity changes must participate in result equality")
+        try assertRoundTrip(historical)
     }
 
     func testExecutionProfileRoundTripsAndUsesCanonicalMCPShape() throws {

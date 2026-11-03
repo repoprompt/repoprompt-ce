@@ -739,6 +739,82 @@ final class OraclePresetExecutionTests: XCTestCase {
         XCTAssertTrue(capturedMessages.allSatisfy { $0.systemPrompt.contains(promptMarker) })
     }
 
+    func testTerminalOnlyUsageSurvivesPreviouslySavedLiveProjection() async throws {
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -9324,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService()
+        )
+        await composition.workspaceManager.awaitInitialized()
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            composition.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting(nil)
+            composition.workspaceManager.prepareForWindowClose()
+            composition.oracleViewModel.sessions = []
+            try? FileManager.default.removeItem(at: root)
+        }
+        var workspace = try XCTUnwrap(composition.workspaceManager.activeWorkspace)
+        let tab = ComposeTabState(id: UUID())
+        workspace.customStoragePath = root
+        workspace.composeTabs = [tab]
+        workspace.activeComposeTabID = tab.id
+        if let index = composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) {
+            composition.workspaceManager.workspaces[index] = workspace
+        }
+        composition.workspaceManager.activeWorkspace = workspace
+        composition.promptManager.loadComposeTabsFromWorkspace(workspace)
+        composition.apiSettingsViewModel.openAIApiKey = "test-key"
+        composition.apiSettingsViewModel.isOpenAIKeyValid = true
+        composition.promptManager.preferredModel = AIModel.gpt54Mini.rawValue
+        var output: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation?
+        composition.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting { _, _ in
+            let stream = AsyncThrowingStream<ChatStreamOutput, Error> { output = $0 }
+            output?.yield(ChatStreamOutput(text: "saved text", reasoning: nil, tokens: ChatTokenInfo()))
+            return (UUID(), stream)
+        }
+        let sending = Task {
+            try await composition.oracleViewModel.tool_chatSendWithConfiguredRoster(
+                args: ["message": .string("usage"), "new_chat": .bool(true)],
+                promptVM: composition.promptManager,
+                tabContext: makeTabContext(workspaceID: workspace.id, tabID: tab.id),
+                capturedProfile: AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Mini.rawValue)
+            )
+        }
+        defer {
+            sending.cancel()
+            output?.finish()
+        }
+        var liveResponse: AIChatMessage?
+        var sessionID: UUID?
+        for _ in 0 ..< 10000 {
+            sessionID = composition.oracleViewModel.sessions.first?.id
+            liveResponse = composition.oracleViewModel.messagesSnapshot(for: sessionID).first { !$0.isUser && $0.content == "saved text" }
+            if liveResponse != nil { break }
+            await Task.yield()
+        }
+        let responseID = try XCTUnwrap(liveResponse?.id)
+        let id = try XCTUnwrap(sessionID)
+        XCTAssertEqual(composition.oracleViewModel.currentSessionID, id)
+        composition.oracleViewModel.renameSession(id: id, newName: "Saved before usage")
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        let url = try XCTUnwrap(composition.oracleViewModel.sessions.first { $0.id == id }?.fileURL)
+        let before = try await composition.oracleViewModel.chatData.loadChatSession(from: url)
+        let savedLiveResponse = try XCTUnwrap(before.messages.first { $0.id == responseID })
+        XCTAssertEqual(savedLiveResponse.rawText, "saved text")
+        XCTAssertNil(savedLiveResponse.promptTokens)
+        XCTAssertNil(savedLiveResponse.completionTokens)
+        output?.yield(ChatStreamOutput(text: "", reasoning: nil, tokens: ChatTokenInfo(promptTokens: 0, completionTokens: 7), terminalOutcome: .completed))
+        output?.finish()
+        _ = try await sending.value
+        await composition.oracleViewModel.drainTrackedAutosaves(for: workspace.id)
+        composition.oracleViewModel.purgeSessionStorage(id)
+        let reloaded = try await composition.oracleViewModel.chatData.loadChatSession(from: url)
+        let response = try XCTUnwrap(reloaded.messages.first { $0.id == responseID })
+        XCTAssertEqual(response.promptTokens, 0)
+        XCTAssertEqual(response.completionTokens, 7)
+    }
+
     private func loadSchema1ReviewPreset(
         directory: URL,
         model: AIModel,

@@ -63,6 +63,11 @@ private struct SettingsNotificationHandler: ViewModifier {
     let windowState: WindowState
 
     func body(content: Content) -> some View {
+        presetNotifications(modelNotifications(generalNotifications(content)))
+    }
+
+    /// Opaque results bound each notification chain without changing modifier order.
+    private func generalNotifications(_ content: some View) -> some View {
         content
             .onReceive(NotificationCenter.default.publisher(for: .showSettingsPopover)) { note in
                 guard noteTargetsCurrentWindow(note) else { return }
@@ -84,6 +89,10 @@ private struct SettingsNotificationHandler: ViewModifier {
                 guard noteTargetsCurrentWindow(note) else { return }
                 openSettings(tab: .mcp)
             }
+    }
+
+    private func modelNotifications(_ content: some View) -> some View {
+        content
             .onReceive(NotificationCenter.default.publisher(for: .showCLIProvidersTab)) { note in
                 guard noteTargetsCurrentWindow(note) else { return }
                 openSettings(tab: .cliProviders)
@@ -110,6 +119,10 @@ private struct SettingsNotificationHandler: ViewModifier {
                 openSettings(tab: .notifications)
             }
             .modifier(AgentModeDeepLinkNotificationHandler(windowState: windowState))
+    }
+
+    private func presetNotifications(_ content: some View) -> some View {
+        content
             .onReceive(NotificationCenter.default.publisher(for: .showModelPresetsTab)) { note in
                 guard noteTargetsCurrentWindow(note) else { return }
                 openSettings(tab: .modelPresets)

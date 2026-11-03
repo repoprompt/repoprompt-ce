@@ -138,15 +138,17 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
     private static func target(primaryCheckout repo: GitRepoDescriptor) -> ContextBuilderReviewTarget {
         let root = WorkspaceRootRef(id: UUID(), name: repo.displayName, fullPath: repo.rootPath)
         let checkout = ContextBuilderReviewCheckoutTarget(
-            logicalWorkspaceRoot: root,
-            physicalWorkspaceRoot: root,
-            physicalWorkspaceRootKind: .primaryWorkspace,
+            contributingRoots: [ContextBuilderReviewRootAuthority(
+                logicalWorkspaceRoot: root,
+                physicalWorkspaceRoot: root,
+                physicalWorkspaceRootKind: .primaryWorkspace,
+                sessionRootAuthorization: nil
+            )],
             checkoutRootPath: repo.rootPath,
             repoKey: repo.repoKey,
             repositoryID: "gitrepo_frozen",
             worktreeID: "wt_frozen",
-            kind: .canonical,
-            sessionRootAuthorization: nil
+            kind: .canonical
         )
         return ContextBuilderReviewTarget(
             workspaceID: UUID(),
