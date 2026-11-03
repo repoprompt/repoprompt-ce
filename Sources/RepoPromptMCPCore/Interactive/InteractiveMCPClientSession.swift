@@ -2235,16 +2235,34 @@ actor InteractiveMCPClientSession {
 
     // MARK: - Bootstrap Handshake
 
+    /// Validates the bootstrap socket inside an already-open bootstrap directory. Only a
+    /// missing socket entry (the directory exists, so the app is most likely restarting its
+    /// MCP server) is reclassified as the retryable `bootstrapSocketUnavailable`; symlinks,
+    /// non-sockets, wrong ownership or permissions, and replaced directories stay hard failures.
+    static func validateBootstrapSocket(in directory: MCPBootstrapDirectory, at socketURL: URL) throws {
+        do {
+            try directory.validateSocket(at: socketURL)
+        } catch let error as MCPBootstrapDirectory.DirectoryError where error.isMissing {
+            throw InteractiveSessionError.bootstrapSocketUnavailable(errno: ENOENT)
+        }
+    }
+
     /// Performs the bootstrap socket handshake and returns the connected FD.
-    private func performBootstrapHandshake() async throws -> Int32 {
-        let socketURL = MCPFilesystemConstants.bootstrapSocketURL()
+    ///
+    /// `socketURL` and `afterConnectForTesting` exist so tests can drive the classification
+    /// against a private temporary directory; production always uses the defaults.
+    func performBootstrapHandshake(
+        socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(),
+        afterConnectForTesting: @Sendable () -> Void = {}
+    ) async throws -> Int32 {
+        // A missing bootstrap directory means the app is not running or MCP is disabled.
         let directory: MCPBootstrapDirectory
         do {
             directory = try MCPBootstrapDirectory.open(at: socketURL.deletingLastPathComponent())
-            try directory.validateSocket(at: socketURL)
         } catch let error as MCPBootstrapDirectory.DirectoryError where error.isMissing {
             throw InteractiveSessionError.appNotRunning
         }
+        try Self.validateBootstrapSocket(in: directory, at: socketURL)
 
         // Create socket
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -2303,7 +2321,8 @@ actor InteractiveMCPClientSession {
             throw InteractiveSessionError.connectFailed(errno: err)
         }
 
-        try directory.validateSocket(at: socketURL)
+        afterConnectForTesting()
+        try Self.validateBootstrapSocket(in: directory, at: socketURL)
         logger.debug("Connected to bootstrap socket")
 
         // Send handshake request
