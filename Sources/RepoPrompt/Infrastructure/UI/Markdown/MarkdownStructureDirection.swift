@@ -1,44 +1,34 @@
 import AppKit
 import Markdown
+import RepoPromptC
 
 /// Resolves one base writing direction for a Markdown structure (a list or a table) from the first
 /// strong directional character of its natural-language content, so list markers, continuation
 /// indentation and table columns are laid out the same way for every item and row instead of
 /// flipping per paragraph when an item happens to start with a code span or an English word (#654).
 ///
-/// Display-only: callers set `NSParagraphStyle.baseWritingDirection`. No bidi control characters are
-/// inserted and the backing string is never changed, so search, links, selection, copying and
-/// accessibility keep their original offsets. Structures with no strong character keep `.natural`.
+/// Display-only: callers set `NSParagraphStyle.baseWritingDirection` (and, for fallback tables,
+/// `.writingDirection` attribute embeddings). No bidi control characters are inserted and the
+/// backing string is never changed, so search, links, selection, copying and accessibility keep
+/// their original offsets.
+///
+/// Policy: a structure whose prose has no strong character (only digits, punctuation, code or
+/// HTML) resolves to nil and keeps the platform-resolved `.natural` direction; it is never encoded
+/// as an explicit direction.
 enum MarkdownStructureDirection {
     /// The direction of the first strong character in `markup`'s prose, or nil when there is none.
     ///
     /// Code spans, code blocks and raw HTML are skipped: their content is LTR-embedded separately
     /// and would otherwise decide the direction of the RTL prose around them.
     static func baseWritingDirection(for markup: any Markup) -> NSWritingDirection? {
-        switch markup {
-        case is InlineCode, is CodeBlock, is HTMLBlock, is InlineHTML:
-            return nil
-        case let text as Text:
-            return firstStrongDirection(in: text.string)
-        default:
-            for child in markup.children {
-                if let direction = baseWritingDirection(for: child) {
-                    return direction
-                }
-            }
-            return nil
-        }
+        var scanner = FirstStrongScanner()
+        return scanner.direction(in: markup)
     }
 
-    /// First-strong detection (Unicode bidi rules P2/P3) over scalars: right-to-left letters win as
-    /// `.rightToLeft`, any other letter as `.leftToRight`; digits, marks and punctuation are weak or
-    /// neutral and skipped. Script blocks stand in for the bidi class, which Swift does not expose.
+    /// First-strong detection over one paragraph of plain text (see `FirstStrongScanner`).
     static func firstStrongDirection(in text: String) -> NSWritingDirection? {
-        for scalar in text.unicodeScalars {
-            if isRightToLeftLetter(scalar) { return .rightToLeft }
-            if isLetter(scalar) { return .leftToRight }
-        }
-        return nil
+        var scanner = FirstStrongScanner()
+        return scanner.scan(text)
     }
 
     /// Applies an explicit direction; nil leaves the platform-resolved `.natural` direction alone.
@@ -46,38 +36,60 @@ enum MarkdownStructureDirection {
         guard let direction else { return }
         paragraphStyle.baseWritingDirection = direction
     }
+}
 
-    private static let rightToLeftBlocks: [ClosedRange<UInt32>] = [
-        0x0590 ... 0x05FF, // Hebrew
-        0x0600 ... 0x06FF, // Arabic
-        0x0700 ... 0x074F, // Syriac
-        0x0750 ... 0x077F, // Arabic Supplement
-        0x0780 ... 0x07BF, // Thaana
-        0x07C0 ... 0x07FF, // NKo
-        0x0800 ... 0x083F, // Samaritan
-        0x0840 ... 0x085F, // Mandaic
-        0x0860 ... 0x086F, // Syriac Supplement
-        0x0870 ... 0x089F, // Arabic Extended-B
-        0x08A0 ... 0x08FF, // Arabic Extended-A
-        0xFB1D ... 0xFB4F, // Hebrew presentation forms
-        0xFB50 ... 0xFDFF, // Arabic Presentation Forms-A
-        0xFE70 ... 0xFEFF, // Arabic Presentation Forms-B
-        0x10800 ... 0x10FFF, // Historic right-to-left scripts (Phoenician, Imperial Aramaic, ...)
-        0x1E800 ... 0x1EFFF // Mende Kikakui, Adlam, Arabic Mathematical Alphabetic Symbols
-    ]
+/// Unicode bidi rule P2 (UAX #9) using the real Bidi_Class of each scalar from the system ICU:
+/// the first character of class L is left-to-right, of class R or AL right-to-left. Characters
+/// between an isolate initiator (LRI, RLI, FSI) and its matching PDI are skipped; an unmatched PDI
+/// is ignored; an unmatched initiator hides the rest of its paragraph. Embedding and override
+/// controls (LRE, RLE, LRO, RLO, PDF) are skipped themselves but not their contents, and PDF never
+/// closes an isolate. Isolate nesting is counted without the rendering depth limit.
+///
+/// The isolate state spans the inline nodes of one paragraph (text, emphasis, links) and starts
+/// over at every real paragraph boundary: block elements, table cells, hard line breaks (which the
+/// compiler renders as a line feed) and paragraph-separator characters.
+struct FirstStrongScanner {
+    private var isolateDepth = 0
 
-    private static func isRightToLeftLetter(_ scalar: Unicode.Scalar) -> Bool {
-        guard isLetter(scalar) else { return false }
-        let value = scalar.value
-        return rightToLeftBlocks.contains { $0.contains(value) }
+    mutating func scan(_ text: String) -> NSWritingDirection? {
+        for scalar in text.unicodeScalars {
+            switch rpce_bidi_first_strong_class(scalar.value) {
+            case .leftToRight:
+                if isolateDepth == 0 { return .leftToRight }
+            case .rightToLeft:
+                if isolateDepth == 0 { return .rightToLeft }
+            case .isolateInitiator:
+                isolateDepth += 1
+            case .popDirectionalIsolate:
+                if isolateDepth > 0 { isolateDepth -= 1 }
+            case .paragraphSeparator:
+                isolateDepth = 0
+            case .other:
+                break
+            }
+        }
+        return nil
     }
 
-    private static func isLetter(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.properties.generalCategory {
-        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter:
-            true
+    mutating func direction(in markup: any Markup) -> NSWritingDirection? {
+        switch markup {
+        case is InlineCode, is CodeBlock, is HTMLBlock, is InlineHTML:
+            return nil
+        case let text as Text:
+            return scan(text.string)
+        case is LineBreak:
+            isolateDepth = 0
+            return nil
         default:
-            false
+            let startsParagraph = markup is BlockMarkup || markup is Table.Cell
+            if startsParagraph { isolateDepth = 0 }
+            for child in markup.children {
+                if let direction = direction(in: child) {
+                    return direction
+                }
+            }
+            if startsParagraph { isolateDepth = 0 }
+            return nil
         }
     }
 }
