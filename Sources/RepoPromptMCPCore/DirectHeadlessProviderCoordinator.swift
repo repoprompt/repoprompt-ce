@@ -527,8 +527,8 @@ actor DirectHeadlessProviderCoordinator {
     /// snapshot: publish a short `status_text`, carry the reply only in `assistant_text`, and
     /// when rebuilding a snapshot from another one copy `latestAssistantPreviewTotalCharacters`
     /// (plus `worktreeBindingState` / `parentIsWorktreeBound`) along with the preview.
-    /// Dropping the truncation state misreports `assistant_text_characters` for any truncated
-    /// preview (ASCII included) and loses the flag entirely after byte-only truncation.
+    /// Omitting the total makes every already-bounded preview, ASCII included, republish without
+    /// both `assistant_text_truncated` and `assistant_text_characters`; only the marker remains.
     nonisolated static func terminalStatusText(for outcome: DomainAgentRunTerminalOutcome) -> String {
         switch outcome.kind {
         case .completed:
