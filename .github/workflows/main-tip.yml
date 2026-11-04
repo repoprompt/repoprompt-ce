@@ -26,7 +26,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     outputs:
       eligible: ${{ steps.tip.outputs.eligible }}
       commit: ${{ steps.tip.outputs.commit }}
@@ -717,6 +717,17 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  compatibility:
+    name: Older macOS Tip Artifact Compatibility
+    if: needs.setup.outputs.eligible == 'true'
+    needs:
+      - setup
+      - sign
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: RepoPrompt-CE-signed-tip
+      tooling-ref: ${{ needs.setup.outputs.tooling-commit }}
+
   smoke-no-secrets:
     name: Smoke Tip Without Release Secrets
     if: needs.setup.outputs.eligible == 'true'
@@ -809,6 +820,7 @@ jobs:
     needs:
       - setup
       - smoke-no-secrets
+      - compatibility
     environment: tip-release
     runs-on: macos-26
     permissions:

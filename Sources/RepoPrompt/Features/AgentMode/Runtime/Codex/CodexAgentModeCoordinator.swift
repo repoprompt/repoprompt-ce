@@ -2644,7 +2644,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexNeedsReconnect = true
         }
         await ensureCodexNativeSession(
-            session: session
+            session: session,
+            allowMissingRolloutFallback: false,
+            forIdleNativeCompact: true
         )
         guard !hasCodexStartupClaim(for: session),
               let controller = session.codexController,
@@ -9924,6 +9926,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             sealAssistantBoundary(session)
             reconcileReasoningCompletion(payload, session: session)
             return
+        case .responseUsage:
+            return
         case let .tokenUsage(usage):
             guard session.runState.isActive else { return }
             viewModel?.applyCodexNativeContextUsage(usage, session: session)
@@ -10263,9 +10267,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if let identity = session.codexAuthoritativeActiveTurn {
                 bindCodexFallbackQueueToStartedTurn(identity, session: session)
             }
-            let statusText = turnKind == .compact ? "Compacting context…" : "Thinking…"
-            setRunningStatus(statusText, source: .transport, session: session, urgent: true)
-            session.runState = .running
+            // A transport start can arrive after the MCP instruction wait has parked. Keep
+            // that live continuation authoritative for routing (and its timeout), while still
+            // installing the turn identity above for completion correlation.
+            if session.runState != .waitingForUser || session.instructionContinuation == nil {
+                let statusText = turnKind == .compact ? "Compacting context…" : "Thinking…"
+                setRunningStatus(statusText, source: .transport, session: session, urgent: true)
+                session.runState = .running
+            }
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         case let .turnCompleted(turnID, status, failure):
@@ -11864,6 +11873,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case .assistantCompleted: "assistantCompleted"
             case .reasoningDelta: "reasoningDelta"
             case .reasoningCompleted: "reasoningCompleted"
+            case .responseUsage: "responseUsage"
             case .tokenUsage: "tokenUsage"
             case .approvalRequest: "approvalRequest"
             case .permissionsRequest: "permissionsRequest"
@@ -11896,6 +11906,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "reasoningDelta kind=\(payload.kind) chars=\(payload.text.count) itemID=\(payload.itemID ?? "nil") groupID=\(payload.groupID ?? "nil")"
         case let .reasoningCompleted(payload):
             "reasoningCompleted summary=\(payload.summary.count) content=\(payload.content.count) turnID=\(payload.scope.turnID) itemID=\(payload.scope.itemID)"
+        case .responseUsage:
+            "responseUsage"
         case let .tokenUsage(usage):
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
         case let .approvalRequest(request):

@@ -271,6 +271,12 @@ package actor ExecMCPService: Service {
                         }
                         try await MCPCompatibilitySleep.sleep(.milliseconds(500))
                         continue
+                    case .bootstrapSocketUnavailable where Date() < deadline:
+                        if options.verbose {
+                            fputs("Waiting for RepoPrompt's MCP socket to accept connections (attempt \(attempt))...\n", stderr)
+                        }
+                        try await MCPCompatibilitySleep.sleep(.milliseconds(500))
+                        continue
                     case .bootstrapResponseTimeout where Date() < deadline:
                         if options.verbose {
                             fputs("Retrying stalled RepoPrompt bootstrap handshake (attempt \(attempt))...\n", stderr)
@@ -392,6 +398,19 @@ package actor ExecMCPService: Service {
             To fix:
             1. Launch RepoPrompt.app
             2. Ensure MCP Server is enabled in Settings > MCP
+
+            """, stderr)
+        case let .bootstrapSocketUnavailable(errno):
+            fputs("""
+            Error: RepoPrompt's MCP socket is not accepting connections (retryable)
+
+            The MCP bootstrap directory exists but its socket \(errno == ENOENT ? "is missing" : "refused the connection") (errno \(errno)).
+            This usually means RepoPrompt is restarting its MCP server; it is a transient reconnect window,
+            not "app not running".
+
+            To fix:
+            1. Retry in a moment, or pass --connect-wait <seconds> to wait for the socket
+            2. If it persists, relaunch RepoPrompt.app
 
             """, stderr)
         case .approvalDenied:

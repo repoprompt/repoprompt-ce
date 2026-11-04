@@ -1,10 +1,12 @@
 # CI test gate contract
 
-`CI` uses seven macOS jobs total: one **Build and Static Gates** job, four
-**Test Root Shard (No Build)** jobs, and the secret-free Sentry/privacy and
-release-mode package/MCP smoke jobs. The exact required check **Style** runs last
+`CI` uses six macOS jobs total: one **Build and Static Gates** job, four
+**Test Root Shard (No Build)** jobs, and the secret-free Sentry build/privacy job.
+Universal release packaging and older-runtime artifact smoke instead qualify the
+exact artifacts in Tip, stable, and explicit manual Release Candidate workflows.
+The exact required check **Style** runs last
 on Linux. It depends on the candidate declaration, shared job, all shards,
-Secret Scan, and both integration-product jobs; every prerequisite must succeed
+Secret Scan, and Sentry/privacy; every prerequisite must succeed
 (failed, skipped, or cancelled is not success).
 The final gate prints those prerequisite results in its job summary so an
 upstream test or infrastructure failure is not mistaken for a formatting error.
@@ -24,6 +26,15 @@ CI (main) and Release Candidate remain supplemental workflows with independent
 scheduling. Only obsolete first-attempt PR previews supersede one another in CI;
 queue/main profile runs retain their evidence. There are no test/build retries
 or continue-on-error.
+
+Sentry/privacy waits for the root build, all root shards, and secret scan to
+succeed, so rejected candidates do not consume additional macOS capacity. Skipped
+Sentry/privacy remains a failing prerequisite for Style. The manual Release Candidate
+job can reuse a main-diagnostic-seeded cache of compatible SwiftPM intermediates, but still rebuilds and
+packages the current candidate and executes every smoke check. Root type-check
+measurements remain clean, and the Sentry job's dependency-only cache policy is
+unchanged. See [capacity and scheduling](ci-admission.md#runner-capacity-and-scheduling)
+for the measured backlog and the isolated-run latency tradeoff.
 
 ## Evidence and coverage authority
 
@@ -116,10 +127,10 @@ are never retried to hide deterministic failures.
 Remaining limits: caches and retries cannot guarantee GitHub/Sentry availability;
 skipped tests are visible exceptions, not proof their assertions ran; raw-log/receipt
 parsing is XCTest-specific and intentionally fails closed if its output format
-changes. Sentry and packaging failures still require maintainer triage, now before
-admission as well as in supplemental main workflows. The complete profile increases
-the macOS runner budget from five to seven jobs; it does not eliminate transport
-failures or timing variance.
+changes. Sentry failures block integration; packaging and artifact compatibility failures
+block release qualification/publication, not Style. The integration profile uses
+six macOS jobs; this scheduling boundary does not eliminate transport failures,
+runner capacity limits, or timing variance. Green Style alone is not publishability.
 
 See the [October 23 reliability audit](ci-reliability-2026-10-23.md) for the
 historical failure census, same-commit retry evidence, repairs, and unresolved

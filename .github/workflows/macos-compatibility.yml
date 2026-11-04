@@ -1,0 +1,74 @@
+name: Older macOS Artifact Compatibility
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Same-run artifact containing the release ZIP/PKG, SHA256SUMS, and artifact manifest
+        type: string
+        required: true
+      tooling-ref:
+        description: Exact commit of the caller's validated source or trusted release tooling
+        type: string
+        required: true
+      admission:
+        description: CI candidate identity; empty for independently validated release workflows
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: macOS 15 ${{ matrix.architecture }} artifact smoke
+    if: ${{ inputs.admission == '' || fromJSON(inputs.admission).attempt == github.run_attempt }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact validation tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.tooling-ref }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Verify CI candidate and attempt identity
+        if: inputs.admission != ''
+        working-directory: tooling
+        env:
+          ADMISSION_CONTEXT: ${{ inputs.admission }}
+        run: |
+          python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Download the existing release artifact without rebuilding
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: artifacts
+
+      - name: Launch transferred app and verify MCP on the older runtime
+        env:
+          EXPECTED_ARCH: ${{ matrix.architecture }}
+        run: |
+          python3 tooling/Scripts/smoke_macos_compatibility.py artifacts \
+            --expected-major 15 --expected-arch "$EXPECTED_ARCH" \
+            --report "$RUNNER_TEMP/compatibility/result.json"
+
+      - name: Retain compatibility evidence and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: macos-compatibility-${{ matrix.architecture }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compatibility/
+          if-no-files-found: warn
+          retention-days: 7
