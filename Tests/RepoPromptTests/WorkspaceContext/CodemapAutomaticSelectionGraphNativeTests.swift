@@ -56,7 +56,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         XCTAssertFalse(WorkspaceCodemapRootPausePolicy(defaults: defaults).isPaused(rootPath: workspace.rootURL.path))
     }
 
-    func testPausePreferenceIsKeyedByStandardizedPathAndNotMigratedAcrossPaths() throws {
+    func testPausePolicyEntriesAreIndependentPerStandardizedPath() throws {
         let suite = "CodemapPausePathIdentityTests-\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
@@ -69,7 +69,7 @@ final class CodemapAutomaticSelectionGraphNativeTests: XCTestCase {
         policy.setPaused(true, rootPath: original)
         policy.setPaused(true, rootPath: pausedDestination)
 
-        // A different spelling of the same path resolves to the same preference.
+        // A lexically different spelling (`./`, trailing slash) resolves to the same preference.
         XCTAssertTrue(policy.isPaused(rootPath: base + "/./original/"))
         // A renamed/moved directory is a new path with its own (default unpaused) preference.
         XCTAssertFalse(policy.isPaused(rootPath: moved))
