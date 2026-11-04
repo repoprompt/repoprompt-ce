@@ -27,7 +27,7 @@ jobs:
   validate-ref:
     name: Validate Approved Release Ref
     if: github.ref == 'refs/heads/main'
-    runs-on: macos-26
+    runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.release-ref.outputs.commit }}
       tooling-commit: ${{ steps.release-ref.outputs.tooling-commit }}

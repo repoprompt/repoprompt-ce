@@ -8,7 +8,9 @@ from pathlib import Path
 import re
 import subprocess
 
-PROFILE = 'integration-v1'
+# v2 separates integration acceptance from exact-artifact release qualification.
+# Old receipts must not silently acquire a different guarantee.
+PROFILE = 'integration-v2'
 METADATA = Path('.build/modularization/admission.json')
 SHA = re.compile(r'^[0-9a-f]{40}$')
 
@@ -43,7 +45,7 @@ def candidate(event_name: str, event: dict, sha: str, ref: str,
         raise ValueError('admission requires a real base commit; no unbounded scan fallback')
     return {'schema': 1, 'profile': PROFILE, 'event': event_name, 'head': sha, 'base': base,
             'ref': ref, 'tree': tree, 'run_id': run_id, 'attempt': attempt,
-            'timing_policy': 'clean-enforcing', 'products': 'sentry-privacy-and-release-smoke'}
+            'timing_policy': 'clean-enforcing', 'products': 'sentry-privacy'}
 
 
 def verify(context: dict, root: Path, run_id: str, attempt: str) -> None:
@@ -51,7 +53,7 @@ def verify(context: dict, root: Path, run_id: str, attempt: str) -> None:
         raise ValueError('unknown admission profile')
     if context.get('run_id') != run_id or context.get('attempt') != attempt:
         raise ValueError('Partial/failed-jobs-only reruns are unsupported: select Re-run all jobs for a full profile attempt')
-    if context.get('timing_policy') != 'clean-enforcing' or context.get('products') != 'sentry-privacy-and-release-smoke':
+    if context.get('timing_policy') != 'clean-enforcing' or context.get('products') != 'sentry-privacy':
         raise ValueError('incomplete admission policy')
     if git(root, 'rev-parse', 'HEAD') != context['head'] or git(root, 'rev-parse', 'HEAD^{tree}') != context['tree']:
         raise ValueError('admission candidate commit/tree does not match checkout')

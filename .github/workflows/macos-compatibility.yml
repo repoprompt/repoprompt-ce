@@ -22,6 +22,7 @@ permissions:
 jobs:
   smoke:
     name: macOS 15 ${{ matrix.architecture }} artifact smoke
+    if: ${{ inputs.admission == '' || fromJSON(inputs.admission).attempt == github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
