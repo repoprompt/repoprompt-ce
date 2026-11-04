@@ -43,6 +43,28 @@ import XCTest
             XCTAssertEqual(fixture.rebindRecorder.count, 0)
         }
 
+        func testOracleUtilsModelsListsConfiguredRosterIdentifiers() async throws {
+            let fixture = makeOracleSendFixture()
+            defer { fixture.cleanup() }
+            let settings = GlobalSettingsStore.shared
+            let previousPrimary = settings.planningModelRaw()
+            let previousAdditional = settings.additionalOracleModelRaws()
+            defer {
+                settings.setPlanningModelRaw(previousPrimary, commit: false)
+                try? settings.setAdditionalOracleModelRaws(previousAdditional, commit: false)
+            }
+            let knownAdditional = AIModel.gpt54.rawValue
+            settings.setPlanningModelRaw(knownAdditional, commit: false)
+            try settings.setAdditionalOracleModelRaws([knownAdditional, "bogus-extra-id"], commit: false)
+
+            let value = try await fixture.service.executeOracleUtils(args: ["op": "models"])
+            let output = try XCTUnwrap(value.stringValue)
+            XCTAssertTrue(output.contains("Configured Oracle settings roster (not Model Presets):"), output)
+            XCTAssertTrue(output.contains("- Oracle: \(knownAdditional) — "), output)
+            XCTAssertTrue(output.contains("- Oracle 2: \(knownAdditional) — "), output)
+            XCTAssertTrue(output.contains("- Oracle 3: bogus-extra-id — unknown model"), output)
+        }
+
         func testOracleSendValidContinuationRebindsOnce() async {
             let fixture = makeOracleSendFixture()
             defer { fixture.cleanup() }

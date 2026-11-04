@@ -68,7 +68,7 @@ For grouped follow-ups, `ContextBuilderOracleGroupState` fences callbacks by gen
 
 ## Direct headless execution
 
-`DirectHeadlessOracleRosterResolver` reads `models.planning_model` and `models.additional_oracle_models` from direct settings. A start-only model override replaces the primary model. Continuations reject model overrides.
+`DirectHeadlessOracleRosterResolver` reads `models.planning_model` and `models.additional_oracle_models` from direct settings. A start-only model override replaces the primary model; `additional_oracles` selects a subset of the configured additional lanes at start, preserving configured order, and the effective roster is persisted with the group. Continuations reject model overrides and subset selections; they validate the persisted roster rather than the configured one, so settings edits do not refuse existing conversations.
 
 `DirectHeadlessOracleAdapter` resolves an immutable child launch plan before provider dispatch.
 
@@ -76,7 +76,7 @@ For grouped follow-ups, `ContextBuilderOracleGroupState` fences callbacks by gen
 - N>1 creates or continues a durable group through `OracleGroupRuntime` after the frozen carrier bundle validates. The adapter keeps routing, invocation-plan storage, child launch planning, provider execution, and log projection.
 - A continuation may use any member chat ID. The returned root chat ID is the primary member.
 - A named chat ID that is not a canonical group member stays on the one-lane direct path even when additional models are configured; the direct conversation backend remains authoritative for validating that ID.
-- A roster mismatch fails before provider dispatch.
+- A mismatch between the persisted group roster and the expected roster fails before provider dispatch; the configured roster is not re-compared.
 - A carrier mismatch fails before claim acquisition or group history mutation.
 - `resolveChildLaunchPlan` rechecks shutdown after planning returns, so a cleared plan cache cannot be reinserted. Partial carrier preparation revokes launch tokens and credential envelopes.
 
@@ -134,7 +134,7 @@ Context Builder tool cards show the primary preview and ordered lane summaries. 
 
 `OracleLaneMarkdownFormatter` and `AgentOracleExport` write one section per lane in roster order. `MCPOracleToolService` decodes the canonical group result for export. The export does not modify lane text. Context Builder reports the captured execution's one model or ordered model names as `planning_model`, separately from the discovery `agent` and `model`.
 
-When Model Presets are exposed, `oracle_utils op=models` lists presets in automatic-selection priority order with stable UUIDs, names, primary/additional lane labels, supported modes, effective Chat Preset mapping names, and lane-specific availability. When exposure is disabled or temporarily hidden, it reports the configured current model behavior.
+When Model Presets are exposed, `oracle_utils op=models` lists presets in automatic-selection priority order with stable UUIDs, names, primary/additional lane labels, supported modes, effective Chat Preset mapping names, and lane-specific availability. When exposure is disabled or temporarily hidden, it reports the configured current model behavior. It always lists the configured settings roster (primary plus additional identifiers with availability) so callers can discover `additional_oracles` selectors.
 
 ## Validation
 

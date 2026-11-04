@@ -1200,6 +1200,43 @@ final class DirectHeadlessOracleGroupTests: XCTestCase {
         XCTAssertNil(singleGroup)
     }
 
+    func testGroupContinuationUsesPersistedRosterAfterSettingsChange() async throws {
+        let fixture = try Fixture(name: "settings-drift")
+        defer { fixture.cleanup() }
+        let service = fixture.service()
+        let prepared = try await service.prepareRuntime()
+        addTeardownBlock { await service.teardown(prepared) }
+        try await Self.setRoster(prepared, primary: "lane-0", additional: ["lane-1"])
+        let backend = DirectHeadlessConversationBackend(
+            providerCoordinator: prepared.providerCoordinator,
+            oracleAdapter: prepared.oracleAdapter
+        )
+        let started = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "ask_oracle",
+            arguments: ["message": .string("start")]
+        )
+        let chatID = try XCTUnwrap(started["chat_id"] as? String)
+
+        try await Self.setRoster(prepared, primary: "lane-9", additional: ["lane-7", "lane-8"])
+
+        let continued = try await invoke(
+            prepared: prepared,
+            backend: backend,
+            toolName: "oracle_send",
+            arguments: ["message": .string("follow-up"), "chat_id": .string(chatID)]
+        )
+        XCTAssertEqual(continued["oracle_group_id"] as? String, started["oracle_group_id"] as? String)
+        XCTAssertEqual(continued["oracle_count"] as? Int, 2)
+        let lanes = try XCTUnwrap(continued["oracle_results"] as? [[String: Any]])
+        XCTAssertEqual(
+            lanes.compactMap { $0["response"] as? String },
+            ["response-0-lane-0", "response-1-lane-1"]
+        )
+        XCTAssertEqual(try fixture.calls().count, 4)
+    }
+
     func testThreeOracleContextBuilderUsesOnePersistedCanonicalFrozenPack() async throws {
         let fixture = try Fixture(name: "frozen-context")
         defer { fixture.cleanup() }
