@@ -144,6 +144,33 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         )
     }
 
+    func testSharedPhysicalRootProjectsFullLogicalPathIndependentOfBindingOrder() {
+        let first = WorkspaceRootRef(id: UUID(), name: "Alpha", fullPath: "/repo/a")
+        let second = WorkspaceRootRef(id: UUID(), name: "Zeta", fullPath: "/repo/z")
+        let physical = WorkspaceRootRef(id: UUID(), name: "shared", fullPath: "/tmp/worktrees/shared")
+        let bindings: [WorkspaceRootBindingProjection.BoundRoot] = [
+            .init(
+                logicalRoot: first,
+                physicalRoot: physical,
+                binding: Self.binding(logicalRoot: first, physicalRoot: physical, worktreeID: "wt-a")
+            ),
+            .init(
+                logicalRoot: second,
+                physicalRoot: physical,
+                binding: Self.binding(logicalRoot: second, physicalRoot: physical, worktreeID: "wt-z")
+            )
+        ]
+        for ordered in [bindings, Array(bindings.reversed())] {
+            let projection = WorkspaceRootBindingProjection(
+                sessionID: UUID(), boundRoots: ordered, visibleLogicalRoots: [first, second]
+            )
+            XCTAssertEqual(
+                projection.projectedLogicalDisplayPath(forPhysicalPath: physical.fullPath + "/Sources/App.swift"),
+                "Alpha/Sources/App.swift"
+            )
+        }
+    }
+
     func testExactFileNamespaceRetainsUnavailableNestedWorktreeBinding() {
         let canonicalRoot = WorkspaceRootRef(id: UUID(), name: "Repo", fullPath: "/repo")
         let logicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/repo/project")

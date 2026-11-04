@@ -874,6 +874,57 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertTrue(text.contains("**assistant** @ 2026-07-05T06:00:00Z: Candidate issue: missing smoke coverage"))
     }
 
+    // MARK: - agent_run snapshot contract additions (#399 / #400)
+
+    func testAgentRunUnboundChildUnderBoundParentRendersStateAndWarning() throws {
+        let value: Value = .object([
+            "session_id": .string("child-1"),
+            "status": .string("running"),
+            "worktree_binding_state": .string("unbound"),
+            "worktree": .null,
+            "worktree_bindings": .array([]),
+            "parent_worktree_bound": .bool(true),
+            "worktree_binding_warning": .string("This child session is not bound to a worktree although its parent session is."),
+            "session": .object(["id": .string("child-1"), "name": .string("Probe"), "parent_session_id": .string("parent-1")])
+        ])
+        let text = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("start")], value: value))
+        XCTAssertTrue(text.contains("- Worktree: **unbound**"), text)
+        XCTAssertTrue(text.contains("⚠️ Worktree binding: This child session is not bound to a worktree"), text)
+    }
+
+    func testAgentRunBoundOrUnknownStateDoesNotRenderUnboundLine() throws {
+        let unknown: Value = .object([
+            "session_id": .string("s"), "status": .string("running"),
+            "worktree_binding_state": .string("unknown"),
+            "session": .object(["id": .string("s"), "name": .null])
+        ])
+        let unknownText = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("poll")], value: unknown))
+        XCTAssertFalse(unknownText.contains("Worktree:"), unknownText)
+
+        let bound: Value = .object([
+            "session_id": .string("s"), "status": .string("running"),
+            "worktree_binding_state": .string("bound"),
+            "worktree": .object(["worktree_id": .string("wt_1"), "branch": .string("task/x"), "worktree_root_path": .string("/tmp/x")]),
+            "session": .object(["id": .string("s"), "name": .null])
+        ])
+        let boundText = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("poll")], value: bound))
+        XCTAssertTrue(boundText.contains("- Worktree: **task/x**"), boundText)
+        XCTAssertFalse(boundText.contains("**unbound**"), boundText)
+    }
+
+    func testAgentRunTruncatedAssistantTextRendersNoticeWithTranscriptHint() throws {
+        let value: Value = .object([
+            "session_id": .string("s"), "status": .string("completed"),
+            "assistant_text": .string("head of a long reply… [assistant_text truncated]"),
+            "assistant_text_truncated": .bool(true),
+            "assistant_text_characters": .int(123_456),
+            "session": .object(["id": .string("s"), "name": .null])
+        ])
+        let text = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": .string("wait")], value: value))
+        XCTAssertTrue(text.contains("**Output**"), text)
+        XCTAssertTrue(text.contains("assistant_text truncated of 123456 characters; use `agent_manage get_log`"), text)
+    }
+
     private static func value(_ value: some Encodable) throws -> Value {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]

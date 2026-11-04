@@ -42,6 +42,8 @@ final class AgentSelfCompactTerminalScheduler {
     }
 
     /// Called only after publication and successor arbitration. It never contacts a provider inline.
+    /// Returns the worker launched by this notification, not the compact turn's completion.
+    @discardableResult
     func terminalSettled(
         runID: UUID?,
         runAttemptID: UUID,
@@ -49,33 +51,32 @@ final class AgentSelfCompactTerminalScheduler {
         publication: AgentRunTerminalPublicationResult,
         successorClaimed: Bool,
         teardownSettled: @escaping @MainActor () -> Bool
-    ) {
+    ) -> Task<Void, Never>? {
         var state = load()
         guard let attempt = state.active,
               attempt.phase == .scheduled,
               let owner = attempt.owner,
               owner.runID == runID,
               owner.runAttemptID == runAttemptID
-        else { return }
+        else { return nil }
 
         switch publication {
         case .rejected:
             // A duplicate commit may retry this exact revision, but an unretired rejection must
             // not block readiness forever if no retry comes.
-            Task { @MainActor [self] in
+            return Task { @MainActor [self] in
                 await settleRejectedIfUnresolved(requestID: attempt.id, owner: owner)
             }
-            return
         case .stale:
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             store(state)
-            return
+            return nil
         case .accepted(successorEpoch: nil):
             break
         case .accepted:
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             store(state)
-            return
+            return nil
         }
         // Item 2 deliberately narrowed the plan's failed-origin allowance. A generic .failed
         // terminal does not prove context exhaustion or even a live provider conversation, so native
@@ -83,13 +84,13 @@ final class AgentSelfCompactTerminalScheduler {
         guard !successorClaimed, terminalState == .completed, isCurrentOwner(owner) else {
             state.settle(.cancelled, noteDelivery: .notSent, completionVerified: false)
             store(state)
-            return
+            return nil
         }
         state.active?.phase = .compactDispatchPending
         store(state)
         // The barrier has finished publication but may still be inside its own stack. A new task is
         // the earliest place provider preparation may begin, and this task owns the bounded drain.
-        Task { @MainActor [self] in
+        return Task { @MainActor [self] in
             await run(requestID: attempt.id, owner: owner, teardownSettled: teardownSettled)
         }
     }

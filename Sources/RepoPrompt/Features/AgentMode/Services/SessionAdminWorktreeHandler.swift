@@ -91,12 +91,16 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         scope _: DomainDelegationScopeRecord
     ) -> [BatchConfirmationItem] {
         request.targetSessionIDs.map { sessionID in
-            let bound = host.boundWorktrees(sessionID: sessionID)
+            let selectedID = request.arguments["worktree_id"]?.stringValue
+            let bound = host.boundWorktrees(sessionID: sessionID).filter { selectedID == nil || $0.worktreeID == selectedID }
             let names = bound.map { $0.worktreeName ?? $0.branch ?? $0.worktreeID }
             let effect = request.operation == .adminWorktreeRelease
                 ? "Unbind \(names.isEmpty ? "no worktrees" : names.joined(separator: ", ")) and mark stale for your cleanup (nothing is deleted)"
                 : request.operation.rawValue
-            return BatchConfirmationItem(sessionID: sessionID, title: sessionID.uuidString, effect: effect)
+            return BatchConfirmationItem(
+                sessionID: sessionID, title: sessionID.uuidString, effect: effect,
+                worktreeIDs: request.operation == .adminWorktreeRelease ? Set(bound.map(\.worktreeID)) : nil
+            )
         }
     }
 
@@ -115,6 +119,17 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
             _ = try Self.applyMode(args, op: "worktree_bind")
         case .adminWorktreeUnbind, .adminWorktreeRelease:
             try SessionAdminArguments.requireOnly(["worktree_id"], in: args, op: batch.request.operation.rawValue)
+            if batch.request.operation == .adminWorktreeRelease, let confirmation = batch.confirmation {
+                let card = context.scopes.confirmations.confirmations[confirmation.confirmationID]
+                let selectedID = args["worktree_id"]?.stringValue
+                for target in batch.admittedSessionIDs {
+                    let approved = card?.items.first { $0.sessionID == target }?.worktreeIDs
+                    let current = Set(host.boundWorktrees(sessionID: target).filter { selectedID == nil || $0.worktreeID == selectedID }.map(\.worktreeID))
+                    guard approved == current else {
+                        return SessionAdminReply.refused(code: "worktree_binding_changed", detail: "The selected worktree bindings changed after this card was shown. Request a new approval with a new idempotency key.")
+                    }
+                }
+            }
         case .adminWorktreeInventory:
             try SessionAdminArguments.requireOnly(["idle_days"], in: args, op: "worktree_inventory")
         case .adminMergePreview:
@@ -510,6 +525,19 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
         guard let caller = batch.request.caller.agentSessionID else { throw SessionAdminMCPToolService.unavailableError }
         let op = release ? "worktree_release" : "worktree_unbind"
         let worktreeID = try SessionAdminArguments.string(batch.request.arguments, "worktree_id", op: op)
+        // Freeze the original card before the first host suspension. Later targets cannot inherit
+        // a binding changed while an earlier item was applying, nor a replacement approval row.
+        let approvedBindings: [UUID: Set<String>]?
+        if release, let confirmation = batch.confirmation {
+            guard let card = context.scopes.confirmations.confirmations[confirmation.confirmationID] else {
+                return SessionAdminReply.refused(code: "worktree_binding_changed", detail: "The original release approval is unavailable.")
+            }
+            approvedBindings = Dictionary(uniqueKeysWithValues: card.items.compactMap { item in
+                item.worktreeIDs.map { (item.sessionID, $0) }
+            })
+        } else {
+            approvedBindings = nil
+        }
         var items: [SessionAdminItemResult] = []
         var authorityLost = false
         for lease in batch.leases {
@@ -519,7 +547,12 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 items.append(.revoked(target))
                 continue
             }
-            let bound = host.boundWorktrees(sessionID: target).filter { worktreeID == nil || $0.worktreeID == worktreeID }
+            let allBound = host.boundWorktrees(sessionID: target)
+            let bound = allBound.filter { worktreeID == nil || $0.worktreeID == worktreeID }
+            if let approvedBindings, approvedBindings[target] != Set(bound.map(\.worktreeID)) {
+                items.append(SessionAdminItemResult(sessionID: target, result: "not_applied", code: "worktree_binding_changed"))
+                continue
+            }
             if batch.request.preview {
                 items.append(SessionAdminItemResult(
                     sessionID: target, result: bound.isEmpty ? "nothing_bound" : "would_unbind",
@@ -533,11 +566,18 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                 items.append(SessionAdminItemResult(sessionID: target, result: "nothing_bound"))
                 continue
             }
+            var bindingChanged = false
             do {
                 let context = context
                 let scope = batch.scope
+                let host = host
+                // The host computes the remaining bindings before suspending too. Fence the whole
+                // starting set so a concurrent unrelated bind cannot be overwritten by that snapshot.
+                let approvedIDs = Set(allBound.map(\.worktreeID))
                 let removed = try await host.unbindWorktrees(sessionID: target, worktreeID: worktreeID) {
-                    context.isStillAuthorized(lease, scope: scope, operation: batch.request.operation)
+                    guard context.isStillAuthorized(lease, scope: scope, operation: batch.request.operation) else { return false }
+                    bindingChanged = release && Set(host.boundWorktrees(sessionID: target).map(\.worktreeID)) != approvedIDs
+                    return !bindingChanged
                 }
                 if release {
                     // The stale mark is recorded for whatever was actually unbound, even if authority
@@ -549,7 +589,11 @@ final class SessionAdminWorktreeHandler: AgentSessionAdministrationOperationHand
                     fields: ["worktree_ids": .array(removed.map(Value.string))]
                 ))
             } catch SessionAdminHostError.authorityEnded {
-                items.append(.revoked(target))
+                items.append(
+                    bindingChanged
+                        ? SessionAdminItemResult(sessionID: target, result: "not_applied", code: "worktree_binding_changed")
+                        : .revoked(target)
+                )
             } catch SessionAdminHostError.notIdle {
                 items.append(SessionAdminItemResult(sessionID: target, result: "not_applied", code: "target_busy"))
             } catch {
