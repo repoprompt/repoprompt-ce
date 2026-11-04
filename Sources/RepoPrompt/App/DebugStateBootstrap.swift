@@ -4,9 +4,8 @@ import RepoPromptC
 import RepoPromptDomainRuntime
 import RepoPromptShared
 
-/// Runs once per *process launch*, before settings, windows, catalogs or agents
-/// acquire their stores. A normal launch is always a fresh production snapshot;
-/// clean mode is an argument, never a persisted preference.
+/// Opens the independent debug profile before app stores acquire it. Production
+/// is imported only into an empty profile; clean mode explicitly resets it.
 enum DebugStateBootstrap {
     static let cleanSlateArgument = "--debug-clean-slate"
     /// A live release app keeps writing. Only the first attempt captures the whole
@@ -57,44 +56,26 @@ enum DebugStateBootstrap {
         // If the handler cannot be installed, SIGTERM keeps its default (immediate) behavior.
         let termination = TerminationRequest.install()
         defer { termination?.finish() }
-        // The short startup lock protects concurrent seeds; an already-running
-        // debug app must also be absent, because its ordinary stores are live.
         guard !NSRunningApplication.runningApplications(withBundleIdentifier: AppProfileLocations.current.preferencesDomain)
             .contains(where: { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier })
         else {
             throw DebugStateSnapshot.Failure.unsafeDestination
         }
-        let lease = try DebugProfileAccessLease.acquire(locations: .current, exclusive: true)
         let start = Date()
-        let defaults = UserDefaults.standard
-        let release = AppProfileLocations(identity: .repoPromptCE(.release))
-        let prior = defaults.persistentDomain(forName: AppProfileLocations.current.preferencesDomain) ?? [:]
         let clean = forceCleanSlate || ProcessInfo.processInfo.arguments.contains(cleanSlateArgument)
-        let preferenceDirectory = release.homeDirectory.appendingPathComponent("Library/Preferences")
-        let sourcePreferencesURL = preferenceDirectory.appendingPathComponent(release.preferencesDomain + ".plist")
-        let priorPreferencesURL = preferenceDirectory.appendingPathComponent(AppProfileLocations.current.preferencesDomain + ".plist")
-        try AppProfileLocations.current.validateMetadataFile(priorPreferencesURL)
-        if fm.fileExists(atPath: priorPreferencesURL.path),
-           try ((fm.attributesOfItem(atPath: priorPreferencesURL.path)[.referenceCount] as? NSNumber)?.intValue ?? 1) != 1
-        {
-            throw DebugStateSnapshot.Failure.unsafeDestination
-        }
-        let receipt = try seed(
+        let preparation = try prepareProfile(
             locations: .current,
+            defaults: .standard,
+            preferencesDomain: AppProfileLocations.current.preferencesDomain,
             cleanSlate: clean,
-            releasePreferences: nil,
-            previousPreferences: prior,
-            preferenceSourceURL: clean ? nil : sourcePreferencesURL,
-            previousPreferenceFileURL: priorPreferencesURL,
-            profileLease: lease,
             cancellation: termination.map { request in .init { request.isRequested } }
         )
-        let preferencesURL = AppProfileLocations.current.applicationSupportRoot.appendingPathComponent("seedPreferences.plist")
-        let preferences = try PropertyListSerialization.propertyList(from: Data(contentsOf: preferencesURL), format: nil) as? [String: Any] ?? [:]
-        defaults.setPersistentDomain(preferences, forName: AppProfileLocations.current.preferencesDomain)
-        try lease.allowWriters()
-        appProfileLease = lease
-        print("[DebugStateSeed] schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds) totalSeconds=\(Date().timeIntervalSince(start))")
+        appProfileLease = preparation.lease
+        if let receipt = preparation.receipt {
+            print("[DebugStateSeed] action=\(preparation.action.rawValue) schema=\(receipt.version) clean=\(receipt.cleanSlate) files=\(receipt.copiedFiles) bytes=\(receipt.copiedBytes) captureSeconds=\(receipt.seconds) totalSeconds=\(Date().timeIntervalSince(start))")
+        } else {
+            print("[DebugStateSeed] action=reused totalSeconds=\(Date().timeIntervalSince(start))")
+        }
     }
 
     static func seed(

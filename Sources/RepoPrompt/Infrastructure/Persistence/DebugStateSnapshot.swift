@@ -248,6 +248,7 @@ struct DebugStateSnapshot {
         let copiedFiles: Int
         let copiedBytes: Int
         let seconds: Double
+        let preferencesID: UUID?
     }
 
     enum Failure: Error, LocalizedError {
@@ -483,7 +484,8 @@ struct DebugStateSnapshot {
             cleanSlate: cleanSlate,
             copiedFiles: plan.entries.count + plan.generated.count,
             copiedBytes: bytes,
-            seconds: Date().timeIntervalSince(startedAt)
+            seconds: Date().timeIntervalSince(startedAt),
+            preferencesID: UUID()
         )
         try JSONEncoder().encode(receipt).write(to: stage.appendingPathComponent("debugSeed.json"), options: .withoutOverwriting)
         // Last safe stopping point: after the swap the new profile is published and complete.
