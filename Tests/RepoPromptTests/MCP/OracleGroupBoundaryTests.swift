@@ -65,6 +65,44 @@ import XCTest
             XCTAssertTrue(output.contains("- Oracle 3: bogus-extra-id — unknown model"), output)
         }
 
+        func testOracleUtilsModelsPresetLanesPrintStoredSelectors() async throws {
+            let fixture = makeOracleSendFixture()
+            defer { fixture.cleanup() }
+            let settings = GlobalSettingsStore.shared
+            let previousPresets = ModelPresetsManager.shared.presets
+            let previousExposure = settings.mcpShowModelPresets()
+            let previousDisabled = settings.mcpTemporarilyDisablePresets()
+            let previousPrimary = settings.planningModelRaw()
+            let previousAdditional = settings.additionalOracleModelRaws()
+            defer {
+                ModelPresetsManager.shared.presets = previousPresets
+                settings.setMCPShowModelPresets(previousExposure, commit: false)
+                settings.setMCPTemporarilyDisablePresets(previousDisabled, commit: false)
+                settings.setPlanningModelRaw(previousPrimary, commit: false)
+                try? settings.setAdditionalOracleModelRaws(previousAdditional, commit: false)
+            }
+            let preset = try ModelPreset(name: "Preset selectors", models: [.gpt54Mini, .gpt54])
+            ModelPresetsManager.shared.presets = [preset]
+            settings.setMCPShowModelPresets(true, commit: false)
+            settings.setMCPTemporarilyDisablePresets(false, commit: false)
+            settings.setPlanningModelRaw("other-planning", commit: false)
+            try settings.setAdditionalOracleModelRaws(["other-extra"], commit: false)
+
+            let value = try await fixture.service.executeOracleUtils(args: ["op": "models"])
+            let output = try XCTUnwrap(value.stringValue)
+            XCTAssertTrue(output.contains("- 1. \(preset.name) (\(preset.id.uuidString))"), output)
+            XCTAssertTrue(
+                output.contains("- Oracle: \(AIModel.gpt54Mini.displayName) (\(AIModel.gpt54Mini.rawValue))"),
+                output
+            )
+            XCTAssertTrue(
+                output.contains("- Oracle 2: \(AIModel.gpt54.displayName) (\(AIModel.gpt54.rawValue))"),
+                output
+            )
+            XCTAssertTrue(output.contains("- Oracle: other-planning — "), output)
+            XCTAssertTrue(output.contains("- Oracle 2: other-extra — "), output)
+        }
+
         func testOracleSendValidContinuationRebindsOnce() async {
             let fixture = makeOracleSendFixture()
             defer { fixture.cleanup() }
