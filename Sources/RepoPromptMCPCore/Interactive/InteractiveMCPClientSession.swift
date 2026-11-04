@@ -2237,7 +2237,34 @@ actor InteractiveMCPClientSession {
 
     /// Performs the bootstrap socket handshake and returns the connected FD.
     private func performBootstrapHandshake() async throws -> Int32 {
-        let socketURL = MCPFilesystemConstants.bootstrapSocketURL()
+        try await performBootstrapHandshake(socketURL: MCPFilesystemConstants.bootstrapSocketURL(), afterConnect: nil)
+    }
+
+    #if DEBUG
+        /// Test seam: drives the real handshake classification against a private directory,
+        /// optionally mutating the socket between `connect()` and the post-connect validation.
+        func test_performBootstrapHandshake(
+            socketURL: URL,
+            afterConnect: (@Sendable () -> Void)? = nil
+        ) async throws -> Int32 {
+            try await performBootstrapHandshake(socketURL: socketURL, afterConnect: afterConnect)
+        }
+    #endif
+
+    /// Classification of a missing socket depends on *when* it is missing.
+    ///
+    /// The app never removes the bootstrap directory: a clean quit or MCP disable unlinks only
+    /// the socket (and an in-process MCP restart releases the socket lock before the next
+    /// listener re-acquires it). A socket that is already missing before `connect()` is
+    /// therefore indistinguishable from a stopped app and stays the permanent `appNotRunning`.
+    /// Only a socket that disappears or refuses during the connection attempt itself — present
+    /// at validation, then gone at `connect()` or at the post-connect validation, or refusing as
+    /// a stale inode — is the retryable `bootstrapSocketUnavailable`. Symlinks, non-sockets,
+    /// wrong ownership or permissions, and replaced directories stay hard failures.
+    private func performBootstrapHandshake(
+        socketURL: URL,
+        afterConnect: (@Sendable () -> Void)?
+    ) async throws -> Int32 {
         let directory: MCPBootstrapDirectory
         do {
             directory = try MCPBootstrapDirectory.open(at: socketURL.deletingLastPathComponent())
@@ -2295,12 +2322,22 @@ actor InteractiveMCPClientSession {
         if connectResult < 0 {
             let err = errno
             if err == ECONNREFUSED || err == ENOENT {
-                throw InteractiveSessionError.appNotRunning
+                // The socket passed validation an instant ago but vanished or refused during the
+                // connection attempt: its listener is mid-teardown or mid-restart (#294).
+                throw InteractiveSessionError.bootstrapSocketUnavailable(errno: err)
             }
             throw InteractiveSessionError.connectFailed(errno: err)
         }
 
-        try directory.validateSocket(at: socketURL)
+        #if DEBUG
+            afterConnect?()
+        #endif
+        do {
+            try directory.validateSocket(at: socketURL)
+        } catch let error as MCPBootstrapDirectory.DirectoryError where error.isMissing {
+            // Connected, then the pathname disappeared: the listener is tearing down.
+            throw InteractiveSessionError.bootstrapSocketUnavailable(errno: ENOENT)
+        }
         logger.debug("Connected to bootstrap socket")
 
         // Send handshake request
@@ -2427,7 +2464,14 @@ package enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
     case descriptorConfigurationFailed(errno: Int32)
     case pathTooLong
     case connectFailed(errno: Int32)
+    /// No bootstrap directory: the app is not running or MCP is disabled. Permanent until the
+    /// user launches the app / enables MCP.
     case appNotRunning
+    /// The bootstrap socket passed validation but disappeared (ENOENT) or refused (ECONNREFUSED)
+    /// during the connection attempt: its listener is mid-teardown or mid-restart, or a stale
+    /// socket was left behind. Transient; retry (for example with `--connect-wait`). A socket
+    /// already missing before connecting is `appNotRunning`.
+    case bootstrapSocketUnavailable(errno: Int32)
     case approvalDenied
     case handshakeFailed(reason: String)
     case bootstrapResponseTimeout
@@ -2459,6 +2503,11 @@ package enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
             return "Failed to connect: \(errno)"
         case .appNotRunning:
             return "RepoPrompt app is not running or MCP is disabled"
+        case let .bootstrapSocketUnavailable(errno):
+            let cause = errno == ENOENT ? "disappeared while connecting" : "refused the connection"
+            return "RepoPrompt's MCP bootstrap socket \(cause) (errno \(errno)). " +
+                "Its MCP server is probably restarting or stopping; this is retryable. Retry shortly or pass " +
+                "--connect-wait <seconds>; if it persists, relaunch RepoPrompt."
         case .approvalDenied:
             return "Connection approval was denied"
         case let .handshakeFailed(reason):
@@ -2478,6 +2527,19 @@ package enum InteractiveSessionError: Swift.Error, CustomStringConvertible {
             return "Poll failed: \(errno)"
         case .cancelled:
             return "Operation cancelled"
+        }
+    }
+
+    /// Connection failures that are part of a reconnect window (the app restarting its MCP
+    /// server or answering its bootstrap handshake late) rather than a permanent
+    /// "not running / MCP disabled / approval denied" state. Callers may retry these with
+    /// bounded backoff; `appNotRunning` stays permanent until the user acts.
+    package var isRetryableConnectionFailure: Bool {
+        switch self {
+        case .bootstrapSocketUnavailable, .bootstrapResponseTimeout:
+            true
+        default:
+            false
         }
     }
 }

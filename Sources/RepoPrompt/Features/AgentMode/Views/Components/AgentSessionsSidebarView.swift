@@ -52,6 +52,8 @@ struct AgentModeSessionsSidebarView: View {
     let currentTabID: UUID?
     let onManageWorkspaces: () -> Void
 
+    /// Remembered per window; mirrored into the sidebar store, which owns filtering.
+    @SceneStorage("agentModeSidebarTab") private var storedSidebarTab = AgentSidebarTab.all.rawValue
     @State private var isCollapseAllThreadsButtonHovered = false
     @State private var isCollapseAllThreadsButtonFlashing = false
     @State private var collapseAllThreadsButtonClickTick = 0
@@ -128,13 +130,18 @@ struct AgentModeSessionsSidebarView: View {
                 collapseAllThreadsButton
             }
             .padding(.horizontal, topBarHorizontalPadding)
-            .padding(.vertical, topBarVerticalPadding)
+            .padding(.top, topBarVerticalPadding)
+            .padding(.bottom, topBarSpacing)
             .animation(.easeInOut(duration: 0.15), value: agentModeVM.sidebarCollapseAllState(
                 for: promptManager.currentComposeTabs,
                 currentTabID: currentTabID,
                 searchText: sidebarUI.snapshot.searchText,
                 diagnosticSource: "sidebarTopBar.animation"
             ))
+
+            sidebarTabPicker
+                .padding(.horizontal, topBarHorizontalPadding)
+                .padding(.bottom, topBarVerticalPadding)
 
             AgentModeSessionsListView(
                 agentModeVM: agentModeVM,
@@ -189,7 +196,7 @@ struct AgentModeSessionsSidebarView: View {
             searchText: search,
             diagnosticSource: "collapseAllButton.body"
         )
-        if state != .hidden {
+        if state != .hidden, sidebarUI.snapshot.sidebarTab != .overseers {
             let tooltip = state == .canCollapse ? "Collapse all sub-agent threads" : "Expand all sub-agent threads"
             Button {
                 collapseAllThreadsButtonClickTick &+= 1
@@ -245,6 +252,31 @@ struct AgentModeSessionsSidebarView: View {
             return Color(NSColor.labelColor).opacity(0.85)
         }
         return Color(NSColor.secondaryLabelColor).opacity(0.6)
+    }
+
+    /// All · Pinned · Active · Overseers. All is the unchanged sidebar; the others filter it.
+    private var sidebarTabPicker: some View {
+        Picker("Show", selection: Binding(
+            get: { sidebarUI.snapshot.sidebarTab },
+            set: { tab in
+                storedSidebarTab = tab.rawValue
+                agentModeVM.setSidebarTab(tab)
+            }
+        )) {
+            ForEach(AgentSidebarTab.allCases) { tab in
+                Text(tab.title).tag(tab)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .controlSize(.small)
+        .accessibilityLabel("Show sessions")
+        .onAppear {
+            let tab = AgentSidebarTab(rawValue: storedSidebarTab) ?? .all
+            if tab != sidebarUI.snapshot.sidebarTab {
+                agentModeVM.setSidebarTab(tab)
+            }
+        }
     }
 
     /// Search box for filtering sessions.
@@ -462,8 +494,15 @@ struct AgentModeSessionsListView: View, Equatable {
     /// Expanded archived rows derive creator labels from the same projections and are not tracked
     /// as facts, so they keep the previous unconditional invalidation.
     private func reconcileSessionLinkProjection() {
-        guard archivedSessionsExpanded || rowActions.renderedOversightFactsChanged() else { return }
+        guard archivedSessionsExpanded || sidebarUI.snapshot.sidebarTab == .overseers
+            || rowActions.renderedOversightFactsChanged()
+        else { return }
         sessionLinkProjectionRevision &+= 1
+    }
+
+    static func uniqueVisibleSessions(_ rows: [AgentSidebarRenderedActiveRow]) -> [AgentModeViewModel.SidebarSession] {
+        var seen = Set<UUID>()
+        return rows.filter { !$0.hidesRow }.map(\.session).filter { seen.insert($0.tabID).inserted }
     }
 
     private func groupSectionHeader(_ item: AgentSidebarRenderedActiveRow) -> AnyView? {
@@ -565,13 +604,16 @@ struct AgentModeSessionsListView: View, Equatable {
             renderedOrder: snapshot.renderedSelectionOrder
         )
         let defaultCollapseSeedKeys = snapshot.defaultCollapseSeedKeys
-        let renderedActiveRows = AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
-            for: snapshot.pagedSessions,
-            collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
-            searchText: sidebarUI.snapshot.searchText,
-            now: dateSectionNow,
-            perfRecorder: perfRecorder
-        )
+        // The Overseers tab arrives prebuilt (one-level groups, possibly repeating a session);
+        // every other tab renders through the unchanged group/date sections.
+        let renderedActiveRows = snapshot.overseerRenderedRows
+            ?? AgentSidebarDateSectionBuilder.renderedActiveRowsWithGroups(
+                for: snapshot.pagedSessions,
+                collapsedGroups: sidebarUI.snapshot.collapsedSidebarGroups,
+                searchText: sidebarUI.snapshot.searchText,
+                now: dateSectionNow,
+                perfRecorder: perfRecorder
+            )
         #if DEBUG
             let _ = AgentSidebarRowRenderProbe.onActiveRowsRendered?(renderedActiveRows)
         #endif
@@ -595,7 +637,8 @@ struct AgentModeSessionsListView: View, Equatable {
         // Bind before resolving any facts: an unbound owner resolves `.none`, and a first render
         // recorded with `.none` facts would stay stale behind row equality and the notification filter.
         let _ = rowActions.bind(agentModeVM: agentModeVM, promptManager: promptManager)
-        let renderedRowSessions = renderedActiveRows.filter { !$0.hidesRow }.map(\.session)
+        // One entry per session: an occurrence repeated under several overseers shares its facts.
+        let renderedRowSessions = Self.uniqueVisibleSessions(renderedActiveRows)
         let oversightFactsByTabID = Dictionary(
             renderedRowSessions.map { ($0.tabID, rowActions.oversightFacts(for: $0)) },
             uniquingKeysWith: { first, _ in first }
@@ -643,6 +686,15 @@ struct AgentModeSessionsListView: View, Equatable {
                         .padding(.horizontal, listHorizontalPadding)
                         .padding(.vertical, 6)
                         .accessibilityElement(children: .combine)
+                    }
+                    let isSearching = !sidebarSnapshot.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    if !snapshot.isOwnerPending, renderedActiveRows.isEmpty, sidebarSnapshot.sidebarTab != .all {
+                        Text(isSearching ? "No matching sessions" : sidebarSnapshot.sidebarTab.emptyTitle)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, listHorizontalPadding)
+                            .padding(.vertical, 8)
                     }
                     AgentSidebarKeyedRowList(
                         items: renderedActiveRows,
@@ -1139,29 +1191,6 @@ struct AgentSidebarArchivedDateRow: Identifiable {
 
     var id: UUID {
         stashed.id
-    }
-}
-
-/// One visible active row.
-///
-/// `id` is `SidebarSession.id`. The builder sets that to `ComposeTabState.id`
-/// and copies it when a snapshot rebuilds depth or thread metadata. It has to
-/// stay the same across those rebuilds, re-parenting, and metadata refreshes.
-/// A new id destroys the SwiftUI row and cancels an in-flight tap.
-struct AgentSidebarRenderedActiveRow: Identifiable {
-    let session: AgentModeViewModel.SidebarSession
-    let showsHeader: Bool
-    let isFirstHeader: Bool
-    let headerTitle: String
-    /// Set on the first row of a sidebar group section; its header is collapsible.
-    var groupName: String?
-    var isGroupCollapsed = false
-    var groupRowCount = 0
-    /// A collapsed group's first row carries only the header.
-    var hidesRow = false
-
-    var id: UUID {
-        session.id
     }
 }
 

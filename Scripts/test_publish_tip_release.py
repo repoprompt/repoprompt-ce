@@ -870,7 +870,7 @@ shutil.copyfile(os.environ["ADMISSION_APPCAST"], args[args.index("--output") + 1
         sections = dict(zip(jobs[1::2], jobs[2::2]))
         setup_header = sections.pop("setup").split("    steps:\n", 1)[0]
         self.assertIn("      eligible: ${{ steps.tip.outputs.eligible }}", setup_header)
-        self.assertEqual(set(sections), {"credential-preflight", "stage", "sign", "smoke-no-secrets", "publish"})
+        self.assertEqual(set(sections), {"credential-preflight", "stage", "sign", "compatibility", "smoke-no-secrets", "publish"})
         for name, section in sections.items():
             with self.subTest(job=name):
                 header = section.split("    steps:\n", 1)[0]

@@ -56,6 +56,7 @@ extension DomainAgentRunSnapshot {
         status: Status,
         statusText: String?,
         latestAssistantPreview: String?,
+        latestAssistantPreviewTotalCharacters: Int? = nil,
         interaction: Interaction?,
         hookGate: HookGate? = nil,
         transcriptItemCount: Int,
@@ -63,7 +64,9 @@ extension DomainAgentRunSnapshot {
         parentSessionID: UUID?,
         failureReason: FailureReason?,
         worktreeBindings: [WorktreeBinding],
-        appActiveWorktreeMerges: [AgentSessionWorktreeMergeSummary]
+        appActiveWorktreeMerges: [AgentSessionWorktreeMergeSummary],
+        worktreeBindingState: WorktreeBindingState? = nil,
+        parentIsWorktreeBound: Bool? = nil
     ) {
         self.init(
             sessionID: sessionID,
@@ -78,6 +81,7 @@ extension DomainAgentRunSnapshot {
             status: status,
             statusText: statusText,
             latestAssistantPreview: latestAssistantPreview,
+            latestAssistantPreviewTotalCharacters: latestAssistantPreviewTotalCharacters,
             interaction: interaction,
             hookGate: hookGate,
             transcriptItemCount: transcriptItemCount,
@@ -102,7 +106,9 @@ extension DomainAgentRunSnapshot {
                     conflictFileCount: $0.conflictFileCount,
                     updatedAt: $0.updatedAt
                 )
-            }
+            },
+            worktreeBindingState: worktreeBindingState,
+            parentIsWorktreeBound: parentIsWorktreeBound
         )
     }
 }
