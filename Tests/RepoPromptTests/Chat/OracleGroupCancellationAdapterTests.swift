@@ -278,7 +278,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             XCTAssertEqual(lanes[0].objectValue?["response"]?.stringValue, "exact current answer")
             XCTAssertEqual(lanes[0].objectValue?["answer_ready"], .bool(true))
             XCTAssertNil(lanes[1].objectValue?["response"])
-            let missing = await window.oracleViewModel.backgroundOracleCompletedResponse(.init(sessionID: primary.sessionID, queryID: UUID(), oracleGeneration: primary.oracleGeneration))
+            let missing = await window.oracleViewModel.backgroundOracleCompletedResponse(.init(sessionID: primary.sessionID, queryID: UUID()))
             XCTAssertNil(missing, "Never substitute the prior assistant answer")
             _ = session.endCurrentRunAttempt(source: "ordinary terminal")
             session.runState = .completed
@@ -435,6 +435,199 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         if let closed { try await store.delete(groupID: closingID, owner: canonicalOwner, expectedRevision: closed.revision) }
     }
 
+    func testBackgroundAnswersSurviveUnrelatedChatDeletion() async throws {
+        try await assertBackgroundCatalogChange(.unrelatedChatDeletion)
+    }
+
+    func testBackgroundAnswersSurviveSameWorkspaceLoad() async throws {
+        try await assertBackgroundCatalogChange(.sameWorkspaceLoad)
+    }
+
+    func testBackgroundWorkspaceSwitchDrainsAcceptedQueries() async throws {
+        try await assertBackgroundCatalogChange(.workspaceSwitch)
+    }
+
+    private enum BackgroundCatalogChange { case unrelatedChatDeletion, sameWorkspaceLoad, workspaceSwitch }
+
+    private func assertBackgroundCatalogChange(_ change: BackgroundCatalogChange) async throws {
+        let fixture = try await AgentRunMCPControlledSessionContext.make(
+            workspaceNamePrefix: "Oracle catalog fence", workspaceSwitchReason: "catalog fence fixture",
+            clientName: "oracle-catalog-fixture", unusedStartRunMessage: "No parent provider"
+        )
+        addTeardownBlock { await fixture.cleanup() }
+        let window = fixture.window, oracle = window.oracleViewModel, session = fixture.session
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspaceID)
+        session.installRunID(UUID())
+        _ = session.beginRunAttempt(source: "oracle-catalog-fixture")
+        session.runState = .running
+        let runID = try XCTUnwrap(session.runID)
+        let registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+        let owner = try OracleBackgroundInvocationRegistry.Owner(
+            workspaceID: workspaceID, binding: XCTUnwrap(session.persistentSessionBindingIdentity)
+        )
+        session.oracleBackgroundOwner = owner
+        addTeardownBlock { @MainActor in
+            await registry.close(owner).value
+            try registry.remove(owner)
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+        }
+        window.apiSettingsViewModel.openAIApiKey = "test-key"
+        window.apiSettingsViewModel.isOpenAIKeyValid = true
+        let unrelated = try await oracle.createSession(named: "Unrelated chat", tabID: session.tabID, activateInUI: false, setActiveForTab: false)
+        let preset = try ModelPreset(name: "Catalog fence roster", modelStrings: [AIModel.gpt54Mini.rawValue, AIModel.gpt54.rawValue])
+        let profile = AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Mini.rawValue)
+        let selection = OracleSelectionSnapshot(
+            origin: .mcp, agentModelsProfile: profile, modelPresets: [preset], modelPresetsExposed: true,
+            modelPresetsTemporarilyDisabled: false, chatPresets: ChatPreset.BuiltIn.all(),
+            defaultChatPresets: [.chat: ChatPreset.BuiltIn.chat, .plan: ChatPreset.BuiltIn.plan, .review: ChatPreset.BuiltIn.review]
+        )
+        let context = OracleViewModel.OracleSendTabContext(
+            tabID: session.tabID, workspaceID: workspaceID, agentModeSessionID: fixture.sessionID,
+            agentModeRunID: runID, activationPolicy: .background,
+            packaging: makeTabContext(workspaceID: workspaceID, tabID: session.tabID).packaging
+        )
+        let dispatched = expectation(description: "both controlled streams dispatched")
+        dispatched.expectedFulfillmentCount = 2
+        let progress = expectation(description: "both lanes committed initial text")
+        progress.expectedFulfillmentCount = 2
+        var streams: [AIModel: AsyncThrowingStream<ChatStreamOutput, Error>.Continuation] = [:]
+        oracle.setOraclePostPackagingTransportOverrideForTesting { _, model in
+            let stream = AsyncThrowingStream<ChatStreamOutput, Error> { streams[model] = $0 }
+            dispatched.fulfill()
+            return (UUID(), stream)
+        }
+        defer { streams.values.forEach { $0.finish() } }
+        let args: [String: Value] = ["message": .string("fixture"), "mode": .string("chat"), "new_chat": .bool(true), "model": .string(preset.name)]
+        let prepared = try await oracle.prepareConfiguredOracleRoster(
+            args: args, promptVM: window.promptManager, tabContext: context, capturedProfile: profile,
+            selectionSnapshotOverride: selection, freezeGroupLanes: true
+        )
+        var retainedJob: OracleBackgroundInvocationRegistry.Job?
+        let reference = try await registry.start(owner: owner, runID: runID, invocationID: UUID(), admissionIsCurrent: { true }) { job in
+            retainedJob = job
+            _ = try await oracle.executePreparedOracleGroup(
+                prepared, args: args, promptVM: window.promptManager, tabContext: context,
+                callbacks: AppOracleGroupExecutionCallbacks(prepared: { _, _, _ in }, progress: { _ in }, laneProgress: { _, text, _ in
+                    if text == "before " { progress.fulfill() }
+                }), backgroundJob: job
+            )
+        }
+        let canonicalOwner = try OracleViewModel.oracleGroupOwner(workspaceID: workspaceID, tabID: session.tabID)
+        addTeardownBlock {
+            let store = AppDomainRuntimeComposition.shared.oracleConversationStore
+            await registry.drainGroup(reference.groupID).value
+            if let saved = try await store.load(groupID: reference.groupID, owner: canonicalOwner) {
+                try await store.delete(groupID: saved.group.id, owner: canonicalOwner, expectedRevision: saved.revision)
+            }
+        }
+        await fulfillment(of: [dispatched], timeout: 3)
+        let primaryStream = try XCTUnwrap(streams[.gpt54Mini])
+        let secondaryStream = try XCTUnwrap(streams[.gpt54])
+        for stream in [primaryStream, secondaryStream] {
+            stream.yield(.init(text: "before ", reasoning: nil, tokens: ChatTokenInfo()))
+        }
+        await fulfillment(of: [progress], timeout: 3)
+        let queries = try XCTUnwrap(registry.snapshot(for: owner).invocations.first?.queries)
+        XCTAssertEqual(queries.count, 2)
+        if change == .workspaceSwitch {
+            let switchProvider = ChatWorkspaceSwitchSessionProvider(workspaceManager: window.workspaceManager, oracleViewModel: oracle)
+            await switchProvider.cancelSwitchSessions()
+            XCTAssertTrue(registry.admissionIsClosed(for: owner))
+            XCTAssertTrue(registry.isDrained(owner), "Workspace cancellation must join the accepted group before replacing its catalog")
+            let saved = try await AppDomainRuntimeComposition.shared.oracleConversationStore.load(groupID: reference.groupID, owner: canonicalOwner)
+            XCTAssertEqual(saved?.turns.last?.state, .terminal)
+            XCTAssertEqual(saved?.turns.last?.results.map(\.status), [.cancelled, .cancelled])
+            var successor = WorkspaceModel(name: "Catalog successor", repoPaths: [])
+            successor.isEphemeral = true
+            successor.composeTabs = [ComposeTabState(id: UUID())]
+            successor.activeComposeTabID = successor.composeTabs[0].id
+            window.workspaceManager.workspaces.append(successor)
+            await window.workspaceManager.switchWorkspace(to: successor, saveState: false, reason: "oracle catalog fixture")
+            XCTAssertEqual(window.workspaceManager.activeWorkspaceID, successor.id)
+            await oracle.loadSessionsFromWorkspace()
+            for query in queries.values {
+                XCTAssertFalse(oracle.backgroundOracleQueryIsCurrent(query))
+                let (outcome, message) = await oracle.backgroundOracleQuerySnapshot(query)
+                XCTAssertNil(outcome)
+                XCTAssertNil(message)
+            }
+            for stream in [primaryStream, secondaryStream] {
+                if case .terminated = stream.yield(.init(text: "late old answer", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed)) {} else {
+                    XCTFail("Workspace cancellation must terminate the old provider iterator")
+                }
+            }
+            XCTAssertFalse(oracle.sessions.contains { queries.values.map(\.sessionID).contains($0.id) })
+            return
+        }
+        let generation = oracle.workspaceChatSessionLoadGenerationForTesting
+        if change == .unrelatedChatDeletion {
+            await oracle.deleteSession(unrelated)
+            XCTAssertFalse(oracle.sessions.contains { $0.id == unrelated.id })
+        } else {
+            await oracle.loadSessionsFromWorkspace()
+        }
+        XCTAssertGreaterThan(oracle.workspaceChatSessionLoadGenerationForTesting, generation)
+        for query in queries.values {
+            XCTAssertEqual(oracle.activeQueryId(for: query.sessionID), query.queryID)
+            XCTAssertTrue(oracle.backgroundOracleQueryIsCurrent(query), "Catalog refresh must not revoke an unrelated exact query")
+        }
+        // Inspect exact messages after the group releases its production pins.
+        let inspectedSessionIDs = queries.values.map(\.sessionID)
+        inspectedSessionIDs.forEach { oracle.pinSession($0) }
+        defer { inspectedSessionIDs.forEach { oracle.unpinSession($0) } }
+        primaryStream.yield(.init(text: "primary answer", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+        secondaryStream.yield(.init(text: "secondary answer", reasoning: nil, tokens: ChatTokenInfo(), terminalOutcome: .completed))
+        primaryStream.finish()
+        secondaryStream.finish()
+        let job = try XCTUnwrap(retainedJob)
+        // Join the producers/finalizers, not the group waiter that the defect can strand.
+        for index in queries.keys.sorted() {
+            await job.joinQueryCleanup(laneIndex: index)
+        }
+        let expected = ["before primary answer", "before secondary answer"]
+        var allFinalized = true
+        for index in queries.keys.sorted() {
+            let query = try XCTUnwrap(queries[index])
+            let message = oracle.messagesSnapshot(for: query.sessionID).first { $0.id == query.queryID }
+            XCTAssertEqual(message?.content, expected[index], "Post-refresh deltas must reach the exact assistant message")
+            XCTAssertEqual(message?.isFinalized, true)
+            let (outcome, _) = await oracle.backgroundOracleQuerySnapshot(query)
+            let completed = outcome == .providerCompleted
+            XCTAssertTrue(completed, "Provider completion must reach strict waiters and collect")
+            allFinalized = allFinalized && completed
+        }
+        let connectionID = UUID()
+        let snapshot = MCPTabContextSnapshot(
+            tabID: session.tabID, windowID: window.windowID, workspaceID: workspaceID, promptText: "",
+            selection: StoredSelection(), selectedMetaPromptIDs: [], tabName: "Catalog fence fixture", runID: runID,
+            activeAgentSessionID: fixture.sessionID, frozenLookupContext: .visibleWorkspace, explicitlyBound: true
+        )
+        let service = MCPOracleToolService(
+            askOracleToolName: "ask_oracle", oracleSendToolName: "oracle_send", oracleChatLogToolName: "oracle_chat_log",
+            promptVM: window.promptManager, oracleVM: oracle, liveRunPurpose: { _ in .agentModeRun },
+            resolveTabContextSnapshot: { _ in .init(snapshot: snapshot) }, requireCurrentTabContext: { _ in snapshot },
+            stabilizedVirtualContext: { $0 }, resolveDelegatedReviewPackaging: { _, _, _, _ in nil },
+            rebindChatSessionIfNeeded: { _, _ in XCTFail("Collect must not rebind") },
+            resolveTabIDForAgentMode: { _, _ in session.tabID }, requireTargetWindow: { window }, rawExplicitTabID: { _ in nil },
+            sendStageProgress: { _, _, _, _ in }, withHeartbeat: { _, _, _, _, operation in try await operation() },
+            sendChat: { _, _, _ in XCTFail("Collect must not dispatch")
+                return [:]
+            }, exportOracleResponse: { _ in throw CancellationError() }
+        )
+        let invocation = ToolInvocationContext.trustedLocal(toolName: "oracle_chat_log", metadata: .init(connectionID: connectionID, clientName: "oracle-catalog-fixture", windowID: window.windowID, invocationID: UUID()))
+        let handle: [String: Value] = ["op": .string("collect"), "oracle_group_id": .string(reference.groupID.rawValue.uuidString), "oracle_turn_id": .string(reference.turnID.rawValue.uuidString)]
+        // Failure inspection must remain non-blocking even when the strict waiter has no outcome.
+        if !allFinalized {
+            let stranded = try await service.executeOracleChatLog(args: handle, invocationContext: invocation)
+            XCTFail("Finished provider work did not settle: \(stranded)")
+            return
+        }
+        try await registry.join(owner: owner, reference: reference)
+        let collected = try await service.executeOracleChatLog(args: handle, invocationContext: invocation)
+        XCTAssertEqual(collected.objectValue?["status"]?.stringValue, "completed")
+        XCTAssertEqual(collected.objectValue?["oracle_results"]?.arrayValue?.compactMap { $0.objectValue?["response"]?.stringValue }, expected)
+    }
+
     func testRegistryHandoffAndRequestCancellation() async throws {
         typealias Registry = OracleBackgroundInvocationRegistry
         for commitFirst in [false, true] {
@@ -479,7 +672,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
                         if schedule == "beforePrepared" { await preparation.wait() }
                         try await job.prepared(document)
                         providerCalls += 1
-                        let identity = Registry.QueryIdentity(sessionID: document.members[0].memberID.rawValue, queryID: UUID(), oracleGeneration: 1)
+                        let identity = Registry.QueryIdentity(sessionID: document.members[0].memberID.rawValue, queryID: UUID())
                         try job.registerQuery(laneIndex: 0, identity: identity, isCurrent: { $0 == identity }, cancel: { _ in })
                         job.recordLaneOutcome(.completed, laneIndex: 0, sequence: 1)
                         job.recordLaneOutcome(.failed, laneIndex: 0, sequence: 2)
@@ -541,7 +734,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             retainedJob = job
             let document = try self.registryPrepared(job)
             try await job.prepared(document)
-            let primary = Registry.QueryIdentity(sessionID: document.members[0].memberID.rawValue, queryID: UUID(), oracleGeneration: 1)
+            let primary = Registry.QueryIdentity(sessionID: document.members[0].memberID.rawValue, queryID: UUID())
             currentPrimary = primary.queryID
             let cancel: @MainActor (Registry.QueryIdentity) async -> Void = { identity in
                 cleanupCalls += 1
@@ -555,7 +748,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             registered.fulfill()
             await provider.wait()
             XCTAssertTrue(job.isCancellationRequested)
-            let secondary = Registry.QueryIdentity(sessionID: document.members[1].memberID.rawValue, queryID: UUID(), oracleGeneration: 1)
+            let secondary = Registry.QueryIdentity(sessionID: document.members[1].memberID.rawValue, queryID: UUID())
             try job.registerQuery(laneIndex: 1, identity: secondary, isCurrent: { $0 == secondary }, cancel: cancel)
             try job.registerQuery(laneIndex: 1, identity: secondary, isCurrent: { _ in true }, cancel: cancel)
             await job.joinQueryCleanup(laneIndex: 0)
@@ -564,7 +757,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         }
         await fulfillment(of: [registered], timeout: 2)
         let successor = UUID()
-        let conflicting = Registry.QueryIdentity(sessionID: reference.members[0].memberID.rawValue, queryID: successor, oracleGeneration: 2)
+        let conflicting = Registry.QueryIdentity(sessionID: reference.members[0].memberID.rawValue, queryID: successor)
         XCTAssertThrowsError(try retainedJob?.registerQuery(laneIndex: 0, identity: conflicting, isCurrent: { _ in true }, cancel: { _ in XCTFail("Query registration must not replace its captured identity") }))
         let runningEpoch = registry.awarenessVersion(for: owner).epoch
         let drain = registry.close(owner)
@@ -608,7 +801,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
         let priorEpoch = registry.snapshot(for: owner).epoch
         try registry.reopen(owner, admissionIsCurrent: { true })
         XCTAssertNotEqual(registry.snapshot(for: owner).epoch, priorEpoch)
-        let stale = Registry.QueryIdentity(sessionID: reference.members[0].memberID.rawValue, queryID: successor, oracleGeneration: 2)
+        let stale = Registry.QueryIdentity(sessionID: reference.members[0].memberID.rawValue, queryID: successor)
         XCTAssertThrowsError(try retainedJob?.registerQuery(laneIndex: 0, identity: stale, isCurrent: { _ in true }, cancel: { _ in XCTFail("Stale job must not cancel a successor") }))
         await registry.close(sameSessionRebound).value
         try registry.remove(sameSessionRebound)
@@ -632,7 +825,7 @@ final class OracleGroupCancellationAdapterTests: XCTestCase {
             job = active
             let document = try self.registryPrepared(active)
             try await active.prepared(document)
-            try active.registerQuery(laneIndex: 0, identity: .init(sessionID: document.members[0].memberID.rawValue, queryID: UUID(), oracleGeneration: 1), isCurrent: { _ in true }, cancel: { _ in })
+            try active.registerQuery(laneIndex: 0, identity: .init(sessionID: document.members[0].memberID.rawValue, queryID: UUID()), isCurrent: { _ in true }, cancel: { _ in })
             entered.fulfill()
             await hold.wait()
             try active.recordPublishedTurn(self.registryTerminal(document))

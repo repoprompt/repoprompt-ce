@@ -125,7 +125,6 @@ final class OracleBackgroundInvocationRegistry {
     struct QueryIdentity: Equatable {
         let sessionID: UUID
         let queryID: UUID
-        let oracleGeneration: UInt64
     }
 
     struct Snapshot {
@@ -171,7 +170,7 @@ final class OracleBackgroundInvocationRegistry {
         }
 
         /// Called from the existing onQueryCreated hook. The capability must target this exact
-        /// query/generation, including revalidation inside any suspension-prone provider cleanup.
+        /// session/query, including revalidation inside any suspension-prone provider cleanup.
         func registerQuery(
             laneIndex: Int,
             identity: QueryIdentity,

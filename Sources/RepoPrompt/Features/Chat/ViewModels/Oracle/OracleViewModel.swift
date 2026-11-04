@@ -1731,12 +1731,12 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func backgroundOracleQueryIdentity(sessionID: UUID, queryID: UUID) -> OracleBackgroundInvocationRegistry.QueryIdentity {
-        .init(sessionID: sessionID, queryID: queryID, oracleGeneration: workspaceChatSessionLoadGeneration)
+        .init(sessionID: sessionID, queryID: queryID)
     }
 
     @MainActor
     func backgroundOracleQueryIsCurrent(_ query: OracleBackgroundInvocationRegistry.QueryIdentity) -> Bool {
-        query.oracleGeneration == workspaceChatSessionLoadGeneration && activeQueryId(for: query.sessionID) == query.queryID
+        activeQueryId(for: query.sessionID) == query.queryID
     }
 
     @MainActor
@@ -3725,8 +3725,7 @@ class OracleViewModel: ObservableObject {
 
     private func canCommitContextBuilderLane(_ scope: ContextBuilderOracleLaneScope?, backgroundQuery: OracleBackgroundInvocationRegistry.QueryIdentity? = nil) -> Bool {
         if let backgroundQuery {
-            guard backgroundQuery.oracleGeneration == workspaceChatSessionLoadGeneration,
-                  runStateBySession[backgroundQuery.sessionID]?.activeQueryId == nil || runStateBySession[backgroundQuery.sessionID]?.activeQueryId == backgroundQuery.queryID,
+            guard runStateBySession[backgroundQuery.sessionID]?.activeQueryId == nil || runStateBySession[backgroundQuery.sessionID]?.activeQueryId == backgroundQuery.queryID,
                   messageStore[backgroundQuery.sessionID]?.contains(where: { $0.id == backgroundQuery.queryID && !$0.isUser }) == true
             else { return false }
         }
