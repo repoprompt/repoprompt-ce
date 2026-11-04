@@ -168,6 +168,51 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
+    func testLocalCompactResumesIdlePersistedThreadWithoutStartingTurn() async throws {
+        let fixture = makeFixture([[.policyRequiredResume]])
+        if let ownership = fixture.session.activeRunOwnership {
+            _ = fixture.session.endRunAttempt(ifCurrent: ownership, source: "cold-local-compact")
+        }
+        fixture.session.runState = .idle
+        fixture.session.codexNeedsReconnect = false
+        addTeardownBlock { @MainActor in
+            let runID = fixture.session.runID
+            await fixture.coordinator.shutdownCodexSession(fixture.session)
+            if let runID, let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
+                await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                    for: clientName, windowID: 1, runID: runID
+                )
+            }
+        }
+        var finished = false
+        let compact = Task {
+            let result = await fixture.coordinator.executeNativeSlashCommand(.compact, argumentsText: "", session: fixture.session)
+            finished = true
+            return result
+        }
+        addTeardownBlock {
+            compact.cancel()
+            _ = await compact.value
+        }
+        try await AsyncTestWait.waitUntil("local compact staged or completed", timeout: 4) {
+            finished || fixture.coordinator.test_hasPendingCodexStart(for: fixture.session)
+        }
+        let controller = try XCTUnwrap(fixture.factory.controllers.last)
+        XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(controller.startedTurnCount, 0)
+        XCTAssertEqual(controller.compactCount, 0)
+        XCTAssertEqual(fixture.session.runState, .idle)
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        let result = await compact.value
+        guard case .succeeded = result else {
+            return XCTFail("Local compact must resume the persisted idle thread: \(result)")
+        }
+        XCTAssertEqual(controller.compactCount, 1)
+        XCTAssertEqual(controller.startedTurnCount, 0)
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        assertOldTuple(fixture.session)
+    }
+
     func testColdCompactionAfterRouteRevocationInstallsPolicyBeforeDiscovery() async throws {
         let fixture = makeFixture([
             [.success(Self.oldThreadID)],

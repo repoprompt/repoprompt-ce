@@ -150,12 +150,23 @@ class CompatibilityWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(match, name)
         return match[1]
 
-    def test_existing_required_integration_includes_older_runtime_job(self):
-        job = self.job("ci-integration-products.yml", "compatibility")
-        self.assertIn("needs: package", job)
+    def test_manual_candidate_qualifies_exact_archive_without_entering_style(self):
+        job = self.job("release-candidate.yml", "compatibility")
+        self.assertIn("needs: artifact", job)
         self.assertIn("uses: ./.github/workflows/macos-compatibility.yml", job)
-        self.assertIn("compatibility-candidate-${{ github.run_id }}-${{ github.run_attempt }}", job)
-        self.assertIn("admission: ${{ inputs.admission }}", job)
+        self.assertIn("artifact-name: ${{ needs.artifact.outputs.artifact-name }}", job)
+        self.assertNotIn("github.run_attempt", job)
+        self.assertIn("tooling-ref: ${{ github.sha }}", job)
+        producer = self.job("release-candidate.yml", "artifact")
+        self.assertIn("ARTIFACT_NAME: RepoPrompt-CE-release-candidate-${{ github.run_id }}-${{ github.run_attempt }}", producer)
+        self.assertIn("artifact-name: ${{ steps.archive-name.outputs.name }}", producer)
+        self.assertIn("name: ${{ steps.archive-name.outputs.name }}", producer)
+        self.assertIn("smoke_packaged_mcp_roundtrip.sh", producer)
+        self.assertIn("if-no-files-found: error", producer)
+        self.assertNotIn("continue-on-error", producer)
+        integration = (ROOT / ".github/workflows/ci-integration-products.yml").read_text()
+        self.assertNotIn("macos-compatibility.yml", integration)
+        self.assertNotIn("release artifact", integration)
         style = self.job("ci.yml", "style")
         self.assertIn("integration-products", style)
         self.assertIn('"$PRODUCTS_RESULT" != success', style)
