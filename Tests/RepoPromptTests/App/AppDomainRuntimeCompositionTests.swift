@@ -400,6 +400,187 @@ final class DebugStateBootstrapTests: XCTestCase {
 }
 
 extension DebugStateBootstrapTests {
+    private func oracleStore(_ locations: AppProfileLocations, interrupt: Bool = false) -> (DomainOracleConversationStore, URL) {
+        let identity = DomainRuntimeIdentity(runtimeID: UUID(), lifecycleGeneration: 1, processID: 42, mode: .standalone, createdAt: Date())
+        let persistence = DomainPersistenceCoordinator(configuration: .init(
+            mode: .standalone, profileIdentifier: locations.profileIdentifier,
+            storageDirectory: locations.applicationSupportRoot,
+            eventDirectory: locations.applicationSupportRoot.appendingPathComponent("Events"),
+            temporaryDirectory: locations.applicationSupportRoot.appendingPathComponent("Temporary"), externalReloadInterval: nil
+        ), identity: identity)
+        return (DomainOracleConversationStore(persistence: persistence, identity: identity, mutationObserver: { phase in
+            if interrupt, case .journalPersisted = phase { throw OraclePersistenceError.invalidDocument("fixture_interruption") }
+        }), persistence.oracleStorageRoot)
+    }
+
+    private func oracleGroup(workspace: UUID, seed: String, context: OracleContextEnvelope? = nil) async throws -> OracleGroupDocument {
+        let model = try OracleModelReference(providerID: "fixture", modelID: "model")
+        let owner = try await OracleViewModel.oracleGroupOwner(workspaceID: workspace, tabID: UUID())
+        let second = try OracleModelReference(providerID: "fixture", modelID: "second")
+        let members = try [model, second].enumerated().map { index, model in
+            try OracleGroupMember(laneID: OracleLaneID(index: index), publicChatID: index == 0 ? seed : seed + "-second", model: model)
+        }
+        let turn = try OracleTurnRecord(input: OracleInput(mode: .chat, userMessage: seed, context: context), state: .prepared, startedAt: Date(timeIntervalSince1970: 1000))
+        return try OracleGroupDocument(
+            group: OracleGroupDescriptor(size: 2),
+            owner: owner,
+            name: seed,
+            revision: 1,
+            createdAt: turn.startedAt,
+            updatedAt: turn.startedAt,
+            roster: OracleRoster(primary: model, additional: [second]),
+            members: members,
+            turns: [turn]
+        )
+    }
+
+    private func retainOracleWorkspace(_ f: Fixture, id: UUID) throws {
+        let workspace = f.debug.workspaceRoot.appendingPathComponent("Workspace-Fixture-" + id.uuidString)
+        try f.writeJSON([["id": id.uuidString, "name": "Fixture"]], f.debug.workspaceRoot.appendingPathComponent("workspacesIndex.json"))
+        try f.writeJSON(["id": id.uuidString, "name": "Fixture", "composeTabs": []], workspace.appendingPathComponent("workspace.json"))
+        let grant = DomainDelegationScopeGrant(id: UUID(), granteeSessionID: UUID(), kind: .workspace(workspaceID: id), capabilities: [.observe], guardrails: .init(), origin: .user, grantedAt: Date())
+        let encoder = JSONEncoder()
+        try f.write(encoder.encode(DelegationScopeDocument(scopes: [grant])), f.debug.applicationSupportRoot.appendingPathComponent("delegationScopes.json"))
+    }
+
+    func testOracleRetentionRecoversCapturedIndexJournalAndReseedsWithoutResurrection() async throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspace = UUID()
+        try retainOracleWorkspace(f, id: workspace)
+        let (release, releaseRoot) = oracleStore(f.release)
+        let (debug, debugRoot) = oracleStore(f.debug, interrupt: true)
+        let retained = try await oracleGroup(workspace: workspace, seed: "debug-member")
+        let deleted = try await oracleGroup(workspace: workspace, seed: "release-deleted")
+        let unrelated = try await oracleGroup(workspace: UUID(), seed: "release-member")
+        try await release.create(deleted)
+        try await release.create(unrelated)
+        do { try await debug.create(retained)
+            XCTFail("Expected interruption")
+        } catch {}
+        let journalDirectory = debugRoot.appendingPathComponent("transactions")
+        let journal = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: journalDirectory, includingPropertiesForKeys: nil).first)
+        let journalBytes = try Data(contentsOf: journal)
+        let releaseIndex = try Data(contentsOf: releaseRoot.appendingPathComponent("index.json"))
+        for iteration in 0 ..< 2 {
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+            let (cold, _) = oracleStore(f.debug)
+            let loaded = try await cold.load(member: .init(publicChatID: "debug-member"), owner: retained.owner)
+            XCTAssertEqual(loaded, retained)
+            let other = try await cold.load(member: .init(publicChatID: "release-member"), owner: unrelated.owner)
+            XCTAssertEqual(other, unrelated)
+            let absent = try await cold.load(member: .init(publicChatID: "release-deleted"), owner: deleted.owner)
+            XCTAssertNil(absent)
+            XCTAssertEqual(try Data(contentsOf: releaseRoot.appendingPathComponent("index.json")), releaseIndex)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+            if iteration == 0 {
+                let archives = try FileManager.default.contentsOfDirectory(at: f.recovery, includingPropertiesForKeys: nil)
+                let relative = DomainPersistenceCoordinator.runtimeDirectoryName(profileIdentifier: f.debug.profileIdentifier) + "/oracle/transactions/" + journal.lastPathComponent
+                XCTAssertTrue(archives.contains { (try? Data(contentsOf: $0.appendingPathComponent(relative))) == journalBytes }, "The original journal survives unchanged in the archived source profile")
+            }
+        }
+        let results = try retained.members.map { member in
+            try OracleLaneResult(laneIndex: member.laneID.index, chatID: member.publicChatID, providerID: member.model.providerID, modelID: member.model.modelID, status: .completed, response: "completed reply")
+        }
+        let preparedTurn = try XCTUnwrap(retained.turns.last)
+        let terminalTurn = OracleTurnRecord(id: preparedTurn.id, input: preparedTurn.input, state: .terminal, startedAt: preparedTurn.startedAt, finishedAt: preparedTurn.startedAt.addingTimeInterval(1), status: .completed, warnings: [], results: results)
+        let terminal = try OracleGroupDocument(group: retained.group, owner: retained.owner, name: retained.name, revision: 2, createdAt: retained.createdAt, updatedAt: preparedTurn.startedAt.addingTimeInterval(1), roster: retained.roster, members: retained.members, turns: [terminalTurn])
+        let (interrupted, _) = oracleStore(f.debug, interrupt: true)
+        do { try await interrupted.save(terminal, expectedRevision: retained.revision)
+            XCTFail("Expected interruption")
+        } catch {}
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let (beforeDeletion, _) = oracleStore(f.debug)
+        let loadedTerminal = try await beforeDeletion.load(groupID: retained.group.id, owner: retained.owner)
+        XCTAssertEqual(loadedTerminal, terminal)
+        try await beforeDeletion.delete(groupID: retained.group.id, owner: retained.owner, expectedRevision: terminal.revision)
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let (cold, _) = oracleStore(f.debug)
+        let absent = try await cold.load(member: .init(publicChatID: "release-deleted"), owner: deleted.owner)
+        XCTAssertNil(absent, "An empty retained debug set must not fall back to release")
+        let deletedGroup = try await cold.load(groupID: retained.group.id, owner: retained.owner)
+        XCTAssertNil(deletedGroup)
+        for member in retained.members {
+            let deletedMember = try await cold.load(member: .init(publicChatID: member.publicChatID), owner: retained.owner)
+            XCTAssertNil(deletedMember)
+        }
+        let survivingRelease = try await cold.load(member: .init(publicChatID: "release-member"), owner: unrelated.owner)
+        XCTAssertEqual(survivingRelease, unrelated)
+    }
+
+    func testOracleRetentionPreservesUnknownGroupFieldsAndReferencedArtifactBytes() async throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspace = UUID()
+        try retainOracleWorkspace(f, id: workspace)
+        let (debug, debugRoot) = oracleStore(f.debug)
+        let artifactBytes = Data("retained frozen context\n".utf8)
+        let artifactID = try await debug.storeArtifact(artifactBytes)
+        let context = OracleContextEnvelope(content: .durableArtifact(id: artifactID), sha256: artifactID)
+        let retained = try await oracleGroup(workspace: workspace, seed: "byte-preservation", context: context)
+        try await debug.create(retained)
+        let groupURL = debugRoot.appendingPathComponent("groups/" + retained.group.id.rawValue.uuidString + ".json")
+        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: groupURL)) as? [String: Any])
+        json["future_retention_fixture"] = "unknown field must survive"
+        let groupBytes = try JSONSerialization.data(withJSONObject: json, options: [.sortedKeys, .prettyPrinted])
+        try groupBytes.write(to: groupURL)
+        let artifactURL = debugRoot.appendingPathComponent("artifacts/" + artifactID + ".blob")
+
+        for _ in 0 ..< 2 {
+            _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+            XCTAssertEqual(try Data(contentsOf: groupURL), groupBytes)
+            XCTAssertEqual(try Data(contentsOf: artifactURL), artifactBytes)
+            let (cold, _) = oracleStore(f.debug)
+            for member in retained.members {
+                let loaded = try await cold.load(member: .init(publicChatID: member.publicChatID), owner: retained.owner)
+                XCTAssertEqual(loaded, retained)
+            }
+        }
+    }
+
+    func testOracleRetentionRetriesOptionalStoreAppearanceButIgnoresTemporaryChurn() throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        try retainOracleWorkspace(f, id: UUID())
+        try FileManager.default.createDirectory(at: f.release.applicationSupportRoot, withIntermediateDirectories: true)
+        let (_, releaseRoot) = oracleStore(f.release)
+        let (_, debugRoot) = oracleStore(f.debug)
+        var captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { _ in
+            captures += 1
+            if captures == 1 { try f.write(Data("future".utf8), releaseRoot.appendingPathComponent("future-metadata")) }
+        }
+        XCTAssertEqual(captures, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: debugRoot.appendingPathComponent("future-metadata").path))
+        captures = 0
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:], retryDelay: 0) { _ in
+            captures += 1
+            try f.write(Data("transient".utf8), releaseRoot.appendingPathComponent(".DS_Store"))
+            try f.write(Data(), releaseRoot.appendingPathComponent("locks/new.lock"))
+        }
+        XCTAssertEqual(captures, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: debugRoot.appendingPathComponent(".DS_Store").path))
+    }
+
+    func testOracleRetentionOmitsOpaqueReleaseFilesAndPreservesDebugBytes() async throws {
+        let f = Fixture()
+        defer { f.cleanup() }
+        let workspace = UUID()
+        try retainOracleWorkspace(f, id: workspace)
+        let (release, releaseRoot) = oracleStore(f.release)
+        let (debug, debugRoot) = oracleStore(f.debug)
+        try await release.create(oracleGroup(workspace: UUID(), seed: "release"))
+        try await debug.create(oracleGroup(workspace: workspace, seed: "debug"))
+        try f.write(Data("release".utf8), releaseRoot.appendingPathComponent("future-metadata"))
+        try f.write(Data("debug".utf8), debugRoot.appendingPathComponent("future-metadata"))
+        _ = try DebugStateBootstrap.seed(locations: f.debug, cleanSlate: false, releasePreferences: [:])
+        let receipt = try Data(contentsOf: f.debug.applicationSupportRoot.appendingPathComponent("debugSeedRetainedContinuity.json"))
+        let report = try XCTUnwrap(JSONSerialization.jsonObject(with: receipt) as? [String: Any])
+        XCTAssertEqual(report["oracleReleaseOmissions"] as? [[String: String]], [["path": "future-metadata", "reason": "opaque_release_file"]])
+        XCTAssertEqual(try Data(contentsOf: releaseRoot.appendingPathComponent("future-metadata")), Data("release".utf8))
+        XCTAssertEqual(try Data(contentsOf: debugRoot.appendingPathComponent("future-metadata")), Data("debug".utf8))
+    }
+
     func testRealLegacyScopesAndOwnershipRetainArchivedCarriersWithoutLinksOrDatabase() throws {
         for kind in ["session", "tree", "workspace", "grantee", "ownership"] {
             let f = Fixture()
@@ -958,7 +1139,7 @@ extension DebugStateBootstrapTests {
     }
 
     func testStartEmptyIsOfferedOnlyWhereAnEmptyProfileCanRecover() {
-        let recoverable: [Error] = [DebugStateSnapshot.Failure.sourceChanged, DebugStateSnapshot.Failure.unsafeFile, DebugStateSnapshot.Failure.database(SQLITE_BUSY), DebugStateSnapshot.Failure.unsupportedWAL]
+        let recoverable: [Error] = [DebugStateSnapshot.Failure.oracleRetention("fixture"), DebugStateSnapshot.Failure.sourceChanged, DebugStateSnapshot.Failure.unsafeFile, DebugStateSnapshot.Failure.database(SQLITE_BUSY), DebugStateSnapshot.Failure.unsupportedWAL]
         let unrecoverable: [Error] = [DebugStateSnapshot.Failure.cancelled, DebugStateSnapshot.Failure.unsafeDestination, DebugProfileAccessLease.Failure.busy, ProfileLocationError.releaseAlias("/fixture")]
         XCTAssertEqual(recoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: true, count: recoverable.count))
         XCTAssertEqual(unrecoverable.map(DebugStateBootstrap.startEmptyCanRecover), Array(repeating: false, count: unrecoverable.count))
