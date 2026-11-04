@@ -142,7 +142,14 @@ final class SparkleUpdaterManager: ObservableObject {
     /// re-anchors the throttle, so a failing feed cannot be hammered on every focus change.
     nonisolated static let activationCheckMinimumInterval: TimeInterval = 60 * 60
 
-    private var lastPassiveCheckAttempt: Date?
+    /// Owns the shared passive-attempt throttle anchor and reserves activation admission
+    /// synchronously, before the check task is enqueued.
+    private lazy var activationCheckCoordinator = SparkleActivationCheckCoordinator { [weak self] in
+        Task { [weak self] in
+            await self?.performPassiveAppcastCheck()
+        }
+    }
+
     private var activationCheckObserverInstalled = false
 
     /// UserDefaults key for last passive appcast check timestamp
@@ -425,7 +432,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     @discardableResult
     private func performPassiveAppcastCheck() async -> Bool {
-        lastPassiveCheckAttempt = Date()
+        activationCheckCoordinator.recordPassiveAttempt(at: Date())
         return await Self.performPassiveAppcastCheck {
             await self.checkAppcastDirectly()
         }
@@ -437,7 +444,7 @@ final class SparkleUpdaterManager: ObservableObject {
     private func setupActivationUpdateCheck() {
         guard !activationCheckObserverInstalled else { return }
         activationCheckObserverInstalled = true
-        lastPassiveCheckAttempt = Date()
+        activationCheckCoordinator.recordPassiveAttempt(at: Date())
         NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in
                 Task { @MainActor [weak self] in
@@ -449,17 +456,17 @@ final class SparkleUpdaterManager: ObservableObject {
 
     /// Respects the passive-check preference, never overlaps an in-flight passive or
     /// user-initiated check, and is throttled to `activationCheckMinimumInterval`.
+    /// Admission is reserved in this turn by the coordinator, so activations that arrive before
+    /// the enqueued check starts cannot also pass the throttle.
     func performActivationUpdateCheckIfNeeded(now: Date = Date()) {
-        guard discoveryEnabled, sparkleConfigurationValid, automaticallyChecksForUpdates else { return }
-        guard appcastCheckState != .checking, userInitiatedObserverState.activeRequest == nil else { return }
-        guard Self.shouldPerformActivationCheck(
-            lastSuccessfulCheckTimestamp: UserDefaults.standard.double(forKey: Self.lastCheckKey),
-            lastAttempt: lastPassiveCheckAttempt,
-            now: now
-        ) else { return }
-        Task {
-            await performPassiveAppcastCheck()
-        }
+        activationCheckCoordinator.activationDidOccur(
+            now: now,
+            eligibility: .init(
+                passiveChecksEnabled: discoveryEnabled && sparkleConfigurationValid && automaticallyChecksForUpdates,
+                checkInFlight: appcastCheckState == .checking || userInitiatedObserverState.activeRequest != nil,
+                lastSuccessfulCheckTimestamp: UserDefaults.standard.double(forKey: Self.lastCheckKey)
+            )
+        )
     }
 
     /// Pure throttle decision for activation re-checks. `lastSuccessfulCheckTimestamp` is the
