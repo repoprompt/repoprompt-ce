@@ -8,11 +8,23 @@ from pathlib import Path
 import re
 import subprocess
 
-# v2 separates integration acceptance from exact-artifact release qualification.
-# Old receipts must not silently acquire a different guarantee.
-PROFILE = 'integration-v2'
+# v3 separates the immutable event from the attempt that produced its build.
+# A partial rerun may consume a successful ancestor, never a different build.
+PROFILE = 'integration-v3'
 METADATA = Path('.build/modularization/admission.json')
 SHA = re.compile(r'^[0-9a-f]{40}$')
+POSITIVE = re.compile(r'^[1-9][0-9]*$')
+RECOVERY = 'Re-run Build and Static Gates (and dependents), or Re-run all jobs; do not bypass Style.'
+
+
+class CandidateMismatch(ValueError):
+    """A deterministic identity/policy failure, not a reason to retry builds."""
+
+
+def positive(value: str) -> int:
+    if not isinstance(value, str) or not POSITIVE.fullmatch(value):
+        raise ValueError('invalid run/attempt identity')
+    return int(value)
 
 
 def git(root: Path, *args: str) -> str:
@@ -23,8 +35,8 @@ def candidate(event_name: str, event: dict, sha: str, ref: str,
               run_id: str, attempt: str, tree: str) -> dict:
     if not all(SHA.fullmatch(value) and value != '0' * 40 for value in (sha, tree)):
         raise ValueError('candidate commit/tree must be full nonzero object IDs')
-    if not run_id.isdecimal() or not attempt.isdecimal() or min(int(run_id), int(attempt)) < 1:
-        raise ValueError('invalid run/attempt identity')
+    positive(run_id)
+    positive(attempt)
     if event_name == 'pull_request':
         base = event['pull_request']['base']['sha']
         if event['pull_request']['base']['ref'] != 'main' or not re.fullmatch(r'refs/pull/[0-9]+/merge', ref):
@@ -43,20 +55,64 @@ def candidate(event_name: str, event: dict, sha: str, ref: str,
         raise ValueError('unsupported admission event/target')
     if not SHA.fullmatch(base) or base == '0' * 40:
         raise ValueError('admission requires a real base commit; no unbounded scan fallback')
-    return {'schema': 1, 'profile': PROFILE, 'event': event_name, 'head': sha, 'base': base,
-            'ref': ref, 'tree': tree, 'run_id': run_id, 'attempt': attempt,
+    return {'schema': 2, 'profile': PROFILE, 'event': event_name, 'head': sha, 'base': base,
+            'ref': ref, 'tree': tree, 'run_id': run_id,
             'timing_policy': 'clean-enforcing', 'products': 'sentry-privacy'}
 
 
 def verify(context: dict, root: Path, run_id: str, attempt: str) -> None:
-    if context.get('schema') != 1 or context.get('profile') != PROFILE:
-        raise ValueError('unknown admission profile')
-    if context.get('run_id') != run_id or context.get('attempt') != attempt:
-        raise ValueError('Partial/failed-jobs-only reruns are unsupported: select Re-run all jobs for a full profile attempt')
+    positive(run_id)
+    positive(attempt)
+    if not isinstance(context, dict) or context.get('schema') != 2 or context.get('profile') != PROFILE:
+        raise CandidateMismatch('unknown admission profile')
+    if context.get('run_id') != run_id or 'attempt' in context:
+        raise CandidateMismatch('candidate run identity mismatch')
     if context.get('timing_policy') != 'clean-enforcing' or context.get('products') != 'sentry-privacy':
-        raise ValueError('incomplete admission policy')
+        raise CandidateMismatch('incomplete admission policy')
     if git(root, 'rev-parse', 'HEAD') != context['head'] or git(root, 'rev-parse', 'HEAD^{tree}') != context['tree']:
-        raise ValueError('admission candidate commit/tree does not match checkout')
+        raise CandidateMismatch('admission candidate commit/tree does not match checkout')
+
+
+def toolchain(root: Path) -> dict:
+    return {name: subprocess.check_output(command, cwd=root, text=True).strip()
+            for name, command in (('swift', ['swift', '--version']), ('xcode', ['xcodebuild', '-version']))}
+
+
+def producer_context(context: dict, attempt: str, versions: dict) -> dict:
+    positive(attempt)
+    result = {'candidate': context, 'attempt': attempt, 'toolchain': versions}
+    verify_producer(result, context, attempt)
+    return result
+
+
+def verify_producer(producer: dict, context: dict, current_attempt: str) -> None:
+    if not isinstance(producer, dict) or producer.get('candidate') != context:
+        raise ValueError('root producer candidate mismatch or missing output')
+    if positive(producer.get('attempt')) > positive(current_attempt):
+        raise ValueError('root producer is from a future attempt')
+    versions = producer.get('toolchain')
+    if (not isinstance(versions, dict) or set(versions) != {'swift', 'xcode'}
+            or any(not isinstance(v, str) or not v.strip() for v in versions.values())):
+        raise ValueError('missing root producer toolchain')
+
+
+def artifact_names(producer: dict) -> dict:
+    suffix = producer['candidate']['run_id'] + '-' + producer['attempt']
+    return {'build_artifact': 'root-build-' + suffix, 'coverage_artifact': 'expected-coverage-' + suffix}
+
+
+def verify_receipt_artifact(name: str, run_id: str, attempt: str, build_attempt: str = '1') -> None:
+    match = re.fullmatch(r'shard-execution-all-([1-9][0-9]*)-([1-9][0-9]*)', name)
+    if not match or match[1] != run_id or not positive(build_attempt) <= positive(match[2]) <= positive(attempt):
+        raise ValueError('missing or wrong run/attempt shard artifact output')
+
+
+def write_outputs(path: Path, values: dict) -> None:
+    if path is None:
+        raise ValueError('command requires --output (GitHub job outputs)')
+    with path.open('a') as output:
+        for key, value in values.items():
+            output.write(key + '=' + (json.dumps(value, sort_keys=True) if isinstance(value, dict) else value) + '\n')
 
 
 def invalidate_build_identity(root: Path) -> None:
@@ -74,8 +130,12 @@ def build_identity(root: Path) -> dict | None:
     identity = json.loads(path.read_text())
     if identity['producer'] != 'build-test-bundles':
         raise ValueError('unexpected root build producer')
-    context = identity['context']
-    verify(context, root, context['run_id'], context['attempt'])
+    producer = identity['context']
+    context = producer['candidate']
+    # Structural/local checkout check only. Hosted consumers also compare this
+    # exact identity with the successful producer's needs output, not itself.
+    verify(context, root, context['run_id'], producer['attempt'])
+    verify_producer(producer, context, producer['attempt'])
     return identity
 
 
@@ -86,9 +146,12 @@ def verify_build_identity(identity: dict, context: dict) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('prepare', 'verify', 'bind', 'invalidate'))
+    parser.add_argument('command', choices=('prepare', 'verify', 'produce', 'select', 'bind', 'invalidate'))
     parser.add_argument('--root', type=Path, default=Path.cwd())
     parser.add_argument('--context', help='explicit immutable candidate JSON; never read GITHUB_* inside conductor')
+    parser.add_argument('--producer-context', help='successful root producer job output')
+    parser.add_argument('--receipt-artifact', help='successful worker job output (required by the final gate)')
+    parser.add_argument('--check-toolchain', action='store_true')
     parser.add_argument('--event-path', type=Path)
     parser.add_argument('--event-name')
     parser.add_argument('--sha')
@@ -105,23 +168,38 @@ def main() -> int:
             # Fail on incomplete history or an unrelated base, rather than scanning a different range.
             subprocess.run(['git', 'merge-base', '--is-ancestor', context['base'], context['head']],
                            cwd=args.root, check=True)
-            if args.output is None:
-                raise ValueError('prepare requires --output (GitHub job outputs)')
-            with args.output.open('a') as output:
-                output.write('context=' + json.dumps(context, sort_keys=True) + '\n')
-                output.write('range=' + context['base'] + '..' + context['head'] + '\n')
+            write_outputs(args.output, {'context': context, 'range': context['base'] + '..' + context['head']})
             print(json.dumps(context, sort_keys=True))
         else:
             context = json.loads(args.context)
             verify(context, args.root, args.run_id, args.attempt)
             if args.command == 'invalidate':
                 invalidate_build_identity(args.root)
-            if args.command == 'bind':
-                path = args.root / METADATA
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps({'producer': 'build-test-bundles', 'context': context}, sort_keys=True) + '\n')
+            if args.command == 'produce':
+                producer = producer_context(context, args.attempt, toolchain(args.root))
+                write_outputs(args.output, {'context': producer, **artifact_names(producer)})
+            if args.command in ('bind', 'select'):
+                producer = json.loads(args.producer_context)
+                verify_producer(producer, context, args.attempt)
+                if args.check_toolchain and producer['toolchain'] != toolchain(args.root):
+                    raise ValueError('toolchain-drift: worker Swift/Xcode differs from the root build')
+                if args.command == 'bind':
+                    if producer['attempt'] != args.attempt:
+                        raise ValueError('cannot bind an earlier producer as a new build')
+                    path = args.root / METADATA
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps({'producer': 'build-test-bundles', 'context': producer}, sort_keys=True) + '\n')
+                else:
+                    outputs = artifact_names(producer)
+                    if args.receipt_artifact is not None:
+                        verify_receipt_artifact(args.receipt_artifact, args.run_id, args.attempt, producer['attempt'])
+                        outputs['receipt_artifact'] = args.receipt_artifact
+                    write_outputs(args.output, outputs)
+                    print(f"Selected root build attempt {producer['attempt']} for consumer attempt {args.attempt}; exact candidate/run and producer-bound receipts required.")
+    except CandidateMismatch as error:
+        parser.exit(1, f'Admission failed: {error}. Inspect the original event/profile and update the PR for the intended candidate; rerunning cannot change its SHA/base.\n')
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
-        parser.exit(1, f'Admission failed: {error}\n')
+        parser.exit(1, f'Admission failed: {error}. {RECOVERY}\n')
     return 0
 
 

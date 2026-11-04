@@ -8,7 +8,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 STEPS = ['git diff --check', 'git diff --cached --check', 'guardrails',
-         'python3 Scripts/test_ci_admission.py', 'python3 Scripts/test_ci_app_test_runner.py',
+         'python3 Scripts/test_ci_admission.py', 'python3 Scripts/test_ci_job_diagnostics.py',
+         'python3 Scripts/test_modularization_tooling.py', 'python3 Scripts/test_ci_app_test_runner.py',
          'python3 Scripts/test_ci_test_coverage.py', 'python3 Scripts/test_ci_resolve_packages.py']
 
 

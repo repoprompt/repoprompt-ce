@@ -97,6 +97,8 @@ class PathSelectionTests(unittest.TestCase):
             (".github/workflows/ci-integration-products.yml", 0),
             ("Scripts/ci_admission.py", 0),
             ("Scripts/ci_status_report.py", 0),
+            ("Scripts/ci_job_diagnostics.py", 0),
+            ("Scripts/test_ci_job_diagnostics.py", 0),
             ("Scripts/test_ci_admission.py", 0),
             ("Scripts/ci_test_coverage.py", 0),
             ("Scripts/test_ci_test_coverage.py", 0),

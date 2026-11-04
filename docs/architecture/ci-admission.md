@@ -3,10 +3,10 @@
 ## Authority and scope
 
 `CI / Style` is the final fail-closed **integration** check, not a formatting-only
-row and not permission to publish a release. The `integration-v2` profile is
+row and not permission to publish a release. The `integration-v3` profile is
 implemented by the existing CI DAG, artifact verifier, and exact-test-coverage
 verifier. `Scripts/ci_admission.py` carries immutable identity/policy, **not** a
-second success registry. Version 1 receipts are rejected rather than relabelled
+second success registry. Version 1/2 receipts are rejected rather than relabelled
 under the changed guarantee.
 
 The same profile runs for PRs targeting `main`, merge queue `checks_requested`,
@@ -70,13 +70,29 @@ GitHub documents the [merge-group SHA/ref event contract](https://docs.github.co
 the [Octokit payload example](https://github.com/octokit/webhooks/blob/main/payload-examples/api.github.com/merge_group/checks_requested.payload.json)
 shows the fully-qualified head/base refs used here.
 
-The profile binds commit, tree, base, ref, event, run ID, and attempt. Every job
-verifies the checked-out commit/tree and current run/attempt explicitly before
-work. Conductor does not need to forward `GITHUB_*` or churn manifest environments.
-The root build packs the binding alongside its existing gate metadata. Each shard
-extends its existing execution receipt with that binding and producer identity;
-Style verifies those against independently downloaded expected coverage. Artifacts
-are named by run **and attempt**. No cross-run/event promotion is supported.
+The immutable candidate binds commit, tree, base, ref, event, run ID and policy.
+It deliberately has no consumer-attempt field. Every executing job verifies its
+checkout and current run. The root producer declares a separate identity before
+running tests: candidate + build attempt + Swift/Xcode versions. It binds that
+identity to the archive only after its gates succeed. Job outputs identify the
+successful producer, not a lookup for the latest available artifact.
+
+Workers verify the producer against the candidate, reject future attempts and
+Swift/Xcode drift, then download that producer's exact run/attempt-named archive.
+Each shard receipt carries the same root producer identity. The worker exports its
+own run/execution-attempt-named receipt artifact. Style first requires all job
+results to be successful, then selects the successful root and worker outputs and
+checks expected metadata and the exact four-shard union against the root identity.
+A new root build plus old worker receipts fails, even for the same commit.
+
+Evidence uploads are immutable (no overwrite), fail if absent, and retained seven
+days. Downloads stay in this workflow run, with exact names and no cross-run token,
+run selector or wildcard search. Missing outputs/artifacts fail closed with rebuild
+instructions. Conductor does not need `GITHUB_*` in its manifest environment.
+
+This is correctness/provenance enforcement, not a security boundary against a PR
+that edits its own workflows/scripts. Trusted-base review, required checks and
+repository policy remain essential; diagnostics never grant merge authority.
 
 Caches are acceleration, not evidence. The root cache contains dependency checkouts
 and provider-package intermediates, not the root products that the enforcing
@@ -127,7 +143,7 @@ The 140-minute job envelope covers four sequential steps plus setup/uploads;
 it is not a relaxed individual-test timeout. All four run/attempt-bound receipts
 are uploaded together and the existing Style verifier still requires their exact
 union. Missing or failed shards cannot pass. This does not change the profile's
-correctness obligations or permit partial reruns.
+correctness obligations. Producer-bound partial reruns are described below.
 
 This trades idle-capacity parallel speed for fewer allocations under contention.
 It does not reduce the number of tests or the clean build/Sentry workload. Compare
@@ -173,14 +189,35 @@ existing `make ci-app-test-runner-selftest` lane.
 
 ### Reruns and cancellation
 
-Use **Re-run all jobs**. Failed-jobs-only and individually rerun jobs are deliberately
-unsupported in v1: they retain an earlier candidate declaration and fail with a
-`Re-run all jobs` instruction. The final aggregate independently checks the attempt,
-so successful prerequisites from another attempt cannot silently satisfy it. This
-is a bounded, explicit whole-profile policy, not unverified earlier-producer reuse.
+For runs created with `integration-v3`, normal **Re-run failed jobs** and
+individual-job reruns are supported. Successful ancestors are reused only through
+their exact producer outputs; the consumer's newer attempt number must not be used
+to invent a build artifact name. A worker rerun re-executes all four shards, while a
+Sentry-only rerun need not rebuild the successful root tests. Style-only retries
+still require all prerequisites and independently verify the original evidence.
 
-Mac job admission rejects stale-attempt declarations before allocating a runner;
-Style retains an explicit full-profile error instead of accepting skipped work.
+| Failure | Recovery |
+|---|---|
+| Source/lint/assertion/coverage failure | Fix the source; update the PR and inspect the new exact integration candidate. Repetition is not a fix. |
+| Confirmed transient network/runner failure | Rerun the failed job/dependents or failed jobs. Inspect the original log before classifying a failure as transient. |
+| Missing/expired archive, dropped output, Swift/Xcode drift | Rerun **Build and Static Gates** and dependents, or all jobs. Do not bypass Style. |
+| Wrong/stale producer receipt | Rebuild and rerun dependents; mixed-build evidence must remain rejected. |
+| Outdated PR base/head or unavailable synthetic merge | Update the PR branch; a rerun uses the original SHA/ref, not current main. |
+| Old `integration-v1/v2` run | Re-run all jobs uses that commit's old policy. To obtain v3 behavior, update the branch and trigger fresh CI. |
+
+GitHub [supports whole/failed/specific-job reruns](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs?tool=cli)
+for 30 days (up to 50 attempts), but our seven-day evidence retention can require a
+rebuild sooner. No automatic retry loop, extra write token or success registry is used.
+
+Each job records failed step IDs and recovery guidance in its **job summary**. The
+final **Style** summary lists every prerequisite before interpreting admission
+outputs, so a missing declaration cannot hide a real upstream failure. Main CI
+explains that unsuccessful integration blocks automatic Tip eligibility; a green
+Style still does not certify a release. These reports use workflow step outcomes,
+not guesses from exit codes about flakiness. Log links lead to the actual assertion,
+compiler, download or infrastructure error. Missing reports (checkout failure,
+runner loss, cancellation) are explicitly unknown, not proof of success. A cancelled
+workflow can prevent even `always()` diagnostics; GitHub's timeline remains needed.
 
 Only obsolete first-attempt PR previews supersede one another. Queue/main runs and
 explicit reruns remain run-scoped; newer pushes do not cancel their evidence.
@@ -217,9 +254,11 @@ evidence-led policy decision. The 200001-file test contract is unchanged here.
    landed main head/tree; compare trees (`git rev-parse <sha>^{tree}`), since commit
    IDs may differ. Confirm both have the full profile's results. Exercise a replaced
    candidate and confirm its old success does not authorize the replacement.
-5. Verify a full-profile rerun succeeds only with the new attempt's products and
-   receipts; a failed-jobs-only rerun must fail explicitly. Confirm a failed/skipped
-   Sentry lane or missing/wrong-attempt receipt cannot produce a green Style.
+5. On a non-production PR, verify a full rerun creates new producer evidence;
+   retry the root worker, Sentry and Style individually and confirm their successful
+   ancestors remain reusable. Retain run/job/attempt/artifact receipts. Confirm a
+   failed/skipped Sentry lane or missing/mixed-build receipt cannot produce green Style.
+   This hosted exercise is required before calling native rerun recovery proven.
 
 [GitHub's queue documentation](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
 requires workflow support for `merge_group` before queue admission can work. If the
@@ -231,11 +270,17 @@ removing the queue/check requirement is not a transparent implementation rollbac
 
 ## Validation
 
-`make ci-app-test-runner-selftest` covers event normalization, wrong tree/run/attempt,
-explicit partial-rerun rejection, stale-cache invalidation, required hosted identity,
+`make ci-workflow-selftest` runs admission, diagnostic and workflow-contract tests
+on Ubuntu before any Mac allocation. It is also part of `make check-fast` and the
+path-selected CI lane. `make ci-app-test-runner-selftest` additionally covers the
+runner/coverage/dependency harness: event normalization, wrong tree/run/producer,
+partial-rerun reuse and mixed-build rejection, stale-cache invalidation, required hosted identity,
 clean/enforcing timing and retained outcomes, and receipt provenance/coverage.
 `make conductor-selftest`, `make guardrails`, and actionlint cover the affected local
 boundaries. The contribution preflight selects the hosted-runner suite for these
 workflow/profile/artifact paths. Real GitHub queue/rerun behavior, universal packaging,
 Sentry linking, and release-workflow macOS packaged smoke still require hosted proof; local Python
 success alone is not equivalent to those checks.
+
+See the [reliability incident and recovery validation](ci-capacity-2026-11-04.md#reliability-incident-and-recovery)
+for the confirmed tooling regression, old partial-rerun dead end and remaining limits.

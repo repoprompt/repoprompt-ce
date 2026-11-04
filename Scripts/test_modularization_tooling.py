@@ -365,34 +365,40 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('needs: [candidate, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
-        self.assertEqual(ci.count('runs-on: macos-26'), 2)  # shared root build + 4 matrix children
+        self.assertEqual(ci.count('runs-on: macos-26'), 2)  # shared root build + one worker (four logical shards)
         products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
         self.assertEqual(products.count('runs-on: macos-26'), 1)  # Sentry/privacy only
         self.assertIn('SentryTelemetryPrivacyTests', products)
         self.assertNotIn('release artifact', products)
         self.assertNotIn('macos-compatibility.yml', products)
         self.assertNotIn('continue-on-error', products)
-        self.assertIn('shard: [1, 2, 3, 4]', ci)
+        worker = ci.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertNotIn('matrix:', worker)
+        for shard in range(1, 5):
+            self.assertIn(f'--shard-count 4 --shard-index {shard} --timeout 1800', worker)
         self.assertNotIn('continue-on-error', ci)
         for line in ci.splitlines():
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
 
-    def test_partial_reruns_are_rejected_before_mac_allocation_and_reported_by_style(self) -> None:
+    def test_partial_reruns_select_successful_producer_outputs_after_prerequisite_report(self) -> None:
         root = SCRIPT_DIR.parent / '.github/workflows'
         ci = (root / 'ci.yml').read_text()
         products = (root / 'ci-integration-products.yml').read_text()
-        for job in ('build-test-bundles', 'build-and-test'):
-            body = ci.split(f'\n  {job}:\n', 1)[1].split('\n    steps:', 1)[0]
-            self.assertIn('if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}', body)
-        for job in ('sentry',):
-            body = products.split(f'\n  {job}:\n', 1)[1].split('\n    steps:', 1)[0]
-            self.assertIn('if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}', body)
-        compatibility = (root / 'macos-compatibility.yml').read_text()
-        self.assertIn("if: ${{ inputs.admission == '' || fromJSON(inputs.admission).attempt == github.run_attempt }}", compatibility)
-        final = ci.split('\n  style:\n', 1)[1]
-        self.assertLess(final.index('name: Require one full-profile attempt'),
-                        final.index('name: Fail if a prerequisite failed or was skipped'))
+        self.assertNotIn('fromJSON(', ci)
+        self.assertNotIn('fromJSON(', products)
+        worker = ci.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertIn('needs.build-test-bundles.outputs.context', worker)
+        self.assertIn('steps.selected.outputs.build_artifact', worker)
+        self.assertIn('--check-toolchain', worker)
+        final = ci.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
+        self.assertLess(final.index('ci_job_diagnostics.py prerequisites'), final.index('ci_admission.py select'))
+        self.assertIn('steps.selected.outputs.coverage_artifact', final)
+        self.assertIn('needs.build-and-test.outputs.receipt_artifact', final)
+        self.assertNotIn('pattern:', final)
+        candidate = ci.split('\n  candidate:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
+        self.assertIn('make ci-workflow-selftest', candidate)
+        self.assertIn('Scripts/test_modularization_tooling.py', (SCRIPT_DIR.parent / 'Makefile').read_text().split('ci-workflow-selftest:', 1)[1].split('\n\n', 1)[0])
 
     def test_supplemental_product_workflows_are_manual_only(self) -> None:
         # Sentry is already blocking; universal qualification belongs to publication
@@ -419,22 +425,28 @@ class CatalogTests(unittest.TestCase):
         self.assertGreaterEqual(job_seconds, step_seconds + 15 * 60,
                                 'Preflight, smoke, and diagnostic upload need time outside the package step')
 
-    def test_style_shell_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
+    def test_style_command_rejects_each_failed_cancelled_or_skipped_obligation(self) -> None:
         import os
         import textwrap
+        import ci_job_diagnostics
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
-        gate = ci.split('      - name: Fail if a prerequisite failed or was skipped', 1)[1]
-        script = textwrap.dedent(gate.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0])
-        keys = ('CANDIDATE_RESULT', 'PRODUCTS_RESULT', 'BUILD_RESULT', 'SHARD_RESULT', 'SECRET_RESULT')
+        gate = ci.split('      - name: Report prerequisites and release eligibility', 1)[1]
+        command = textwrap.dedent(gate.split('        run: |\n', 1)[1].split('\n      - name:', 1)[0])
+        needs = {key: {'result': 'success', 'outputs': {}} for key in ci_job_diagnostics.JOBS}
         with tempfile.TemporaryDirectory() as directory:
-            env = {**os.environ, **dict.fromkeys(keys, 'success'), 'GITHUB_STEP_SUMMARY': directory + '/summary'}
-            self.assertEqual(subprocess.run(['bash', '-c', script], env=env, capture_output=True).returncode, 0)
-            for key in keys:
+            env = {**{k: v for k, v in os.environ.items() if not k.startswith('GITHUB_')}, 'HOME': directory, 'NEEDS_CONTEXT': json.dumps(needs), 'GITHUB_STEP_SUMMARY': directory + '/summary',
+                   'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_REPOSITORY': 'example/repo',
+                   'GITHUB_RUN_ID': '42', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_EVENT_NAME': 'push'}
+            self.assertEqual(subprocess.run(['bash', '-c', command], cwd=SCRIPT_DIR.parent,
+                                           env=env, capture_output=True).returncode, 0)
+            for key in needs:
                 for result in ('failure', 'cancelled', 'skipped'):
                     with self.subTest(obligation=key, result=result):
-                        run = subprocess.run(['bash', '-c', script], env={**env, key: result}, capture_output=True)
+                        changed = {**needs, key: {'result': result}}
+                        run = subprocess.run(['bash', '-c', command], cwd=SCRIPT_DIR.parent,
+                                             env={**env, 'NEEDS_CONTEXT': json.dumps(changed)}, capture_output=True)
                         self.assertNotEqual(run.returncode, 0)
-                        self.assertIn(b'Style is the aggregate gate', run.stdout)
+                        self.assertIn(b'Style is the aggregate', run.stdout)
 
     def test_ci_typecheck_warning_classification(self) -> None:
         warning = '/checkout/Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check'

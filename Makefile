@@ -1,4 +1,4 @@
-.PHONY: check-fast help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest new-module ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: ci-workflow-selftest check-fast help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status codex-acquire codex-status codex-update-candidate resolve build run test guardrails codex-schema-check conductor-selftest new-module ci-app-test-runner-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-clean dev-status dev-build dev-swift-build dev-run dev-launch-existing dev-codex-schema-check dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 CODEX_ARCH ?= all
@@ -168,8 +168,13 @@ conductor-selftest:
 	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
 
-ci-app-test-runner-selftest:
+ci-workflow-selftest:
 	python3 Scripts/test_ci_admission.py
+	python3 Scripts/test_ci_job_diagnostics.py
+	python3 Scripts/test_modularization_tooling.py
+
+ci-app-test-runner-selftest:
+	$(MAKE) ci-workflow-selftest
 	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_ci_test_coverage.py
 	python3 Scripts/test_ci_resolve_packages.py

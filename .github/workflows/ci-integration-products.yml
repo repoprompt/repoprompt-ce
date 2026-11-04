@@ -4,6 +4,10 @@ name: Secret-free Integration Checks
 # older-runtime artifact checks belong to the release workflows, not every PR.
 on:
   workflow_call:
+    outputs:
+      failure:
+        description: Failed Sentry step IDs (diagnostic only)
+        value: ${{ jobs.sentry.outputs.failure }}
     inputs:
       admission:
         type: string
@@ -15,23 +19,27 @@ permissions:
 jobs:
   sentry:
     name: Sentry Build and Privacy
-    if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}
     runs-on: macos-26
     timeout-minutes: 60
     env:
       ADMISSION_CONTEXT: ${{ inputs.admission }}
+    outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
     steps:
       - uses: actions/checkout@v6
+        id: actions-checkout-v6
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
-      - name: Verify exact candidate and full-profile attempt
+      - name: Verify immutable candidate
+        id: verify-immutable-candidate
         run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       # Never restore compiled products/gate metadata here: this lane must build
       # the declared checkout with Sentry enabled, not consume a cached success.
       - name: Restore checksum-verified dependency binaries only
+        id: restore-checksum-verified-dependency-binaries-only
         uses: actions/cache/restore@v6
         with:
           path: |
@@ -42,16 +50,32 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-binaries-v1-${{ hashFiles('Package.resolved', 'Packages/RepoPromptAgentProviders/Package.resolved') }}
 
       - name: Resolve Sentry dependencies
+        id: resolve-sentry-dependencies
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: python3 Scripts/ci_resolve_packages.py
 
       - name: Build app with Sentry linked
+        id: build-app-with-sentry-linked
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./conductor swift-build --product RepoPrompt --full-log
 
       - name: Test serialized Sentry privacy boundary
+        id: test-serialized-sentry-privacy-boundary
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./conductor test --filter SentryTelemetryPrivacyTests --full-log
+
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Checkout unavailable; inspect checkout/runner failure. No CI evidence was accepted.'
+            echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
+          fi
