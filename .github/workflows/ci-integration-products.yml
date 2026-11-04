@@ -14,6 +14,7 @@ permissions:
 jobs:
   sentry:
     name: Sentry Build and Privacy
+    if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -56,6 +57,7 @@ jobs:
 
   package:
     name: Release-mode Package and MCP Smoke
+    if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}
     runs-on: macos-26
     # Conductor bounds universal artifact construction at four hours. Let that
     # deadline report failure and leave time for smoke/diagnostic upload instead
@@ -76,11 +78,31 @@ jobs:
       - name: Configure retained package diagnostics
         run: echo "REPOPROMPT_DEV_DAEMON_STATE_DIR=$RUNNER_TEMP/admission-conductor" >> "$GITHUB_ENV"
 
+      - name: Identify release build cache compatibility
+        id: release-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(python3 Scripts/ci_release_cache.py --sentry 1)"
+          [[ "$key" =~ ^swiftpm-release-v2-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      # Cache only SwiftPM intermediates, never packaged apps or admission evidence.
+      # One immutable main seed per compatible toolchain/policy avoids per-PR churn.
+      - name: Restore universal release build intermediates
+        id: release-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .build/public-release-swiftpm
+          key: ${{ steps.release-toolchain.outputs.key }}
+
       - name: Run release preflight
         run: ./conductor release preflight --full-log
 
       - name: Package secret-free universal ad-hoc release candidate
         timeout-minutes: 245
+        env:
+          REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS: "0"
         run: ./conductor release artifact --full-log
 
       - name: Smoke exact release-mode packaged MCP helper
@@ -91,6 +113,13 @@ jobs:
             ".build/release/RepoPrompt.app" \
             "Admission release-mode package" \
             ".build/release/RepoPrompt-artifact-manifest.json"
+
+      - name: Seed universal release build cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.release-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .build/public-release-swiftpm
+          key: ${{ steps.release-cache.outputs.cache-primary-key }}
 
       - name: Transfer the same candidate to older macOS runners
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
