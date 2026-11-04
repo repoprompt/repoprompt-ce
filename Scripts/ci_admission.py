@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 from pathlib import Path
 import re
 import subprocess
@@ -74,8 +75,9 @@ def verify(context: dict, root: Path, run_id: str, attempt: str) -> None:
 
 
 def toolchain(root: Path) -> dict:
-    return {name: subprocess.check_output(command, cwd=root, text=True).strip()
-            for name, command in (('swift', ['swift', '--version']), ('xcode', ['xcodebuild', '-version']))}
+    versions = {name: subprocess.check_output(command, cwd=root, text=True).strip()
+                for name, command in (('swift', ['swift', '--version']), ('xcode', ['xcodebuild', '-version']))}
+    return {**versions, 'architecture': platform.machine()}
 
 
 def producer_context(context: dict, attempt: str, versions: dict) -> dict:
@@ -91,9 +93,11 @@ def verify_producer(producer: dict, context: dict, current_attempt: str) -> None
     if positive(producer.get('attempt')) > positive(current_attempt):
         raise ValueError('root producer is from a future attempt')
     versions = producer.get('toolchain')
-    if (not isinstance(versions, dict) or set(versions) != {'swift', 'xcode'}
+    if (not isinstance(versions, dict) or set(versions) != {'swift', 'xcode', 'architecture'}
             or any(not isinstance(v, str) or not v.strip() for v in versions.values())):
         raise ValueError('missing root producer toolchain')
+    if versions['architecture'] not in ('arm64', 'x86_64'):
+        raise ValueError('unsupported root producer architecture')
 
 
 def artifact_names(producer: dict) -> dict:
@@ -182,7 +186,7 @@ def main() -> int:
                 producer = json.loads(args.producer_context)
                 verify_producer(producer, context, args.attempt)
                 if args.check_toolchain and producer['toolchain'] != toolchain(args.root):
-                    raise ValueError('toolchain-drift: worker Swift/Xcode differs from the root build')
+                    raise ValueError('toolchain-drift: worker architecture/Swift/Xcode differs from the root build')
                 if args.command == 'bind':
                     if producer['attempt'] != args.attempt:
                         raise ValueError('cannot bind an earlier producer as a new build')

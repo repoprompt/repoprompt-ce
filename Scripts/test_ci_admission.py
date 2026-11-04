@@ -44,6 +44,7 @@ class WorkerSchedulingTests(unittest.TestCase):
         self.assertIn('--shard-count 4 --admission-context', aggregate)
 
 
+
 class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.base, self.head, self.tree = 'a' * 40, 'b' * 40, 'c' * 40
@@ -121,7 +122,7 @@ class CheckoutTests(unittest.TestCase):
         return json.loads(lines['context'])
 
     def producer(self, context, attempt='1'):
-        return admission.producer_context(context, attempt, {'swift': 'Swift fixture', 'xcode': 'Xcode fixture'})
+        return admission.producer_context(context, attempt, {'swift': 'Swift fixture', 'xcode': 'Xcode fixture', 'architecture': 'arm64'})
 
     def test_native_partial_rerun_keeps_candidate_but_selects_actual_producer_attempt(self):
         first = self.context()
@@ -214,6 +215,29 @@ class CheckoutTests(unittest.TestCase):
         self.assertIn('toolchain-drift', errors.getvalue())
         self.assertIn('Re-run Build and Static Gates', errors.getvalue())
         self.assertFalse((self.root / 'selection').exists())
+
+    def test_worker_rejects_other_architecture_even_with_identical_swift_and_xcode(self):
+        context = self.context()
+        producer = self.producer(context)
+        output = self.root / 'selected'
+        argv = ['admission', 'select', '--root', str(self.root), '--run-id', '42', '--attempt', '2',
+                '--context', json.dumps(context), '--producer-context', json.dumps(producer),
+                '--check-toolchain', '--output', str(output)]
+        for architecture, expected in [('arm64', 0), ('x86_64', 1)]:
+            output.unlink(missing_ok=True)
+            installed = {**producer['toolchain'], 'architecture': architecture}
+            with self.subTest(architecture=architecture), mock.patch('sys.argv', argv), \
+                    mock.patch.object(admission, 'toolchain', return_value=installed), \
+                    mock.patch('sys.stderr', new_callable=io.StringIO) as errors:
+                if expected:
+                    with self.assertRaises(SystemExit) as failure:
+                        admission.main()
+                    self.assertEqual(failure.exception.code, expected)
+                    self.assertIn('worker architecture/Swift/Xcode differs', errors.getvalue())
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(admission.main(), 0)
+                    self.assertIn('root-build-42-1', output.read_text())
 
     def test_legacy_release_profile_cannot_be_relabelled_as_current_integration(self):
         context = self.context()
