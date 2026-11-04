@@ -164,6 +164,7 @@ ci-app-test-runner-selftest:
 	python3 Scripts/test_ci_resolve_packages.py
 
 release-selftest:
+	python3 Scripts/test_ci_release_cache.py
 	python3 -B Scripts/test_tip_history.py
 	python3 -B Scripts/test_tip_history_admission.py
 	python3 -B Scripts/test_tip_history_seed.py

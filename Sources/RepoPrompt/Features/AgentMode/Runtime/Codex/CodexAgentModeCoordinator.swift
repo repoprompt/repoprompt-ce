@@ -2645,7 +2645,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexNeedsReconnect = true
         }
         await ensureCodexNativeSession(
-            session: session
+            session: session,
+            allowMissingRolloutFallback: false,
+            forIdleNativeCompact: true
         )
         guard !hasCodexStartupClaim(for: session),
               let controller = session.codexController,

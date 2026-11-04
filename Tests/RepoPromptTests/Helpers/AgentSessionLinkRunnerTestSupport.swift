@@ -156,10 +156,7 @@ final class AgentSessionLinkRunnerHarness {
                 estimateRuntimeTokens: { $0.count },
                 addUserInputTokensToActiveNonCodexTurn: { _, _ in },
                 startNonCodexTurnAccountingIfNeeded: { _, _ in },
-                finalizeNonCodexTurnUsage: { _, _, _, _ in },
-                applyClaudeRuntimeAutoCompactWindow: { tokens, session in
-                    harnessBox?.host.applyClaudeRuntimeAutoCompactWindow(tokens, to: session) ?? false
-                }
+                finalizeNonCodexTurnUsage: { _, _, _, _ in }
             ),
             attachments: .init(
                 reserveAttachmentsForTurn: { _, _ in nil },
@@ -192,6 +189,12 @@ final class AgentSessionLinkRunnerHarness {
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
                 flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) } },
+                beginClaudeProviderOutputSegment: { session in
+                    if replayTranscript {
+                        harnessBox?.host.flushPendingAssistantDelta(session)
+                        harnessBox?.host.endActiveAssistantSegment(session)
+                    }
+                },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(

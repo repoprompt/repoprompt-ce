@@ -1,8 +1,9 @@
 # CI test gate contract
 
-`CI` uses seven macOS jobs total: one **Build and Static Gates** job, four
+`CI` uses nine macOS jobs total: one **Build and Static Gates** job, four
 **Test Root Shard (No Build)** jobs, and the secret-free Sentry/privacy and
-release-mode package/MCP smoke jobs. The exact required check **Style** runs last
+release-mode package/MCP smoke jobs, plus two older-macOS artifact smoke jobs.
+The exact required check **Style** runs last
 on Linux. It depends on the candidate declaration, shared job, all shards,
 Secret Scan, and both integration-product jobs; every prerequisite must succeed
 (failed, skipped, or cancelled is not success).
@@ -24,6 +25,15 @@ CI (main) and Release Candidate remain supplemental workflows with independent
 scheduling. Only obsolete first-attempt PR previews supersede one another in CI;
 queue/main profile runs retain their evidence. There are no test/build retries
 or continue-on-error.
+
+Integration products wait for the root build, all root shards, and secret scan to
+succeed, so rejected candidates do not consume additional macOS capacity. Skipped
+products remain a failing prerequisite for Style. The release job can reuse a
+main-seeded cache of compatible SwiftPM intermediates, but still rebuilds and
+packages the current candidate and executes every smoke check. Root type-check
+measurements remain clean, and the Sentry job's dependency-only cache policy is
+unchanged. See [capacity and scheduling](ci-admission.md#runner-capacity-and-scheduling)
+for the measured backlog and the isolated-run latency tradeoff.
 
 ## Evidence and coverage authority
 
@@ -117,9 +127,10 @@ Remaining limits: caches and retries cannot guarantee GitHub/Sentry availability
 skipped tests are visible exceptions, not proof their assertions ran; raw-log/receipt
 parsing is XCTest-specific and intentionally fails closed if its output format
 changes. Sentry and packaging failures still require maintainer triage, now before
-admission as well as in supplemental main workflows. The complete profile increases
-the macOS runner budget from five to seven jobs; it does not eliminate transport
-failures or timing variance.
+admission as well as in supplemental main workflows. The complete profile uses
+nine macOS jobs, including both older-runtime checks; dependency scheduling and
+release caching do not eliminate transport failures, runner capacity limits, or
+timing variance.
 
 See the [October 23 reliability audit](ci-reliability-2026-10-23.md) for the
 historical failure census, same-commit retry evidence, repairs, and unresolved

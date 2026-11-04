@@ -916,7 +916,7 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
         XCTAssertNil(session.vouchedContextWindow)
 
         for _ in 0 ..< 2 {
-            viewModel.applyClaudeRuntimeAutoCompactWindow(400_000, to: session)
+            viewModel.claudeCoordinator.observeRuntimeInit(.init(sessionID: nil, tools: [], mcpServerStatuses: [:], initializeResponse: nil, autoCompactWindowTokens: 400_000), session: session)
             XCTAssertEqual(session.contextUsageSnapshot?.window, 400_000)
             XCTAssertEqual(session.contextUsageSnapshot?.source, before?.source)
             XCTAssertEqual(session.contextUsageSnapshot?.confidence, before?.confidence)
@@ -925,7 +925,7 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
             XCTAssertNil(session.codexContextUsage?.lastTotalTokens)
             XCTAssertNil(session.vouchedContextWindow, "A recomputed window is not a provider report")
         }
-        XCTAssertFalse(viewModel.applyClaudeRuntimeAutoCompactWindow(400_000, to: session), "An unchanged cap changes nothing")
+        XCTAssertFalse(viewModel.claudeCoordinator.observeRuntimeInit(.init(sessionID: nil, tools: [], mcpServerStatuses: [:], initializeResponse: nil, autoCompactWindowTokens: 400_000), session: session), "An unchanged cap changes nothing")
     }
 }
 
@@ -995,7 +995,7 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
             XCTAssertNil(legacy.contextWindowCapacity)
             XCTAssertEqual(legacy.codexContextUsage?.lastTotalTokens, 180_000, "The legacy cap is not a ceiling")
             XCTAssertEqual(legacy.codexContextUsage?.modelContextWindow, 150_000, "It stays as historical display data")
-            viewModel.applyClaudeRuntimeAutoCompactWindow(nil, to: legacy)
+            viewModel.claudeCoordinator.observeRuntimeInit(.init(sessionID: nil, tools: [], mcpServerStatuses: [:], initializeResponse: nil, autoCompactWindowTokens: nil), session: legacy)
             XCTAssertNil(legacy.codexContextUsage?.modelContextWindow, "An uncapped process does not keep the legacy cap")
             XCTAssertEqual(sidebarWindow(legacy), 200_000, "The sidebar falls back to the model's catalog window")
 
@@ -1011,9 +1011,9 @@ final class ClaudeContextWindowCapLifecycleTests: XCTestCase {
             XCTAssertEqual(current.contextWindowCapacity, capacity)
             XCTAssertEqual(current.selectedModelRaw, model)
             XCTAssertEqual(current.codexContextUsage?.lastTotalTokens, 190_000, "An impossible restored row is rejected")
-            viewModel.applyClaudeRuntimeAutoCompactWindow(160_000, to: current)
+            viewModel.claudeCoordinator.observeRuntimeInit(.init(sessionID: nil, tools: [], mcpServerStatuses: [:], initializeResponse: nil, autoCompactWindowTokens: 160_000), session: current)
             XCTAssertEqual(current.codexContextUsage?.modelContextWindow, 160_000)
-            viewModel.applyClaudeRuntimeAutoCompactWindow(nil, to: current)
+            viewModel.claudeCoordinator.observeRuntimeInit(.init(sessionID: nil, tools: [], mcpServerStatuses: [:], initializeResponse: nil, autoCompactWindowTokens: nil), session: current)
             XCTAssertEqual(current.codexContextUsage?.modelContextWindow, 200_000)
         }
     }

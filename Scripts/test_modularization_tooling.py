@@ -358,7 +358,7 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn('compression-level:', cache_save)
         self.assertNotIn('if-no-files-found:', cache_save)
 
-    def test_required_style_is_final_and_mac_job_budget_is_seven(self) -> None:
+    def test_required_style_is_final_and_full_mac_profile_is_retained(self) -> None:
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]
         self.assertIn('name: Style', final)
@@ -374,6 +374,22 @@ class CatalogTests(unittest.TestCase):
         for line in ci.splitlines():
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
+
+    def test_partial_reruns_are_rejected_before_mac_allocation_and_reported_by_style(self) -> None:
+        root = SCRIPT_DIR.parent / '.github/workflows'
+        ci = (root / 'ci.yml').read_text()
+        products = (root / 'ci-integration-products.yml').read_text()
+        for job in ('build-test-bundles', 'build-and-test'):
+            body = ci.split(f'\n  {job}:\n', 1)[1].split('\n    steps:', 1)[0]
+            self.assertIn('if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}', body)
+        for job in ('sentry', 'package'):
+            body = products.split(f'\n  {job}:\n', 1)[1].split('\n    steps:', 1)[0]
+            self.assertIn('if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}', body)
+        compatibility = (root / 'macos-compatibility.yml').read_text()
+        self.assertIn("if: ${{ inputs.admission == '' || fromJSON(inputs.admission).attempt == github.run_attempt }}", compatibility)
+        final = ci.split('\n  style:\n', 1)[1]
+        self.assertLess(final.index('name: Require one full-profile attempt'),
+                        final.index('name: Fail if a prerequisite failed or was skipped'))
 
     def test_supplemental_product_workflows_are_manual_only(self) -> None:
         # The integration profile above already gates both products. Automatic

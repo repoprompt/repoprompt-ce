@@ -28,9 +28,6 @@ extension AgentModeRunService {
         let addUserInputTokensToActiveNonCodexTurn: (Int, AgentTabSession) -> Void
         let startNonCodexTurnAccountingIfNeeded: (AgentTabSession, String) -> Void
         let finalizeNonCodexTurnUsage: (AgentTabSession, Int?, Int?, Int?) -> Void
-        /// Records the auto-compact window a Claude-native process reported in its runtime init and
-        /// recomputes only the effective window. Returns whether the displayed window changed.
-        let applyClaudeRuntimeAutoCompactWindow: (Int?, AgentTabSession) -> Bool
     }
 
     /// Attachment file lifecycle for one turn (reserve → consume → finalize).
@@ -103,6 +100,7 @@ extension AgentModeRunService {
         let finalizePendingToolCalls: (AgentTabSession, AgentSessionRunState) -> Void
         let finalizePendingToolCallsWithUpperBound: (AgentTabSession, AgentSessionRunState, Int?) -> Void
         let flushPendingAssistantDelta: (AgentTabSession) -> Void
+        let beginClaudeProviderOutputSegment: (AgentTabSession) -> Void
         let clearPendingAssistantDelta: (AgentTabSession) -> Void
     }
 
@@ -261,9 +259,10 @@ extension AgentModeRunService {
         let terminalSettlement: TerminalSettlementHooks
         let continuation: RunContinuationHooks
         /// Host-owned synchronous deferred-work cleanup, before the terminal shortcut.
+        /// Returns the exact withdrawn provider cleanup for teardown-completed cancellation.
         var prepareForCancellation: (
             AgentTabSession, DomainAgentRunCancellationIntent, AgentModeRunService.CancellationOrigin
-        ) -> Void = { _, _, _ in }
+        ) -> (@MainActor () async -> Void)? = { _, _, _ in nil }
     }
 }
 

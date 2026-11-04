@@ -8,7 +8,7 @@ verifier, and exact-test-coverage verifier. `Scripts/ci_admission.py` carries on
 immutable identity/policy, **not** a second success registry.
 
 The same profile runs for PRs targeting `main`, merge queue `checks_requested`,
-and main pushes. Every candidate runs all obligations (no path-based exemptions):
+and main pushes. Successful admission requires all obligations (no path-based exemptions):
 
 - existing static/style/secret/import/index gates, provider and module parity tests;
 - one clean root test build with the existing enforcing type-check budgets;
@@ -24,6 +24,10 @@ no inherited secrets and read-only contents permission. They are prerequisites o
 Style. Signing identities, notarization, Sentry publication, releases, tags, and
 promotion remain independent credentialed workflows. This check does not establish
 notarization, Computer Use release compatibility, or a distributable artifact.
+The product workflow starts only after the root build/static gates, all four root
+shards, and secret scan succeed. A rejected candidate therefore cannot occupy
+macOS runners with Sentry or universal packaging; skipped products still make
+Style fail. This changes scheduling, not which checks a successful candidate needs.
 The older-runtime matrix uses the oldest available hosted macOS generation.
 It does not claim macOS 14 coverage after that hosted image's retirement; see
 [the manual macOS 14 validation path](../releasing.md#older-macos-artifact-compatibility).
@@ -65,13 +69,61 @@ extends its existing execution receipt with that binding and producer identity;
 Style verifies those against independently downloaded expected coverage. Artifacts
 are named by run **and attempt**. No cross-run/event promotion is supported.
 
-Caches are acceleration, not evidence. Root cache restoration explicitly invalidates
+Caches are acceleration, not evidence. The root cache contains dependency checkouts
+and provider-package intermediates, not the root products that the enforcing
+clean build discards. One exact toolchain/policy-compatible main
+seed replaces per-commit multi-GB snapshots. Root cache restoration explicitly invalidates
 old admission identity before selftests/builds. The build helper also invalidates
 identity and timing data before a clean/rebuild, including failed cleans. A fresh
 binding is written only after all producer gates pass. Hosted pack/shard/aggregate
 boundaries require that binding; only non-hosted/local callers may omit it.
 The Sentry lane restores checksum-verified dependency binaries only, never compiled
 app products or gate metadata.
+
+The release package lane separately restores `.build/public-release-swiftpm`,
+including both architecture-specific SwiftPM intermediates. Its exact cache key
+includes the runner OS/architecture, Xcode/Swift/SDK/image/workspace identity,
+package manifests and pins, release build policy, and dependency patch contents.
+There is no fallback across those boundaries. Only a successful main-push package
+and packaged-helper smoke can seed the cache. One immutable seed per compatible
+key avoids creating a large cache for every PR or commit; PRs and merge groups
+only restore it. Eviction or a toolchain/policy change produces a cold build.
+
+Admission packaging explicitly sets `REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS=0`
+through conductor's per-request environment. SwiftPM still builds both products
+for both architectures on every attempt, even on an exact cache hit. Packaging
+recreates the app, manifest, and archive and reruns architecture/resource checks,
+the packaged MCP smoke, and older-runtime smoke. Assembled apps, `dist`, and root
+admission/coverage receipts are outside the cache. Official Tip and stable release
+staging remain clean: compiled-cache reuse in subsequently signed artifacts needs
+separate integrity and stale-resource validation. Local release commands also
+retain their default clean build behavior. A cache hit is never accepted as test,
+build, or admission evidence.
+
+## Runner capacity and scheduling
+
+The November 3 backlog investigation found 32 queued macOS jobs and five running;
+three running jobs were universal release packages. In
+[run 41332992580](https://github.com/repoprompt/repoprompt-ce/actions/runs/41332992580),
+the root producer waited 325 minutes for a runner and then executed in 38 minutes.
+In [run 41419660951](https://github.com/repoprompt/repoprompt-ce/actions/runs/41419660951),
+universal packaging occupied a runner for 152 minutes. These are observed examples,
+not runtime budgets or speedup guarantees. GitHub's
+[macOS concurrency limits](https://docs.github.com/en/actions/reference/limits)
+apply across standard and larger hosted macOS runners; changing the image label
+does not increase that account allowance. Physical runner availability is a
+separate constraint: a provider capacity failure is not a compiler failure.
+
+Delaying integration products avoids spending that capacity on candidates whose
+root checks already fail. For example,
+[run 41407861568](https://github.com/repoprompt/repoprompt-ce/actions/runs/41407861568)
+continued packaging for 126 minutes after its compiler-index gate failed.
+Serial admission increases the critical path for an isolated successful cold run;
+it reduces work and contention when many candidates or rejected runs are queued.
+The main-seeded release cache targets repeated compilation independently. Its
+benefit must be measured on a compatible hosted cache hit, not inferred from local
+tests. `Publish Tip` also resolves its candidate on Ubuntu so Git/Python-only
+eligibility work does not wait for or consume a macOS slot.
 
 ### Reruns and cancellation
 
@@ -81,9 +133,13 @@ unsupported in v1: they retain an earlier candidate declaration and fail with a
 so successful prerequisites from another attempt cannot silently satisfy it. This
 is a bounded, explicit whole-profile policy, not unverified earlier-producer reuse.
 
+Mac job admission rejects stale-attempt declarations before allocating a runner;
+Style retains an explicit full-profile error instead of accepting skipped work.
+
 Only obsolete first-attempt PR previews supersede one another. Queue/main runs and
-explicit reruns are run-scoped; newer pushes do not cancel their evidence. Any
-failed, cancelled, skipped, or missing required obligation prevents Style success.
+explicit reruns remain run-scoped; newer pushes do not cancel their evidence.
+Whole-main-run coalescing would skip push-range secret scans and is not used.
+Any failed, cancelled, skipped, or missing required obligation prevents Style success.
 A removed/replaced queue candidate cannot authorize a different candidate.
 
 ## Timing policy
