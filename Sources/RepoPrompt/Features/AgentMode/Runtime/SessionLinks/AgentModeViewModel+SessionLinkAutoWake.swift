@@ -1351,9 +1351,12 @@ extension AgentModeViewModel {
             cancelAgentSessionLinkAutoWake(for: endpoint, reason: .requiredClaimUnavailable)
             return
         }
-        guard agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID) else {
-            return
-        }
+        // This continuation carries the wake, not the handover already owned by its active run.
+        // Preserve that bound handover proof while acquiring the wake through its own fence.
+        let acquired = switchInFlightOnActiveRun
+            ? agentSessionLinkAcquireAutoWakePhysicalDispatch(for: session, dispatchID: claim.dispatchID)
+            : agentSessionLinkAcquirePhysicalDispatch(for: session, dispatchID: claim.dispatchID)
+        guard acquired else { return }
         // The continuation is also a physical acceptance boundary. Carry the note first, just as
         // native/ACP provider sends do; never consume either receipt before the resume succeeds.
         let carry = AgentSelfCompactParkedPrefix.prepare(claim.fragment, session: session) {}
