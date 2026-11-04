@@ -49,9 +49,11 @@ import XCTest
             let settings = GlobalSettingsStore.shared
             let previousPrimary = settings.planningModelRaw()
             let previousAdditional = settings.additionalOracleModelRaws()
+            let previousSync = settings.syncChatModelWithOracle()
             defer {
                 settings.setPlanningModelRaw(previousPrimary, commit: false)
                 try? settings.setAdditionalOracleModelRaws(previousAdditional, commit: false)
+                settings.setSyncChatModelWithOracle(previousSync, commit: false)
             }
             let knownAdditional = AIModel.gpt54.rawValue
             settings.setPlanningModelRaw(knownAdditional, commit: false)
@@ -74,12 +76,14 @@ import XCTest
             let previousDisabled = settings.mcpTemporarilyDisablePresets()
             let previousPrimary = settings.planningModelRaw()
             let previousAdditional = settings.additionalOracleModelRaws()
+            let previousSync = settings.syncChatModelWithOracle()
             defer {
                 ModelPresetsManager.shared.presets = previousPresets
                 settings.setMCPShowModelPresets(previousExposure, commit: false)
                 settings.setMCPTemporarilyDisablePresets(previousDisabled, commit: false)
                 settings.setPlanningModelRaw(previousPrimary, commit: false)
                 try? settings.setAdditionalOracleModelRaws(previousAdditional, commit: false)
+                settings.setSyncChatModelWithOracle(previousSync, commit: false)
             }
             let preset = try ModelPreset(name: "Preset selectors", models: [.gpt54Mini, .gpt54])
             ModelPresetsManager.shared.presets = [preset]
