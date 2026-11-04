@@ -145,7 +145,7 @@ struct AgentSessionLinkPassiveStatusNotices {
         var isRoutineWakeEligible: Bool {
             let freshIdle = toStatus == .idle && runFacts != nil
             let unpaid = ordinaryThrough.map { ordinary in
-                deliveredThroughAtSnapshot.map { ordinary > $0 } ?? false
+                deliveredThroughAtSnapshot.map { ordinary > $0 } ?? true
             } ?? false
             if freshIdle, let runFacts, let openingSettledThrough,
                runFacts.settledThrough > openingSettledThrough,
@@ -816,21 +816,27 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
             if let incoming = sample.runFacts, let delivered = deliveredRunThrough[reference]?.through,
                incoming.settledThrough < delivered { sample.runFacts = nil }
+            let priorStatus = preceding?.status == .unavailable ? sample.status : preceding?.status ?? sample.status
+            let statusChanged = priorStatus != sample.status
+            let immediateEdge = PendingEntry.isStatusEdge(from: priorStatus, to: sample.status)
+            let oldEntry = pendingByReference[reference]
             let known = sample.runFacts ?? preceding?.lastKnownRunFacts
+            // First proof baselines a fresh lane, never an already-observed unpaid status edge.
             let isBaseline = deliveredRunThrough[reference]?.through == nil && sample.runFacts != nil
+                && oldEntry == nil && !immediateEdge
             if isBaseline {
                 deliveredRunThrough[reference]?.through = sample.runFacts?.settledThrough
             }
             let delivered = deliveredRunThrough[reference]?.through
-            let owesCoverage = known.map { facts in delivered.map { facts.ordinaryThrough > $0 } ?? false } ?? false
+            let owesCoverage = known.map { facts in
+                delivered.map { facts.ordinaryThrough > $0 } ?? (oldEntry != nil || immediateEdge)
+            } ?? false
             let overflowDisclosed = deliveredRunThrough[reference]?.overflowDisclosedOrdinaryThrough
             let owesUndisclosedCoverage = owesCoverage
                 && known.map { facts in overflowDisclosed.map { facts.ordinaryThrough > $0 } ?? true } ?? false
             let freshIdleDebt = sample.status == .idle && sample.runFacts != nil && owesCoverage
             let newOrdinary = sample.runFacts.map { $0.ordinaryThrough > (preceding?.lastKnownRunFacts?.ordinaryThrough ?? 0) } ?? false
             let reacquired = sample.runFacts != nil && preceding?.sample.runFacts == nil
-            let priorStatus = preceding?.status == .unavailable ? sample.status : preceding?.status ?? sample.status
-            let statusChanged = priorStatus != sample.status
             changed = changed || statusChanged
             let quietInterval: Bool = if let opening = preceding?.sample.runFacts, let closing = sample.runFacts {
                 closing.settledThrough > opening.settledThrough
@@ -838,7 +844,6 @@ struct AgentSessionLinkPassiveStatusNotices {
             } else {
                 false
             }
-            let oldEntry = pendingByReference[reference]
             lastObservedStatus[reference] = Observation(
                 sample: sample, observedAt: observedAt, lastKnownRunFacts: known
             )
@@ -848,9 +853,8 @@ struct AgentSessionLinkPassiveStatusNotices {
             }
             // A first observation is a silent baseline, but a surviving position returning from an
             // unavailable/proof gap must recover owed work BEFORE same-status early return.
-            let recoverDebt = freshIdleDebt && !isBaseline && (newOrdinary || reacquired)
+            let recoverDebt = freshIdleDebt && owesUndisclosedCoverage && !isBaseline && (newOrdinary || reacquired)
             if preceding == nil && !recoverDebt { continue }
-            let immediateEdge = PendingEntry.isStatusEdge(from: priorStatus, to: sample.status)
             let quietClose = sample.status == .idle && quietInterval
             var origin = oldEntry?.fromStatus ?? priorStatus
             if sample.status == .waiting, statusChanged, let oldEntry, !oldEntry.isStatusEdge {
@@ -881,22 +885,38 @@ struct AgentSessionLinkPassiveStatusNotices {
                 // origin. Quiet refresh/coalescing preserves the old occurrence's boundary.
                 preceding?.sample.runFacts?.settledThrough
             } else {
-                oldEntry?.openingSettledThrough
+                // Positive quiet evidence can supply an unknown occurrence opening, without
+                // replacing an earlier known boundary or acknowledging the pending ordinary work.
+                oldEntry?.openingSettledThrough ?? (quietClose ? preceding?.sample.runFacts?.settledThrough : nil)
             }
             if quietClose, let oldEntry { origin = oldEntry.fromStatus }
+            // A facts-only refresh cannot turn the same positively paid idle occurrence into a
+            // new status debt. A real intervening edge still follows the ordinary path above.
+            if !statusChanged, sample.status == .idle, !owesCoverage,
+               let oldEntry, oldEntry.hasSameFinalMetadata(as: sample),
+               oldEntry.runFacts != sample.runFacts, let closing = oldEntry.runFacts,
+               let opening = oldEntry.openingSettledThrough, closing.settledThrough > opening,
+               let delivered, closing.ordinaryThrough <= delivered
+            {
+                origin = .idle
+            }
             let ordinary = known?.ordinaryThrough ?? oldEntry?.ordinaryThrough
             if let oldEntry, !statusChanged, !advancesEdge,
                oldEntry.hasSameFinalMetadata(as: sample), oldEntry.runFacts == sample.runFacts,
                oldEntry.receiptSettledThrough == cutoff,
                oldEntry.ordinaryThrough == ordinary, oldEntry.openingSettledThrough == opening
             { continue }
+            // Losing only proof freshness does not change the status the frozen receipt rendered.
+            // Keep that receipt applicable; real edges and visible metadata changes still advance it.
+            let preservesStatusReceipt = !statusChanged && !advancesEdge && sample.runFacts == nil
+                && oldEntry?.hasSameFinalMetadata(as: sample) == true
             nextChangeSequence += 1
             pendingByReference[reference] = PendingEntry(
                 reference: reference, targetEndpoint: sample.targetEndpoint, targetSessionID: sample.targetSessionID,
                 displayName: sample.displayName, fromStatus: origin, toStatus: sample.status,
                 observedAt: observedAt, idleForSend: sample.idleForSend, idleSince: sample.idleSince,
                 waitingOn: sample.waitingOn, latestVisibleAssistantPreview: sample.latestVisibleAssistantPreview,
-                changeSequence: nextChangeSequence,
+                changeSequence: preservesStatusReceipt ? oldEntry?.changeSequence ?? nextChangeSequence : nextChangeSequence,
                 edgeSequence: advancesEdge ? nextChangeSequence : oldEntry?.edgeSequence ?? nextChangeSequence,
                 runFacts: sample.runFacts, receiptSettledThrough: cutoff,
                 ordinaryThrough: ordinary, openingSettledThrough: opening
@@ -991,7 +1011,8 @@ struct AgentSessionLinkPassiveStatusNotices {
         // Each receipt names only rendered rows; a newer partial receipt may omit these statuses.
         for delivered in receipt.deliveredStatuses {
             guard var position = deliveredRunThrough[delivered.reference], position.target == delivered.targetEndpoint else { continue }
-            if let cutoff = delivered.settledThrough, let through = position.through, cutoff > through {
+            // An actual rendered receipt may establish an unknown position; proof alone cannot.
+            if let cutoff = delivered.settledThrough, position.through.map({ cutoff > $0 }) ?? true {
                 position.through = cutoff
                 deliveredRunThrough[delivered.reference] = position
                 changed = true

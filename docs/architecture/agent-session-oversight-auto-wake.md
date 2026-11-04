@@ -116,8 +116,9 @@ ascending as a deterministic tie-break). The runtime caches the per-grantee proj
 decoding all history on every status/render. Only this 16-item projection is bounded: the backing
 `scopeEndings` map and persisted terminal rows remain unbounded; retention pruning is deferred.
 Restore-time drops in `recoverContinuity` and `reactivate` (deleted sessions, orphan grants, invalid
-children) still record no ending evidence. Passive expiry projection can also hide a grant before
-lazy expiry materializes its ending. These are remaining observability gaps, not explained endings.
+children) still record no ending evidence. These are remaining observability gaps, not explained
+endings. A scope-owner deadline now materializes live expiry without a later query; authority checks
+still enforce wall-clock expiry independently if deadline execution is delayed.
 `record(id:)` remains authority-only; only status uses
 `statusRecord(id:)` to project persisted history. MCP status remains caller-owned; knowing another
 scope UUID does not authorize reading its historical details. Scope status also reports continuity
@@ -216,6 +217,9 @@ Rules that hold the scope design together:
 - **Cards bind arguments.** A batch card is bound to the scope generation, operation, item set,
   idempotency key, and a canonical digest of the call's other arguments. Changed arguments under
   the same key conflict instead of riding the approval, and an approval applies once.
+  Worktree-release rows also freeze the selected worktree IDs: a changed selection refuses before
+  application, and the host's mutation predicate fences the complete starting binding set across
+  suspensions. An explicit `worktree_id` card shows only that selected effect.
 - **Scopes are keyed by session, not by incarnation.** Unlike link grants, a scope is durable and is
   granted to a session UUID, so every live incarnation of that session (for example the same session
   open in two windows) holds it. The caller is still resolved only from exact server-owned run
@@ -271,7 +275,9 @@ Rules that hold the scope design together:
   claimed with `beginApplying` and settled with `finishApplying`, including when unticking brought
   the batch to or below the threshold, so a successful application always ends `applied` and a
   failed one (a thrown error, or a handler result that refuses the whole batch with a top-level
-  `denied`) returns the card to `approved`. Per-item refusals inside an applied batch consume it. Undo tokens are
+  `denied`) returns the card to `approved`. A wholly refused `worktree_release` (`not_applied`)
+  likewise keeps its approval for retry. Retire retains its existing single-use no-op and partial
+  receipt contract. Per-item refusals inside an applied or partially applied batch consume it. Undo tokens are
   re-authorized as the original operation over the original targets at redemption.
 
 Structural operations (Milestone 1, Lane C) keep those rules. They register through the same front
@@ -933,16 +939,29 @@ below, but it still cannot enqueue, authorize, or alter the Auto-wake itself.
 Quietness and delivery have different owners. `AgentTabSession` owns one exact run-attempt ledger.
 A normal drained terminal barrier seals the finished range synchronously, after its second ownership
 check and before teardown. A positively routine first physical dispatch may be quiet only when no
-accepted task input, tool, interaction, recovery, uncertainty, incomplete range, or queued successor
-occurred. Finished assistant messages may be silent or exactly `[ack]` (ASCII padding/case and one
-trailing full stop); plain `ack` is ordinary. Acceptance is not required to seal, and completion
-notifications are unchanged. Unsupported providers, natural/manual/periodic/waiting/control work,
+accepted task input, other tool, interaction, recovery, uncertainty, incomplete range, or queued successor
+occurred. Exactly one accepted same-run `self_noop` declaration and its successfully completed,
+identity-correlated canonical result are required. Leading assistant output is ordinary; text-only
+closing output after the declaration need not use a keyword. Silence, `[ack]` and all other magic
+replies without that declaration remain ordinary. Completion notifications are unchanged. Unsupported providers, natural/manual/periodic/waiting/control work,
 watchdog completion, and replay onto a new owner are ordinary.
 
-The single frozen `routineQuietCheckIn` claim/render Boolean records initial idle-follow-up routine
-qualification, including Codex. Actual rendered attention makes it false. Only qualified Claude Code
-gets `Nothing needed? Reply [ack].` in that dispatch's lane guidance, inside the existing 24 KiB
-budget and deterministic subset selection. Codex gets no sentence. Devin's classification and copy
+The owed batch is reserved early; the existing attempt retains its original idle-follow-up candidacy,
+not frozen quiet qualification. After provider preparation, the prompt owner finalizes the claim/render
+`routineQuietCheckIn` Boolean from an actual returned definition for the same run, observer incarnation,
+connection and lifecycle, plus the ordinary-occurrence veto, before physical input. Current route
+authorization remains required. The returned offer keeps its original routing-generation token. It may
+survive a generation renewal only while the advertisement inputs are unchanged: the manager checks
+producer revisions, registry and membership revisions, semantic policy identities, and captured consent
+expiry. An absent or invalidated observation cannot be restored from expected definitions. A material
+change followed by reversal still needs a fresh actual list.
+Qualification may upgrade only before acquisition and may still be removed until release. Missing,
+withdrawn, ambiguous, stale or after-send evidence cannot qualify; there is no added wait or relist.
+Actual rendered attention makes it false. Qualified Claude Code and Codex get
+`Nothing needed? Call self_noop.` in that dispatch's lane guidance only with that proof,
+inside the existing 24 KiB budget and deterministic subset selection; adding the hint cannot replace
+the reserved receipt.
+Devin's classification and copy
 remain disabled together until its raw negative-evidence qualification closes. No standing guidance
 revision, autonomy rule, public field, provider protocol, or saved state changes.
 
@@ -987,10 +1006,7 @@ pay an older already-frozen cutoff, not a newer cache value.
 
 The sixteen-row bound and attention queue are unchanged. Eviction represents debt in existing
 anonymous overflow, never pays a target; overflow acceptance acknowledges only its own watermark.
-Unchanged evicted ordinary coverage is not repeatedly re-enqueued/overflowed, including across
-quiet running/idle cycles: the lane's delivered position records the ordinary watermark its eviction
-already disclosed as overflow, and a quiet close re-represents only coverage beyond it. That record
-never pays; a late exact receipt still pays its frozen cutoff. A new ordinary
+Unchanged evicted ordinary coverage is not repeatedly re-enqueued/overflowed. A new ordinary
 watermark or real new edge changes failure identity; quiet refresh/rebase does not. The existing
 single failure slot holds fingerprint plus producer wake identity. A late W1 may append its canonical
 marker and pay its frozen receipt, but only W2 can clear W2's suppression, even for identical shapes.
@@ -999,9 +1015,10 @@ These are not durable notification or quiet-result fields. Temporary target unre
 exact delivered position and resumes at fresh proof; observer ineligibility, Read retirement, unlink,
 and endpoint replacement still retire their queues/claims. Cold restart restores existing intent and
 preferences through the ordinary readiness/durability owners, but creates fresh grants and baselines:
-no quiet verdict, delivered position, in-flight wake, suppression, or callback is restored, and no
-history catch-up is invented. Losing live verdict proof makes canonical rows visible again; it does
-not lose saved link intent. Local display masking is a separate projection boundary; canonical rows,
+no live ledger verdict, delivered position, in-flight wake, suppression, or callback is restored, and no
+history catch-up is invented. Successfully certified saved rows and their bounded local formatter
+inputs remain locally omitted independently of that fresh ledger. Missing or damaged durable proof
+fails visible; it does not lose saved link intent. Local display is a separate projection boundary; canonical rows,
 Read, replay/export, and assistant preview remain unchanged.
 
 ## Purposeful attention is an inverse signal, not reverse send
@@ -1485,7 +1502,12 @@ limits. It does not widen membership, grant human-only actions, or enable read-o
 Ordinary Grant still cannot exceed the request. Active delegations display the actual capabilities
 and allow immediate revocation. No tool argument can invoke Grant all or enable auto-approval.
 
-Grant, denial, and revocation generate app-authored decision notices for the requesting session.
+Grant, denial, revocation, and live expiry generate app-authored decision notices for the requesting session.
+The scope runtime owns one cancellable deadline at the earliest active grant's expiry, rearmed on
+scope changes and restoration and cancelled on termination. Its sweep expires every overdue scope
+and attenuated descendant through the existing authority, persistence, confirmation invalidation,
+and catalog publication paths. Query-triggered expiry remains a fallback; a terminal scope emits no
+second expiry notice. Expiry notices use the same requester delivery queue, not passive Auto-wake.
 These use noncomposer submission after the active turn settles, without reading/clearing the user's
 draft, attachments, workflow or interview state. The queue is bound to the presenting session and
 its Stop fence. It is not attention, a link grant, an interaction response, or passive Auto-wake;
@@ -1533,8 +1555,11 @@ does not converge.
 
 ### Local quiet transcript display
 
-Quiet verdicts mask only the local transcript UI. The session's canonical items, structured
-transcript/projections, Read/replay/save/export, previews and completion notifications remain intact.
+Quiet work is omitted only from local transcript presentation. Canonical items and structured audit,
+Read (including link reads and MCP logs/handoff), replay/save/export, previews and completion
+notifications remain intact. Existing exact-owner provisional candidates are staged before local
+grouping, so their marker, reasoning, declaration card and closing text do not flash. An ordinary veto
+or failed certification releases the actual ordinary work. Provisional staging never mints saved proof.
 The UI synchronization owner prepares one derived presentation keyed by exact session/binding,
 base presentation revision and internal display-mask revision. Getters never rebuild it. Every
 archive install/reset invalidates it; unchanged reads reuse the same archived array buffer.
@@ -1549,8 +1574,19 @@ materialized render-block values: identities/count facts and independently copie
 the existing 120-character policy, never full source/tool payloads. Full groups reuse their sections;
 only a buffered leading narration source omitted from those sections needs summary metadata.
 Those inputs share the projection/cache lifetime, not a separate history store or ID index.
-Reload without materialized verdict proof shows those rows again. A still-admissible unmaterialized
-marker instead retains its exclusion until its last producer or exact source binding retires.
+The normal save owner preserves W1 certified row stamps and bounded `quietLocal` formatter inputs;
+a fresh session with an empty ledger uses that same proof at every retention tier. Uncertified,
+legacy, malformed or revoked proof remains ordinary. A still-admissible unmaterialized marker retains
+its live exclusion until its last producer or exact source binding retires.
+
+Canonical retention decisions remain unchanged: hidden quiet members still affect pressure, frozen
+caps and retention sizing. Local equality is relative to those SAME decisions, removing only exact
+certified members; the reference is not compacted again. Ordinary detailed-tool threshold remains 8.
+Condensed conclusions use existing full local conclusion text; summary/archived use compact text.
+When canonical retention kept a quiet conclusion instead, the local conclusion may use the documented
+synthetic ID/sequence/activity metadata; text, status and dates still come from ordinary local inputs.
+A rare full turn with many tool-free ordinary rows plus quiet tools can therefore show more ordinary
+history than the canonical compactor estimate until that turn ages. Quiet-aware sizing is deferred.
 
 The passive reducer's existing value also suppresses equal queue publications and duplicate receipts.
 This is not an admission cache: readiness waiters, catalog readiness, selection changes and the

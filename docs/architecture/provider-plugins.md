@@ -164,7 +164,7 @@ Path: `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibl
 
 This is the only file in core that `import RepoPromptClaudeCompatibleProvider`. It is responsible for:
 
-- declaring `ClaudeCompatiblePlugin…` type aliases for every package DTO core code references, so other files can refer to plugin types without importing the package;
+- declaring `ClaudeCompatiblePlugin…` type aliases for every package DTO and pure rule core code references, so other files can refer to plugin types without importing the package (for example `ClaudeCompatiblePluginAutoCompactWindow`, the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` launch-environment rule);
 - converting core enums/structs to plugin DTOs and back (`pluginRuntimeVariant(for:)`, `pluginBackendID(for:)`, `pluginBackendConfig(from:)`, `runtimeConfig(from:)`, `launchEnvironment(from:)`, `coreLaunchEnvironment(from:)`, etc.);
 - forwarding pure runtime helpers from the package: `ClaudeCompatiblePromptDelivery`, `ClaudeCompatibleBackendEnvironmentBuilder`, `ClaudeCompatibleHeadlessRuntime`, `ClaudeCompatibleLaunchEnvironmentResolver`, `ClaudeCompatibleModelCatalog`, `ClaudeCompatibleModelNormalizer`;
 - translating package errors (`ClaudeCompatibleProviderError.invalidConfiguration`) into core errors (`AIProviderError.invalidConfiguration`);

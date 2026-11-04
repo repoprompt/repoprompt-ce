@@ -111,6 +111,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     /// Typed recovery record for a `.system` notice row. Same retention rationale as the
     /// fields above: the summary extraction reads it before the activity is trimmed.
     public var recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic?
+    public var quietCheckInWakeID: UUID?
 
     public init(
         id: UUID,
@@ -132,7 +133,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         userInputOrigin: AgentUserInputOrigin? = nil,
         crossSessionAttribution: AgentCrossSessionAttribution? = nil,
         laneUpdateDisplayAttribution: AgentLaneUpdateDisplayAttribution? = nil,
-        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil
+        recoveryDiagnostic: AgentTranscriptRecoveryDiagnostic? = nil,
+        quietCheckInWakeID: UUID? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -154,6 +156,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.crossSessionAttribution = crossSessionAttribution
         self.laneUpdateDisplayAttribution = laneUpdateDisplayAttribution?.validated
         self.recoveryDiagnostic = recoveryDiagnostic
+        self.quietCheckInWakeID = quietCheckInWakeID
     }
 
     public init(from item: AgentChatItem, toolExecution: AgentTranscriptToolExecution? = nil, role: AgentTranscriptActivityRole? = nil, sealsAssistantBoundary: Bool = false) {
@@ -177,6 +180,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         crossSessionAttribution = item.crossSessionAttribution
         laneUpdateDisplayAttribution = item.laneUpdateDisplayAttribution?.validated
         recoveryDiagnostic = item.recoveryDiagnostic
+        quietCheckInWakeID = item.quietCheckInWakeID
         // The activity is the authoritative carrier once inside a turn: re-key the record
         // to this activity so sequence rewrites at append time cannot desync it.
         recoveryDiagnostic?.align(to: id, timestamp: timestamp, sequenceIndex: sequenceIndex)
@@ -206,7 +210,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             // Synthesized decoding cannot reject a malformed nested value without failing the whole
             // activity, so the drop happens here instead.
             laneUpdateDisplayAttribution: laneUpdateDisplayAttribution?.validated,
-            recoveryDiagnostic: recoveryDiagnostic
+            recoveryDiagnostic: recoveryDiagnostic,
+            quietCheckInWakeID: quietCheckInWakeID
         )
     }
 
@@ -214,7 +219,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         case id, timestamp, sequenceIndex, role, itemKind, text, attachments, taggedFileAttachments
         case workflow, codexGoalMode, isLocalControlPlaneEcho, isStreaming, toolExecution, reasoning
         case isSubstantiveAssistant, sealsAssistantBoundary, userInputOrigin, crossSessionAttribution
-        case laneUpdateDisplayAttribution, recoveryDiagnostic
+        case laneUpdateDisplayAttribution, recoveryDiagnostic, quietCheckInWakeID
     }
 
     public init(from decoder: Decoder) throws {
@@ -239,6 +244,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         crossSessionAttribution = try c.decodeIfPresent(AgentCrossSessionAttribution.self, forKey: .crossSessionAttribution)
         laneUpdateDisplayAttribution = try c.decodeIfPresent(AgentLaneUpdateDisplayAttribution.self, forKey: .laneUpdateDisplayAttribution)?.validated
         recoveryDiagnostic = try c.decodeIfPresent(AgentTranscriptRecoveryDiagnostic.self, forKey: .recoveryDiagnostic)
+        quietCheckInWakeID = try? c.decodeIfPresent(UUID.self, forKey: .quietCheckInWakeID)
     }
 
     private static func defaultRole(for item: AgentChatItem) -> AgentTranscriptActivityRole {
@@ -556,6 +562,37 @@ struct AgentTranscriptFullRenderGroupedHistoryCache: Equatable {
     let summary: AgentTranscriptGroupedHistorySummary
 }
 
+/// Local-only formatter inputs. Reuse the existing bounded summaries, never retained source arrays.
+public struct AgentTranscriptQuietLocalTurn: Codable, Sendable, Equatable {
+    public var summary: AgentTranscriptTurnSummary?
+    public var conclusionActivityID: UUID?
+    public var completedAt: Date?
+}
+
+public struct AgentTranscriptQuietLocalSpan: Codable, Sendable, Equatable {
+    public var collapsedSummary: AgentTranscriptGroupedHistorySummary?
+
+    public init(collapsedSummary: AgentTranscriptGroupedHistorySummary?) {
+        self.collapsedSummary = collapsedSummary
+    }
+
+    private enum CodingKeys: String, CodingKey { case collapsedSummary }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // An explicit null is a valid empty local span; a missing field is not proof.
+        guard container.contains(.collapsedSummary) else {
+            throw DecodingError.keyNotFound(CodingKeys.collapsedSummary, .init(codingPath: decoder.codingPath, debugDescription: "Missing local summary"))
+        }
+        collapsedSummary = try container.decodeIfPresent(AgentTranscriptGroupedHistorySummary.self, forKey: .collapsedSummary)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(collapsedSummary, forKey: .collapsedSummary)
+    }
+}
+
 public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendable, Equatable {
     public let id: UUID
     public var providerTurnID: String?
@@ -567,6 +604,7 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
     public var activities: [AgentTranscriptActivity]
     /// Durable for compacted turns; rebuildable cache for full turns.
     public var collapsedSummary: AgentTranscriptGroupedHistorySummary?
+    public var quietLocal: AgentTranscriptQuietLocalSpan?
     /// Transient in-memory cache for completed full-turn grouped-history rendering.
     var fullRenderGroupedHistoryCache: AgentTranscriptFullRenderGroupedHistoryCache?
 
@@ -590,6 +628,7 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
         self.completedAt = completedAt
         self.activities = activities
         self.collapsedSummary = collapsedSummary
+        quietLocal = nil
         fullRenderGroupedHistoryCache = nil
     }
 
@@ -603,6 +642,7 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
         case completedAt
         case activities
         case collapsedSummary
+        case quietLocal
     }
 
     public init(from decoder: Decoder) throws {
@@ -616,6 +656,7 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
         completedAt = try container.decodeIfPresent(Date.self, forKey: .completedAt)
         activities = try container.decodeIfPresent([AgentTranscriptActivity].self, forKey: .activities) ?? []
         collapsedSummary = try container.decodeIfPresent(AgentTranscriptGroupedHistorySummary.self, forKey: .collapsedSummary)
+        quietLocal = try? container.decodeIfPresent(AgentTranscriptQuietLocalSpan.self, forKey: .quietLocal)
         fullRenderGroupedHistoryCache = nil
     }
 
@@ -630,6 +671,7 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
         try container.encodeIfPresent(completedAt, forKey: .completedAt)
         try container.encode(activities, forKey: .activities)
         try container.encodeIfPresent(collapsedSummary, forKey: .collapsedSummary)
+        try container.encodeIfPresent(quietLocal, forKey: .quietLocal)
     }
 
     public static func == (lhs: AgentTranscriptProviderResponseSpan, rhs: AgentTranscriptProviderResponseSpan) -> Bool {
@@ -642,6 +684,7 @@ public struct AgentTranscriptProviderResponseSpan: Codable, Identifiable, Sendab
             && lhs.completedAt == rhs.completedAt
             && lhs.activities == rhs.activities
             && lhs.collapsedSummary == rhs.collapsedSummary
+            && lhs.quietLocal == rhs.quietLocal
     }
 
     public var hasStoredActivities: Bool {
@@ -657,6 +700,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
     public var retentionTier: AgentTranscriptRetentionTier
     /// Durable for non-full turns; rebuildable cache for full turns.
     public var summary: AgentTranscriptTurnSummary?
+    public var quietLocal: AgentTranscriptQuietLocalTurn?
     public var terminalState: AgentSessionRunState?
     public var startedAt: Date
     public var lastActivityAt: Date?
@@ -684,6 +728,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         self.conclusionActivityID = conclusionActivityID
         self.retentionTier = retentionTier
         self.summary = summary
+        quietLocal = nil
         self.terminalState = terminalState
         self.startedAt = startedAt
         self.lastActivityAt = lastActivityAt
@@ -698,6 +743,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         case conclusionActivityID
         case retentionTier
         case summary
+        case quietLocal
         case terminalState
         case startedAt
         case lastActivityAt
@@ -713,6 +759,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         conclusionActivityID = try container.decodeIfPresent(UUID.self, forKey: .conclusionActivityID)
         retentionTier = try container.decode(AgentTranscriptRetentionTier.self, forKey: .retentionTier)
         summary = try container.decodeIfPresent(AgentTranscriptTurnSummary.self, forKey: .summary)
+        quietLocal = try? container.decodeIfPresent(AgentTranscriptQuietLocalTurn.self, forKey: .quietLocal)
         terminalState = try container.decodeIfPresent(AgentSessionRunState.self, forKey: .terminalState)
         startedAt = try container.decode(Date.self, forKey: .startedAt)
         lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
@@ -728,6 +775,7 @@ public struct AgentTranscriptTurn: Codable, Identifiable, Sendable, Equatable {
         try container.encodeIfPresent(conclusionActivityID, forKey: .conclusionActivityID)
         try container.encode(retentionTier, forKey: .retentionTier)
         try container.encodeIfPresent(summary, forKey: .summary)
+        try container.encodeIfPresent(quietLocal, forKey: .quietLocal)
         try container.encodeIfPresent(terminalState, forKey: .terminalState)
         try container.encode(startedAt, forKey: .startedAt)
         try container.encodeIfPresent(lastActivityAt, forKey: .lastActivityAt)

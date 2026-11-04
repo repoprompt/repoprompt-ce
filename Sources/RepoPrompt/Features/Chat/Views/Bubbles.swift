@@ -12,18 +12,41 @@ import SwiftUI
 
 // MARK: - Token Usage Indicator
 
+enum TokenUsagePresentation {
+    static func elapsedText(seconds value: Double?) -> (visible: String, spoken: String)? {
+        guard let value, value.isFinite, value >= 0,
+              let seconds = Int(exactly: value.rounded(.down)) else { return nil }
+        let duration = AgentRuntimeDurationFormatter.string(totalSeconds: seconds)
+        let minutes = seconds / 60
+        let remainder = seconds % 60
+        let spokenSeconds = "\(remainder) \(remainder == 1 ? "second" : "seconds")"
+        let spokenDuration = minutes == 0
+            ? spokenSeconds
+            : "\(minutes) \(minutes == 1 ? "minute" : "minutes"), \(spokenSeconds)"
+        return (duration, "Elapsed \(spokenDuration)")
+    }
+
+    static func text(inputTokens: Int?, outputTokens: Int?) -> String {
+        guard inputTokens != nil || outputTokens != nil else {
+            return "Usage unavailable"
+        }
+        return "Tokens: \(format(inputTokens)) in | \(format(outputTokens)) out"
+    }
+
+    private static func format(_ tokens: Int?) -> String {
+        guard let tokens else { return "unavailable" }
+        // Keep small counts exact so a measured zero never resembles a positive count.
+        return tokens < 1000 ? String(tokens) : String(format: "%.2fk", Double(tokens) / 1000.0)
+    }
+}
+
 private struct TokenUsageIndicator: View {
-    let inputTokens: Int
-    let outputTokens: Int
+    let inputTokens: Int?
+    let outputTokens: Int?
     let modelName: String?
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
-    }
-
-    // helper: 1 k = 1000 tokens, always 2 decimals
-    private func format(_ tokens: Int) -> String {
-        String(format: "%.2fk", Double(tokens) / 1000.0)
     }
 
     var body: some View {
@@ -33,7 +56,7 @@ private struct TokenUsageIndicator: View {
                     .font(fontPreset.captionFont)
                     .foregroundColor(.secondary.opacity(0.6))
             }
-            Text("Tokens: \(format(inputTokens)) in | \(format(outputTokens)) out")
+            Text(TokenUsagePresentation.text(inputTokens: inputTokens, outputTokens: outputTokens))
                 .font(fontPreset.captionFont)
                 .foregroundColor(.secondary.opacity(0.8))
         }
@@ -285,6 +308,7 @@ struct MessageBubble: View {
     @ObservedObject var viewModel: OracleViewModel
     let isLatestMessage: Bool
     let actionPolicy: ChatTranscriptActionPolicy
+    var oracleElapsedSeconds: Double?
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     // Flags for hover states
@@ -388,7 +412,8 @@ struct MessageBubble: View {
                         if !message.fileAttachments.isEmpty {
                             FileAttachmentStrip(attachments: message.fileAttachments)
                         }
-                        CollapsibleUserMessage(text: message.content)
+                        MarkdownTextView(text: message.content, isMarkdown: true, allowInteraction: true)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -506,19 +531,26 @@ struct MessageBubble: View {
                         }
                     }
 
-                    if actionPolicy.showsTokenUsage,
-                       let inTok = message.promptTokens,
-                       let outTok = message.completionTokens
-                    {
+                    if actionPolicy.showsTokenUsage {
                         TokenUsageIndicator(
-                            inputTokens: inTok,
-                            outputTokens: outTok,
+                            inputTokens: message.promptTokens,
+                            outputTokens: message.completionTokens,
                             modelName: message.modelName
                         )
                     } else if let modelName = message.modelName {
                         Text(modelName)
                             .font(fontPreset.captionFont)
                             .foregroundColor(.secondary.opacity(0.6))
+                    }
+                    if let elapsed = TokenUsagePresentation.elapsedText(seconds: oracleElapsedSeconds) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "clock")
+                            Text(elapsed.visible)
+                        }
+                        .font(fontPreset.captionFont)
+                        .foregroundColor(.secondary.opacity(0.8))
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(elapsed.spoken)
                     }
                 }
                 .padding(.vertical, 6)

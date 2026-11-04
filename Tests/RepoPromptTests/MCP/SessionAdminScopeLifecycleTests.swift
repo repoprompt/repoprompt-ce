@@ -6,6 +6,159 @@ import RepoPromptPersistence
 import RepoPromptVCS
 import XCTest
 
+@MainActor
+final class DelegationScopeExpiryTests: XCTestCase {
+    /// Deliberately cancellation-insensitive to exercise the generation fence as well as cancellation.
+    private final class Sleeper {
+        var waits: [(TimeInterval, CheckedContinuation<Void, Never>)] = []
+        var onSleep: (() -> Void)?
+
+        func sleep(_ delay: TimeInterval) async {
+            await withCheckedContinuation { continuation in
+                waits.append((delay, continuation))
+                onSleep?()
+            }
+        }
+
+        func resumeFirst() {
+            waits.removeFirst().1.resume()
+        }
+
+        func finish() {
+            let remaining = waits
+            waits = []
+            for wait in remaining {
+                wait.1.resume()
+            }
+        }
+    }
+
+    private func grant(_ runtime: DelegationScopeRuntime, to session: UUID, seconds: Int?) throws -> DomainDelegationScopeRecord {
+        let request = try runtime.requestScope(
+            requesterSessionID: session, requesterTabID: nil, kind: .tree(rootSessionID: session),
+            capabilities: [.observe, .spawn], guardrails: .init(), expiresInSeconds: seconds,
+            reason: nil, idempotencyKey: nil
+        ).get()
+        return try runtime.approve(requestID: request.id).get()
+    }
+
+    func testDeadlineExpiresParentAndChildWithoutQueriesAndNotifiesEachOnce() async throws {
+        var now = Date(timeIntervalSince1970: 2_000_000)
+        let sleeper = Sleeper()
+        let armed = expectation(description: "earliest expiry armed")
+        sleeper.onSleep = { armed.fulfill() }
+        let runtime = DelegationScopeRuntime(
+            persistenceMode: .ephemeral, now: { now }, sleepForExpiry: { await sleeper.sleep($0) }, notifyCatalogChanged: { _ in }
+        )
+        defer { runtime.freezeForTermination()
+            sleeper.finish()
+        }
+        let parentSession = UUID(), childSession = UUID()
+        let parent = try grant(runtime, to: parentSession, seconds: 60)
+        let provenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        provenance.add(parentSession, parent: nil)
+        provenance.add(childSession, parent: parentSession)
+        let projector = SpawnProvenanceDelegationMembershipProjector(source: provenance)
+        let proof = try XCTUnwrap(projector.membershipProof(for: childSession, in: parent.grant))
+        let child = try runtime.attenuate(
+            parentScopeID: parent.id, presentedGeneration: parent.generation, caller: .agentSession(parentSession),
+            newGranteeSessionID: childSession, newGranteeMemberships: [proof], capabilities: [.observe], guardrails: parent.grant.guardrails
+        ).get()
+        let expired = expectation(description: "both grantees receive expiry")
+        expired.expectedFulfillmentCount = 2
+        var recipients: [UUID] = []
+        runtime.test_scopeDecision = { session, text in
+            XCTAssertTrue(text.contains("decision: expired"))
+            XCTAssertTrue(text.contains("grants no authority or new task"))
+            recipients.append(session)
+            expired.fulfill()
+        }
+        await fulfillment(of: [armed], timeout: 2)
+        XCTAssertEqual(sleeper.waits.map(\.0), [60])
+        // A delayed deadline sweeps all overdue scopes, not just the one used to arm it.
+        now = now.addingTimeInterval(90)
+        sleeper.resumeFirst()
+        await fulfillment(of: [expired], timeout: 2)
+        XCTAssertEqual(Set(recipients), [parentSession, childSession])
+        XCTAssertEqual(runtime.record(id: parent.id)?.state, .expired)
+        XCTAssertEqual(runtime.record(id: child.id)?.state, .expired)
+        _ = runtime.liveScopes(grantedTo: parentSession)
+        XCTAssertEqual(recipients.count, 2, "query fallback cannot duplicate timer notices")
+        XCTAssertTrue(sleeper.waits.isEmpty)
+    }
+
+    func testRevokingEarliestRearmsAndStaleSleeperCannotExpireSuccessor() async throws {
+        var now = Date(timeIntervalSince1970: 2_000_000)
+        let sleeper = Sleeper()
+        let firstArmed = expectation(description: "first deadline armed")
+        let secondArmed = expectation(description: "replacement deadline armed")
+        var sleeps = 0
+        sleeper.onSleep = {
+            sleeps += 1
+            (sleeps == 1 ? firstArmed : secondArmed).fulfill()
+        }
+        let returned = expectation(description: "cancelled sleeper returned")
+        let runtime = DelegationScopeRuntime(
+            persistenceMode: .ephemeral, now: { now }, sleepForExpiry: {
+                await sleeper.sleep($0)
+                if Task.isCancelled { returned.fulfill() }
+            }, notifyCatalogChanged: { _ in }
+        )
+        defer { runtime.freezeForTermination()
+            sleeper.finish()
+        }
+        let first = try grant(runtime, to: UUID(), seconds: 60)
+        let second = try grant(runtime, to: UUID(), seconds: 120)
+        await fulfillment(of: [firstArmed], timeout: 2)
+        runtime.revoke(scopeID: first.id)
+        await fulfillment(of: [secondArmed], timeout: 2)
+        XCTAssertEqual(sleeper.waits.map(\.0), [60, 120])
+        var notices: [String] = []
+        let expired = expectation(description: "surviving scope expires")
+        runtime.test_scopeDecision = { _, text in notices.append(text)
+            expired.fulfill()
+        }
+        now = now.addingTimeInterval(60)
+        sleeper.resumeFirst()
+        await fulfillment(of: [returned], timeout: 2)
+        XCTAssertTrue(notices.isEmpty)
+        XCTAssertEqual(runtime.record(id: second.id)?.state, .active)
+        now = now.addingTimeInterval(60)
+        sleeper.resumeFirst()
+        await fulfillment(of: [expired], timeout: 2)
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertTrue(notices[0].contains(second.id.uuidString))
+        XCTAssertEqual(runtime.record(id: second.id)?.state, .expired)
+    }
+
+    func testTerminationCancelsExpiryAndUnlimitedScopeArmsNothing() async throws {
+        var now = Date(timeIntervalSince1970: 2_000_000)
+        let sleeper = Sleeper()
+        let armed = expectation(description: "finite scope armed")
+        sleeper.onSleep = { armed.fulfill() }
+        let returned = expectation(description: "termination sleeper returned")
+        let runtime = DelegationScopeRuntime(
+            persistenceMode: .ephemeral, now: { now }, sleepForExpiry: {
+                await sleeper.sleep($0)
+                returned.fulfill()
+            }, notifyCatalogChanged: { _ in }
+        )
+        defer { sleeper.finish() }
+        _ = try grant(runtime, to: UUID(), seconds: nil)
+        XCTAssertTrue(sleeper.waits.isEmpty)
+        _ = try grant(runtime, to: UUID(), seconds: 60)
+        await fulfillment(of: [armed], timeout: 2)
+        var decisions = 0
+        runtime.test_scopeDecision = { _, _ in decisions += 1 }
+        runtime.freezeForTermination()
+        now = now.addingTimeInterval(120)
+        sleeper.resumeFirst()
+        await fulfillment(of: [returned], timeout: 2)
+        XCTAssertEqual(decisions, 0)
+        XCTAssertTrue(sleeper.waits.isEmpty)
+    }
+}
+
 /// Deterministic failure injection before a real SQLite transaction.
 private final class DelegationScopeFileWriteGate: @unchecked Sendable {
     private let lock = NSLock()
@@ -2341,6 +2494,12 @@ final class SessionAdminStructureTests: XCTestCase {
         var beforeCreateCommit: (@MainActor () async -> Void)?
         var afterBindAdmission: (@MainActor (UUID, String) async throws -> Void)?
         var failPersistenceAfterBind = false
+        /// Thrown after a bind is published (and its commit callback ran), like a failed required save.
+        var bindErrorAfterCommit: (any Error)?
+        /// Models the production transition: the unbind is published (and its callback runs), then
+        /// this hook runs during the required save and the error, if any, is thrown.
+        var afterUnbindPublication: (@MainActor () async -> Void)?
+        var unbindErrorAfterPublication: (any Error)?
         var provenance: Provenance?
         var boundElsewhere: [String: Set<UUID>] = [:]
         var retainedBindingsBySession: [UUID: Set<String>] = [:]
@@ -2388,6 +2547,7 @@ final class SessionAdminStructureTests: XCTestCase {
             updateProvenance(sessionID, worktrees: [worktreeID])
             bindingsCommitted([worktreeID])
             if failPersistenceAfterBind { throw SessionAdminHostError.invalid("test_persistence_failure") }
+            if let bindErrorAfterCommit { throw bindErrorAfterCommit }
             return SessionAdminWorktreeInfo(
                 worktreeID: worktreeID, repositoryID: "repo", repoRootPath: "/repo", path: "/managed/\(worktreeID)",
                 branch: nil, isPrunable: false
@@ -2397,15 +2557,20 @@ final class SessionAdminStructureTests: XCTestCase {
         func unbindWorktrees(
             sessionID: UUID,
             worktreeID: String?,
-            isStillAuthorized: @escaping @MainActor () -> Bool
+            isStillAuthorized: @escaping @MainActor () -> Bool,
+            bindingsRemoved: @escaping @MainActor (Set<String>) -> Void
         ) async throws -> [String] {
             guard idle[sessionID] ?? true else { throw SessionAdminHostError.notIdle }
             beforeWrite?()
             guard isStillAuthorized() else { throw SessionAdminHostError.authorityEnded }
-            unbindCalls.append(sessionID)
             let removed = (bound[sessionID] ?? []).filter { worktreeID == nil || $0.worktreeID == worktreeID }
+            guard !removed.isEmpty else { return [] }
+            unbindCalls.append(sessionID)
             bound[sessionID] = (bound[sessionID] ?? []).filter { !removed.contains($0) }
             updateProvenance(sessionID, worktrees: Set((bound[sessionID] ?? []).map(\.worktreeID)))
+            bindingsRemoved(Set(removed.map(\.worktreeID)))
+            await afterUnbindPublication?()
+            if let unbindErrorAfterPublication { throw unbindErrorAfterPublication }
             return removed.map(\.worktreeID)
         }
 
@@ -2968,6 +3133,33 @@ final class SessionAdminStructureTests: XCTestCase {
         XCTAssertEqual(fixture.structure.lastAuthorization?(), false, "a revoked scope cannot commit a late model change")
     }
 
+    func testForkDepthUsesCallerPlacementRatherThanTranscriptSource() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), source = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(source, parent: caller)
+        try fixture.grant(caller, guardrails: .init(maxDepth: 1))
+        let reply = try await fixture.value(.adminFork, caller: caller, targets: [source], key: "depth-one")
+        XCTAssertEqual(reply["result"], .string("forked"))
+        XCTAssertEqual(fixture.structure.forkCalls, [source])
+        XCTAssertEqual(fixture.provenance.sessions[fixture.structure.nextFork]?.effectiveOrganizationalParentID, caller)
+
+        let tooDeep = Fixture()
+        let ancestor = UUID()
+        tooDeep.provenance.add(ancestor, parent: nil)
+        tooDeep.provenance.add(caller, parent: ancestor)
+        tooDeep.provenance.add(source, parent: caller)
+        let parent = try tooDeep.grant(ancestor, guardrails: .init(maxDepth: 1))
+        let proof = try XCTUnwrap(tooDeep.projector.membershipProof(for: caller, in: parent.grant))
+        _ = try tooDeep.runtime.attenuate(
+            parentScopeID: parent.id, presentedGeneration: parent.generation, caller: .agentSession(ancestor),
+            newGranteeSessionID: caller, newGranteeMemberships: [proof], capabilities: [.spawn], guardrails: parent.grant.guardrails
+        ).get()
+        let refused = try await tooDeep.value(.adminFork, caller: caller, targets: [source], key: "depth-two")
+        XCTAssertEqual(refused["guardrail"], .string("max_depth"))
+        XCTAssertTrue(tooDeep.structure.forkCalls.isEmpty)
+    }
+
     func testForkIsIdempotentJoinsTheScopeAndHonorsGuardrails() async throws {
         let fixture = Fixture()
         let overseer = UUID(), a = UUID(), b = UUID()
@@ -3512,6 +3704,365 @@ final class SessionAdminStructureTests: XCTestCase {
         await fixture.worktreeHandler.settleDeferredBinds()
         XCTAssertEqual(fixture.worktreeHandler.deferredOutcomes[revokedTarget], .revoked)
         XCTAssertEqual(fixture.worktrees.bindCalls.count, 1, "a revoked scope never applies a queued bind")
+    }
+
+    func testWorktreeReleaseRefusesBindingsChangedSinceCardOrInsideTransition() async throws {
+        for duringTransition in [false, true] {
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            try fixture.grant(caller)
+            fixture.worktrees.bound[target] = [WorktreeHost.summary("approved")]
+            guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-stale"
+            ) else { return XCTFail("missing card") }
+            XCTAssertEqual(card.items.first?.worktreeIDs, ["approved"])
+            _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+            if duringTransition {
+                fixture.worktrees.beforeWrite = { fixture.worktrees.bound[target] = [WorktreeHost.summary("replacement")] }
+            } else {
+                fixture.worktrees.bound[target] = [WorktreeHost.summary("replacement")]
+            }
+            let reply = try await fixture.value(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-stale", confirmation: card.id
+            )
+            XCTAssertTrue(codes(reply).contains("worktree_binding_changed"))
+            XCTAssertTrue(fixture.worktrees.unbindCalls.isEmpty)
+            XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["replacement"])
+            XCTAssertNil(fixture.ownership.record(worktreeID: "replacement")?.releasedAt)
+            XCTAssertNil(fixture.ownership.record(worktreeID: "approved")?.releasedAt)
+            XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .approved)
+        }
+    }
+
+    func testWorktreeReleaseKeepsOriginalApprovalForLaterBatchItems() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), first = UUID(), second = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(first, parent: caller)
+        fixture.provenance.add(second, parent: caller)
+        try fixture.grant(caller)
+        fixture.worktrees.bound[first] = [WorktreeHost.summary("first")]
+        fixture.worktrees.bound[second] = [WorktreeHost.summary("second-approved")]
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminWorktreeRelease, caller: caller, targets: [first, second], key: "release-batch"
+        ) else { return XCTFail("missing card") }
+        _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+        fixture.worktrees.beforeWrite = { fixture.worktrees.bound[second] = [WorktreeHost.summary("second-replacement")] }
+        let reply = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [first, second], key: "release-batch", confirmation: card.id
+        )
+        XCTAssertEqual(fixture.worktrees.unbindCalls, [first])
+        XCTAssertEqual(items(reply)[second.uuidString]?["code"], .string("worktree_binding_changed"))
+        XCTAssertNotNil(fixture.ownership.record(worktreeID: "first")?.releasedAt)
+        XCTAssertNil(fixture.ownership.record(worktreeID: "second-replacement")?.releasedAt)
+        XCTAssertEqual(fixture.worktrees.bound[second]?.map(\.worktreeID), ["second-replacement"])
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .consumed, "The committed first item makes this approval single-use")
+    }
+
+    func testWorktreeReleaseCardShowsAndReleasesOnlyExplicitSelection() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("selected"), WorktreeHost.summary("not-selected")]
+        let args: [String: Value] = ["worktree_id": .string("selected")]
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminWorktreeRelease, caller: caller, targets: [target], args: args, key: "release-selected"
+        ) else { return XCTFail("missing card") }
+        XCTAssertEqual(card.items.first?.worktreeIDs, ["selected"])
+        XCTAssertFalse(card.items.first?.effect.contains("not-selected") ?? true)
+        _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("selected"), WorktreeHost.summary("new-unselected")]
+        let reply = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [target], args: args, key: "release-selected", confirmation: card.id
+        )
+        XCTAssertEqual(items(reply)[target.uuidString]?["result"], .string("released"))
+        XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["new-unselected"])
+        XCTAssertNotNil(fixture.ownership.record(worktreeID: "selected")?.releasedAt)
+        XCTAssertNil(fixture.ownership.record(worktreeID: "new-unselected")?.releasedAt)
+    }
+
+    func testWhollyRefusedWorktreeReleaseKeepsApprovalForIdleRetry() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("approved")]
+        fixture.worktrees.idle[target] = false
+        guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+            .adminWorktreeRelease, caller: caller, targets: [target], key: "release-busy"
+        ) else { return XCTFail("missing card") }
+        _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+        let refused = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [target], key: "release-busy", confirmation: card.id
+        )
+        XCTAssertEqual(refused["result"], .string("not_applied"))
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .approved)
+        XCTAssertTrue(fixture.worktrees.unbindCalls.isEmpty)
+        fixture.worktrees.idle[target] = true
+        let retry = try await fixture.value(
+            .adminWorktreeRelease, caller: caller, targets: [target], key: "release-busy", confirmation: card.id
+        )
+        XCTAssertEqual(retry["result"], .string("applied"))
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .consumed)
+        XCTAssertEqual(fixture.worktrees.unbindCalls, [target])
+    }
+
+    func testCommittedReleaseWithFailedCompletionConsumesApprovalAndMarksStale() async throws {
+        // A save failure, a post-save check, a run that started during the save, a late authority
+        // check and cancellation all arrive after publication: none may read as a pre-commit refusal.
+        let lateErrors: [any Error] = [
+            SessionAdminHostError.invalid("test_persistence_failure"), SessionAdminHostError.notIdle,
+            SessionAdminHostError.authorityEnded, CancellationError()
+        ]
+        for lateError in lateErrors {
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            try fixture.grant(caller)
+            fixture.worktrees.bound[target] = [WorktreeHost.summary("w1")]
+            guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-save-fails"
+            ) else { return XCTFail("missing card") }
+            _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+            fixture.worktrees.unbindErrorAfterPublication = lateError
+            let reply = try await fixture.value(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-save-fails", confirmation: card.id
+            )
+            let label = "\(lateError)"
+            XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), [], label)
+            XCTAssertEqual(reply["result"], .string("partial"), label)
+            XCTAssertEqual(reply[AgentSessionAdminRendering.committedChangesKey], .bool(true), label)
+            let item = items(reply)[target.uuidString]
+            XCTAssertEqual(item?["code"], .string("unbind_failed"), label)
+            XCTAssertEqual(item?["subreason"], .string("completion_failed"), label)
+            XCTAssertEqual(item?["worktree_ids"], .array([.string("w1")]), label)
+            XCTAssertEqual(item?[AgentSessionAdminRendering.committedChangesKey], .bool(true), label)
+            XCTAssertEqual(item?["retryable"], .bool(false), label)
+            XCTAssertTrue(item?["detail"]?.stringValue?.contains("committed") ?? false, label)
+            XCTAssertNotNil(fixture.ownership.record(worktreeID: "w1")?.releasedAt, "The committed release keeps its stale mark: \(label)")
+            XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .consumed, label)
+
+            // Rebinding the same worktree must not revive the already-used approval.
+            fixture.worktrees.unbindErrorAfterPublication = nil
+            fixture.worktrees.bound[target] = [WorktreeHost.summary("w1")]
+            let replay = try await fixture.value(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-save-fails", confirmation: card.id
+            )
+            XCTAssertEqual(replay["result"], .string("denied"), label)
+            XCTAssertEqual(fixture.worktrees.unbindCalls, [target], "A consumed approval cannot release W1 again: \(label)")
+            XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["w1"], label)
+        }
+    }
+
+    func testCommittedPlainUnbindWithFailedCompletionReportsCommittedChangesWithoutStaleMark() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("w1")]
+        fixture.worktrees.unbindErrorAfterPublication = SessionAdminHostError.notIdle
+        let reply = try await fixture.value(.adminWorktreeUnbind, caller: caller, targets: [target])
+        XCTAssertEqual(reply["result"], .string("partial"))
+        XCTAssertEqual(reply[AgentSessionAdminRendering.committedChangesKey], .bool(true))
+        XCTAssertEqual(items(reply)[target.uuidString]?["code"], .string("unbind_failed"), "Not target_busy: the unbind committed")
+        XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), [])
+        XCTAssertNil(fixture.ownership.record(worktreeID: "w1")?.releasedAt, "Only a release records a stale mark")
+    }
+
+    func testReleaseStaleMarkIsRecordedAtPublicationSoAConcurrentRebindKeepsItCleared() async throws {
+        for saveFails in [false, true] {
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID(), other = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            fixture.provenance.add(other, parent: caller)
+            try fixture.grant(caller)
+            fixture.worktrees.bound[target] = [WorktreeHost.summary("w1")]
+            guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-race"
+            ) else { return XCTFail("missing card") }
+            _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+            var markedAtPublication = false
+            fixture.worktrees.afterUnbindPublication = {
+                markedAtPublication = fixture.ownership.record(worktreeID: "w1")?.releasedAt != nil
+                // While the release awaits its required save, another member binds W1, which
+                // reactivates (clears) the stale mark.
+                let bind = try? await fixture.value(.adminWorktreeBind, caller: caller, targets: [other], args: ["worktree": .string("w1")])
+                XCTAssertEqual(bind?["result"], .string("applied"))
+            }
+            if saveFails { fixture.worktrees.unbindErrorAfterPublication = SessionAdminHostError.invalid("test_persistence_failure") }
+            _ = try await fixture.value(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "release-race", confirmation: card.id
+            )
+            XCTAssertTrue(markedAtPublication, "saveFails=\(saveFails)")
+            XCTAssertEqual(fixture.worktrees.bound[other]?.map(\.worktreeID), ["w1"])
+            XCTAssertNil(
+                fixture.ownership.record(worktreeID: "w1")?.releasedAt,
+                "A late release completion must not re-mark W1 stale after another session bound it: saveFails=\(saveFails)"
+            )
+            XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .consumed)
+        }
+    }
+
+    func testCommittedChangesConsumeApprovalEvenWithAnInconsistentNotAppliedResult() async throws {
+        @MainActor final class InconsistentReleaseHandler: AgentSessionAdministrationOperationHandler {
+            let operations: Set<DomainAgentSessionTargetOperation> = [.adminWorktreeRelease]
+            var committed = true
+            func perform(_: AgentSessionAdministrationAuthorizedBatch) async throws -> Value {
+                .object(["result": .string("not_applied"), AgentSessionAdminRendering.committedChangesKey: .bool(committed)])
+            }
+        }
+        for committed in [true, false] {
+            let fixture = Fixture()
+            let handler = InconsistentReleaseHandler()
+            handler.committed = committed
+            fixture.core.register(handler)
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            try fixture.grant(caller)
+            guard case let .pendingConfirmation(card, _) = try await fixture.perform(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "inconsistent"
+            ) else { return XCTFail("missing card") }
+            _ = fixture.runtime.confirmations.approve(confirmationID: card.id)
+            _ = try await fixture.value(
+                .adminWorktreeRelease, caller: caller, targets: [target], key: "inconsistent", confirmation: card.id
+            )
+            XCTAssertEqual(
+                fixture.runtime.confirmations.confirmations[card.id]?.state, committed ? .consumed : .approved,
+                "committed_changes is effect evidence; without it a wholly refused release stays retryable"
+            )
+        }
+    }
+
+    func testFrontDoorRecordsCommittedUnbindForKeyedReplayAndRefusesRedeemingAConsumedReleaseCard() async throws {
+        let fixture = Fixture()
+        let caller = UUID(), target = UUID(), tab = UUID()
+        fixture.provenance.add(caller, parent: nil)
+        fixture.provenance.add(target, parent: caller)
+        try fixture.grant(caller)
+        typealias Organizing = SessionAdminOrganizingOperationTests
+        let organizer = Organizing.FakeOrganizer(), links = Organizing.FakeLinks()
+        let inventoryProvenance = SessionAdminScopeLifecycleTests.FakeProvenance()
+        defer { withExtendedLifetime((organizer, links, inventoryProvenance)) {} }
+        let door = AgentSessionAdministrationFrontDoor(
+            core: fixture.core, scopes: fixture.runtime, projector: fixture.projector,
+            inventory: Organizing.FakeInventory(organizer: organizer, provenance: inventoryProvenance, links: links, now: Date()),
+            liveBoundSession: { $0 == tab ? caller : nil }
+        )
+        door.registerStructureHandlers(
+            scopes: fixture.runtime, worktreeOwnership: fixture.ownership, projector: fixture.projector,
+            structureHost: fixture.structure, worktreeHost: fixture.worktrees
+        )
+
+        // Direct, uncarded keyed call: committed_changes is recorded even though changed_count is 0.
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("w0")]
+        fixture.worktrees.unbindErrorAfterPublication = SessionAdminHostError.invalid("test_persistence_failure")
+        let unbind = AgentSessionAdministrationRequest(
+            operation: .adminWorktreeUnbind, caller: .agentSession(caller), callerTabID: tab,
+            targetSessionIDs: [target], idempotencyKey: "unbind-key"
+        )
+        guard case let .completed(first) = try await door.perform(unbind) else { return XCTFail("Unbind completes") }
+        XCTAssertEqual(first.objectValue?["result"], .string("partial"))
+        XCTAssertEqual(first.objectValue?["changed_count"], .int(0))
+        XCTAssertEqual(first.objectValue?[AgentSessionAdminRendering.committedChangesKey], .bool(true))
+        fixture.worktrees.unbindErrorAfterPublication = nil
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("w0")]
+        guard case let .completed(replay) = try await door.perform(unbind) else { return XCTFail("Replay completes") }
+        XCTAssertEqual(replay.objectValue?["idempotent_replay"], .bool(true))
+        XCTAssertEqual(fixture.worktrees.unbindCalls, [target], "The committed keyed call replays instead of re-running")
+
+        // Carded release: bypasses the ledger, consumes the card, and keeps its applied result.
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("w1")]
+        let release = AgentSessionAdministrationRequest(
+            operation: .adminWorktreeRelease, caller: .agentSession(caller), callerTabID: tab,
+            targetSessionIDs: [target], idempotencyKey: "release-key"
+        )
+        guard case let .pendingConfirmation(card, _) = try await door.perform(release) else { return XCTFail("missing card") }
+        fixture.worktrees.unbindErrorAfterPublication = SessionAdminHostError.invalid("test_persistence_failure")
+        await door.approveAndApply(confirmationID: card.id, presentedTabID: tab, presentedSessionID: caller)
+        XCTAssertEqual(fixture.worktrees.unbindCalls, [target, target])
+        XCTAssertEqual(fixture.runtime.confirmations.confirmations[card.id]?.state, .consumed)
+        let applied = try XCTUnwrap(door.appliedResult(forConfirmation: card.id)?.objectValue)
+        XCTAssertEqual(applied["result"], .string("partial"))
+        XCTAssertEqual(applied[AgentSessionAdminRendering.committedChangesKey], .bool(true))
+        XCTAssertNotNil(fixture.ownership.record(worktreeID: "w1")?.releasedAt)
+
+        fixture.worktrees.unbindErrorAfterPublication = nil
+        fixture.worktrees.bound[target] = [WorktreeHost.summary("w1")]
+        let redeemed = try await door.perform(release.rebuilt(targets: [target], confirmationID: card.id))
+        guard case .denied = redeemed else { return XCTFail("Redeeming a consumed card must be refused, got \(redeemed)") }
+        XCTAssertEqual(fixture.worktrees.unbindCalls, [target, target], "The consumed approval cannot release a rebound W1")
+        XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["w1"])
+    }
+
+    func testCommittedImmediateBindWithLateFailureIsNotRequeuedOrRevoked() async throws {
+        let lateErrors: [any Error] = [SessionAdminHostError.notIdle, SessionAdminHostError.authorityEnded, CancellationError()]
+        for lateError in lateErrors {
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            try fixture.grant(caller)
+            fixture.worktrees.bindErrorAfterCommit = lateError
+            let reply = try await fixture.value(
+                .adminWorktreeBind, caller: caller, targets: [target],
+                args: ["worktree": .string("w1"), "apply": .string("next_boundary")]
+            )
+            let label = "\(lateError)"
+            let item = items(reply)[target.uuidString]
+            XCTAssertEqual(reply["result"], .string("partial"), label)
+            XCTAssertEqual(item?["code"], .string("bind_failed"), label)
+            XCTAssertEqual(item?["worktree_ids"], .array([.string("w1")]), label)
+            XCTAssertEqual(item?[AgentSessionAdminRendering.committedChangesKey], .bool(true), label)
+            XCTAssertTrue(fixture.worktreeHandler.pendingBinds.isEmpty, "A committed bind is never queued again: \(label)")
+            XCTAssertEqual(fixture.worktrees.bindCalls.count, 1, label)
+        }
+    }
+
+    func testDeferredBindCommittedThenFailingSettlesWithoutRetrying() async throws {
+        let lateErrors: [any Error] = [
+            SessionAdminHostError.invalid("test_persistence_failure"), SessionAdminHostError.notIdle, CancellationError()
+        ]
+        for lateError in lateErrors {
+            let fixture = Fixture()
+            let caller = UUID(), target = UUID()
+            fixture.provenance.add(caller, parent: nil)
+            fixture.provenance.add(target, parent: caller)
+            try fixture.grant(caller)
+            fixture.worktrees.idle[target] = false
+            let queued = try await fixture.value(
+                .adminWorktreeBind, caller: caller, targets: [target],
+                args: ["worktree": .string("later"), "apply": .string("next_boundary")]
+            )
+            XCTAssertEqual(items(queued)[target.uuidString]?["result"], .string("queued"))
+            XCTAssertTrue(fixture.worktrees.bindCalls.isEmpty, "The bind is genuinely deferred")
+            fixture.worktrees.bindErrorAfterCommit = lateError
+            fixture.worktrees.becomeIdle(target)
+            await fixture.worktreeHandler.settleDeferredBinds()
+            let label = "\(lateError)"
+            XCTAssertEqual(fixture.worktrees.bindCalls.count, 1, "A committed deferred bind is not retried: \(label)")
+            XCTAssertEqual(fixture.worktrees.bound[target]?.map(\.worktreeID), ["later"], label)
+            guard case let .committedIncomplete(worktreeIDs, detail)? = fixture.worktreeHandler.deferredOutcomes[target] else {
+                return XCTFail("Expected a committed-incomplete outcome for \(label), got \(String(describing: fixture.worktreeHandler.deferredOutcomes[target]))")
+            }
+            XCTAssertEqual(worktreeIDs, ["later"], label)
+            XCTAssertTrue(detail.contains("committed"), label)
+            XCTAssertTrue(fixture.worktreeHandler.pendingBinds.isEmpty, label)
+            let inventory = try await fixture.value(.adminWorktreeInventory, caller: caller)
+            let row = inventory["deferred_outcomes"]?.arrayValue?.first?.objectValue
+            XCTAssertEqual(row?["result"], .string("partial"), label)
+            XCTAssertEqual(row?[AgentSessionAdminRendering.committedChangesKey], .bool(true), label)
+            XCTAssertEqual(row?["worktree_ids"], .array([.string("later")]), label)
+            XCTAssertEqual(row?["retryable"], .bool(false), label)
+        }
     }
 
     func testWorktreeReleaseIsAlwaysCardedUnbindsAndMarksStale() async throws {
@@ -4984,6 +5535,28 @@ final class SessionAdminOrganizingOperationTests: XCTestCase {
         XCTAssertEqual(undone["result"], .string("undone"))
         XCTAssertEqual(fixture.organizer.pinnedSessionOrder(workspaceID: fixture.workspace), [a, x, b])
         XCTAssertFalse(fixture.organizer.written.contains(x), "undo never writes the outsider either")
+    }
+
+    func testReorderGroupsRefusesRankCollisionWithUnnamedGroupWithoutWrites() async throws {
+        let fixture = Fixture()
+        let a = fixture.member("A", group: "A")
+        let b = fixture.outsider("B")
+        let z = fixture.member("Z", group: "Z")
+        fixture.organizer.states[a]?.sidebarGroupOrder = 0
+        fixture.organizer.states[b]?.sidebarGroup = "B"
+        fixture.organizer.states[b]?.sidebarGroupOrder = 0
+        fixture.organizer.states[z]?.sidebarGroupOrder = 1
+        try fixture.grant()
+        let reply = try await fixture.call([
+            "op": .string("reorder_groups"), "workspace": .string(fixture.workspace.uuidString),
+            "order": .array([.string("Z"), .string("A")]), "expected_order": .array([.string("A"), .string("Z")])
+        ])
+        XCTAssertEqual(reply["code"], .string("group_rank_collision"))
+        XCTAssertTrue(fixture.organizer.written.isEmpty)
+        XCTAssertEqual(fixture.organizer.states[a]?.sidebarGroupOrder, 0)
+        XCTAssertEqual(fixture.organizer.states[b]?.sidebarGroupOrder, 0)
+        XCTAssertEqual(fixture.organizer.states[z]?.sidebarGroupOrder, 1)
+        XCTAssertNil(reply["undo_token"])
     }
 
     func testReorderGroupsCASOverEveryMemberOfTheNamedGroups() async throws {
@@ -7141,8 +7714,13 @@ final class SessionAdminDeferredOutcomeTests: XCTestCase {
             )
         }
 
-        func unbindWorktrees(sessionID: UUID, worktreeID: String?, isStillAuthorized: @escaping @MainActor () -> Bool) async throws -> [String] {
-            try await base.unbindWorktrees(sessionID: sessionID, worktreeID: worktreeID, isStillAuthorized: isStillAuthorized)
+        func unbindWorktrees(
+            sessionID: UUID, worktreeID: String?, isStillAuthorized: @escaping @MainActor () -> Bool,
+            bindingsRemoved: @escaping @MainActor (Set<String>) -> Void
+        ) async throws -> [String] {
+            try await base.unbindWorktrees(
+                sessionID: sessionID, worktreeID: worktreeID, isStillAuthorized: isStillAuthorized, bindingsRemoved: bindingsRemoved
+            )
         }
 
         func boundWorktrees(sessionID: UUID) -> [AgentSessionWorktreeBindingSummary] {
@@ -8005,6 +8583,35 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             )
         }
 
+        /// These carriers belong to a live window. Capture through its save owner so a
+        /// deferred UI publication is recaptured instead of racing a caller-local proposal.
+        ///
+        /// Activation also schedules a post-switch Git-data root load. Its root expansion marks
+        /// the workspace dirty and reaches the stored tab (`expandedFolders`) only on a later
+        /// publication, without another version bump. If it lands during save preparation it
+        /// is a second pending edit, and a fixture that deliberately spends the save's single
+        /// retry on its own edit then exhausts it. Join the activation's load, and the main-queue
+        /// work it scheduled, so this capture starts from a settled foreground.
+        func persistActiveCarriers() async throws -> URL {
+            let manager = window.workspaceManager
+            await manager.waitUntilPostSwitchGitDataLoadComplete()
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+            let workspace = try XCTUnwrap(manager.activeWorkspace)
+            manager.markWorkspaceDirty()
+            let outcome = await manager.pollAndSaveStateWithOutcomeAsync(
+                workspaceID: workspace.id, source: WorkspaceSaveSource("inventoryFixture")
+            )
+            let persistedID: UUID? = if case let .persisted(workspaceID, _) = outcome {
+                workspaceID
+            } else {
+                nil
+            }
+            XCTAssertEqual(try XCTUnwrap(persistedID, "Fixture save must persist: \(outcome)"), workspace.id)
+            return manager.workspaceFileURL(for: workspace)
+        }
+
         init(window: WindowState, runtime: MCPDomainRuntime, directory: URL, ownsRuntime: Bool = true) {
             self.window = window
             self.runtime = runtime
@@ -8100,6 +8707,102 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 XCTAssertEqual(shutdown.finalLifecycle, .stopped)
             }
             try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    /// W0(b): actual saved hydration and scheduled idle dispatch, with no pre-dispatch refresh.
+    func testQuietW0OrdinaryBaselineCurrencyAtActiveInactiveAndPreparedDispatch() async throws {
+        try await MCPSharedServerTestLease.shared.withLease { _ in
+            for placement in ["active", "inactive", "prepared"] {
+                let selectedID = UUID(), targetID = placement == "active" ? selectedID : UUID()
+                let factory: WindowStateCompositionFactory.AgentModeViewModelFactory = { windowID, prompt, manager, server in
+                    let vm = AgentModeViewModel(
+                        testWindowID: windowID, testWorkspacePath: FileManager.default.temporaryDirectory.path,
+                        codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: LifecycleRecorder()) },
+                        headlessProviderFactory: { _, _ in XCTFail("Dispatch must stop before a provider")
+                            return AgentSessionLinkCapturingHeadlessProvider()
+                        },
+                        mcpServerEnabler: { false }, testMCPServer: server,
+                        testWorkspaceFileContextStore: prompt.workspaceFileContextStore
+                    )
+                    vm.promptManager = prompt
+                    vm.workspaceManager = manager
+                    return vm
+                }
+                let fixture = try await LoadedWindowFixture.make(activeID: selectedID, parentID: nil, agentFactory: factory)
+                addTeardownBlock { @MainActor in await fixture.cleanup() }
+                var carriers = try XCTUnwrap(fixture.carriers)
+                let selectedTab = try XCTUnwrap(carriers.composeTabs.first)
+                let targetTab: ComposeTabState
+                if placement == "inactive" {
+                    targetTab = ComposeTabState(name: "Inactive W0", activeAgentSessionID: targetID)
+                    carriers.composeTabs.append(targetTab)
+                    fixture.carriers = carriers
+                } else { targetTab = selectedTab }
+                fixture.indexEntries[targetID] = AgentSessionIndexEntry(
+                    id: targetID, tabID: targetTab.id, name: "Quiet W0", savedAt: .distantPast,
+                    itemCount: 2, autoEditEnabled: false, hasUnknownConversationContent: false,
+                    isMCPOriginated: false, worktreeBindingSummaries: [], activeWorktreeMergeSummaries: []
+                )
+                try fixture.installCarriers()
+                let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+                let rows = [
+                    AgentChatItem(id: UUID(), timestamp: Date(timeIntervalSince1970: 1), kind: .user, text: "Ordinary request", sequenceIndex: 0),
+                    AgentChatItem(id: UUID(), timestamp: Date(timeIntervalSince1970: 2), kind: .assistant, text: "Ordinary completion", sequenceIndex: 1)
+                ]
+                let url = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(
+                    id: targetID, workspaceID: workspace.id, composeTabID: targetTab.id, name: "Quiet W0",
+                    transcript: AgentTranscriptIO.buildTranscript(from: rows, terminalState: .idle),
+                    agentKind: "openCode", lastRunState: "idle"
+                ), for: workspace)
+                addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+                let owner: WindowState
+                if placement == "prepared" {
+                    let resolution = await WindowStatesManager.shared.resolveSavedOversightLocation(targetID)
+                    guard case let .success(location) = resolution else { return XCTFail("Saved location unavailable: \(resolution)") }
+                    owner = WindowState.makePreparedSessionOwner(workspace: location.runtimeWorkspace, borrowing: fixture.window, agentModeViewModelFactory: factory)
+                    XCTAssertTrue(owner.isPreparedSessionOwner)
+                    XCTAssertTrue(owner.workspaceManager.isSessionRuntimeProjection)
+                    let ready = await owner.agentModeViewModel.prepareSavedOversightSession(
+                        tabID: targetTab.id, sessionID: targetID, workspaceID: workspace.id, isStillAuthorized: { true }
+                    )
+                    XCTAssertTrue(ready)
+                    addTeardownBlock { @MainActor in _ = await owner.tearDownPreparedSessionOwner() }
+                } else {
+                    owner = fixture.window
+                    _ = await owner.agentModeViewModel.ensureSessionReady(tabID: targetTab.id)
+                }
+                let vm = owner.agentModeViewModel
+                let session = try XCTUnwrap(vm.session(for: targetTab.id, createIfNeeded: false))
+                XCTAssertEqual(session.activeAgentSessionID, targetID)
+                if placement == "inactive" { XCTAssertNotEqual(vm.currentTabID, targetTab.id) }
+                session.oversight.autoWakeOnUpdates = true
+                let laterOrdinary = AgentChatItem(id: UUID(), timestamp: Date(timeIntervalSince1970: 3), kind: .assistant, text: "Later ordinary completion", sequenceIndex: 2)
+                session.appendItem(laterOrdinary)
+                let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(vm, tabID: targetTab.id)
+                let observed = expectation(description: "\(placement) actual routine idle boundary")
+                var currentAtDispatch = false
+                vm.test_beforeRoutineIdleFollowUpStart = { candidate, _ in
+                    XCTAssertTrue(candidate === session)
+                    let protection = vm.transcriptProjectionProtection(for: candidate)
+                    currentAtDispatch = vm.canReuseDerivedTranscriptForSave(for: candidate, projectionProtection: protection)
+                    XCTAssertEqual(candidate.transcript.turns.last?.conclusionActivityID, laterOrdinary.id)
+                    XCTAssertEqual(candidate.transcript.turns.last?.completedAt, laterOrdinary.timestamp)
+                    observed.fulfill()
+                    return false
+                }
+                defer { vm.test_beforeRoutineIdleFollowUpStart = nil }
+                vm.agentSessionLinkPublishPromptInventory(
+                    AgentSessionLinkAutoWakeTests.inventory(observerSessionID: targetID, revision: 1), to: endpoint
+                )
+                vm.agentSessionLinkPublishPassiveStatusNotices(
+                    AgentSessionLinkAutoWakeTests.laneSnapshot(observerEndpoint: endpoint), to: endpoint
+                )
+                await fulfillment(of: [observed], timeout: 5)
+                XCTAssertTrue(currentAtDispatch, "\(placement): cannot silently manufacture baseline currency")
+                XCTAssertNil(session.activeRunOwnership, "The observer hook cannot start a fake provider run")
+                XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, selectedTab.id)
+            }
         }
     }
 
@@ -8313,7 +9016,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 session.selectedAgent = .claudeCode
                 fixture.window.apiSettingsViewModel.isClaudeCodeConnected = true
                 try await AsyncTestWait.waitUntil("notification provider available") { fixture.window.apiSettingsViewModel.agentAvailability.claudeCodeAvailable }
-                _ = try await fixture.window.workspaceManager.saveWorkspaceToFileAsync(XCTUnwrap(fixture.window.workspaceManager.activeWorkspace))
+                _ = try await fixture.persistActiveCarriers()
                 var writes = 0
                 vm.test_setAgentSessionSaver { _, _, _ in
                     writes += 1
@@ -8420,7 +9123,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
     }
 
     func testActiveManagedRunSurvivesCarrierSessionSwitch() async throws {
-        try await assertExactTargetFlow(placement: "historical", duringRun: "switch")
+        try await assertExactTargetFlow(placement: "historical", duringRun: "switch", deferredFixturePublication: true)
     }
 
     func testActiveManagedRunSurvivesUnstash() async throws {
@@ -8463,7 +9166,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
         try await assertExactTargetFlow(placement: "historical", duringRun: "shutdown-active", longWatch: true)
     }
 
-    private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false) async throws {
+    private func assertExactTargetFlow(placement: String, retirement: String = "revoke", checksConnectionChanges: Bool = false, duringRun: String? = nil, longWatch: Bool = false, terminalStatus: NativeAgentRuntimeTurnStatus = .completed, reconnectBeforeActivation: Bool = false, deferredFixturePublication: Bool = false) async throws {
         // This is the full-access OFF approval-card flow. Never inherit the machine's real setting.
         let previousFullAccess = OverseerGlobalAutoApprove.isEnabled
         OverseerGlobalAutoApprove.isEnabled = { false }
@@ -8629,10 +9332,32 @@ final class SessionAdminInventoryReadTests: XCTestCase {
             let workspace = targetFixture.window.workspaceManager.workspaces[workspaceIndex]
             // Unlike the read-only inventory fixtures, this test dispatches a real write. Publish
             // both carriers through the workspace owner so a save cannot reload their older disk tabs.
-            let sourceWorkspaceURL = try await targetFixture.window.workspaceManager.saveWorkspaceToFileAsync(workspace)
-            _ = try await observerFixture.window.workspaceManager.saveWorkspaceToFileAsync(
-                XCTUnwrap(observerFixture.window.workspaceManager.activeWorkspace)
-            )
+            let targetManager = targetFixture.window.workspaceManager
+            let targetPrompt = targetFixture.window.promptManager
+            let nextFixtureView: FilesTab = targetPrompt.storedActiveSubView == .selected ? .context : .selected
+            var fixturePreparations = 0
+            if deferredFixturePublication {
+                targetManager.setWorkspaceSavePreparationDidFinishHandlerForTesting { @MainActor workspaceID, _, _ in
+                    guard workspaceID == workspace.id else { return }
+                    fixturePreparations += 1
+                    if fixturePreparations == 1 {
+                        targetPrompt.setActiveFilesTab(nextFixtureView, source: .user)
+                    } else {
+                        targetManager.publishActiveComposeTabSnapshot(commitToMemory: true)
+                    }
+                }
+            }
+            defer { targetManager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil) }
+            let sourceWorkspaceURL = try await targetFixture.persistActiveCarriers()
+            targetManager.setWorkspaceSavePreparationDidFinishHandlerForTesting(nil)
+            if deferredFixturePublication {
+                XCTAssertEqual(fixturePreparations, 2, "The active save must recapture one pending UI edit")
+                let saved = try WorkspaceManagerViewModel.decodeDomainWorkspaceProjection(
+                    documentBytes: Data(contentsOf: sourceWorkspaceURL), fileURL: sourceWorkspaceURL
+                )
+                XCTAssertEqual(saved.composeTabs.first { $0.id == targetTab.id }?.activeSubView, nextFixtureView)
+            }
+            _ = try await observerFixture.persistActiveCarriers()
             if let prior = targetVM.sessions[targetTab.id] {
                 prior.saveDebounceTask?.cancel()
                 prior.persistedLoadTask?.cancel()
@@ -8659,7 +9384,7 @@ final class SessionAdminInventoryReadTests: XCTestCase {
                 placed.composeTabs[0].activeAgentSessionID = UUID()
                 targetFixture.carriers = placed
                 try targetFixture.installCarriers()
-                _ = try await targetFixture.window.workspaceManager.saveWorkspaceToFileAsync(placed)
+                _ = try await targetFixture.persistActiveCarriers()
                 targetVM.test_removeSession(tabID: targetTab.id)
             } else if placement == "inactive" {
                 let created = try targetFixture.window.workspaceManager.createPersistentWorkspace(name: "Unrelated visible workspace", repoPaths: [])

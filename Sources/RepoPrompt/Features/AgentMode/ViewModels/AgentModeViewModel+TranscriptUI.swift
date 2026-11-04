@@ -44,7 +44,7 @@ extension AgentModeViewModel {
         guard session.quietTranscriptDisplayCache?.key != key else { return true }
         // Inline run-state publication can reenter UI sync while the terminal barrier owns the
         // actor. Its existing phase-end callback requests the scoped refresh after that phase.
-        if session.terminalCommitInProgress, !session.quietLedger.hiddenSourceIDs.isEmpty {
+        if session.terminalCommitInProgress, session.quietDisplayCandidate != nil || !session.quietLedger.hiddenSourceIDs.isEmpty {
             session.quietTranscriptDisplayCache = nil
             return false
         }

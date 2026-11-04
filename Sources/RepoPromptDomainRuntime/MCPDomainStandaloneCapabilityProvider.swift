@@ -326,6 +326,10 @@ package enum MCPDomainStandaloneToolInstaller {
             binding(MCPWindowToolName.becomeOverseer) { _ in
                 throw MCPError.invalidParams("become_overseer is not available for this session.")
             },
+            binding(MCPWindowToolName.selfNoop) { _ in
+                // No app-owned attempt exists here; use the ordinary host policy denial.
+                throw MCPDomainCallPolicyDenial.missingAdditionalGrant(toolName: MCPWindowToolName.selfNoop)
+            },
             // Direct-headless has no app-owned Agent Mode run or registration-time self origin.
             // Keep the canonical catalog complete while failing closed even if a caller names it.
             binding(MCPWindowToolName.agentSelf) { _ in

@@ -1,3 +1,4 @@
+import RepoPromptSettingsCore
 import SwiftUI
 
 // MARK: - Agent Workflows Popover
@@ -12,6 +13,7 @@ import SwiftUI
 struct AgentWorkflowsPopoverView: View {
     @ObservedObject var statusPillsUI: AgentStatusPillsUIStore
     @ObservedObject var workflowStore: AgentWorkflowStore
+    @ObservedObject var settingsStore: GlobalSettingsStore = .shared
     @Binding var isPresented: Bool
 
     @Binding var showConfigureSheet: Bool
@@ -137,6 +139,14 @@ struct AgentWorkflowsPopoverView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            Toggle("Auto Workflow", isOn: Binding(
+                get: { settingsStore.autoWorkflowEnabled() },
+                set: { settingsStore.setAutoWorkflowEnabled($0) }
+            ))
+            .toggleStyle(.switch)
+            .hoverTooltip("Automatically choose a workflow, or no workflow, for the first message you send from the composer in a new session. Manual selections take precedence.", .top)
+            .padding(sectionContentPadding)
+            Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: rowVerticalSpacing) {
                     workflowSections

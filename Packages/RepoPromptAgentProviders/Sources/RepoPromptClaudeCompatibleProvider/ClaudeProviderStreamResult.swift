@@ -15,6 +15,7 @@ public struct ClaudeProviderStreamResult: Sendable, Equatable {
     public let toolArgs: String?
     public let toolOutput: String?
     public let toolInvocationID: UUID?
+    public let claudeToolUseID: String?
     public let toolResultJSON: String?
     public let toolArgsJSON: String?
     public let toolIsError: Bool?
@@ -35,6 +36,7 @@ public struct ClaudeProviderStreamResult: Sendable, Equatable {
         toolArgs: String? = nil,
         toolOutput: String? = nil,
         toolInvocationID: UUID? = nil,
+        claudeToolUseID: String? = nil,
         toolResultJSON: String? = nil,
         toolArgsJSON: String? = nil,
         toolIsError: Bool? = nil,
@@ -54,6 +56,7 @@ public struct ClaudeProviderStreamResult: Sendable, Equatable {
         self.toolArgs = toolArgs
         self.toolOutput = toolOutput
         self.toolInvocationID = toolInvocationID
+        self.claudeToolUseID = claudeToolUseID
         self.toolResultJSON = toolResultJSON
         self.toolArgsJSON = toolArgsJSON
         self.toolIsError = toolIsError

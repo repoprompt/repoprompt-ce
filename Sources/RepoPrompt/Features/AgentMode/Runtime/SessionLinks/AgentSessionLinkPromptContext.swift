@@ -716,7 +716,7 @@ struct AgentSessionLinkOutboundPromptClaim: Hashable {
     /// The exact observer incarnation this claim was rendered for. Acceptance never transfers its
     /// inventory or passive receipt to a successor incarnation.
     var observerEndpoint: DomainAgentSessionLinkEndpointIdentity?
-    /// Frozen from the initial route and the ACTUALLY rendered batch. Codex qualifies without copy.
+    /// Upgraded only before acquisition from current-route proof; removable until release.
     let routineQuietCheckIn: Bool
 
     init(
@@ -1228,6 +1228,17 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             state.renderedResult = rendered
         }
         guard !requiresLaneBatch || rendered.passiveBatch != nil else {
+            if routineQuietCheckIn, let reserved = state.pending[dispatchID],
+               ClaimFingerprint(reserved) == ClaimFingerprint(
+                   membershipKind: membershipKind, inventory: inventory, passiveNotices: passiveBatch,
+                   laneGuidanceMode: laneGuidanceMode, inventoryGuidanceRevision: fingerprint.inventoryGuidanceRevision,
+                   routineQuietCheckIn: false
+               )
+            {
+                // An optional hint cannot destroy the same valid ordinary reservation.
+                state.recordPossibleDelivery(of: reserved)
+                return .claimed(reserved)
+            }
             // Membership consumed the shared byte budget. Starting a wake on a membership-only turn
             // would spend the observer's one automatic follow-up on content it did not need, so abort
             // and leave the lane batch owed.
@@ -1294,6 +1305,14 @@ final class AgentSessionLinkOutboundPromptClaimStore {
             observerEndpoint: epoch.endpoint,
             routineQuietCheckIn: effectiveRoutineQuietCheckIn
         )
+        if let reserved = state.pending[dispatchID], !reserved.routineQuietCheckIn,
+           claim.routineQuietCheckIn, reserved.passiveQueue == claim.passiveQueue,
+           reserved.membership == claim.membership, reserved.passive != claim.passive
+        {
+            // The hint may spend spare budget, never replace an already reserved receipt.
+            state.recordPossibleDelivery(of: reserved)
+            return .claimed(reserved)
+        }
         claim.localInput = decorateLocalInputs(rendered)
         state.setPending(claim)
         // Recorded at hand-off, not at dispatch: the store never learns whether the caller's transport

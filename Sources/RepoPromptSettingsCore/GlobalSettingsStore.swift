@@ -48,6 +48,7 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     @Published package private(set) var nonGitCodeMapsEnabled: Bool = false
     @Published package private(set) var modelRouterSettingsRevision: UInt64 = 0
     @Published package private(set) var autoEffortSettingsRevision: UInt64 = 0
+    @Published package private(set) var autoWorkflowSettingsRevision: UInt64 = 0
     private var routerDemandObservers: [UUID: AsyncStream<RoutingSettingsSnapshot>.Continuation] = [:]
     /// Non-nil when the on-disk settings file is blocked (unreadable or a newer schema).
     /// UI surfaces this when the store cannot safely repair the document automatically.
@@ -302,6 +303,15 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         agentModelsSettingsByWorkspaceID[workspaceID] ?? WorkspaceAgentModelsSettings()
     }
 
+    package func setWorkspaceAgentRepromptEnabled(workspaceID: UUID, enabled: Bool) {
+        var settings = workspaceAgentModelsSettings(for: workspaceID)
+        guard (settings.agentRepromptEnabled ?? false) != enabled else { return }
+        settings.agentRepromptEnabled = enabled ? true : nil
+        agentModelsSettingsByWorkspaceID[workspaceID] = settings
+        save()
+        postAgentModelsSettingsDidChange(scope: .workspace(workspaceID))
+    }
+
     package func setWorkspaceAgentModelsInheritanceMode(
         workspaceID: UUID,
         mode: AgentModelsInheritanceMode
@@ -338,7 +348,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         let normalized = normalizedAgentModelsProfile(profile)
         let settings = WorkspaceAgentModelsSettings(
             inheritanceMode: existing?.inheritanceMode ?? .useWorkspaceOverrides,
-            profile: normalized
+            profile: normalized,
+            agentRepromptEnabled: existing?.agentRepromptEnabled
         )
         agentModelsSettingsByWorkspaceID[workspaceID] = settings
         recordAgentModelsProfileWriteDiagnostic(
@@ -522,7 +533,8 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             let normalized = normalizedAgentModelsProfile(profile)
             agentModelsSettingsByWorkspaceID[workspaceID] = WorkspaceAgentModelsSettings(
                 inheritanceMode: .useWorkspaceOverrides,
-                profile: normalized
+                profile: normalized,
+                agentRepromptEnabled: agentModelsSettingsByWorkspaceID[workspaceID]?.agentRepromptEnabled
             )
             recordAgentModelsProfileWriteDiagnostic(
                 scope: .workspace,
@@ -1065,7 +1077,9 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             autoEffortEnabled: autoEffortEnabled(),
             routerRevision: modelRouterSettingsRevision,
             autoEffortBackendRawValue: scalarPreferences.agentMode?.autoEffortBackendRawValue,
-            autoEffortRevision: autoEffortSettingsRevision
+            autoEffortRevision: autoEffortSettingsRevision,
+            autoWorkflowEnabled: autoWorkflowEnabled(),
+            autoWorkflowRevision: autoWorkflowSettingsRevision
         )
     }
 
@@ -1091,6 +1105,18 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
         guard scalarPreferences.agentMode?.autoEffortBackendRawValue != raw else { return }
         updateAgentModeScalar(commit: false) { $0.autoEffortBackendRawValue = raw }
         autoEffortSettingsRevision &+= 1
+        publishRouterDemand()
+        if commit { save() }
+    }
+
+    package func autoWorkflowEnabled() -> Bool {
+        scalarPreferences.agentMode?.autoWorkflowEnabled == true
+    }
+
+    package func setAutoWorkflowEnabled(_ enabled: Bool, commit: Bool = true) {
+        guard autoWorkflowEnabled() != enabled else { return }
+        updateAgentModeScalar(commit: false) { $0.autoWorkflowEnabled = enabled ? true : nil }
+        autoWorkflowSettingsRevision &+= 1
         publishRouterDemand()
         if commit { save() }
     }
@@ -1562,6 +1588,9 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
             var settings = preferences.modelRouter ?? GlobalScalarPreferences.ModelRouterSettings()
             mutation(&settings)
             preferences.modelRouter = settings
+        }
+        if before?.selectedBackendRawValue != scalarPreferences.modelRouter?.selectedBackendRawValue {
+            autoWorkflowSettingsRevision &+= 1
         }
         if before != scalarPreferences.modelRouter {
             modelRouterSettingsRevision &+= 1
@@ -2070,9 +2099,15 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
 
     private func load(notifyAgentModelsChanges: Bool = false) {
         let oldRouterSettings = scalarPreferences.modelRouter
+        let oldAutoWorkflowEnabled = autoWorkflowEnabled()
         let oldEnabled = autoEffortEnabled()
         let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
         defer {
+            if oldAutoWorkflowEnabled != autoWorkflowEnabled()
+                || oldRouterSettings?.selectedBackendRawValue != scalarPreferences.modelRouter?.selectedBackendRawValue
+            {
+                autoWorkflowSettingsRevision &+= 1
+            }
             if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
             if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
                 autoEffortSettingsRevision &+= 1
@@ -2197,9 +2232,15 @@ package class GlobalSettingsStore: ObservableObject, CodexHookApprovalSettingsPr
     @discardableResult
     package func reloadFromDisk() -> Bool {
         let oldRouterSettings = scalarPreferences.modelRouter
+        let oldAutoWorkflowEnabled = autoWorkflowEnabled()
         let oldEnabled = autoEffortEnabled()
         let oldBackend = scalarPreferences.agentMode?.autoEffortBackendRawValue
         defer {
+            if oldAutoWorkflowEnabled != autoWorkflowEnabled()
+                || oldRouterSettings?.selectedBackendRawValue != scalarPreferences.modelRouter?.selectedBackendRawValue
+            {
+                autoWorkflowSettingsRevision &+= 1
+            }
             if oldRouterSettings != scalarPreferences.modelRouter { modelRouterSettingsRevision &+= 1 }
             if oldEnabled != autoEffortEnabled() || oldBackend != scalarPreferences.agentMode?.autoEffortBackendRawValue {
                 autoEffortSettingsRevision &+= 1

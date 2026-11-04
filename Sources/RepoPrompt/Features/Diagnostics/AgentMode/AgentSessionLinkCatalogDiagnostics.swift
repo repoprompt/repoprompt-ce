@@ -66,10 +66,22 @@ enum AgentSessionLinkCatalogDiagnostics {
         }
     }
 
-    private static let logger = Logger(
+    // Logger.isEnabled(type:) lacks SDK availability annotations but is absent
+    // from older supported macOS runtimes. Query the underlying OSLog instead.
+    private static let logHandle = OSLog(
         subsystem: Bundle.main.bundleIdentifier ?? "RepoPrompt",
         category: "AgentSessionLinkCatalog"
     )
+    private static let logger = Logger(logHandle)
+
+    typealias LaneCreationAddFailureBranch = WorkspaceRestoreLaneAddFailureBranch
+
+    static func laneCreationAddFailed(
+        branch: LaneCreationAddFailureBranch,
+        reason: String? = nil
+    ) {
+        logger.notice("event=create-lane-add-failed branch=\(branch.rawValue, privacy: .public) reason=\(reason ?? "none", privacy: .public)")
+    }
 
     #if DEBUG
         private final class TestCapture: @unchecked Sendable {
@@ -176,6 +188,19 @@ enum AgentSessionLinkCatalogDiagnostics {
         ))
     }
 
+    typealias ReturnedDefinition = AgentSessionLinkReturnedDefinition
+
+    /// One bounded record at an attempt's final qualification; never input to the decision.
+    @discardableResult
+    static func quietQualification(
+        tabID: UUID, reserved: Bool, candidate: Bool, routingGeneration: UInt64?,
+        definition: ReturnedDefinition, serverProof: Bool, ordinary: Bool, qualified: Bool
+    ) -> Bool {
+        guard logHandle.isEnabled(type: .default) else { return false }
+        logger.notice("event=quiet-qualification tab=\(hashedID(tabID), privacy: .public) reserved=\(reserved, privacy: .public) candidate=\(candidate, privacy: .public) routingGeneration=\(routingGeneration.map(String.init) ?? "nil", privacy: .public) definition=\(definition.rawValue, privacy: .public) serverProof=\(serverProof, privacy: .public) ordinaryOccurrence=\(ordinary, privacy: .public) qualified=\(qualified, privacy: .public)")
+        return true
+    }
+
     static func toolCallReceived(runID: UUID?, tabID: UUID?, connectionID: UUID) {
         emit(Record(
             event: .toolCallReceived,
@@ -235,6 +260,11 @@ struct AppAgentSessionLinkCatalogEventSink: AgentSessionLinkCatalogEventSink {
             AgentSessionLinkCatalogDiagnostics.repairTransition(runID: runID, tabID: tabID, outcome: outcome)
         case let .toolCallReceived(runID, tabID, connectionID):
             AgentSessionLinkCatalogDiagnostics.toolCallReceived(runID: runID, tabID: tabID, connectionID: connectionID)
+        case let .quietQualification(tabID, reserved, candidate, routingGeneration, definition, serverProof, ordinary, qualified):
+            AgentSessionLinkCatalogDiagnostics.quietQualification(
+                tabID: tabID, reserved: reserved, candidate: candidate, routingGeneration: routingGeneration,
+                definition: definition, serverProof: serverProof, ordinary: ordinary, qualified: qualified
+            )
         }
     }
 }

@@ -1,4 +1,5 @@
 import AppKit
+import KeyboardShortcuts
 @testable import RepoPromptApp
 import SwiftUI
 import XCTest
@@ -397,6 +398,38 @@ final class ResizableTextFieldTests: XCTestCase {
         XCTAssertTrue(fixture.window.firstResponder === fixture.textView)
     }
 
+    func testConfigurableRewriteKeyReplacesCommandReturnInEveryDispatchPath() throws {
+        var rewrites = 0
+        var submits = 0
+        var assigned: KeyboardShortcuts.Shortcut? = .init(.return, modifiers: [.command, .option])
+        let fixture = try ResizableTextFieldHostingFixture(
+            initialText: "draft",
+            onReturn: { submits += 1 },
+            onCommandReturn: { rewrites += 1
+                return true
+            },
+            commandReturnMatcher: { event in assigned.map { LocalKeyboardShortcut.matches(event, $0) } ?? false }
+        )
+        defer { fixture.tearDown() }
+
+        try fixture.sendReturn(modifiers: .command)
+        XCTAssertEqual(rewrites, 0, "The former fixed Command-Return must not rewrite once remapped")
+        try fixture.sendReturn(modifiers: [.command, .option])
+        try fixture.sendReturn(modifiers: [.command, .option], repeatKey: true)
+        XCTAssertEqual(rewrites, 1)
+
+        // Bindings without Command never reach performKeyEquivalent; keyDown must still honor them.
+        assigned = .init(.return, modifiers: .option)
+        try fixture.sendReturn(modifiers: .option)
+        XCTAssertEqual(rewrites, 2)
+
+        assigned = nil
+        try fixture.sendReturn(modifiers: .option)
+        try fixture.sendReturn(modifiers: .command)
+        XCTAssertEqual(rewrites, 2, "A cleared binding disables the rewrite key")
+        XCTAssertEqual(submits, 0)
+    }
+
     func testNativeSnapshotTracksVisibleTextAndCompositionForTheRenderedIdentity() throws {
         let editor = TextFieldNativeEditor()
         let firstIdentity = AnyHashable(UUID())
@@ -509,6 +542,7 @@ private final class ResizableTextFieldHostingFixture {
     private let onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?
     private let onReturn: () -> Void
     private let onCommandReturn: (() -> Bool)?
+    private let commandReturnMatcher: ((NSEvent) -> Bool)?
     private let nativeEditor: TextFieldNativeEditor?
     private var nativeEditorIdentity: AnyHashable?
     private var isTornDown = false
@@ -524,6 +558,7 @@ private final class ResizableTextFieldHostingFixture {
         onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)? = nil,
         onReturn: @escaping () -> Void = {},
         onCommandReturn: (() -> Bool)? = nil,
+        commandReturnMatcher: ((NSEvent) -> Bool)? = nil,
         nativeEditor: TextFieldNativeEditor? = nil,
         nativeEditorIdentity: AnyHashable? = nil
     ) throws {
@@ -534,6 +569,7 @@ private final class ResizableTextFieldHostingFixture {
         self.onBeginUserEditing = onBeginUserEditing
         self.onReturn = onReturn
         self.onCommandReturn = onCommandReturn
+        self.commandReturnMatcher = commandReturnMatcher
         self.nativeEditor = nativeEditor
         self.nativeEditorIdentity = nativeEditorIdentity
 
@@ -547,6 +583,7 @@ private final class ResizableTextFieldHostingFixture {
                 onBeginUserEditing: onBeginUserEditing,
                 onReturn: onReturn,
                 onCommandReturn: onCommandReturn,
+                commandReturnMatcher: commandReturnMatcher,
                 nativeEditor: nativeEditor,
                 nativeEditorIdentity: nativeEditorIdentity
             )
@@ -598,6 +635,7 @@ private final class ResizableTextFieldHostingFixture {
             onBeginUserEditing: onBeginUserEditing,
             onReturn: onReturn,
             onCommandReturn: onCommandReturn,
+            commandReturnMatcher: commandReturnMatcher,
             nativeEditor: nativeEditor,
             nativeEditorIdentity: self.nativeEditorIdentity
         )
@@ -688,6 +726,7 @@ private final class ResizableTextFieldHostingFixture {
         onBeginUserEditing: ((String, UUID?) -> TextFieldExternalEditTakeover?)?,
         onReturn: @escaping () -> Void,
         onCommandReturn: (() -> Bool)?,
+        commandReturnMatcher: ((NSEvent) -> Bool)?,
         nativeEditor: TextFieldNativeEditor?,
         nativeEditorIdentity: AnyHashable?
     ) -> CustomTextField {
@@ -704,6 +743,7 @@ private final class ResizableTextFieldHostingFixture {
             externalEditTransaction: externalEditTransaction,
             onBeginUserEditing: onBeginUserEditing,
             onCommandReturn: onCommandReturn,
+            commandReturnMatcher: commandReturnMatcher,
             nativeEditor: nativeEditor,
             nativeEditorIdentity: nativeEditorIdentity,
             currentHeightPresetIndex: Binding(

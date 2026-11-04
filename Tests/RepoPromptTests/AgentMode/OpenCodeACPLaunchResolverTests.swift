@@ -47,9 +47,11 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         )
 
         let support = try await ProviderProcessLaunchPolicy.$allowsLaunchForTesting.withValue(true) { try await resolver.probeSupport(for: config) }
+        guard support == .supported else {
+            return XCTFail("Expected fixture ACP support, got \(support)")
+        }
         let launch = try resolver.resolvedLaunch(for: config)
 
-        XCTAssertEqual(support, .supported)
         XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
     }
 

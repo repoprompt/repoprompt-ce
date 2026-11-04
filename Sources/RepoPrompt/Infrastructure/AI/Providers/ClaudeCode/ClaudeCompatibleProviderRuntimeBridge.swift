@@ -25,6 +25,7 @@ typealias ClaudeCompatiblePluginPromptDeliveryMode = RepoPromptClaudeCompatibleP
 typealias ClaudeCompatiblePluginProtocolCodec = RepoPromptClaudeCompatibleProvider.ClaudeSDKProtocolCodec
 typealias ClaudeCompatiblePluginNDJSONTranslator = RepoPromptClaudeCompatibleProvider.ClaudeSDKNDJSONTranslator
 typealias ClaudeCompatiblePluginJSONValue = RepoPromptClaudeCompatibleProvider.ClaudeProviderJSONValue
+typealias ClaudeCompatiblePluginAutoCompactWindow = RepoPromptClaudeCompatibleProvider.ClaudeAutoCompactWindow
 
 /// Infrastructure-level facade for pure Claude-compatible provider package
 /// helpers. This keeps lower-level Claude provider code from depending upward on
@@ -278,6 +279,7 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             toolArgs: providerResult.toolArgs,
             toolOutput: providerResult.toolOutput,
             toolInvocationID: providerResult.toolInvocationID,
+            claudeToolUseID: providerResult.claudeToolUseID,
             toolResultJSON: providerResult.toolResultJSON,
             toolArgsJSON: providerResult.toolArgsJSON,
             toolIsError: providerResult.toolIsError,
@@ -301,6 +303,7 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             toolArgs: streamResult.toolArgs,
             toolOutput: streamResult.toolOutput,
             toolInvocationID: streamResult.toolInvocationID,
+            claudeToolUseID: streamResult.claudeToolUseID,
             toolResultJSON: streamResult.toolResultJSON,
             toolArgsJSON: streamResult.toolArgsJSON,
             toolIsError: streamResult.toolIsError,

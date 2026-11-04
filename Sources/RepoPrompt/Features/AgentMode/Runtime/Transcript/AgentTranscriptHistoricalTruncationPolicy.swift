@@ -108,6 +108,10 @@ enum AgentTranscriptHistoricalTruncationPolicy {
             truncateSummary(&summary)
             turn.summary = summary
         }
+        if var summary = turn.quietLocal?.summary {
+            truncateSummary(&summary)
+            turn.quietLocal?.summary = summary
+        }
     }
 
     /// Truncates eligible text fields on a single activity in-place.

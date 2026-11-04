@@ -10,8 +10,22 @@ import SwiftUI
 final class ToolAvailabilityStore: ObservableObject {
     // MARK: - Published state
 
-    @Published private(set) var disabledTools: Set<String> // names only
-    @Published private(set) var globallySuppressedTools: Set<String>
+    @Published private(set) var disabledTools: Set<String> {
+        willSet {
+            if disabledTools != newValue {
+                ServerNetworkManager.catalogAdvertisementDidChange()
+            }
+        }
+    }
+
+    @Published private(set) var globallySuppressedTools: Set<String> {
+        willSet {
+            if globallySuppressedTools != newValue {
+                ServerNetworkManager.catalogAdvertisementDidChange()
+            }
+        }
+    }
+
     /// NOTE: allTools is intentionally not @Published to avoid large UI invalidations
     private(set) var allTools: [Tool] = [] // full metadata
 

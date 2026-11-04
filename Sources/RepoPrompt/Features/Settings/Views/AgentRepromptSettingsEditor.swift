@@ -4,11 +4,19 @@ import SwiftUI
 struct AgentRepromptSettingsEditor: View {
     @ObservedObject var viewModel: AgentModelsSettingsViewModel
     @State private var showsGuidance = false
+    @ObservedObject private var shortcutDisplay = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
+
+    private var repromptHelp: String {
+        let key = shortcutDisplay.localLabel(for: .repromptDraft)
+        let again = key.isEmpty ? "" : ", \(key) to re-prompt again"
+        return "Re-prompt rewrites your message into a clearer brief before it's sent; press Return to send\(again). "
+            + "Re-prompt keys can be changed in Keyboard Shortcuts settings."
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Re-prompt").font(.callout.weight(.medium))
-            Text("Re-prompt rewrites your message into a clearer brief before it's sent; press Return to send, ⌘Return to re-prompt again.")
+            Text(repromptHelp)
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Text("Model")

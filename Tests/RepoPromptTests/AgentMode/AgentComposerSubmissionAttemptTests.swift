@@ -1739,3 +1739,305 @@ private actor SlashSuggestionRuntime: NativeAgentRuntimeControlling {
         .noTurnInFlight
     }
 }
+
+// MARK: - Auto Workflow regressions
+
+@MainActor
+final class AutoWorkflowSubmissionTests: XCTestCase {
+    func testRealComposerNewDestinationPathJudgesExactlyOnce() async throws {
+        let fixture = try await makeFixture()
+        var destination: AgentModeViewModel.TabSession?
+        let result = await fixture.viewModel.executeComposerSubmitAttempt(text: Self.text, claim: fixture.claim) {
+            let id = UUID()
+            let session = fixture.viewModel.session(for: id)
+            fixture.viewModel.test_setCurrentTabIDOverride(id)
+            destination = session
+            return id
+        }
+        XCTAssertEqual(result, .submitted)
+        let requests = await fixture.backend.requests
+        XCTAssertEqual(requests.count(where: { $0.consumerID == .autoWorkflow }), 1)
+        let item = try XCTUnwrap(destination?.items.first { $0.kind == .user })
+        XCTAssertEqual(item.workflow?.builtInWorkflow, .review)
+        XCTAssertNil(destination?.selectedWorkflow)
+    }
+
+    func testChosenWorkflowReachesSubmissionWithoutChangingManualSelection() async throws {
+        let fixture = try await makeFixture()
+        let selection = await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session)
+        XCTAssertEqual(selection?.workflow, AgentWorkflow.review.definition)
+        XCTAssertNil(fixture.session.selectedWorkflow)
+        let result = await fixture.viewModel.submitUserTurnAfterFreshTaskRouting(
+            text: Self.text, claim: fixture.claim, session: fixture.session,
+            destinationTabID: fixture.session.tabID, autoWorkflow: selection
+        )
+        XCTAssertEqual(result, .submitted)
+        let item = try XCTUnwrap(fixture.session.items.first { $0.kind == .user })
+        XCTAssertEqual(item.workflow?.builtInWorkflow, .review)
+        XCTAssertEqual(item.text, Self.text)
+        XCTAssertNil(fixture.session.selectedWorkflow)
+        XCTAssertFalse(fixture.viewModel.autoWorkflowIsEligible(session: fixture.session, text: "Follow up"))
+        _ = await fixture.viewModel.chooseAutoWorkflow(text: "Follow up", claim: fixture.claim, session: fixture.session)
+        let requests = await fixture.backend.requests
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    func testNoneAndFailureSendNormally() async throws {
+        for outcome in [WorkflowTestBackend.Choice.none, .failure] {
+            let fixture = try await makeFixture(choice: outcome)
+            let selection = await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session)
+            XCTAssertNil(selection)
+            let result = await fixture.viewModel.submitUserTurnAfterFreshTaskRouting(
+                text: Self.text, claim: fixture.claim, session: fixture.session,
+                destinationTabID: fixture.session.tabID, autoWorkflow: selection
+            )
+            XCTAssertEqual(result, .submitted)
+            let item = try XCTUnwrap(fixture.session.items.first { $0.kind == .user })
+            XCTAssertNil(item.workflow)
+            XCTAssertEqual(item.text, Self.text)
+        }
+    }
+
+    func testDisabledManualResumedSlashAndMCPInputsNeverJudge() async throws {
+        let fixture = try await makeFixture()
+        fixture.store.setAutoWorkflowEnabled(false)
+        let disabled = await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session)
+        XCTAssertNil(disabled)
+        fixture.store.setAutoWorkflowEnabled(true)
+        fixture.session.selectedWorkflow = AgentWorkflow.refactor.definition
+        let manual = await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session)
+        XCTAssertNil(manual)
+        fixture.session.selectedWorkflow = nil
+        for text in ["", "/compact"] {
+            let ineligible = await fixture.viewModel.chooseAutoWorkflow(text: text, claim: fixture.claim, session: fixture.session)
+            XCTAssertNil(ineligible)
+        }
+        fixture.session.providerSessionID = "restored-provider-conversation"
+        XCTAssertFalse(fixture.viewModel.autoWorkflowIsEligible(session: fixture.session, text: Self.text))
+        fixture.session.providerSessionID = nil
+        fixture.session.hasLoadedPersistedState = false
+        XCTAssertFalse(fixture.viewModel.autoWorkflowIsEligible(session: fixture.session, text: Self.text))
+        fixture.session.hasLoadedPersistedState = true
+        fixture.session.isMCPOriginated = true
+        XCTAssertFalse(fixture.viewModel.autoWorkflowIsEligible(session: fixture.session, text: Self.text))
+        fixture.session.isMCPOriginated = false
+        fixture.session.parentSessionID = UUID()
+        XCTAssertFalse(fixture.viewModel.autoWorkflowIsEligible(session: fixture.session, text: Self.text))
+        let requests = await fixture.backend.requests
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    func testSavedBindingAndUnknownProvenanceAreNotFreshEvenWithEmptyTranscript() async throws {
+        let fixture = try await makeFixture()
+        _ = fixture.viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: fixture.session)
+        fixture.session.hasLoadedPersistedState = true
+        XCTAssertFalse(fixture.viewModel.autoWorkflowIsEligible(session: fixture.session, text: Self.text))
+        let untracked = AgentModeViewModel.TabSession(tabID: UUID())
+        fixture.viewModel.test_installLiveSession(untracked)
+        XCTAssertFalse(fixture.viewModel.autoWorkflowIsEligible(session: untracked, text: Self.text))
+    }
+
+    func testManualEditOrSettingChangeDuringJudgmentSupersedesAutomaticChoice() async throws {
+        for edit in ["select", "select-clear", "disable", "service"] {
+            let fixture = try await makeFixture(hold: true)
+            let choosing = Task { await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session) }
+            try await AsyncTestWait.waitUntil("workflow judgment started") { await fixture.backend.requestCount == 1 }
+            if edit == "disable" {
+                fixture.store.setAutoWorkflowEnabled(false)
+            } else if edit == "service" {
+                fixture.store.setModelRouterBackend(.jev)
+            } else {
+                fixture.viewModel.selectWorkflow(AgentWorkflow.refactor.definition)
+                if edit == "select-clear" { fixture.viewModel.selectWorkflow(nil) }
+            }
+            await fixture.backend.release()
+            let selection = await choosing.value
+            XCTAssertNil(selection)
+            XCTAssertEqual(fixture.session.selectedWorkflow?.builtInWorkflow, edit == "select" ? .refactor : nil)
+        }
+    }
+
+    func testCatalogChangeInvalidatesSelectionAndLongTasksUseBoundedMaskedExcerpts() async throws {
+        let fixture = try await makeFixture()
+        let longText = String(repeating: "Review the parser in /Users/private/project for errors. ", count: 120)
+        let selection = await fixture.viewModel.chooseAutoWorkflow(text: longText, claim: fixture.claim, session: fixture.session)
+        XCTAssertNotNil(selection)
+        let requests = await fixture.backend.requests
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertLessThan(request.textContext.count, 1500)
+        XCTAssertFalse(request.textContext.contains("/Users/private"))
+        fixture.viewModel.test_autoWorkflowCatalog = [AgentWorkflow.refactor.definition]
+        XCTAssertNil(fixture.viewModel.effectiveWorkflow(session: fixture.session, autoWorkflow: selection))
+    }
+
+    func testRouterEnablementDoesNotCancelWorkflowConsumer() async throws {
+        let fixture = try await makeFixture(hold: true)
+        let choosing = Task { await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session) }
+        try await AsyncTestWait.waitUntil("workflow judgment started") { await fixture.backend.requestCount == 1 }
+        fixture.store.setModelRouterEnabled(true)
+        await fixture.viewModel.modelRouterRuntime?.reconcileDemand()
+        await fixture.backend.release()
+        let selection = await choosing.value
+        XCTAssertEqual(selection?.workflow.builtInWorkflow, .review)
+    }
+
+    func testPresentedCancellationRestoresDraftAndPreventsLateDispatch() async throws {
+        let fixture = try await makeFixture(hold: true, presented: true)
+        let choosing = Task { await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session) }
+        try await AsyncTestWait.waitUntil("workflow judgment started") { await fixture.backend.requestCount == 1 }
+        XCTAssertTrue(fixture.viewModel.ui.composer.pendingSubmissions[fixture.claim.attempt.id]?.isChoosingWorkflow == true)
+        await fixture.viewModel.cancelPresentedComposerSubmission(id: fixture.claim.attempt.id)
+        let selection = await choosing.value
+        XCTAssertNil(selection)
+        XCTAssertFalse(fixture.viewModel.composerSubmitClaimIsCurrent(fixture.claim))
+        XCTAssertEqual(fixture.viewModel.retrieveDraftText(for: fixture.session.tabID), Self.text)
+        XCTAssertTrue(fixture.session.items.isEmpty)
+        await fixture.backend.release()
+        XCTAssertTrue(fixture.viewModel.autoWorkflowJudgments.isEmpty)
+    }
+
+    func testLatePreparationRevalidationAndRejectedSendNeverInstallAutomaticPickerState() async throws {
+        let fixture = try await makeFixture()
+        let selection = await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session)
+        XCTAssertNotNil(selection)
+        fixture.session.userWorkflowSelectionMutationGeneration &+= 1
+        XCTAssertNil(fixture.viewModel.effectiveWorkflow(session: fixture.session, autoWorkflow: selection))
+        let rejected = fixture.viewModel.submitUserTurn(text: "", tabID: fixture.session.tabID, autoWorkflow: selection)
+        XCTAssertEqual(rejected, .blocked(message: ""))
+        XCTAssertNil(fixture.session.selectedWorkflow)
+    }
+
+    func testEffectiveBuiltInWorkflowIsIncludedInAutoEffortJudgment() async throws {
+        let fixture = try await makeFixture()
+        fixture.store.setAutoEffortBackend(fixture.backend.id)
+        fixture.store.setAutoEffortEnabled(true)
+        let selection = await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session)
+        _ = await fixture.viewModel.submitUserTurnAfterAutoEffort(
+            text: Self.text, claim: fixture.claim, session: fixture.session,
+            destinationTabID: fixture.session.tabID, autoWorkflow: selection
+        )
+        let requests = await fixture.backend.requests
+        let effort = try XCTUnwrap(requests.first { $0.consumerID == .autoEffort })
+        XCTAssertTrue(effort.textContext.contains("BUILT_IN_WORKFLOW_CATEGORY:\nreview"))
+        let custom = AgentWorkflowDefinition(customID: UUID(), displayName: "Private custom", template: "PRIVATE")
+        XCTAssertFalse(AutoEffortModelPolicy.shouldJudgeWorkflow(custom))
+    }
+
+    func testWorkflowInvalidatedDuringEffortDropsStaleEffortSelection() async throws {
+        let fixture = try await makeFixture(holdEffort: true)
+        fixture.store.setAutoEffortBackend(fixture.backend.id)
+        fixture.store.setAutoEffortEnabled(true)
+        let selection = await fixture.viewModel.chooseAutoWorkflow(text: Self.text, claim: fixture.claim, session: fixture.session)
+        let sending = Task {
+            await fixture.viewModel.submitUserTurnAfterAutoEffort(
+                text: Self.text, claim: fixture.claim, session: fixture.session,
+                destinationTabID: fixture.session.tabID, autoWorkflow: selection
+            )
+        }
+        try await AsyncTestWait.waitUntil("effort judgment started") { await fixture.backend.requestCount == 2 }
+        fixture.store.setAutoWorkflowEnabled(false)
+        await fixture.backend.release()
+        let result = await sending.value
+        XCTAssertEqual(result, .submitted)
+        XCTAssertNil(fixture.session.items.first { $0.kind == .user }?.workflow)
+        XCTAssertEqual(fixture.session.automationTurnAudit.last?.autoEffort.decision, .fallback)
+        XCTAssertTrue(fixture.session.automationTurnAudit.last?.autoEffort.fallbackApplied == true)
+    }
+
+    private static let text = "Review the parser for correctness and edge cases"
+
+    private struct Fixture {
+        let viewModel: AgentModeViewModel
+        let store: GlobalSettingsStore
+        let backend: WorkflowTestBackend
+        let session: AgentModeViewModel.TabSession
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+    }
+
+    private func makeFixture(choice: WorkflowTestBackend.Choice = .review, hold: Bool = false, presented: Bool = false, holdEffort: Bool = false) async throws -> Fixture {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let suite = "AutoWorkflowSubmission.\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("settings.json")))
+        let backend = WorkflowTestBackend(choice: choice, hold: hold || holdEffort, heldConsumer: holdEffort ? .autoEffort : .autoWorkflow)
+        store.setModelRouterBackend(backend.id)
+        store.setModelRouterEnabled(false)
+        store.setAutoWorkflowEnabled(true)
+        let runtime = try AgentTaskRouterRuntime(registrations: [.init(service: backend)], demandSource: store)
+        await runtime.reconcileDemand()
+        let viewModel = AgentModeViewModel(
+            testWorkspacePath: root.path,
+            codexControllerFactory: { _, _, _, _, _, _ in preconditionFailure("Auto Workflow test must not launch Codex") },
+            headlessProviderFactory: { _, _ in UnsupportedHeadlessAgentProvider(reason: "test terminal") },
+            testModelRouterSettingsStore: store
+        )
+        viewModel.modelRouterRuntime = runtime
+        viewModel.test_autoWorkflowCatalog = [AgentWorkflow.review.definition, AgentWorkflow.refactor.definition]
+        let workspace = WorkspaceModel(id: UUID(), dateModified: Date(), name: "Auto Workflow", repoPaths: [root.path], lastUsed: Date(), composeTabs: [])
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        viewModel.test_installSessionIndexSnapshot([:], owner: owner, latestOwner: owner, activeWorkspace: workspace)
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = viewModel.session(for: tabID)
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = "claude-opus-5-5"
+        session.selectedClaudeEffortRaw = "high"
+        XCTAssertTrue(viewModel.autoWorkflowIsEligible(session: session, text: Self.text))
+        viewModel.storeDraftText(for: tabID, Self.text)
+        let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(id: UUID(), target: target, inputRevision: 0, noticeRevision: 0, rawDraftSnapshot: Self.text)
+        let result = presented ? viewModel.claimComposerSubmitForImmediatePresentation(attempt) : viewModel.claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false)
+        guard case let .claimed(claim) = result else { throw NSError(domain: "AutoWorkflowTests", code: 1) }
+        addTeardownBlock { @MainActor in
+            await backend.release()
+            viewModel.releaseComposerSubmitClaim(claim)
+            await viewModel.prepareForWindowClose()
+            await runtime.teardown()
+            defaults.removePersistentDomain(forName: suite)
+            try? FileManager.default.removeItem(at: root)
+        }
+        return Fixture(viewModel: viewModel, store: store, backend: backend, session: session, claim: claim)
+    }
+}
+
+private actor WorkflowTestBackend: DecisionService {
+    enum Choice { case review, none, failure }
+    nonisolated let id = DecisionServiceID(rawValue: "workflow-test")
+    nonisolated let displayName = "Workflow Test"
+    nonisolated let capabilities = AutoWorkflowPolicyTests.capabilities
+    private let choice: Choice
+    private var hold: Bool
+    private let heldConsumer: DecisionConsumerID
+    private var gate: CheckedContinuation<Void, Never>?
+    private(set) var requests: [FiniteChoiceDecisionRequest] = []
+    var requestCount: Int {
+        requests.count
+    }
+
+    init(choice: Choice, hold: Bool, heldConsumer: DecisionConsumerID) {
+        self.choice = choice
+        self.hold = hold
+        self.heldConsumer = heldConsumer
+    }
+
+    func readinessSnapshot() -> DecisionReadiness {
+        .ready(generation: 1, policyVersion: "test-v1")
+    }
+
+    func decide(_ request: FiniteChoiceDecisionRequest) async -> DecisionOutcome {
+        requests.append(request)
+        if hold, request.consumerID == heldConsumer { await withCheckedContinuation { gate = $0 } }
+        if choice == .failure { return .failed(category: .transport, retryable: false, evidence: nil) }
+        let key = request.consumerID == .autoWorkflow
+            ? (choice == .none ? "workflow-none" : request.question.choices.first { $0.description.contains("Built-in category: review.") }?.opaqueKey)
+            : request.question.choices.first?.opaqueKey
+        return key.map { .selected(opaqueKey: $0, evidence: nil) } ?? .unavailable
+    }
+
+    func release() {
+        hold = false
+        gate?.resume()
+        gate = nil
+    }
+}

@@ -214,8 +214,10 @@ struct AgentModeChatDetailView: View {
     @State private var lastPresentedPendingSendByTab: [UUID: UUID] = [:]
     @StateObject private var scrollEngine = AgentTranscriptScrollEngine()
 
-    // Non-grouped state
+    /// Non-grouped state
     @State private var resetTextFieldTrigger = false
+    // Held without observation so drag updates re-render only the overlay, not the pane.
+    @State private var attachmentDropController = AgentAttachmentDropController()
     @State private var isTranscriptWindowExpanded = false
 
     // MARK: - Computed Shims (bridge existing references to struct members)
@@ -1780,7 +1782,25 @@ struct AgentModeChatDetailView: View {
                 )
             }
             .frame(maxHeight: .infinity)
+            .overlay {
+                AgentAttachmentDropOverlay(controller: attachmentDropController)
+            }
+            .onDrop(of: AgentAttachmentPaneDropDelegate.acceptedTypes, delegate: attachmentPaneDropDelegate)
+            .environment(\.agentAttachmentDropController, attachmentDropController)
+            .environment(\.agentAttachmentDropHandler, attachmentPaneDropDelegate.performDrop(pasteboard:))
         }
+    }
+
+    private var attachmentPaneDropDelegate: AgentAttachmentPaneDropDelegate {
+        let tabID = currentTabID
+        let agentModeVM = agentModeVM
+        return AgentAttachmentPaneDropDelegate(
+            controller: attachmentDropController,
+            currentTabID: { tabID },
+            prepareAttach: { tabID in
+                agentModeVM.prepareAttachmentIntake(tabID: tabID)
+            }
+        )
     }
 
     // MARK: - Chat Transcript

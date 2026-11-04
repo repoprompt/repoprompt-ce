@@ -931,6 +931,13 @@ enum AgentApprovalDecision: Hashable {
     case acceptWithExecpolicyAmendment(String)
     case decline
     case cancel
+
+    static func parseExecpolicyAmendment(_ json: String) -> [String]? {
+        guard let values = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String],
+              !values.isEmpty
+        else { return nil }
+        return values
+    }
 }
 
 enum AgentApprovalRequestID: Hashable {
@@ -1037,6 +1044,8 @@ struct AgentApprovalRequest: Identifiable, Hashable {
     let cwd: String?
     let grantRoot: String?
     let proposedExecpolicyAmendmentJSON: String?
+    /// Codex's top-level advertised choices. Nil preserves legacy behavior; empty permits nothing.
+    let availableDecisions: [AgentApprovalDecision]?
     /// ACP-only snapshot of genuine one-time allow availability; submission rechecks the live request.
     let overseerOneTimeAllowAvailable: Bool?
     /// ACP-only availability of the ordinary one-time decision, derived from live provider options.
@@ -1058,6 +1067,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         cwd: String? = nil,
         grantRoot: String? = nil,
         proposedExecpolicyAmendmentJSON: String? = nil,
+        availableDecisions: [AgentApprovalDecision]? = nil,
         overseerOneTimeAllowAvailable: Bool? = nil,
         plainApproveAvailable: Bool? = nil,
         sessionApprovalScope: AgentApprovalSessionScope? = nil,
@@ -1082,6 +1092,7 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         self.cwd = cwd
         self.grantRoot = grantRoot
         self.proposedExecpolicyAmendmentJSON = proposedExecpolicyAmendmentJSON
+        self.availableDecisions = availableDecisions
         self.overseerOneTimeAllowAvailable = overseerOneTimeAllowAvailable
         self.plainApproveAvailable = plainApproveAvailable
         self.sessionApprovalScope = sessionApprovalScope
@@ -1110,13 +1121,70 @@ struct AgentApprovalRequest: Identifiable, Hashable {
         }
     }
 
+    /// Request authority only. The coordinator additionally intersects the live Computer Use rule.
+    func allows(_ decision: AgentApprovalDecision) -> Bool {
+        guard case .codex = requestID else {
+            switch decision {
+            case .accept: return supportsPlainApprove
+            case .acceptForSession: return sessionApprovalScope != .oneTime
+            case .acceptWithExecpolicyAmendment: return kind == .commandExecution && sessionApprovalScope == nil
+            case .decline, .cancel: return true
+            }
+        }
+        if case let .acceptWithExecpolicyAmendment(json) = decision {
+            guard kind == .commandExecution,
+                  let amendment = AgentApprovalDecision.parseExecpolicyAmendment(json)
+            else { return false }
+            guard let availableDecisions else { return true }
+            return availableDecisions.contains { advertised in
+                guard case let .acceptWithExecpolicyAmendment(value) = advertised else { return false }
+                guard let advertised = AgentApprovalDecision.parseExecpolicyAmendment(value) else { return false }
+                return advertised.elementsEqual(amendment) { $0.utf8.elementsEqual($1.utf8) }
+            }
+        }
+        return availableDecisions?.contains(decision) ?? true
+    }
+
+    var rememberedDecision: AgentApprovalDecision? {
+        if case .codex = requestID, let availableDecisions {
+            if let amendment = availableDecisions.first(where: {
+                if case .acceptWithExecpolicyAmendment = $0 { return allows($0) }
+                return false
+            }) { return amendment }
+        } else if let json = proposedExecpolicyAmendmentJSON, !json.isEmpty {
+            let decision = AgentApprovalDecision.acceptWithExecpolicyAmendment(json)
+            if allows(decision) { return decision }
+        }
+        return allows(.acceptForSession) ? .acceptForSession : nil
+    }
+
+    /// The amendment shown alongside Remember, without letting legacy metadata override a list.
+    var presentedExecpolicyAmendmentJSON: String? {
+        if case .codex = requestID, availableDecisions != nil {
+            guard case let .acceptWithExecpolicyAmendment(json)? = rememberedDecision else { return nil }
+            return json
+        }
+        return proposedExecpolicyAmendmentJSON
+    }
+
+    var supportsExecpolicyAmendment: Bool {
+        guard kind == .commandExecution, sessionApprovalScope == nil else { return false }
+        guard case .codex = requestID, availableDecisions != nil else { return true }
+        if case .acceptWithExecpolicyAmendment? = rememberedDecision { return true }
+        return false
+    }
+
     var supportsPlainApprove: Bool {
-        guard case .acp = requestID else { return true }
-        return plainApproveAvailable == true
+        switch requestID {
+        case .codex: allows(.accept)
+        case .acp: plainApproveAvailable == true
+        case .claudeControl: true
+        }
     }
 
     var supportsAlwaysAllow: Bool {
-        sessionApprovalScope != .oneTime
+        if case .codex = requestID { return rememberedDecision != nil }
+        return sessionApprovalScope != .oneTime
     }
 
     var sessionApprovalLabel: String {

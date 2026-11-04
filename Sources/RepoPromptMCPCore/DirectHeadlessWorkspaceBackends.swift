@@ -155,19 +155,20 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         let action = args["action"]?.stringValue ?? "list"
         switch action {
         case "list":
-            return try await workspaceCatalogResult(includeBinding: false)
+            return try await workspaceCatalogResult(
+                includeBinding: false,
+                includeHidden: args["include_hidden"]?.boolValue == true
+            )
         case "switch":
             guard let selector = args["workspace"]?.stringValue else {
                 throw MCPError.invalidParams("switch requires workspace")
             }
             let catalog = await runtime.workspaceStore.snapshot()
-            let matches = catalog.workspaces.filter {
-                $0.document.workspaceID.uuidString == selector
-                    || $0.document.metadata.name.localizedCaseInsensitiveCompare(selector) == .orderedSame
-            }
-            guard matches.count == 1, let workspace = matches.first else {
-                throw MCPError.invalidParams("workspace is unknown or ambiguous")
-            }
+            let workspace = try resolveWorkspace(
+                selector,
+                in: catalog,
+                includeHidden: args["include_hidden"]?.boolValue == true
+            )
             let activeID = workspace.document.metadata.activeContextID
             guard let chosen = workspace.contexts.first(where: { $0.metadata.identity.contextID == activeID })
                 ?? workspace.contexts.first
@@ -267,7 +268,17 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         let catalog = await runtime.workspaceStore.snapshot()
         let workspace: DomainWorkspaceSnapshot
         if let selector = args["workspace"]?.stringValue {
-            workspace = try resolveWorkspace(selector, in: catalog, includeHidden: args["include_hidden"]?.boolValue == true)
+            switch action {
+            case "unhide":
+                // Restoring hidden workspaces is unhide's purpose, so its names match them without include_hidden.
+                workspace = try resolveWorkspace(selector, in: catalog, includeHidden: true)
+            case "hide":
+                // A unique visible name wins; otherwise a unique hidden name, so re-hiding is idempotent.
+                workspace = try (try? resolveWorkspace(selector, in: catalog, includeHidden: false))
+                    ?? resolveWorkspace(selector, in: catalog, includeHidden: true)
+            default:
+                workspace = try resolveWorkspace(selector, in: catalog, includeHidden: args["include_hidden"]?.boolValue == true)
+            }
         } else {
             let current = try await context.snapshot(for: request)
             workspace = current.workspace
@@ -503,9 +514,16 @@ actor DirectHeadlessGlobalBackend: DomainGlobalControlBackend {
         }
     }
 
-    private func workspaceCatalogResult(includeBinding: Bool) async throws -> DomainPhysicalToolResult {
+    /// `includeHidden` defaults to the full inventory, which `bind_context list` and `list_tabs` keep;
+    /// only `manage_workspaces list` publishes a hidden-workspace rule.
+    private func workspaceCatalogResult(
+        includeBinding: Bool,
+        includeHidden: Bool = true
+    ) async throws -> DomainPhysicalToolResult {
         let catalog = await runtime.workspaceStore.snapshot()
-        let workspaces = catalog.workspaces.map { workspace in
+        let workspaces = catalog.workspaces.filter {
+            includeHidden || !$0.document.metadata.isHiddenInMenus
+        }.map { workspace in
             Value.object([
                 "workspace_id": .string(workspace.document.workspaceID.uuidString),
                 "name": .string(workspace.document.metadata.name),

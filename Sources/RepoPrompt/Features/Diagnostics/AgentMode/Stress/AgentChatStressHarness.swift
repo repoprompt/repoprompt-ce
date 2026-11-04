@@ -1389,14 +1389,14 @@
             let events = try await collectPersistedCodexFixtureEvents(named: fixtureName, threadID: threadID)
             guard !events.isEmpty else { return nil }
             guard let toolCall = events.first(where: {
-                if case let .toolCall(name, _, _) = $0 {
+                if case let .toolCall(name, _, _, _) = $0 {
                     return name == "bash"
                 }
                 return false
             }) else {
                 return nil
             }
-            guard case let .toolCall(_, invocationID, argsJSON) = toolCall else {
+            guard case let .toolCall(_, invocationID, argsJSON, _) = toolCall else {
                 return nil
             }
             let runningUpdates = events.compactMap { event -> CodexNativeSessionController.CommandExecutionRunningUpdate? in
@@ -1418,7 +1418,7 @@
                 switch event {
                 case .toolCall, .commandExecutionRunning:
                     true
-                case .toolResult, .turnStarted, .turnCompleted, .assistantDelta, .canonicalAssistantDelta, .assistantCompleted, .reasoningDelta, .reasoningCompleted, .tokenUsage, .contextCompacted, .approvalRequest, .permissionsRequest, .requestUserInput, .mcpElicitationRequest, .serverRequestIssue, .livenessActivity, .errorNotification, .error, .system:
+                case .toolResult, .turnStarted, .turnCompleted, .assistantDelta, .canonicalAssistantDelta, .assistantCompleted, .reasoningDelta, .reasoningCompleted, .responseUsage, .tokenUsage, .contextCompacted, .approvalRequest, .permissionsRequest, .requestUserInput, .mcpElicitationRequest, .serverRequestIssue, .livenessActivity, .errorNotification, .error, .system:
                     false
                 }
             }

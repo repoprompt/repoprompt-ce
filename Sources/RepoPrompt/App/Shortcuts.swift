@@ -26,7 +26,28 @@ extension KeyboardShortcuts.Name {
     static let copyAgentSessionID = sessionAction("copyAgentSessionID", default: .init(.c, modifiers: [.command, .option]))
     static let deleteAgentSession = Self("deleteAgentSession")
 
-    /// Preserve upgrade-time custom assignments, including explicitly cleared new actions.
+    // MARK: - Agent workflow actions (defaults follow macOS conventions and yield to saved assignments)
+
+    /// Stop the focused session's active run (⌘. is the macOS cancel/stop convention).
+    static let stopAgentRun = sessionAction("stopAgentRun", default: .init(.period, modifiers: [.command]))
+    /// Move keyboard focus to the current session's composer (⌘L focuses the primary input field in browsers).
+    static let focusAgentComposer = sessionAction("focusAgentComposer", default: .init(.l, modifiers: [.command]))
+    /// Restore the most recently stashed session (⌘W stashes; ⇧⌘T reopens the last closed tab in browsers).
+    static let reopenStashedAgentSession = sessionAction("reopenStashedAgentSession", default: .init(.t, modifiers: [.command, .shift]))
+    /// Jump to the next session with an unseen completed, failed, or waiting state.
+    static let nextAttentionAgentSession = sessionAction("nextAttentionAgentSession", default: .init(.a, modifiers: [.command, .shift]))
+
+    // MARK: - Composer-local commands
+
+    // These were fixed keys before becoming configurable, so they keep their defaults unconditionally.
+    // They are matched by the focused view, never registered with Carbon; see `LocalKeyboardShortcut`.
+
+    /// Re-prompt the composer draft again (formerly fixed ⌘↩).
+    static let repromptDraft = Self("repromptDraft", default: .init(.return, modifiers: [.command]))
+    /// Send the original text while a Re-prompt is shown (formerly fixed ⇧⌘O).
+    static let repromptSendOriginal = Self("repromptSendOriginal", default: .init(.o, modifiers: [.command, .shift]))
+
+    /// New defaults yield to upgrade-time custom assignments; explicitly cleared new actions stay cleared.
     /// The pinned library has no public name/existence enumeration API. Its documented-in-source
     /// UserDefaults prefix is used only for discovery; decoding and writes stay in the library.
     static func sessionAction(_ rawValue: String, default shortcut: KeyboardShortcuts.Shortcut) -> Self {

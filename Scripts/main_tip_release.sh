@@ -405,6 +405,7 @@ validate_public_app() {
     local signed_team_identifier="${4:-}"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$app_bundle" "$label MCP helper layout"
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$app_bundle" "arm64,x86_64" "$label architectures"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_macos_runtime_symbols.py" "$app_bundle"
     local codex_verification_args=(
         --manifest "$CODEX_MANIFEST" verify-bundle
         --arch all

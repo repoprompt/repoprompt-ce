@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import MCP
 import RepoPromptDomainRuntime
 import RepoPromptInstrumentation
 import RepoPromptSettingsCore
@@ -38,8 +39,23 @@ final class AgentQuietMarkerProducerLifetime: @unchecked Sendable {
 @MainActor
 final class AgentTabSession: ObservableObject {
     let tabID: UUID
-    var quietLedger = AgentRunQuietLedger()
-    var nonCodexContentMessageID: String?
+    var quietLedger = AgentRunQuietLedger() {
+        didSet {
+            guard oldValue.displayCandidate != quietLedger.displayCandidate else { return }
+            // Candidate loss may have no source mutation (Stop, uncertainty, successor).
+            // Reuse the existing UI refresh owner; never build from this callback.
+            derivedTranscriptSyncState = nil
+            quietTranscriptDisplayCache = nil
+            onQuietDisplayMaskChanged?(self)
+        }
+    }
+
+    var quietDisplayCandidate: AgentRunQuietLedger.DisplayCandidate? {
+        guard let candidate = quietLedger.displayCandidate,
+              isCurrentRunAttemptForCurrentBinding(candidate.owner) else { return nil }
+        return candidate
+    }
+
     let perfRecorder: any AgentModePerfRecording
     private var suppressSourceItemsChanged = false
 
@@ -51,6 +67,12 @@ final class AgentTabSession: ObservableObject {
             guard !suppressSourceItemsChanged else { return }
             if let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
             let previousIDs = liveItemIDs
+            let reconciled = reconcilingQuietCertificates(in: items, previousItems: oldValue)
+            if reconciled != items {
+                suppressSourceItemsChanged = true
+                items = reconciled
+                suppressSourceItemsChanged = false
+            }
             repairStoredSourceItemsIfNeeded(diagnosticContext: "items.didSet")
             rebuildSourceItemDerivedState()
             reconcileQuietSourceIDs(previousLiveIDs: previousIDs)
@@ -251,6 +273,31 @@ final class AgentTabSession: ObservableObject {
                 noteMonitorObservationInputsChanged()
             }
         }
+    }
+
+    var claudeTerminalAnchor: (AgentRunOwnership, AgentRunTerminalCommitBarrier.TerminalAnchor)?
+    /// A provider execution that starts after host input owns a fresh assistant segment,
+    /// even when its deferred predecessor keeps the same run attempt alive.
+    var claudeProviderOutputBoundary: (attemptID: UUID, startSequenceIndex: Int)?
+    /// Provider starts already consumed by the current attempt that still need a terminal owner.
+    var claudeLiveSuccessorTurnIDs: Set<UUID> = []
+    /// Host inputs accepted by Claude for this attempt, regardless of later steer protection.
+    var claudeAcceptedHostTurnIDs: Set<UUID> = []
+
+    func acceptClaudeHostTurn(_ turnID: UUID) {
+        claudeExpectedTurnIDs.insert(turnID)
+        claudeAcceptedHostTurnIDs.insert(turnID)
+        let supersededProviderIDs = claudeLiveSuccessorTurnIDs
+        for index in pendingClaudeSteeringInstructions.indices
+            where pendingClaudeSteeringInstructions[index].targetRunAttemptID == activeRunAttemptID
+        {
+            pendingClaudeSteeringInstructions[index].supersedingProtectedTurnIDs.subtract(supersededProviderIDs)
+        }
+        claudeLiveSuccessorTurnIDs.removeAll()
+    }
+
+    func terminalAnchor(for ownership: AgentRunOwnership) -> AgentRunTerminalCommitBarrier.TerminalAnchor {
+        claudeTerminalAnchor.flatMap { $0.0 == ownership ? $0.1 : nil } ?? .automatic
     }
 
     var activeAgentRunStartedAt: Date?
@@ -1024,10 +1071,13 @@ final class AgentTabSession: ObservableObject {
             // Usage recorded under another provider must never be reported as this provider's load.
             if selectedAgent != oldValue {
                 selectedClaudeEffortRaw = nil
+                // The cap came from the previous provider's process; the next process reports its own.
+                claudeAutoCompactWindowTokens = nil
                 batchingContextVouchSignals {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
                 }
+                reconcileContextWindowAfterIdentityChange()
             }
         }
     }
@@ -1045,8 +1095,16 @@ final class AgentTabSession: ObservableObject {
                     vouchedContextCount = nil
                     vouchedContextWindow = nil
                 }
+                reconcileContextWindowAfterIdentityChange()
             }
         }
+    }
+
+    /// The effective window belongs to a provider and model, so a switch recomputes it at once
+    /// rather than leaving the previous identity's window in place until the next usage event.
+    private func reconcileContextWindowAfterIdentityChange() {
+        guard ClaudeContextUsageEstimator.estimatesUsage(for: selectedAgent) else { return }
+        ClaudeContextUsageEstimator.reconcileContextWindow(session: self, createsUsage: false)
     }
 
     var selectedReasoningEffortRaw: String?
@@ -1121,6 +1179,9 @@ final class AgentTabSession: ObservableObject {
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     var attachmentsPendingProviderConsumptionCleanup: [AgentFileAttachment] = []
     var attachmentTurnState: AgentModeViewModel.AttachmentTurnState = .idle
+    /// `AgentSessions/attachments` of the workspace this turn was sent from, captured when its
+    /// images are reserved so a mid-turn workspace switch cannot retain them elsewhere.
+    var attachmentRetentionRoot: URL?
 
     /// Provider session ID for resumption (e.g., Claude CLI session_id)
     var providerSessionID: String?
@@ -1146,6 +1207,10 @@ final class AgentTabSession: ObservableObject {
 
     var pendingNonCodexUserInputTokenQueue: [Int] = []
     var activeNonCodexTurnTokenAccumulator: AgentModeViewModel.NonCodexTurnTokenAccumulator?
+
+    func beginProviderInitiatedTurnAccounting() {
+        activeNonCodexTurnTokenAccumulator = .init()
+    }
 
     // Codex native session identifiers and metadata
     var codexConversationID: String?
@@ -1204,6 +1269,43 @@ final class AgentTabSession: ObservableObject {
         }
         pendingNonCodexUserInputTokenQueue = snapshot.pendingTokens
         activeNonCodexTurnTokenAccumulator = snapshot.accumulator
+    }
+
+    /// `CLAUDE_CODE_AUTO_COMPACT_WINDOW` from the running Claude-native process's launch
+    /// environment, as reported by its runtime init. Not persisted: each launch reports it again.
+    /// Cleared when the provider changes or the conversation resets, because it describes one process.
+    /// A model switch keeps it: the process and its launch environment stay the same.
+    var claudeAutoCompactWindowTokens: Int?
+
+    /// The model's own context capacity as the provider last reported it, before any auto-compact
+    /// cap. Persisted with the provider and model it describes.
+    var contextWindowCapacity: AgentContextWindowCapacity?
+
+    /// The stored capacity, only while the provider and base model it was reported for stay selected.
+    var identityValidContextWindowCapacity: Int? {
+        guard let contextWindowCapacity,
+              contextWindowCapacity.tokens > 0,
+              contextWindowCapacity.agentRaw == selectedAgent.rawValue,
+              contextWindowCapacity.modelRaw == AgentContextWindowCapacity.modelKey(forRaw: selectedModelRaw)
+        else { return nil }
+        return contextWindowCapacity.tokens
+    }
+
+    func recordContextWindowCapacity(_ tokens: Int) {
+        guard tokens > 0 else { return }
+        let next = AgentContextWindowCapacity(
+            tokens: tokens,
+            agentRaw: selectedAgent.rawValue,
+            modelRaw: AgentContextWindowCapacity.modelKey(forRaw: selectedModelRaw)
+        )
+        guard contextWindowCapacity != next else { return }
+        contextWindowCapacity = next
+        isDirty = true
+    }
+
+    /// The auto-compact window, only while a Claude-native provider is selected.
+    var activeClaudeAutoCompactWindowTokens: Int? {
+        selectedAgent.usesClaudeNativeRuntime ? claudeAutoCompactWindowTokens : nil
     }
 
     var contextCompactedAt: Date? {
@@ -1626,6 +1728,7 @@ final class AgentTabSession: ObservableObject {
     }
 
     var createdByOverseerSessionID: UUID? {
+        willSet { if createdByOverseerSessionID != newValue { ServerNetworkManager.catalogAdvertisementDidChange() } }
         didSet {
             if createdByOverseerSessionID != nil { oversight.overseerActivation = nil }
         }
@@ -2087,8 +2190,23 @@ final class AgentTabSession: ObservableObject {
         runLifecycle.claimTerminalTeardown(ownership: ownership, terminalState: terminalState)
     }
 
+    private func currentQuietBaseline() -> AgentRunQuietLedger.Baseline? {
+        guard !runState.isActive,
+              derivedTranscriptSyncState == AgentModeViewModel.makeDerivedTranscriptSyncState(
+                  for: self, projectionProtection: transcriptProjectionProtection
+              ),
+              let turn = transcript.turns.last, turn.retentionTier == .full else { return nil }
+        let local = turn.quietLocal ?? AgentTranscriptQuietLocalTurn(summary: nil, conclusionActivityID: turn.conclusionActivityID, completedAt: turn.completedAt)
+        guard local.completedAt != nil else { return nil }
+        return .init(turnID: turn.id, local: local, sourceRevision: sourceItemsRevision)
+    }
+
     @discardableResult
     func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+        claudeProviderOutputBoundary = nil
+        claudeLiveSuccessorTurnIDs.removeAll()
+        claudeAcceptedHostTurnIDs.removeAll()
+        let baseline = currentQuietBaseline()
         // Host-specific responsibilities stay here: Codex routing resets and
         // exactly-once MCP prepared-epoch consumption. The neutral attempt
         // initialization (terminal-state reset + tracker begin) is delegated
@@ -2131,10 +2249,11 @@ final class AgentTabSession: ObservableObject {
                 pendingHandoff.isStagedForSend = false
             }
         }
-        nonCodexContentMessageID = nil
         let previousFacts = quietLedger.facts
-        quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent))
-        if previousFacts != quietLedger.facts { noteMonitorObservationInputsChanged() }
+        quietLedger.begin(owner: ownership, startKey: nextSequenceIndex, provider: .init(agentKind: selectedAgent), baseline: baseline)
+        if previousFacts != quietLedger.facts {
+            noteMonitorObservationInputsChanged()
+        }
         #if DEBUG
             perfRecorder.increment("run.lifecycle.attempt.started")
             perfRecorder.increment("run.lifecycle.attempt.started.source.\(source)")
@@ -2176,7 +2295,8 @@ final class AgentTabSession: ObservableObject {
         kind: AgentRunLivenessSignalKind,
         stage: AgentRunLifecycleStage,
         retryIntent: AgentRunRetryIntent = .none,
-        timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+        timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds,
+        quietDeclarationRepresentation: Bool = false
     ) -> AgentRunProgressAcceptance {
         let result = runLifecycle.recordProgress(
             ownership: ownership,
@@ -2185,7 +2305,7 @@ final class AgentTabSession: ObservableObject {
             retryIntent: retryIntent,
             timestampUptimeNanoseconds: timestampUptimeNanoseconds
         )
-        noteQuietProgress(result, kind: kind, stage: stage, retryIntent: retryIntent)
+        noteQuietProgress(result, kind: kind, stage: stage, retryIntent: retryIntent, quietDeclarationRepresentation: quietDeclarationRepresentation)
         recordRunProgressDiagnostic(result, kind: kind, stage: stage)
         return result
     }
@@ -2229,11 +2349,13 @@ final class AgentTabSession: ObservableObject {
         _ acceptance: AgentRunProgressAcceptance,
         kind: AgentRunLivenessSignalKind,
         stage: AgentRunLifecycleStage,
-        retryIntent: AgentRunRetryIntent
+        retryIntent: AgentRunRetryIntent,
+        quietDeclarationRepresentation: Bool = false
     ) {
         guard case let .accepted(snapshot) = acceptance,
               isCurrentRunAttemptForCurrentBinding(snapshot.ownership)
         else { return }
+        if quietDeclarationRepresentation, kind == .toolActivity, stage == .running, retryIntent == .none { return }
         if kind == .toolActivity || kind == .interaction || stage == .waitingForInteraction
             || stage == .retrying || stage == .cancelling || retryIntent != .none
         {
@@ -2247,20 +2369,82 @@ final class AgentTabSession: ObservableObject {
         quietLedger.noteOccurrence(owner: owner)
     }
 
+    /// Correlation owners call before a heuristic join can acquire an apparently exact UUID.
+    /// Uses the existing irreversible attempt veto; diagnostic attribution is not authority.
+    func noteUncertainToolCorrelation() {
+        guard let owner = activeRunOwnership, isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        quietLedger.noteOccurrence(owner: owner)
+    }
+
+    var hasOwnPendingQuietInteraction: Bool {
+        let snapshot = AgentModeViewModel.agentSessionLinkDeliveryReadinessSnapshot(
+            session: self, endpointMatchesGrant: true, isClosing: false
+        )
+        return snapshot.hasWaitingPrompt || snapshot.hasPendingAskUser || snapshot.hasPendingUserInputRequest
+            || snapshot.hasPendingApproval || snapshot.hasPendingPermissionsRequest
+            || snapshot.hasPendingMCPElicitationRequest || snapshot.hasPendingApplyEditsReview
+            || snapshot.hasPendingWorktreeMergeReview || hasActiveCodexHookGateOperation
+    }
+
     func noteAcceptedStream(_ result: AIStreamResult, owner: AgentRunOwnership) {
         guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        if result.type == "content" || result.type == "final_content" {
+            quietLedger.noteDeclarationAssistantText(owner: owner, text: result.text ?? "")
+        }
+        if result.type == "tool_call" || result.type == "tool_result",
+           selectedAgent == .claudeCode,
+           MCPIntegrationHelper.canonicalRepoPromptToolName(result.toolName) == MCPWindowToolName.selfNoop,
+           result.toolInvocationID != nil,
+           ToolInvocationContext.candidateClaudeToolUseID(result.claudeToolUseID.map(MCP.Value.string)) != nil,
+           // The Claude translator intentionally leaves host-owned error verdicts nil. The
+           // exact successful host result remains mandatory at the terminal association fence.
+           result.type == "tool_call" || result.toolIsError != true,
+           quietLedger.routineWakeID(owner: owner) != nil
+        {
+            // The normal tracker must still resolve the exact host/native join before terminal.
+            return
+        }
+        #if DEBUG
+            if result.type == "tool_call" || result.type == "tool_result",
+               test_quietDeclarationMembership?(result) == true { return }
+        #endif
         quietLedger.noteAcceptedStream(result, owner: owner)
     }
 
     func sealQuietCheckIn(owner: AgentRunOwnership, terminalState: AgentSessionRunState, normal: Bool, hasSuccessor: Bool) {
+        #if DEBUG
+            test_beforeQuietMetadataSeal?()
+            test_observeQuietSealEligibility?(normal)
+        #endif
         guard isCurrentRunAttemptForCurrentBinding(owner) else { return }
+        if hasOwnPendingQuietInteraction { quietLedger.noteOccurrence(owner: owner) }
         // Only positively routine candidates need a range. No history materialization or stored
         // array offset: binary-search the already ordered live suffix. Missing retained rows fail open.
         let start = normal && terminalState == .completed && !hasSuccessor ? quietLedger.candidateStartKey(owner: owner) : nil
         let rows = start.map { quietSourceSuffix(in: items, startKey: $0) } ?? items[items.endIndex...]
         let maskRevision = quietLedger.displayMaskRevision
+        let revision = sourceItemsRevision
+        var certified = false
+        if let baseline = quietLedger.baseline(owner: owner), let wakeID = quietLedger.routineWakeID(owner: owner),
+           quietLedger.canCertify(
+               owner: owner,
+               terminalState: terminalState,
+               normal: normal,
+               hasSuccessor: hasSuccessor,
+               endKey: nextSequenceIndex - 1,
+               rangeIsComplete: start != nil,
+               rows: rows
+           )
+        {
+            let members = rows.indices.filter { rows[$0].kind != .system || rows[$0].id == wakeID }
+            certified = stampQuietCheckInMembers(
+                members.map { (index: $0, id: rows[$0].id) }, wakeID: wakeID,
+                turnID: baseline.turnID, baseline: baseline.local, expectedSourceRevision: revision,
+                examinedRows: members.map { rows[$0] }
+            )
+        }
         quietLedger.settle(
-            owner: owner, terminalState: terminalState, classifiesQuietCheckIn: normal,
+            owner: owner, terminalState: terminalState, classifiesQuietCheckIn: certified,
             hasSuccessor: hasSuccessor, endKey: nextSequenceIndex - 1,
             rangeIsComplete: start != nil, rows: rows
         )
@@ -2577,17 +2761,64 @@ final class AgentTabSession: ObservableObject {
         case batchDiff
     }
 
+    /// Ordinary edits cannot carry a certificate across changed content or identity.
+    /// Only explicit hydration/route-activation/retention copies bypass this comparison.
+    private func invalidatingQuietCertificate(in item: AgentChatItem, previous: AgentChatItem) -> AgentChatItem {
+        guard item != previous else { return item }
+        var changed = item
+        changed.quietCheckInWakeID = nil
+        if previous.quietCheckInWakeID != nil { invalidateQuietSourceCaches(for: previous.id) }
+        return changed
+    }
+
+    private func invalidateQuietSourceCaches(for sourceID: UUID) {
+        let revision = quietLedger.displayMaskRevision
+        quietLedger.retireSourceIDs([sourceID])
+        quietDisplayMaskDidChange(since: revision)
+        quietTranscriptDisplayCache = nil
+        quietTranscriptArchiveDisplayCache = nil
+        // The normal turn cache token intentionally omits source payloads. A changed
+        // formerly hidden row can leave conclusion/date/count unchanged, so evict its
+        // exact turn through the existing source-anchor index as well.
+        if let anchor = fullTranscriptProjection.rowAnchorIndex[sourceID] ?? baseTranscriptProjection.rowAnchorIndex[sourceID] {
+            let turnID: UUID = switch anchor {
+            case let .request(id), let .activity(id, _, _), let .conclusion(id, _), let .summary(id), let .groupedHistory(id, _): id
+            }
+            turnProjectionCaches.removeValue(forKey: turnID)
+        }
+    }
+
+    private func reconcilingQuietCertificates(in newItems: [AgentChatItem], previousItems: [AgentChatItem]) -> [AgentChatItem] {
+        var previousByID = Dictionary(previousItems.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let reconciled = newItems.map { item in
+            guard let previous = previousByID.removeValue(forKey: item.id) else {
+                var unstamped = item
+                unstamped.quietCheckInWakeID = nil
+                return unstamped
+            }
+            return invalidatingQuietCertificate(in: item, previous: previous)
+        }
+        // Rekey/replacement can keep the row count and all formatter inputs unchanged.
+        // A removed certified identity still invalidates its old turn's prepared cache.
+        for previous in previousByID.values where previous.quietCheckInWakeID != nil {
+            invalidateQuietSourceCaches(for: previous.id)
+        }
+        return reconciled
+    }
+
     private func commitSourceItems(
         _ newItems: [AgentChatItem],
         dispatch: SourceItemsDispatch,
         payloadUpdate: SourceItemPayloadUpdate = .rebuildFromSource,
         localInputIdentity: LocalInputIdentityDisposition = .invalidate,
         diagnosticContext: String,
-        preservesQuietRange: Bool = false
+        preservesQuietRange: Bool = false,
+        preservesQuietCertificates: Bool = false
     ) {
         if !preservesQuietRange, let owner = activeRunOwnership { quietLedger.invalidateRange(owner: owner) }
         let previousIDs = liveItemIDs
-        let repair = repairedSourceItems(newItems, diagnosticContext: diagnosticContext)
+        let candidateItems = preservesQuietCertificates ? newItems : reconcilingQuietCertificates(in: newItems, previousItems: items)
+        let repair = repairedSourceItems(candidateItems, diagnosticContext: diagnosticContext)
         let repairedItems = repair.items
         let previousItemsByID: [UUID: AgentChatItem]? = if case .preserveUnchangedRows = payloadUpdate {
             Dictionary(items.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -2616,6 +2847,7 @@ final class AgentTabSession: ObservableObject {
         items = repairedItems
         suppressSourceItemsChanged = false
         rebuildSourceItemDerivedState(payloadUpdate: payloadUpdate)
+        if !preservesQuietRange { reconcileQuietSourceIDs(previousLiveIDs: previousIDs) }
         if let previousItemsByID {
             // Unchanged summary rows cannot reconstruct their retained raw result. Re-inspect
             // only changed/new rows, after ID repair and live-ID pruning, before notifying.
@@ -2623,7 +2855,6 @@ final class AgentTabSession: ObservableObject {
                 refreshEphemeralPayload(for: item)
             }
         }
-        if !preservesQuietRange { reconcileQuietSourceIDs(previousLiveIDs: previousIDs) }
         sourceItemsRevision &+= 1
         derivedTranscriptSyncState = nil
         if case let .notify(mutation) = dispatch {
@@ -2910,7 +3141,86 @@ final class AgentTabSession: ObservableObject {
         onSourceItemsChanged?(self, mutation)
     }
 
+    /// Commit a caller-certified exact membership batch. This is a proof *mutation* seam,
+    /// not declaration qualification: the terminal owner supplies complete membership and the
+    /// current ownership/observer cut.
+    /// Validate everything before either row stamps or the matching local inputs change.
+    /// The supplied baseline is provisional until the normal rebuild recomputes it from
+    /// complete source. The committed source callback, not @Published's willSet event,
+    /// pairs the complete row batch with the updated baseline and source revision.
+    @discardableResult
+    func stampQuietCheckInMembers(
+        _ members: [(index: Int, id: UUID)], wakeID: UUID,
+        turnID: UUID, baseline: AgentTranscriptQuietLocalTurn, expectedSourceRevision: Int,
+        examinedRows: [AgentChatItem]? = nil
+    ) -> Bool {
+        guard sourceItemsRevision == expectedSourceRevision, !members.isEmpty,
+              let turnIndex = transcript.turns.indices.last,
+              transcript.turns[turnIndex].id == turnID,
+              transcript.turns[turnIndex].retentionTier == .full,
+              baseline.completedAt != nil else { return false }
+        // Inspect only the current user-anchored source unit: an unprojected new request
+        // must not acquire the previous turn's proof, even with a fresh source revision.
+        let requestIndex = items.lastIndex { $0.kind == .user }
+        guard requestIndex.map({ items[$0].id }) == transcript.turns[turnIndex].request?.id else { return false }
+        guard examinedRows == nil || examinedRows?.count == members.count else { return false }
+        var indices = Set<Int>()
+        for (offset, member) in members.enumerated() {
+            #if DEBUG
+                test_quietMetadataVisitedItems += 1
+            #endif
+            guard items.indices.contains(member.index), member.index > (requestIndex ?? -1), indices.insert(member.index).inserted,
+                  items[member.index].id == member.id, items[member.index].kind != .user,
+                  items[member.index].sequenceIndex > (transcript.turns[turnIndex].request?.sequenceIndex ?? Int.min),
+                  items[member.index].quietCheckInWakeID == nil,
+                  examinedRows == nil || items[member.index] == examinedRows?[offset] else { return false }
+        }
+        /// Main-actor synchronous transaction: callbacks and save preparation see all or none.
+        func applyStamps(to source: inout [AgentChatItem]) {
+            for member in members {
+                #if DEBUG
+                    test_quietMetadataVisitedItems += 1
+                #endif
+                source[member.index].quietCheckInWakeID = wakeID
+            }
+        }
+        suppressSourceItemsChanged = true
+        // One inout access publishes one complete array, not per-member @Published updates.
+        applyStamps(to: &items)
+        suppressSourceItemsChanged = false
+        transcript.turns[turnIndex].quietLocal = AgentTranscriptQuietLocalTurn(
+            summary: nil, conclusionActivityID: baseline.conclusionActivityID, completedAt: baseline.completedAt
+        )
+        quietTranscriptDisplayCache = nil
+        quietTranscriptArchiveDisplayCache = nil
+        turnProjectionCaches.removeValue(forKey: turnID)
+        isDirty = true
+        finishIncrementalSourceItemsMutation(.metadataRange(indices.min()! ... indices.max()!))
+        return true
+    }
+
     #if DEBUG
+        var test_beforeQuietMetadataSeal: (() -> Void)?
+        var test_observeQuietSealEligibility: ((Bool) -> Void)?
+        var test_flushQuietToolObservations: (@MainActor () async -> Bool)?
+        var test_quietToolObservationsAreComplete: @MainActor () -> Bool = { true }
+        var test_quietDeclarationMembership: ((AIStreamResult) -> Bool)?
+        var test_codexQuietDeclarationMembership: ((CodexNativeSessionController.MCPToolIdentity) -> Bool)?
+        /// Actual member validation/write visits; excludes source-boundary lookup and array CoW.
+        private(set) var test_quietMetadataVisitedItems = 0
+
+        /// W0 injects already-qualified exact membership; no production caller can certify a wake.
+        @discardableResult
+        func test_stampQuietMetadata(range: ClosedRange<Int>, expectedIDs: [UUID], wakeID: UUID) -> Bool {
+            guard range.lowerBound >= 0, range.upperBound < items.count,
+                  range.count == expectedIDs.count else { return false }
+            guard let turn = transcript.turns.last, let baseline = turn.quietLocal else { return false }
+            return stampQuietCheckInMembers(
+                zip(range, expectedIDs).map { (index: $0.0, id: $0.1) }, wakeID: wakeID,
+                turnID: turn.id, baseline: baseline, expectedSourceRevision: sourceItemsRevision
+            )
+        }
+
         func testAssertSourceItemDerivedStateIsConsistent() {
             assertSourceItemDerivedStateIsConsistent()
         }
@@ -3039,7 +3349,8 @@ final class AgentTabSession: ObservableObject {
             dispatch: .silent,
             payloadUpdate: payloadUpdate,
             localInputIdentity: localInputIdentity,
-            diagnosticContext: "setItemsSilently reason=\(reason.rawValue)"
+            diagnosticContext: "setItemsSilently reason=\(reason.rawValue)",
+            preservesQuietCertificates: reason == .persistedSessionHydration || reason == .routeActivation || reason == .retentionCompaction
         )
         pendingSourceItemsMutationSummary = nil
         pendingDerivedTranscriptRefreshReason = nil
@@ -3194,9 +3505,27 @@ final class AgentTabSession: ObservableObject {
         isDirty = true
     }
 
+    @discardableResult
+    func appendAcceptedHostMarker(_ marker: AgentChatItem) -> Bool {
+        guard !liveItemIDs.contains(marker.id), quietLedger.registerHostMarker(marker) else { return false }
+        appendItem(marker, certifiedWakeID: quietLedger.hiddenSourceIDs.contains(marker.id) ? marker.id : nil)
+        return true
+    }
+
     func appendItem(_ item: AgentChatItem) {
-        if item.kind == .user { noteAcceptedTaskInput() }
+        appendItem(item, certifiedWakeID: nil)
+    }
+
+    private func appendItem(_ item: AgentChatItem, certifiedWakeID: UUID?) {
+        if item.kind == .user, let owner = activeRunOwnership, claudeTerminalAnchor?.0 == owner {
+            claudeTerminalAnchor = (owner, .exact(item.id))
+        }
+        if item.kind == .user {
+            noteAcceptedTaskInput()
+        }
         var newItem = item
+        // Ordinary insertion cannot mint or resurrect proof from a captured row copy.
+        newItem.quietCheckInWakeID = certifiedWakeID
         newItem.sequenceIndex = nextSequenceIndex
         nextSequenceIndex += 1
         let candidateItems = items + [newItem]
@@ -3227,6 +3556,7 @@ final class AgentTabSession: ObservableObject {
     func replaceItem(at index: Int, with updatedItem: AgentChatItem) {
         guard items.indices.contains(index) else { return }
         let previousItem = items[index]
+        let updatedItem = invalidatingQuietCertificate(in: updatedItem, previous: previousItem)
         guard updatedItem != previousItem else { return }
         var candidateItems = items
         candidateItems[index] = updatedItem
@@ -3261,6 +3591,7 @@ final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
+        updatedItem = invalidatingQuietCertificate(in: updatedItem, previous: previousItem)
         guard updatedItem != previousItem else { return }
         var candidateItems = items
         candidateItems[index] = updatedItem
@@ -3294,6 +3625,7 @@ final class AgentTabSession: ObservableObject {
     func removeItem(at index: Int) -> AgentChatItem? {
         guard items.indices.contains(index) else { return nil }
         let removed = items[index]
+        if removed.quietCheckInWakeID != nil { invalidateQuietSourceCaches(for: removed.id) }
         if let owner = activeRunOwnership, let start = quietLedger.startKey(owner: owner), removed.sequenceIndex >= start {
             quietLedger.invalidateRange(owner: owner)
         }
@@ -3326,6 +3658,7 @@ final class AgentTabSession: ObservableObject {
         let previousItem = items[index]
         var updatedItem = previousItem
         mutate(&updatedItem)
+        updatedItem = invalidatingQuietCertificate(in: updatedItem, previous: previousItem)
         guard updatedItem != previousItem else { return }
         var candidateItems = items
         candidateItems[index] = updatedItem

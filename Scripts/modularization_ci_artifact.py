@@ -10,6 +10,7 @@ import tarfile
 from pathlib import Path
 from swift_imports import sources_import_module
 from ci_test_coverage import listed_tests, validate_targets
+from ci_admission import METADATA as ADMISSION_METADATA, build_identity, verify_build_identity
 
 ROOT = Path(__file__).resolve().parent.parent
 METADATA = Path('.build/modularization')
@@ -31,6 +32,7 @@ def product_directory(root: Path) -> Path | None:
 
 def validate(root: Path) -> Path:
     metadata = root / METADATA
+    build_identity(root)  # If present, the transferred build must match this exact candidate tree.
     try:
         fingerprints = json.loads((metadata / 'app-source-sha256.json').read_text(encoding='utf-8'))['source_sha256']
         index = json.loads((metadata / 'index-check.json').read_text(encoding='utf-8'))['source_sha256']
@@ -73,6 +75,8 @@ def pack(root: Path, output: Path) -> int:
     products = validate(root)
     members = [root / METADATA / name for name in
                ('app-source-sha256.json', 'index-check.json', 'ci-test-list.txt', 'test-source-sha256.json', 'test-targets.json')]
+    if (root / ADMISSION_METADATA).exists():
+        members.append(root / ADMISSION_METADATA)
     members += sorted(path for path in products.iterdir()
                       if (path.is_dir() and path.suffix in {'.xctest', '.bundle', '.framework'})
                       or (path.is_file() and path.suffix == '.dylib'))
@@ -89,9 +93,12 @@ def main() -> int:
     parser.add_argument('command', choices=('pack', 'verify'))
     parser.add_argument('--root', type=Path, default=ROOT)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--admission-context', help='require the hosted root producer identity')
     args = parser.parse_args()
     root = args.root.resolve()
     try:
+        if args.admission_context is not None:
+            verify_build_identity(build_identity(root), json.loads(args.admission_context))
         if args.command == 'verify':
             print(f'CI artifact verified: {validate(root)}')
             return 0

@@ -73,7 +73,7 @@ enum OracleGroupLanePayloadLoader {
             laneIndex: member.laneID.index,
             chatID: member.publicChatID,
             providerID: profile?.providerID ?? result.providerID ?? member.model.providerID,
-            modelID: profile?.modelID ?? result.modelID,
+            modelID: AIModel.readableModelID(selectedID: result.modelID, executionID: profile?.modelID),
             effectiveReasoningEffort: profile?.effectiveReasoningEffort,
             status: markdownStatus(result.status),
             response: result.response,

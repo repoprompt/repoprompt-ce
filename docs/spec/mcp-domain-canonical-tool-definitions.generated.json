@@ -106,7 +106,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "List, inspect, and bind the canonical workspace context for this MCP connection. Bind by working_dirs (preferred) or context_id. This global tool never accepts an app window selector.",
+      "description" : "List, inspect, and bind this MCP connection's workspace context. `op` is `list`, `status`, or `bind`. App-backed `list` returns open windows and their compose tabs; `window_id` filters that list. App-backed `bind` accepts `working_dirs` (preferred), `context_id`, or `window_id`; a window bind captures and explicitly binds that window's current compose-tab context. Later visible-tab changes do not redirect the binding. Direct headless `list` returns the saved workspace/context inventory and current binding, without windows; `status` returns the current binding. Headless `bind` accepts `context_id` or `working_dirs` and rejects any supplied `window_id`. `working_dirs` matches workspace roots, exact set first, then superset fallback; descendant paths are not root selectors. App-backed calls can use window_id to disambiguate matching workspaces. Headless requires a unique eligible match. Prefer an array of absolute root paths. A string remains accepted and is split on commas; use an array when a root contains a comma. App-backed `create_if_missing=true` may create a workspace after approval when no match exists. Headless never creates a workspace implicitly: an existing match still binds when `create_if_missing` or `tab_name` is supplied, and no match is an error.",
       "inputSchema" : {
         "properties" : {
           "context_id" : {
@@ -114,7 +114,7 @@
             "type" : "string"
           },
           "create_if_missing" : {
-            "description" : "For bind with working_dirs: create a new workspace after approval if no exact or superset workspace matches",
+            "description" : "App-backed bind with working_dirs: create a workspace after approval when no exact or superset match exists. Headless ignores this flag: existing matches still bind; no match is an error and nothing is created.",
             "type" : "boolean"
           },
           "op" : {
@@ -127,12 +127,27 @@
             "type" : "string"
           },
           "tab_name" : {
-            "description" : "Optional workspace name when creating via working_dirs + create_if_missing",
+            "description" : "App-backed only: optional workspace name hint when creating through working_dirs + create_if_missing. Ignored by headless; it does not name or rename an existing match.",
             "type" : "string"
           },
+          "window_id" : {
+            "description" : "App-backed only. For list: filter to one window. For bind: capture and explicitly bind that window's current compose-tab context. Direct headless rejects this parameter when supplied.",
+            "type" : "integer"
+          },
           "working_dirs" : {
-            "description" : "For bind: comma-separated absolute workspace root paths; exact match first, then repo_paths superset fallback",
-            "type" : "string"
+            "anyOf" : [
+              {
+                "description" : "Preferred for bind: absolute workspace root paths. Exact root-set match first, then superset fallback; the match must resolve unambiguously. Each string is one root, including a path containing a comma.",
+                "items" : {
+                  "type" : "string"
+                },
+                "type" : "array"
+              },
+              {
+                "description" : "Compatibility form for bind: comma-separated absolute workspace root paths. The string is split on commas; use an array for a root containing a comma.",
+                "type" : "string"
+              }
+            ]
           }
         },
         "required" : [
@@ -149,7 +164,7 @@
         "openWorldHint" : false,
         "readOnlyHint" : false
       },
-      "description" : "Manage workspaces and compose-tab lifecycle across RepoPrompt windows.\n\n**This is the workspace inventory view.** `bind_context` remains the canonical API for per-window tab routing and context_id discovery. Legacy-compatible `list_tabs` and `select_tab` actions are restored for older clients, but new integrations should prefer `bind_context`.\n\nActions:\n• list         – Return known visible workspaces by default (id, name, repoPaths, showing window IDs, is_hidden)\n• switch       – Switch a window to a specified workspace\n• create       – Create a new workspace (optional folder_path)\n• hide         – Hide a workspace from default workspace lists without deleting it\n• unhide       – Restore a hidden workspace to default workspace lists\n• delete       – Delete a workspace permanently (optionally close window)\n• add_folder   – Add a folder to a workspace (defaults to active workspace)\n• remove_folder – Remove a folder from a workspace (defaults to active workspace)\n• list_tabs    – List compose tabs in one window (Legacy compatibility — prefer bind_context op=list)\n• select_tab   – Bind this connection to a compose tab (Legacy compatibility — prefer bind_context op=bind context_id=<id>)\n• create_tab   – Create a new compose tab in the background\n• close_tab    – Close a compose tab safely\n\nParameters:\n- action: \"list\" | \"switch\" | \"create\" | \"hide\" | \"unhide\" | \"delete\" | \"add_folder\" | \"remove_folder\" | \"list_tabs\" | \"select_tab\" | \"create_tab\" | \"close_tab\" (required)\n- workspace: string                             (required for 'switch', 'hide', 'unhide', 'delete'; optional for 'add_folder', 'remove_folder' - defaults to active workspace; UUID or name)\n- name: string                                  (required for 'create'; optional for 'create_tab')\n- folder_path: string                           (required for 'add_folder', 'remove_folder'; optional for 'create' to initialize with a root folder; absolute path)\n- tab: string                                   (required for 'select_tab'; optional for 'close_tab'; UUID or name)\n- mode: \"blank\" | \"fork\"                      (optional for 'create_tab'; default \"blank\")\n- source_tab: string                            (optional for 'create_tab' when mode=\"fork\"; UUID or name)\n- bind: boolean                                 (optional for 'create_tab'; default true)\n- focus: boolean                                (optional for 'select_tab' or 'create_tab'; if true, also switches the UI to show the tab)\n- allow_active: boolean                         (optional for 'close_tab'; default false)\n- window_id: integer                            (optional; target window, defaults to selected or only window)\n- open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it)\n- switch_to_created: boolean                    (optional for 'create'; when true, switches to the newly created workspace)\n- close_window: boolean                         (optional for 'delete'; when true, switches away without saving, deletes the workspace, then requests window close)\n- include_hidden: boolean                       (optional; default false. For 'list', includes hidden workspaces. For name-based 'switch'/'delete', allows hidden matches. UUID lookup remains explicit and can resolve hidden workspaces.)\n\nHidden workspaces remain persisted/recoverable. Default 'list' and name-based 'switch'/'delete' exclude hidden workspaces unless include_hidden=true; 'hide'/'unhide' are non-destructive. Explicit UUID switch/delete can target hidden workspaces without unhiding them.\n\n**Relationship with bind_context:**\n- `manage_workspaces.list` returns workspace inventory: names, folder paths, and which windows show each workspace\n- `bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding\n- When the same workspace is open in multiple windows, compose tabs are shared — use `bind_context` to discover per-window context_ids\n\ncreate_tab defaults to bind=true and focus=false so automation can create isolated background tabs without stealing UI focus.\n\nIMPORTANT: The 'focus' parameter switches the visible tab in the UI, which can be disruptive to the user's workflow. Only set focus=true when the user explicitly requests to see or switch to a specific tab. For background operations, omit focus or set it to false. The 'close_tab' action refuses to close the last remaining tab, the active visible tab unless allow_active=true, or any tab with a live bound run.",
+      "description" : "Manage workspaces and compose-tab lifecycle. App-backed calls operate through RepoPrompt windows; direct headless calls operate on canonical workspace contexts without windows.\n\n**This is the workspace inventory view.** `bind_context` remains the canonical API for context binding and context_id discovery. Legacy-compatible `list_tabs` and `select_tab` actions are restored for older clients, but new integrations should prefer `bind_context`.\n\nActions:\n• list         – Return known visible workspaces by default (app-backed: id, name, repo_paths, showing window IDs, is_hidden; headless: workspace_id, name, repo_paths, hidden, contexts, without window IDs)\n• switch       – App-backed: switch the target window to a workspace. Headless: bind its active context, or first stored context when none is active\n• create       – Create a new workspace (optional folder_path)\n• hide         – Hide a workspace from default workspace lists without deleting it\n• unhide       – Restore a hidden workspace to default workspace lists\n• delete       – Delete a workspace permanently (optionally close window)\n• add_folder   – Add a folder to a workspace (defaults to active workspace)\n• remove_folder – Remove a folder from a workspace (defaults to active workspace)\n• list_tabs    – List app-backed tabs in one window or headless workspace/context inventory (Legacy compatibility — prefer bind_context op=list)\n• select_tab   – Bind this connection to a compose tab: UUID or name on the app backend; canonical UUID only on headless (Legacy compatibility — prefer bind_context op=bind context_id=<id>)\n• create_tab   – Create a compose tab; app-backed creation can stay in the background. Headless has no UI\n• close_tab    – Close a compose tab safely\n\nParameters:\n- action: \"list\" | \"switch\" | \"create\" | \"hide\" | \"unhide\" | \"delete\" | \"add_folder\" | \"remove_folder\" | \"list_tabs\" | \"select_tab\" | \"create_tab\" | \"close_tab\" (required)\n- workspace: string                             (required for 'switch', 'hide', 'unhide', 'delete'; optional for 'add_folder', 'remove_folder' - defaults to active workspace; UUID or name)\n- name: string                                  (required for 'create'; optional for 'create_tab')\n- folder_path: string                           (required for 'add_folder', 'remove_folder'; optional for 'create' to initialize with a root folder; absolute path)\n- tab: string — Required for select_tab and close_tab. App-backed: compose-tab UUID or name. Headless: canonical UUID for select_tab; UUID exactly as listed or unambiguous name for close_tab. Other actions do not require tab.\n- mode: \"blank\" | \"fork\"                      (optional for 'create_tab'; default \"blank\")\n- source_tab: string                            (optional for 'create_tab' when mode=\"fork\"; UUID or name)\n- bind: boolean                                 (optional for 'create_tab'; default true)\n- focus: boolean — App-backed select_tab/create_tab: true also switches the visible tab; use only when the user requests a UI switch. Headless accepts and ignores this compatibility flag; it has no UI effect.\n- allow_active: boolean                         (optional for 'close_tab'; default false)\n- window_id: integer — App-backed target window; defaults to the selected or only window. Headless rejects this parameter when supplied.\n- open_in_new_window: boolean — App-backed switch/create: when true, open a new window and bind to it. Headless rejects true; false or omission requests no new-window effect.\n- switch_to_created: boolean — For create: when true, switch to the new workspace in the app target window, or bind its context on headless.\n- close_window: boolean — App-backed delete: true requests window closure after deletion. Headless accepts and ignores this compatibility flag; it does not prevent the delete action.\n- include_hidden: boolean                       (optional; default false. For 'list', includes hidden workspaces. For name-based 'switch'/'delete', allows hidden matches. UUID lookup remains explicit and can resolve hidden workspaces.)\n\nHidden workspaces remain persisted/recoverable. Default 'list' and name-based 'switch'/'delete' exclude hidden workspaces unless include_hidden=true; 'hide'/'unhide' are non-destructive and ignore include_hidden. Name-based 'hide' uses the unique visible match and falls back to a unique hidden match only when no visible workspace matches, so an ambiguous visible name stays ambiguous. Name-based 'unhide' needs a unique match among visible and hidden workspaces. Use a workspace UUID to disambiguate. Explicit UUID switch/delete can target hidden workspaces without unhiding them.\n\n**Relationship with bind_context:**\n- `manage_workspaces.list` returns workspace inventory; app-backed results also identify showing windows\n- App-backed `bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding. Headless lists canonical workspace/context identities and the connection binding; there is no window routing\n- App-backed: when the same workspace is open in multiple windows, compose tabs are shared — use `bind_context` to discover per-window context_ids\n\ncreate_tab defaults to bind=true and focus=false. On the app backend this allows a background tab without UI focus. Headless has no UI; bind=true selects the new context and records it as the workspace's active compose tab.\n\nIMPORTANT: App-backed 'focus' switches the visible tab in the UI, which can be disruptive to the user's workflow. Headless ignores this flag. Only set focus=true when the user explicitly requests to see or switch to a specific tab. For background operations, omit focus or set it to false. The 'close_tab' action refuses to close the last remaining tab, the active visible tab unless allow_active=true, or any tab with a live bound run.",
       "inputSchema" : {
         "properties" : {
           "action" : {
@@ -179,11 +194,11 @@
             "type" : "boolean"
           },
           "close_window" : {
-            "description" : "For 'delete': when true, switches away without saving, deletes the workspace, then requests window close.",
+            "description" : "App-backed delete: true requests window closure after deletion. Headless accepts and ignores this compatibility flag; it does not prevent the delete action.",
             "type" : "boolean"
           },
           "focus" : {
-            "description" : "For 'select_tab' or 'create_tab': if true, also switches the UI to show the tab",
+            "description" : "App-backed select_tab/create_tab: true also switches the visible tab; use only when the user requests a UI switch. Headless accepts and ignores this compatibility flag; it has no UI effect.",
             "type" : "boolean"
           },
           "folder_path" : {
@@ -203,7 +218,7 @@
             "type" : "string"
           },
           "open_in_new_window" : {
-            "description" : "For 'switch' or 'create': when true, opens workspace in a new window and binds connection to it. Returns window_id in response.",
+            "description" : "App-backed switch/create: when true, open a new window and bind to it. Headless rejects true; false or omission requests no new-window effect.",
             "type" : "boolean"
           },
           "source_tab" : {
@@ -211,15 +226,15 @@
             "type" : "string"
           },
           "switch_to_created" : {
-            "description" : "For 'create': when true, switches to the newly created workspace in the target window.",
+            "description" : "For create: when true, switch to the new workspace in the app target window, or bind its context on headless.",
             "type" : "boolean"
           },
           "tab" : {
-            "description" : "Compose tab UUID or name (required for 'select_tab'; optional for 'close_tab')",
+            "description" : "Required for select_tab and close_tab. App-backed: compose-tab UUID or name. Headless: canonical UUID for select_tab; UUID exactly as listed or unambiguous name for close_tab. Other actions do not require tab.",
             "type" : "string"
           },
           "window_id" : {
-            "description" : "Optional window ID; defaults to selected or only window",
+            "description" : "App-backed target window; defaults to the selected or only window. Headless rejects this parameter when supplied.",
             "type" : "integer"
           },
           "workspace" : {
@@ -2353,6 +2368,21 @@
       },
       "isEnabledByDefault" : true,
       "name" : "self_compact"
+    },
+    {
+      "annotations" : {
+
+      },
+      "description" : "Quietly close a routine wake that needs nothing.",
+      "inputSchema" : {
+        "additionalProperties" : false,
+        "properties" : {
+
+        },
+        "type" : "object"
+      },
+      "isEnabledByDefault" : true,
+      "name" : "self_noop"
     },
     {
       "annotations" : {

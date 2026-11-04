@@ -20,10 +20,23 @@ final class MCPAgentSessionControlToolProvider: MCPAppToolProviding {
     func buildTools() -> [Tool] {
         [
             agentSelfTool(),
+            selfNoopTool(),
             shareThoughtsTool(),
             setStatusTool(),
             waitForNextInstructionTool()
         ]
+    }
+
+    private func selfNoopTool() -> Tool {
+        runtime.tool(
+            name: MCPWindowToolName.selfNoop,
+            freshnessPolicy: .none,
+            description: AgentSelfNoopTool.definition.description,
+            inputSchema: .object(properties: [:])
+        ) { [dependencies] invocation, args in
+            _ = try await dependencies.requireAgentModeConnection(invocation.context, MCPWindowToolName.selfNoop)
+            return try await dependencies.executeAgentSelf(args)
+        }
     }
 
     private func agentSelfTool() -> Tool {

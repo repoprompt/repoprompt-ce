@@ -9,8 +9,21 @@ struct AgentRepromptComposerStrip: View {
     var onUndo: ((UUID) -> Void)?
     var onSendOriginal: ((UUID) -> Void)?
     @State private var showingOriginal = false
+    @State private var showingRewrite = false
     @State private var confirmingReplacement = false
     @State private var confirmingOriginal = false
+    /// Live assignments: both commands are user-configurable composer-local bindings.
+    @ObservedObject private var shortcutDisplay = GlobalKeyboardShortcutsCoordinator.shared.bindingDisplay
+
+    private var sendOriginalKey: String {
+        shortcutDisplay.localLabel(for: .repromptSendOriginal)
+    }
+
+    private var rewriteHint: String {
+        let key = shortcutDisplay.localLabel(for: .repromptDraft)
+        guard !key.isEmpty else { return "" }
+        return " · \(key) rewrite"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -20,14 +33,22 @@ struct AgentRepromptComposerStrip: View {
                     HStack(spacing: 6) {
                         Button {
                             if let onSendOriginal { onSendOriginal(presentation.id) } else { operation?.useOriginal() }
-                        } label: { AgentRepromptShortcutLabel(title: "Send original", shortcut: "⌘⇧O") }
-                            .keyboardShortcut("o", modifiers: [.command, .shift])
-                            .hoverTooltip("Send your original text now (⌘⇧O). Return sends the text currently in the composer.", .top)
+                        } label: { AgentRepromptShortcutLabel(title: "Send original", shortcut: sendOriginalKey) }
+                            .localKeyboardShortcut(.repromptSendOriginal)
+                            .hoverTooltip(
+                                "Send your original text now\(sendOriginalKey.isEmpty ? "" : " (\(sendOriginalKey))"). Return sends the text currently in the composer.",
+                                .top
+                            )
                         if presentation.phase != .completed {
                             Button { operation?.cancel() } label: { AgentRepromptShortcutLabel(title: "Cancel", shortcut: "esc") }
                                 .hoverTooltip("Stop rewriting and restore your original (Esc in the composer).", .top)
                         }
-                        Image(systemName: "wand.and.sparkles")
+                        if presentation.phase.isStreaming {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Image(systemName: presentation.phase == .completed ? "checkmark.circle.fill" : "wand.and.sparkles")
+                                .foregroundStyle(presentation.phase == .completed ? Color.green : Color.secondary)
+                        }
                         Text("\(presentation.phase == .completed ? "Re-prompted" : "Re-prompting") · \(presentation.modelName)\(presentation.usesChatContext ? " · with chat context" : "")")
                             .lineLimit(1).layoutPriority(1)
                         if presentation.phase != .completed {
@@ -46,7 +67,7 @@ struct AgentRepromptComposerStrip: View {
                                 .buttonStyle(.plain).accessibilityLabel("Revert to original")
                                 .hoverTooltip("Revert to original (Esc)", .top)
                             Spacer(minLength: 4)
-                            Text("↩ send · ⌘↩ rewrite · esc revert")
+                            Text("↩ send\(rewriteHint) · esc revert")
                                 .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                         } else {
                             Spacer(minLength: 4)
@@ -57,6 +78,17 @@ struct AgentRepromptComposerStrip: View {
                     }
                 }
                 .font(.caption).controlSize(.small)
+                if presentation.phase == .completed {
+                    HStack {
+                        Label(operation?.hasUserEdits == true ? "Draft ready to send" : "Rewrite complete — ready to send", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Spacer()
+                        Button("Read rewrite…") { showingRewrite = true }
+                    }
+                    .font(.callout)
+                    .padding(8)
+                    .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                }
                 if presentation.phase == .completed, presentation.startsWithProviderCommand {
                     Text("Starts with / — your agent may treat it as a command")
                         .font(.caption).foregroundStyle(.orange)
@@ -99,7 +131,34 @@ struct AgentRepromptComposerStrip: View {
             }
         }
         .padding(.horizontal, 4)
-        .onChange(of: store.presentation?.id) { _, _ in showingOriginal = false }
+        .sheet(isPresented: $showingRewrite) {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    Text("Rewritten prompt").font(.title2.bold())
+                    Spacer()
+                    Button("Done") { showingRewrite = false }
+                        .keyboardShortcut(.cancelAction)
+                }
+                ScrollView {
+                    MarkdownTextView(
+                        text: viewModel.repromptOperation?.expectedDraft ?? "",
+                        isMarkdown: true,
+                        allowInteraction: true,
+                        bareURLLinkificationPolicy: .httpHTTPSOnly
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                }
+                Text("Edit or send this prompt in the composer after closing this preview.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(24)
+            .frame(minWidth: 680, idealWidth: 800, maxWidth: .infinity, minHeight: 440, idealHeight: 600, maxHeight: .infinity)
+        }
+        .onChange(of: store.presentation?.id) { _, _ in
+            showingOriginal = false
+            showingRewrite = false
+        }
         .onChange(of: tabID) { _, _ in confirmingReplacement = false
             confirmingOriginal = false
         }
@@ -116,9 +175,9 @@ struct AgentRepromptShortcutLabel: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            if shortcutFirst { shortcutText }
+            if shortcutFirst, !shortcut.isEmpty { shortcutText }
             Text(title)
-            if !shortcutFirst { shortcutText }
+            if !shortcutFirst, !shortcut.isEmpty { shortcutText }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)

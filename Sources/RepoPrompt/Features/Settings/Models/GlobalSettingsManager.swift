@@ -233,6 +233,14 @@ extension GlobalSettingsStore {
         }
     }
 
+    func autoWorkflowConfiguration() -> AutoWorkflowConfiguration {
+        .init(
+            enabled: autoWorkflowEnabled(),
+            selectedBackendRawValue: scalarPreferences.modelRouter?.selectedBackendRawValue,
+            revision: autoWorkflowSettingsRevision
+        )
+    }
+
     func autoEffortConfiguration() -> AutoEffortConfiguration {
         .init(
             enabled: scalarPreferences.agentMode?.autoEffortEnabled == true,

@@ -223,6 +223,7 @@ enum WorkspaceCodemapGraphIndexPhase: Hashable {
     case persistingManifestCache
     case suspendedBusy
     case budgetLimited
+    case retryExhausted
     case complete
     case cancelled
     case superseded

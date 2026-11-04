@@ -406,6 +406,7 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
 run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
 run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$PACKAGED_APP_EXECUTABLE" 2>/dev/null || true
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
+run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_macos_runtime_symbols.py" "$APP_BUNDLE"
 
 if (( ! IS_RELEASE )); then
     phase "Writing debug bundle provenance"

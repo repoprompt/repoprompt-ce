@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptProcess
 import RepoPromptSecureStorage
 import RepoPromptShared
 import XCTest
@@ -615,6 +616,35 @@ private final class ExecutionCounter: @unchecked Sendable {
             XCTAssertEqual(events.generations.count, 1)
         }
 
+        /// Avoid blocking Process.waitUntilExit across actor hops and bound cleanup.
+        /// The exact mechanism of the CI hang was not identified.
+        private func withAdmissionChild(_ operation: (ChildProcessExitObserver) async throws -> Void) async throws {
+            let process = try ProcessLauncher.spawn(
+                command: "/bin/sleep", arguments: ["60"], environment: [:], workingDirectory: nil, purpose: .tool
+            )
+            let child = ChildProcessExitObserver.observe(pid: process.pid)
+            process.stdin?.closeFile()
+            process.stdout.closeFile()
+            process.stderr.closeFile()
+            do {
+                try await operation(child)
+            } catch {
+                _ = await stopAdmissionChild(child)
+                throw error
+            }
+            _ = await stopAdmissionChild(child)
+        }
+
+        private func stopAdmissionChild(_ child: ChildProcessExitObserver) async -> Bool {
+            // The observer owns reaping and closes signaling before PID reuse.
+            // Repeated cleanup after an explicit stop is therefore safe.
+            _ = child.signalRootProcessFamilyIfUnreaped(processGroupID: nil, signal: SIGKILL)
+            let outcome = await child.wait(timeout: 5)
+            let expected = ChildProcessExitObserver.Outcome.exited(.uncaughtSignal(signal: SIGKILL))
+            XCTAssertEqual(outcome, expected, "Synthetic admission child exit/cleanup was not confirmed within five seconds")
+            return outcome == expected
+        }
+
         /// Uses real OS child lifetimes to exercise process resolution and consent;
         /// bundled-executable verification and the MCP socket path are separate boundaries.
         func testRealChildRespawnsShareLauncherConsentEvenAfterPromptingChildExits() async throws {
@@ -622,45 +652,34 @@ private final class ExecutionCounter: @unchecked Sendable {
                 let controller = ServerController(installNetworkCallbacks: false)
                 let events = AdmissionEvents()
                 await controller.setApprovalCallback { _, generation, _ in events.prompt(generation) }
-                let first = Process()
-                first.executableURL = URL(fileURLWithPath: "/bin/sleep")
-                first.arguments = ["60"]
-                try first.run()
-                defer { if first.isRunning { first.terminate()
-                    first.waitUntilExit()
-                } }
-                let firstPID = first.processIdentifier
-                let firstPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: firstPID))
-                let launcher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: firstPID, bundledHelper: true))
-                XCTAssertEqual(launcher.pid, getpid())
-                await controller.test_requestApproval(
-                    clientID: "external-test-client", principal: launcher,
-                    validate: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
-                    isConnectionLive: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
-                    approve: { events.decide("unexpected") }, deny: { events.decide("old-helper-denied") }
-                )
-                first.terminate()
-                first.waitUntilExit()
-                let second = Process()
-                second.executableURL = URL(fileURLWithPath: "/bin/sleep")
-                second.arguments = ["60"]
-                try second.run()
-                defer { if second.isRunning { second.terminate()
-                    second.waitUntilExit()
-                } }
-                let secondPID = second.processIdentifier
-                let secondPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: secondPID))
-                let secondLauncher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: secondPID, bundledHelper: true))
-                XCTAssertEqual(secondLauncher, launcher)
-                await controller.test_requestApproval(
-                    clientID: "external-test-client", principal: secondLauncher,
-                    validate: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
-                    isConnectionLive: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
-                    approve: { events.decide("new-helper-allowed") }, deny: { events.decide("new-helper-denied") }
-                )
-                await controller.resolvePendingApproval(allow: allow, generation: events.generations[0])
-                XCTAssertEqual(events.generations.count, 1)
-                XCTAssertEqual(events.decisions, ["old-helper-denied", allow ? "new-helper-allowed" : "new-helper-denied"])
+                try await withAdmissionChild { first in
+                    let firstPID = first.pid
+                    let firstPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: firstPID))
+                    let launcher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: firstPID, bundledHelper: true))
+                    XCTAssertEqual(launcher.pid, getpid())
+                    await controller.test_requestApproval(
+                        clientID: "external-test-client", principal: launcher,
+                        validate: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
+                        isConnectionLive: { MCPApprovalProcessIdentity.read(pid: firstPID) == firstPeer },
+                        approve: { events.decide("unexpected") }, deny: { events.decide("old-helper-denied") }
+                    )
+                    guard await stopAdmissionChild(first) else { return }
+                    try await withAdmissionChild { second in
+                        let secondPID = second.pid
+                        let secondPeer = try XCTUnwrap(MCPApprovalProcessIdentity.read(pid: secondPID))
+                        let secondLauncher = try XCTUnwrap(MCPApprovalProcessIdentity.resolve(peerPID: secondPID, bundledHelper: true))
+                        XCTAssertEqual(secondLauncher, launcher)
+                        await controller.test_requestApproval(
+                            clientID: "external-test-client", principal: secondLauncher,
+                            validate: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
+                            isConnectionLive: { MCPApprovalProcessIdentity.read(pid: secondPID) == secondPeer },
+                            approve: { events.decide("new-helper-allowed") }, deny: { events.decide("new-helper-denied") }
+                        )
+                        await controller.resolvePendingApproval(allow: allow, generation: events.generations[0])
+                        XCTAssertEqual(events.generations.count, 1)
+                        XCTAssertEqual(events.decisions, ["old-helper-denied", allow ? "new-helper-allowed" : "new-helper-denied"])
+                    }
+                }
             }
         }
 

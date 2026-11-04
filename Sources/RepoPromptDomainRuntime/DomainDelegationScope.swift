@@ -83,6 +83,13 @@ package final class DomainDelegationScopeLinkConsent: @unchecked Sendable {
         lock.withLock { self.grants = Dictionary(uniqueKeysWithValues: grants.map { ($0.id, $0) }) }
     }
 
+    /// Read-only bound for actual catalog ingress, limited to its exact indexed link consents.
+    package func earliestExpiry(scopeIDs: Set<UUID>, at date: Date) -> Date? {
+        lock.withLock {
+            scopeIDs.compactMap { grants[$0]?.guardrails.expiresAt }.filter { $0 > date }.min()
+        }
+    }
+
     package func permits(scopeID: UUID, observer: UUID, target: UUID, at date: Date) -> Bool {
         guard let grant = lock.withLock({ grants[scopeID] }), grant.granteeSessionID == observer,
               grant.capabilities.isSuperset(of: [.observe, .control, .restructure]),

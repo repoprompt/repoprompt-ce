@@ -119,6 +119,11 @@ final class FontScaleManager: ObservableObject {
         step(-1)
     }
 
+    /// Return to the default preset (the macOS "Actual Size" command).
+    func reset() {
+        setPreset(.normal)
+    }
+
     /// Optional helper to set directly from a stored raw value.
     func setRawValue(_ rawValue: Double) {
         guard let p = FontScalePreset(rawValue: rawValue) else {

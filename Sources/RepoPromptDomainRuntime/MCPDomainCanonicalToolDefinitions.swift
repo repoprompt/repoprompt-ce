@@ -1113,6 +1113,7 @@ package enum MCPDomainCanonicalToolDefinitions {
         else {
             preconditionFailure("Invalid canonical MCP domain tool definitions")
         }
+        definitions.insert(AgentSelfNoopTool.definition, at: insertion)
         definitions.insert(agentSelfDefinition, at: insertion)
         if let linkIndex = definitions.firstIndex(where: { $0.name == MCPWindowToolName.agentSessionLink }) {
             definitions.insert(MCPDomainSessionAdminToolDefinition.definition, at: linkIndex + 1)
@@ -1492,6 +1493,9 @@ package enum MCPDomainCanonicalToolDefinitions {
     private static func canonicalizeGlobalSemantics(
         _ definition: MCPDomainToolDefinition
     ) -> MCPDomainToolDefinition {
+        if definition.name == MCPGlobalToolName.manageWorkspaces {
+            return canonicalizeWorkspaceSemantics(definition)
+        }
         if definition.name == MCPWindowToolName.history {
             return canonicalizeHistoryWorkspaceDiscovery(definition)
         }
@@ -1668,14 +1672,96 @@ package enum MCPDomainCanonicalToolDefinitions {
         else {
             return definition
         }
-        properties.removeValue(forKey: "window_id")
+        properties["window_id"] = .object([
+            "type": .string("integer"),
+            "description": .string("App-backed only. For list: filter to one window. For bind: capture and explicitly bind that window's current compose-tab context. Direct headless rejects this parameter when supplied.")
+        ])
+        properties["working_dirs"] = .object([
+            "anyOf": .array([
+                .object([
+                    "type": .string("array"),
+                    "description": .string("Preferred for bind: absolute workspace root paths. Exact root-set match first, then superset fallback; the match must resolve unambiguously. Each string is one root, including a path containing a comma."),
+                    "items": .object(["type": .string("string")])
+                ]),
+                .object([
+                    "type": .string("string"),
+                    "description": .string("Compatibility form for bind: comma-separated absolute workspace root paths. The string is split on commas; use an array for a root containing a comma.")
+                ])
+            ])
+        ])
+        properties["create_if_missing"] = .object([
+            "type": .string("boolean"),
+            "description": .string("App-backed bind with working_dirs: create a workspace after approval when no exact or superset match exists. Headless ignores this flag: existing matches still bind; no match is an error and nothing is created.")
+        ])
+        properties["tab_name"] = .object([
+            "type": .string("string"),
+            "description": .string("App-backed only: optional workspace name hint when creating through working_dirs + create_if_missing. Ignored by headless; it does not name or rename an existing match.")
+        ])
         schema["properties"] = .object(properties)
         return MCPDomainToolDefinition(
             name: definition.name,
-            description: "List, inspect, and bind the canonical workspace context for this MCP connection. Bind by working_dirs (preferred) or context_id. This global tool never accepts an app window selector.",
+            description: "List, inspect, and bind this MCP connection's workspace context. `op` is `list`, `status`, or `bind`. App-backed `list` returns open windows and their compose tabs; `window_id` filters that list. App-backed `bind` accepts `working_dirs` (preferred), `context_id`, or `window_id`; a window bind captures and explicitly binds that window's current compose-tab context. Later visible-tab changes do not redirect the binding. Direct headless `list` returns the saved workspace/context inventory and current binding, without windows; `status` returns the current binding. Headless `bind` accepts `context_id` or `working_dirs` and rejects any supplied `window_id`. `working_dirs` matches workspace roots, exact set first, then superset fallback; descendant paths are not root selectors. App-backed calls can use window_id to disambiguate matching workspaces. Headless requires a unique eligible match. Prefer an array of absolute root paths. A string remains accepted and is split on commas; use an array when a root contains a comma. App-backed `create_if_missing=true` may create a workspace after approval when no match exists. Headless never creates a workspace implicitly: an existing match still binds when `create_if_missing` or `tab_name` is supplied, and no match is an error.",
             inputSchema: .object(schema),
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    /// Shared publication qualifiers preserve the existing app/headless behavior and accepted inputs.
+    private static func canonicalizeWorkspaceSemantics(
+        _ definition: MCPDomainToolDefinition
+    ) -> MCPDomainToolDefinition {
+        guard case var .object(schema) = definition.inputSchema,
+              case var .object(properties)? = schema["properties"]
+        else { return definition }
+        if case var .object(property)? = properties["tab"] {
+            property["description"] = .string("Required for select_tab and close_tab. App-backed: compose-tab UUID or name. Headless: canonical UUID for select_tab; UUID exactly as listed or unambiguous name for close_tab. Other actions do not require tab.")
+            properties["tab"] = .object(property)
+        }
+        if case var .object(property)? = properties["window_id"] {
+            property["description"] = .string("App-backed target window; defaults to the selected or only window. Headless rejects this parameter when supplied.")
+            properties["window_id"] = .object(property)
+        }
+        if case var .object(property)? = properties["open_in_new_window"] {
+            property["description"] = .string("App-backed switch/create: when true, open a new window and bind to it. Headless rejects true; false or omission requests no new-window effect.")
+            properties["open_in_new_window"] = .object(property)
+        }
+        if case var .object(property)? = properties["focus"] {
+            property["description"] = .string("App-backed select_tab/create_tab: true also switches the visible tab; use only when the user requests a UI switch. Headless accepts and ignores this compatibility flag; it has no UI effect.")
+            properties["focus"] = .object(property)
+        }
+        if case var .object(property)? = properties["close_window"] {
+            property["description"] = .string("App-backed delete: true requests window closure after deletion. Headless accepts and ignores this compatibility flag; it does not prevent the delete action.")
+            properties["close_window"] = .object(property)
+        }
+        if case var .object(property)? = properties["switch_to_created"] {
+            property["description"] = .string("For create: when true, switch to the new workspace in the app target window, or bind its context on headless.")
+            properties["switch_to_created"] = .object(property)
+        }
+        schema["properties"] = .object(properties)
+        let description = definition.description
+            .replacingOccurrences(of: "'hide'/'unhide' are non-destructive.", with: "'hide'/'unhide' are non-destructive and ignore include_hidden. Name-based 'hide' uses the unique visible match and falls back to a unique hidden match only when no visible workspace matches, so an ambiguous visible name stays ambiguous. Name-based 'unhide' needs a unique match among visible and hidden workspaces. Use a workspace UUID to disambiguate.")
+            .replacingOccurrences(of: "Manage workspaces and compose-tab lifecycle across RepoPrompt windows.", with: "Manage workspaces and compose-tab lifecycle. App-backed calls operate through RepoPrompt windows; direct headless calls operate on canonical workspace contexts without windows.")
+            .replacingOccurrences(of: "canonical API for per-window tab routing and context_id discovery", with: "canonical API for context binding and context_id discovery")
+            .replacingOccurrences(of: "(id, name, repoPaths, showing window IDs, is_hidden)", with: "(app-backed: id, name, repo_paths, showing window IDs, is_hidden; headless: workspace_id, name, repo_paths, hidden, contexts, without window IDs)")
+            .replacingOccurrences(of: "Switch a window to a specified workspace", with: "App-backed: switch the target window to a workspace. Headless: bind its active context, or first stored context when none is active")
+            .replacingOccurrences(of: "List compose tabs in one window", with: "List app-backed tabs in one window or headless workspace/context inventory")
+            .replacingOccurrences(of: "Bind this connection to a compose tab (Legacy compatibility", with: "Bind this connection to a compose tab: UUID or name on the app backend; canonical UUID only on headless (Legacy compatibility")
+            .replacingOccurrences(of: "Create a new compose tab in the background", with: "Create a compose tab; app-backed creation can stay in the background. Headless has no UI")
+            .replacingOccurrences(of: "`manage_workspaces.list` returns workspace inventory: names, folder paths, and which windows show each workspace", with: "`manage_workspaces.list` returns workspace inventory; app-backed results also identify showing windows")
+            .replacingOccurrences(of: "`bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding", with: "App-backed `bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding. Headless lists canonical workspace/context identities and the connection binding; there is no window routing")
+            .replacingOccurrences(of: "When the same workspace is open in multiple windows", with: "App-backed: when the same workspace is open in multiple windows")
+            .replacingOccurrences(of: "create_tab defaults to bind=true and focus=false so automation can create isolated background tabs without stealing UI focus.", with: "create_tab defaults to bind=true and focus=false. On the app backend this allows a background tab without UI focus. Headless has no UI; bind=true selects the new context and records it as the workspace's active compose tab.")
+            .replacingOccurrences(of: "IMPORTANT: The 'focus' parameter switches the visible tab in the UI, which can be disruptive to the user's workflow.", with: "IMPORTANT: App-backed 'focus' switches the visible tab in the UI, which can be disruptive to the user's workflow. Headless ignores this flag.")
+            .replacingOccurrences(of: "- tab: string                                   (required for 'select_tab'; optional for 'close_tab'; UUID or name)", with: "- tab: string — Required for select_tab and close_tab. App-backed: compose-tab UUID or name. Headless: canonical UUID for select_tab; UUID exactly as listed or unambiguous name for close_tab. Other actions do not require tab.")
+            .replacingOccurrences(of: "- window_id: integer                            (optional; target window, defaults to selected or only window)", with: "- window_id: integer — App-backed target window; defaults to the selected or only window. Headless rejects this parameter when supplied.")
+            .replacingOccurrences(of: "- open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it)", with: "- open_in_new_window: boolean — App-backed switch/create: when true, open a new window and bind to it. Headless rejects true; false or omission requests no new-window effect.")
+            .replacingOccurrences(of: "- focus: boolean                                (optional for 'select_tab' or 'create_tab'; if true, also switches the UI to show the tab)", with: "- focus: boolean — App-backed select_tab/create_tab: true also switches the visible tab; use only when the user requests a UI switch. Headless accepts and ignores this compatibility flag; it has no UI effect.")
+            .replacingOccurrences(of: "- close_window: boolean                         (optional for 'delete'; when true, switches away without saving, deletes the workspace, then requests window close)", with: "- close_window: boolean — App-backed delete: true requests window closure after deletion. Headless accepts and ignores this compatibility flag; it does not prevent the delete action.")
+            .replacingOccurrences(of: "- switch_to_created: boolean                    (optional for 'create'; when true, switches to the newly created workspace)", with: "- switch_to_created: boolean — For create: when true, switch to the new workspace in the app target window, or bind its context on headless.")
+        return MCPDomainToolDefinition(
+            name: definition.name, description: description, inputSchema: .object(schema),
+            annotations: definition.annotations, isEnabledByDefault: definition.isEnabledByDefault
         )
     }
 

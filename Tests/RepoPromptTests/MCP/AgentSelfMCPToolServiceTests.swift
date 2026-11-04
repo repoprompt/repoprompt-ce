@@ -376,6 +376,14 @@ final class AgentSelfMCPToolServiceTests: XCTestCase {
                 requireTargetWindow: { self.window },
                 resolveObserverEndpoint: { _, _ in self.resolvedEndpoint },
                 captureCallOrigin: { self.origin },
+                enterNoop: { window, origin, invocationID, argumentsAreEmpty in
+                    window.agentModeViewModel.enterSelfNoopBody(
+                        origin: origin, invocationID: invocationID, argumentsAreEmpty: argumentsAreEmpty
+                    )
+                },
+                acceptNoop: { window, origin, endpoint, invocationID in
+                    window.agentModeViewModel.acceptSelfNoopBody(origin: origin, endpoint: endpoint, invocationID: invocationID)
+                },
                 readSelf: { _, _, _ in
                     self.reads += 1
                     return self.snapshot

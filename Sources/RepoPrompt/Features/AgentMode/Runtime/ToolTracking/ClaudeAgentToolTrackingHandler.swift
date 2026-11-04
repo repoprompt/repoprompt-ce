@@ -49,9 +49,27 @@ final class ClaudeAgentToolTrackingHandler {
     // MARK: - Correlation State (moved from AgentTabSession)
 
     /// Pending provider-stream invocation IDs queued for correlation with tracker callbacks, keyed by signature.
-    private var pendingProviderRepoPromptInvocationsBySignature: [String: [UUID]] = [:]
+    private enum CorrelationSlot: Hashable {
+        case signature(String)
+        case native(attemptID: UUID, toolUseID: String)
+    }
+
+    private var pendingProviderRepoPromptInvocationsBySignature: [CorrelationSlot: [UUID]] = [:]
     /// Maps tracker invocation IDs to provider-stream invocation IDs for dual-source correlation.
-    private var providerInvocationByTrackerInvocationID: [UUID: UUID] = [:]
+    private struct TrackerCorrelation {
+        var providerID: UUID
+        var nativeID: String?
+        var owner: AgentRunOwnership?
+        var nativeCallSeen = false
+        var nativeResultSeen = false
+        var hostResultSeen = false
+        var ambiguous = false
+    }
+
+    // Enrich the existing, turn-reset correlation map; no parallel invocation registry.
+    private var providerInvocationByTrackerInvocationID: [UUID: TrackerCorrelation] = [:]
+    private var exactObservationOwner: AgentRunOwnership?
+
     /// Sequence boundary for provider/tracker tool correlation within the active Claude turn.
     private var toolCorrelationStartSequenceIndex: Int = 0
     /// Currently tracked Claude run for explicit provider `tool_result` acknowledgements.
@@ -100,11 +118,14 @@ final class ClaudeAgentToolTrackingHandler {
         session: AgentTabSession,
         clientNameHint: String?
     ) async {
+        let capturedOwner = session.runID == runID ? session.activeRunOwnership : nil
+        exactObservationOwner = capturedOwner
         if trackedRunID != runID {
             beginTrackingExplicitProviderToolResultAcks(for: runID)
         }
         await trackingController.startTracking(
             runID: runID,
+            attemptID: capturedOwner?.attemptID,
             clientNameHint: clientNameHint,
             onCalled: { [weak self, weak session] invocationID, toolName, args in
                 guard let self, let session else { return }
@@ -112,7 +133,8 @@ final class ClaudeAgentToolTrackingHandler {
                     invocationID: invocationID,
                     toolName: toolName,
                     args: args,
-                    session: session
+                    session: session,
+                    observationOwner: capturedOwner
                 )
             },
             onCompleted: { [weak self, weak session] invocationID, toolName, args, resultJSON, isError in
@@ -123,7 +145,8 @@ final class ClaudeAgentToolTrackingHandler {
                     args: args,
                     resultJSON: resultJSON,
                     isError: isError,
-                    session: session
+                    session: session,
+                    observationOwner: capturedOwner
                 )
             }
         )
@@ -140,7 +163,15 @@ final class ClaudeAgentToolTrackingHandler {
     func resetTurnState(
         for session: AgentTabSession
     ) {
+        let registeredOwner = exactObservationOwner
         resetCorrelationState(session)
+        // The send path resets after tracking is registered. Preserve only that same current
+        // registration; a successor must register its own callbacks before acquiring exact proof.
+        if let registeredOwner,
+           session.isCurrentRunAttemptForCurrentBinding(registeredOwner, expectedRunID: trackedRunID)
+        {
+            exactObservationOwner = registeredOwner
+        }
     }
 
     // MARK: - Provider Stream Event Handling
@@ -176,6 +207,18 @@ final class ClaudeAgentToolTrackingHandler {
            let invocationID = call.invocationID,
            session.indexedToolItemIndices(invocationID: invocationID).isEmpty
         {
+            return true
+        }
+
+        if handleExactNativeObservation(
+            providerID: call.invocationID,
+            nativeID: call.claudeToolUseID,
+            toolName: toolName,
+            argsJSON: call.argsJSON,
+            isResult: false,
+            session: session
+        ) {
+            hooks.addToolInputTokens(call.argsJSON, session)
             return true
         }
 
@@ -217,6 +260,24 @@ final class ClaudeAgentToolTrackingHandler {
             toolName: toolName,
             invocationID: result.invocationID
         )
+
+        if handleExactNativeObservation(
+            providerID: result.invocationID,
+            nativeID: result.claudeToolUseID,
+            toolName: toolName,
+            argsJSON: result.argsJSON,
+            isResult: true,
+            session: session
+        ) {
+            if result.isError == true {
+                session.noteUncertainToolCorrelation()
+                // A client-side failure may have no host completion. Keep the existing provider
+                // result/error rendering instead of leaving its reserved slot pending.
+            } else {
+                hooks.addToolOutputTokens(outputJSON, session)
+                return true
+            }
+        }
 
         // Claude Code emits `<tool_use_error>Error: No such tool available: …</tool_use_error>`
         // when the model invokes a tool the CLI doesn't know (e.g. a bare `mcp__RepoPrompt`
@@ -399,7 +460,7 @@ final class ClaudeAgentToolTrackingHandler {
                let trackerInvocationID = updated.toolInvocationID,
                trackerInvocationID != providerInvocationID
             {
-                providerInvocationByTrackerInvocationID[trackerInvocationID] = providerInvocationID
+                providerInvocationByTrackerInvocationID[trackerInvocationID] = TrackerCorrelation(providerID: providerInvocationID)
             }
             if let providerInvocationID = invocationID {
                 if updated.kind == .toolCall, updated.toolInvocationID != providerInvocationID {
@@ -429,10 +490,10 @@ final class ClaudeAgentToolTrackingHandler {
         }
 
         if let invocationID {
-            var pending = pendingProviderRepoPromptInvocationsBySignature[signature, default: []]
+            var pending = pendingProviderRepoPromptInvocationsBySignature[.signature(signature), default: []]
             if !pending.contains(invocationID) {
                 pending.append(invocationID)
-                pendingProviderRepoPromptInvocationsBySignature[signature] = pending
+                pendingProviderRepoPromptInvocationsBySignature[.signature(signature)] = pending
             }
         }
 
@@ -532,10 +593,22 @@ final class ClaudeAgentToolTrackingHandler {
         invocationID: UUID,
         toolName: String,
         args: [String: Value]?,
-        session: AgentTabSession
+        session: AgentTabSession,
+        observationOwner: AgentRunOwnership? = nil
     ) {
+        if let observationOwner,
+           !session.isCurrentRunAttemptForCurrentBinding(observationOwner, expectedRunID: trackedRunID) { return }
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
+        if handleExactHostObservation(
+            invocationID: invocationID,
+            toolName: toolName,
+            args: args,
+            result: nil,
+            isError: false,
+            observationOwner: observationOwner,
+            session: session
+        ) { return }
         // Flush buffered assistant content before inserting tool card to preserve interleaving order.
         hooks.flushPendingAssistantDelta(session)
         hooks.endActiveAssistantSegment(session)
@@ -552,7 +625,7 @@ final class ClaudeAgentToolTrackingHandler {
                     "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                     "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
             )
-            providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
+            providerInvocationByTrackerInvocationID[invocationID] = TrackerCorrelation(providerID: providerInvocationID)
             let indexedCandidates = session.indexedToolItemIndices(invocationID: providerInvocationID)
             let fallback = indexedCandidates.isEmpty
                 ? session.activeTurnToolItemIndices(where: { $0.toolInvocationID == providerInvocationID })
@@ -618,7 +691,8 @@ final class ClaudeAgentToolTrackingHandler {
                     "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                     "providerInvocation=\(providerInvocationID.uuidString) matches=\(matchingProviderBackedSignatureIndices.count)"
             )
-            providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
+            session.noteUncertainToolCorrelation()
+            providerInvocationByTrackerInvocationID[invocationID] = TrackerCorrelation(providerID: providerInvocationID)
             var updated = session.items[existingInvocationIndex]
             updated.toolName = storedToolName
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
@@ -647,6 +721,7 @@ final class ClaudeAgentToolTrackingHandler {
                     "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                     "matches=\(matchingNilIDSignatureIndices.count)"
             )
+            session.noteUncertainToolCorrelation()
             var updated = session.items[fallbackIndex]
             updated.toolName = storedToolName
             updated.toolInvocationID = invocationID
@@ -694,6 +769,7 @@ final class ClaudeAgentToolTrackingHandler {
                     "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                     "matches=\(matchingNilIDNameIndices.count)"
             )
+            session.noteUncertainToolCorrelation()
             var updated = session.items[fallbackByNameIndex]
             updated.toolName = storedToolName
             if updated.toolInvocationID == nil {
@@ -729,10 +805,22 @@ final class ClaudeAgentToolTrackingHandler {
         args: [String: Value]?,
         resultJSON: String,
         isError: Bool,
-        session: AgentTabSession
+        session: AgentTabSession,
+        observationOwner: AgentRunOwnership? = nil
     ) {
+        if let observationOwner,
+           !session.isCurrentRunAttemptForCurrentBinding(observationOwner, expectedRunID: trackedRunID) { return }
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
+        if handleExactHostObservation(
+            invocationID: invocationID,
+            toolName: toolName,
+            args: args,
+            result: resultJSON,
+            isError: isError,
+            observationOwner: observationOwner,
+            session: session
+        ) { return }
         // Flush buffered assistant content before inserting tool result to preserve interleaving order.
         hooks.flushPendingAssistantDelta(session)
         hooks.endActiveAssistantSegment(session)
@@ -740,7 +828,7 @@ final class ClaudeAgentToolTrackingHandler {
         let storedToolName = Self.canonicalTranscriptToolName(toolName)
         let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
         let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
-        let resolvedInvocationID = providerInvocationByTrackerInvocationID[invocationID] ?? invocationID
+        let resolvedInvocationID = providerInvocationByTrackerInvocationID[invocationID]?.providerID ?? invocationID
         providerInvocationByTrackerInvocationID.removeValue(forKey: invocationID)
 
         var correlationPath = "none"
@@ -776,7 +864,7 @@ final class ClaudeAgentToolTrackingHandler {
                             "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                             "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
                     )
-                    providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
+                    providerInvocationByTrackerInvocationID[invocationID] = TrackerCorrelation(providerID: providerInvocationID)
                     correlationPath = providerFallback.lastIndex == nil
                         ? "signature_pending_map"
                         : "signature_pending_map_active_turn_scan"
@@ -817,6 +905,7 @@ final class ClaudeAgentToolTrackingHandler {
                         "resolvedInvocation=\(resolvedInvocationID.uuidString) matches=\(matchingPendingSignatureIndices.count)"
                 )
                 correlationPath = signatureUsedFallback ? "signature_active_turn_scan" : "signature"
+                session.noteUncertainToolCorrelation()
                 return byPendingCallSignature
             }
             let normalizedToolName = AgentTabSession.normalizedToolCorrelationName(toolName)
@@ -852,6 +941,7 @@ final class ClaudeAgentToolTrackingHandler {
                         "matches=\(matchingPendingNameIndices.count)"
                 )
                 correlationPath = nameUsedFallback ? "name_active_turn_scan" : "name_fallback"
+                session.noteUncertainToolCorrelation()
                 return byPendingCallName
             }
             return nil
@@ -895,6 +985,185 @@ final class ClaudeAgentToolTrackingHandler {
         hooks.requestUIRefresh(session.tabID, false)
     }
 
+    /// Exact candidate association is run/attempt scoped. The external client's metadata contract
+    /// is assumed only by deterministic W0 fixtures, not certified as live runtime behavior.
+    private func exactOwner(in session: AgentTabSession) -> AgentRunOwnership? {
+        guard session.selectedAgent == .claudeCode, let owner = exactObservationOwner,
+              trackedRunID == session.runID, session.activeRunOwnership == owner,
+              session.isCurrentRunAttemptForCurrentBinding(owner), session.quietLedger.isOpen(owner: owner),
+              session.quietLedger.routineWakeID(owner: owner) != nil
+        else { return nil }
+        return owner
+    }
+
+    private func nativePendingKey(_ raw: String, owner: AgentRunOwnership) -> CorrelationSlot {
+        .native(attemptID: owner.attemptID, toolUseID: raw)
+    }
+
+    private func handleExactNativeObservation(
+        providerID: UUID?,
+        nativeID: String?,
+        toolName: String,
+        argsJSON: String?,
+        isResult: Bool,
+        session: AgentTabSession
+    ) -> Bool {
+        guard let owner = exactOwner(in: session), let providerID,
+              let raw = ToolInvocationContext.candidateClaudeToolUseID(nativeID.map(Value.string)),
+              AgentToolTrackingSupport.isExplicitRepoPromptTool(toolName),
+              !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName)
+        else { return false }
+        let matches = providerInvocationByTrackerInvocationID.filter { $0.value.nativeID == raw && $0.value.owner == owner }
+        guard matches.count <= 1 else { session.noteUncertainToolCorrelation()
+            return false
+        }
+        if let (hostID, existing) = matches.first {
+            guard !existing.ambiguous, existing.providerID == hostID || existing.providerID == providerID else {
+                session.noteUncertainToolCorrelation()
+                return false
+            }
+            var pair = existing
+            pair.providerID = providerID
+            pair.nativeCallSeen = pair.nativeCallSeen || !isResult
+            pair.nativeResultSeen = pair.nativeResultSeen || isResult
+            if isResult, !pair.nativeCallSeen { pair.ambiguous = true
+                session.noteUncertainToolCorrelation()
+            }
+            providerInvocationByTrackerInvocationID[hostID] = pair
+            // The host UUID is canonical; provider local UUID is only representation identity.
+            if let index = session.indexedToolItemIndices(invocationID: hostID).last {
+                if !isResult, let argsJSON { session.mutateItem(at: index) { $0.toolArgsJSON = argsJSON } }
+            } else { session.noteUncertainToolCorrelation() }
+            return true
+        }
+        let key = nativePendingKey(raw, owner: owner)
+        var pending = pendingProviderRepoPromptInvocationsBySignature[key, default: []]
+        // A result cannot manufacture proof that its native declaration was observed.
+        if isResult, !pending.contains(providerID) {
+            session.noteUncertainToolCorrelation()
+            return false
+        }
+        if !pending.contains(providerID) { pending.append(providerID) }
+        pendingProviderRepoPromptInvocationsBySignature[key] = pending
+        guard pending.count == 1 else { session.noteUncertainToolCorrelation()
+            return false
+        }
+        if isResult {
+            // This can precede FIFO host delivery; the existing native ACK set retains it.
+            return true
+        }
+        if session.indexedToolItemIndices(invocationID: providerID).isEmpty {
+            let storedName = Self.canonicalTranscriptToolName(toolName)
+            session.appendItem(.toolCall(name: storedName, invocationID: providerID, argsJSON: argsJSON, sequenceIndex: session.nextSequenceIndex))
+            let signature = Self.repoPromptInvocationSignature(toolName: toolName, argsJSON: argsJSON)
+            pendingProviderRepoPromptInvocationsBySignature[.signature(signature), default: []].append(providerID)
+        }
+        return true
+    }
+
+    private func handleExactHostObservation(
+        invocationID: UUID,
+        toolName: String,
+        args: [String: Value]?,
+        result: String?,
+        isError: Bool,
+        observationOwner: AgentRunOwnership?,
+        session: AgentTabSession
+    ) -> Bool {
+        guard let owner = exactOwner(in: session), observationOwner == owner else { return false }
+        guard let context = MCPInvocationContextBridge.current, context.invocationID == invocationID,
+              context.metadata.invocationID == invocationID, let raw = context.claudeToolUseID
+        else { session.noteUncertainToolCorrelation()
+            return false
+        }
+        let matches = providerInvocationByTrackerInvocationID.filter { $0.value.nativeID == raw && $0.value.owner == owner }
+        guard matches.isEmpty || (matches.count == 1 && matches.first?.key == invocationID) else {
+            for (id, var pair) in matches {
+                pair.ambiguous = true
+                providerInvocationByTrackerInvocationID[id] = pair
+            }
+            session.noteUncertainToolCorrelation()
+            return false
+        }
+        let key = nativePendingKey(raw, owner: owner)
+        let pending = pendingProviderRepoPromptInvocationsBySignature[key] ?? []
+        guard pending.count <= 1 else { session.noteUncertainToolCorrelation()
+            return false
+        }
+        if result != nil && providerInvocationByTrackerInvocationID[invocationID] == nil {
+            session.noteUncertainToolCorrelation()
+            return false
+        }
+        var pair = providerInvocationByTrackerInvocationID[invocationID]
+            ?? TrackerCorrelation(
+                providerID: pending.first ?? invocationID,
+                nativeID: raw,
+                owner: owner,
+                nativeCallSeen: !pending.isEmpty,
+                nativeResultSeen: pending.first.map { explicitProviderToolResultAckedInvocationIDs.contains($0) } ?? false
+            )
+        guard !pair.ambiguous else { session.noteUncertainToolCorrelation()
+            return false
+        }
+        pair.hostResultSeen = pair.hostResultSeen || result != nil
+        providerInvocationByTrackerInvocationID[invocationID] = pair
+        hooks.flushPendingAssistantDelta(session)
+        hooks.endActiveAssistantSegment(session)
+        hooks.endActiveReasoningSegment(session)
+        let candidates = session.indexedToolItemIndices(invocationID: invocationID)
+        let providerCandidates = session.indexedToolItemIndices(invocationID: pair.providerID)
+        let index = candidates.last ?? providerCandidates.last
+        let argsJSON = AgentToolTrackingController.encodeArgsToJSON(args)
+        if let index {
+            var item = session.items[index]
+            item.toolInvocationID = invocationID
+            item.toolName = Self.canonicalTranscriptToolName(toolName)
+            item.toolArgsJSON = argsJSON ?? item.toolArgsJSON
+            if let result { item.kind = .toolResult
+                item.toolResultJSON = result
+                item.text = result
+                item.toolIsError = isError
+            }
+            session.replaceItem(at: index, with: item)
+        } else if let result {
+            session.appendItem(.toolResult(name: toolName, invocationID: invocationID, resultJSON: result, isError: isError, sequenceIndex: session.nextSequenceIndex))
+        } else {
+            session.appendItem(.toolCall(name: Self.canonicalTranscriptToolName(toolName), invocationID: invocationID, argsJSON: argsJSON, sequenceIndex: session.nextSequenceIndex))
+        }
+        // Retire only the exact provider ID from legacy pending queues. No signature chooses a join.
+        for key in Array(pendingProviderRepoPromptInvocationsBySignature.keys) {
+            pendingProviderRepoPromptInvocationsBySignature[key]?.removeAll { $0 == pair.providerID }
+            if pendingProviderRepoPromptInvocationsBySignature[key]?.isEmpty == true { pendingProviderRepoPromptInvocationsBySignature[key] = nil }
+        }
+        if isError { session.noteUncertainToolCorrelation() }
+        hooks.requestUIRefresh(session.tabID, false)
+        return true
+    }
+
+    #if DEBUG
+        var pendingEventDeliveryWaiterCountForTesting: Int {
+            trackingController.pendingEventDeliveryWaiterCountForTesting
+        }
+
+        func enqueueEventDeliveryBarrierForTesting(_ operation: @escaping @Sendable () async -> Void) {
+            trackingController.enqueueEventDeliveryBarrierForTesting(operation)
+        }
+    #endif
+
+    func waitForPendingEventDeliveries() async {
+        await trackingController.waitForPendingEventDeliveries()
+    }
+
+    func hasExactNativeResult(hostInvocationID: UUID, owner: AgentRunOwnership, session: AgentTabSession) -> Bool {
+        guard exactOwner(in: session) == owner, let pair = providerInvocationByTrackerInvocationID[hostInvocationID] else { return false }
+        return pair.owner == owner && pair.nativeID != nil && pair.nativeCallSeen && pair.nativeResultSeen && !pair.ambiguous
+    }
+
+    func hasCompleteExactAssociation(hostInvocationID: UUID, owner: AgentRunOwnership, session: AgentTabSession) -> Bool {
+        guard exactOwner(in: session) == owner, let pair = providerInvocationByTrackerInvocationID[hostInvocationID] else { return false }
+        return pair.owner == owner && pair.nativeID != nil && pair.nativeCallSeen && pair.nativeResultSeen && pair.hostResultSeen && !pair.ambiguous
+    }
+
     // MARK: - Correlation Helpers
 
     private func resetCorrelationState(_ session: AgentTabSession) {
@@ -910,6 +1179,7 @@ final class ClaudeAgentToolTrackingHandler {
         pendingProviderRepoPromptInvocationsBySignature.removeAll(keepingCapacity: false)
         providerInvocationByTrackerInvocationID.removeAll(keepingCapacity: false)
         toolCorrelationStartSequenceIndex = session.nextSequenceIndex
+        exactObservationOwner = nil
     }
 
     private func pendingProviderInvocationCount() -> Int {
@@ -1046,6 +1316,7 @@ final class ClaudeAgentToolTrackingHandler {
 
         let signatureCandidates = session.indexedToolItemIndices(signature: signature)
         if let bySignature = signatureCandidates.last(where: { isEligible(session.items[$0]) }) {
+            session.noteUncertainToolCorrelation()
             return bySignature
         }
         let signatureFallback = session.activeTurnToolItemIndices(where: {
@@ -1056,6 +1327,7 @@ final class ClaudeAgentToolTrackingHandler {
                 ) == signature
         })
         if let bySignature = signatureFallback.lastIndex {
+            session.noteUncertainToolCorrelation()
             return bySignature
         }
 
@@ -1070,9 +1342,10 @@ final class ClaudeAgentToolTrackingHandler {
             }
             return item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
         }) {
+            session.noteUncertainToolCorrelation()
             return byName
         }
-        return session.activeTurnToolItemIndices(where: { item in
+        let nameMatch = session.activeTurnToolItemIndices(where: { item in
             guard isEligible(item) else { return false }
             guard AgentTabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName else {
                 return false
@@ -1082,13 +1355,15 @@ final class ClaudeAgentToolTrackingHandler {
             }
             return item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
         }).lastIndex
+        if nameMatch != nil { session.noteUncertainToolCorrelation() }
+        return nameMatch
     }
 
     private func consumePendingProviderInvocationID(
         forSignature signature: String,
         session: AgentTabSession
     ) -> UUID? {
-        guard var queue = pendingProviderRepoPromptInvocationsBySignature[signature], !queue.isEmpty else {
+        guard var queue = pendingProviderRepoPromptInvocationsBySignature[.signature(signature)], !queue.isEmpty else {
             return nil
         }
         while !queue.isEmpty {
@@ -1097,11 +1372,12 @@ final class ClaudeAgentToolTrackingHandler {
             let exists = !indexedCandidates.isEmpty
                 || session.activeTurnToolItemIndices(where: { $0.toolInvocationID == candidate }).lastIndex != nil
             if exists {
-                pendingProviderRepoPromptInvocationsBySignature[signature] = queue.isEmpty ? nil : queue
+                session.noteUncertainToolCorrelation()
+                pendingProviderRepoPromptInvocationsBySignature[.signature(signature)] = queue.isEmpty ? nil : queue
                 return candidate
             }
         }
-        pendingProviderRepoPromptInvocationsBySignature[signature] = nil
+        pendingProviderRepoPromptInvocationsBySignature[.signature(signature)] = nil
         return nil
     }
 

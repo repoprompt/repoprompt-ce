@@ -100,6 +100,7 @@ extension AgentModeRunService {
         let finalizePendingToolCalls: (AgentTabSession, AgentSessionRunState) -> Void
         let finalizePendingToolCallsWithUpperBound: (AgentTabSession, AgentSessionRunState, Int?) -> Void
         let flushPendingAssistantDelta: (AgentTabSession) -> Void
+        let beginClaudeProviderOutputSegment: (AgentTabSession) -> Void
         let clearPendingAssistantDelta: (AgentTabSession) -> Void
     }
 
@@ -258,9 +259,10 @@ extension AgentModeRunService {
         let terminalSettlement: TerminalSettlementHooks
         let continuation: RunContinuationHooks
         /// Host-owned synchronous deferred-work cleanup, before the terminal shortcut.
+        /// Returns the exact withdrawn provider cleanup for teardown-completed cancellation.
         var prepareForCancellation: (
             AgentTabSession, DomainAgentRunCancellationIntent, AgentModeRunService.CancellationOrigin
-        ) -> Void = { _, _, _ in }
+        ) -> (@MainActor () async -> Void)? = { _, _, _ in nil }
     }
 }
 
@@ -276,10 +278,19 @@ extension AgentModeRunService.Hooks {
         _ session: AgentTabSession
     ) -> AgentRunTerminalSessionBinding {
         let tabID = session.tabID
+        #if DEBUG
+            let observationFlush = session.test_flushQuietToolObservations
+            let observationCheck = session.test_quietToolObservationsAreComplete
+        #else
+            let observationFlush: (@MainActor () async -> Bool)? = nil
+            let observationCheck: @MainActor () -> Bool = { true }
+        #endif
         return AgentRunTerminalSessionBinding(
             tabID: tabID,
             lifecycle: session.runLifecycle,
             hooks: .init(
+                flushQuietToolObservations: observationFlush,
+                quietToolObservationsAreComplete: observationCheck,
                 sealQuietCheckIn: { owner, state, normal, successor in
                     session.sealQuietCheckIn(owner: owner, terminalState: state, normal: normal, hasSuccessor: successor)
                 },
@@ -296,6 +307,7 @@ extension AgentModeRunService.Hooks {
                     usage.finalizeNonCodexTurnUsage(session, nil, nil, nil)
                 },
                 cancelPendingInteractions: { reviewReason in
+                    if session.hasOwnPendingQuietInteraction { session.noteAcceptedTaskInput() }
                     interactions.cancelPendingQuestion(session)
                     interactions.cancelPendingApproval(session)
                     interactions.cancelPendingApplyEditsReview(session, reviewReason)

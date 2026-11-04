@@ -127,7 +127,7 @@ extension AgentModeViewModel {
         return speculation
     }
 
-    func reusableRepromptEffort(claim: AgentComposerSubmitClaim, approved: String?, session: TabSession) -> RepromptSpeculation? {
+    func reusableRepromptEffort(claim: AgentComposerSubmitClaim, approved: String?, session: TabSession, autoWorkflow: AutoWorkflowTurnSelection? = nil) -> RepromptSpeculation? {
         guard let speculation = repromptSpeculations[claim.attempt.id], let approved, speculation.effortTask != nil else { return nil }
         guard speculation.matchesText(approved) else {
             speculation.reuse = .discardedEdited
@@ -140,7 +140,7 @@ extension AgentModeViewModel {
               backendReady,
               modelRouterSettingsStore.autoEffortConfiguration() == speculation.effortConfiguration,
               executableTarget(for: session) == speculation.target,
-              session.selectedWorkflow == speculation.workflow,
+              effectiveWorkflow(session: session, autoWorkflow: autoWorkflow) == speculation.workflow,
               session !== claim.sourceSession || session.userWorkflowSelectionMutationGeneration == speculation.workflowGeneration,
               (modelRouterRuntime?.usageBalancer?.revision ?? 0) == speculation.usageRevision,
               !session.runState.isActive

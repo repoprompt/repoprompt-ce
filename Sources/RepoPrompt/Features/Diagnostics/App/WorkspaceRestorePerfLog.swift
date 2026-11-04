@@ -229,4 +229,28 @@ struct AppWorkspaceRestorePerfRecorder: WorkspaceRestorePerfRecording {
             WorkspaceRestorePerfLog.event(name, fields: fields)
         #endif
     }
+
+    func recordStartupPhase(_ phase: WorkspaceRestoreStartupPhase, debug: Bool, window: Int?, fields: [String: Int]) {
+        let phase: StartupPhaseLog.Phase = switch phase {
+        case .oversightIntentLoad: .oversightIntentLoad
+        case .oversightLaunchSeed: .oversightLaunchSeed
+        case .oversightRestoreAdmission: .oversightRestoreAdmission
+        case .oversightDiscoveryAdoption: .oversightDiscoveryAdoption
+        case .oversightDiscoveryCompletion: .oversightDiscoveryCompletion
+        case .oversightDiscoveryBarrier: .oversightDiscoveryBarrier
+        }
+        if debug {
+            StartupPhaseLog.debugMark(phase, window: window, fields: fields)
+        } else {
+            StartupPhaseLog.mark(phase, window: window, fields: fields)
+        }
+    }
+
+    func recordOversightRestoreAttempt(observer: UUID, target: UUID, outcome: WorkspaceRestoreOversightOutcome, reason: String?) {
+        StartupPhaseLog.oversightRestoreAttempt(observer: observer, target: target, outcome: outcome, reason: reason)
+    }
+
+    func recordLaneCreationAddFailure(branch: WorkspaceRestoreLaneAddFailureBranch, reason: String?) {
+        AgentSessionLinkCatalogDiagnostics.laneCreationAddFailed(branch: branch, reason: reason)
+    }
 }

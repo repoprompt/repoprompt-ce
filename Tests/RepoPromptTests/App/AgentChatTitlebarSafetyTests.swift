@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Combine
 import Foundation
 import KeyboardShortcuts
@@ -7,6 +8,7 @@ import MCP
 import RepoPromptDomainRuntime
 import RepoPromptPersistence
 import RepoPromptSettingsCore
+import SwiftUI
 import XCTest
 
 @MainActor
@@ -1673,6 +1675,77 @@ final class KeyboardShortcutCoverageTests: XCTestCase {
         for action in AgentChatShortcutAction.allCases {
             XCTAssertTrue(names.contains(action.shortcutName))
         }
+        let workflow: [KeyboardShortcuts.Name] = [
+            .stopAgentRun, .focusAgentComposer, .reopenStashedAgentSession, .nextAttentionAgentSession, .resetFontScale
+        ]
+        for name in workflow + LocalKeyboardShortcut.names {
+            XCTAssertTrue(names.contains(name), "\(name.rawValue) must be customizable in Settings")
+        }
+        XCTAssertTrue(Set(KeyboardShortcutCatalog.applicationNames).isDisjoint(with: LocalKeyboardShortcut.names))
+    }
+
+    func testFormerlyFixedComposerKeysKeepTheirDefaultsAndNewWorkflowDefaultsFollowConventions() {
+        XCTAssertEqual(KeyboardShortcuts.Name.repromptDraft.defaultShortcut, .init(.return, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.repromptSendOriginal.defaultShortcut, .init(.o, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.stopAgentRun.defaultShortcut, .init(.period, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.focusAgentComposer.defaultShortcut, .init(.l, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.reopenStashedAgentSession.defaultShortcut, .init(.t, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.nextAttentionAgentSession.defaultShortcut, .init(.a, modifiers: [.command, .shift]))
+        XCTAssertEqual(KeyboardShortcuts.Name.resetFontScale.defaultShortcut, .init(.zero, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.increaseFontScale.defaultShortcut, .init(.equal, modifiers: .command))
+        XCTAssertEqual(KeyboardShortcuts.Name.decreaseFontScale.defaultShortcut, .init(.minus, modifiers: .command))
+    }
+
+    func testLocalShortcutMatchesCurrentAssignmentAndConvertsForSwiftUI() throws {
+        func key(_ code: Int, _ flags: NSEvent.ModifierFlags, _ characters: String = "\r") throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0, windowNumber: 0, context: nil,
+                characters: characters, charactersIgnoringModifiers: characters, isARepeat: false, keyCode: UInt16(code)
+            ))
+        }
+        let original = KeyboardShortcuts.getShortcut(for: .repromptDraft)
+        defer { KeyboardShortcuts.setShortcut(original, for: .repromptDraft) }
+
+        KeyboardShortcuts.reset(.repromptDraft)
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), .repromptDraft))
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_ANSI_KeypadEnter, .command), .repromptDraft), "Keypad Enter keeps working")
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, [.command, .shift]), .repromptDraft))
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, []), .repromptDraft))
+
+        KeyboardShortcuts.setShortcut(.init(.r, modifiers: [.command, .option]), for: .repromptDraft)
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), .repromptDraft))
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_ANSI_R, [.command, .option], "r"), .repromptDraft))
+
+        let recordedKeypadEnter = KeyboardShortcuts.Shortcut(carbonKeyCode: kVK_ANSI_KeypadEnter, carbonModifiers: cmdKey)
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_ANSI_KeypadEnter, .command), recordedKeypadEnter))
+        XCTAssertTrue(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), recordedKeypadEnter))
+
+        KeyboardShortcuts.setShortcut(nil, for: .repromptDraft)
+        XCTAssertFalse(try LocalKeyboardShortcut.matches(key(kVK_Return, .command), .repromptDraft))
+        XCTAssertNil(LocalKeyboardShortcut.swiftUIShortcut(for: .repromptDraft))
+
+        let originalSend = KeyboardShortcuts.getShortcut(for: .repromptSendOriginal)
+        defer { KeyboardShortcuts.setShortcut(originalSend, for: .repromptSendOriginal) }
+        KeyboardShortcuts.reset(.repromptSendOriginal)
+        let send = try XCTUnwrap(LocalKeyboardShortcut.swiftUIShortcut(for: .repromptSendOriginal))
+        XCTAssertEqual(send.key, KeyEquivalent("o"))
+        XCTAssertEqual(send.modifiers, [.command, .shift])
+    }
+
+    func testNextAttentionSessionWrapsInSidebarOrderAndSkipsTheActiveSession() {
+        let ids = (0 ..< 4).map { _ in UUID() }
+        let next = AgentModeViewModel.nextAttentionSidebarSessionTabID
+        XCTAssertEqual(next(ids[1], ids, [ids[0], ids[3]]), ids[3])
+        XCTAssertEqual(next(ids[3], ids, [ids[0], ids[3]]), ids[0], "Wraps past the end")
+        XCTAssertEqual(next(nil, ids, [ids[2]]), ids[2])
+        XCTAssertNil(next(ids[2], ids, [ids[2]]), "The active session alone is not a jump target")
+        XCTAssertNil(next(ids[0], ids, []))
+    }
+
+    func testStopFallsBackToNativeCancelOnlyForConventionalCommandPeriod() {
+        XCTAssertTrue(GlobalKeyboardShortcutsCoordinator.shouldForwardNativeCancel(stopShortcut: .init(.period, modifiers: .command)))
+        XCTAssertFalse(GlobalKeyboardShortcutsCoordinator.shouldForwardNativeCancel(stopShortcut: .init(.period, modifiers: [.command, .shift])))
+        XCTAssertFalse(GlobalKeyboardShortcutsCoordinator.shouldForwardNativeCancel(stopShortcut: nil))
     }
 
     func testExistingMenuDefaultsArePreservedAndNewDefaultsDoNotCollide() {

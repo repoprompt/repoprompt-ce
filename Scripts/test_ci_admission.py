@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Reject wrong integration trees and mixed attempts before hosted evidence is consumed."""
+import copy
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+import io
+import contextlib
+
+import ci_admission as admission
+import modularization_ci_build as ci_build
+import modularization_ci_artifact as artifact
+
+
+class WorkerSchedulingTests(unittest.TestCase):
+    def test_one_worker_retains_four_fail_closed_logical_shards(self):
+        workflow = (Path(__file__).resolve().parent.parent / '.github/workflows/ci.yml').read_text()
+        worker = workflow.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertNotIn('matrix:', worker)
+        self.assertNotIn('continue-on-error:', worker)
+        self.assertEqual(worker.count('uses: actions/download-artifact@'), 1)
+        self.assertIn('id: verified-build', worker)
+        commands = []
+        for step in worker.split('      - name: ')[1:]:
+            if not step.startswith('Run root test shard '):
+                continue
+            self.assertIn("if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}", step)
+            self.assertIn('timeout-minutes: 32', step)
+            commands.append(step.split('run: ', 1)[1].strip())
+        self.assertEqual(commands, [
+            f'./conductor ci-shard --shard-count 4 --shard-index {i} --timeout 1800 --full-log'
+            for i in range(1, 5)])
+        self.assertIn('name: shard-execution-all-${{ github.run_id }}-${{ github.run_attempt }}', worker)
+        self.assertIn('path: .build/ci-test-results/shard-*', worker)
+        self.assertIn('if: always()', worker)
+        aggregate = workflow.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
+        self.assertIn('needs.build-and-test.result', aggregate)
+        self.assertIn('pattern: shard-execution-*-${{ github.run_id }}-${{ github.run_attempt }}', aggregate)
+        self.assertIn('--shard-count 4 --admission-context', aggregate)
+
+
+class CandidateTests(unittest.TestCase):
+    def setUp(self):
+        self.base, self.head, self.tree = 'a' * 40, 'b' * 40, 'c' * 40
+
+    def prepare(self, name, event, ref):
+        return admission.candidate(name, event, self.head, ref, '42', '1', self.tree)
+
+    def test_pr_group_and_push_declare_same_complete_policy_and_correct_range(self):
+        cases = [
+            ('pull_request', {'pull_request': {'base': {'sha': self.base, 'ref': 'main'}}}, 'refs/pull/9/merge'),
+            ('merge_group', {'action': 'checks_requested', 'merge_group': {
+                'base_sha': self.base, 'head_sha': self.head,
+                'base_ref': 'refs/heads/main', 'head_ref': 'refs/heads/gh-readonly-queue/main/pr-9'}},
+                'refs/heads/gh-readonly-queue/main/pr-9'),
+            ('push', {'before': self.base, 'after': self.head, 'ref': 'refs/heads/main'}, 'refs/heads/main'),
+        ]
+        for name, event, ref in cases:
+            with self.subTest(event=name):
+                context = self.prepare(name, event, ref)
+                self.assertEqual((context['head'], context['base'], context['tree']),
+                                 (self.head, self.base, self.tree))
+                self.assertEqual(context['profile'], admission.PROFILE)
+                self.assertEqual(context['timing_policy'], 'clean-enforcing')
+                self.assertEqual(context['products'], 'sentry-privacy')
+
+    def test_reject_wrong_queue_head_ref_action_base_and_zero_base(self):
+        group = {'base_sha': self.base, 'head_sha': self.head,
+                 'base_ref': 'refs/heads/main', 'head_ref': 'refs/heads/queue'}
+        for field, value in [('head_sha', self.base), ('head_ref', 'refs/heads/other'),
+                             ('base_ref', 'refs/heads/other'), ('base_sha', '0' * 40)]:
+            changed = {**group, field: value}
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.prepare('merge_group', {'action': 'checks_requested', 'merge_group': changed}, 'refs/heads/queue')
+        with self.assertRaises(ValueError):
+            self.prepare('merge_group', {'action': 'destroyed', 'merge_group': group}, 'refs/heads/queue')
+        with self.assertRaises(ValueError):
+            self.prepare('pull_request', {'pull_request': {'base': {'sha': self.base, 'ref': 'main'}}}, 'refs/heads/topic')
+        with self.assertRaises(ValueError):
+            self.prepare('push', {'before': self.base, 'after': self.base, 'ref': 'refs/heads/main'}, 'refs/heads/main')
+
+
+class CheckoutTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        admission.git(self.root, 'init', '-q')
+        admission.git(self.root, 'config', 'user.email', 'test@example.invalid')
+        admission.git(self.root, 'config', 'user.name', 'Admission Test')
+        (self.root / 'file').write_text('base')
+        admission.git(self.root, 'add', '.')
+        admission.git(self.root, 'commit', '-qm', 'base')
+        self.base = admission.git(self.root, 'rev-parse', 'HEAD')
+        (self.root / 'file').write_text('candidate')
+        admission.git(self.root, 'commit', '-qam', 'candidate')
+        self.head = admission.git(self.root, 'rev-parse', 'HEAD')
+        self.event = {'before': self.base, 'after': self.head, 'ref': 'refs/heads/main'}
+        self.event_path = self.root / 'event.json'
+        self.event_path.write_text(json.dumps(self.event))
+
+    def command(self, command, attempt='1', **kwargs):
+        args = [sys.executable, str(Path(admission.__file__).resolve()), command, '--root', str(self.root),
+                '--run-id', '42', '--attempt', attempt]
+        for key, value in kwargs.items():
+            args.extend(['--' + key.replace('_', '-'), str(value)])
+        return subprocess.run(args, capture_output=True, text=True)
+
+    def context(self, attempt='1'):
+        output = self.root / 'outputs'
+        result = self.command('prepare', attempt, event_path=self.event_path, event_name='push',
+                              sha=self.head, ref='refs/heads/main', output=output)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = dict(line.split('=', 1) for line in output.read_text().splitlines())
+        self.assertEqual(lines['range'], f'{self.base}..{self.head}')
+        return json.loads(lines['context'])
+
+    def test_full_profile_rerun_passes_but_failed_jobs_only_cannot_reuse_context(self):
+        first = self.context()
+        self.assertEqual(self.command('verify', context=json.dumps(first)).returncode, 0)
+        partial = self.command('verify', '2', context=json.dumps(first))
+        self.assertNotEqual(partial.returncode, 0)
+        self.assertIn('Re-run all jobs', partial.stderr)
+        second = self.context('2')
+        self.assertEqual(self.command('verify', '2', context=json.dumps(second)).returncode, 0)
+        with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+            admission.verify_build_identity({'producer': 'build-test-bundles', 'context': first}, second)
+
+    def test_legacy_release_profile_cannot_be_relabelled_as_current_integration(self):
+        context = self.context()
+        # Profile and obligations must move together. Neither a legacy receipt
+        # nor a hybrid may be consumed under the new integration guarantee.
+        for fields in (
+            {'profile': 'integration-v1', 'products': 'sentry-privacy-and-release-smoke'},
+            {'profile': 'integration-v1'},
+            {'products': 'sentry-privacy-and-release-smoke'},
+            {'products': ''},
+        ):
+            with self.subTest(fields=fields):
+                result = self.command('verify', context=json.dumps({**context, **fields}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('Admission failed:', result.stderr)
+        self.assertEqual(self.command('verify', context=json.dumps(context)).returncode, 0)
+
+    def test_binding_rejects_other_tree_commit_run_profile_and_producer(self):
+        context = self.context()
+        bound = self.command('bind', context=json.dumps(context))
+        self.assertEqual(bound.returncode, 0, bound.stderr)
+        identity = admission.build_identity(self.root)
+        admission.verify_build_identity(identity, context)
+        for field, value in [('tree', self.base), ('head', self.base), ('run_id', '41'),
+                             ('profile', 'unknown'), ('timing_policy', 'report-only')]:
+            changed = {**context, field: value}
+            with self.subTest(field=field):
+                self.assertNotEqual(self.command('verify', context=json.dumps(changed)).returncode, 0)
+        wrong = copy.deepcopy(identity)
+        wrong['producer'] = 'other-job'
+        (self.root / admission.METADATA).write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(ValueError, 'producer'):
+            admission.build_identity(self.root)
+        with self.assertRaisesRegex(ValueError, 'identity mismatch'):
+            admission.verify_build_identity(None, context)
+
+    def test_stale_cache_is_invalidated_but_hosted_boundary_requires_fresh_binding(self):
+        context = self.context()
+        path = self.root / admission.METADATA
+        path.parent.mkdir(parents=True)
+        path.write_text('{malformed old cache')
+        timing = path.with_name('typecheck-timing.json')
+        timing.write_text('{stale measurement')
+        with self.assertRaises(ValueError):
+            admission.build_identity(self.root)  # Malformed is not the optional-local fallback.
+        result = self.command('invalidate', context=json.dumps(context))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(timing.exists())
+        self.assertIsNone(admission.build_identity(self.root))
+        for mode in ('pack', 'verify'):
+            result = subprocess.run([
+                sys.executable, str(Path(artifact.__file__).resolve()), mode, '--root', str(self.root),
+                '--admission-context', json.dumps(context), '--output', str(self.root / 'build.tar.gz')],
+                capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('identity mismatch', result.stderr)
+
+    def test_unrelated_base_fails_instead_of_scanning_another_range(self):
+        # A real object is insufficient: it must be an ancestor of the candidate.
+        admission.git(self.root, 'checkout', '--orphan', 'unrelated')
+        admission.git(self.root, 'commit', '-qam', 'unrelated')
+        self.event['before'] = admission.git(self.root, 'rev-parse', 'HEAD')
+        self.event_path.write_text(json.dumps(self.event))
+        admission.git(self.root, 'checkout', '--detach', self.head)
+        result = self.command('prepare', event_path=self.event_path, event_name='push', sha=self.head,
+                              ref='refs/heads/main', output=self.root / 'outputs')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / 'outputs').exists())
+
+
+class TimingProtocolTests(unittest.TestCase):
+    def test_failed_clean_cannot_leave_cached_identity_or_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / admission.METADATA
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text('{stale cache')
+            timing = metadata.with_name('typecheck-timing.json')
+            timing.write_text('{stale measurement')
+            baseline = root / 'baseline.json'
+            baseline.write_text(json.dumps({'typecheck': {}, 'warnings': {'first_party_unique': 0}}))
+            with mock.patch.object(ci_build, 'ROOT', root), mock.patch.object(ci_build, 'BASELINE', baseline), \
+                    mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}), \
+                    mock.patch.object(ci_build.subprocess, 'run', return_value=subprocess.CompletedProcess([], 2)):
+                self.assertEqual(ci_build.main(), 2)
+            self.assertFalse(metadata.exists())
+            self.assertFalse(timing.exists())
+            self.assertIsNone(admission.build_identity(root))
+
+    def test_clean_enforcing_build_retains_success_failure_and_ratchet_failure(self):
+        warning = 'Sources/RepoPrompt/App/X.swift:3:4: warning: expression took 502ms to type-check\n'
+        for build_status, budget, expected in [(0, 1, 0), (2, 1, 2), (0, 0, 1)]:
+            with self.subTest(build=build_status, budget=budget), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                baseline = root / 'baseline.json'
+                baseline.write_text(json.dumps({'typecheck': {
+                    'function_bodies_1000ms': 0, 'expressions_500ms': budget},
+                    'warnings': {'first_party_unique': 0}}))
+                process = mock.Mock(stdout=io.StringIO(warning + warning))
+                process.wait.return_value = build_status
+                listing = subprocess.CompletedProcess([], 0, stdout='CoreTests.Example/testOne\n')
+                manifest = subprocess.CompletedProcess([], 0, stdout=json.dumps({
+                    'targets': [{'name': 'CoreTests', 'type': 'test'}]}))
+                (root / 'Package.swift').write_text('// fixture')
+                with mock.patch.object(ci_build, 'ROOT', root), \
+                        mock.patch.object(ci_build, 'BASELINE', baseline), \
+                        mock.patch.dict('os.environ', {'TYPECHECK_RATCHET_ENFORCE': '1'}), \
+                        mock.patch.object(ci_build.subprocess, 'Popen', return_value=process), \
+                        mock.patch.object(ci_build.subprocess, 'run', side_effect=[
+                            subprocess.CompletedProcess([], 0), listing, manifest]) as run, \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(ci_build.main(), expected)
+                self.assertEqual(run.call_args_list[0].args[0], ['swift', 'package', 'clean'])
+                report = json.loads((root / '.build/modularization/typecheck-timing.json').read_text())
+                self.assertEqual(report['policy'], 'clean-enforcing')
+                self.assertEqual(report['build_exit_code'], build_status)
+                self.assertEqual(report['budget']['expressions_500ms'], budget)
+                self.assertEqual(report['counts'], {'expression': 1, 'function_body': 0})
+                self.assertEqual(report['locations'], [{
+                    'path': 'Sources/RepoPrompt/App/X.swift', 'line': 3, 'column': 4,
+                    'kind': 'expression', 'duration_ms': 502}])
+
+
+class StatusReportTests(unittest.TestCase):
+    def test_queue_and_execution_require_actual_runner_assignment(self):
+        from ci_status_report import job_timing
+        job = {'id': 1, 'name': 'test', 'status': 'in_progress', 'runner_id': 0,
+               'created_at': '2026-11-04T10:00:00Z', 'started_at': '2026-11-04T10:00:01Z'}
+        now = '2026-11-04T10:10:00Z'
+        pending = job_timing(job, now)
+        self.assertEqual(pending['queue_seconds'], 600)
+        self.assertIsNone(pending['execution_seconds'])
+        running = job_timing({**job, 'runner_id': 5, 'started_at': '2026-11-04T10:04:00Z'}, now)
+        self.assertEqual((running['queue_seconds'], running['execution_seconds']), (240, 360))
+        done = job_timing({**job, 'runner_id': 5, 'status': 'completed',
+                           'completed_at': '2026-11-04T10:06:00Z'}, now)
+        self.assertEqual(done['execution_seconds'], 359)
+        self.assertFalse(done['timing_censored'])
+        for conclusion in ('cancelled', 'skipped', 'failure'):
+            terminal = job_timing({**job, 'status': 'completed', 'conclusion': conclusion}, now)
+            self.assertIsNone(terminal['queue_seconds'])
+            self.assertIsNone(terminal['execution_seconds'])
+
+    def test_report_rejects_mixed_attempts_and_duplicate_pages(self):
+        from ci_status_report import report, seconds
+        run = {'id': 42, 'run_attempt': 2}
+        with self.assertRaisesRegex(ValueError, 'attempt'):
+            report(run, [{'id': 1, 'run_id': 42, 'run_attempt': 1}], '2026-11-04T10:00:00Z')
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            report(run, [{'id': 1}, {'id': 1}], '2026-11-04T10:00:00Z')
+        self.assertIsNone(seconds('2026-11-04T10:01:00Z', '2026-11-04T10:00:00Z'))
+
+    def test_collection_pins_attempt_paginates_and_detects_rerun(self):
+        import ci_status_report as status
+        run = {'id': 42, 'run_attempt': 2, 'html_url': 'https://example.invalid/42',
+               'name': 'CI', 'head_sha': 'a' * 40, 'event': 'push', 'status': 'completed',
+               'conclusion': 'success', 'created_at': '2026-11-04T10:00:00Z'}
+        job = {'id': 1, 'run_id': 42, 'run_attempt': 2, 'name': 'test', 'status': 'completed',
+               'runner_id': 3, 'labels': ['macos-26'], 'created_at': run['created_at'],
+               'started_at': '2026-11-04T10:01:00Z', 'completed_at': '2026-11-04T10:03:00Z'}
+        with mock.patch.object(status, 'api', side_effect=[run, [{'total_count': 2, 'jobs': [job]}, {'total_count': 2, 'jobs': [{**job, 'id': 2}]}], run]) as api:
+            result = status.collect('owner/repo', 42)
+        self.assertEqual(result['observed_macos_jobs'], 2)
+        self.assertEqual(result['sum_observed_macos_execution_seconds'], 240)
+        self.assertEqual(api.call_args_list[1], mock.call('repos/owner/repo/actions/runs/42/attempts/2/jobs?per_page=100', pages=True))
+        with mock.patch.object(status, 'api', side_effect=[run, [{'total_count': 1, 'jobs': [job]}], {**run, 'run_attempt': 3}]):
+            with self.assertRaisesRegex(ValueError, 'changed attempt'):
+                status.collect('owner/repo', 42)
+
+    def test_invalid_job_state_and_incomplete_pagination_are_not_silent(self):
+        import ci_status_report as status
+        job = {'id': 1, 'name': 'test', 'runner_id': 8, 'status': 'queued',
+               'created_at': '2026-11-04T10:00:00Z', 'started_at': '2026-11-04T10:00:01Z'}
+        self.assertIsNone(status.job_timing(job, '2026-11-04T10:05:00Z')['execution_seconds'])
+        with self.assertRaises(ValueError):
+            status.job_timing({**job, 'status': 'surprise'}, '2026-11-04T10:05:00Z')
+        for bad in ('bad', '2026-11-04T10:00:00', '0001-01-01T00:00:00Z'):
+            with self.assertRaises(ValueError):
+                status.timestamp(bad)
+        with mock.patch.object(status, 'api', side_effect=[{'id': 42, 'run_attempt': 1},
+                                                         [{'total_count': 2, 'jobs': []}]]):
+            with self.assertRaisesRegex(ValueError, 'truncated'):
+                status.collect('owner/repo', 42)
+
+    def test_api_uses_get_and_does_not_print_debug_stderr(self):
+        import ci_status_report as status
+        with mock.patch.object(status.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='[]')) as run:
+            self.assertEqual(status.api('repos/owner/repo/actions/runs', pages=True), [])
+        self.assertEqual(run.call_args.args[0], ['gh', 'api', '--method', 'GET',
+                         'repos/owner/repo/actions/runs', '--paginate', '--slurp'])
+        with mock.patch.object(status.subprocess, 'run', return_value=mock.Mock(returncode=1, stderr='private-marker')):
+            with self.assertRaises(ValueError) as failure:
+                status.api('repos/owner/repo/actions/runs')
+        self.assertNotIn('private-marker', str(failure.exception))
+
+
+if __name__ == '__main__':
+    unittest.main()

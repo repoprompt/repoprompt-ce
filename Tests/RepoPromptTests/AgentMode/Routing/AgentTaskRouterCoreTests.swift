@@ -1085,6 +1085,9 @@ final class AgentTaskRouterRuntimeTests: XCTestCase {
         await jev.set(ready)
         try await waitForReadiness(ready, id: .jev, runtime: runtime)
         XCTAssertTrue(runtime.isBackendReady(.jev))
+        // A fresh same-generation revalidation after ready must still become visible.
+        await jev.set(.validating(generation: 1))
+        try await waitForReadiness(.validating(generation: 1), id: .jev, runtime: runtime)
         await runtime.teardown()
     }
 

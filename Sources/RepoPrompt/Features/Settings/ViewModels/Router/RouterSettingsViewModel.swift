@@ -28,6 +28,7 @@ final class RouterSettingsViewModel: ObservableObject {
         let displayName: String
         let isModelRouterEligible: Bool
         let isAutoEffortEligible: Bool
+        var isAutoWorkflowEligible = false
         let displayOrder: Int
         let presentation: DecisionServiceSettingsPresentation?
     }
@@ -97,6 +98,7 @@ final class RouterSettingsViewModel: ObservableObject {
 
     @Published private(set) var configuration: AgentTaskRouterConfiguration
     @Published private(set) var autoEffortConfiguration: AutoEffortConfiguration
+    @Published private(set) var autoWorkflowConfiguration: AutoWorkflowConfiguration
     @Published private(set) var targetPreviews: [TargetPreview] = []
     @Published private(set) var unavailableTargetPreviews: [UnavailableTargetPreview] = []
     @Published private(set) var policyCanBuildCandidates = false
@@ -116,6 +118,7 @@ final class RouterSettingsViewModel: ObservableObject {
 
     private var lastObservedRouterConfiguration: AgentTaskRouterConfiguration
     private var lastObservedAutoEffortConfiguration: AutoEffortConfiguration
+    private var lastObservedAutoWorkflowConfiguration: AutoWorkflowConfiguration
     private var lastForwardedReadinessByID: [DecisionServiceID: DecisionReadiness]
     private var targetPreviewAvailability: AgentModelCatalog.AvailabilityContext?
     private var refreshTask: Task<Void, Never>?
@@ -149,8 +152,10 @@ final class RouterSettingsViewModel: ObservableObject {
         let initialAutoEffortConfiguration = settingsStore.autoEffortConfiguration()
         configuration = initialRouterConfiguration
         autoEffortConfiguration = initialAutoEffortConfiguration
+        autoWorkflowConfiguration = settingsStore.autoWorkflowConfiguration()
         lastObservedRouterConfiguration = initialRouterConfiguration
         lastObservedAutoEffortConfiguration = initialAutoEffortConfiguration
+        lastObservedAutoWorkflowConfiguration = settingsStore.autoWorkflowConfiguration()
         lastForwardedReadinessByID = runtime.decisionServiceReadinessByID
         settingsStore.objectWillChange
             .receive(on: RunLoop.main)
@@ -244,6 +249,21 @@ final class RouterSettingsViewModel: ObservableObject {
 
     var canEnable: Bool {
         readiness.isReady && policyCanBuildCandidates
+    }
+
+    var autoWorkflowReadiness: DecisionReadiness {
+        guard let id = autoWorkflowConfiguration.selectedBackendID,
+              serviceRows.contains(where: { $0.id == id && $0.isAutoWorkflowEligible }),
+              let readiness = runtime.backendReadiness(id)
+        else {
+            return .needsConfiguration(generation: 0, reason: "Configure a compatible Model Router decision service.")
+        }
+        return readiness
+    }
+
+    func setAutoWorkflowEnabled(_ enabled: Bool) {
+        settingsStore.setAutoWorkflowEnabled(enabled)
+        synchronizeConfiguration()
     }
 
     var autoEffortEnabled: Bool {
@@ -494,6 +514,7 @@ final class RouterSettingsViewModel: ObservableObject {
                 displayName: $0.displayName,
                 isModelRouterEligible: ModelRouterDecisionPolicy.supports($0.capabilities),
                 isAutoEffortEligible: AutoEffortDecisionPolicy.supports($0.capabilities),
+                isAutoWorkflowEligible: AutoWorkflowDecisionPolicy.supports($0.capabilities),
                 displayOrder: $0.displayOrder,
                 presentation: $0.configuration?.presentation
             )
@@ -529,6 +550,10 @@ final class RouterSettingsViewModel: ObservableObject {
         let currentAutoEffortConfiguration = settingsStore.autoEffortConfiguration()
         if autoEffortConfiguration != currentAutoEffortConfiguration {
             autoEffortConfiguration = currentAutoEffortConfiguration
+        }
+        let currentAutoWorkflow = settingsStore.autoWorkflowConfiguration()
+        if autoWorkflowConfiguration != currentAutoWorkflow {
+            autoWorkflowConfiguration = currentAutoWorkflow
         }
         rebuildTargetPreviews()
     }
@@ -582,10 +607,13 @@ final class RouterSettingsViewModel: ObservableObject {
     private func settingsStoreDidChange() {
         let currentRouterConfiguration = settingsStore.modelRouterConfiguration()
         let currentAutoEffortConfiguration = settingsStore.autoEffortConfiguration()
-        let changed = currentRouterConfiguration != lastObservedRouterConfiguration
+        let currentAutoWorkflowConfiguration = settingsStore.autoWorkflowConfiguration()
+        let changed = currentAutoWorkflowConfiguration != lastObservedAutoWorkflowConfiguration
+            || currentRouterConfiguration != lastObservedRouterConfiguration
             || currentAutoEffortConfiguration != lastObservedAutoEffortConfiguration
         lastObservedRouterConfiguration = currentRouterConfiguration
         lastObservedAutoEffortConfiguration = currentAutoEffortConfiguration
+        lastObservedAutoWorkflowConfiguration = currentAutoWorkflowConfiguration
         if changed {
             scheduleRefresh()
         }
