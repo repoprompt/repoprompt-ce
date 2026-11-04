@@ -134,11 +134,32 @@ jobs:
             "Reviewed packaged app" \
             "$ARTIFACT_MANIFEST_PATH"
 
+      - name: Transfer reviewed bytes for older macOS compatibility
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: reviewed-release-compatibility
+          path: |
+            reviewed-assets/*.zip
+            reviewed-assets/SHA256SUMS
+            reviewed-assets/*-artifact-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
+  compatibility:
+    name: Older macOS Reviewed Artifact Compatibility
+    needs: [validate-ref, smoke-reviewed-helper]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/macos-compatibility.yml
+    with:
+      artifact-name: reviewed-release-compatibility
+      tooling-ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+
   promote:
     name: Mirror and Promote Reviewed Draft
     needs:
       - validate-ref
       - smoke-reviewed-helper
+      - compatibility
     if: github.ref == 'refs/heads/main'
     environment: release
     runs-on: macos-26

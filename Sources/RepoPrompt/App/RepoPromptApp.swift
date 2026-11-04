@@ -152,6 +152,9 @@ struct RepoPromptSwiftUIApp: App {
             // IMPORTANT: Each time a new SwiftUI window/scene is created,
             // we instantiate a fresh WindowContentView (and thus a new WindowState)
             WindowContentView()
+                .environment(\.navigateToLoadedAgentSession) { sessionID in
+                    await AppDeepLinkRouter.shared.routeLoadedAgentSession(sessionID: sessionID)
+                }
                 .environmentObject(versionManager)
                 .environmentObject(appDelegate.sparkleManager)
                 .environmentObject(windowStatesManager)

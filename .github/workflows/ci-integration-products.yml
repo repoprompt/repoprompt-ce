@@ -1,6 +1,7 @@
-name: Secret-free Integration Products
+name: Secret-free Integration Checks
 
-# Shared implementation for admission; credentialed publication stays independent.
+# Sentry build/privacy is an integration obligation. Universal packaging and
+# older-runtime artifact checks belong to the release workflows, not every PR.
 on:
   workflow_call:
     inputs:
@@ -14,6 +15,7 @@ permissions:
 jobs:
   sentry:
     name: Sentry Build and Privacy
+    if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -53,53 +55,3 @@ jobs:
         env:
           REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./conductor test --filter SentryTelemetryPrivacyTests --full-log
-
-  package:
-    name: Release-mode Package and MCP Smoke
-    runs-on: macos-26
-    # Conductor bounds universal artifact construction at four hours. Let that
-    # deadline report failure and leave time for smoke/diagnostic upload instead
-    # of cancelling a still-valid build at the former two-hour job limit.
-    timeout-minutes: 270
-    env:
-      ADMISSION_CONTEXT: ${{ inputs.admission }}
-      PYTHONUNBUFFERED: "1"
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-
-      - name: Verify exact candidate and full-profile attempt
-        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
-
-      - name: Configure retained package diagnostics
-        run: echo "REPOPROMPT_DEV_DAEMON_STATE_DIR=$RUNNER_TEMP/admission-conductor" >> "$GITHUB_ENV"
-
-      - name: Run release preflight
-        run: ./conductor release preflight --full-log
-
-      - name: Package secret-free universal ad-hoc release candidate
-        timeout-minutes: 245
-        run: ./conductor release artifact --full-log
-
-      - name: Smoke exact release-mode packaged MCP helper
-        env:
-          REPOPROMPT_PACKAGED_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/packaged-smoke
-        run: |
-          ./Scripts/smoke_packaged_mcp_roundtrip.sh \
-            ".build/release/RepoPrompt.app" \
-            "Admission release-mode package" \
-            ".build/release/RepoPrompt-artifact-manifest.json"
-
-      - name: Retain package manifest and failure diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: admission-package-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            .build/release/RepoPrompt-artifact-manifest.json
-            ${{ runner.temp }}/packaged-smoke
-            ${{ runner.temp }}/admission-conductor/jobs/*.log
-          if-no-files-found: warn
-          retention-days: 7
