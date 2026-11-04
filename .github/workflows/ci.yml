@@ -49,6 +49,8 @@ jobs:
 
   build-test-bundles:
     needs: candidate
+    # Reject inherited declaration outputs before allocating a macOS runner.
+    if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Build and Static Gates
@@ -65,18 +67,27 @@ jobs:
       - name: Verify exact candidate and full-profile attempt
         run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
-      - name: Restore SwiftPM build cache
+      - name: Identify SwiftPM support cache compatibility
+        id: support-toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          key="$(python3 Scripts/ci_release_cache.py --sentry 0)"
+          [[ "$key" =~ ^swiftpm-release-v2-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+
+      - name: Restore SwiftPM dependencies and provider support cache
         id: rootbundles-cache
         uses: actions/cache/restore@v6
         with:
           path: |
-            .build
+            .build/checkouts
+            .build/repositories
+            .build/workspace-state.json
             Packages/RepoPromptAgentProviders/.build
-          # Own prefix: must never prefix-match the Sentry or sources caches.
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptAgentProviders/Package.swift', 'Packages/RepoPromptAgentProviders/Package.resolved') }}-
-            ${{ runner.os }}-${{ runner.arch }}-swiftpm-rootbundles-
+          # The enforcing root build cleans its products anyway. Do not transfer
+          # them (or admission receipts), or save another multi-GB copy per commit.
+          key: support-${{ steps.support-toolchain.outputs.key }}
 
       - name: Invalidate cached admission evidence before any build or selftest
         if: always()
@@ -254,20 +265,23 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm/artifacts
           key: ${{ steps.binaries-cache.outputs.cache-primary-key }}
 
-      # Save the compiled cache only from main, so PR runs restore a warm, main-built cache
-      # (PR-scoped caches would evict it). One key per main commit keeps it current.
-      - name: Save SwiftPM build cache (main only)
+      # One compatible main seed; PRs restore only. Root products/receipts are
+      # transferred explicitly to shards, never through an acceleration cache.
+      - name: Save SwiftPM dependencies and provider support cache (main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.rootbundles-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
-            .build
+            .build/checkouts
+            .build/repositories
+            .build/workspace-state.json
             Packages/RepoPromptAgentProviders/.build
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
 
   build-and-test:
     name: Test Root Shard (No Build)
     needs: [candidate, build-test-bundles]
+    if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     runs-on: macos-26
@@ -326,6 +340,9 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      - name: Require one full-profile attempt
+        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
       - name: Fail if a prerequisite failed or was skipped
         env:
           CANDIDATE_RESULT: ${{ needs.candidate.result }}
@@ -347,9 +364,6 @@ jobs:
             echo '::error::CI prerequisite failed, was cancelled, or was skipped. Inspect the failing job; Style is the aggregate gate.'
             exit 1
           fi
-
-      - name: Require one full-profile attempt
-        run: python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Download expected coverage
         uses: actions/download-artifact@v4

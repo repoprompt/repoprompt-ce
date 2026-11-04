@@ -14,6 +14,7 @@ permissions:
 jobs:
   sentry:
     name: Sentry Build and Privacy
+    if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}
     runs-on: macos-26
     timeout-minutes: 60
     env:
@@ -56,6 +57,7 @@ jobs:
 
   package:
     name: Release-mode Package and MCP Smoke
+    if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}
     runs-on: macos-26
     # Conductor bounds universal artifact construction at four hours. Let that
     # deadline report failure and leave time for smoke/diagnostic upload instead
@@ -81,15 +83,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          {
-            xcodebuild -version
-            xcrun swift --version
-            xcrun --sdk macosx --show-sdk-path
-            xcrun --sdk macosx --show-sdk-version
-            printf '%s\n' "${ImageOS:-}" "${ImageVersion:-}" "$GITHUB_WORKSPACE"
-          } > "$RUNNER_TEMP/admission-release-toolchain.txt"
-          toolchain="$(shasum -a 256 "$RUNNER_TEMP/admission-release-toolchain.txt" | awk '{print $1}')"
-          echo "key=$toolchain" >> "$GITHUB_OUTPUT"
+          key="$(python3 Scripts/ci_release_cache.py --sentry 1)"
+          [[ "$key" =~ ^swiftpm-release-v2-[0-9a-f]{64}$ ]]
+          echo "key=$key" >> "$GITHUB_OUTPUT"
 
       # Cache only SwiftPM intermediates, never packaged apps or admission evidence.
       # One immutable main seed per compatible toolchain/policy avoids per-PR churn.
@@ -98,7 +94,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .build/public-release-swiftpm
-          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-admission-release-v1-${{ steps.release-toolchain.outputs.key }}-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/**/Package.swift', 'Packages/**/Package.resolved', 'Scripts/build_swiftpm_release_products.sh', 'Scripts/patch_keyboard_shortcuts_resource_lookup.sh', 'Scripts/patches/*.patch', 'Scripts/run_without_github_tokens.sh', 'Scripts/compare_swiftpm_release_resources.py', 'Scripts/conductor.py', 'Scripts/package_app.sh', 'Scripts/release.sh', 'Scripts/release_sentry_symbols.sh', 'Vendor/Sparkle/SHA256SUMS', '.github/workflows/ci-integration-products.yml') }}
+          key: ${{ steps.release-toolchain.outputs.key }}
 
       - name: Run release preflight
         run: ./conductor release preflight --full-log

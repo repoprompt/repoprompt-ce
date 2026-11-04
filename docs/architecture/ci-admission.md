@@ -69,7 +69,10 @@ extends its existing execution receipt with that binding and producer identity;
 Style verifies those against independently downloaded expected coverage. Artifacts
 are named by run **and attempt**. No cross-run/event promotion is supported.
 
-Caches are acceleration, not evidence. Root cache restoration explicitly invalidates
+Caches are acceleration, not evidence. The root cache contains dependency checkouts
+and provider-package intermediates, not the root products that the enforcing
+clean build discards. One exact toolchain/policy-compatible main
+seed replaces per-commit multi-GB snapshots. Root cache restoration explicitly invalidates
 old admission identity before selftests/builds. The build helper also invalidates
 identity and timing data before a clean/rebuild, including failed cleans. A fresh
 binding is written only after all producer gates pass. Hosted pack/shard/aggregate
@@ -91,9 +94,11 @@ through conductor's per-request environment. SwiftPM still builds both products
 for both architectures on every attempt, even on an exact cache hit. Packaging
 recreates the app, manifest, and archive and reruns architecture/resource checks,
 the packaged MCP smoke, and older-runtime smoke. Assembled apps, `dist`, and root
-admission/coverage receipts are outside the cache. The ordinary release workflow
-and local release commands retain their default clean build behavior. A cache
-hit is never accepted as test, build, or admission evidence.
+admission/coverage receipts are outside the cache. Official Tip and stable release
+staging remain clean: compiled-cache reuse in subsequently signed artifacts needs
+separate integrity and stale-resource validation. Local release commands also
+retain their default clean build behavior. A cache hit is never accepted as test,
+build, or admission evidence.
 
 ## Runner capacity and scheduling
 
@@ -106,7 +111,8 @@ universal packaging occupied a runner for 152 minutes. These are observed exampl
 not runtime budgets or speedup guarantees. GitHub's
 [macOS concurrency limits](https://docs.github.com/en/actions/reference/limits)
 apply across standard and larger hosted macOS runners; changing the image label
-does not provide a separate pool.
+does not increase that account allowance. Physical runner availability is a
+separate constraint: a provider capacity failure is not a compiler failure.
 
 Delaying integration products avoids spending that capacity on candidates whose
 root checks already fail. For example,
@@ -127,9 +133,13 @@ unsupported in v1: they retain an earlier candidate declaration and fail with a
 so successful prerequisites from another attempt cannot silently satisfy it. This
 is a bounded, explicit whole-profile policy, not unverified earlier-producer reuse.
 
+Mac job admission rejects stale-attempt declarations before allocating a runner;
+Style retains an explicit full-profile error instead of accepting skipped work.
+
 Only obsolete first-attempt PR previews supersede one another. Queue/main runs and
-explicit reruns are run-scoped; newer pushes do not cancel their evidence. Any
-failed, cancelled, skipped, or missing required obligation prevents Style success.
+explicit reruns remain run-scoped; newer pushes do not cancel their evidence.
+Whole-main-run coalescing would skip push-range secret scans and is not used.
+Any failed, cancelled, skipped, or missing required obligation prevents Style success.
 A removed/replaced queue candidate cannot authorize a different candidate.
 
 ## Timing policy
