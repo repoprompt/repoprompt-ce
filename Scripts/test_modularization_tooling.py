@@ -358,7 +358,7 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn('compression-level:', cache_save)
         self.assertNotIn('if-no-files-found:', cache_save)
 
-    def test_required_style_is_final_and_mac_job_budget_is_seven(self) -> None:
+    def test_required_style_retains_core_and_sentry_without_release_builds(self) -> None:
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]
         self.assertIn('name: Style', final)
@@ -367,7 +367,10 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('ci_test_coverage.py', final)
         self.assertEqual(ci.count('runs-on: macos-26'), 2)  # shared root build + 4 matrix children
         products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
-        self.assertEqual(products.count('runs-on: macos-26'), 2)  # Sentry/privacy + release package/smoke
+        self.assertEqual(products.count('runs-on: macos-26'), 1)  # Sentry/privacy only
+        self.assertIn('SentryTelemetryPrivacyTests', products)
+        self.assertNotIn('release artifact', products)
+        self.assertNotIn('macos-compatibility.yml', products)
         self.assertNotIn('continue-on-error', products)
         self.assertIn('shard: [1, 2, 3, 4]', ci)
         self.assertNotIn('continue-on-error', ci)
@@ -375,9 +378,25 @@ class CatalogTests(unittest.TestCase):
             if line.startswith('    name:'):
                 self.assertNotIn('${{', line)
 
+    def test_partial_reruns_are_rejected_before_mac_allocation_and_reported_by_style(self) -> None:
+        root = SCRIPT_DIR.parent / '.github/workflows'
+        ci = (root / 'ci.yml').read_text()
+        products = (root / 'ci-integration-products.yml').read_text()
+        for job in ('build-test-bundles', 'build-and-test'):
+            body = ci.split(f'\n  {job}:\n', 1)[1].split('\n    steps:', 1)[0]
+            self.assertIn('if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}', body)
+        for job in ('sentry',):
+            body = products.split(f'\n  {job}:\n', 1)[1].split('\n    steps:', 1)[0]
+            self.assertIn('if: ${{ fromJSON(inputs.admission).attempt == github.run_attempt }}', body)
+        compatibility = (root / 'macos-compatibility.yml').read_text()
+        self.assertIn("if: ${{ inputs.admission == '' || fromJSON(inputs.admission).attempt == github.run_attempt }}", compatibility)
+        final = ci.split('\n  style:\n', 1)[1]
+        self.assertLess(final.index('name: Require one full-profile attempt'),
+                        final.index('name: Fail if a prerequisite failed or was skipped'))
+
     def test_supplemental_product_workflows_are_manual_only(self) -> None:
-        # The integration profile above already gates both products. Automatic
-        # copies consume scarce macOS runners without adding an admission gate.
+        # Sentry is already blocking; universal qualification belongs to publication
+        # or an explicit diagnostic, not another automatic copy per push.
         for name in ('ci-main.yml', 'release-candidate.yml'):
             with self.subTest(workflow=name):
                 workflow = (SCRIPT_DIR.parent / '.github/workflows' / name).read_text()
@@ -388,8 +407,8 @@ class CatalogTests(unittest.TestCase):
         # The old 120-minute job killed a valid four-hour operation on main.
         # Compare the independent owners rather than pinning another timeout copy.
         root = SCRIPT_DIR.parent
-        products = (root / '.github/workflows/ci-integration-products.yml').read_text()
-        package = products.split('\n  package:\n', 1)[1]
+        products = (root / '.github/workflows/release-candidate.yml').read_text()
+        package = products.split('\n  artifact:\n', 1)[1]
         job_seconds = int(package.split('    timeout-minutes:', 1)[1].splitlines()[0]) * 60
         step = package.split('      - name: Package secret-free universal ad-hoc release candidate\n', 1)[1]
         step = step.split('\n      - name:', 1)[0]
