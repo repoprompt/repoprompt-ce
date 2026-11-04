@@ -1,7 +1,9 @@
 # CI test gate contract
 
-`CI` uses six macOS jobs total: one **Build and Static Gates** job, four
-**Test Root Shard (No Build)** jobs, and the secret-free Sentry build/privacy job.
+`CI` uses three macOS jobs total: one **Build and Static Gates** job, one
+**Test Root Shards (No Build)** worker running all four logical shards sequentially,
+and the secret-free Sentry build/privacy job. Each shard retains its own execution
+deadline and receipt; ordinary failures do not suppress later shards.
 Universal release packaging and older-runtime artifact smoke instead qualify the
 exact artifacts in Tip, stable, and explicit manual Release Candidate workflows.
 The exact required check **Style** runs last
