@@ -16,6 +16,33 @@ import modularization_ci_build as ci_build
 import modularization_ci_artifact as artifact
 
 
+class WorkerSchedulingTests(unittest.TestCase):
+    def test_one_worker_retains_four_fail_closed_logical_shards(self):
+        workflow = (Path(__file__).resolve().parent.parent / '.github/workflows/ci.yml').read_text()
+        worker = workflow.split('\n  build-and-test:\n', 1)[1].split('\n  style:\n', 1)[0]
+        self.assertNotIn('matrix:', worker)
+        self.assertNotIn('continue-on-error:', worker)
+        self.assertEqual(worker.count('uses: actions/download-artifact@'), 1)
+        self.assertIn('id: verified-build', worker)
+        commands = []
+        for step in worker.split('      - name: ')[1:]:
+            if not step.startswith('Run root test shard '):
+                continue
+            self.assertIn("if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}", step)
+            self.assertIn('timeout-minutes: 32', step)
+            commands.append(step.split('run: ', 1)[1].strip())
+        self.assertEqual(commands, [
+            f'./conductor ci-shard --shard-count 4 --shard-index {i} --timeout 1800 --full-log'
+            for i in range(1, 5)])
+        self.assertIn('name: shard-execution-all-${{ github.run_id }}-${{ github.run_attempt }}', worker)
+        self.assertIn('path: .build/ci-test-results/shard-*', worker)
+        self.assertIn('if: always()', worker)
+        aggregate = workflow.split('\n  style:\n', 1)[1].split('\n  secret-scan:\n', 1)[0]
+        self.assertIn('needs.build-and-test.result', aggregate)
+        self.assertIn('pattern: shard-execution-*-${{ github.run_id }}-${{ github.run_attempt }}', aggregate)
+        self.assertIn('--shard-count 4 --admission-context', aggregate)
+
+
 class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.base, self.head, self.tree = 'a' * 40, 'b' * 40, 'c' * 40

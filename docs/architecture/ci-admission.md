@@ -106,8 +106,10 @@ build, test, or publication evidence.
 
 ## Runner capacity and scheduling
 
-Integration now requests six macOS jobs instead of nine: one producer, four shards,
-and Sentry/privacy. Universal packaging and its two artifact checks are demanded
+Integration requests three macOS jobs: one producer, one root-test worker running
+all four logical shards sequentially, and Sentry/privacy. The earlier reduction
+removed universal packaging and compatibility from nine jobs to six; consolidating
+the shard workers removes another three allocations and artifact downloads. Universal packaging and its two artifact checks are demanded
 only by actual release flows or an explicit diagnostic. This removes the largest
 per-candidate workload amplifier; it does not reserve capacity or promise a latency
 SLO. GitHub account limits and hosted image availability remain separate constraints.
@@ -115,7 +117,28 @@ The [capacity audit](ci-capacity-2026-11-04.md) separates measured queue/executi
 from expected impact. There is no measured hosted before/after result yet.
 
 Sentry still waits for root gates to reject bad candidates before allocating a VM.
-Four root shards keep exact full coverage and fail-fast false. Do not increase
+Four logical root shards keep exact full coverage. A single worker downloads and
+verifies the producer once, then runs each shard with a fresh per-suite sandbox
+through conductor. Ordinary shard failure does not suppress later shards; failed
+setup and workflow cancellation do. No `continue-on-error` masks a failure.
+Each shard has a 1,800-second conductor execution limit (owned process cleanup),
+a 32-minute step envelope, and unchanged individual-suite/test assertion budgets.
+The 140-minute job envelope covers four sequential steps plus setup/uploads;
+it is not a relaxed individual-test timeout. All four run/attempt-bound receipts
+are uploaded together and the existing Style verifier still requires their exact
+union. Missing or failed shards cannot pass. This does not change the profile's
+correctness obligations or permit partial reruns.
+
+This trades idle-capacity parallel speed for fewer allocations under contention.
+It does not reduce the number of tests or the clean build/Sentry workload. Compare
+end-to-end latency and summed macOS execution minutes for successful runs, separating
+queue time from execution. Keep failed/cancelled attempts visible but out of the
+successful-run timing comparison. Revert the worker consolidation if queue savings
+do not offset sequential execution or state isolation regresses; do not weaken
+coverage, deadlines, secret scans, or publication gates. Hosted benefit is unproven
+until the new workflow runs. Existing suite isolation is unchanged, but one VM is
+now reused across shards; hosted validation must specifically check this boundary.
+ Do not increase
 parallelism or switch images assuming that creates account capacity. Preserve the
 Ubuntu Tip eligibility job so obsolete candidates do not wait for a Mac just to skip.
 Main pushes remain run-scoped: coalescing the whole workflow would discard introduced
