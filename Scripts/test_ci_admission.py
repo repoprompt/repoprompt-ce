@@ -225,5 +225,78 @@ class TimingProtocolTests(unittest.TestCase):
                     'kind': 'expression', 'duration_ms': 502}])
 
 
+class StatusReportTests(unittest.TestCase):
+    def test_queue_and_execution_require_actual_runner_assignment(self):
+        from ci_status_report import job_timing
+        job = {'id': 1, 'name': 'test', 'status': 'in_progress', 'runner_id': 0,
+               'created_at': '2026-11-04T10:00:00Z', 'started_at': '2026-11-04T10:00:01Z'}
+        now = '2026-11-04T10:10:00Z'
+        pending = job_timing(job, now)
+        self.assertEqual(pending['queue_seconds'], 600)
+        self.assertIsNone(pending['execution_seconds'])
+        running = job_timing({**job, 'runner_id': 5, 'started_at': '2026-11-04T10:04:00Z'}, now)
+        self.assertEqual((running['queue_seconds'], running['execution_seconds']), (240, 360))
+        done = job_timing({**job, 'runner_id': 5, 'status': 'completed',
+                           'completed_at': '2026-11-04T10:06:00Z'}, now)
+        self.assertEqual(done['execution_seconds'], 359)
+        self.assertFalse(done['timing_censored'])
+        for conclusion in ('cancelled', 'skipped', 'failure'):
+            terminal = job_timing({**job, 'status': 'completed', 'conclusion': conclusion}, now)
+            self.assertIsNone(terminal['queue_seconds'])
+            self.assertIsNone(terminal['execution_seconds'])
+
+    def test_report_rejects_mixed_attempts_and_duplicate_pages(self):
+        from ci_status_report import report, seconds
+        run = {'id': 42, 'run_attempt': 2}
+        with self.assertRaisesRegex(ValueError, 'attempt'):
+            report(run, [{'id': 1, 'run_id': 42, 'run_attempt': 1}], '2026-11-04T10:00:00Z')
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            report(run, [{'id': 1}, {'id': 1}], '2026-11-04T10:00:00Z')
+        self.assertIsNone(seconds('2026-11-04T10:01:00Z', '2026-11-04T10:00:00Z'))
+
+    def test_collection_pins_attempt_paginates_and_detects_rerun(self):
+        import ci_status_report as status
+        run = {'id': 42, 'run_attempt': 2, 'html_url': 'https://example.invalid/42',
+               'name': 'CI', 'head_sha': 'a' * 40, 'event': 'push', 'status': 'completed',
+               'conclusion': 'success', 'created_at': '2026-11-04T10:00:00Z'}
+        job = {'id': 1, 'run_id': 42, 'run_attempt': 2, 'name': 'test', 'status': 'completed',
+               'runner_id': 3, 'labels': ['macos-26'], 'created_at': run['created_at'],
+               'started_at': '2026-11-04T10:01:00Z', 'completed_at': '2026-11-04T10:03:00Z'}
+        with mock.patch.object(status, 'api', side_effect=[run, [{'total_count': 2, 'jobs': [job]}, {'total_count': 2, 'jobs': [{**job, 'id': 2}]}], run]) as api:
+            result = status.collect('owner/repo', 42)
+        self.assertEqual(result['observed_macos_jobs'], 2)
+        self.assertEqual(result['sum_observed_macos_execution_seconds'], 240)
+        self.assertEqual(api.call_args_list[1], mock.call('repos/owner/repo/actions/runs/42/attempts/2/jobs?per_page=100', pages=True))
+        with mock.patch.object(status, 'api', side_effect=[run, [{'total_count': 1, 'jobs': [job]}], {**run, 'run_attempt': 3}]):
+            with self.assertRaisesRegex(ValueError, 'changed attempt'):
+                status.collect('owner/repo', 42)
+
+    def test_invalid_job_state_and_incomplete_pagination_are_not_silent(self):
+        import ci_status_report as status
+        job = {'id': 1, 'name': 'test', 'runner_id': 8, 'status': 'queued',
+               'created_at': '2026-11-04T10:00:00Z', 'started_at': '2026-11-04T10:00:01Z'}
+        self.assertIsNone(status.job_timing(job, '2026-11-04T10:05:00Z')['execution_seconds'])
+        with self.assertRaises(ValueError):
+            status.job_timing({**job, 'status': 'surprise'}, '2026-11-04T10:05:00Z')
+        for bad in ('bad', '2026-11-04T10:00:00', '0001-01-01T00:00:00Z'):
+            with self.assertRaises(ValueError):
+                status.timestamp(bad)
+        with mock.patch.object(status, 'api', side_effect=[{'id': 42, 'run_attempt': 1},
+                                                         [{'total_count': 2, 'jobs': []}]]):
+            with self.assertRaisesRegex(ValueError, 'truncated'):
+                status.collect('owner/repo', 42)
+
+    def test_api_uses_get_and_does_not_print_debug_stderr(self):
+        import ci_status_report as status
+        with mock.patch.object(status.subprocess, 'run', return_value=mock.Mock(returncode=0, stdout='[]')) as run:
+            self.assertEqual(status.api('repos/owner/repo/actions/runs', pages=True), [])
+        self.assertEqual(run.call_args.args[0], ['gh', 'api', '--method', 'GET',
+                         'repos/owner/repo/actions/runs', '--paginate', '--slurp'])
+        with mock.patch.object(status.subprocess, 'run', return_value=mock.Mock(returncode=1, stderr='private-marker')):
+            with self.assertRaises(ValueError) as failure:
+                status.api('repos/owner/repo/actions/runs')
+        self.assertNotIn('private-marker', str(failure.exception))
+
+
 if __name__ == '__main__':
     unittest.main()

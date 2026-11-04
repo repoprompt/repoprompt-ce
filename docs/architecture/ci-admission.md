@@ -121,6 +121,33 @@ Ubuntu Tip eligibility job so obsolete candidates do not wait for a Mac just to 
 Main pushes remain run-scoped: coalescing the whole workflow would discard introduced
 commit-range secret scans. Do not add cancellation without addressing that obligation.
 
+### Read-only queue and execution report
+
+Use authenticated `gh` with the repository-owned reporter; it only makes GET requests:
+
+```sh
+python3 Scripts/ci_status_report.py --run 41802322531 --run 41783464696 > /tmp/ci-timing.json
+```
+
+The report pins each run's current attempt, paginates its jobs, preserves failures
+and cancellations, and separates runner allocation delay from execution. A synthetic
+`started_at` with no runner ID is not executing. In-progress times are approximate snapshots (API races and clock skew apply);
+future dependent jobs are absent. Unassigned skipped/cancelled jobs have unknown
+queue duration, not zero. A changed/mixed attempt or incomplete job pagination fails instead of silently
+combining evidence. This diagnostic does not certify partial-rerun lineage. Queue
+time includes any approval or concurrency wait, not only runner-capacity pressure. Collection is a bounded snapshot, not an atomic view of GitHub.
+
+Compare successful runs on the same profile and similar workload/queue pressure.
+Use run links and per-job timestamps; summed runner seconds are not wall-clock latency
+or billing. Do not compare a cancelled/partial run's short duration to a passing run.
+For worker consolidation, record test-worker queue time, execution, total macOS
+execution, exact coverage success, and overall time to Style. Keep a rollback available
+if serialized execution outweighs queue/setup savings. No automated cancellation,
+rerun, secret access, or workflow mutation is provided by this command.
+
+Reporter regression tests run with `python3 Scripts/test_ci_admission.py` and the
+existing `make ci-app-test-runner-selftest` lane.
+
 ### Reruns and cancellation
 
 Use **Re-run all jobs**. Failed-jobs-only and individually rerun jobs are deliberately
