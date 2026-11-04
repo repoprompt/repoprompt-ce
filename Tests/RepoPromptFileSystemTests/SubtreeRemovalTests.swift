@@ -11,7 +11,7 @@ final class SubtreeRemovalTests: XCTestCase {
             ("slash neighbour", "a/b", ["a": true, "a/b": true, "a/b/file": false, "a/bc": true, "a/bc/file": false]),
             ("Unicode", "café/📁", ["café": true, "café/📁": true, "café/📁/文.txt": false, "café/📁extra": false]),
             ("equal length ties", "a", ["a": true, "a/b": true, "a/c": false, "a/b/x": false, "a/d": true]),
-            ("empty top", "", ["": true, "/child": false, "a": true, "a/file": false]),
+            ("empty top", "", ["": true, "/child": false, "a": true, "a/file": false])
         ]
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -43,8 +43,8 @@ final class SubtreeRemovalTests: XCTestCase {
 }
 
 private extension FileSystemService {
-    // Snapshot the actor's iteration order so equal-length ties compare against the old implementation,
-    // not a separately constructed Set whose iteration order may differ.
+    /// Snapshot the actor's iteration order so equal-length ties compare against the old implementation,
+    /// not a separately constructed Set whose iteration order may differ.
     func referenceSubtreeRemoval(for topRelPath: String) -> (
         deltas: [FileSystemDelta], paths: Set<String>, items: [String: Bool]
     ) {
