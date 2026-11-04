@@ -415,6 +415,7 @@
                         codexLastTotalTokens: session.codexLastTotalTokens,
                         codexTotalTotalTokens: session.codexTotalTotalTokens,
                         codexMcpSessionKey: session.codexMcpSessionKey,
+                        contextWindowCapacity: session.contextWindowCapacity,
                         pendingHandoffPayload: session.pendingHandoffPayload,
                         pendingHandoffCreatedAt: session.pendingHandoffCreatedAt,
                         pendingHandoffSourceItemID: session.pendingHandoffSourceItemID,

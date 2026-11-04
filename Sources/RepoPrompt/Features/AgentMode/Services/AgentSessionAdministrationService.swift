@@ -235,11 +235,16 @@ final class AgentSessionAdministrationCore: AgentSessionAdministrationService {
                 // A handler refusal after its own re-checks (state changed since the card) applied
                 // nothing: the card returns to `approved` rather than being consumed.
                 if let claimedCard {
-                    let result = value.objectValue?["result"]?.stringValue
+                    let object = value.objectValue
+                    let result = object?["result"]?.stringValue
+                    // Effect evidence, not authorization: any committed change consumes the approval,
+                    // whatever result string accompanies it, so a committed release whose completion
+                    // failed can never be redeemed again (for example after the worktree is rebound).
+                    let committed = object?[AgentSessionAdminRendering.committedChangesKey] == .bool(true)
                     // Retire retains its existing single-use no-op/partial receipt contract.
                     // A wholly refused worktree release, however, has no effect to consume.
-                    let applied = result != "denied"
-                        && (batch.request.operation != .adminWorktreeRelease || result != "not_applied")
+                    let refusedRelease = batch.request.operation == .adminWorktreeRelease && result == "not_applied"
+                    let applied = committed || (result != "denied" && !refusedRelease)
                     scopes.confirmations.finishApplying(confirmationID: claimedCard, succeeded: applied)
                 }
                 return .completed(value)

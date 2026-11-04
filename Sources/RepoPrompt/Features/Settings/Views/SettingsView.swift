@@ -105,9 +105,8 @@ struct SettingsView: View {
             Divider()
 
             // Right side with content
-            VStack(spacing: 0) {
+            SettingsDetailViewport {
                 selectedDetailContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .id(selectedTab)
             }
         }
@@ -364,8 +363,10 @@ struct SettingsView: View {
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .promptOrder:
-            PromptOrderSettingsView(promptViewModel: promptViewModel)
-                .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+            ScrollView {
+                PromptOrderSettingsView(promptViewModel: promptViewModel)
+            }
+            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .manageWorkspaces:
             ManageWorkspacesView(isPresented: .constant(true), showCloseButton: false)
                 .environmentObject(windowState.workspaceManager)
@@ -512,6 +513,22 @@ struct SettingsView: View {
             diagnostics: diagnostics
         )
         return (provider, subagent, diagnostics)
+    }
+}
+
+struct SettingsDetailViewport<Content: View>: View {
+    private let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            content
+                .frame(width: geometry.size.width, height: geometry.size.height, alignment: .topLeading)
+        }
+        .clipped()
     }
 }
 

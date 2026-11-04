@@ -93,6 +93,33 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(status, 0)
             coverage.verify_shards(TESTS, ['CoreTests'], [json.loads(receipt.read_text())], 1, identity['context'])
 
+    def test_sequential_shards_preserve_prior_receipts_after_failure_and_timeout(self):
+        # One worker reuses the checkout, but never reuses a failed shard's receipt.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = {'context': {'head': 'candidate', 'run_id': '42', 'attempt': '1'}}
+            statuses = []
+            pass_log = (FIXTURES / 'pass.txt').read_text()
+            with mock.patch.object(runner, 'build_identity', return_value=identity), \
+                    mock.patch.object(runner, 'execute_logged', side_effect=[
+                        (0, pass_log), (1, ''), (124, ''), (0, pass_log)]) as execute:
+                for index in range(1, 5):
+                    receipt = root / f'shard-{index}.json'
+                    receipt.write_text('stale receipt')
+                    statuses.append(runner.run_selected_suites(
+                        ['CoreTests.ExampleTests'], swift_binary='swift', cwd=root,
+                        bundle_selection=runner.BundleSelection(root / 'PackageTests.xctest', {}, ('xctest',)),
+                        sandbox_root=root / f'sandbox-{index}', suite_methods={'CoreTests.ExampleTests': TESTS},
+                        receipt_path=receipt, shard_count=4, shard_index=index, output=io.StringIO()))
+            self.assertEqual(statuses, [0, 1, 124, 0])
+            self.assertEqual(execute.call_count, 4)
+            self.assertEqual(sorted(p.name for p in root.glob('shard-*.json')), ['shard-1.json', 'shard-4.json'])
+            receipts = [json.loads(p.read_text()) for p in sorted(root.glob('shard-*.json'))]
+            self.assertEqual([r['producer'] for r in receipts], ['build-and-test-1', 'build-and-test-4'])
+            self.assertTrue(all(r['admission'] == identity['context'] for r in receipts))
+            with self.assertRaises(ValueError):
+                coverage.verify_shards(TESTS, ['CoreTests'], receipts, 4, identity['context'])
+
     def test_runner_checks_later_suites_after_zero_execution_without_publishing_receipt(self):
         methods = {
             'CoreTests.EmptyTests': ['CoreTests.EmptyTests/testOne'],
