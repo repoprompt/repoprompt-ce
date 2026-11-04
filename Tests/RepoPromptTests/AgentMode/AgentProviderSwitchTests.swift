@@ -9,6 +9,71 @@
         private let date = Date(timeIntervalSince1970: 1_700_000_000)
         private let sessionID = UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
 
+        @MainActor
+        func testTokenEstimateOmitsWindowForCatalogAndAssumedBudgets() {
+            for window in [1_050_000, nil] as [Int?] {
+                let budget = Handover.Budget(catalogWindow: window, instructions: ["abcd"], composedInput: "", isPreview: true)
+                XCTAssertEqual(AgentProviderSwitchPreview.tokenEstimateText(bytes: 100, budget: budget), "~2076 tokens")
+            }
+        }
+
+        @MainActor
+        func testVisibleChoicesHideOnlyUnavailableHistoryAndAlreadyHiddenRows() {
+            typealias Choice = AgentModeViewModel.ProviderSwitchChoice
+            let recent = Choice(mode: .newestTurns, unavailable: "the last turn alone doesn't fit")
+            let summary = Choice(mode: .summary, unavailable: "no room for a summary")
+            let unavailableHistory = Choice(mode: .history, unavailable: "too large")
+            let fittingHistory = Choice(mode: .history, retainedPayload: "history")
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([unavailableHistory, recent, summary]).map(\.mode), [.newestTurns, .summary])
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, recent, summary]).map(\.mode), [.history, .newestTurns, .summary])
+            XCTAssertEqual(AgentProviderSwitchPreview.visibleChoices([fittingHistory, Choice(mode: .newestTurns, hidden: true), summary]).map(\.mode), [.history, .summary])
+        }
+
+        @MainActor
+        func testPreviewSelectionPrefersLivePickThenRetainedThenFittingHistoryAndRecent() {
+            typealias Choice = AgentModeViewModel.ProviderSwitchChoice
+            let history = Choice(mode: .history, retainedPayload: "history")
+            let recent = Choice(mode: .newestTurns, retainedPayload: "recent")
+            let summary = Choice(mode: .summary, retainedPayload: "summary")
+            let cases: [([Choice], Handover.Mode?, Handover.Mode?, Handover.Mode?)] = [
+                ([history, recent, summary], .newestTurns, .summary, .newestTurns),
+                ([history, recent, summary], nil, .summary, .summary),
+                ([history, recent], nil, nil, .history),
+                ([Choice(mode: .history, unavailable: "too large"), recent], nil, nil, .newestTurns),
+                ([history, Choice(mode: .newestTurns, retainedPayload: "recent", hidden: true)], .newestTurns, nil, .history),
+                ([Choice(mode: .history), recent], .history, nil, .newestTurns),
+                ([Choice(mode: .history, retainedPayload: "history", unavailable: "too large")], nil, nil, nil)
+            ]
+            for (choices, explicit, retained, expected) in cases {
+                XCTAssertEqual(AgentModeViewModel.providerSwitchSelection(choices: choices, explicit: explicit, retained: retained), expected)
+            }
+        }
+
+        @MainActor
+        func testExpiredPreviewCannotPublishDiscoveredSkillsButOrdinaryRefreshStillCan() async throws {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let commands = root.appendingPathComponent(".claude/commands")
+            try FileManager.default.createDirectory(at: commands, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            try "---\ndescription: Preview-only test skill\n---\nTest instructions".write(to: commands.appendingPathComponent("preview-fence.md"), atomically: true, encoding: .utf8)
+            let catalog = AgentSkillCatalog(homeDirectoryURL: root.appendingPathComponent("home"))
+            var live = true
+            catalog.test_beforePublish = { live = false }
+            await catalog.refresh(workspacePaths: [root.path], agentKind: .claudeCode, shouldPublish: { live })
+            XCTAssertNil(catalog.resolve(name: "preview-fence"))
+            catalog.test_beforePublish = nil
+            await catalog.refreshIfNeeded(workspacePaths: [root.path], agentKind: .claudeCode)
+            XCTAssertNotNil(catalog.resolve(name: "preview-fence"))
+        }
+
+        @MainActor
+        func testSwitchViewNeverEchoesUnknownErrorsOrAgentRefusals() {
+            for reason in ["private transport failure", AgentSessionLinkSendFailure.providerSwitchUnconfirmed.message] {
+                XCTAssertFalse(AgentProviderSwitchPreview.blockerText(reason).contains(reason))
+                XCTAssertEqual(AgentProviderSwitchPreview.unavailableText(reason), "This handover option is unavailable.")
+            }
+        }
+
         func testPendingDeliveryCodecAndLightweightHeaderPreservePayloadAndFailClosed() async throws {
             let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

@@ -65,6 +65,9 @@ struct AgentInputBar: View {
     @Binding var transcriptBottomClearance: CGFloat
 
     @FocusState var isFocused: Bool
+    @State private var providerSwitchBannerHeight: CGFloat = 0
+    @State private var composerOnlyBottomInset: CGFloat = 0
+    @State private var composerOnlyBottomClearance: CGFloat = 0
 
     /// Height of the footer spacing below the composer chrome
     static let footerHeight: CGFloat = 28
@@ -95,11 +98,19 @@ struct AgentInputBar: View {
         #if DEBUG
             let _ = perfRecorder.increment("ui.body.inputBar")
         #endif
-        AgentProviderSwitchPresentation(viewModel: agentModeVM, tabID: currentTabID, content: composer)
+        AgentProviderSwitchPresentation(viewModel: agentModeVM, tabID: currentTabID, content: composer, bannerHeight: $providerSwitchBannerHeight)
+            .onChange(of: providerSwitchBannerHeight) { _, _ in syncProviderSwitchGeometry() }
+            .onChange(of: composerOnlyBottomInset) { _, _ in syncProviderSwitchGeometry() }
+            .onChange(of: composerOnlyBottomClearance) { _, _ in syncProviderSwitchGeometry() }
             .overlay(alignment: .bottom) {
                 statusPills
-                    .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
+                    .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerOnlyBottomInset - 8)
             }
+    }
+
+    private func syncProviderSwitchGeometry() {
+        composerBottomInset = composerOnlyBottomInset + providerSwitchBannerHeight
+        transcriptBottomClearance = composerOnlyBottomClearance + providerSwitchBannerHeight
     }
 
     private var composer: some View {
@@ -116,8 +127,8 @@ struct AgentInputBar: View {
             repromptStore: agentModeVM.repromptUIStore,
             pendingSubmissionStore: composerUI,
             resetTextFieldTrigger: $resetTextFieldTrigger,
-            composerBottomInset: $composerBottomInset,
-            transcriptBottomClearance: $transcriptBottomClearance,
+            composerBottomInset: $composerOnlyBottomInset,
+            transcriptBottomClearance: $composerOnlyBottomClearance,
             isFocused: _isFocused
         )
         .equatable()

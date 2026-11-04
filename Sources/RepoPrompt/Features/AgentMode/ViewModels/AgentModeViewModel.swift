@@ -324,8 +324,15 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
 
     @Published var providerSwitchPreview: ProviderSwitchPreview?
     @Published var providerSwitchMutation: ProviderSwitchMutation?
+    @Published var providerSwitchBackgroundOutcome: ProviderSwitchBackgroundOutcome?
     #if DEBUG
         var test_providerSwitchRetirement: (@MainActor (TabSession) async -> Void)?
+        var test_providerSwitchSkillCatalog: AgentSkillCatalog {
+            skillCatalog
+        }
+
+        var test_providerSwitchIdleProbe: (@MainActor (TabSession) async throws -> Void)?
+        var test_providerSwitchDeadlineGates: [ProviderSwitchDeadline: @Sendable () async -> Void] = [:]
         var test_providerSwitchGeneration: (@MainActor (TabSession, UUID, String) async -> Void)?
         var test_providerSwitchGenerationStart: (@MainActor (TabSession, String, AgentRunStartOutcomeRecorder) async -> Void)?
         var test_providerSwitchGenerationRebuildDidFinish: (@MainActor () -> Void)?
@@ -333,6 +340,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         var test_providerSwitchStart: (@MainActor (TabSession, String, String) async -> Void)?
         var test_beforeProviderSwitchScheduledAdmission: (@MainActor (TabSession) async -> Void)?
         var test_beforeProviderSwitchPreviewRefresh: (@MainActor (TabSession) async -> Void)?
+        var test_providerSwitchForceStop: (@MainActor (TabSession) async -> Void)?
+        var test_providerSwitchStopDeadlineSeconds: TimeInterval = AgentRunStopState.managedStopDeadlineSeconds
     #endif
 
     /// Selected agent kind
@@ -3428,14 +3437,14 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    private func refreshSkillCatalog(force: Bool, agentKind: AgentProviderKind? = nil) async {
+    private func refreshSkillCatalog(force: Bool, agentKind: AgentProviderKind? = nil, shouldPublish: @MainActor () -> Bool = { true }) async {
         let paths = currentWorkspacePaths()
         let agent = agentKind ?? activeSession?.selectedAgent ?? selectedAgent
         if force {
-            await skillCatalog.refresh(workspacePaths: paths, agentKind: agent)
+            await skillCatalog.refresh(workspacePaths: paths, agentKind: agent, shouldPublish: shouldPublish)
             return
         }
-        await skillCatalog.refreshIfNeeded(workspacePaths: paths, agentKind: agent)
+        await skillCatalog.refreshIfNeeded(workspacePaths: paths, agentKind: agent, shouldPublish: shouldPublish)
     }
 
     private func scheduleInitialSkillCatalogRefresh() {
@@ -10394,33 +10403,46 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         }
     }
 
-    /// Retire while the outgoing provider is still selected. Provider switching holds its ordinary
-    /// claim and save gate across these awaits; the caller clears/stages durable state synchronously.
-    func retireProviderContextForProviderSwitch(_ session: TabSession) async {
-        #if DEBUG
-            if let test_providerSwitchRetirement {
-                await test_providerSwitchRetirement(session)
-                return
-            }
-        #endif
-        // Detach every outgoing instance synchronously. The existing captured-handle retirement
-        // paths never look up a same-tab successor after suspension (unlike tab-terminal shutdown).
+    /// Transfers runtime ownership without suspension. The returned cleanup touches only captured
+    /// instances, so a deadline may stop waiting without retiring a same-tab successor.
+    func detachProviderContextForProviderSwitch(_ session: TabSession) -> (@MainActor () async -> Void) {
         let provider = session.provider
         session.provider = nil
         let acp = session.acpController
         session.acpController = nil
         let codex = codexCoordinator.detachForWorkspaceSwitchFinalizeSync(session, runIDs: [])
         let claude = claudeCoordinator.detachForWorkspaceSwitchFinalizeSync(session)
-        if let provider { await provider.dispose() }
-        if let acp { await acp.cancelPrompt()
-            await acp.shutdown()
+        let codexCoordinator = codexCoordinator
+        let claudeCoordinator = claudeCoordinator
+        #if DEBUG
+            let hook = test_providerSwitchRetirement
+        #endif
+        return {
+            #if DEBUG
+                if let hook {
+                    await hook(session)
+                    return
+                }
+            #endif
+            if let provider {
+                await provider.dispose()
+            }
+            if let acp {
+                await acp.cancelPrompt()
+                await acp.shutdown()
+            }
+            if let codex {
+                await codexCoordinator.retireDetachedControllerForWorkspaceSwitch(codex)
+            }
+            if let claude {
+                await claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(claude, discardedSession: session)
+            }
         }
-        if let codex { await codexCoordinator.retireDetachedControllerForWorkspaceSwitch(codex) }
-        if let claude { await claudeCoordinator.retireDetachedControllerForWorkspaceSwitch(claude, discardedSession: session) }
     }
 
     func clearProviderContextForProviderSwitch(_ session: TabSession) {
         codexCoordinator.clearCodexSessionState(session)
+        claudeCoordinator.rotateClaudeRuntimeEpoch(for: session)
         session.providerSessionID = nil
         session.providerCleanupHandle = nil
         session.contextUsageSnapshot = nil
@@ -22004,10 +22026,12 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         agent: AgentProviderKind? = nil,
         session: TabSession? = nil,
         ignoresPendingHandoff: Bool = false,
-        skipsSlashExpansion: Bool = false
+        skipsSlashExpansion: Bool = false,
+        shouldPublishCatalog: @MainActor () -> Bool = { true }
     ) async -> String {
         let effectiveAgent = agent ?? session?.selectedAgent ?? activeSession?.selectedAgent ?? selectedAgent
-        let withSkillExpansion = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent)
+        let withSkillExpansion = skipsSlashExpansion ? text : await expandSlashSkillInvocationIfNeeded(text, agentKind: effectiveAgent, shouldPublishCatalog: shouldPublishCatalog)
+        guard shouldPublishCatalog() else { return withSkillExpansion }
         let lookupContext: WorkspaceLookupContext = if let session {
             await agentWorkspaceLookupContext(tabID: session.tabID, session: session)
         } else if let tabID = currentTabID {
@@ -22015,11 +22039,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         } else {
             .visibleWorkspace
         }
+        guard shouldPublishCatalog() else { return withSkillExpansion }
         let withTaggedFiles = await augmentUserMessageWithTaggedFileContents(
             withSkillExpansion,
             taggedFileAttachments: taggedFileAttachments,
             lookupContext: lookupContext
         )
+        guard shouldPublishCatalog() else { return withTaggedFiles }
         let withAttachmentRendering = renderProviderMessage(
             text: withTaggedFiles,
             attachments: attachments,
@@ -22127,11 +22153,13 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
     @MainActor
     private func expandSlashSkillInvocationIfNeeded(
         _ text: String,
-        agentKind: AgentProviderKind? = nil
+        agentKind: AgentProviderKind? = nil,
+        shouldPublishCatalog: @MainActor () -> Bool = { true }
     ) async -> String {
         guard !text.isEmpty else { return text }
         let effectiveAgent = agentKind ?? activeSession?.selectedAgent ?? selectedAgent
-        await refreshSkillCatalog(force: false, agentKind: effectiveAgent)
+        await refreshSkillCatalog(force: false, agentKind: effectiveAgent, shouldPublish: shouldPublishCatalog)
+        guard shouldPublishCatalog() else { return text }
         var invocations = resolvedSlashSkillInvocations(in: text, agentKind: effectiveAgent)
 
         // Defensive fallback: if slash-skill tokens were detected syntactically but none
@@ -22140,7 +22168,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         if invocations.isEmpty {
             let syntacticTokens = Self.extractSlashSkillTokens(from: text)
             if !syntacticTokens.isEmpty {
-                await refreshSkillCatalog(force: true, agentKind: effectiveAgent)
+                await refreshSkillCatalog(force: true, agentKind: effectiveAgent, shouldPublish: shouldPublishCatalog)
+                guard shouldPublishCatalog() else { return text }
                 invocations = resolvedSlashSkillInvocations(in: text, agentKind: effectiveAgent)
             }
         }
@@ -24481,6 +24510,22 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         requestUIRefresh(tabID: tabID, urgent: true)
     }
 
+    /// Forced provider switch declines every pending interaction exactly once through the same
+    /// private paths the run-cancel hooks use. Called before the ordinary stop inside the switch
+    /// mutation; each helper is idempotent, so anything `cancelRun` already cleared is a no-op.
+    func providerSwitchDeclinePendingInteractions(for session: TabSession) {
+        // A Codex user-input request dies with the controller retirement that follows; it has no
+        // user-level decline response, only the cleared field the coordinator uses on turn end.
+        // Clear it before the cancels below so their reconcile/publish sees the final state.
+        session.pendingUserInputRequest = nil
+        session.queuedUserInputRequests.removeAll()
+        cancelPendingInstruction(for: session)
+        cancelPendingQuestion(for: session)
+        cancelPendingApproval(for: session)
+        cancelPendingApplyEditsReview(for: session, reason: "Provider switch")
+        cancelPendingWorktreeMergeReview(for: session, reason: "Provider switch")
+    }
+
     private func cancelPendingQuestion(for session: TabSession) {
         invalidatePendingAskUserTimeout(for: session)
         let continuation = session.askUserContinuation
@@ -25778,6 +25823,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         sourceTabID explicitSourceTabID: UUID? = nil,
         activateDestination: Bool = true,
         inheritOversightLinks: Bool = true,
+        missingImagePolicy: AgentSessionAttachmentStore.HandoffMissingImagePolicy = .strict,
+        onImagesOmitted: (@MainActor (Int) -> Void)? = nil,
         isStillAuthorized: (@MainActor () -> Bool)? = nil
     ) async throws -> UUID {
         guard let promptManager,
@@ -25932,6 +25979,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 detail: "The fork was created, but its destination changed during chat cloning."
             )
         }
+        var omittedImageCount = 0
         if !localAttachments.isEmpty {
             guard let handoffAttachmentStore else {
                 throw SessionAdminPartialForkError(
@@ -25945,7 +25993,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     sourceSessionID: sourceWorktreeSnapshot.sourceSessionID,
                     destinationSessionID: destinationClaim.sessionID,
                     store: handoffAttachmentStore,
-                    temporaryRoot: handoffTemporaryRoot
+                    temporaryRoot: handoffTemporaryRoot,
+                    missingImagePolicy: missingImagePolicy
                 )
                 guard destinationIsCurrent() else {
                     throw PersistentBindingMutationError.staleTransition
@@ -25957,6 +26006,8 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                     handoffAttachmentStore.removeSessionFolder(sessionID: destinationClaim.sessionID)
                     throw CancellationError()
                 }
+                omittedImageCount = Set(localAttachments.map(\.id)).subtracting(copied.keys).count
+                // Keep dead metadata for projection compatibility; omit bytes, not transcript references.
                 migratedItems = migratedItems.map { item in
                     var item = item
                     item.attachments = item.attachments.map { attachment in
@@ -26104,6 +26155,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
         // Acknowledged configured durability cannot be undone by late cancellation. Keep the
         // saved session and omit optional inheritance/focus changes when its caller has ended.
         if Task.isCancelled {
+            if omittedImageCount > 0 { onImagesOmitted?(omittedImageCount) }
             return destTabID
         }
         let childEndpoint = agentSessionLinkObserverEndpoint(tabID: destTabID)
@@ -26125,7 +26177,10 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
                 detail: "The fork was saved, but its destination changed before activation."
             )
         }
-        guard activateDestination else { return destTabID }
+        guard activateDestination else {
+            if omittedImageCount > 0 { onImagesOmitted?(omittedImageCount) }
+            return destTabID
+        }
         // 7) Switch to the destination tab, focus the cloned active Oracle chat if one
         //    exists, then update active bindings for the handoff session.
         await promptManager.switchComposeTab(destTabID)
@@ -26141,6 +26196,7 @@ final class AgentModeViewModel: ObservableObject, CodexManagedSessionShutdownPar
             )
         }
         updateBindingsFromSession(destSession)
+        if omittedImageCount > 0 { onImagesOmitted?(omittedImageCount) }
 
         return destTabID
     }

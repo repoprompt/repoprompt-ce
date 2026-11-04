@@ -83,6 +83,43 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         )
     }
 
+    func testStreamEndCancelsOnlyCurrentControllersTransportFallback() async throws {
+        for retired in [true, false] {
+            let fixture = makeFixture([[.success("listener-thread")]], shouldManageCodexTooling: false)
+            let session = fixture.session
+            let coordinator = fixture.coordinator
+            await coordinator.ensureCodexNativeSession(session: session)
+            let controller = try XCTUnwrap(session.codexController as? WedgeFakeCodexController)
+            let listener = try XCTUnwrap(session.codexEventTask)
+            let release = AgentSessionLinkStopSignal<Void>()
+            let fallback = Task { await release.value() }
+            defer { release.finish(())
+                fallback.cancel()
+            }
+            let detached: CodexAgentModeCoordinator.DetachedCodexController?
+            if retired {
+                detached = coordinator.detachForWorkspaceSwitchFinalizeSync(session, runIDs: [])
+                session.codexController = WedgeFakeCodexController(runID: UUID(), responses: [])
+            } else { detached = nil }
+            // No suspension between retirement and installing the successor's spy: the old
+            // listener must execute its real stream-end branch after this registration.
+            coordinator.test_installTransportClosedFallback(fallback, tabID: session.tabID)
+            session.runState = .idle
+            controller.finishEventsForTest()
+            await listener.value
+            XCTAssertEqual(
+                fallback.isCancelled,
+                !retired,
+                retired ? "Retired listener must not cancel its successor's fallback" : "Current listener must still cancel its own fallback"
+            )
+            release.finish(())
+            await fallback.value
+            if let detached { await coordinator.retireDetachedControllerForWorkspaceSwitch(detached) }
+            await coordinator.shutdownCodexSession(session)
+            session.endCurrentRunAttempt(source: "test.cleanup")
+        }
+    }
+
     func testComposerRechecksEligibilityAfterSuspendedRuntimePreflight() async throws {
         CodexComputerUseWorkflow.setEnabledForTesting(false)
         defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
@@ -2563,6 +2600,10 @@ final class WedgeFakeCodexController: CodexSessionControllerPassiveStubDefaults,
         var storedContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation!
         events = AsyncStream { storedContinuation = $0 }
         continuation = storedContinuation
+    }
+
+    func finishEventsForTest() {
+        continuation.finish()
     }
 
     var hasActiveThread: Bool {

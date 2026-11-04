@@ -3,6 +3,10 @@ import RepoPromptFileSystem
 import RepoPromptInstrumentation
 import SwiftUI
 
+private extension EnvironmentValues {
+    @Entry var handoffOmittedImageCount: Binding<Int> = .constant(0)
+}
+
 /// Agent Mode view - a chat-style interface for long-running agent interactions
 /// with per-tab session management, markdown message rendering, and tool call display
 struct AgentModeView: View {
@@ -14,6 +18,7 @@ struct AgentModeView: View {
     @StateObject private var navigationController: AgentModeNavigationController
     @StateObject private var rootsSidebarStore: AgentWorkspaceRootsSidebarStore
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @State private var omittedHandoffImageCount = 0
 
     private var currentTabID: UUID? {
         promptManager.activeComposeTabID
@@ -57,6 +62,19 @@ struct AgentModeView: View {
     }
 
     var body: some View {
+        content
+            .environment(\.handoffOmittedImageCount, $omittedHandoffImageCount)
+            .alert("Handoff completed", isPresented: Binding(
+                get: { omittedHandoffImageCount > 0 },
+                set: { if !$0 { omittedHandoffImageCount = 0 } }
+            )) {
+                Button("OK", role: .cancel) { omittedHandoffImageCount = 0 }
+            } message: {
+                Text("\(omittedHandoffImageCount) unavailable image(s) could not be copied. The new chat is ready; conversation history is unchanged.")
+            }
+    }
+
+    private var content: some View {
         GeometryReader { proxy in
             let fontPreset = fontScale.preset
             let sidebarMinWidth = AgentSidebarSizing.minWidth(for: fontPreset)
@@ -183,6 +201,7 @@ struct AgentModeView: View {
 // Transcript scroll types extracted to Components/AgentTranscriptScrollTypes.swift
 
 struct AgentModeChatDetailView: View {
+    @Environment(\.handoffOmittedImageCount) private var omittedHandoffImageCount
     let agentModeVM: AgentModeViewModel
     @ObservedObject var transcriptUI: AgentTranscriptUIStore
     @ObservedObject var runInteractionUI: AgentRunInteractionUIStore
@@ -3277,7 +3296,9 @@ struct AgentModeChatDetailView: View {
                     upToItemID: itemID,
                     destinationAgent: selection.agent,
                     destinationModelRaw: selection.modelRaw,
-                    destinationReasoningEffortRaw: selection.reasoningEffortRaw
+                    destinationReasoningEffortRaw: selection.reasoningEffortRaw,
+                    missingImagePolicy: .omitMissingImagesForHumanHandoff,
+                    onImagesOmitted: { omittedHandoffImageCount.wrappedValue = $0 }
                 )
             }
         )

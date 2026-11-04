@@ -7092,7 +7092,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         }
                     }
                     logCodex("[AgentModeVM] Event task: events stream ended")
-                    cancelCodexTransportClosedFallback(for: session.tabID)
 
                     // --- Stream ended without an explicit terminal event ---
                     // If the task was cancelled (intentional teardown) or run has moved on, do nothing.
@@ -7106,6 +7105,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                         return
                     }
 
+                    cancelCodexTransportClosedFallback(for: session.tabID)
                     guard session.runState.isActive else {
                         guard invalidateCodexControllerForReconnect(
                             session: session,
@@ -8327,6 +8327,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                             viewModel?.scheduleSave(for: session.tabID)
                         }
                         guard await computerUsePhysicalDispatchIsCurrent() else { throw CancellationError() }
+                        // Bind switch evidence before optional Read proof can suspend. Upstream's
+                        // finalized dispatch acquisition remains after Read, with a switch recheck.
+                        guard viewModel?.providerSwitchAcquirePhysicalDispatch(session: session, dispatchID: promptDispatchID)
+                            ?? (session.pendingHandoff.providerSwitchDelivery == nil)
+                        else { throw CancellationError() }
                         let proof = await viewModel?.agentSessionLinkProveProviderInput(for: session, claim: monitoring?.claim)
                         if monitoring?.claim?.localInput != nil || monitoring?.claim?.dispatchID.isAutoWakeFamily == true {
                             guard !Task.isCancelled, effectiveStopFence.permitsStart(of: session),
@@ -11363,6 +11368,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     #if DEBUG
+        func test_installTransportClosedFallback(_ task: Task<Void, Never>, tabID: UUID) {
+            codexTransportClosedFallbackTasksByTabID.set(tabID, task: task)
+        }
+
         @_spi(TestSupport)
         public func test_dispatchCodexFallbackHead(
             session: AgentTabSession,
