@@ -2,6 +2,35 @@
 
 Use this guide for contributor-facing XCTest changes. Follow `AGENTS.md` for coordinated daemon use, style checks, and lifecycle approvals. Use `$rpce-test-quality` when deciding whether coverage is worth adding, retaining, consolidating, or removing.
 
+## Fast local feedback and CI escalation
+
+Start with `make check-fast` while iterating. It checks unstaged/staged whitespace,
+repository guardrails, and the existing CI admission/runner/coverage/dependency
+selftests, serially and fail-fast. Guardrails evaluate Swift package manifests, so
+the configured Swift toolchain is still required. It does not resolve Swift packages, build or launch
+the app, install tools, or claim complete validation. Untracked-file whitespace and
+secret scans are not covered; mandatory commit/push preflight still applies.
+
+Then choose the narrowest relevant coordinated check (`make dev-test FILTER=<Suite>`,
+`make dev-provider-test FILTER=<Suite>`, `make dev-lint`). Check nonzero executed test
+counts. Use the contribution skill's `pr-ready` lane for the outgoing-range-selected
+broader pass. Use `make dev-release-preflight` and an explicitly requested manual
+`Release Candidate` workflow for packaging changes. Live app lifecycle requires approval.
+
+**Style means integration passed, not release-ready.** It still requires all root,
+provider, module, static, secret and Sentry/privacy obligations. Tip/stable qualify
+the exact artifact they publish, including older-runtime compatibility. See
+[integration admission](architecture/ci-admission.md) for the full boundary.
+
+For hosted failures, inspect the failing prerequisite, not just the final Style row.
+For **CI / Style**, use **Re-run all jobs**, never failed-jobs-only: artifacts and receipts are bound to
+one candidate/run/attempt. A failed-jobs-only retry cannot reuse a prior declaration
+and is rejected; it is not evidence of a test flake. Do not issue cosmetic pushes or
+start duplicates to escape a queue. Job creation-to-start is pending time; execution
+starts only after runner assignment. Cancelled/unassigned jobs and inherited retry
+results can have misleading API timestamps. Locally, use the existing conductor
+ticket / `job wait` / request key rather than bypassing shared heavy admission.
+
 ## Claude status-line compatibility experiment (debug only)
 
 This is an explicit one-process probe, not a replacement quota source or persistent usage cache. It tests whether the installed Claude CLI invokes its documented status-line command during RepoPrompt's native headless run. It makes no independent account HTTP requests and reads no credentials.

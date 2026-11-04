@@ -24,6 +24,7 @@ POLICY_FILES = (
     'Scripts/conductor.py',
     'Vendor/Sparkle/SHA256SUMS',
     '.github/workflows/ci-integration-products.yml',
+    '.github/workflows/release-candidate.yml',
     '.github/workflows/ci.yml',
     '.github/workflows/main-tip.yml',
     '.github/workflows/release.yml',

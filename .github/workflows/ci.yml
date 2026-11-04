@@ -40,8 +40,9 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
 
   integration-products:
-    # Reserve scarce macOS runners for candidates that passed the root gates.
-    # Style still fails closed when these products are skipped after a failure.
+    # Sentry/privacy stays blocking, after root gates reject bad candidates.
+    # Universal packaging/older-runtime smoke gate publication in release flows;
+    # do not duplicate those expensive builds on every integration candidate.
     needs: [candidate, build-test-bundles, build-and-test, secret-scan]
     uses: ./.github/workflows/ci-integration-products.yml
     with:
@@ -355,7 +356,7 @@ jobs:
           {
             echo '## CI prerequisite results'
             echo "- Candidate declaration: $CANDIDATE_RESULT"
-            echo "- Sentry/privacy and release-mode packaged smoke: $PRODUCTS_RESULT"
+            echo "- Sentry-enabled build and privacy: $PRODUCTS_RESULT"
             echo "- Build and Static Gates: $BUILD_RESULT"
             echo "- Root test shards: $SHARD_RESULT"
             echo "- Secret Scan: $SECRET_RESULT"
