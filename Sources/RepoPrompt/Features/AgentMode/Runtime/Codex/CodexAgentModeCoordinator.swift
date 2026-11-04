@@ -2644,7 +2644,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.codexNeedsReconnect = true
         }
         await ensureCodexNativeSession(
-            session: session
+            session: session,
+            allowMissingRolloutFallback: false,
+            forIdleNativeCompact: true
         )
         guard !hasCodexStartupClaim(for: session),
               let controller = session.codexController,
@@ -10265,9 +10267,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if let identity = session.codexAuthoritativeActiveTurn {
                 bindCodexFallbackQueueToStartedTurn(identity, session: session)
             }
-            let statusText = turnKind == .compact ? "Compacting context…" : "Thinking…"
-            setRunningStatus(statusText, source: .transport, session: session, urgent: true)
-            session.runState = .running
+            // A transport start can arrive after the MCP instruction wait has parked. Keep
+            // that live continuation authoritative for routing (and its timeout), while still
+            // installing the turn identity above for completion correlation.
+            if session.runState != .waitingForUser || session.instructionContinuation == nil {
+                let statusText = turnKind == .compact ? "Compacting context…" : "Thinking…"
+                setRunningStatus(statusText, source: .transport, session: session, urgent: true)
+                session.runState = .running
+            }
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         case let .turnCompleted(turnID, status, failure):

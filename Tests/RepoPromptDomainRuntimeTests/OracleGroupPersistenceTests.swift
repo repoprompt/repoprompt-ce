@@ -217,6 +217,9 @@ final class OracleGroupPersistenceTests: XCTestCase {
         let loaded = try XCTUnwrap(loadedDocument)
         XCTAssertEqual(loaded.schemaVersion, OracleGroupDocument.currentSchemaVersion)
         XCTAssertEqual(loaded.turns.last?.status, .completed)
+        XCTAssertEqual(loaded.turns.last?.results.map(\.elapsedSeconds), [0.625, 1.625])
+        XCTAssertEqual(loaded.turns.last?.results.map(\.assistantReplyID), terminal.turns.last?.results.map(\.assistantReplyID))
+        XCTAssertEqual(loaded.turns.last?.results.first?.assistantReplyID, UUID(uuidString: "A460C1D9-38BA-4A84-B3FE-1967EF8111A8"))
 
         try await fixture.store.rename(
             groupID: loaded.group.id,
@@ -384,21 +387,28 @@ final class OracleGroupPersistenceTests: XCTestCase {
         try await fixture.store.stageTerminalPublication(canonicalIntent)
         _ = try await fixture.store.reconcileTerminalPublication(canonicalIntent)
 
-        let conflicting = try prepared.settling(
-            try completedResult(for: prepared, responsePrefix: "conflicting"),
-            finishedAt: prepared.updatedAt.addingTimeInterval(2)
-        )
-        let conflictingIntent = try OracleTerminalPublicationIntent(
-            terminal: conflicting,
-            expectedRevision: prepared.revision
-        )
-        await XCTAssertOraclePersistenceThrowsErrorAsync {
-            try await fixture.store.stageTerminalPublication(conflictingIntent)
-        } verify: {
-            XCTAssertEqual($0 as? OraclePersistenceError, .terminalPublicationMismatch)
+        let replyID = UUID(uuidString: "A460C1D9-38BA-4A84-B3FE-1967EF8111A8")
+        for (responsePrefix, elapsedSeconds, assistantReplyID) in [
+            ("conflicting", 0.625, replyID),
+            ("response", 2.5, replyID),
+            ("response", 0.625, UUID(uuidString: "A460C1D9-38BA-4A84-B3FE-1967EF8111A9"))
+        ] {
+            let conflicting = try prepared.settling(
+                completedResult(for: prepared, responsePrefix: responsePrefix, elapsedSeconds: elapsedSeconds, assistantReplyID: assistantReplyID),
+                finishedAt: prepared.updatedAt.addingTimeInterval(1)
+            )
+            let conflictingIntent = try OracleTerminalPublicationIntent(
+                terminal: conflicting,
+                expectedRevision: prepared.revision
+            )
+            await XCTAssertOraclePersistenceThrowsErrorAsync {
+                try await fixture.store.stageTerminalPublication(conflictingIntent)
+            } verify: {
+                XCTAssertEqual($0 as? OraclePersistenceError, .terminalPublicationMismatch)
+            }
+            let persisted = try await fixture.store.load(groupID: prepared.group.id, owner: prepared.owner)
+            XCTAssertEqual(persisted, canonical)
         }
-        let persisted = try await fixture.store.load(groupID: prepared.group.id, owner: prepared.owner)
-        XCTAssertEqual(persisted, canonical)
     }
 
     func testRenameDeleteAndRetentionOperateOnLogicalGroupsAndArtifacts() async throws {
@@ -1093,7 +1103,9 @@ final class OracleGroupPersistenceTests: XCTestCase {
 
     private func completedResult(
         for prepared: OracleGroupDocument,
-        responsePrefix: String = "response"
+        responsePrefix: String = "response",
+        elapsedSeconds: Double = 0.625,
+        assistantReplyID: UUID? = UUID(uuidString: "A460C1D9-38BA-4A84-B3FE-1967EF8111A8")
     ) throws -> OracleGroupResult {
         let results = try prepared.members.map { member in
             try OracleLaneResult(
@@ -1102,7 +1114,9 @@ final class OracleGroupPersistenceTests: XCTestCase {
                 providerID: member.model.providerID,
                 modelID: member.model.modelID,
                 status: .completed,
-                response: "\(responsePrefix)-\(member.laneID.index)"
+                elapsedSeconds: elapsedSeconds + Double(member.laneID.index),
+                response: "\(responsePrefix)-\(member.laneID.index)",
+                assistantReplyID: assistantReplyID
             )
         }
         return try OracleGroupResult(

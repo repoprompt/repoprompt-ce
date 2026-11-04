@@ -32,6 +32,34 @@ typealias AgentRunTurnEpoch = DomainAgentRunTurnEpoch
 typealias AgentRunTerminalPublicationEnvelope = DomainAgentRunTerminalPublicationEnvelope
 typealias AgentRunTerminalPublicationResult = DomainAgentRunTerminalPublicationResult
 
+/// Terminal outcome an Agent Mode runner commits when `MCPBootstrapLease.acquire()` returns `false`.
+///
+/// A gate deadline is a retryable failure the user must see; every other acquire failure
+/// (cancellation, release, enabler or routing failure) remains an intentional cancel.
+struct MCPBootstrapLeaseAcquireFailureOutcome: Equatable {
+    let terminalState: AgentSessionRunState
+    let errorText: String?
+
+    init(timedOut: Bool) {
+        if timedOut {
+            terminalState = .failed
+            errorText = HeadlessAgentConnectionAcquireTimeoutError().localizedDescription
+        } else {
+            terminalState = .cancelled
+            errorText = nil
+        }
+    }
+}
+
+/// Agent Mode owns terminal presentation policy; MCP infrastructure exposes only the
+/// acquisition fact. Keep the mapping in this layer, not in MCPBootstrapLease.swift.
+extension MCPBootstrapLease {
+    /// How a runner should finalize after `acquire()` returned `false`.
+    var acquireFailureOutcome: MCPBootstrapLeaseAcquireFailureOutcome {
+        MCPBootstrapLeaseAcquireFailureOutcome(timedOut: lastAcquireWasTimeout)
+    }
+}
+
 /// Provider-neutral ownership token for one logical run attempt.
 struct AgentRunOwnership: Equatable, Hashable {
     let attemptID: UUID

@@ -7,7 +7,15 @@ import XCTest
 @MainActor
 final class AgentRunServiceWaitingOwnershipTests: XCTestCase {
     func testServiceStartedTurnsKeepWaitingSteerCurrentAfterRestoreAndProviderInit() async throws {
-        for agent in [AgentProviderKind.codexExec, .claudeCode, .openCode] {
+        try await assertWaitingSteer(agents: [.codexExec, .claudeCode, .openCode])
+    }
+
+    func testLateCodexTurnStartedPreservesParkedInstructionWait() async throws {
+        try await assertWaitingSteer(agents: [.codexExec], delayCodexTurnStarted: true)
+    }
+
+    private func assertWaitingSteer(agents: [AgentProviderKind], delayCodexTurnStarted: Bool = false) async throws {
+        for agent in agents {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("WaitingOwner-\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: directory) }
@@ -56,13 +64,31 @@ final class AgentRunServiceWaitingOwnershipTests: XCTestCase {
                 } else {
                     XCTAssertEqual(codex.startedTurns.count, turn)
                     XCTAssertEqual(session.codexConversationID, "monitor-thread")
-                    codex.emit(.turnStarted(turnID: "turn-\(turn)"))
+                    if !delayCodexTurnStarted || turn == 1 {
+                        codex.emit(.turnStarted(turnID: "turn-\(turn)"))
+                        try await AsyncTestWait.waitUntil("Codex turnStarted is applied") {
+                            session.codexAuthoritativeActiveTurn?.turnID == "turn-\(turn)"
+                                && session.runState == .running
+                        }
+                    }
                 }
                 XCTAssertEqual(session.currentRestorationBindingToken, binding)
                 if turn == 2 {
                     host.storeDraftText(for: tabID, "untouched local draft")
                     let waiting = Task { @MainActor in try await host.waitForNextUserInstruction(tabID: tabID, prompt: "Next?", timeoutSeconds: 10) }
-                    try await AsyncTestWait.waitUntil("real instruction wait is parked") { session.instructionContinuation != nil }
+                    try await AsyncTestWait.waitUntil("real instruction wait is parked") {
+                        host.agentSessionLinkManagedSteerRoute(for: session) == .waitingInstruction
+                    }
+                    if delayCodexTurnStarted {
+                        // Apply the first start notification only after the MCP wait has parked.
+                        // Await the handler itself, so a route assertion cannot pass before ingress.
+                        await host.test_codexCoordinator.test_handleCodexNativeEvent(
+                            .turnStarted(turnID: "turn-\(turn)"), session: session, sourceController: codex
+                        )
+                        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn-\(turn)")
+                        XCTAssertEqual(session.runState, .waitingForUser)
+                        XCTAssertEqual(host.agentSessionLinkManagedSteerRoute(for: session), .waitingInstruction)
+                    }
                     XCTAssertTrue(session.isCurrentRunAttemptForCurrentBinding(owner))
                     XCTAssertTrue(session.quietLedger.isOpen(owner: owner))
                     let endpoint = try AgentSessionLinkEndpointTestSupport.endpoint(host, tabID: tabID)
