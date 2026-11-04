@@ -22,7 +22,7 @@ permissions:
 jobs:
   candidate:
     name: Declare Integration Candidate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       failure: ${{ steps.diagnostics.outputs.failure }}
@@ -55,9 +55,9 @@ jobs:
           fi
 
   workflow-contracts:
-    name: Workflow Contracts
+    name: Portable Checks
     needs: candidate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       failure: ${{ steps.diagnostics.outputs.failure }}
@@ -68,9 +68,20 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Test workflow and admission contracts before allocating macOS
+      - name: Test portable tooling before allocating macOS
         id: test-workflow-contracts
-        run: make ci-workflow-selftest
+        run: make ci-portable-selftest
+      - name: Set up Node for pinned Codex CLI
+        id: set-up-node-for-pinned-codex-cli
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install pinned Codex CLI
+        id: install-pinned-codex-cli
+        run: npm install --global @openai/codex@0.164.0
+      - name: Validate Codex app-server schema contract
+        id: validate-codex-app-server-schema-contract
+        run: make codex-schema-check
       - name: Broadcast failed steps and recovery
         id: diagnostics
         if: always()
@@ -89,12 +100,20 @@ jobs:
     # Universal packaging/older-runtime smoke gate publication in release flows;
     # do not duplicate those expensive builds on every integration candidate.
     needs: [candidate, build-test-bundles, build-and-test, secret-scan]
+    concurrency:
+      group: ci-sentry-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+      cancel-in-progress: false
     uses: ./.github/workflows/ci-integration-products.yml
     with:
       admission: ${{ needs.candidate.outputs.context }}
 
   build-test-bundles:
-    needs: [candidate, workflow-contracts]
+    needs: [candidate, workflow-contracts, secret-scan]
+    # Preserve running work and retain only the newest pending main build.
+    # Job-level coalescing leaves every push's introduced-range scan independent.
+    concurrency:
+      group: ci-build-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+      cancel-in-progress: false
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Build and Static Gates
@@ -120,6 +139,10 @@ jobs:
       - name: Declare this root build producer and toolchain
         id: producer
         run: python3 Scripts/ci_admission.py produce --context "$ADMISSION_CONTEXT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
+
+      - name: Run compiler-dependent repository guardrails
+        id: run-repository-guardrails
+        run: make guardrails
 
       - name: Identify SwiftPM support cache compatibility
         id: support-toolchain
@@ -166,13 +189,9 @@ jobs:
           python3 Scripts/ci_resolve_packages.py --scratch-path .build/swiftbuild
           python3 Scripts/ci_resolve_packages.py --root Packages/RepoPromptAgentProviders
 
-      - name: Run repository guardrails
-        id: run-repository-guardrails
-        run: make guardrails
-
-      - name: Run hosted runner and admission selftests
+      - name: Verify macOS process supervision and platform tooling
         id: run-hosted-runner-and-admission-selftests
-        run: make ci-app-test-runner-selftest
+        run: make ci-macos-selftest
 
       - name: Install Swift style tools
         id: install-swift-style-tools
@@ -181,28 +200,6 @@ jobs:
       - name: Run Swift style lint
         id: run-swift-style-lint
         run: make lint
-
-      - name: Run conductor tests
-        id: run-conductor-tests
-        run: make conductor-selftest
-
-      - name: Set up Node for pinned Codex CLI
-        id: set-up-node-for-pinned-codex-cli
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-
-      - name: Install pinned Codex CLI
-        id: install-pinned-codex-cli
-        run: npm install --global @openai/codex@0.164.0
-
-      - name: Validate Codex app-server schema contract
-        id: validate-codex-app-server-schema-contract
-        run: make dev-codex-schema-check
-
-      - name: Run release workflow tests
-        id: run-release-workflow-tests
-        run: make release-selftest
 
       - name: Run provider package tests
         id: run-provider-package-tests
@@ -376,6 +373,9 @@ jobs:
   build-and-test:
     name: Test Root Shards (No Build)
     needs: [candidate, build-test-bundles]
+    concurrency:
+      group: ci-tests-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.run_attempt == '1' && 'main' || github.run_id }}
+      cancel-in-progress: false
     env:
       ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
       CANDIDATE_CONTEXT: ${{ needs.candidate.outputs.context }}
@@ -476,7 +476,7 @@ jobs:
       ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
       CANDIDATE_CONTEXT: ${{ needs.candidate.outputs.context }}
       RECEIPT_ARTIFACT: ${{ needs.build-and-test.outputs.receipt_artifact }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       failure: ${{ steps.diagnostics.outputs.failure }}
@@ -543,7 +543,7 @@ jobs:
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Secret Scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       failure: ${{ steps.diagnostics.outputs.failure }}

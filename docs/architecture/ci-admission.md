@@ -29,8 +29,14 @@ every integration candidate. This deliberately permits a release-only regression
 to merge; it must still prevent publication. A green Style is **not** evidence that
 release packaging, notarization, older macOS, or Computer Use works.
 
-- **Automatic Tip:** successful exact-main CI triggers `Publish Tip`. Its current-main
-  eligibility, trusted tooling/source identity, secret-free clean universal staging,
+- **Automatic Tip:** successful main-push CI triggers `Publish Tip`. When its rolling
+  queue starts, it selects the newest passing source from the authenticated
+  triggering event and at most 300 recent successful CI runs, ordered by pinned
+  protected-main first-parent ancestry. The event closes a list-API visibility race.
+  A newer untested main commit does not suppress that qualified ancestor. The exact
+  source CI run/attempt and the separately pinned main tooling SHA are recorded.
+  Already-published or newer-published sources skip before Mac allocation. Its
+  source authorization, secret-free clean universal staging,
   signing/notarization, exact packaged-helper smoke, and macOS 15 ARM64/Intel artifact
   checks remain intact. Publication waits for smoke and compatibility.
 - **Stable:** `Publish Release` builds a reviewed source draft and checks its signed
@@ -179,8 +185,15 @@ now reused across shards; hosted validation must specifically check this boundar
  Do not increase
 parallelism or switch images assuming that creates account capacity. Preserve the
 Ubuntu Tip eligibility job so obsolete candidates do not wait for a Mac just to skip.
-Main pushes remain run-scoped: coalescing the whole workflow would discard introduced
-commit-range secret scans. Do not add cancellation without addressing that obligation.
+Main workflows remain run-scoped so every introduced-commit-range secret scan can
+finish. First-attempt main **Mac stages** use separate concurrency groups: one
+running and one pending build, test worker, and Sentry job. Running work finishes;
+the newest queued request replaces the previous pending request. PR previews,
+merge-group candidates and explicit reruns do not share these main groups.
+GitHub orders pending replacement by arrival, not commit ancestry. If an old
+request arrives late and evicts the current main candidate, the bounded recovery
+controller recognizes the exact system annotation and retries that job under its
+run-specific retry group. Ordinary user cancellation is not reversed.
 
 ### Read-only queue and execution report
 
@@ -221,15 +234,32 @@ still require all prerequisites and independently verify the original evidence.
 | Failure | Recovery |
 |---|---|
 | Source/lint/assertion/coverage failure | Fix the source; update the PR and inspect the new exact integration candidate. Repetition is not a fix. |
-| Confirmed transient network/runner failure | Rerun the failed job/dependents or failed jobs. Inspect the original log before classifying a failure as transient. |
-| Missing/expired archive, dropped output, architecture/Swift/Xcode drift | Rerun **Build and Static Gates** and dependents, or all jobs. Do not bypass Style. |
+| Recognized hosted-runner startup or artifact-transport failure | CI Recovery retries failed jobs within its attempt budget, retaining successful jobs. Unrecognized failures need diagnosis. |
+| Missing/expired archive or architecture/Swift/Xcode drift | CI Recovery rebuilds the successful root producer and dependents once when exact diagnostics and artifact history prove this cause. |
+| Dropped producer output or exhausted automatic recovery | Re-run **Build and Static Gates** and dependents after inspecting the cause. |
+| Current main evicted from a pending Mac stage | CI Recovery retries the specific stage only when a system annotation identifies the matching main concurrency group. Obsolete main work stays superseded. |
 | Wrong/stale producer receipt | Rebuild and rerun dependents; mixed-build evidence must remain rejected. |
 | Outdated PR base/head or unavailable synthetic merge | Update the PR branch; a rerun uses the original SHA/ref, not current main. |
 | Old `integration-v1/v2` run | Re-run all jobs uses that commit's old policy. To obtain v3 behavior, update the branch and trigger fresh CI. |
 
 GitHub [supports whole/failed/specific-job reruns](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/re-run-workflows-and-jobs?tool=cli)
 for 30 days (up to 50 attempts), but our seven-day evidence retention can require a
-rebuild sooner. No automatic retry loop, extra write token or success registry is used.
+rebuild sooner. `CI Recovery` handles recognized infrastructure/evidence failures
+after completion, with a cap of **three total source-run attempts and one successful
+root-producer rebuild**. A controller API error, ambiguous evidence, exhausted
+budget or unconfirmed rerun submission produces an explicit summary. There is no
+success registry and no assertion/lint/compiler/coverage retry policy.
+
+The controller runs only trusted default-branch code with `contents: read`,
+`actions: write`, `checks: read` and `pull-requests: read`. It verifies the workflow
+ID/path, repository, event, source attempt, latest branch CI and current main or
+open same-repository PR. For PRs it checks the immutable local reusable-workflow
+merge SHA and its actual parents against the current PR base/head; nested PR refs
+in a workflow-run response are mutable and cannot establish original provenance.
+It rechecks freshness immediately before submitting a rerun. Forks and merge-group
+runs remain outside automatic recovery; their ordinary native reruns still work.
+Job IDs are not check-run IDs: startup annotations are read using the validated
+same-repository `check_run_url`. Zero steps alone never establish a transient error.
 
 Each job records failed step IDs and recovery guidance in its **job summary**. The
 final **Style** summary lists every prerequisite before interpreting admission
@@ -241,9 +271,9 @@ compiler, download or infrastructure error. Missing reports (checkout failure,
 runner loss, cancellation) are explicitly unknown, not proof of success. A cancelled
 workflow can prevent even `always()` diagnostics; GitHub's timeline remains needed.
 
-Only obsolete first-attempt PR previews supersede one another. Queue/main runs and
-explicit reruns remain run-scoped; newer pushes do not cancel their evidence.
-Whole-main-run coalescing would skip push-range secret scans and is not used.
+Obsolete first-attempt PR previews supersede one another. Main coalescing is
+restricted to pending Mac stages; independent push scans and already running work
+remain intact. Queue runs and explicit reruns remain run-scoped.
 Any failed, cancelled, skipped, or missing required obligation prevents Style success.
 A removed/replaced queue candidate cannot authorize a different candidate.
 
@@ -292,11 +322,19 @@ removing the queue/check requirement is not a transparent implementation rollbac
 
 ## Validation
 
-`make ci-workflow-selftest` runs admission, diagnostic and workflow-contract tests
-in a separate Ubuntu job before any Mac allocation. Secret Scan depends only on
-the candidate declaration: failing tooling contracts must not suppress a main
-push's introduced-commit-range scan. It is also part of `make check-fast` and the
-path-selected CI lane. `make ci-app-test-runner-selftest` additionally covers the
+`make ci-portable-selftest` runs portable conductor, CI and release tooling tests
+once in the Ubuntu **Portable Checks** job before Mac allocation, followed by the
+pinned Codex schema contract. `make ci-workflow-selftest` covers admission,
+recovery, diagnostics and cross-workflow contracts and remains part of
+`make check-fast` and the path-selected CI lane. Secret Scan depends only on the
+candidate declaration; portable failures cannot suppress an introduced-range scan.
+Both cheap gates must pass before the Mac producer starts.
+
+Compiler-dependent guardrails, native process supervision, Apple `plutil`/ICU
+tests, the real unsigned-archive rejection test and native IndexStore binding stay
+on macOS (`make guardrails`, `make ci-macos-selftest`). Moving a decorated native
+test to Linux must not silently replace its execution with a skip.
+`make ci-app-test-runner-selftest` additionally covers the
 runner/coverage/dependency harness: event normalization, wrong tree/run/producer,
 partial-rerun reuse and mixed-build rejection, stale-cache invalidation, required hosted identity,
 clean/enforcing timing and retained outcomes, and receipt provenance/coverage.
@@ -308,3 +346,6 @@ success alone is not equivalent to those checks.
 
 See the [reliability incident and recovery validation](ci-capacity-2026-11-04.md#reliability-incident-and-recovery)
 for the confirmed tooling regression, old partial-rerun dead end and remaining limits.
+The [November 5 diagnosis and repair](ci-reliability-2026-11-05.md) records the
+larger historical sample, release liveness fixes, automatic recovery boundaries,
+and required hosted acceptance.

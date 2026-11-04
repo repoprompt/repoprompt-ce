@@ -50,6 +50,11 @@ jobs:
           python3 Scripts/ci_admission.py verify --context "$ADMISSION_CONTEXT" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
 
+      - name: Require an exact producer artifact
+        env:
+          PRODUCER_ARTIFACT: ${{ inputs.artifact-name }}
+        run: test -n "$PRODUCER_ARTIFACT"
+
       - name: Download the existing release artifact without rebuilding
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:

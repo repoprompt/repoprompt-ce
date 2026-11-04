@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -397,7 +398,7 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('needs.build-and-test.outputs.receipt_artifact', final)
         self.assertNotIn('pattern:', final)
         contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
-        self.assertIn('make ci-workflow-selftest', contracts)
+        self.assertIn('make ci-portable-selftest', contracts)
         self.assertIn('Scripts/test_modularization_tooling.py', (SCRIPT_DIR.parent / 'Makefile').read_text().split('ci-workflow-selftest:', 1)[1].split('\n\n', 1)[0])
 
     def test_contract_failure_never_suppresses_the_main_commit_range_secret_scan(self) -> None:
@@ -408,7 +409,49 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('    needs: candidate\n', secret)
         self.assertNotIn('workflow-contracts', secret)
         build = ci.split('\n  build-test-bundles:\n', 1)[1].split('    steps:', 1)[0]
-        self.assertIn('    needs: [candidate, workflow-contracts]\n', build)
+        self.assertIn('    needs: [candidate, workflow-contracts, secret-scan]\n', build)
+
+    def test_main_coalescing_preserves_scans_and_running_work(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        for name in ('candidate', 'workflow-contracts', 'secret-scan', 'style'):
+            job = re.split(r'\n  [a-z][\w-]*:\n', ci.split(f'\n  {name}:\n', 1)[1], maxsplit=1)[0]
+            self.assertNotIn('concurrency:', job, name)
+        for name, group in (('build-test-bundles', 'build'), ('build-and-test', 'tests'),
+                            ('integration-products', 'sentry')):
+            job = re.split(r'\n  [a-z][\w-]*:\n', ci.split(f'\n  {name}:\n', 1)[1], maxsplit=1)[0]
+            self.assertIn(f'group: ci-{group}-', job)
+            self.assertIn("github.event_name == 'push'", job)
+            self.assertIn("github.ref == 'refs/heads/main'", job)
+            self.assertIn("github.run_attempt == '1'", job)
+            self.assertIn("'main' || github.run_id", job)
+            self.assertIn('cancel-in-progress: false', job)
+
+    def test_portable_checks_run_before_mac_allocation_without_duplicate_suites(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
+        build = ci.split('\n  build-test-bundles:\n', 1)[1].split('\n  build-and-test:\n', 1)[0]
+        self.assertIn('make guardrails', build)
+        self.assertLess(build.index('make guardrails'), build.index('Resolve dependency downloads'))
+        self.assertIn('make codex-schema-check', contracts)
+        self.assertNotIn('make conductor-selftest', build)
+        self.assertNotIn('make release-selftest', build)
+        self.assertIn('make ci-macos-selftest', build)
+        commands = subprocess.run(['make', '--no-print-directory', '-n', 'ci-portable-selftest'],
+                                  cwd=SCRIPT_DIR.parent, capture_output=True, text=True, check=True).stdout.splitlines()
+        tests = [line.strip() for line in commands if line.startswith(('python3 ', './Scripts/test_'))]
+        self.assertEqual(len(tests), len(set(tests)), 'portable suites must not run twice through nested Make targets')
+        for script in ('test_ci_admission.py', 'test_ci_job_diagnostics.py', 'test_ci_app_test_runner.py',
+                       'test_ci_test_coverage.py', 'test_ci_resolve_packages.py', 'test_modularization_tooling.py',
+                       'test_conductor_heavy_admission.py', 'test_release_tooling.py'):
+            self.assertTrue(any(script in line for line in tests), script)
+        self.assertFalse(any('test_local_production_installer.py' in line or 'Scripts/test_tip_history.py' in line
+                             for line in tests), 'Apple plutil/ICU checks must stay on macOS')
+        native = subprocess.run(['make', '--no-print-directory', '-n', 'ci-macos-selftest'],
+                                cwd=SCRIPT_DIR.parent, capture_output=True, text=True, check=True).stdout
+        self.assertIn('Scripts/test_local_production_installer.py', native)
+        self.assertIn('Scripts/test_tip_history.py', native)
+        self.assertIn('ArchiveTests.test_real_ditto_and_codesign_reject_unsigned_fixture_without_running_it', native)
+        self.assertIn('Scripts/test_modularization_index_graph.py LibraryBindingTests', native)
 
     def test_supplemental_product_workflows_are_manual_only(self) -> None:
         # Sentry is already blocking; universal qualification belongs to publication

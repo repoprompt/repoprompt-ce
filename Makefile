@@ -147,17 +147,19 @@ codex-schema-check:
 new-module:
 	python3 Scripts/modularization_new_module.py --name "$(NAME)" --family "$(FAMILY)"
 
+.PHONY: conductor-portable-selftest release-portable-selftest ci-macos-selftest
 conductor-selftest:
+	$(MAKE) conductor-portable-selftest
+	python3 Scripts/test_local_production_installer.py
+
+conductor-portable-selftest:
+	$(MAKE) ci-app-test-runner-selftest
 	python3 Scripts/test_fast_check.py
-	python3 Scripts/test_ci_test_coverage.py
-	python3 Scripts/test_ci_resolve_packages.py
 	python3 Scripts/test_codex_app_server_schema.py
 	python3 Scripts/test_debug_app_process.py
-	python3 Scripts/test_ci_app_test_runner.py
 	python3 Scripts/test_conductor_diagnostics.py
 	python3 Scripts/test_contribution_preflight.py
 	python3 Scripts/test_modularization_metrics.py
-	python3 Scripts/test_modularization_tooling.py
 	python3 Scripts/test_modularization_t0.py
 	python3 Scripts/test_source_layout_resource_guard.py
 	python3 Scripts/test_modularization_index_graph.py
@@ -165,11 +167,23 @@ conductor-selftest:
 	python3 Scripts/test_conductor_job_phases.py
 	python3 Scripts/test_conductor_cache_retry.py
 	python3 Scripts/test_conductor_heavy_admission.py
-	python3 Scripts/test_local_production_installer.py
 	python3 Scripts/test_security_inventory.py
+
+.PHONY: ci-portable-selftest
+ci-portable-selftest:
+	$(MAKE) conductor-portable-selftest
+	$(MAKE) release-portable-selftest
+
+ci-macos-selftest:
+	python3 Scripts/test_ci_app_test_runner.py
+	python3 Scripts/test_local_production_installer.py
+	python3 -B Scripts/test_tip_history.py
+	python3 Scripts/test_tip_history_seed.py ArchiveTests.test_real_ditto_and_codesign_reject_unsigned_fixture_without_running_it
+	python3 Scripts/test_modularization_index_graph.py LibraryBindingTests
 
 ci-workflow-selftest:
 	python3 Scripts/test_ci_admission.py
+	python3 Scripts/test_ci_recovery.py
 	python3 Scripts/test_ci_job_diagnostics.py
 	python3 Scripts/test_modularization_tooling.py
 
@@ -180,8 +194,12 @@ ci-app-test-runner-selftest:
 	python3 Scripts/test_ci_resolve_packages.py
 
 release-selftest:
-	python3 Scripts/test_ci_release_cache.py
+	$(MAKE) release-portable-selftest
 	python3 -B Scripts/test_tip_history.py
+
+release-portable-selftest:
+	python3 Scripts/test_tip_ci_selection.py
+	python3 Scripts/test_ci_release_cache.py
 	python3 -B Scripts/test_tip_history_admission.py
 	python3 -B Scripts/test_tip_history_seed.py
 	python3 -B Scripts/test_tip_release_history_hooks.py

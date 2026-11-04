@@ -30,11 +30,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: xcode-workspace-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   validate:
     name: Validate Generated Xcode Workspace
     # Standard/free Intel pool; ARM64 allocation failures must not strand integration.
     runs-on: macos-26-intel
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

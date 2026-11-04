@@ -10,7 +10,7 @@ import re
 
 JOBS = {
     'candidate': 'Candidate declaration',
-    'workflow-contracts': 'Workflow contracts',
+    'workflow-contracts': 'Portable checks',
     'build-test-bundles': 'Build and Static Gates',
     'build-and-test': 'Root test shards',
     'secret-scan': 'Secret Scan',
@@ -19,8 +19,10 @@ JOBS = {
 RECOVERY = '''### Recovery (no gate bypass)
 - Open the failed job/step above. Skipped dependents are consequences, not root causes.
 - Code, assertion, lint or coverage failure: fix the source and update the PR; rerunning the same code is not a fix.
-- Confirmed transient runner/network failure: **Re-run failed jobs** or the failed job and its dependents. Successful ancestors remain bound to their original candidate and build.
-- Missing/expired artifact, dropped producer output or Swift/Xcode drift: **Re-run Build and Static Gates** and dependents, or **Re-run all jobs**. Evidence artifacts expire after 7 days.
+- See **CI Recovery** for automatic recovery of verified runner startup failures and missing build evidence. Automatic recovery is bounded to three total attempts and never retries an assertion, lint, compiler or coverage failure.
+- Confirmed transient runner/network failure outside automatic recovery: **Re-run failed jobs** or the failed job and its dependents. Successful ancestors remain bound to their original candidate and build.
+- Missing/expired artifact or Swift/Xcode drift: recovery rebuilds the successful root producer once when the failure is positively identified. If recovery is exhausted or producer output is missing, **Re-run Build and Static Gates** and dependents. Evidence artifacts expire after 7 days.
+- An obsolete pending main job may be superseded to preserve capacity. Its secret scan still runs. The current candidate is recovered if an out-of-order old request evicts it; ordinary user cancellation is respected.
 - A rerun uses the original SHA/base, not today's main. Update the PR branch to test new integration code. Runs created before integration-v3 still require Re-run all jobs.
 - Cancellation/runner loss may prevent a job report. Inspect the run timeline; absence of a report or a skipped job is never passing evidence.
 '''
@@ -56,7 +58,7 @@ def prerequisite_report(needs: dict, event: str) -> tuple[str, bool]:
         text += f'| {label} | {result} | {failure} |\n'
     text += '\n**Prerequisites are not the final verdict:** exact build identity and complete test receipts must also pass below.\n'
     if event == 'push':
-        text += '\n**Automatic Tip release is blocked unless this main CI run succeeds.** Success only makes this SHA eligible; Tip still checks current-main identity and runs its own signed-artifact qualification. Stable/manual releases have separate gates.\n'
+        text += '\n**Automatic Tip release is blocked unless main CI succeeds.** Tip selects the newest successful main-push CI source still on protected main, so a newer untested commit cannot strand an already qualified source. It then runs signed-artifact qualification. Stable/manual releases have separate gates.\n'
     else:
         text += '\nThis PR/queue run is integration evidence, not authority to publish a release.\n'
     return text + '\n' + RECOVERY, passed
