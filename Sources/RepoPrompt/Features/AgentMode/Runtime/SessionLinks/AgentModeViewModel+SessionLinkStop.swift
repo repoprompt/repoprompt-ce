@@ -48,13 +48,18 @@ extension AgentModeViewModel {
         if case let .blocked(failure) = selection { return .blocked(failure) }
         if queueHasCommittedDrain() { return .blocked(.targetBusy) }
         guard let binding = session.persistentSessionBindingIdentity else { return .blocked(.targetBusy) }
+        let oracleHadWork = session.oracleBackgroundOwner.map { AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.hasLiveOwner($0) } ?? false
+        var oracleDrained = !oracleHadWork
 
         if selection == .notRunning {
             prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
+            oracleDrained = await awaitOracleBackgroundDrain(for: session, timeout: teardownDeadlineSeconds)
             return .settled(Self.agentSessionLinkStopReceipt(
                 request: request, targetSessionID: candidate.sessionID,
-                result: .notRunning, stopRequested: false, audit: .notRequired,
-                runState: session.runState.rawValue
+                result: oracleHadWork ? (oracleDrained ? .stopped : .stopFailed) : .notRunning,
+                failure: oracleDrained ? nil : .cancellationUnconfirmed,
+                stopRequested: oracleHadWork, teardownCompleted: oracleHadWork ? oracleDrained : nil, audit: .notRequired,
+                runState: session.persistentSessionBindingIdentity == binding ? session.runState.rawValue : nil
             ))
         }
         if selection == .activeRun, session.activeRunOwnership == nil || session.runID == nil {
@@ -88,6 +93,18 @@ extension AgentModeViewModel {
             let itemID = agentSessionLinkAppendStopRow(
                 request: request, candidate: candidate, session: session, binding: binding
             )
+            guard await awaitOracleBackgroundDrain(for: session, timeout: teardownDeadlineSeconds) else {
+                return .settled(Self.agentSessionLinkStopReceipt(
+                    request: request,
+                    targetSessionID: candidate.sessionID,
+                    result: .stopFailed,
+                    failure: .cancellationUnconfirmed,
+                    stopRequested: true,
+                    teardownCompleted: false,
+                    itemID: itemID,
+                    audit: itemID == nil ? .notRequired : .unknown
+                ))
+            }
             let audit = await agentSessionLinkFlushStopAudit(
                 candidate: candidate, session: session, binding: binding,
                 itemID: itemID, deadlineSeconds: auditDeadlineSeconds,
@@ -111,6 +128,7 @@ extension AgentModeViewModel {
         // Claim-time withdrawal is independent of whether the run still exists when cleanup starts.
         prepareAgentRunCancellation(session: session, intent: .userStop, origin: .explicitStop)
         withdrawQueuedWorkForManagedStop(session: session)
+        let oracleDrain = session.oracleBackgroundDrain
         let claimedAdmission = AgentRunCancellationAdmission(
             scope: .activeRun, session: session, binding: binding,
             expectedOwnership: admission.expectedOwnership, expectedRunID: admission.expectedRunID,
@@ -147,7 +165,10 @@ extension AgentModeViewModel {
             let routed = await cancelAgentRunForSessionLink(
                 session: session, admission: claimedAdmission, outcomeRecorder: recorder
             )
-            teardown.finish(routed && recorder.teardownCompleted)
+            if let oracleDrain {
+                oracleDrained = await OracleBackgroundInvocationRegistry.awaitDrain(oracleDrain, timeout: teardownDeadlineSeconds)
+            }
+            teardown.finish(routed && recorder.teardownCompleted && oracleDrained)
             if session.stopState.releaseManagedStop(id: request.requestID, binding: binding) {
                 session.noteMonitorObservationInputsChanged()
                 requestUIRefresh(tabID: candidate.tabID, urgent: true)
@@ -183,6 +204,18 @@ extension AgentModeViewModel {
         let accepted = if case .accepted? = recorder.publicationResult { true } else { false }
         let itemID = session.items.contains(where: { $0.id == request.requestID })
             ? request.requestID : nil
+        if !recorder.initiatedCancellation, oracleHadWork {
+            return .settled(Self.agentSessionLinkStopReceipt(
+                request: request,
+                targetSessionID: candidate.sessionID,
+                result: oracleDrained ? .stopped : .stopFailed,
+                failure: oracleDrained ? nil : .cancellationUnconfirmed,
+                stopRequested: true,
+                teardownCompleted: oracleDrained,
+                audit: .notRequired,
+                runState: matchedTerminalRunState()
+            ))
+        }
         if !teardownCompleted {
             if !recorder.initiatedCancellation, let terminalState = matchedTerminalRunState() {
                 return .settled(Self.agentSessionLinkStopReceipt(
@@ -191,7 +224,7 @@ extension AgentModeViewModel {
                     audit: .notRequired, runState: terminalState
                 ))
             }
-            if recorder.initiatedCancellation, recorder.teardownCompleted,
+            if recorder.initiatedCancellation, recorder.teardownCompleted, oracleDrained,
                recorder.publicationResult == nil, let terminalState = matchedTerminalRunState()
             {
                 return .settled(Self.agentSessionLinkStopReceipt(

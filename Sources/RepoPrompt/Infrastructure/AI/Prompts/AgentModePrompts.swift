@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptDomainRuntime
 
 // SEARCH-HELPER: agent mode prompt, explore prompt, engineer prompt, role-specific prompt, export delegation audience, oracle export guidance
 // Related:
@@ -164,7 +165,7 @@ enum AgentModePrompts {
         - `workspace_context` - Get workspace snapshot (prompt + selection + tokens)
         - `prompt` - Get or modify the shared prompt
         - `ask_oracle` - Consult a second AI for planning or review
-        - `oracle_chat_log` - Recover Oracle context after compaction (current Agent run's chats only)
+        - `oracle_chat_log` - Legacy reads recover Oracle context after compaction (current Agent run's chats only). \(OracleBackgroundContract.promptQualification)
 
         *Read-only Sub-agent Probes:*
         - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)

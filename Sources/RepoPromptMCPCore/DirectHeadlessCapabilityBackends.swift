@@ -748,6 +748,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
 
     func startOracleConversation(_ request: DomainPhysicalToolRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.mcpArguments()
+        try OracleBackgroundContract.refuseHeadlessOptIn(tool: "ask_oracle", arguments: args)
         guard let message = args["message"]?.stringValue, !message.isEmpty else {
             throw MCPError.invalidParams("ask_oracle requires message")
         }
@@ -800,6 +801,7 @@ actor DirectHeadlessConversationBackend: DomainConversationCapabilityBackend {
 
     func readOracleLog(_ request: DomainPhysicalReadRequest) async throws -> DomainPhysicalToolResult {
         let args = try request.request.mcpArguments()
+        try OracleBackgroundContract.refuseHeadlessOptIn(tool: "oracle_chat_log", arguments: args)
         let chatID = args["chat_id"]?.stringValue
         let limit = args["limit"]?.intValue ?? 8
         if let chatID {

@@ -27,8 +27,14 @@ final class ChatWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvider {
 
     func cancelSwitchSessions(for deletionToken: WorkspaceDeletionCancellationToken?) async {
         guard let workspaceManager, let oracleViewModel else { return }
-        guard activeChatCount() > 0 else { return }
         let expectedWorkspaceID = workspaceManager.activeWorkspaceID
+        if let expectedWorkspaceID {
+            let registry = AppDomainRuntimeComposition.shared.oracleBackgroundInvocations
+            let drain = registry.closeAll(workspaceID: expectedWorkspaceID)
+            if !registry.isShuttingDown { await drain.value }
+            guard deletionToken?.isActive ?? true, workspaceManager.activeWorkspaceID == expectedWorkspaceID else { return }
+        }
+        guard activeChatCount() > 0 else { return }
 
         await oracleViewModel.cancelAllActiveSessionStreams()
         guard deletionToken?.isActive ?? true,

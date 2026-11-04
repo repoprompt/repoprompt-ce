@@ -263,6 +263,7 @@ extension AgentModeRunService {
         var prepareForCancellation: (
             AgentTabSession, DomainAgentRunCancellationIntent, AgentModeRunService.CancellationOrigin
         ) -> (@MainActor () async -> Void)? = { _, _, _ in nil }
+        var oracleCancellationDrain: (AgentTabSession) -> Task<Void, Never>? = { _ in nil }
     }
 }
 

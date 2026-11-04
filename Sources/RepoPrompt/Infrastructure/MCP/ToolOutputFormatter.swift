@@ -2247,6 +2247,7 @@ extension ToolOutputFormatter {
     }
 
     static func formatOracleChatLog(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
+        if value.objectValue?["oracle_turn_id"] != nil, let group = formatOracleGroup(value: value, heading: "## Oracle Chat Log \(statusIcon(success: true))") { return [.text(group)] }
         _ = emitResources
         guard case let .object(obj) = value, let arr = obj["messages"]?.arrayValue else {
             return formatGeneric(value: value)
@@ -2545,6 +2546,7 @@ extension ToolOutputFormatter {
     }
 
     static func formatChatSend(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
+        if value.objectValue?["code"]?.stringValue?.hasPrefix("oracle_background_") == true { return formatGeneric(value: value) }
         var shortId: String? = args["chat_id"]?.stringValue
         var mode = args["mode"]?.stringValue
         var response: String?
@@ -2633,6 +2635,11 @@ extension ToolOutputFormatter {
     }
 
     static func formatAskOracle(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
+        if let object = value.objectValue, object["oracle_results"] == nil,
+           object["oracle_turn_id"] != nil || object["code"]?.stringValue?.hasPrefix("oracle_background_") == true
+        {
+            return formatGeneric(value: value)
+        }
         var shortId: String? = args["chat_id"]?.stringValue
         var mode = args["mode"]?.stringValue
         var response: String?
@@ -4599,6 +4606,11 @@ extension ToolOutputFormatter {
         if let groupID = dto.oracleGroupID {
             lines.append("- Oracle group: `\(groupID)`")
         }
+        let backgroundTurnID = value.objectValue?["oracle_turn_id"]?.stringValue
+        if backgroundTurnID != nil, let object = value.objectValue {
+            let keys = ["oracle_group_id", "oracle_turn_id", "chat_id", "mode", "backend", "context_id", "agent_session_id", "agent_run_id"]
+            lines.append(rawJSONString(.object(object.filter { keys.contains($0.key) })))
+        }
         let payload = OracleLaneMarkdownPayload(lanes: ordered.map { lane in
             let status: OracleLaneMarkdownPayload.Status = switch OracleLaneResultStatus(rawValue: lane.status) {
             case .completed: .completed
@@ -4628,7 +4640,7 @@ extension ToolOutputFormatter {
                 response: lane.response,
                 partialResponse: lane.partialResponse
             )
-        }, reconciliationGuidance: dto.oracleReconciliationGuidance) {
+        }, reconciliationGuidance: dto.oracleReconciliationGuidance, backgroundTurnID: backgroundTurnID) {
             lines.append("")
             lines.append(preamble)
         }

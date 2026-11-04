@@ -230,7 +230,11 @@ final class HeadlessAgentModeRunner {
             }
             let released = hooks.providerInput.handoffAgentSessionLinkProviderInput(session, .headlessRun(runID: runID), monitoring.claim, proof)
             guard !released.mustAbortDispatch else { throw CancellationError() }
-            let stream = try await provider.streamAgentMessage(released.message(initialMessage), runID: runID)
+            let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(lease))
+            defer { session.oracleBackgroundAwareness.release(oracle) }
+            let outbound = released.message(initialMessage)
+            let stream = try await provider.streamAgentMessage(oracle?.decorating(outbound) ?? outbound, runID: runID)
+            session.oracleBackgroundAwareness.accept(oracle)
             // Successful stream creation is the acceptance signal for every headless provider,
             // including Claude headless. A throwing creation leaves the claim pending for the retry.
             hooks.providerInput.acceptAgentSessionLinkPrompt(session, monitoring.dispatchContext, released.claim)

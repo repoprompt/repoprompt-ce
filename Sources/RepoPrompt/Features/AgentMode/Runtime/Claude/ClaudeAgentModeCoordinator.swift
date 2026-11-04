@@ -1946,12 +1946,16 @@ final class ClaudeAgentModeCoordinator {
                 }
                 let released = hostCapabilities.handoffLocalInput(session, promptDispatchID, monitoring.claim, inputProof)
                 guard !released.mustAbortDispatch else { return .superseded }
-                let providerBoundText = providerBoundUserMessage(released.text(textWithNote), instructions: instructions)
+                let oracle = session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+                defer { session.oracleBackgroundAwareness.release(oracle) }
+                let ordinaryText = released.text(textWithNote)
+                let providerBoundText = providerBoundUserMessage(oracle?.decorating(ordinaryText) ?? ordinaryText, instructions: instructions)
                 let inputInbox = controllerListeners[session.tabID]?.subscription
                 inputInbox?.beginInputHandoff()
                 defer { inputInbox?.endInputHandoff() }
                 inputAttemptChanged?(true)
                 let turnID = try await controller.sendUserMessage(providerBoundText, configuration: configurationProof)
+                session.oracleBackgroundAwareness.accept(oracle)
                 recordOrdinaryDispatchAttempt()
                 if let parked {
                     var state = session.selfCompactState

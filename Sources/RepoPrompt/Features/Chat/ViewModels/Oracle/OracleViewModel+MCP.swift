@@ -863,7 +863,9 @@ extension OracleViewModel {
         implicitSessionID: UUID? = nil,
         contextBuilderScope: ContextBuilderOracleLaneScope? = nil,
         onQueryCreated: ((UUID) -> Void)? = nil,
-        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
+        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
+        backgroundJob: OracleBackgroundInvocationRegistry.Job? = nil,
+        backgroundLaneIndex: Int = 0
     ) async throws
         -> [String: Value]
     {
@@ -1005,7 +1007,9 @@ extension OracleViewModel {
                 completionPolicy: contextBuilderScope == nil ? .interactive : .contextBuilderStrict,
                 contextBuilderScope: contextBuilderScope,
                 onQueryCreated: onQueryCreated,
-                onProgress: onProgress
+                onProgress: onProgress,
+                backgroundJob: backgroundJob,
+                backgroundLaneIndex: backgroundLaneIndex
             )
         }
         let queryId: UUID?

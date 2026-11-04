@@ -926,6 +926,7 @@ extension AgentModeViewModel {
     ///
     /// A no-op for sessions that never held a claim, so it is safe on every rebuild.
     func agentSessionLinkReoweSupplementForRebuiltProviderContext(for session: TabSession) {
+        session.oracleBackgroundAwareness.resetContext()
         guard let sessionID = session.activeAgentSessionID else { return }
         agentSessionLinkPromptClaimStore.invalidateAcknowledgedContext(observerSessionID: sessionID)
     }

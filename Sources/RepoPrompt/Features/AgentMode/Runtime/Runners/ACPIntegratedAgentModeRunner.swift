@@ -755,7 +755,11 @@ final class ACPIntegratedAgentModeRunner {
             log("active steering session/prompt begin attempt=\(runAttemptID)", runID: runID)
             let released = inputProof.map { hooks.providerInput.handoffAgentSessionLinkProviderInput(session, oversightDispatch, monitoring?.claim, $0) }
             guard released?.mustAbortDispatch != true else { return false }
-            try await controller.prompt(released?.message(agentMessage) ?? agentMessage, request: runRequest, writeReceipt: writeReceipt)
+            let oracle = carry.exactNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+            defer { session.oracleBackgroundAwareness.release(oracle) }
+            let outbound = released?.message(agentMessage) ?? agentMessage
+            try await controller.prompt(oracle?.decorating(outbound) ?? outbound, request: runRequest, writeReceipt: writeReceipt)
+            session.oracleBackgroundAwareness.accept(oracle)
             if let monitoring {
                 hooks.providerInput.acceptAgentSessionLinkPrompt(
                     session, monitoring.dispatchContext, released?.claim
@@ -1260,7 +1264,11 @@ final class ACPIntegratedAgentModeRunner {
             log("controller.prompt begin", runID: runID)
             let released = inputProof.map { hooks.providerInput.handoffAgentSessionLinkProviderInput(session, oversightDispatch, monitoring?.claim, $0) }
             guard released?.mustAbortDispatch != true else { return .cancelled }
-            try await controller.prompt(released?.message(agentMessage) ?? agentMessage, request: runRequest)
+            let oracle = carry.exactNote ? nil : session.oracleBackgroundAwareness.reserve(session: session, providerID: ObjectIdentifier(controller))
+            defer { session.oracleBackgroundAwareness.release(oracle) }
+            let outbound = released?.message(agentMessage) ?? agentMessage
+            try await controller.prompt(oracle?.decorating(outbound) ?? outbound, request: runRequest)
+            session.oracleBackgroundAwareness.accept(oracle)
             // A non-throwing `controller.prompt` return is ACP's acceptance signal.
             session.settleLocalComposerOrigin(localComposerCandidate, disposition: .retained)
             if let monitoring {

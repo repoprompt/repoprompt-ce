@@ -22,6 +22,20 @@ struct AppOracleGroupExecutionCallbacks {
     ) -> Void
 }
 
+struct AppOracleConfiguredRosterPreparation {
+    let workspaceID: UUID?
+    let startExecution: ResolvedOracleExecution?
+    let existingGroup: OracleGroupDocument?
+    let singleSessionID: UUID?
+    let singleExecution: ResolvedOracleExecution?
+    let reconciliationGuidance: String?
+    let lanes: [(execution: ResolvedOracleExecution, index: Int)]?
+    let selectionSnapshot: OracleSelectionSnapshot?
+    var isGrouped: Bool {
+        (startExecution?.roster.count ?? existingGroup?.roster.count ?? 1) > 1
+    }
+}
+
 private struct AppOracleConfiguredRosterSelection {
     let group: OracleGroupDocument?
     let singleSessionID: UUID?
@@ -120,6 +134,40 @@ extension OracleViewModel {
         contextBuilderSupervision: ContextBuilderOracleGroupSupervision?,
         singleFallback: AppOracleConfiguredRosterSingleFallback
     ) async throws -> AppOracleConfiguredRosterDispatch {
+        let preparation = try await prepareConfiguredOracleRoster(
+            args: args, promptVM: promptVM, tabContext: tabContext, capturedProfile: capturedProfile,
+            selectionSnapshotOverride: selectionSnapshotOverride, resolvedStartExecution: resolvedStartExecution
+        )
+        guard preparation.isGrouped else {
+            switch singleFallback {
+            case .executeSingleMCPValue:
+                return try await .singleMCPValue(tool_chatSend(
+                    args: args, promptVM: promptVM, tabContext: tabContext,
+                    resolvedExecution: preparation.singleExecution, implicitSessionID: preparation.singleSessionID
+                ))
+            case .rejectTypedCompletion:
+                throw ChatToolError.invalidParams(
+                    "Configured Oracle group execution requires an additional Oracle roster or an existing Oracle group."
+                )
+            }
+        }
+        let completion = try await executePreparedOracleGroup(
+            preparation, args: args, promptVM: promptVM, tabContext: tabContext,
+            frozenInput: frozenInput, callbacks: callbacks, contextBuilderSupervision: contextBuilderSupervision
+        )
+        return .groupedCompletion(completion, reconciliationGuidance: preparation.reconciliationGuidance)
+    }
+
+    /// Read-only route/roster capture. Background calls additionally freeze every continuation lane
+    /// and prove projection ownership before the runtime may append a prepared turn.
+    @MainActor
+    func prepareConfiguredOracleRoster(
+        args: [String: Value], promptVM: PromptViewModel, tabContext: OracleSendTabContext?,
+        capturedProfile: AgentModelsSettingsProfile? = nil,
+        selectionSnapshotOverride: OracleSelectionSnapshot? = nil,
+        resolvedStartExecution: ResolvedOracleExecution? = nil,
+        freezeGroupLanes: Bool = false
+    ) async throws -> AppOracleConfiguredRosterPreparation {
         let workspaceID = tabContext?.workspaceID ?? workspaceManager.activeWorkspace?.id
         let profile = capturedProfile
             ?? GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID)
@@ -135,8 +183,11 @@ extension OracleViewModel {
             route: route,
             promptVM: promptVM,
             tabContext: tabContext,
-            workspaceID: workspaceID
+            workspaceID: workspaceID,
+            requireGroup: freezeGroupLanes
         )
+        guard oracleBackgroundHistoryAdmissionIsOpen(workspaceID: workspaceID, groupID: selection.group?.group.id) else { throw OracleGroupClaimError.conflict }
+        if let group = selection.group, AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.hasLiveGroup(group.group.id) { throw OracleGroupClaimError.conflict }
         let beginsNewConversation: Bool = switch route {
         case .start:
             true
@@ -187,37 +238,52 @@ extension OracleViewModel {
         } else {
             nil
         }
-        guard (startExecution?.roster.count ?? selection.group?.roster.count ?? 1) > 1 else {
-            switch singleFallback {
-            case .executeSingleMCPValue:
-                let value = try await tool_chatSend(
-                    args: args,
-                    promptVM: promptVM,
-                    tabContext: tabContext,
-                    resolvedExecution: singleExecution,
-                    implicitSessionID: selection.singleSessionID
-                )
-                return .singleMCPValue(value)
-            case .rejectTypedCompletion:
-                throw ChatToolError.invalidParams(
-                    "Configured Oracle group execution requires an additional Oracle roster or an existing Oracle group."
-                )
+        var lanes: [(execution: ResolvedOracleExecution, index: Int)]?
+        if freezeGroupLanes {
+            if let startExecution {
+                lanes = startExecution.models.indices.map { (startExecution, $0) }
+            } else if let group = selection.group, let tabID = tabContext?.tabID {
+                lanes = try group.members.map { member in
+                    guard let index = try validatedOracleProjectionIndex(member: member, group: group, workspaceID: workspaceID, tabID: tabID) else {
+                        throw ChatToolError.invalidParams("Oracle conversation history is unavailable. Restore the chat history or set new_chat=true.")
+                    }
+                    var session = sessions[index]
+                    guard Self.sessionMatchesOracleOwnerForExplicitContinuation(session, agentModeSessionID: tabContext?.agentModeSessionID, agentModeRunID: tabContext?.agentModeRunID) else {
+                        throw ChatToolError.invalidParams(Self.oracleOwnerRefusalMessage(chatID: member.publicChatID, session: session, agentModeSessionID: tabContext?.agentModeSessionID))
+                    }
+                    session.preferredAIModel = member.model.modelID
+                    if session.oracleExecutionAuthority == nil { session.selectedChatPresetID = nil }
+                    return try (resolveOracleConversationExecution(session: session, mode: args["mode"]?.stringValue ?? "chat", profile: profile, promptVM: promptVM, snapshotOverride: selectionSnapshotOverride), 0)
+                }
+            }
+            for lane in lanes ?? [] {
+                if case let .failure(error) = AttachmentPlanner.plan(OracleAttachmentSet(tabContext?.attachments ?? []), route: lane.execution.models[lane.index].attachmentRoute, limits: .production) {
+                    throw ChatToolError.invalidParams(error.localizedDescription)
+                }
             }
         }
-        let completion = try await tool_chatSendGroupCompletion(
-            args: args,
-            promptVM: promptVM,
-            tabContext: tabContext,
-            workspaceID: workspaceID,
-            startExecution: startExecution,
-            reconciliationGuidance: reconciliationGuidance,
-            selectionSnapshotOverride: selectionSnapshotOverride,
-            existingGroup: selection.group,
-            frozenInput: frozenInput,
-            callbacks: callbacks,
-            contextBuilderSupervision: contextBuilderSupervision
+        return AppOracleConfiguredRosterPreparation(
+            workspaceID: workspaceID, startExecution: startExecution, existingGroup: selection.group,
+            singleSessionID: selection.singleSessionID, singleExecution: singleExecution,
+            reconciliationGuidance: reconciliationGuidance, lanes: lanes, selectionSnapshot: selectionSnapshotOverride
         )
-        return .groupedCompletion(completion, reconciliationGuidance: reconciliationGuidance)
+    }
+
+    @MainActor
+    func executePreparedOracleGroup(
+        _ preparation: AppOracleConfiguredRosterPreparation, args: [String: Value],
+        promptVM: PromptViewModel, tabContext: OracleSendTabContext?,
+        frozenInput: OracleInput? = nil, callbacks: AppOracleGroupExecutionCallbacks? = nil,
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision? = nil,
+        backgroundJob: OracleBackgroundInvocationRegistry.Job? = nil
+    ) async throws -> OracleGroupRuntime.Completion {
+        try await tool_chatSendGroupCompletion(
+            args: args, promptVM: promptVM, tabContext: tabContext, workspaceID: preparation.workspaceID,
+            startExecution: preparation.startExecution, reconciliationGuidance: preparation.reconciliationGuidance,
+            selectionSnapshotOverride: preparation.selectionSnapshot, existingGroup: preparation.existingGroup, frozenInput: frozenInput,
+            callbacks: callbacks, contextBuilderSupervision: contextBuilderSupervision,
+            frozenLanes: preparation.lanes, backgroundJob: backgroundJob
+        )
     }
 
     @MainActor
@@ -225,7 +291,8 @@ extension OracleViewModel {
         route: OracleConversationRoute,
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext?,
-        workspaceID: UUID?
+        workspaceID: UUID?,
+        requireGroup: Bool = false
     ) async throws -> AppOracleConfiguredRosterSelection {
         let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
         guard let tabID else { return .none }
@@ -240,6 +307,7 @@ extension OracleViewModel {
                 owner: owner
             )
             guard let group else {
+                if requireGroup { return .none }
                 if sessions.contains(where: { Self.isOracleProjection($0, addressedBy: chatID) }) {
                     throw ChatToolError.internalError("Canonical Oracle group was not found.")
                 }
@@ -305,7 +373,9 @@ extension OracleViewModel {
         existingGroup: OracleGroupDocument?,
         frozenInput: OracleInput?,
         callbacks: AppOracleGroupExecutionCallbacks?,
-        contextBuilderSupervision: ContextBuilderOracleGroupSupervision?
+        contextBuilderSupervision: ContextBuilderOracleGroupSupervision?,
+        frozenLanes: [(execution: ResolvedOracleExecution, index: Int)]? = nil,
+        backgroundJob: OracleBackgroundInvocationRegistry.Job? = nil
     ) async throws -> OracleGroupRuntime.Completion {
         let useTabPrompt = args["use_tab_prompt"]?.boolValue ?? false
         let rawMessage = args["message"]?.stringValue ?? ""
@@ -365,8 +435,10 @@ extension OracleViewModel {
         guard input.mode == mode, input.userMessage == message else {
             throw ChatToolError.invalidParams("Frozen Oracle input does not match the requested mode and message.")
         }
-        let invocationID = UUID()
+        let invocationID = backgroundJob?.provenance.invocationID ?? UUID()
         let runID = tabContext?.agentModeRunID ?? invocationID
+        var retainedSessions: [UUID] = []
+        defer { retainedSessions.forEach { unpinSession($0) } }
         let runtimeCallbacks = OracleGroupRuntime.Callbacks(
             prepared: { [weak self] document in
                 guard let self else { throw CancellationError() }
@@ -382,6 +454,13 @@ extension OracleViewModel {
                     try await callbacks?.prepared(document.group.id, turn.id, document.members)
                     await tabContext?.toolSettlement?.prepared(document.group.id, turn.id)
                 }
+                if backgroundJob != nil {
+                    await MainActor.run {
+                        retainedSessions = document.members.map(\.memberID.rawValue)
+                        retainedSessions.forEach { self.pinSession($0) }
+                    }
+                }
+                try await backgroundJob?.prepared(document)
             },
             executeLane: { [weak self] invocation in
                 guard let self else { throw CancellationError() }
@@ -395,11 +474,16 @@ extension OracleViewModel {
                     selectionSnapshotOverride: selectionSnapshotOverride,
                     executionContext: invocation.context,
                     callbacks: callbacks,
-                    supervision: contextBuilderSupervision
+                    supervision: contextBuilderSupervision,
+                    frozenLane: frozenLanes?[invocation.member.laneID.index],
+                    backgroundJob: backgroundJob
                 )
             },
             progress: { [weak self] event in
                 await self?.receiveOracleGroupProgress(event, owner: owner, invocationID: invocationID)
+                if event.kind == .laneSettled, let lane = event.laneID, let status = event.text.flatMap(OracleLaneResultStatus.init(rawValue:)), let sequence = event.sequence {
+                    await backgroundJob?.recordLaneOutcome(status, laneIndex: lane.index, sequence: sequence)
+                }
                 await callbacks?.progress(event)
             }
         )
@@ -420,7 +504,9 @@ extension OracleViewModel {
                                 observedRevision: observed.revision,
                                 expectedRoster: roster
                             )
-                        )
+                        ),
+                        agentSessionID: tabContext?.agentModeSessionID,
+                        backgroundExecution: backgroundJob?.provenance
                     ),
                     callbacks: runtimeCallbacks
                 )
@@ -451,11 +537,14 @@ extension OracleViewModel {
                                 roster: roster,
                                 members: members
                             )
-                        )
+                        ),
+                        agentSessionID: tabContext?.agentModeSessionID,
+                        backgroundExecution: backgroundJob?.provenance
                     ),
                     callbacks: runtimeCallbacks
                 )
             }
+            try backgroundJob?.recordPublishedTurn(completion.terminalDocument)
             recordOracleGroupPresentation(completion.terminalDocument)
             if let turn = completion.terminalDocument.turns.last {
                 tabContext?.toolSettlement?.settled(completion.result, turn.id, reconciliationGuidance)
@@ -477,7 +566,7 @@ extension OracleViewModel {
     }
 
     @MainActor
-    private func validatedOracleProjectionIndex(
+    func validatedOracleProjectionIndex(
         member: OracleGroupMember,
         group: OracleGroupDocument,
         workspaceID: UUID?,
@@ -605,7 +694,9 @@ extension OracleViewModel {
         selectionSnapshotOverride: OracleSelectionSnapshot?,
         executionContext: OracleLaneExecutionContext,
         callbacks: AppOracleGroupExecutionCallbacks?,
-        supervision: ContextBuilderOracleGroupSupervision?
+        supervision: ContextBuilderOracleGroupSupervision?,
+        frozenLane: (execution: ResolvedOracleExecution, index: Int)? = nil,
+        backgroundJob: OracleBackgroundInvocationRegistry.Job? = nil
     ) async throws -> OracleLaneExecutionResponse {
         let scope = supervision?.makeLane(sessionID: member.memberID.rawValue)
         let sessionID = member.memberID.rawValue
@@ -641,6 +732,7 @@ extension OracleViewModel {
                 member: member, args: args, promptVM: promptVM, tabContext: tabContext,
                 startExecution: startExecution, selectionSnapshotOverride: selectionSnapshotOverride,
                 executionContext: executionContext, callbacks: callbacks, scope: scope,
+                frozenLane: frozenLane, backgroundJob: backgroundJob,
                 onQueryCreated: { id, providerID in
                     queryID = id
                     capturedProviderID = providerID
@@ -687,6 +779,8 @@ extension OracleViewModel {
         executionContext: OracleLaneExecutionContext,
         callbacks: AppOracleGroupExecutionCallbacks?,
         scope: ContextBuilderOracleLaneScope?,
+        frozenLane: (execution: ResolvedOracleExecution, index: Int)?,
+        backgroundJob: OracleBackgroundInvocationRegistry.Job?,
         onQueryCreated: @escaping (UUID, String?) -> Void
     ) async throws -> OracleLaneExecutionResponse {
         var laneArgs = args
@@ -696,7 +790,10 @@ extension OracleViewModel {
         laneArgs.removeValue(forKey: "chat_name")
         let laneExecution: ResolvedOracleExecution
         let resolvedLaneIndex: Int
-        if let startExecution {
+        if let frozenLane {
+            laneExecution = frozenLane.execution
+            resolvedLaneIndex = frozenLane.index
+        } else if let startExecution {
             laneExecution = startExecution
             resolvedLaneIndex = member.laneID.index
         } else {
@@ -720,7 +817,7 @@ extension OracleViewModel {
         let resolvedModel = laneExecution.models[resolvedLaneIndex]
         let executionProfile = AppOracleGroupRouting.executionProfile(for: resolvedModel)
         scope?.executionProfile = executionProfile
-        let laneContext: OracleSendTabContext? = if member.laneID.index == 0 {
+        let laneContext: OracleSendTabContext? = if member.laneID.index == 0, backgroundJob == nil {
             tabContext
         } else if let tabContext {
             Self.backgroundOracleContext(tabContext)
@@ -729,6 +826,14 @@ extension OracleViewModel {
         }
         let sessionID = member.memberID.rawValue
         var partialResponse: String?
+        if let backgroundJob {
+            return try await executeBackgroundOracleLane(
+                member: member, args: laneArgs, promptVM: promptVM, tabContext: laneContext,
+                execution: laneExecution, index: resolvedLaneIndex, executionProfile: executionProfile,
+                executionContext: executionContext, job: backgroundJob, callbacks: callbacks,
+                onQueryCreated: onQueryCreated
+            )
+        }
         do {
             let reply = try await withTaskCancellationHandler {
                 try await tool_chatSend(
@@ -799,6 +904,70 @@ extension OracleViewModel {
         }
     }
 
+    @MainActor
+    private func executeBackgroundOracleLane(
+        member: OracleGroupMember, args: [String: Value], promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext?, execution: ResolvedOracleExecution, index: Int,
+        executionProfile: OracleExecutionProfile?, executionContext: OracleLaneExecutionContext,
+        job: OracleBackgroundInvocationRegistry.Job, callbacks: AppOracleGroupExecutionCallbacks?,
+        onQueryCreated: @escaping (UUID, String?) -> Void
+    ) async throws -> OracleLaneExecutionResponse {
+        try Task.checkCancellation()
+        var query: OracleBackgroundInvocationRegistry.QueryIdentity?
+        var partial: String?
+        do {
+            let reply = try await tool_chatSend(
+                args: args, promptVM: promptVM, tabContext: tabContext,
+                resolvedExecution: execution, resolvedLaneIndex: index,
+                onQueryCreated: { id in
+                    onQueryCreated(id, executionProfile?.providerID)
+                    let identity = self.backgroundOracleQueryIdentity(sessionID: member.memberID.rawValue, queryID: id)
+                    query = identity
+                    do {
+                        try job.registerQuery(
+                            laneIndex: member.laneID.index,
+                            identity: identity,
+                            isCurrent: { [weak self] in self?.backgroundOracleQueryIsCurrent($0) == true },
+                            cancel: { [self] identity in
+                                await cancelAIResponse(
+                                    in: identity.sessionID,
+                                    skipPartialParseAndSave: true,
+                                    cleanupOwnerIsCurrent: { self.backgroundOracleQueryIsCurrent(identity) },
+                                    preserveGlobalRetryTask: true
+                                )
+                            }
+                        )
+                    } catch { job.cancelExecution() }
+                },
+                onProgress: { text, reasoning in
+                    partial = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
+                    callbacks?.laneProgress(member.laneID, text, reasoning)
+                },
+                backgroundJob: job, backgroundLaneIndex: member.laneID.index
+            )
+            // A finalized exact-query success survives a later Stop, including while the
+            // producer/finalizer or coordinator is still draining. Never consult a predecessor.
+            guard let response = reply["response"]?.stringValue else {
+                throw OracleLaneFailure(code: "empty_response", message: "Oracle lane returned no response.")
+            }
+            job.recordLaneOutcome(.completed, laneIndex: member.laneID.index, sequence: 1)
+            await job.joinQueryCleanup(laneIndex: member.laneID.index)
+            await executionContext.emitDelta(response)
+            return OracleLaneExecutionResponse(response: response, executionProfile: executionProfile)
+        } catch {
+            job.cancelQuery(laneIndex: member.laneID.index)
+            await job.joinQueryCleanup(laneIndex: member.laneID.index)
+            if let query, let response = await backgroundOracleCompletedResponse(query) {
+                return OracleLaneExecutionResponse(response: response, executionProfile: executionProfile)
+            }
+            if error is CancellationError || Task.isCancelled || job.isCancellationRequested {
+                throw OracleLaneCancellation(partialResponse: partial, executionProfile: executionProfile)
+            }
+            if let failure = error as? OracleLaneFailure { throw failure }
+            throw OracleLaneFailure(message: error.localizedDescription, partialResponse: partial, executionProfile: executionProfile)
+        }
+    }
+
     private func mapOracleGroupRuntimeError(_ error: OracleGroupRuntime.RuntimeError) -> ChatToolError {
         switch error {
         case .rosterConflict, .singleLaneBypassRequired:
@@ -864,7 +1033,7 @@ extension OracleViewModel {
         )
     }
 
-    private static func backgroundOracleContext(_ context: OracleSendTabContext) -> OracleSendTabContext {
+    static func backgroundOracleContext(_ context: OracleSendTabContext) -> OracleSendTabContext {
         OracleSendTabContext(
             tabID: context.tabID,
             workspaceID: context.workspaceID,
@@ -911,13 +1080,18 @@ extension OracleViewModel {
         else {
             throw ChatToolError.internalError("Oracle group projection is missing its tab owner.")
         }
+        guard oracleHistoryDeletingGroups.insert(OracleGroupID(rawValue: rawGroupID)).inserted else { throw OracleGroupClaimError.conflict }
+        defer { oracleHistoryDeletingGroups.remove(OracleGroupID(rawValue: rawGroupID)) }
         let store = AppDomainRuntimeComposition.shared.oracleConversationStore
-        guard let group = try await store.load(
+        guard var group = try await store.load(
             groupID: OracleGroupID(rawValue: rawGroupID),
             owner: owner
         ) else { return false }
         let memberIDs = Set(group.members.map(\.memberID.rawValue))
         guard memberIDs.contains(session.id) else { return false }
+        await AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.drainGroup(group.group.id).value
+        guard let latest = try await store.load(groupID: group.group.id, owner: owner), latest.members == group.members else { return false }
+        group = latest
         guard invalidateDeletedSnapshot.isCurrent() else {
             throw ChatToolError.internalError("Workspace storage changed before the Oracle group could be deleted.")
         }
@@ -939,6 +1113,7 @@ extension OracleViewModel {
             owner: owner,
             expectedRevision: group.revision
         )
+        AppDomainRuntimeComposition.shared.oracleBackgroundInvocations.removeSettledGroup(group.group.id)
         invalidateDeletedSnapshot.invalidate()
         // A released lane's save is an un-awaited tracked task; let it land (and record its file) before deleting files.
         if let workspaceID = session.workspaceID { await drainTrackedAutosaves(for: workspaceID) }

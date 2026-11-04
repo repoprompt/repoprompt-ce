@@ -3,10 +3,211 @@ import MCP
 @testable import RepoPromptApp
 import RepoPromptDomainRuntime
 import RepoPromptSettingsCore
+import RepoPromptShared
 import XCTest
 
 @MainActor
 final class OraclePresetExecutionTests: XCTestCase {
+    func testBackgroundFlatSchemaSurvivesCanonicalCallerProjection() async throws {
+        let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle))
+        var schema = try XCTUnwrap(canonical.inputSchema.objectValue)
+        var properties = try XCTUnwrap(schema["properties"]?.objectValue)
+        XCTAssertEqual(properties[OracleAdditionalOraclesContract.argumentName], OracleAdditionalOraclesContract.schemaProperty())
+        XCTAssertNil(schema["required"])
+        XCTAssertTrue(canonical.description.hasSuffix(OracleBackgroundContract.startDescription + "\n\n" + OracleBackgroundContract.cancelDescription))
+
+        properties["background"] = .object(["type": .string("boolean"), "default": .bool(false)])
+        properties["op"] = .object([
+            "type": .string("string"), "enum": .array([.string("send"), .string("cancel")]), "default": .string("send")
+        ])
+        for key in ["oracle_group_id", "oracle_turn_id"] {
+            properties[key] = .object(["type": .string("string"), "format": .string("uuid")])
+        }
+        schema["properties"] = .object(properties)
+        schema.removeValue(forKey: "required")
+        XCTAssertEqual(schema["type"], .string("object"))
+        for key in ["anyOf", "oneOf", "allOf", "if", "then", "not"] {
+            XCTAssertNil(schema[key], "Oracle schema root must omit \(key)")
+        }
+        // Independently spell the approved recipe, including the fork roster property.
+        let projected = MCPDomainToolDefinition(
+            name: canonical.name,
+            description: canonical.description,
+            inputSchema: .object(schema),
+            annotations: canonical.annotations,
+            isEnabledByDefault: canonical.isEnabledByDefault
+        )
+        XCTAssertEqual(projected.inputSchema, canonical.inputSchema)
+        let collect = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.oracleChatLog))
+        let collectProperties = try XCTUnwrap(collect.inputSchema.objectValue?["properties"]?.objectValue)
+        XCTAssertEqual(collectProperties["op"], .object(["type": .string("string"), "enum": .array([.string("read"), .string("collect")]), "default": .string("read")]))
+        XCTAssertEqual(collectProperties["include_finished"], .object(["type": .string("boolean"), "default": .bool(true)]))
+        for key in ["oracle_group_id", "oracle_turn_id"] {
+            XCTAssertEqual(collectProperties[key], properties[key])
+        }
+        XCTAssertTrue(collect.description.hasSuffix(OracleBackgroundContract.collectDescription))
+        let binding = MCPDomainToolBinding(definition: canonical) { _ in .null }
+        let tool = try RepoPromptApp.Tool(domainBinding: binding)
+        // The typed schema is not the advertised authority for a canonical name.
+        // Registration reloads the exact raw canonical schema.
+        XCTAssertEqual(try tool.domainBinding().definition, canonical)
+        let rebound = try RepoPromptApp.Tool(canonicalizing: tool).domainBinding()
+        XCTAssertEqual(rebound.definition, canonical)
+
+        #if DEBUG
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("oracle-schema-\(UUID().uuidString)")
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let runtime = MCPDomainRuntime(configuration: .init(
+                mode: .app, profileIdentifier: "oracle-schema-test", storageDirectory: directory,
+                eventDirectory: directory, temporaryDirectory: directory, externalReloadInterval: nil
+            ))
+            // Exercise canonical registration, host policy, production cache and final codec.
+            _ = try await runtime.toolRegistry.register(
+                registrationID: MCPDomainToolRegistrationID(), scope: .window(id: 1), bindings: [binding]
+            )
+            let manager = ServerNetworkManager(domainHost: runtime.domainHost)
+            let callers: [(MCPClientToolPolicyProfile, MCPRunPurpose, String)] = [
+                (.direct, .unknown, "manual"), (.discovery, .discoverRun, "discovery"),
+                (.agentModeGenericExplore, .agentModeRun, "generic"),
+                (.agentModeGenericEngineer, .agentModeRun, "generic"),
+                (.agentModeClaudeEngineer, .agentModeRun, "claude-code"),
+                (.agentModeCodexEngineer, .agentModeRun, "codex-mcp-client"),
+                (.agentModeOpenCodeEngineer, .agentModeRun, "opencode"),
+                (.agentModeCursorEngineer, .agentModeRun, "cursor")
+            ]
+            for (profile, purpose, client) in callers {
+                let classification = MCPClientToolPolicyCatalog.classification(for: profile)
+                let policy = MCPDomainClientPolicySnapshot(
+                    restrictedToolNames: MCPDomainToolCatalog.toolNames(for: classification.restrictedCapabilities),
+                    additionalToolNames: MCPDomainToolCatalog.toolNames(for: classification.grantedCapabilities),
+                    role: classification.role, allowsAgentExternalControlTools: classification.allowsAgentExternalControlTools
+                )
+                for surface: AgentSessionLinkToolSurface in [.full, .overseenOnly] {
+                    let advertised = await runtime.domainHost.advertisedCatalog(.init(
+                        isGloballyEnabled: true, disabledToolNames: [],
+                        policy: policy, agentSessionLinkSurface: surface
+                    ))
+                    if profile == .discovery || profile == .agentModeGenericExplore {
+                        XCTAssertTrue(advertised.definitions.isEmpty, "\(profile) must not gain Oracle access")
+                        XCTAssertEqual(advertised.hiddenReasonsByToolName[canonical.name], profile == .discovery ? .restricted : .roleAdvertisementPolicy)
+                        continue
+                    }
+                    let definition = try XCTUnwrap(advertised.definitions.first { $0.name == canonical.name }, "\(profile)")
+                    XCTAssertEqual(definition.inputSchema, projected.inputSchema)
+                    let outboundSchema = try await manager.debugCachedToolSchema(
+                        definition: definition, purpose: purpose, surface: surface
+                    )
+                    let outbound = ListTools.Result(tools: [MCP.Tool(
+                        name: definition.name, description: definition.description, inputSchema: outboundSchema,
+                        annotations: CodexMCPToolAnnotationProjection.project(
+                            definition.annotations.mcpAnnotations, clientIdentifier: client
+                        )
+                    )])
+                    let decoded = try JSONDecoder().decode(ListTools.Result.self, from: JSONEncoder().encode(outbound))
+                    XCTAssertEqual(decoded.tools.first?.inputSchema, projected.inputSchema, "\(profile)/\(purpose)/\(surface)")
+                }
+            }
+        #else
+            throw XCTSkip("Production schema cache testing seam is DEBUG-only")
+        #endif
+        XCTAssertEqual(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle)?.inputSchema, canonical.inputSchema)
+    }
+
+    func testPublishedAppToolSchemasHaveNoRootCombinators() async throws {
+        func assertFlatRoot(_ input: Value, name: String) throws {
+            let schema = try XCTUnwrap(input.objectValue, name)
+            XCTAssertEqual(schema["type"], .string("object"), name)
+            for key in ["anyOf", "oneOf", "allOf", "if", "then", "not"] {
+                XCTAssertNil(schema[key], "\(name) schema root must omit \(key)")
+            }
+        }
+        let definitions = MCPDomainCanonicalToolDefinitions.definitions
+        XCTAssertFalse(definitions.isEmpty)
+        for definition in definitions {
+            try assertFlatRoot(definition.inputSchema, name: definition.name)
+        }
+        let canonical = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.askOracle))
+        let collect = try XCTUnwrap(MCPDomainCanonicalToolDefinitions.definition(named: MCPWindowToolName.oracleChatLog))
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                var agentEndpoint: PersistentMCPTestEndpoint?
+                @MainActor func closeAgentEndpoint() async {
+                    guard let endpoint = agentEndpoint else { return }
+                    endpoint.client.close()
+                    await endpoint.connectionManager.stop()
+                    await fixture.networkManager.debugRemoveConnection(endpoint.connectionID)
+                    await fixture.networkManager.clearClientConnectionPolicy(for: endpoint.clientName)
+                    await fixture.networkManager.debugClearPersistedRoutingState(for: endpoint.clientName)
+                    fixture.contextA.window.mcpServer.removeTabContext(forConnectionID: endpoint.connectionID, clientName: endpoint.clientName, windowID: nil, runID: nil)
+                }
+                do {
+                    let window = fixture.contextA.window
+                    var workspace = try XCTUnwrap(window.workspaceManager.workspaces.first { $0.id == fixture.contextA.workspaceID })
+                    let sessionID = UUID(), runID = UUID()
+                    workspace.composeTabs[0].activeAgentSessionID = sessionID
+                    _ = try await AgentSessionDataService.shared.saveAgentSession(AgentSession(id: sessionID, workspaceID: workspace.id, composeTabID: fixture.contextA.tabID, name: "Oracle schema fixture", agentKind: AgentProviderKind.claudeCode.rawValue), for: workspace)
+                    if let index = window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) { window.workspaceManager.workspaces[index] = workspace }
+                    await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "offline Oracle schema fixture")
+                    let session = await window.agentModeViewModel.ensureSessionReady(tabID: fixture.contextA.tabID, reconnectActiveProviders: false)
+                    session.installRunID(runID)
+                    _ = session.beginRunAttempt(source: "schema fixture")
+                    session.runState = .running
+                    try await window.agentModeViewModel.mcpActivateControlContext(forTabID: fixture.contextA.tabID, sessionID: sessionID, originatingConnectionID: nil, startPending: true)
+                    let clientName = "oracle-schema-agent-\(UUID().uuidString)"
+                    let agentPolicy = MCPClientToolPolicyCatalog.classification(for: .agentModeGenericEngineer)
+                    await fixture.networkManager.installClientConnectionPolicy(
+                        for: clientName, windowID: fixture.contextA.window.windowID,
+                        restrictedTools: MCPDomainToolCatalog.toolNames(for: agentPolicy.restrictedCapabilities),
+                        tabID: fixture.contextA.tabID, runID: runID,
+                        additionalTools: MCPDomainToolCatalog.toolNames(for: agentPolicy.grantedCapabilities),
+                        purpose: .agentModeRun, taskLabelKind: .engineer
+                    )
+                    let endpoint = try await PersistentMCPTestEndpoint.make(label: "oracle-schema-agent", networkManager: fixture.networkManager, clientName: clientName, requiredToolNames: [MCPWindowToolName.askOracle, MCPWindowToolName.oracleChatLog])
+                    agentEndpoint = endpoint
+                    let policy = await fixture.networkManager.debugConnectionPolicyState(for: endpoint.connectionID)
+                    XCTAssertEqual(policy.purpose, .agentModeRun)
+                    for refresh in [false, true] {
+                        if refresh {
+                            await AppDomainRuntimeComposition.shared.unregister(fixture.contextA.catalogService)
+                            try await AppDomainRuntimeComposition.shared.register(fixture.contextA.catalogService)
+                        }
+                        let catalog = await AppDomainRuntimeComposition.shared.runtime.domainHost.advertisedCatalog(.init(
+                            isGloballyEnabled: true, disabledToolNames: [],
+                            policy: .init(
+                                restrictedToolNames: MCPDomainToolCatalog.toolNames(for: agentPolicy.restrictedCapabilities),
+                                additionalToolNames: MCPDomainToolCatalog.toolNames(for: agentPolicy.grantedCapabilities),
+                                role: agentPolicy.role, allowsAgentExternalControlTools: agentPolicy.allowsAgentExternalControlTools
+                            )
+                        ))
+                        XCTAssertFalse(catalog.definitions.isEmpty)
+                        XCTAssertTrue(catalog.definitions.contains { $0.name == canonical.name })
+                        for definition in catalog.definitions {
+                            try assertFlatRoot(definition.inputSchema, name: "app catalog/\(definition.name)")
+                        }
+                        let response = try await endpoint.client.request(method: "tools/list", params: [:])
+                        let object = try MCPExportWatchdogIntegrationTests.responseObject(from: response)
+                        let result = try JSONDecoder().decode(ListTools.Result.self, from: JSONSerialization.data(withJSONObject: XCTUnwrap(object["result"])))
+                        XCTAssertFalse(result.tools.isEmpty)
+                        for tool in result.tools {
+                            try assertFlatRoot(tool.inputSchema, name: "socket/\(tool.name)")
+                        }
+                        for expected in [canonical, collect] {
+                            let tool = try XCTUnwrap(result.tools.first { $0.name == expected.name }, "Missing \(expected.name); actual \(result.tools.map(\.name))")
+                            XCTAssertEqual(tool.inputSchema, expected.inputSchema, "actual socket/catalog refresh=\(refresh)")
+                        }
+                    }
+                } catch {
+                    await closeAgentEndpoint()
+                    await fixture.cleanup()
+                    throw error
+                }
+                await closeAgentEndpoint()
+                await fixture.cleanup()
+            }
+        #endif
+    }
+
     func testSchema1ReviewPresetOverridesConflictingAgentRosterAndUsesMappedPrompt() async throws {
         let composition = WindowStateCompositionFactory.make(
             windowID: -9321,

@@ -219,6 +219,7 @@ actor DirectHeadlessOracleAdapter {
         arguments: [String: Value],
         request: DomainPhysicalToolRequest
     ) async throws -> InvocationPlan {
+        try OracleBackgroundContract.refuseHeadlessOptIn(tool: toolName, arguments: arguments)
         guard !isShuttingDown else { throw CancellationError() }
         if let invocationID = request.securityContext?.invocationID,
            let plan = plansByInvocationID.removeValue(forKey: invocationID)
@@ -242,6 +243,7 @@ actor DirectHeadlessOracleAdapter {
         invocationID: UUID,
         runID: UUID
     ) async throws -> InvocationPlan {
+        try OracleBackgroundContract.refuseHeadlessOptIn(tool: toolName, arguments: arguments)
         if toolName == "context_builder" {
             try Self.validateContextBuilderArguments(arguments)
         }

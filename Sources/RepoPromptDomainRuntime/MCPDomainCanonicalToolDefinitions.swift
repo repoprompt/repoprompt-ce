@@ -1130,6 +1130,7 @@ package enum MCPDomainCanonicalToolDefinitions {
             .map(advertiseModelParameters)
             .map(advertiseOracleAttachments)
             .map(advertiseAdditionalOracles)
+            .map(advertiseOracleBackground)
             .map(advertiseWorktreeListPagination)
             .map(advertiseDefaultRepositoryElection)
             .map(advertiseSessionDiscovery)
@@ -1257,6 +1258,24 @@ package enum MCPDomainCanonicalToolDefinitions {
             description: definition.description
                 + "\n\n**Cursor parameters**: `\(operations)` accept `model_parameters` as exact `config_id` and `value` pairs for app-backed Cursor sessions. Discover choices in `agent_manage.list_agents`; catalog `current_value` is the catalog default, not a live session value. Selections are applied before prompting and returned in session snapshots. Standalone headless sessions reject parameter overrides.",
             inputSchema: .object(schema),
+            annotations: definition.annotations,
+            isEnabledByDefault: definition.isEnabledByDefault
+        )
+    }
+
+    private static func advertiseOracleBackground(_ definition: MCPDomainToolDefinition) -> MCPDomainToolDefinition {
+        let suffix: String
+        switch definition.name {
+        case MCPWindowToolName.askOracle:
+            suffix = OracleBackgroundContract.startDescription + "\n\n" + OracleBackgroundContract.cancelDescription
+        case MCPWindowToolName.oracleChatLog:
+            suffix = OracleBackgroundContract.collectDescription
+        default: return definition
+        }
+        return MCPDomainToolDefinition(
+            name: definition.name,
+            description: definition.description + "\n\n" + suffix,
+            inputSchema: OracleBackgroundContract.schema(tool: definition.name, extending: definition.inputSchema),
             annotations: definition.annotations,
             isEnabledByDefault: definition.isEnabledByDefault
         )
@@ -1612,7 +1631,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 description: definition.description
                     .replacingOccurrences(
                         of: "Use `oracle_chat_log` after compaction to recover recent oracle messages.",
-                        with: "Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and reading it with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit."
+                        with: "Use `oracle_chat_log` after compaction to recover recent oracle messages. In app-backed Agent Mode, continuing a chat and legacy reading with `oracle_chat_log` work only for chats created by the current Agent run; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused, so start a new chat instead. The direct headless backend does not apply this run limit."
                     )
                     + " Omit chat_id or set new_chat=true to start; otherwise chat_id continues. The optional model override applies only to the primary model of a new conversation.",
                 inputSchema: .object(schema),
@@ -1625,7 +1644,7 @@ package enum MCPDomainCanonicalToolDefinitions {
                 name: definition.name,
                 description: definition.description.replacingOccurrences(
                     of: "Available only during agent mode runs.",
-                    with: "Available only during agent mode runs. In app-backed Agent Mode, only chats created by the current Agent run can be read; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused. The direct headless backend does not apply this run limit."
+                    with: "Available only during agent mode runs. In app-backed Agent Mode, only legacy reads of chats created by the current Agent run are allowed; chats from an earlier run (for example before Stop, Clear chat, or an app relaunch) are refused. The direct headless backend does not apply this run limit."
                 ),
                 inputSchema: definition.inputSchema,
                 annotations: definition.annotations,

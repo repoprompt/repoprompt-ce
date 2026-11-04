@@ -38,6 +38,12 @@ final class AppDomainRuntimeComposition: Sendable {
         "agentModeAutoEditEnabled"
     ]
 
+    @MainActor private static let backgroundOracleInvocations = OracleBackgroundInvocationRegistry()
+
+    @MainActor var oracleBackgroundInvocations: OracleBackgroundInvocationRegistry {
+        Self.backgroundOracleInvocations
+    }
+
     let oracleConversationStore: DomainOracleConversationStore
     let oracleGroupRuntime: OracleGroupRuntime
     private let defaultRuntime: MCPDomainRuntime
