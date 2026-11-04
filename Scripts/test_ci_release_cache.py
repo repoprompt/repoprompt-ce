@@ -22,7 +22,7 @@ class ReleaseCacheTests(unittest.TestCase):
 
     def test_cache_key_failures_are_not_masked_and_signed_releases_stay_clean(self):
         workflows = Path(__file__).resolve().parent.parent / '.github/workflows'
-        for name in ('ci.yml', 'ci-integration-products.yml'):
+        for name in ('ci.yml', 'release-candidate.yml'):
             workflow = (workflows / name).read_text()
             self.assertNotIn('echo "key=$(', workflow)
             self.assertIn('[[ "$key" =~ ^swiftpm-release-v2-[0-9a-f]{64}$ ]]', workflow)
@@ -32,6 +32,22 @@ class ReleaseCacheTests(unittest.TestCase):
             self.assertNotIn('REPOPROMPT_CLEAN_PUBLIC_SWIFTPM_BUILDS: "0"', workflow)
         validate = (workflows / 'release.yml').read_text().split('\n  validate-ref:\n', 1)[1].split('\n  stage:\n', 1)[0]
         self.assertIn('runs-on: ubuntu-latest', validate)
+
+    def test_manual_main_only_seed_follows_fresh_package_and_smoke(self):
+        workflow = (Path(__file__).resolve().parent.parent / '.github/workflows/release-candidate.yml').read_text()
+        save = workflow.split('      - name: Seed universal release build cache', 1)[1].split('\n      - name:', 1)[0]
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", save)
+        self.assertNotIn('always()', save)
+        self.assertNotIn('restore-keys:', workflow)
+        self.assertIn('path: .build/public-release-swiftpm', save)
+        self.assertLess(workflow.index('run: ./conductor release artifact'),
+                        workflow.index('name: Smoke exact release-mode packaged MCP helper'))
+        self.assertLess(workflow.index('name: Smoke exact release-mode packaged MCP helper'),
+                        workflow.index('name: Seed universal release build cache'))
+        self.assertLess(workflow.index('name: Transfer the same candidate'),
+                        workflow.index('name: Seed universal release build cache'))
+        self.assertNotIn('secrets: inherit', workflow)
+        self.assertNotIn('contents: write', workflow)
 
     def test_only_compatible_intermediates_share_a_key(self):
         with tempfile.TemporaryDirectory() as directory:
