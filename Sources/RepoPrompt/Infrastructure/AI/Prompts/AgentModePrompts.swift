@@ -421,6 +421,19 @@ enum AgentModePrompts {
             }
         }
 
+        /// Shell/command execution guidance shared by every agent-mode prompt (#401).
+        ///
+        /// Providers that expose `exec_command`/`write_stdin`-style primitives can burn thousands
+        /// of low-value calls re-polling a long command. RepoPrompt cannot change those provider
+        /// tools, so the prompt steers the model toward a single bounded wait instead.
+        static let longRunningCommandGuidance = """
+
+        **Long-running Commands**
+        - Run a long command once with a bounded timeout (or in the background with one follow-up wait); do not loop on exec/status/poll calls to watch it.
+        - Never re-read output you already have; request only new output (tail, offsets) when a follow-up check is unavoidable.
+        - Prefer structured waits (`job wait`, `wait` operations, `--wait` flags) over repeated status checks; a sleep-backed single retry beats a polling loop.
+        """
+
         /// Trailing tool-list items: set_status plus provider-specific guidance blocks.
         static func toolListSuffix(
             agentKind: AgentProviderKind?,
@@ -453,7 +466,7 @@ enum AgentModePrompts {
             - Keep updates direct and factual: usually 1-2 sentences, no filler.
             """
 
-            return "\(setStatus)\(codexToolPriority)\(progressUpdates)"
+            return "\(setStatus)\(codexToolPriority)\(progressUpdates)\(longRunningCommandGuidance)"
         }
     }
 }

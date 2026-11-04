@@ -631,6 +631,65 @@ architecture sets, executable/helper hashes, signing identifiers and teams,
 designated requirements, certificate fingerprints when present, and the
 canonical entitlement hash without recording secrets, host paths, or timestamps.
 
+Packaging, staged signing, archive validation, and promotion inspect every Mach-O
+slice of the app and `repoprompt-mcp` with
+`Scripts/validate_macos_runtime_symbols.py`. This rejects known Swift overlay
+imports that lack SDK availability annotations but are missing from supported
+macOS runtimes, including `os.Logger.isEnabled(type:)` and `os.Logger.disabled`
+(#1603). Use `OSLog.isEnabled(type:)` with a `Logger` created from the same handle
+instead. This bounded denylist is not a complete macOS 14 compatibility audit;
+launch validation on the oldest supported OS remains necessary.
+
+### Older macOS artifact compatibility
+
+The required integration products now transfer the **same ZIP and manifest**
+built on macOS 26 to macOS 15 ARM64 and Intel runners. Both run the existing
+isolated app/MCP roundtrip. Stable promotion and Tip publication also wait for
+these checks against their signed, checksum-bound artifacts; transition PKGs
+are expanded and checked without installation. Nothing is rebuilt or re-signed
+on the compatibility runners. The runtime and native architecture must match
+the selected matrix cell, and failures retain a JSON result plus smoke logs.
+Automated packaged smoke disables telemetry for the test process so CI activity
+does not contribute production Sentry events.
+
+This detects unknown missing-symbol and startup regressions beyond the bounded
+symbol denylist. It does **not** establish macOS 14 compatibility. GitHub retired
+its hosted macOS 14 images on [November 2, 2026](https://github.com/actions/runner-images/issues/13518),
+and the project currently has no macOS 14 CI runner. The advertised deployment
+minimum remains 14.0; changing it is a separate product decision.
+
+For a macOS 14 check, use a disposable Sonoma VM on compatible Apple silicon.
+[Tart's quick start](https://tart.run/quick-start/) lists prebuilt Sonoma images;
+for example, these commands create and start a local VM (a substantial download):
+
+```bash
+brew install cirruslabs/cli/tart
+tart clone ghcr.io/cirruslabs/macos-sonoma-base:latest rpce-sonoma
+tart run rpce-sonoma
+```
+
+Verify the guest with `sw_vers`; retain its exact OS/build and image digest for
+repeatability, and keep it on macOS 14. A Parallels VM installed from a compatible
+Sonoma IPSW is another option. In the guest, install Python 3.11+ and compatible
+Xcode command-line tools, check out the exact validation-tooling commit, and copy
+the already-built release ZIP (or transition PKG), `SHA256SUMS`, and artifact
+manifest into one directory. Then run:
+
+```bash
+python3 Scripts/smoke_macos_compatibility.py /path/to/release-artifacts \
+  --expected-major 14 --expected-arch arm64 --report /tmp/rpce-sonoma/result.json
+```
+
+Use `--expected-arch x86_64` on a native Intel macOS 14 runner. The helper refuses
+a newer host in place of the requested runtime. It verifies the transferred
+enclosure and manifest checksums, checks signatures and linked symbols, then
+launches the actual app until its embedded MCP helper completes the roundtrip.
+The result records the artifact digest and observed runtime. Run this only in a
+disposable test environment: it launches the app with isolated state and cleans
+up its owned process session. A successful newer-OS check must never be reported
+as macOS 14 evidence. A future macOS 14 CI runner should run this same helper;
+the current PR/merge gate has no dependency on unprovisioned self-hosted hardware.
+
 The direct fallback commands are `make release-preflight` and
 `make release-artifact`. The GitHub **Release Candidate** workflow runs the same
 path on `main` and on manual dispatch, then uploads the archive as a workflow
@@ -900,7 +959,12 @@ persisted checkout credentials. After remote-tag attestation it scrubs GitHub
 tokens before invoking SwiftPM-controlled commands. It resolves dependencies without lockfile
 drift, builds the approved source, verifies the trusted Sparkle payload, stages
 a universal ad-hoc app bundle plus its deterministic artifact manifest, and
-uploads that payload as a short-lived workflow artifact. The environment-scoped signing job starts on a fresh runner,
+uploads that payload as a short-lived workflow artifact. The staging job runs
+the phases of `release.sh stage-publish` as separate workflow steps (tag
+verification, dependency resolution and preflight, the universal build,
+packaged-app validation, and archiving), so `gh run watch` shows which phase is
+running; only the tag-verification step receives a GitHub token. The universal
+build step is still the long one. The environment-scoped signing job starts on a fresh runner,
 downloads and verifies the staged artifact, then imports the Developer ID
 certificate and notarization key. Before secrets are imported, trusted tooling
 extracts the untrusted staging archive with path-confinement checks and verifies
@@ -1054,6 +1118,56 @@ The promotion gate confirms:
   resources.
 - The reviewed external artifact manifest regenerates exactly from both ZIP and
   DMG app contents and is mirrored unchanged to the public updater release.
+
+## Post-promotion operator checklist
+
+The promotion workflow verifies the assets it published, but some release state
+is outside its control. After **Promote Release** succeeds, and before
+announcing the release, confirm each item for the promoted tag (`TAG=v<version>`):
+
+- [ ] **Both releases are published, latest, and immutable.**
+
+  ```bash
+  for repo in repoprompt/repoprompt-ce repoprompt/repoprompt-ce-updates; do
+    gh release view "$TAG" --repo "$repo" \
+      --json tagName,isDraft,isPrerelease,isImmutable,assets \
+      --jq '{tag: .tagName, draft: .isDraft, prerelease: .isPrerelease, immutable: .isImmutable, assets: [.assets[].name]}'
+    gh api "repos/$repo/releases/latest" --jq .tag_name
+  done
+  ```
+
+  Expect `draft: false`, `prerelease: false`, the reviewed asset list, and
+  `$TAG` as the latest release in both repositories. Expect `immutable: true`.
+  If it is `false`, GitHub **Release immutability** is not enabled for that
+  repository (see [Maintainer setup](#maintainer-setup)). Record that in the
+  release notes or tracking issue and fix the repository setting before the
+  next release. Do not delete or re-upload published assets to work around it.
+- [ ] **The public appcast reports the new version.**
+
+  ```bash
+  curl -fsSL https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml |
+    grep -E 'sparkle:(shortVersionString|version)>|<enclosure'
+  ```
+
+  `sparkle:shortVersionString` must equal `MARKETING_VERSION`,
+  `sparkle:version` must equal `BUILD_NUMBER`, and the enclosure URL must
+  point at `releases/download/$TAG/`, not `latest/download`.
+- [ ] **The Homebrew tap is updated.** Update the
+  [`repoprompt/homebrew-repoprompt-ce`](https://github.com/repoprompt/homebrew-repoprompt-ce)
+  cask version and ZIP checksum if needed, then run the
+  [Post-promote Homebrew tap checks](#post-promote-homebrew-tap-checks).
+- [ ] **Any temporary ruleset or branch-protection bypass is restored.** If a
+  bypass actor or relaxed rule was added for a specially permitted release (for
+  example, to merge release metadata into protected `main`), remove it and
+  compare the result with the backup taken before the change:
+
+  ```bash
+  gh api repos/repoprompt/repoprompt-ce/rulesets --jq '.[] | {id, name, enforcement}'
+  gh api repos/repoprompt/repoprompt-ce/rulesets/<id> --jq '{name, enforcement, bypass_actors}'
+  ```
+
+  `enforcement` must be `active` and `bypass_actors` must match the
+  pre-release backup.
 
 ## Post-promote Homebrew tap checks
 

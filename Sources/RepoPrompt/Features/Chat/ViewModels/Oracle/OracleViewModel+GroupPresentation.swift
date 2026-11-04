@@ -15,6 +15,14 @@ struct OracleMemberPresentation: Equatable {
     var errorMessage: String?
     var providerID: String?
     var capturedModelName: String?
+    var elapsedSeconds: Double?
+    var assistantReplyID: UUID?
+
+    func completedElapsedSeconds(for message: AIChatMessage) -> Double? {
+        guard status == .completed, !message.isUser, message.isFinalized,
+              assistantReplyID == message.id else { return nil }
+        return elapsedSeconds
+    }
 
     static let unknown = Self(status: .unknown)
 }
@@ -71,7 +79,9 @@ struct OracleGroupPresentation: Equatable {
                     status: status,
                     errorMessage: result.error.map { "[\($0.code)] \($0.message)" },
                     providerID: result.executionProfile?.providerID ?? result.providerID ?? member.model.providerID,
-                    capturedModelName: result.capturedModelName
+                    capturedModelName: result.capturedModelName,
+                    elapsedSeconds: result.elapsedSeconds,
+                    assistantReplyID: result.assistantReplyID
                 )
             }
         }

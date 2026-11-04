@@ -3280,7 +3280,9 @@ actor WorkspaceFileContextStore {
         WorkspaceCodemapRootEpoch: [UUID: CheckedContinuation<Void, Never>]
     ] = [:]
     private var codemapGraphIndexBuildReschedulePendingRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private let codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy
     private var codemapSuspendedRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var codemapPauseRestoredRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
     private var codemapResumeTransitionIDsByRootEpoch: [WorkspaceCodemapRootEpoch: UUID] = [:]
     private var codemapGraphAccountingByRootEpoch: [
         WorkspaceCodemapRootEpoch: WorkspaceCodemapGraphIncrementalAccounting
@@ -3409,6 +3411,7 @@ actor WorkspaceFileContextStore {
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = true,
             codeMapsGloballyDisabled: Bool = false,
+            codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy = WorkspaceCodemapRootPausePolicy(),
             codemapGraphIndexBuildLaunchPolicyForTesting: CodemapGraphIndexBuildLaunchPolicyForTesting = .enabled,
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
@@ -3447,6 +3450,7 @@ actor WorkspaceFileContextStore {
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
+            self.codemapRootPausePolicy = codemapRootPausePolicy
             self.codemapGraphIndexBuildLaunchPolicyForTesting = codemapGraphIndexBuildLaunchPolicyForTesting
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
@@ -3488,6 +3492,7 @@ actor WorkspaceFileContextStore {
             codemapGraphIndexBuildRetryPolicy: CodemapGraphIndexBuildRetryPolicy = .production,
             nonGitCodeMapsEnabled: Bool = false,
             codeMapsGloballyDisabled: Bool = false,
+            codemapRootPausePolicy: WorkspaceCodemapRootPausePolicy = WorkspaceCodemapRootPausePolicy(),
             selectionGraphFactory: WorkspaceCodemapSelectionGraphFactory = .production,
             selectionGraphQueryBudgetPolicy: WorkspaceCodemapAutomaticSelectionBudgetPolicy = .initial,
             automaticSelectionAccountingMaximum: Int = .max,
@@ -3524,6 +3529,7 @@ actor WorkspaceFileContextStore {
             self.codemapGraphIndexBuildRetryPolicy = codemapGraphIndexBuildRetryPolicy
             self.nonGitCodeMapsEnabled = nonGitCodeMapsEnabled
             self.codeMapsGloballyDisabled = codeMapsGloballyDisabled
+            self.codemapRootPausePolicy = codemapRootPausePolicy
             self.selectionGraphFactory = selectionGraphFactory
             self.selectionGraphQueryBudgetPolicy = selectionGraphQueryBudgetPolicy
             precondition(automaticSelectionAccountingMaximum >= 0)
@@ -11660,9 +11666,11 @@ actor WorkspaceFileContextStore {
         guard let state = rootStatesByID[rootID] else { return .rootUnavailable }
         let rootEpoch = WorkspaceCodemapRootEpoch(rootID: rootID, rootLifetimeID: state.lifetimeID)
 
+        restoreCodemapPausePolicyIfNeeded(rootEpoch: rootEpoch)
         if suspended {
             let cancelledResume = codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch) != nil
             let inserted = codemapSuspendedRootEpochs.insert(rootEpoch).inserted
+            codemapRootPausePolicy.setPaused(true, rootPath: state.root.standardizedFullPath)
             guard inserted || cancelledResume else { return .unchanged }
             codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
             publishCodemapRootStatusesIfChanged()
@@ -11694,6 +11702,7 @@ actor WorkspaceFileContextStore {
               codemapSuspendedRootEpochs.remove(rootEpoch) != nil
         else { return .unchanged }
         codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
+        codemapRootPausePolicy.setPaused(false, rootPath: state.root.standardizedFullPath)
         // The suspension detached this root's authority recovery, but not the requirement it ran
         // for. Restart it before scheduling anything: the schedule below is a no-op while that
         // requirement is registered, and the recovery reschedules the build itself once its scan
@@ -11816,8 +11825,19 @@ actor WorkspaceFileContextStore {
         publishCodemapRootStatusesIfChanged()
     }
 
+    private func restoreCodemapPausePolicyIfNeeded(rootEpoch: WorkspaceCodemapRootEpoch) {
+        guard let state = rootStatesByID[rootEpoch.rootID],
+              state.lifetimeID == rootEpoch.rootLifetimeID,
+              codemapPauseRestoredRootEpochs.insert(rootEpoch).inserted
+        else { return }
+        if codemapRootPausePolicy.isPaused(rootPath: state.root.standardizedFullPath) {
+            codemapSuspendedRootEpochs.insert(rootEpoch)
+        }
+    }
+
     private func codemapGenerationIsSuspended(rootEpoch: WorkspaceCodemapRootEpoch) -> Bool {
-        codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch) ||
+        restoreCodemapPausePolicyIfNeeded(rootEpoch: rootEpoch)
+        return codeMapsGloballyDisabled || codemapSuspendedRootEpochs.contains(rootEpoch) ||
             repositoryExcludeObservations[rootEpoch.rootID]?.isBlocked == true
     }
 
@@ -11881,6 +11901,8 @@ actor WorkspaceFileContextStore {
         let launchPhase = codemapGraphIndexBuildLaunchesByRootEpoch[rootEpoch]?.phase
         let executionState = codemapGraphIndexExecutionStatesByRootEpoch[rootEpoch]
         let unavailableReason: WorkspaceCodemapRootStatusUnavailableReason? = if codemapCatalogRecoveryRequirementsByRootEpoch[rootEpoch]?.retryExhausted == true {
+            .retryExhausted
+        } else if executionState == .retryExhausted {
             .retryExhausted
         } else if executionState == .exhausted {
             .workerRecoveryExhausted
@@ -12669,6 +12691,7 @@ actor WorkspaceFileContextStore {
             }
             codemapGraphIndexBuildReschedulePendingRootEpochs.remove(rootEpoch)
             codemapSuspendedRootEpochs.remove(rootEpoch)
+            codemapPauseRestoredRootEpochs.remove(rootEpoch)
             codemapResumeTransitionIDsByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphAccountingByRootEpoch.removeValue(forKey: rootEpoch)
             codemapGraphIndexExecutionStatesByRootEpoch.removeValue(forKey: rootEpoch)
@@ -15385,11 +15408,23 @@ actor WorkspaceFileContextStore {
                 rootID: file.rootID,
                 rootLifetimeID: state.lifetimeID
             )
-            seedsByRootEpoch[rootEpoch, default: []].append(fileID)
-            seedPathsByFileID[fileID] = WorkspaceCodemapLogicalPresentationPath(
+            let seedPath = WorkspaceCodemapLogicalPresentationPath(
                 rootDisplayName: rootLabels[file.rootID] ?? state.root.name,
                 standardizedRelativePath: file.standardizedRelativePath
             )?.displayPath
+            let fileExtension = (file.name as NSString).pathExtension
+            guard SyntaxManager.supportsCodeMap(fileExtension: fileExtension),
+                  SyntaxManager.shared.language(forFileExtension: fileExtension) != nil
+            else {
+                requestIssues.append(.init(
+                    code: "unsupported_file_type", phase: "seed_resolution", path: seedPath,
+                    retryable: false, retryAfterMilliseconds: nil, attempted: nil, limit: nil,
+                    message: "This file type does not support Code Maps."
+                ))
+                continue
+            }
+            seedsByRootEpoch[rootEpoch, default: []].append(fileID)
+            seedPathsByFileID[fileID] = seedPath
         }
 
         var remainingNodes = budget.maximumNodeCount
@@ -15407,6 +15442,23 @@ actor WorkspaceFileContextStore {
                 let rhs = seedPathsByFileID[$1] ?? $1.uuidString
                 if lhs != rhs { return lhs.utf8.lexicographicallyPrecedes(rhs.utf8) }
                 return $0.uuidString < $1.uuidString
+            }
+            if codemapGenerationIsSuspended(rootEpoch: rootEpoch) {
+                roots.append(unavailableCodemapStructureRoot(
+                    rootEpoch: rootEpoch, rootName: rootName, seedFileIDs: rootSeedIDs,
+                    seedPathsByFileID: seedPathsByFileID,
+                    code: codeMapsGloballyDisabled ? "codemaps_disabled" : (
+                        codemapSuspendedRootEpochs.contains(rootEpoch) ? "root_paused" : "repository_excluded"
+                    ),
+                    message: codeMapsGloballyDisabled
+                        ? "Codemap generation is disabled globally."
+                        : (
+                            codemapSuspendedRootEpochs.contains(rootEpoch)
+                                ? "Code Map generation is paused for this root. Resume it to index code structure."
+                                : "This root is excluded by repository policy."
+                        )
+                ))
+                continue
             }
             let raw: WorkspaceCodemapGraphStructureRootResult
             if remainingNodes <= 0 || remainingBytes == 0 {

@@ -606,6 +606,8 @@ extension AgentModeViewModel {
         archivedSessionsExpanded: Bool,
         showComposeTabsWithoutAgentSessions: Bool
     ) -> SidebarListProjection {
+        let isOverseersTab = sidebarSnapshot.sidebarTab == .overseers
+        let liveOverseerRelations = isOverseersTab ? sidebarLiveOverseerRelations() : []
         let key = SidebarListProjectionCacheKey(
             workspaceID: workspaceID,
             sidebarSnapshot: sidebarSnapshot,
@@ -614,7 +616,9 @@ extension AgentModeViewModel {
             stashedTabSignatures: makeSessionSidebarStashedTabSignatures(for: stashedTabs),
             archivedSessionsExpanded: archivedSessionsExpanded,
             showComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions,
-            restorePresentation: sidebarRestorePresentationKey
+            restorePresentation: sidebarRestorePresentationKey,
+            liveOverseerRelations: liveOverseerRelations,
+            liveActiveTabIDs: sidebarSnapshot.sidebarTab == .active ? sidebarLiveActiveTabIDs() : []
         )
         if let cached = sidebarListProjectionCache, cached.key == key {
             return cached.projection
@@ -631,7 +635,17 @@ extension AgentModeViewModel {
             workspaceID: workspaceID,
             includeComposeTabsWithoutAgentSessions: showComposeTabsWithoutAgentSessions
         )
-        let filteredSessions = filteredSidebarSessions(
+        // The Overseers tab has its own one-level layout (sessions may appear under several
+        // overseers); every other tab keeps the ordinary pipeline below untouched.
+        let overseerPresentation = isOverseersTab
+            ? sidebarOverseerPresentation(
+                canonicalRows,
+                liveRelations: liveOverseerRelations,
+                searchText: sidebarSnapshot.searchText,
+                currentTabID: currentTabID
+            )
+            : nil
+        let filteredSessions = overseerPresentation?.orderedUniqueSessions ?? filteredSidebarSessions(
             canonicalRows,
             inputTabCount: composeTabs.count,
             currentTabID: currentTabID,
@@ -651,8 +665,9 @@ extension AgentModeViewModel {
             visibleSessionCount: sidebarSnapshot.visibleSessionCount
         )
         // Owner pending exposes no archived rows, headings or navigation targets either (§5.3).
+        // The Overseers tab shows relationships only; archived sessions stay in the other tabs.
         let archivedSessionTabs = archivedSessionTabsForSidebarSnapshot(
-            key.restorePresentation.isOwnerPending ? [] : stashedTabs,
+            key.restorePresentation.isOwnerPending || isOverseersTab ? [] : stashedTabs,
             searchText: sidebarSnapshot.searchText,
             prepareSortedRows: archivedSessionsExpanded
         )
@@ -662,7 +677,7 @@ extension AgentModeViewModel {
             : Array(archivedSessionTabs.sortedTabs.prefix(sidebarSnapshot.archivedVisibleSessionCount))
         // Selection (shift-range, Cmd-A, bulk targets) follows the displayed order: group sections
         // first, and rows hidden inside a collapsed group are not selectable.
-        let displayedActiveRows = Self.sidebarDisplayOrder(
+        let displayedActiveRows = isOverseersTab ? pagedSessions : Self.sidebarDisplayOrder(
             pagedSessions,
             collapsedGroups: sidebarSnapshot.collapsedSidebarGroups,
             searchText: sidebarSnapshot.searchText
@@ -683,12 +698,13 @@ extension AgentModeViewModel {
             pagedArchivedSessionTabsForRows: pagedArchivedTabs,
             archivedDateInfoByStashedTabID: archivedSessionTabs.dateInfoByStashedTabID,
             archivedSessionIDByStashedTabID: archivedSessionTabs.sessionIDByStashedTabID,
-            defaultCollapseSeedKeys: defaultCollapsedSidebarThreadKeys(
+            defaultCollapseSeedKeys: isOverseersTab ? [] : defaultCollapsedSidebarThreadKeys(
                 in: canonicalRows,
                 searchText: sidebarSnapshot.searchText
             ),
             existingSelectionIdentities: existingSelectionIdentities,
-            renderedSelectionOrder: renderedSelectionOrder
+            renderedSelectionOrder: renderedSelectionOrder,
+            overseerRenderedRows: overseerPresentation?.renderedRows
         )
         sidebarListProjectionCache = (key, projection)
         #if DEBUG
@@ -761,7 +777,7 @@ extension AgentModeViewModel {
     }
 
     private func filteredSidebarSessions(
-        _ sortedSessions: [SidebarSession],
+        _ canonicalSessions: [SidebarSession],
         inputTabCount: Int,
         currentTabID: UUID?,
         searchText: String,
@@ -770,6 +786,16 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
+        if ui.sessionSidebar.snapshot.sidebarTab == .overseers {
+            return sidebarOverseerPresentation(
+                canonicalSessions,
+                liveRelations: sidebarLiveOverseerRelations(),
+                searchText: searchText,
+                currentTabID: currentTabID
+            ).orderedUniqueSessions
+        }
+        // The All tab passes rows through untouched; other tabs narrow them before search.
+        let sortedSessions = sidebarRows(canonicalSessions, in: ui.sessionSidebar.snapshot.sidebarTab)
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let effectiveSearchText = searchText
         let searchTrimmed = effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -843,6 +869,134 @@ extension AgentModeViewModel {
         return result
     }
 
+    func setSidebarTab(_ tab: AgentSidebarTab) {
+        ui.sessionSidebar.setSidebarTab(tab)
+    }
+
+    /// Folds or unfolds one overseer's group in the Overseers tab (its own key namespace).
+    func toggleSidebarOverseerGroup(_ overseerTabID: UUID) {
+        ui.sessionSidebar.toggleThreadCollapse(.overseerGroup(overseerTabID))
+    }
+
+    /// Live oversight pairs in this window, flattened to session IDs. O(links).
+    func sidebarLiveOverseerRelations() -> Set<AgentSidebarOverseerRelation> {
+        var relations = Set<AgentSidebarOverseerRelation>()
+        for props in monitorPillPropsByEndpoint.values {
+            guard let localSessionID = props.endpoint?.sessionID ?? props.sessionID else { continue }
+            for row in props.outbound where row.targetSessionID != localSessionID {
+                relations.insert(.init(overseerSessionID: localSessionID, overseenSessionID: row.targetSessionID))
+            }
+            for row in props.inbound where row.observerSessionID != localSessionID {
+                relations.insert(.init(overseerSessionID: row.observerSessionID, overseenSessionID: localSessionID))
+            }
+        }
+        return relations
+    }
+
+    /// Live links plus lane provenance (a lane's creator oversees it), deduplicated.
+    func sidebarOverseerRelations(
+        for rows: [SidebarSession],
+        liveRelations: Set<AgentSidebarOverseerRelation>
+    ) -> Set<AgentSidebarOverseerRelation> {
+        var relations = liveRelations
+        for row in rows {
+            guard let sessionID = row.sessionID, let creator = row.createdByOverseerSessionID, creator != sessionID else { continue }
+            relations.insert(.init(overseerSessionID: creator, overseenSessionID: sessionID))
+        }
+        return relations
+    }
+
+    /// The Overseers tab: overseer groups one level deep, then "Overseen elsewhere".
+    func sidebarOverseerPresentation(
+        _ canonicalRows: [SidebarSession],
+        liveRelations: Set<AgentSidebarOverseerRelation>,
+        searchText: String,
+        currentTabID: UUID?
+    ) -> AgentSidebarOverseerPresentation {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var matchesSearch: ((SidebarSession) -> Bool)?
+        if !trimmed.isEmpty {
+            let query = AgentSessionSearchQuery.parse(trimmed)
+            let fields = sidebarSearchFields(for: canonicalRows)
+            let matched = Set(zip(canonicalRows, fields).compactMap { row, fields in
+                AgentSessionSearchMatcher.matches(query: query, fields: fields) ? row.tabID : nil
+            })
+            matchesSearch = { matched.contains($0.tabID) }
+        } else {
+            sidebarSearchFieldsMemo.removeAll(keepingCapacity: true)
+        }
+        let snapshot = ui.sessionSidebar.snapshot
+        return AgentSidebarOverseerSectionBuilder.build(
+            rows: canonicalRows,
+            relations: sidebarOverseerRelations(for: canonicalRows, liveRelations: liveRelations),
+            matchesSearch: matchesSearch,
+            collapsedKeys: snapshot.collapsedThreadKeys,
+            currentTabID: currentTabID,
+            attentionTabIDs: Set(snapshot.attentionRunStateByTabID.keys)
+        )
+    }
+
+    /// Narrows rows to one filter tab, keeping each match's parent chain for context (as search
+    /// does). `.all` returns `rows` unchanged.
+    func sidebarRows(_ rows: [SidebarSession], in tab: AgentSidebarTab) -> [SidebarSession] {
+        guard tab != .all else { return rows }
+        let attention = Set(ui.sessionSidebar.snapshot.attentionRunStateByTabID.keys)
+        let overseers: Set<UUID> = tab == .overseers
+            ? Set(
+                sidebarOverseerRelations(for: rows, liveRelations: sidebarLiveOverseerRelations())
+                    .flatMap { [$0.overseerSessionID, $0.overseenSessionID] }
+            )
+            : []
+        return Self.sidebarRows(
+            rows,
+            in: tab,
+            attentionTabIDs: attention,
+            overseerSessionIDs: overseers,
+            liveRunStateByTabID: tab == .active ? sessions.mapValues(\.runState) : [:]
+        )
+    }
+
+    /// Tabs whose live session is running or waiting. Rows are not rebuilt on run-state changes,
+    /// so the Active tab reads this (and the projection cache keys on it) instead of row snapshots.
+    func sidebarLiveActiveTabIDs() -> Set<UUID> {
+        Set(sessions.compactMap { tabID, session in session.runState.isActive ? tabID : nil })
+    }
+
+    static func sidebarRows(
+        _ rows: [SidebarSession],
+        in tab: AgentSidebarTab,
+        attentionTabIDs: Set<UUID>,
+        overseerSessionIDs: Set<UUID>,
+        liveRunStateByTabID: [UUID: AgentSessionRunState] = [:]
+    ) -> [SidebarSession] {
+        func matches(_ row: SidebarSession) -> Bool {
+            switch tab {
+            case .all: true
+            case .pinned: row.isPinned
+            case .active:
+                (liveRunStateByTabID[row.tabID] ?? row.searchFieldSource.runState)?.isActive == true
+                    || attentionTabIDs.contains(row.tabID)
+            case .overseers: row.sessionID.map(overseerSessionIDs.contains) ?? false
+            }
+        }
+        guard tab != .all else { return rows }
+        let sessionByID = Dictionary(
+            rows.compactMap { row in row.sessionID.map { ($0, row) } },
+            uniquingKeysWith: { _, new in new }
+        )
+        var kept = Set<UUID>()
+        for row in rows where matches(row) {
+            kept.insert(row.id)
+            var cursor = row.parentSessionID
+            var visited: Set<UUID> = []
+            while let parentID = cursor, visited.insert(parentID).inserted, let parent = sessionByID[parentID] {
+                kept.insert(parent.id)
+                cursor = parent.parentSessionID
+            }
+        }
+        return rows.filter { kept.contains($0.id) }
+    }
+
     /// Stored collapsed keys plus currently eligible default-collapse keys not yet handled (§5.6). The
     /// first released projection is therefore already collapsed; the view's later seeding task only
     /// persists the handled set and cannot move rows, paging or sections.
@@ -866,7 +1020,9 @@ extension AgentModeViewModel {
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
+        // A filter tab, like search, shows matches in context: collapsed parents must not hide them.
         let isSearching = !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || ui.sessionSidebar.snapshot.sidebarTab != .all
         let source = diagnosticSource.isEmpty ? "unknown" : diagnosticSource
         let collapsedThreadKeys = effectiveCollapsedSidebarThreadKeys(in: rows, searchText: searchText)
         guard !rows.isEmpty else {
@@ -1092,6 +1248,7 @@ extension AgentModeViewModel {
         currentTabID: UUID?,
         visibleSessionCount: Int? = nil
     ) -> Int {
+        guard ui.sessionSidebar.snapshot.sidebarTab != .overseers else { return filteredSessions.count }
         #if DEBUG
             let startMS = perfRecorder.timestampMSIfEnabled()
         #endif
@@ -1180,6 +1337,8 @@ extension AgentModeViewModel {
         currentTabID: UUID?,
         visibleSessionCount: Int? = nil
     ) -> [SidebarSession] {
+        // The Overseers tab is small and grouped; paging would split children from their overseer.
+        guard ui.sessionSidebar.snapshot.sidebarTab != .overseers else { return filteredSessions }
         let activeIndex = currentTabID.flatMap { tabID in filteredSessions.firstIndex { $0.tabID == tabID } }
         return Self.sidebarPageRows(
             containingUnpinned: max(0, visibleSessionCount ?? sessionSidebarVisibleSessionCount),
@@ -1226,14 +1385,13 @@ extension AgentModeViewModel {
         searchText: String? = nil,
         visibleSessionCount: Int? = nil
     ) -> UUID? {
-        let orderedTabIDs = Self.sidebarDisplayOrder(
+        let orderedTabIDs = sidebarDisplayOrder(
             pagedSidebarSessions(
                 for: tabs,
                 currentTabID: currentTabID,
                 searchText: searchText,
                 visibleSessionCount: visibleSessionCount
             ),
-            collapsedGroups: ui.sessionSidebar.snapshot.collapsedSidebarGroups,
             searchText: searchText ?? sessionSidebarSearchText
         )
         .map(\.tabID)
@@ -1257,18 +1415,28 @@ extension AgentModeViewModel {
         visibleSessionCount: Int? = nil
     ) -> UUID? {
         guard index >= 0 else { return nil }
-        let pagedSessions = Self.sidebarDisplayOrder(
+        let pagedSessions = sidebarDisplayOrder(
             pagedSidebarSessions(
                 for: tabs,
                 currentTabID: currentTabID,
                 searchText: searchText,
                 visibleSessionCount: visibleSessionCount
             ),
-            collapsedGroups: ui.sessionSidebar.snapshot.collapsedSidebarGroups,
             searchText: searchText ?? sessionSidebarSearchText
         )
         guard index < pagedSessions.count else { return nil }
         return pagedSessions[index].tabID
+    }
+
+    /// Displayed order for the selected tab. The Overseers tab's rows are already in first-occurrence
+    /// display order; every other tab renders through the group/date sections.
+    func sidebarDisplayOrder(_ rows: [SidebarSession], searchText: String) -> [SidebarSession] {
+        guard ui.sessionSidebar.snapshot.sidebarTab != .overseers else { return rows }
+        return Self.sidebarDisplayOrder(
+            rows,
+            collapsedGroups: ui.sessionSidebar.snapshot.collapsedSidebarGroups,
+            searchText: searchText
+        )
     }
 
     /// Active rows in displayed order: sidebar group sections first (rows of a collapsed group

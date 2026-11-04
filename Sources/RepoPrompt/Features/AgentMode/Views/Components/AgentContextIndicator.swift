@@ -55,11 +55,13 @@ struct AgentContextIndicator: View {
         return .secondary
     }
 
+    static let unknownWindowText = "Context window unknown until the provider reports it"
+
     private var tooltipText: String {
         if awaitingPostCompactionUsage { return "Awaiting post-compaction usage" }
         guard let used = contextUsedPercent else {
             if let usedTokens {
-                return "Used tokens: \(Self.formatTokens(usedTokens))"
+                return "Used tokens: \(Self.formatTokens(usedTokens))\n\(Self.unknownWindowText)"
             }
             return "Context usage unavailable"
         }

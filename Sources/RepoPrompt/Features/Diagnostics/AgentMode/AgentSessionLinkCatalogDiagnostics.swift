@@ -66,10 +66,13 @@ enum AgentSessionLinkCatalogDiagnostics {
         }
     }
 
-    private static let logger = Logger(
+    // Logger.isEnabled(type:) lacks SDK availability annotations but is absent
+    // from older supported macOS runtimes. Query the underlying OSLog instead.
+    private static let logHandle = OSLog(
         subsystem: Bundle.main.bundleIdentifier ?? "RepoPrompt",
         category: "AgentSessionLinkCatalog"
     )
+    private static let logger = Logger(logHandle)
 
     typealias LaneCreationAddFailureBranch = WorkspaceRestoreLaneAddFailureBranch
 
@@ -193,7 +196,7 @@ enum AgentSessionLinkCatalogDiagnostics {
         tabID: UUID, reserved: Bool, candidate: Bool, routingGeneration: UInt64?,
         definition: ReturnedDefinition, serverProof: Bool, ordinary: Bool, qualified: Bool
     ) -> Bool {
-        guard logger.isEnabled(type: .default) else { return false }
+        guard logHandle.isEnabled(type: .default) else { return false }
         logger.notice("event=quiet-qualification tab=\(hashedID(tabID), privacy: .public) reserved=\(reserved, privacy: .public) candidate=\(candidate, privacy: .public) routingGeneration=\(routingGeneration.map(String.init) ?? "nil", privacy: .public) definition=\(definition.rawValue, privacy: .public) serverProof=\(serverProof, privacy: .public) ordinaryOccurrence=\(ordinary, privacy: .public) qualified=\(qualified, privacy: .public)")
         return true
     }

@@ -67,12 +67,19 @@ class LoggedSuiteDeadlineTests(unittest.TestCase):
         # Foundation Process children own a process group but share their parent's session.
         source = '''
 import os, signal, sys, time
+reader, writer = os.pipe()
 pid = os.fork()
 if pid == 0:
+    os.close(reader)
     os.setpgrp()
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    print('grandchild=' + str(os.getpid()), flush=True)
+    os.write(1, ('grandchild=' + str(os.getpid()) + '\\n').encode())
+    os.write(writer, b'ready')
+    os.close(writer)
     while True: signal.pause()
+os.close(writer)
+os.read(reader, 5)
+os.close(reader)
 print('leader=' + str(os.getpid()), flush=True)
 print("Test Case '-[Fixture testHung]' started.", flush=True)
 print('partial output', end='', flush=True)
@@ -82,12 +89,15 @@ while True: signal.pause()
         self.assertEqual(status, 124)
         self.assertIn("last started: Test Case '-[Fixture testHung]' started.", transcript)
         self.assertIn('partial output', transcript)
+        pids = []
         for line in transcript.splitlines():
             if line.startswith(('leader=', 'grandchild=')):
                 pid = int(line.split('=')[1])
+                pids.append(pid)
                 # A killed orphan can briefly remain a zombie pending init's reap;
                 # it must never be executing or retain the group's output pipe.
                 self.assert_process_stopped(pid)
+        self.assertEqual(len(set(pids)), 2, 'both owned processes must be observed and checked')
 
     def test_ordinary_exit_stops_own_group_descendant_without_signaling_another_session(self):
         source = '''
