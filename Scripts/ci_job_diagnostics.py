@@ -9,7 +9,8 @@ from pathlib import Path
 import re
 
 JOBS = {
-    'candidate': 'Candidate / workflow contracts',
+    'candidate': 'Candidate declaration',
+    'workflow-contracts': 'Workflow contracts',
     'build-test-bundles': 'Build and Static Gates',
     'build-and-test': 'Root test shards',
     'secret-scan': 'Secret Scan',

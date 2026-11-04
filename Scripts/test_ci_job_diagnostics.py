@@ -26,7 +26,7 @@ class DiagnosticsTests(unittest.TestCase):
 
     def test_missing_candidate_output_does_not_hide_real_prerequisite_failure(self):
         needs = self.needs()
-        needs['candidate'] = {'result': 'failure', 'outputs': {'failure': 'test-workflow-contracts'}}
+        needs['workflow-contracts'] = {'result': 'failure', 'outputs': {'failure': 'test-workflow-contracts'}}
         needs['build-test-bundles'] = {'result': 'skipped'}
         text, passed = diagnostics.prerequisite_report(needs, 'push')
         self.assertFalse(passed)

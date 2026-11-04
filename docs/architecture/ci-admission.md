@@ -271,7 +271,9 @@ removing the queue/check requirement is not a transparent implementation rollbac
 ## Validation
 
 `make ci-workflow-selftest` runs admission, diagnostic and workflow-contract tests
-on Ubuntu before any Mac allocation. It is also part of `make check-fast` and the
+in a separate Ubuntu job before any Mac allocation. Secret Scan depends only on
+the candidate declaration: failing tooling contracts must not suppress a main
+push's introduced-commit-range scan. It is also part of `make check-fast` and the
 path-selected CI lane. `make ci-app-test-runner-selftest` additionally covers the
 runner/coverage/dependency harness: event normalization, wrong tree/run/producer,
 partial-rerun reuse and mixed-build rejection, stale-cache invalidation, required hosted identity,

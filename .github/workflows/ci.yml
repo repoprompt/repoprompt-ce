@@ -41,10 +41,6 @@ jobs:
           python3 Scripts/ci_admission.py prepare --event-path "$GITHUB_EVENT_PATH" \
             --event-name "$GITHUB_EVENT_NAME" --sha "$GITHUB_SHA" --ref "$GITHUB_REF" \
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --output "$GITHUB_OUTPUT"
-      - name: Test workflow and admission contracts before allocating macOS
-        id: test-workflow-and-admission-contracts-before-allocating-macos
-        run: make ci-workflow-selftest
-
       - name: Broadcast failed steps and recovery
         id: diagnostics
         if: always()
@@ -58,6 +54,36 @@ jobs:
             echo 'Checkout unavailable: inspect checkout/runner failure; no evidence accepted.' >> "$GITHUB_STEP_SUMMARY"
           fi
 
+  workflow-contracts:
+    name: Workflow Contracts
+    needs: candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      failure: ${{ steps.diagnostics.outputs.failure }}
+    steps:
+      - name: Check out repository
+        id: check-out-repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Test workflow and admission contracts before allocating macOS
+        id: test-workflow-contracts
+        run: make ci-workflow-selftest
+      - name: Broadcast failed steps and recovery
+        id: diagnostics
+        if: always()
+        env:
+          STEPS_CONTEXT: ${{ toJSON(steps) }}
+        run: |
+          if [[ -f Scripts/ci_job_diagnostics.py ]]; then
+            python3 Scripts/ci_job_diagnostics.py job
+          else
+            echo '::error::Workflow-contract checkout unavailable; inspect the job log.'
+            echo 'Workflow-contract checkout unavailable; inspect the job log.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   integration-products:
     # Sentry/privacy stays blocking, after root gates reject bad candidates.
     # Universal packaging/older-runtime smoke gate publication in release flows;
@@ -68,7 +94,7 @@ jobs:
       admission: ${{ needs.candidate.outputs.context }}
 
   build-test-bundles:
-    needs: candidate
+    needs: [candidate, workflow-contracts]
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Build and Static Gates
@@ -442,7 +468,7 @@ jobs:
   style:
     # Protect main requires exactly Style: it must be the FINAL gate, not an early green row.
     name: Style
-    needs: [candidate, build-test-bundles, build-and-test, secret-scan, integration-products]
+    needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]
     if: always()
     env:
       ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
@@ -510,6 +536,7 @@ jobs:
           fi
 
   secret-scan:
+    # Contract failures must not suppress the introduced-range scan on main.
     needs: candidate
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}

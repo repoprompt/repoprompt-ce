@@ -254,7 +254,9 @@ establish execution lineage. This is a policy dead end, not evidence of a test f
 1. **Local iteration:** `check-fast` now includes the cross-workflow contracts.
    Mandatory commit/push safety still performs secret scans and guardrails;
    `pr-ready` selects additional lanes. None is a substitute for hosted acceptance.
-2. **PR/queue/main CI:** portable contracts run before scarce Mac work. Candidate
+2. **PR/queue/main CI:** portable contracts run in a separate Ubuntu job before
+   scarce Mac work. Secret Scan remains dependent only on candidate declaration,
+   so a tooling-contract failure cannot suppress a main push's introduced-range scan. Candidate
    identity stays immutable; successful root producers carry their own attempt
    and Swift/Xcode identity. Native partial reruns reuse exact successful ancestors,
    never a guessed/latest artifact. Rebuilding invalidates old worker receipts.

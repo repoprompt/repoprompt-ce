@@ -362,7 +362,7 @@ class CatalogTests(unittest.TestCase):
         ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
         final = ci.split('  style:', 1)[1].split('  secret-scan:', 1)[0]
         self.assertIn('name: Style', final)
-        self.assertIn('needs: [candidate, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
+        self.assertIn('needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
         self.assertEqual(ci.count('runs-on: macos-26'), 2)  # shared root build + one worker (four logical shards)
@@ -396,9 +396,19 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('steps.selected.outputs.coverage_artifact', final)
         self.assertIn('needs.build-and-test.outputs.receipt_artifact', final)
         self.assertNotIn('pattern:', final)
-        candidate = ci.split('\n  candidate:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
-        self.assertIn('make ci-workflow-selftest', candidate)
+        contracts = ci.split('\n  workflow-contracts:\n', 1)[1].split('\n  integration-products:\n', 1)[0]
+        self.assertIn('make ci-workflow-selftest', contracts)
         self.assertIn('Scripts/test_modularization_tooling.py', (SCRIPT_DIR.parent / 'Makefile').read_text().split('ci-workflow-selftest:', 1)[1].split('\n\n', 1)[0])
+
+    def test_contract_failure_never_suppresses_the_main_commit_range_secret_scan(self) -> None:
+        ci = (SCRIPT_DIR.parent / '.github/workflows/ci.yml').read_text()
+        candidate = ci.split('\n  candidate:\n', 1)[1].split('\n  workflow-contracts:\n', 1)[0]
+        self.assertNotIn('make ci-workflow-selftest', candidate)
+        secret = ci.split('\n  secret-scan:\n', 1)[1].split('    steps:', 1)[0]
+        self.assertIn('    needs: candidate\n', secret)
+        self.assertNotIn('workflow-contracts', secret)
+        build = ci.split('\n  build-test-bundles:\n', 1)[1].split('    steps:', 1)[0]
+        self.assertIn('    needs: [candidate, workflow-contracts]\n', build)
 
     def test_supplemental_product_workflows_are_manual_only(self) -> None:
         # Sentry is already blocking; universal qualification belongs to publication
