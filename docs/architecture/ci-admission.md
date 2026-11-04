@@ -73,12 +73,12 @@ shows the fully-qualified head/base refs used here.
 The immutable candidate binds commit, tree, base, ref, event, run ID and policy.
 It deliberately has no consumer-attempt field. Every executing job verifies its
 checkout and current run. The root producer declares a separate identity before
-running tests: candidate + build attempt + Swift/Xcode versions. It binds that
+running tests: candidate + build attempt + architecture + Swift/Xcode versions. It binds that
 identity to the archive only after its gates succeed. Job outputs identify the
 successful producer, not a lookup for the latest available artifact.
 
 Workers verify the producer against the candidate, reject future attempts and
-Swift/Xcode drift, then download that producer's exact run/attempt-named archive.
+architecture/Swift/Xcode drift, then download that producer's exact run/attempt-named archive.
 Each shard receipt carries the same root producer identity. The worker exports its
 own run/execution-attempt-named receipt artifact. Style first requires all job
 results to be successful, then selects the successful root and worker outputs and
@@ -121,6 +121,28 @@ Local release commands retain their default clean behavior. Cache hits are not
 build, test, or publication evidence.
 
 ## Runner capacity and scheduling
+
+Integration uses the standard `macos-26-intel` pool (not the paid `-large`
+labels). The root producer and worker must run on the same architecture, recorded
+in the producer identity and checked before downloading/executing its archive.
+Dependency/cache keys already include architecture. Sentry and Xcode workspace
+validation also use Intel; no automatic retry or fallback duplicates work on ARM.
+This runs the full integration suite natively on x86_64 rather than arm64. It is
+not ARM-native test evidence. Universal release builds and both ARM/Intel
+older-runtime publication checks remain unchanged. No typecheck budget, test
+assertion, coverage requirement or execution deadline is relaxed for Intel.
+
+This change responds to confirmed ARM runner allocation failures, not a product
+failure. GitHub documents Intel macOS 26 as a standard free public-repository
+runner: [hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Intel capacity and performance must still be measured on hosted runs; switching
+pools does not increase account concurrency or guarantee availability. The label
+change is isolated in a revertible commit in PR #1628. Before leaving draft,
+maintainers must accept the loss of ARM-native PR test execution explicitly and
+require an exact-head Intel pass without budget/assertion changes. Reconsider the
+pool choice when ARM allocation recovers; if Intel cannot complete the unchanged
+gates, revert the label commit rather than weakening them. Publication's ARM smoke
+is not equivalent to the full ARM-native suite (including vendored native code).
 
 Integration requests three macOS jobs: one producer, one root-test worker running
 all four logical shards sequentially, and Sentry/privacy. The earlier reduction
@@ -200,7 +222,7 @@ still require all prerequisites and independently verify the original evidence.
 |---|---|
 | Source/lint/assertion/coverage failure | Fix the source; update the PR and inspect the new exact integration candidate. Repetition is not a fix. |
 | Confirmed transient network/runner failure | Rerun the failed job/dependents or failed jobs. Inspect the original log before classifying a failure as transient. |
-| Missing/expired archive, dropped output, Swift/Xcode drift | Rerun **Build and Static Gates** and dependents, or all jobs. Do not bypass Style. |
+| Missing/expired archive, dropped output, architecture/Swift/Xcode drift | Rerun **Build and Static Gates** and dependents, or all jobs. Do not bypass Style. |
 | Wrong/stale producer receipt | Rebuild and rerun dependents; mixed-build evidence must remain rejected. |
 | Outdated PR base/head or unavailable synthetic merge | Update the PR branch; a rerun uses the original SHA/ref, not current main. |
 | Old `integration-v1/v2` run | Re-run all jobs uses that commit's old policy. To obtain v3 behavior, update the branch and trigger fresh CI. |

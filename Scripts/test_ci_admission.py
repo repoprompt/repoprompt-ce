@@ -43,6 +43,18 @@ class WorkerSchedulingTests(unittest.TestCase):
         self.assertIn('name: ${{ steps.selected.outputs.receipt_artifact }}', aggregate)
         self.assertIn('--shard-count 4 --admission-context', aggregate)
 
+    def test_all_integration_producers_and_consumers_use_the_same_standard_intel_pool(self):
+        root = Path(__file__).resolve().parent.parent
+        for name, count in [('ci.yml', 2), ('ci-integration-products.yml', 1), ('xcode-workspace.yml', 1)]:
+            text = (root / '.github/workflows' / name).read_text()
+            mac_labels = [line.strip().split(': ', 1)[1] for line in text.splitlines()
+                          if line.strip().startswith('runs-on: macos')]
+            self.assertEqual(mac_labels, ['macos-26-intel'] * count, name)
+        # Publication retains native ARM builds and both oldest-runtime architectures.
+        compatibility = (root / '.github/workflows/macos-compatibility.yml').read_text()
+        self.assertIn('runner: macos-15\n', compatibility)
+        self.assertIn('runner: macos-15-intel\n', compatibility)
+        self.assertIn('runs-on: macos-26\n', (root / '.github/workflows/main-tip.yml').read_text())
 
 
 class CandidateTests(unittest.TestCase):

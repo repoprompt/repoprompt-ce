@@ -98,7 +98,8 @@ jobs:
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     name: Build and Static Gates
-    runs-on: macos-26
+    # Standard/free Intel pool; ARM64 allocation failures must not strand integration.
+    runs-on: macos-26-intel
     timeout-minutes: 75
     outputs:
       failure: ${{ steps.diagnostics.outputs.failure }}
@@ -378,7 +379,8 @@ jobs:
     env:
       ADMISSION_CONTEXT: ${{ needs.build-test-bundles.outputs.context }}
       CANDIDATE_CONTEXT: ${{ needs.candidate.outputs.context }}
-    runs-on: macos-26
+    # Standard/free Intel pool; ARM64 allocation failures must not strand integration.
+    runs-on: macos-26-intel
     # One allocation/transfer, four logical shards. Each keeps its own deadline.
     # 4 * 32 minutes plus setup/receipt upload; not a larger per-suite budget.
     timeout-minutes: 140

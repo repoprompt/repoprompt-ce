@@ -33,7 +33,8 @@ permissions:
 jobs:
   validate:
     name: Validate Generated Xcode Workspace
-    runs-on: macos-26
+    # Standard/free Intel pool; ARM64 allocation failures must not strand integration.
+    runs-on: macos-26-intel
     steps:
       - name: Check out repository
         uses: actions/checkout@v6

@@ -365,9 +365,9 @@ class CatalogTests(unittest.TestCase):
         self.assertIn('needs: [candidate, workflow-contracts, build-test-bundles, build-and-test, secret-scan, integration-products]', final)
         self.assertIn('if: always()', final)
         self.assertIn('ci_test_coverage.py', final)
-        self.assertEqual(ci.count('runs-on: macos-26'), 2)  # shared root build + one worker (four logical shards)
+        self.assertEqual(ci.count('runs-on: macos-26-intel\n'), 2)  # shared root build + one worker (four logical shards)
         products = (SCRIPT_DIR.parent / '.github/workflows/ci-integration-products.yml').read_text()
-        self.assertEqual(products.count('runs-on: macos-26'), 1)  # Sentry/privacy only
+        self.assertEqual(products.count('runs-on: macos-26-intel\n'), 1)  # Sentry/privacy only
         self.assertIn('SentryTelemetryPrivacyTests', products)
         self.assertNotIn('release artifact', products)
         self.assertNotIn('macos-compatibility.yml', products)

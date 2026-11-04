@@ -19,7 +19,8 @@ permissions:
 jobs:
   sentry:
     name: Sentry Build and Privacy
-    runs-on: macos-26
+    # Standard/free Intel pool; ARM64 allocation failures must not strand integration.
+    runs-on: macos-26-intel
     timeout-minutes: 60
     env:
       ADMISSION_CONTEXT: ${{ inputs.admission }}
