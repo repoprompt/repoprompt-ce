@@ -984,3 +984,150 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         }
     }
 }
+
+// MARK: - agent_run snapshot truncation round-trip (#399, follow-up to #1598)
+
+/// Follow-up to #1598 (#399): the app's wait decoration decodes an already-published snapshot
+/// and publishes it again. That round-trip must keep `assistant_text`, its truncation flag, and
+/// the original character count stable, and suppressing the preview must drop all three.
+@MainActor
+final class AgentRunMCPSnapshotTruncationRoundTripTests: XCTestCase {
+    func testOversizedSingleWaitRedecorationKeepsTruncationMetadataAcrossRepeatedRoundTrips() async throws {
+        let service = Self.makeService()
+        let agentModeVM = Self.makeAgentModeViewModel()
+        let cases: [(label: String, text: String, characters: Int)] = [
+            ("ascii", String(repeating: "x", count: 160_000), 160_000),
+            ("byte-only", String(repeating: "👍🏽", count: 10000), 10000),
+            ("single grapheme", "e" + String(repeating: "\u{0301}", count: 40000), 1)
+        ]
+        for (label, text, characters) in cases {
+            var published = Self.snapshot(status: .completed, preview: text).asObject()
+            published["_meta"] = .object(["wait_result": .string("completed")])
+            let first = published
+            var current = Value.object(published)
+            for round in 1 ... 3 {
+                current = try await service.test_finalDecoratedSingleWaitValue(from: current, agentModeVM: agentModeVM)
+                let object = try XCTUnwrap(current.objectValue)
+                let context = "\(label) round \(round)"
+                XCTAssertEqual(object["_meta"]?.objectValue?["wait_result"], .string("completed"), context)
+                XCTAssertEqual(object["assistant_text"], first["assistant_text"], context)
+                XCTAssertTrue(
+                    object["assistant_text"]?.stringValue?.hasSuffix(AgentRunMCPSnapshot.assistantTextTruncationMarker) == true,
+                    context
+                )
+                XCTAssertEqual(object["assistant_text_truncated"], .bool(true), context)
+                XCTAssertEqual(object["assistant_text_characters"]?.intValue, characters, context)
+                XCTAssertLessThanOrEqual(
+                    object["assistant_text"]?.stringValue?.utf8.count ?? .max,
+                    AgentRunMCPSnapshot.assistantTextUTF8ByteLimit,
+                    context
+                )
+            }
+        }
+    }
+
+    func testDecodedSnapshotCarriesExplicitTruncationState() throws {
+        let service = Self.makeService()
+        let truncated = try service.test_decodeSnapshot(
+            from: .object(Self.snapshot(status: .completed, preview: String(repeating: "y", count: 40000)).asObject())
+        )
+        XCTAssertEqual(truncated.latestAssistantPreviewTotalCharacters, 40000)
+
+        let verbatim = try service.test_decodeSnapshot(
+            from: .object(Self.snapshot(status: .completed, preview: "Short reply.").asObject())
+        )
+        XCTAssertNil(verbatim.latestAssistantPreviewTotalCharacters)
+    }
+
+    func testSuppressedPreviewDropsTruncationMetadata() async throws {
+        let service = Self.makeService()
+        let running = Self.snapshot(status: .running, preview: String(repeating: "r", count: 40000))
+        var delivered = running.asObject()
+        delivered["_meta"] = .object([
+            "wake_reason": .string(AgentRunSessionStore.WakeReason.instructionDelivered.rawValue),
+            "wait_result": .string("woken")
+        ])
+        let finalized = try await service.test_finalDecoratedSingleWaitValue(
+            from: .object(delivered),
+            agentModeVM: Self.makeAgentModeViewModel()
+        )
+        let redecorated = try XCTUnwrap(finalized.objectValue)
+        Self.assertNoAssistantText(redecorated, "single wait suppression")
+        XCTAssertEqual(redecorated["_meta"]?.objectValue?["wait_result"], .string("woken"))
+
+        let interrupt = try XCTUnwrap(AgentRunMCPToolService.test_decoratedMultiWaitInterruptValue(
+            sessionIDs: [running.sessionID],
+            snapshots: [running],
+            pendingSessionIDs: [running.sessionID],
+            interruptedSessionID: running.sessionID
+        ).objectValue)
+        Self.assertNoAssistantText(interrupt, "multi-wait interrupt")
+        for entry in interrupt["snapshots"]?.arrayValue ?? [] {
+            try Self.assertNoAssistantText(XCTUnwrap(entry.objectValue), "multi-wait interrupt snapshot")
+        }
+    }
+
+    // MARK: - Helpers
+
+    private static func assertNoAssistantText(_ object: [String: Value], _ label: String) {
+        XCTAssertNil(object["assistant_text"], label)
+        XCTAssertNil(object["assistant_text_truncated"], label)
+        XCTAssertNil(object["assistant_text_characters"], label)
+    }
+
+    private static func snapshot(status: AgentRunMCPSnapshot.Status, preview: String) -> AgentRunMCPSnapshot {
+        AgentRunMCPSnapshot(
+            sessionID: UUID(),
+            runID: UUID(),
+            tabID: UUID(),
+            sessionName: "Child",
+            agentRaw: "claudeCode",
+            agentDisplayName: "Claude Code",
+            modelRaw: "sonnet",
+            reasoningEffortRaw: nil,
+            status: status,
+            statusText: nil,
+            latestAssistantPreview: preview,
+            interaction: nil,
+            transcriptItemCount: 3,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            parentSessionID: nil,
+            failureReason: nil,
+            worktreeBindings: [],
+            activeWorktreeMerges: []
+        )
+    }
+
+    private static func makeAgentModeViewModel() -> AgentModeViewModel {
+        AgentModeViewModel(
+            testWindowID: -991,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                preconditionFailure("Truncation round-trip tests must not start a Codex session")
+            },
+            connectionPolicyInstaller: { _, _, _, _, _, _, _, _, _, _, _, _, _ in },
+            mcpServerEnabler: { true }
+        )
+    }
+
+    private static func makeService() -> AgentRunMCPToolService {
+        AgentRunMCPToolService(
+            toolName: MCPWindowToolName.agentRun,
+            captureRequestMetadata: {
+                MCPServerViewModel.RequestMetadata(
+                    connectionID: UUID(),
+                    clientName: "agent-run-truncation-round-trip-tests",
+                    windowID: 1
+                )
+            },
+            requireTargetWindow: { throw MCPError.internalError("not used by round-trip tests") },
+            resolveRequestedTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
+            resolveSpawnParentSessionID: { _, _ in nil },
+            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
+                throw MCPError.internalError("startRun is not used by round-trip tests")
+            }
+        )
+    }
+}

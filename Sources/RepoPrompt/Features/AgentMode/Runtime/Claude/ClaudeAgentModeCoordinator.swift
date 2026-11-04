@@ -492,7 +492,7 @@ final class ClaudeAgentModeCoordinator {
             guard let self, let session, let listener, listener.isCurrent() else { return }
             switch event {
             case let .runtimeInit(status):
-                observeRuntimeInit(status, session: session)
+                if observeRuntimeInit(status, session: session) { hostCapabilities.requestUIRefresh(session, false) }
                 if status.isRepoPromptServerFailed { scheduleIdleFailure(session, listener: listener, error: Self.mcpInitializationFailureMessage(sessionID: status.sessionID)) }
             case let .error(message): scheduleIdleFailure(session, listener: listener, error: message)
             default: break
@@ -522,16 +522,18 @@ final class ClaudeAgentModeCoordinator {
         eventListener(for: session).install(controller: controller, handle: handle)
     }
 
-    /// Records runtime-init state for both host-run and self-started (idle) events.
-    /// Returns `true` when the auto-compact window changed, so an active run can re-resolve usage.
+    /// Records runtime-init state for both host-run and self-started (idle) events. Every init
+    /// recomputes the effective window, including one repeating the last cap: a reset conversation
+    /// or replaced process must not keep a stale or missing window. Returns `true` when the window
+    /// changed, so the host can refresh its presentation.
     @discardableResult
     func observeRuntimeInit(_ status: NativeAgentRuntimeRuntimeInitStatus, session: AgentTabSession) -> Bool {
         if let id = status.sessionID, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             updateProviderSessionIDIfNeeded(id, for: session)
         }
-        guard session.claudeAutoCompactWindowTokens != status.autoCompactWindowTokens else { return false }
         session.claudeAutoCompactWindowTokens = status.autoCompactWindowTokens
-        return true
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return false }
+        return ClaudeContextUsageEstimator.reconcileContextWindow(session: session, createsUsage: true)
     }
 
     private func scheduleIdleFailure(_ session: AgentTabSession, listener: ClaudeControllerEventListener, error: String) {

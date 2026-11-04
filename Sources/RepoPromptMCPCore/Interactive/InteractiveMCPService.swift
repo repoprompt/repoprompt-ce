@@ -105,8 +105,8 @@ package actor InteractiveMCPService: Service {
             fputs("""
             \u{001B}[31mError: RepoPrompt's MCP socket is not accepting connections (retryable)\u{001B}[0m
 
-            The MCP bootstrap directory exists but its socket \(errno == ENOENT ? "is missing" : "refused the connection") (errno \(errno)).
-            This usually means RepoPrompt is restarting its MCP server; it is a transient reconnect window.
+            RepoPrompt's MCP socket \(errno == ENOENT ? "disappeared while connecting" : "refused the connection") (errno \(errno)).
+            This usually means RepoPrompt is restarting or stopping its MCP server; it is a transient reconnect window.
 
             To fix:
             1. Retry in a moment
