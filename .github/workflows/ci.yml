@@ -280,17 +280,15 @@ jobs:
           key: ${{ steps.rootbundles-cache.outputs.cache-primary-key }}
 
   build-and-test:
-    name: Test Root Shard (No Build)
+    name: Test Root Shards (No Build)
     needs: [candidate, build-test-bundles]
     if: ${{ fromJSON(needs.candidate.outputs.context).attempt == github.run_attempt }}
     env:
       ADMISSION_CONTEXT: ${{ needs.candidate.outputs.context }}
     runs-on: macos-26
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
+    # One allocation/transfer, four logical shards. Each keeps its own deadline.
+    # 4 * 32 minutes plus setup/receipt upload; not a larger per-suite budget.
+    timeout-minutes: 140
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -311,17 +309,37 @@ jobs:
         run: gzip -dc root-build.tar.gz | tar -xf -
 
       - name: Verify transferred build candidate and producer
+        id: verified-build
         run: python3 Scripts/modularization_ci_artifact.py verify --admission-context "$ADMISSION_CONTEXT"
 
-      - name: Run root test shard without compiling
-        run: ./conductor ci-shard --shard-count 4 --shard-index ${{ matrix.shard }} --full-log
+      # A failed shard must not suppress the remaining coverage. A failed setup
+      # or cancellation must not start tests. Never mask failures; Style must fail.
+      - name: Run root test shard 1 without compiling
+        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
+        timeout-minutes: 32
+        run: ./conductor ci-shard --shard-count 4 --shard-index 1 --timeout 1800 --full-log
+
+      - name: Run root test shard 2 without compiling
+        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
+        timeout-minutes: 32
+        run: ./conductor ci-shard --shard-count 4 --shard-index 2 --timeout 1800 --full-log
+
+      - name: Run root test shard 3 without compiling
+        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
+        timeout-minutes: 32
+        run: ./conductor ci-shard --shard-count 4 --shard-index 3 --timeout 1800 --full-log
+
+      - name: Run root test shard 4 without compiling
+        if: ${{ !cancelled() && steps.verified-build.outcome == 'success' }}
+        timeout-minutes: 32
+        run: ./conductor ci-shard --shard-count 4 --shard-index 4 --timeout 1800 --full-log
 
       - name: Retain execution receipts and full shard logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
-          name: shard-execution-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: shard-execution-all-${{ github.run_id }}-${{ github.run_attempt }}
           path: .build/ci-test-results/shard-*
           if-no-files-found: error
           retention-days: 7

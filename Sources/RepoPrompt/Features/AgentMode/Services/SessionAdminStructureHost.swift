@@ -151,10 +151,14 @@ protocol SessionAdminWorktreeHost: AnyObject {
         bindingsCommitted: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> SessionAdminWorktreeInfo
     /// Removes the binding for `worktreeID`, or every binding when `nil`. Returns removed IDs.
+    /// `bindingsRemoved` runs synchronously at actual publication with the removed IDs, before any
+    /// required persistence await. It never runs for a refusal, a preparation step, or an empty no-op,
+    /// so a later throw after it ran means the removal is committed even though completion failed.
     func unbindWorktrees(
         sessionID: UUID,
         worktreeID: String?,
-        isStillAuthorized: @escaping @MainActor () -> Bool
+        isStillAuthorized: @escaping @MainActor () -> Bool,
+        bindingsRemoved: @escaping @MainActor (Set<String>) -> Void
     ) async throws -> [String]
     func boundWorktrees(sessionID: UUID) -> [AgentSessionWorktreeBindingSummary]
     /// Every worktree bound by any session in any loaded workspace, with its binding sessions.
