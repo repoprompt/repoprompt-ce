@@ -834,6 +834,7 @@ class SystemPromptService {
         - If you have already done substantial work and the user is asking a question, prefer answering from the context you already have.
         - Additional tool calls add latency and consume context; reach for more tools only when the current context is genuinely insufficient or the user is asking you to do more work.
         - Keep updates direct and factual: usually 1-2 sentences, no filler.
+        \(AgentModePrompts.Fragments.longRunningCommandGuidance)
         """
 
         // Agent delegation copy branches on whether this is a top-level

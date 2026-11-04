@@ -1,8 +1,40 @@
 import Foundation
 import RepoPromptInstrumentation
 
+/// Filter tabs above the session list. `.all` is the unfiltered sidebar; the others narrow the same
+/// list to matching sessions (plus their parent rows for context).
+enum AgentSidebarTab: String, CaseIterable, Identifiable {
+    case all
+    case pinned
+    case active
+    case overseers
+
+    var id: Self {
+        self
+    }
+
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .pinned: "Pinned"
+        case .active: "Active"
+        case .overseers: "Overseers"
+        }
+    }
+
+    var emptyTitle: String {
+        switch self {
+        case .all: "No sessions"
+        case .pinned: "No pinned sessions"
+        case .active: "Nothing running or waiting for you"
+        case .overseers: "No sessions are overseeing others"
+        }
+    }
+}
+
 struct AgentSessionSidebarSnapshot: Equatable {
     var searchText: String
+    var sidebarTab: AgentSidebarTab = .all
     var visibleSessionCount: Int
     var archivedVisibleSessionCount: Int
     var collapsedThreadKeys: Set<AgentSidebarThreadKey> = []
@@ -49,6 +81,12 @@ final class AgentSessionSidebarUIStore: ObservableObject {
             force: false,
             affectsRowContent: false
         )
+    }
+
+    func setSidebarTab(_ tab: AgentSidebarTab) {
+        var next = snapshot
+        next.sidebarTab = tab
+        _ = publish(next, eventName: "sessionSidebar.tab", force: false, affectsRowContent: false)
     }
 
     func handleSelectionGesture(

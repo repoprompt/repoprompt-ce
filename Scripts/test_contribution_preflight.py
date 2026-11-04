@@ -80,6 +80,7 @@ class PathSelectionTests(unittest.TestCase):
             ("Scripts/conductor_diagnostics.py", 0),
             ("Scripts/guardrails.sh", 0),
             ("Scripts/test_contribution_preflight.py", 0),
+            ("Scripts/test_fast_check.py", 0),
             (".agents/skills/rpce-contribution-check/scripts/preflight.sh", 0),
             (".agents/skills/rpce-contribution-check/scripts/preflight_timing.py", 0),
             ("Makefile", 0),

@@ -253,4 +253,11 @@ if actual_identity_migration_phase != identity_migration_phase:
     )
 PYTHON
 
+# The signing job applies the trusted control plane's entitlements, so the staged
+# Info.plist must not enable Sparkle's sandbox-only installer launcher (#42).
+python3 "$SCRIPT_DIR/validate_sparkle_installer_launcher.py" \
+    --info-plist "$APP_BUNDLE/Contents/Info.plist" \
+    --entitlements "$SCRIPT_DIR/../AppBundle/RepoPrompt.entitlements.template" \
+    --label "Staged app Sparkle installer launcher"
+
 printf 'OK: staged release payload matches approved source and confined path policy.\n'

@@ -189,6 +189,12 @@ final class AgentSessionLinkRunnerHarness {
                 finalizePendingToolCalls: { _, _ in },
                 finalizePendingToolCallsWithUpperBound: { _, _, _ in },
                 flushPendingAssistantDelta: { session in if replayTranscript { harnessBox?.host.flushPendingAssistantDelta(session) } },
+                beginClaudeProviderOutputSegment: { session in
+                    if replayTranscript {
+                        harnessBox?.host.flushPendingAssistantDelta(session)
+                        harnessBox?.host.endActiveAssistantSegment(session)
+                    }
+                },
                 clearPendingAssistantDelta: { _ in }
             ),
             providerInput: .init(

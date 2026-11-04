@@ -168,6 +168,51 @@ final class CodexResumeWedgeCommitTests: XCTestCase {
         }
     }
 
+    func testLocalCompactResumesIdlePersistedThreadWithoutStartingTurn() async throws {
+        let fixture = makeFixture([[.policyRequiredResume]])
+        if let ownership = fixture.session.activeRunOwnership {
+            _ = fixture.session.endRunAttempt(ifCurrent: ownership, source: "cold-local-compact")
+        }
+        fixture.session.runState = .idle
+        fixture.session.codexNeedsReconnect = false
+        addTeardownBlock { @MainActor in
+            let runID = fixture.session.runID
+            await fixture.coordinator.shutdownCodexSession(fixture.session)
+            if let runID, let clientName = AgentProviderKind.codexExec.mcpClientNameHint {
+                await ServerNetworkManager.shared.revokeClientConnectionPolicy(
+                    for: clientName, windowID: 1, runID: runID
+                )
+            }
+        }
+        var finished = false
+        let compact = Task {
+            let result = await fixture.coordinator.executeNativeSlashCommand(.compact, argumentsText: "", session: fixture.session)
+            finished = true
+            return result
+        }
+        addTeardownBlock {
+            compact.cancel()
+            _ = await compact.value
+        }
+        try await AsyncTestWait.waitUntil("local compact staged or completed", timeout: 4) {
+            finished || fixture.coordinator.test_hasPendingCodexStart(for: fixture.session)
+        }
+        let controller = try XCTUnwrap(fixture.factory.controllers.last)
+        XCTAssertEqual(controller.receivedExistingIDs, [Self.oldThreadID])
+        XCTAssertEqual(controller.startedTurnCount, 0)
+        XCTAssertEqual(controller.compactCount, 0)
+        XCTAssertEqual(fixture.session.runState, .idle)
+        try await MCPRoutingWaiter.shared.notifyRouted(runID: XCTUnwrap(fixture.session.runID))
+        let result = await compact.value
+        guard case .succeeded = result else {
+            return XCTFail("Local compact must resume the persisted idle thread: \(result)")
+        }
+        XCTAssertEqual(controller.compactCount, 1)
+        XCTAssertEqual(controller.startedTurnCount, 0)
+        XCTAssertEqual(fixture.factory.controllers.count, 1)
+        assertOldTuple(fixture.session)
+    }
+
     func testColdCompactionAfterRouteRevocationInstallsPolicyBeforeDiscovery() async throws {
         let fixture = makeFixture([
             [.success(Self.oldThreadID)],
@@ -4019,6 +4064,37 @@ extension CodexResumeWedgeCommitTests {
 }
 
 extension CodexResumeWedgeCommitTests {
+    func testThreadNameMetadataDoesNotVetoPristineRoutineCandidate() async throws {
+        for malformed in [false, true] {
+            let (f, controller, owner) = try await makeQuietToolProgressFixture()
+            defer { f.session.saveDebounceTask?.cancel() }
+            XCTAssertFalse(f.session.quietLedger.hasOrdinaryOccurrence(owner: owner))
+            await controller.test_handleNotification(method: "thread/name/updated", params: [
+                "threadId": .string(Self.oldThreadID), "threadName": malformed ? .number(42) : .string("Provider-generated title")
+            ])
+            await controller.test_handleNotification(method: "turn/completed", params: [
+                "threadId": .string(Self.oldThreadID),
+                "turn": .object(["id": .string("progress-turn"), "status": .string("completed"), "items": .array([])])
+            ])
+            await controller.shutdown()
+            var sawIngress = false
+            for await event in controller.events {
+                if case .turnCompleted = event {
+                    XCTAssertTrue(sawIngress)
+                    XCTAssertEqual(f.session.quietLedger.hasOrdinaryOccurrence(owner: owner), malformed)
+                    XCTAssertEqual(f.session.quietLedger.candidateStartKey(owner: owner) == nil, malformed)
+                }
+                await f.coordinator.test_handleCodexNativeEvent(event, session: f.session, sourceController: controller)
+                if case let .livenessActivity(activity) = event {
+                    sawIngress = true
+                    XCTAssertEqual(activity.kind, malformed ? .warning : .protocolMetadata)
+                    XCTAssertEqual(f.session.quietLedger.hasOrdinaryOccurrence(owner: owner), malformed)
+                }
+            }
+            XCTAssertTrue(sawIngress)
+        }
+    }
+
     func testProtocolMetadataIsNotOutputAndUnknownOrMalformedIngressRemainsOrdinary() async throws {
         let thread = CodexJSONValue.string(Self.oldThreadID)
         let turn = CodexJSONValue.string("w0e-turn")
@@ -4029,6 +4105,11 @@ extension CodexResumeWedgeCommitTests {
                 "item": .object(["type": .string("function_call"), "arguments": .string("{}")])
             ])], false),
             ("settings-before-close", "thread/settings/updated", settings, false),
+            ("thread-name", "thread/name/updated", ["threadName": .string("Untrusted thread title")], false),
+            ("null-thread-name", "thread/name/updated", ["threadName": .null], false),
+            ("absent-thread-name", "thread/name/updated", [:], false),
+            ("malformed-thread-name", "thread/name/updated", ["threadName": .number(42)], true),
+            ("object-thread-name", "thread/name/updated", ["threadName": .object([:])], true),
             ("malformed-settings", "thread/settings/updated", ["threadSettings": .array([])], true),
             ("partial-settings", "thread/settings/updated", ["threadSettings": .object([:])], true),
             ("missing-moderation-metadata", "turn/moderationMetadata", [:], true),
