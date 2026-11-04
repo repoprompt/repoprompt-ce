@@ -154,7 +154,6 @@ conductor-selftest:
 
 conductor-portable-selftest:
 	$(MAKE) ci-app-test-runner-selftest
-	python3 Scripts/test_fast_check.py
 	python3 Scripts/test_codex_app_server_schema.py
 	python3 Scripts/test_debug_app_process.py
 	python3 Scripts/test_conductor_diagnostics.py
@@ -186,6 +185,7 @@ ci-workflow-selftest:
 	python3 Scripts/test_ci_recovery.py
 	python3 Scripts/test_ci_job_diagnostics.py
 	python3 Scripts/test_modularization_tooling.py
+	python3 Scripts/test_fast_check.py
 
 ci-app-test-runner-selftest:
 	$(MAKE) ci-workflow-selftest

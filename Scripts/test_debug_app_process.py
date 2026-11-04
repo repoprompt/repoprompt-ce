@@ -171,9 +171,19 @@ class LifecycleSurfaceTests(unittest.TestCase):
         self.assertIn("uncoordinated no-Python fallback", readme)
 
     def test_conductor_selftest_includes_process_helper_suite(self) -> None:
-        makefile = (SCRIPT_DIR.parent / "Makefile").read_text(encoding="utf-8")
-        target = makefile.split("conductor-selftest:", 1)[1].split("\n\n", 1)[0]
-        self.assertIn("python3 Scripts/test_debug_app_process.py", target)
+        for target in ("conductor-selftest", "conductor-portable-selftest"):
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    ["make", "--no-print-directory", "-n", target],
+                    cwd=SCRIPT_DIR.parent,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    result.stdout.splitlines().count("python3 Scripts/test_debug_app_process.py"),
+                    1,
+                )
 
 
 
