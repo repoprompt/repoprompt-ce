@@ -805,7 +805,7 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: Self.resolvedEffortLevel(model: model, suppliedEffortLevel: effortLevel, fallbackEffortLevel: config.effortLevel)
         ))
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
-        launchAutoCompactWindowTokens = ClaudeAutoCompactWindow.tokens(in: environment)
+        launchAutoCompactWindowTokens = ClaudeCompatiblePluginAutoCompactWindow.tokens(in: environment)
         var arguments = buildArguments(
             existingSessionID: existingSessionID,
             model: nil

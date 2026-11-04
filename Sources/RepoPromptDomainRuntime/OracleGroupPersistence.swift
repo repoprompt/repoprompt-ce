@@ -573,6 +573,187 @@ package actor DomainOracleConversationStore: OracleGroupStore, OracleArtifactSto
     }
 }
 
+/// Offline bootstrap seam. Inputs are isolated captured copies, never live profiles.
+/// Recover each source before combining: a source journal can replace the entire index.
+package enum OracleDebugRetention {
+    package struct Omission: Equatable {
+        package let path: String
+        package let reason: String
+    }
+
+    private struct Candidate {
+        let document: OracleGroupDocument
+        let url: URL
+        let source: OracleStorageFiles
+    }
+
+    private static func isInvalidImport(_ error: Error) -> Bool {
+        if error is DecodingError || error is OracleGroupContractError { return true }
+        guard let error = error as? OraclePersistenceError else { return false }
+        switch error {
+        case .invalidDocument, .futureSchema, .artifactMissing, .artifactDigestMismatch: return true
+        default: return false
+        }
+    }
+
+    package static func combine(
+        releaseRoot: URL, debugRoot: URL, destination: URL,
+        isRetained: (OracleConversationOwner) -> Bool,
+        checkCancellation: @escaping () throws -> Void
+    ) throws -> [Omission] {
+        let cancellation = DomainBlockingCancellation()
+        func files(_ root: URL) -> OracleStorageFiles {
+            OracleStorageFiles(root: root, cancellation: cancellation, mutationObserver: { _ in }, bootstrapCancellation: checkCancellation)
+        }
+        let release = files(releaseRoot), debug = files(debugRoot), output = files(destination)
+        try checkCancellation()
+        try debug.recoverTransactions()
+        _ = try debug.loadAndValidateAllGroups()
+        var omissions: [Omission] = []
+        func candidates(_ source: OracleStorageFiles, strict: Bool) throws -> [Candidate] {
+            let directory = source.root.appendingPathComponent("groups")
+            guard source.exists(directory) else { return [] }
+            var result: [Candidate] = []
+            for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                .filter({ $0.pathExtension == "json" }).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                try checkCancellation()
+                do {
+                    let group = try source.decodeGroup(from: url)
+                    guard isRetained(group.owner) == strict else { continue }
+                    if !strict { try source.validate(group) }
+                    result.append(Candidate(document: group, url: url, source: source))
+                } catch {
+                    guard !strict, isInvalidImport(error) else { throw error }
+                    omissions.append(.init(path: source.relative(url), reason: "invalid_release_group"))
+                }
+            }
+            return result
+        }
+        let debugCandidates = try candidates(debug, strict: true)
+        var releaseCandidates: [Candidate] = []
+        var releaseUsable = true
+        do {
+            try release.recoverTransactions()
+            let index = try release.loadIndex()
+            let directory = release.root.appendingPathComponent("groups")
+            var knownIDs = Set<OracleGroupID>()
+            if release.exists(directory) {
+                for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                    .filter({ $0.pathExtension == "json" }) {
+                    try checkCancellation()
+                    let bytes = try Data(contentsOf: url)
+                    let group: OracleGroupDocument
+                    do {
+                        group = try release.decode(OracleGroupDocument.self, from: bytes)
+                    } catch {
+                        guard isInvalidImport(error) else { throw error }
+                        // An unreadable group's identity is limited to its filename. Its
+                        // content is omitted below; do not infer or repair its index rows.
+                        if let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) {
+                            knownIDs.insert(OracleGroupID(rawValue: id))
+                        }
+                        continue
+                    }
+                    knownIDs.insert(group.group.id)
+                    try release.validateIndex(for: group)
+                }
+            }
+            guard index.entries.allSatisfy({ knownIDs.contains($0.groupID) }) else {
+                throw OraclePersistenceError.invalidDocument("member_index_mismatch")
+            }
+        } catch {
+            guard isInvalidImport(error) else { throw error }
+            releaseUsable = false
+            omissions.append(.init(path: ".", reason: "invalid_release_journal_or_index"))
+        }
+        if releaseUsable { releaseCandidates = try candidates(release, strict: false) }
+        func memberAliases(_ group: OracleGroupDocument) throws -> [String] {
+            try group.members.map {
+                try JSONEncoder().encode([group.owner.kind, group.owner.identifier, $0.publicChatID]).base64EncodedString()
+            }
+        }
+        let debugIDs = Set(debugCandidates.map { $0.document.group.id })
+        var releaseIDs: [OracleGroupID: Int] = [:]
+        var releaseAliases: [String: Int] = [:]
+        for candidate in releaseCandidates {
+            releaseIDs[candidate.document.group.id, default: 0] += 1
+            for alias in try memberAliases(candidate.document) { releaseAliases[alias, default: 0] += 1 }
+        }
+        // Reject all ambiguous release candidates rather than selecting a directory-order winner.
+        releaseCandidates = try releaseCandidates.filter { candidate in
+            let group = candidate.document
+            let groupAliases = try memberAliases(group)
+            let conflict = debugIDs.contains(group.group.id) || releaseIDs[group.group.id, default: 0] > 1
+                || groupAliases.contains { releaseAliases[$0, default: 0] > 1 }
+            if conflict { omissions.append(.init(path: release.relative(candidate.url), reason: "release_identity_conflict")) }
+            return !conflict
+        }
+        let selected = debugCandidates + releaseCandidates
+        var aliases = Set<String>()
+        var entries: [OracleMemberIndexEntry] = []
+        for candidate in selected {
+            let group = candidate.document
+            try checkCancellation()
+            for (member, alias) in zip(group.members, try memberAliases(group)) {
+                // Encode the tuple rather than concatenate potentially ambiguous identifiers.
+                guard aliases.insert(alias).inserted else { throw OraclePersistenceError.ambiguousMemberAlias }
+                entries.append(.init(owner: group.owner, publicChatID: member.publicChatID, groupID: group.group.id, laneIndex: member.laneID.index))
+            }
+        }
+        func write(_ bytes: Data, relative: String) throws {
+            let target = destination.appendingPathComponent(relative)
+            if FileManager.default.fileExists(atPath: target.path) {
+                guard try Data(contentsOf: target) == bytes else { throw OraclePersistenceError.invalidDocument("retained_file_conflict") }
+            } else {
+                try DomainPersistenceLock.atomicWrite(bytes, to: target)
+            }
+        }
+        for candidate in selected {
+            try checkCancellation()
+            try write(Data(contentsOf: candidate.url), relative: output.relative(output.groupURL(candidate.document.group.id)))
+            for id in Set(candidate.source.referencedArtifactIDs(candidate.document)) {
+                try checkCancellation()
+                try write(candidate.source.loadArtifact(id), relative: "artifacts/\(id).blob")
+            }
+        }
+        // Recognized blobs follow selected references, not source directory membership.
+        // Opaque debug evidence survives; opaque release evidence stays in the source profile.
+        func copyOpaque(_ source: OracleStorageFiles, retain: Bool) throws {
+            func visit(_ directory: URL, prefix: String = "") throws {
+                guard FileManager.default.fileExists(atPath: directory.path) else { return }
+                for url in try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) {
+                    try checkCancellation()
+                    let relative = prefix + url.lastPathComponent
+                    if relative == "index.json" || relative == "locks" || relative == "claims" { continue }
+                    if try url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true {
+                        try visit(url, prefix: relative + "/")
+                        continue
+                    }
+                    let parts = relative.split(separator: "/")
+                    if parts.count == 2 {
+                        if (parts[0] == "groups" || parts[0] == "transactions"), url.pathExtension == "json" { continue }
+                        let stem = url.deletingPathExtension().lastPathComponent
+                        if parts[0] == "artifacts", url.pathExtension == "blob", stem.count == 64,
+                           stem.allSatisfy({ "0123456789abcdef".contains($0) }) { continue }
+                    }
+                    if retain {
+                        try write(Data(contentsOf: url), relative: relative)
+                    } else {
+                        omissions.append(.init(path: relative, reason: "opaque_release_file"))
+                    }
+                }
+            }
+            try visit(source.root)
+        }
+        try copyOpaque(debug, retain: true)
+        try copyOpaque(release, retain: false)
+        try DomainPersistenceLock.atomicWrite(output.encode(OracleMemberIndexDocument().replacing(entries: entries)), to: output.indexURL)
+        _ = try output.loadAndValidateAllGroups()
+        try checkCancellation()
+        return omissions.sorted { ($0.path, $0.reason) < ($1.path, $1.reason) }
+    }
+}
+
 private struct OracleMemberIndexEntry: Codable, Equatable {
     let owner: OracleConversationOwner
     let publicChatID: String
@@ -636,6 +817,12 @@ private struct OracleStorageFiles: @unchecked Sendable {
     let root: URL
     let cancellation: DomainBlockingCancellation
     let mutationObserver: DomainOracleConversationStore.MutationObserver
+    var bootstrapCancellation: (() throws -> Void)? = nil
+
+    private func checkCancellation() throws {
+        try cancellation.check()
+        try bootstrapCancellation?()
+    }
 
     var indexURL: URL {
         root.appendingPathComponent("index.json")
@@ -722,7 +909,7 @@ private struct OracleStorageFiles: @unchecked Sendable {
             includingPropertiesForKeys: nil
         ).filter { $0.pathExtension == "json" }.sorted { $0.lastPathComponent < $1.lastPathComponent }
         for url in urls {
-            try cancellation.check()
+            try checkCancellation()
             let journal = try decode(OracleTransactionJournal.self, from: Data(contentsOf: url))
             guard journal.version == OracleTransactionJournal.currentVersion else {
                 throw OraclePersistenceError.futureSchema(journal.version)
@@ -734,7 +921,7 @@ private struct OracleStorageFiles: @unchecked Sendable {
 
     private func apply(_ journal: OracleTransactionJournal, notify: Bool = true) throws {
         for (index, write) in journal.writes.enumerated() {
-            try cancellation.check()
+            try checkCancellation()
             let destination = try validatedURL(for: write.relativePath)
             if let data = write.data {
                 try DomainPersistenceLock.atomicWrite(data, to: destination)
@@ -791,6 +978,7 @@ private struct OracleStorageFiles: @unchecked Sendable {
         var seen = Set<UUID>()
         var groups: [OracleGroupDocument] = []
         for url in urls {
+            try checkCancellation()
             let group = try decodeGroup(from: url)
             guard seen.insert(group.group.id.rawValue).inserted else {
                 throw OraclePersistenceError.invalidDocument("duplicate_group_id")

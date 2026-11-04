@@ -49,6 +49,102 @@ final class DomainAgentRunSnapshotPayloadContractTests: XCTestCase {
         XCTAssertTrue(over.text.hasPrefix(emoji))
     }
 
+    // MARK: - Byte ceilings and republish stability (follow-up to #1598)
+
+    func testAssistantTextByteCeilingTruncatesWithinCharacterLimitAndIncludesMarker() throws {
+        // 10,000 eight-byte graphemes (emoji + skin tone): under the character cap, over 64 KiB.
+        let text = String(repeating: "👍🏽", count: 10000)
+        XCTAssertEqual(text.count, 10000)
+        let object = Self.makeSnapshot(latestAssistantPreview: text).asObject()
+        let published = try XCTUnwrap(object["assistant_text"]?.stringValue)
+        XCTAssertLessThanOrEqual(published.utf8.count, DomainAgentRunSnapshot.assistantTextUTF8ByteLimit)
+        XCTAssertLessThan(published.count, DomainAgentRunSnapshot.assistantTextCharacterLimit)
+        XCTAssertTrue(published.hasSuffix(DomainAgentRunSnapshot.assistantTextTruncationMarker))
+        XCTAssertEqual(object["assistant_text_truncated"], .bool(true))
+        XCTAssertEqual(object["assistant_text_characters"]?.intValue, 10000)
+    }
+
+    func testOversizedSingleGraphemeIsDroppedRatherThanSplit() throws {
+        let grapheme = "e" + String(repeating: "\u{0301}", count: 40000) // one Character, ~80 KB
+        XCTAssertEqual(grapheme.count, 1)
+        let object = Self.makeSnapshot(latestAssistantPreview: grapheme).asObject()
+        XCTAssertEqual(object["assistant_text"]?.stringValue, DomainAgentRunSnapshot.assistantTextTruncationMarker)
+        XCTAssertEqual(object["assistant_text_truncated"], .bool(true))
+        XCTAssertEqual(object["assistant_text_characters"]?.intValue, 1)
+    }
+
+    func testRepeatedDecodeAndRepublishKeepsTextMarkerFlagAndCount() throws {
+        let cases: [(label: String, text: String, characters: Int)] = [
+            ("ascii", String(repeating: "x", count: 160_000), 160_000),
+            ("byte-only", String(repeating: "👍🏽", count: 10000), 10000),
+            ("single grapheme", "e" + String(repeating: "\u{0301}", count: 40000), 1)
+        ]
+        for (label, text, characters) in cases {
+            let first = Self.makeSnapshot(latestAssistantPreview: text).asObject()
+            var current = first
+            for round in 1...3 {
+                // What a host decoder does: keep the published text and its explicit truncation state.
+                let decodedTotal = current["assistant_text_truncated"]?.boolValue == true
+                    ? current["assistant_text_characters"]?.intValue
+                    : nil
+                current = Self.makeSnapshot(
+                    latestAssistantPreview: current["assistant_text"]?.stringValue,
+                    latestAssistantPreviewTotalCharacters: decodedTotal
+                ).asObject()
+                let context = "\(label) round \(round)"
+                XCTAssertEqual(current["assistant_text"], first["assistant_text"], context)
+                XCTAssertTrue(
+                    current["assistant_text"]?.stringValue?.hasSuffix(DomainAgentRunSnapshot.assistantTextTruncationMarker) == true,
+                    context
+                )
+                XCTAssertEqual(current["assistant_text_truncated"], .bool(true), context)
+                XCTAssertEqual(current["assistant_text_characters"]?.intValue, characters, context)
+            }
+        }
+    }
+
+    func testBoundedTextIsIdempotentAndNeverStacksMarkers() {
+        let marker = DomainAgentRunSnapshot.assistantTextTruncationMarker
+        let once = DomainAgentRunSnapshot.boundedText(
+            String(repeating: "y", count: 50000), characterLimit: 100, utf8ByteLimit: 1000, marker: marker
+        )
+        XCTAssertTrue(once.truncated)
+        let twice = DomainAgentRunSnapshot.boundedText(once.text, characterLimit: 100, utf8ByteLimit: 1000, marker: marker)
+        XCTAssertFalse(twice.truncated)
+        XCTAssertEqual(twice.text, once.text)
+        XCTAssertEqual(once.text.components(separatedBy: marker).count, 2)
+    }
+
+    func testStatusTextIsCappedByCharactersAndBytesWithMarker() throws {
+        let short = Self.makeSnapshot(statusText: "Completed").asObject()
+        XCTAssertEqual(short["status_text"], .string("Completed"))
+
+        let long = Self.makeSnapshot(statusText: String(repeating: "s", count: 160_000)).asObject()
+        let published = try XCTUnwrap(long["status_text"]?.stringValue)
+        XCTAssertEqual(
+            published.count,
+            DomainAgentRunSnapshot.statusTextCharacterLimit + DomainAgentRunSnapshot.statusTextTruncationMarker.count
+        )
+        XCTAssertTrue(published.hasSuffix(DomainAgentRunSnapshot.statusTextTruncationMarker))
+
+        let wide = Self.makeSnapshot(statusText: String(repeating: "👍🏽", count: 1500)).asObject()
+        let widePublished = try XCTUnwrap(wide["status_text"]?.stringValue)
+        XCTAssertLessThanOrEqual(widePublished.utf8.count, DomainAgentRunSnapshot.statusTextUTF8ByteLimit)
+        XCTAssertTrue(widePublished.hasSuffix(DomainAgentRunSnapshot.statusTextTruncationMarker))
+
+        let republished = Self.makeSnapshot(statusText: published).asObject()
+        XCTAssertEqual(republished["status_text"]?.stringValue, published)
+    }
+
+    func testRemoveAssistantTextStripsTruncationMetadata() {
+        var object = Self.makeSnapshot(latestAssistantPreview: String(repeating: "z", count: 20000)).asObject()
+        XCTAssertNotNil(object["assistant_text_truncated"])
+        DomainAgentRunSnapshot.removeAssistantText(from: &object)
+        XCTAssertNil(object["assistant_text"])
+        XCTAssertNil(object["assistant_text_truncated"])
+        XCTAssertNil(object["assistant_text_characters"])
+    }
+
     // MARK: - Effective worktree binding (#400)
 
     func testUnboundSnapshotPublishesExplicitUnboundStateInsteadOfOmittingBindingFields() {
@@ -116,7 +212,9 @@ final class DomainAgentRunSnapshotPayloadContractTests: XCTestCase {
     // MARK: - Helpers
 
     private static func makeSnapshot(
+        statusText: String? = nil,
         latestAssistantPreview: String? = "Done.",
+        latestAssistantPreviewTotalCharacters: Int? = nil,
         parentSessionID: UUID? = nil,
         worktreeBindings: [DomainAgentRunSnapshot.WorktreeBinding] = [],
         worktreeBindingState: DomainAgentRunSnapshot.WorktreeBindingState? = nil,
@@ -132,8 +230,9 @@ final class DomainAgentRunSnapshotPayloadContractTests: XCTestCase {
             modelRaw: "sonnet",
             reasoningEffortRaw: nil,
             status: .completed,
-            statusText: nil,
+            statusText: statusText,
             latestAssistantPreview: latestAssistantPreview,
+            latestAssistantPreviewTotalCharacters: latestAssistantPreviewTotalCharacters,
             interaction: nil,
             transcriptItemCount: 3,
             updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
